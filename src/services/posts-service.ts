@@ -54,7 +54,7 @@ export interface UpdatedPost {
 
 export interface ListPostsResult {
   posts: PostItem[];
-  nextCursor: string | null;
+  lastKey: string | undefined;
 }
 
 function validateContent(content: string | undefined): string {
@@ -183,11 +183,11 @@ export async function listRoomPosts(
   }));
 
   const posts = (result.Items ?? []) as PostItem[];
-  const nextCursor = result.LastEvaluatedKey
+  const lastKey = result.LastEvaluatedKey
     ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
-    : null;
+    : undefined;
 
-  return { posts, nextCursor };
+  return { posts, lastKey };
 }
 
 export async function listUserPosts(userId: string): Promise<PostItem[]> {

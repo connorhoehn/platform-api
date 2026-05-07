@@ -15,8 +15,8 @@ postLikesRouter.post('/', requireRoomMembership, asyncHandler(async (req: Reques
 
 // DELETE /api/rooms/:roomId/posts/:postId/likes — unlike a post (REAC-02)
 postLikesRouter.delete('/', requireRoomMembership, asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const { postId } = req.params;
-  await likesService.unlikePost(postId, req.user!.sub);
+  const { roomId, postId } = req.params;
+  await likesService.unlikePost(roomId, postId, req.user!.sub);
   res.status(204).send();
 }));
 

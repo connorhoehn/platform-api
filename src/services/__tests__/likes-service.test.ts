@@ -63,12 +63,12 @@ describe('unlikePost', () => {
     mockSend
       .mockResolvedValueOnce({ Item: { targetId: 'post:p-1', userId: 'u-1' } })
       .mockResolvedValueOnce({});
-    await expect(unlikePost('p-1', 'u-1')).resolves.toBeUndefined();
+    await expect(unlikePost('r-1', 'p-1', 'u-1')).resolves.toBeUndefined();
   });
 
   it('throws NotFoundError when like missing', async () => {
     mockSend.mockResolvedValue({ Item: undefined });
-    await expect(unlikePost('p-1', 'u-1')).rejects.toThrow(NotFoundError);
+    await expect(unlikePost('r-1', 'p-1', 'u-1')).rejects.toThrow(NotFoundError);
   });
 });
 

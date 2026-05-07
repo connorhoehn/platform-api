@@ -13,7 +13,8 @@ import {
   DeleteCommand,
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { docClient, publishSocialEvent } from '../lib/aws-clients';
+import { docClient } from '../lib/aws-clients';
+import { publishDurable } from '../lib/event-catalog';
 import { broadcastToRoom } from './room-broadcaster';
 import { profileRepo } from '../repositories';
 import {
@@ -102,10 +103,10 @@ export async function likePost(
   await insertLike(targetId, userId, createdAt);
 
   await broadcastToRoom(roomId, 'social:like', {
-    targetId, userId, type: 'like', createdAt,
+    targetId, userId, postId, action: 'liked', createdAt,
   });
 
-  void publishSocialEvent('social.like', {
+  void publishDurable('social.like', {
     targetId,
     userId,
     roomId,
@@ -115,9 +116,13 @@ export async function likePost(
   return { targetId, userId, type: 'like', createdAt };
 }
 
-export async function unlikePost(postId: string, userId: string): Promise<void> {
+export async function unlikePost(roomId: string, postId: string, userId: string): Promise<void> {
   const targetId = `post:${postId}`;
   await removeLike(targetId, userId);
+
+  await broadcastToRoom(roomId, 'social:like', {
+    targetId, userId, postId, action: 'unliked', createdAt: new Date().toISOString(),
+  });
 }
 
 export async function listPostLikes(
@@ -169,10 +174,10 @@ export async function likeComment(
   await insertLike(targetId, userId, createdAt);
 
   await broadcastToRoom(roomId, 'social:like', {
-    targetId, userId, type: 'like', createdAt,
+    targetId, userId, postId, commentId, action: 'liked', createdAt,
   });
 
-  void publishSocialEvent('social.like', {
+  void publishDurable('social.like', {
     targetId,
     userId,
     roomId,

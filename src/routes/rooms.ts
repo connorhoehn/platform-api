@@ -20,15 +20,16 @@ export const roomsRouter = Router();
 // POST /api/rooms/dm — create DM room (ROOM-03, ROOM-05)
 // IMPORTANT: defined BEFORE /:roomId to avoid Express matching '/dm' as a roomId value
 roomsRouter.post('/dm', asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const { targetUserId } = req.body as { targetUserId?: string };
+  const { targetUserId, peerId } = req.body as { targetUserId?: string; peerId?: string };
+  const resolvedTarget = targetUserId ?? peerId;
 
-  if (!targetUserId) {
-    throw new ValidationError('targetUserId is required');
+  if (!resolvedTarget) {
+    throw new ValidationError('targetUserId (or peerId) is required');
   }
 
   const callerId = req.user!.sub;
 
-  if (targetUserId === callerId) {
+  if (resolvedTarget === callerId) {
     throw new ValidationError('Cannot create a DM with yourself');
   }
 
@@ -46,16 +47,16 @@ roomsRouter.post('/dm', asyncHandler(async (req: Request, res: Response): Promis
   // Check target follows caller (point query — O(1), not scan)
   const reverseResult = await docClient.send(new GetCommand({
     TableName: REL_TABLE,
-    Key: { followerId: targetUserId, followeeId: callerId },
+    Key: { followerId: resolvedTarget, followeeId: callerId },
   }));
   const targetFollowsCaller = !!reverseResult.Item;
 
-  if (!followeeSet.has(targetUserId) || !targetFollowsCaller) {
+  if (!followeeSet.has(resolvedTarget) || !targetFollowsCaller) {
     throw new ForbiddenError('DM rooms can only be created between mutual friends');
   }
 
   // Deterministic DM roomId — sorted to ensure same key regardless of who initiates (ROOM-03)
-  const dmRoomId = ['dm', ...[callerId, targetUserId].sort()].join('#');
+  const dmRoomId = ['dm', ...[callerId, resolvedTarget].sort()].join('#');
   const channelId = randomUUID();
   const now = new Date().toISOString();
 
@@ -64,10 +65,10 @@ roomsRouter.post('/dm', asyncHandler(async (req: Request, res: Response): Promis
     await roomRepo.createRoomConditional({
       roomId: dmRoomId,
       channelId,
-      name: `dm-${callerId.slice(-6)}-${targetUserId.slice(-6)}`,
+      name: `dm-${callerId.slice(-6)}-${resolvedTarget.slice(-6)}`,
       type: 'dm',
       ownerId: callerId,
-      dmPeerUserId: targetUserId,
+      dmPeerUserId: resolvedTarget,
       createdAt: now,
       updatedAt: now,
     });
@@ -78,9 +79,6 @@ roomsRouter.post('/dm', asyncHandler(async (req: Request, res: Response): Promis
       'name' in err &&
       (err as { name: string }).name === 'ConditionalCheckFailedException'
     ) {
-      // Preserve existing response shape — include the roomId so clients can
-      // act on the duplicate (e.g. open the existing DM). This adds a field
-      // beyond the standard `{ error }` envelope, so use a custom AppError.
       throw new DmExistsError(dmRoomId);
     }
     throw err;
@@ -88,15 +86,15 @@ roomsRouter.post('/dm', asyncHandler(async (req: Request, res: Response): Promis
 
   // Auto-enroll BOTH users: caller as 'owner', peer as 'member'
   await roomRepo.addMember({ roomId: dmRoomId, userId: callerId, role: 'owner', joinedAt: now });
-  await roomRepo.addMember({ roomId: dmRoomId, userId: targetUserId, role: 'member', joinedAt: now });
+  await roomRepo.addMember({ roomId: dmRoomId, userId: resolvedTarget, role: 'member', joinedAt: now });
 
   // Populate cache with newly created DM room
   void setCachedRoom(dmRoomId, {
-    roomId: dmRoomId, channelId, name: `dm-${callerId.slice(-6)}-${targetUserId.slice(-6)}`,
-    type: 'dm', ownerId: callerId, dmPeerUserId: targetUserId, createdAt: now, updatedAt: now,
+    roomId: dmRoomId, channelId, name: `dm-${callerId.slice(-6)}-${resolvedTarget.slice(-6)}`,
+    type: 'dm', ownerId: callerId, dmPeerUserId: resolvedTarget, createdAt: now, updatedAt: now,
   });
 
-  res.status(201).json({ roomId: dmRoomId, channelId, type: 'dm', dmPeerUserId: targetUserId, createdAt: now });
+  res.status(201).json({ roomId: dmRoomId, channelId, type: 'dm', dmPeerUserId: resolvedTarget, createdAt: now });
 }));
 
 // Custom AppError variant — existing endpoint returns an extra `roomId` alongside

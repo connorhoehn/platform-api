@@ -33,8 +33,8 @@ postsRouter.delete('/:postId', asyncHandler(async (req: Request, res: Response):
 postsRouter.get('/', requireRoomMembership, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { roomId } = req.params;
   const limit = parseInt(req.query['limit'] as string ?? '20', 10) || 20;
-  const cursor = req.query['cursor'] as string | undefined;
-  const result = await postsService.listRoomPosts(roomId, { limit, ...(cursor ? { cursor } : {}) });
+  const lastKey = (req.query['lastKey'] ?? req.query['cursor']) as string | undefined;
+  const result = await postsService.listRoomPosts(roomId, { limit, ...(lastKey ? { cursor: lastKey } : {}) });
   res.status(200).json(result);
 }));
 
