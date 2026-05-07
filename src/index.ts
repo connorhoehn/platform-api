@@ -19,6 +19,7 @@ import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
 import { RetryManager } from 'distributed-core/dist/transport/RetryManager';
 import { connectCatalog, disconnectCatalog } from './lib/event-catalog';
+import { ensureOutboxTTL } from './lib/dynamo-setup';
 import { startOutboxDrainer } from './services/outbox-drainer';
 
 const port = process.env.PORT ?? '3001';
@@ -43,6 +44,10 @@ const server = app.listen(Number(port), () => {
 
 const drainer = startOutboxDrainer();
 log.info('outbox-drainer started');
+
+ensureOutboxTTL().catch((err: unknown) => {
+  log.warn({ err }, 'outbox TTL auto-provision failed');
+});
 
 const catalogRetry = new RetryManager({
   maxRetries: 2,
