@@ -1,0 +1,25 @@
+{
+  "name": "websocket-gateway-pipelines",
+  "version": "1.0.0",
+  "description": "MCP server for visual pipeline orchestration — list, trigger, observe, validate",
+  "transport": "stdio",
+  "command": "node",
+  "args": ["src/mcp/pipeline-mcp-server.js"],
+  "env": {
+    "API_BASE_URL": "http://localhost:3001/api",
+    "AUTH_TOKEN": ""
+  },
+  "tools": [
+    "pipeline_list",
+    "pipeline_get",
+    "pipeline_trigger",
+    "pipeline_get_run",
+    "pipeline_history",
+    "pipeline_list_runs",
+    "pipeline_active_runs",
+    "pipeline_resolve_approval",
+    "pipeline_cancel_run",
+    "pipeline_get_metrics",
+    "pipeline_validate"
+  ]
+}

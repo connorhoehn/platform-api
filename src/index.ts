@@ -1,0 +1,201 @@
+// IMPORTANT: tracing.start() must run before any other imports so that
+// OpenTelemetry auto-instrumentation can monkey-patch http/express/etc.
+// before they are require()'d by the rest of the application.
+import { start as startTracing } from './tracing';
+const tracingShutdown = startTracing();
+
+import { createApp } from './app';
+import { createScheduleEvaluator } from './services/scheduleEvaluator';
+import { pipelineDefinitionsCache } from './pipeline/definitions-cache';
+import { setPipelineBridge } from './routes/pipelineTriggers';
+import { bootstrapPipeline } from './pipeline/bootstrap';
+import { createBridge } from './pipeline/createBridge';
+import { PipelineRunRepository } from './repositories/PipelineRunRepository';
+import { DLQRepository } from './repositories/DLQRepository';
+import { docClient } from './lib/aws-clients';
+import log from './lib/logger';
+import { RedisIngestEventBus } from './ingest/redis-event-bus';
+import { IngestEngine } from './ingest/engine';
+import { setIngestEngine } from './ingest/engine-singleton';
+
+const port = process.env.PORT ?? '3001';
+
+if (!process.env.COGNITO_REGION || !process.env.COGNITO_USER_POOL_ID) {
+  log.error({ env: { COGNITO_REGION: !!process.env.COGNITO_REGION, COGNITO_USER_POOL_ID: !!process.env.COGNITO_USER_POOL_ID } }, 'FATAL: COGNITO_REGION and COGNITO_USER_POOL_ID must be set');
+  process.exit(1);
+}
+
+const app = createApp();
+const server = app.listen(Number(port), () => {
+  log.info({ port }, 'social-api listening');
+});
+
+// ---------------------------------------------------------------------------
+// Phase-4: bootstrap distributed-core's PipelineModule and wire its surfaces
+// into the route layer. Failure here is non-fatal — the routes' stub paths
+// keep working with the in-memory stubRunStore so dev workflows that don't
+// need real LLM streaming aren't gated on this succeeding.
+// ---------------------------------------------------------------------------
+
+let pipelineShutdown: (() => Promise<void>) | null = null;
+
+// Pipeline run persistence — wire PipelineRunRepository into bootstrap so run
+// state is persisted to DDB. Opt-in via PIPELINE_RUN_PERSISTENCE_ENABLED=true.
+const runPersistenceEnabled =
+  (process.env.PIPELINE_RUN_PERSISTENCE_ENABLED ?? 'true').trim().toLowerCase() !== 'false';
+const pipelineRunRepository = runPersistenceEnabled
+  ? new PipelineRunRepository(docClient)
+  : undefined;
+
+// DLQ persistence — wire DLQRepository so failed events survive restarts.
+// Opt-in via PIPELINE_DLQ_PERSISTENCE_ENABLED=true.
+const dlqPersistenceEnabled =
+  (process.env.PIPELINE_DLQ_PERSISTENCE_ENABLED ?? 'true').trim().toLowerCase() !== 'false';
+const dlqRepository = dlqPersistenceEnabled
+  ? new DLQRepository(docClient)
+  : undefined;
+
+bootstrapPipeline({ pipelineRunRepository, dlqRepository })
+  .then(({ module, nodeId, dlq, shutdown }) => {
+    pipelineShutdown = shutdown;
+    setPipelineBridge(createBridge(module, dlq, pipelineRunRepository));
+    log.info({
+      nodeId,
+      runPersistence: runPersistenceEnabled,
+      dlqPersistence: dlqPersistenceEnabled
+    }, 'PipelineModule bootstrapped');
+  })
+  .catch((err: unknown) => {
+    const e = err as { message?: string; stack?: string; name?: string };
+    log.error(
+      {
+        errName: e?.name,
+        errMessage: e?.message,
+        errStack: e?.stack,
+      },
+      'PipelineModule bootstrap FAILED — pipeline bridge is NOT wired; ' +
+        'all triggers will fall back to in-memory stub and runs will NOT persist',
+    );
+  });
+
+// ---------------------------------------------------------------------------
+// Ingest engine bootstrap — wires IngestEngine with Redis-backed event bus so
+// progress events flow to the gateway via Redis pub/sub (decoupled from
+// gateway process). Non-fatal: routes return 503 if engine isn't available.
+// ---------------------------------------------------------------------------
+
+let ingestShutdown: (() => Promise<void>) | null = null;
+
+(async () => {
+  try {
+    const { ingestSourceRepo, ingestItemRepo, syncCursorRepo } = await import('./ingest/repositories');
+    const { typedDocumentRepo } = await import('./repositories');
+
+    const eventBus = new RedisIngestEventBus({ logger: log });
+    await eventBus.connect();
+
+    const engine = new IngestEngine({
+      sourceRepository: ingestSourceRepo,
+      itemRepository: ingestItemRepo,
+      cursorRepository: syncCursorRepo,
+      documentRepository: typedDocumentRepo,
+      eventBus,
+    });
+
+    await engine.start();
+    setIngestEngine(engine);
+
+    ingestShutdown = async () => {
+      await engine.stop();
+      await eventBus.disconnect();
+    };
+
+    log.info('IngestEngine bootstrapped (Redis event bus)');
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    log.error(
+      { errMessage: e?.message },
+      'IngestEngine bootstrap FAILED — ingest routes will return 503',
+    );
+  }
+})();
+
+// ---------------------------------------------------------------------------
+// Pipeline definitions cache — Scan-backed, refreshed every 60s.
+//
+// Replaces the old write-through in-memory mirror. The schedule evaluator
+// (below) and the public webhook router both consume this cache
+// synchronously, so cold-start blindness after a process restart is bounded
+// by the first refresh's Scan latency (~tens of ms in-region) rather than
+// requiring every pipeline to be re-touched via PUT.
+//
+// We deliberately don't `await` the first refresh — if DynamoDB is slow or
+// the table doesn't exist yet, blocking startup would be worse than the
+// (at most) 60-second window of "scheduler/webhooks see no pipelines".
+// ---------------------------------------------------------------------------
+pipelineDefinitionsCache.start().catch((err: unknown) => {
+  log.error({ err }, 'pipelineDefinitionsCache initial refresh failed (will retry on tick)');
+});
+
+// ---------------------------------------------------------------------------
+// Schedule evaluator — fires pipelines whose triggerBinding.event === 'schedule'
+// on their cron expression. Phase 1: logs only; Phase 4 will call the pipeline
+// resource to produce a run.
+// ---------------------------------------------------------------------------
+
+interface ScheduledPipelineShape {
+  id?: unknown;
+  status?: unknown;
+  triggerBinding?: { event?: unknown; schedule?: unknown };
+}
+
+const scheduler = createScheduleEvaluator({
+  listPipelines: () => {
+    const out: Array<{ id: string; status: string; triggerBinding?: { event: string; schedule?: string } }> = [];
+    // Reads from the in-memory cache — `pipelineDefinitionsCache` refreshes
+    // every 60s from DynamoDB, so this loop never makes a network call. The
+    // only correctness invariant we care about here is "the cache is at most
+    // 60s stale", which is fine for cron-minute granularity.
+    for (const raw of pipelineDefinitionsCache.all()) {
+      const p = raw as ScheduledPipelineShape;
+      if (typeof p?.id !== 'string' || typeof p.status !== 'string') continue;
+      const tb = p.triggerBinding;
+      const triggerBinding = tb && typeof tb.event === 'string'
+        ? {
+            event: tb.event,
+            schedule: typeof tb.schedule === 'string' ? tb.schedule : undefined,
+          }
+        : undefined;
+      out.push({ id: p.id, status: p.status, triggerBinding });
+    }
+    return out;
+  },
+  trigger: async (pipelineId, payload) => {
+    // Phase 1: log only. Phase 4 will create a pipeline run via ResourceRouter.
+    log.info({ pipelineId, payload }, 'scheduler firing');
+  },
+});
+scheduler.start();
+
+// Graceful shutdown — stop the timer so the process can exit cleanly.
+async function shutdown(signal: string): Promise<void> {
+  log.info({ signal }, 'received shutdown signal');
+  scheduler.stop();
+  pipelineDefinitionsCache.stop();
+  if (pipelineShutdown) {
+    try { await pipelineShutdown(); } catch (err) {
+      log.error({ err }, 'pipeline shutdown failed');
+    }
+  }
+  if (ingestShutdown) {
+    try { await ingestShutdown(); } catch (err) {
+      log.error({ err }, 'ingest shutdown failed');
+    }
+  }
+  try { await tracingShutdown(); } catch (err) {
+    log.error({ err }, 'tracing shutdown failed');
+  }
+  server.close(() => process.exit(0));
+}
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.on('SIGINT',  () => { void shutdown('SIGINT'); });

@@ -1,0 +1,99 @@
+export type ErrorCategory =
+  | 'NetworkError'
+  | 'TimeoutError'
+  | 'ValidationError'
+  | 'LLMError'
+  | 'RegistryConflict'
+  | 'UnknownError';
+
+export type Retryability = 'retryable' | 'terminal' | 'unknown';
+
+const CATEGORY_RETRYABILITY: Record<ErrorCategory, Retryability> = {
+  NetworkError:     'retryable',
+  TimeoutError:     'retryable',
+  ValidationError:  'terminal',
+  RegistryConflict: 'terminal',
+  LLMError:         'retryable',  // refined by classifyRetryability for 4xx auth
+  UnknownError:     'unknown',
+};
+
+/**
+ * Returns whether an error with the given category and message is safe to
+ * retry automatically. LLMErrors are retryable by default except for 4xx
+ * authentication/permission failures, which require human intervention.
+ */
+export function classifyRetryability(category: ErrorCategory, message: string): Retryability {
+  if (category === 'LLMError') {
+    const lower = message.toLowerCase();
+    if (
+      lower.includes('unauthorized') ||
+      lower.includes('invalid api key') ||
+      lower.includes('invalid_api_key') ||
+      lower.includes('authentication') ||
+      lower.includes('permission denied') ||
+      lower.includes('403') ||
+      lower.includes('401')
+    ) {
+      return 'terminal';
+    }
+  }
+  return CATEGORY_RETRYABILITY[category];
+}
+
+export function classifyPipelineError(message: string, stack?: string): ErrorCategory {
+  const lowerMsg = message.toLowerCase();
+  const lowerStack = (stack || '').toLowerCase();
+  const combined = lowerMsg + ' ' + lowerStack;
+
+  if (
+    combined.includes('econnrefused') ||
+    combined.includes('enotfound') ||
+    combined.includes('network') ||
+    combined.includes('fetch failed') ||
+    combined.includes('socket hang up')
+  ) {
+    return 'NetworkError';
+  }
+
+  if (
+    combined.includes('conflict') ||
+    combined.includes('lock') ||
+    combined.includes('lease') ||
+    combined.includes('registry') ||
+    combined.includes('version mismatch')
+  ) {
+    return 'RegistryConflict';
+  }
+
+  if (
+    combined.includes('timeout') ||
+    combined.includes('timed out') ||
+    combined.includes('etimedout')
+  ) {
+    return 'TimeoutError';
+  }
+
+  if (
+    combined.includes('rate limit') ||
+    combined.includes('rate_limit') ||
+    combined.includes('model_error') ||
+    combined.includes('anthropic') ||
+    combined.includes('bedrock') ||
+    combined.includes('overloaded') ||
+    combined.includes('quota exceeded')
+  ) {
+    return 'LLMError';
+  }
+
+  if (
+    combined.includes('validation') ||
+    combined.includes('required field') ||
+    combined.includes('invalid') ||
+    combined.includes('schema') ||
+    combined.includes('type mismatch')
+  ) {
+    return 'ValidationError';
+  }
+
+  return 'UnknownError';
+}

@@ -1,0 +1,1602 @@
+# social-api/openapi/pipelines.yaml
+#
+# OpenAPI 3.1 spec for the pipelines HTTP surface exposed by social-api.
+#
+# Authoritative source: `social-api/src/routes/pipelineDefinitions.ts`,
+# `pipelineMetrics.ts`, `pipelineTriggers.ts`, and `profiles.ts`. Schemas
+# mirror `frontend/src/types/pipeline.ts` per TYPES_SYNC.md — update both
+# in lockstep.
+#
+# Hand-maintained (no codegen). Useful for future SDK generation, shape
+# sanity-checks at the repo boundary, and letting LLMs reason about the
+# API without re-reading source.
+
+openapi: 3.1.0
+
+info:
+  title: Pipelines HTTP API
+  description: |
+    REST surface for pipeline definitions, runs, metrics, and the user
+    search used by the pipeline editor's UserPicker. Part of `social-api`.
+
+    Phase 1 endpoints back onto in-memory stubs; the wire contracts are
+    intentionally stable so Phase 4 can swap in distributed-core's
+    PipelineModule without touching clients. See `PIPELINES_PLAN.md §17`.
+  version: 1.0.0
+  contact:
+    name: websocket-gateway
+    url: https://github.com/hoehn/websocket-gateway
+
+servers:
+  - url: /api
+    description: social-api mount (Express app mounts the router at /api)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: pipelines
+    description: Pipeline definitions, runs, and metrics
+  - name: profiles
+    description: User profile search (UserPicker backing store)
+
+paths:
+  # --- Public webhook trigger ---------------------------------------------
+  # Mounted at the app root (NOT under /api) — see `social-api/src/app.ts`.
+  # Public by design: no Cognito JWT required, since external systems
+  # (Stripe, GitHub, internal cron, etc.) won't carry one. Authenticity is
+  # enforced via per-pipeline HMAC-SHA256 signatures when the matched
+  # pipeline definition's webhook trigger binding has a `webhookSecret`
+  # configured. No secret ⇒ unsigned-OK fallback (Phase-1 behavior).
+  #
+  # Note: `/hooks/pipeline/{path}` is sibling to the `/api` server URL
+  # declared above — the OpenAPI `servers` block describes the JWT-gated
+  # surface; this endpoint is documented here for completeness, callers
+  # should target it at `<host>/hooks/pipeline/{path}` directly.
+  /hooks/pipeline/{path}:
+    parameters:
+      - in: path
+        name: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-zA-Z0-9_-]{1,64}$'
+        description: |
+          Webhook path — matches the regex enforced by both the route and
+          the frontend `TriggerConfig` "Full URL" preview. Alphanumeric,
+          underscore, hyphen; 1-64 chars.
+    post:
+      tags: [pipelines]
+      summary: Public webhook trigger for pipeline definitions
+      security: []  # No bearer token — see signature header instead.
+      description: |
+        Fires the pipeline whose published `triggerBinding` matches
+        `(event: 'webhook', webhookPath: <path>)`. Body is forwarded
+        verbatim; only `x-*` headers (minus the signature header) are
+        captured into pipeline context.
+
+        ## Authenticity
+        When the matched pipeline definition has a `webhookSecret` configured
+        on its trigger binding, the request MUST carry a valid
+        `X-Pipeline-Signature-256` header of the form:
+
+        ```
+        X-Pipeline-Signature-256: sha256=<hex>
+        ```
+
+        where `<hex>` is HMAC-SHA256(secret, raw_request_body) — same
+        convention as GitHub webhooks. Comparison is constant-time
+        (`crypto.timingSafeEqual`). On mismatch the route returns
+        `401 Unauthorized` with an RFC-7807 problem-details body and emits
+        a structured `[pipeline-webhook] signature verification failed`
+        log line for observability.
+
+        When no `webhookSecret` is configured, unsigned requests are
+        accepted (Phase-1 dev fallback). Phase-5 will add a global config
+        flag to require signatures everywhere.
+      operationId: triggerPipelineWebhook
+      parameters:
+        - in: header
+          name: X-Pipeline-Signature-256
+          required: false
+          schema:
+            type: string
+            pattern: '^sha256=[0-9a-f]{64}$'
+          description: |
+            HMAC-SHA256 signature of the raw request body, formatted as
+            `sha256=<64-hex-chars>`. Required when the matched pipeline
+            definition's trigger binding has a `webhookSecret`; ignored
+            otherwise.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+          '*/*':
+            schema:
+              type: string
+              format: binary
+              description: |
+                Raw payload — the route preserves exact bytes for HMAC
+                verification before attempting JSON parsing.
+      responses:
+        '202':
+          description: Webhook accepted (and signature verified, if required)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted, webhookPath, at]
+                properties:
+                  accepted:
+                    type: boolean
+                    enum: [true]
+                  webhookPath:
+                    type: string
+                  at:
+                    type: string
+                    format: date-time
+        '400':
+          description: Path failed regex validation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: |
+            Signature missing or invalid for a pipeline that requires one.
+            Body is RFC-7807 problem-details.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WebhookSignatureProblem'
+
+  # --- Definitions ---------------------------------------------------------
+  # Mounted at /api/pipelines/defs — the `/defs` segment exists to avoid
+  # colliding with the static `/metrics` segment under `/api/pipelines`.
+  # See routes/index.ts for the mount-order note.
+  /pipelines/defs:
+    get:
+      tags: [pipelines]
+      summary: List pipeline definitions for the caller
+      operationId: listPipelineDefinitions
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pipelines]
+                properties:
+                  pipelines:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PipelineDefinition'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/defs/{pipelineId}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+    get:
+      tags: [pipelines]
+      summary: Get one pipeline definition
+      operationId: getPipelineDefinition
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineDefinition'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    put:
+      tags: [pipelines]
+      summary: Upsert a pipeline definition
+      description: |
+        Body `id` must match the `:pipelineId` path param; mismatch returns
+        `400 invalid_body`. Creates if absent, replaces if present.
+      operationId: upsertPipelineDefinition
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineDefinition'
+      responses:
+        '200':
+          description: Upserted definition (echoed body)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineDefinition'
+        '400':
+          description: Body missing or `body.id` does not match `:pipelineId`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    delete:
+      tags: [pipelines]
+      summary: Delete a pipeline definition
+      operationId: deletePipelineDefinition
+      responses:
+        '204':
+          description: Deleted (or no-op if absent)
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/defs/{pipelineId}/publish:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+    post:
+      tags: [pipelines]
+      summary: Publish a pipeline definition
+      description: |
+        Bumps `version` by 1, sets `status = 'published'`, and snapshots
+        `publishedVersion` to the new `version`. Idempotent in the sense
+        that each call bumps, but no additional side effects.
+      operationId: publishPipelineDefinition
+      responses:
+        '200':
+          description: Updated definition after publish
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineDefinition'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --- Runs ----------------------------------------------------------------
+  /pipelines/{pipelineId}/runs:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+    post:
+      tags: [pipelines]
+      summary: Trigger a pipeline run
+      description: |
+        Phase 1: synthesizes a runId and returns 202. The frontend's
+        MockExecutor drives the actual execution via the in-process
+        EventStreamContext. Phase 4 swaps the body for
+        `pipelineModule.createResource(...)` without changing this contract.
+
+        ## Idempotency
+        Callers may pass an `Idempotency-Key` header. When present we dedupe
+        by `${userId}:${pipelineId}:${key}` against a 5-minute in-memory
+        cache. Replays return the original response with HTTP 200 (instead
+        of 202) and an `X-Idempotency-Replay: true` response header so the
+        frontend/logs can distinguish replays from fresh triggers.
+
+        Body `definition.id`, when supplied, MUST equal `:pipelineId` —
+        mismatch returns `400 invalid_body`.
+      operationId: triggerPipelineRun
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema:
+            type: string
+            maxLength: 200
+          description: |
+            Optional client-supplied dedupe key. Within the 5-minute window
+            the same key replays the original response (HTTP 200 +
+            `X-Idempotency-Replay: true`).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TriggerRunRequest'
+      responses:
+        '202':
+          description: Trigger accepted (fresh)
+          headers:
+            X-Idempotency-Replay:
+              schema: { type: string, enum: ['true'] }
+              description: Absent on a fresh trigger; only present on replay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerRunResponse'
+        '200':
+          description: |
+            Idempotent replay — request matched a recent `Idempotency-Key`
+            in the dedupe window. Body is the original response; the
+            `X-Idempotency-Replay` header is set to `true`.
+          headers:
+            X-Idempotency-Replay:
+              schema: { type: string, enum: ['true'] }
+              required: true
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerRunResponse'
+        '400':
+          description: Body `definition.id` does not match `:pipelineId`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+    get:
+      tags: [pipelines]
+      summary: Fetch a single pipeline run
+      description: |
+        Returns the full run document — status, step executions, accumulated
+        context, and any terminal error. Phase 4 routes through the
+        ResourceRouter owner.
+      operationId: getPipelineRun
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineRun'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}/history:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+    get:
+      tags: [pipelines]
+      summary: Replay event history for a run
+      description: |
+        Returns the ordered list of `PipelineWireEvent` envelopes for the
+        run, optionally starting from a `seq` cursor (`fromVersion`). Used
+        by the replay UI to reconstruct state and by reconnecting clients
+        to catch up after a disconnect. Events are returned in `seq`-
+        ascending order; clients dedupe on `seq` (NEVER on `emittedAt` —
+        that field is re-stamped on replay).
+      operationId: getPipelineRunHistory
+      parameters:
+        - in: query
+          name: fromVersion
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: |
+            Inclusive `seq` cursor. Omit to start from 0.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PipelineWireEvent'
+                  nextFromVersion:
+                    type: integer
+                    minimum: 0
+                    description: |
+                      `seq` to pass on the next request to continue the stream.
+                      Absent when the run has reached a terminal event.
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --- Pending approvals queue --------------------------------------------
+  # Surfaces `PipelineModule.getPendingApprovals()` to the frontend so the
+  # approvals inbox can render across all in-flight runs in one round-trip.
+  # Static segment — registered BEFORE both `/pipelines/{pipelineId}/...`
+  # and `/pipelines/{runId}/approvals` so it isn't captured as a path
+  # param. When the bridge isn't wired (or doesn't implement this method)
+  # the route returns `{ approvals: [] }` with HTTP 200 — empty queue is a
+  # valid answer in stub mode, NOT a 503.
+  /pipelines/approvals:
+    get:
+      tags: [pipelines]
+      summary: List pending approvals across all in-flight runs on this node
+      description: |
+        Returns every Approval node currently waiting on this gateway node.
+        Pass `?userId=` to filter to rows where the given user appears in
+        `approvers`; omit it to receive everything (the frontend's
+        approvals inbox typically filters visually).
+
+        ## Stub mode
+        When no live `PipelineBridge` is wired (Phase 1 / pre-bootstrap)
+        the route returns `{ approvals: [] }` with HTTP 200. Frontend
+        consumers should NOT treat the empty list as an error — it is the
+        documented Phase-1 fallback.
+      operationId: listPendingApprovals
+      parameters:
+        - in: query
+          name: userId
+          required: false
+          schema:
+            type: string
+          description: |
+            Optional approver-user filter. When present, only rows where
+            this `userId` appears in `approvers[]` are returned.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [approvals]
+                properties:
+                  approvals:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PendingApprovalRow'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --- Approvals -----------------------------------------------------------
+  # Approvals are addressed by `runId` directly (not pipeline-scoped) — the
+  # caller resolving an approval generally does not know / care which
+  # pipeline produced the run, only the runId on the approval card.
+  /pipelines/{runId}/approvals:
+    parameters:
+      - $ref: '#/components/parameters/RunIdPath'
+    post:
+      tags: [pipelines]
+      summary: Record an approval / rejection on a waiting Approval node
+      description: |
+        Resolves the approval gate for a run that is `awaiting_approval`.
+        The approver's user id is taken from the bearer token and recorded
+        in the resulting `pipeline.approval.recorded` event. Idempotent on
+        `(runId, stepId, userId)`: a second call with the same triple is a
+        no-op and returns the existing record.
+      operationId: recordApproval
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordApprovalRequest'
+      responses:
+        '200':
+          description: Approval recorded (or replayed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordApprovalResponse'
+        '400':
+          description: Missing `stepId`/`decision` or invalid decision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Run not found, or not awaiting_approval, or stepId not in waiting set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --- Observability -------------------------------------------------------
+  /observability/dashboard:
+    get:
+      tags: [pipelines]
+      summary: Aggregated dashboard snapshot
+      description: |
+        Single-shot read-only payload backing `/observability` — KPI tiles,
+        cluster health, active runs, recent events, alerts. Computed
+        server-side so the dashboard renders in one round-trip.
+      operationId: getObservabilityDashboard
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservabilityDashboard'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /observability/metrics:
+    get:
+      tags: [pipelines]
+      summary: Time-series metrics for the metrics route
+      description: |
+        Aliases `/pipelines/metrics` and may add additional time-series the
+        Metrics chart grid needs. Phase 1 returns the same shape as
+        `/pipelines/metrics` with optional series fields.
+      operationId: getObservabilityMetrics
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineMetrics'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --- Metrics -------------------------------------------------------------
+  /pipelines/metrics:
+    get:
+      tags: [pipelines]
+      summary: Aggregate pipeline runtime metrics
+      description: |
+        Phase 1 returns a synthesized, deterministic-ish snapshot driven by
+        wall-clock buckets — enough to validate polling and rendering.
+        Phase 4 returns `pipelineModule.getMetrics()`.
+      operationId: getPipelineMetrics
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineMetrics'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --- Profiles (UserPicker) ----------------------------------------------
+  /profiles:
+    get:
+      tags: [profiles]
+      summary: Search user profiles by displayName / userId substring
+      description: |
+        Case-insensitive substring search. Visibility-gated: private
+        profiles are only returned when the requester is the owner OR is
+        in a mutual-follow relationship with the candidate.
+      operationId: searchProfiles
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+          description: Search query (1..100 chars)
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+          description: Max results (clamped server-side to [1, 50])
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [profiles]
+                properties:
+                  profiles:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProfileSummary'
+        '400':
+          description: Missing or invalid `q`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Cognito ID token. Passed as `Authorization: Bearer <token>`.
+        Validated by `middleware/auth.ts` against the configured user pool.
+
+  parameters:
+    PipelineIdPath:
+      in: path
+      name: pipelineId
+      required: true
+      schema:
+        type: string
+      description: Pipeline definition identifier (opaque string, often UUID).
+
+    RunIdPath:
+      in: path
+      name: runId
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Pipeline run identifier (UUID minted at trigger time).
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorBody'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorBody'
+
+  schemas:
+    # -----------------------------------------------------------------
+    # Error envelope
+    # -----------------------------------------------------------------
+    ErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code (e.g. `not_found`, `invalid_body`).
+        message:
+          type: string
+          description: Optional human-readable detail.
+
+    # RFC 7807 problem-details body returned by /hooks/pipeline/{path} on a
+    # signature-verification failure. Mirrors what the route emits — kept
+    # narrow so SDK consumers get a stable shape.
+    WebhookSignatureProblem:
+      type: object
+      required: [type, title, status, detail]
+      properties:
+        type:
+          type: string
+          description: 'RFC 7807 problem type URI; `about:blank` for inline problems.'
+        title:
+          type: string
+          enum: ['Invalid webhook signature']
+        status:
+          type: integer
+          enum: [401]
+        detail:
+          type: string
+          description: Human-readable reason — missing header vs digest mismatch.
+
+    # -----------------------------------------------------------------
+    # Trigger run request/response
+    # -----------------------------------------------------------------
+    TriggerRunRequest:
+      type: object
+      properties:
+        triggerPayload:
+          type: object
+          additionalProperties: true
+          description: Arbitrary payload merged into the run's initial context.
+        definition:
+          allOf:
+            - $ref: '#/components/schemas/PipelineDefinition'
+          description: |
+            Inline pipeline definition. Optional in Phase 1; required in
+            Phase 4 where distributed-core's `createResource` consumes it
+            inline. When present `definition.id` MUST equal `:pipelineId`.
+
+    TriggerRunResponse:
+      type: object
+      required: [runId, pipelineId, triggeredBy, at]
+      properties:
+        runId:
+          type: string
+          format: uuid
+        pipelineId:
+          type: string
+        triggeredBy:
+          type: object
+          required: [userId, triggerType]
+          properties:
+            userId:
+              type: string
+            triggerType:
+              type: string
+              description: Phase 1 always emits `manual`.
+        at:
+          type: string
+          format: date-time
+
+    RecordApprovalRequest:
+      type: object
+      required: [stepId, decision]
+      properties:
+        stepId:
+          type: string
+          description: The Approval node id within the run that is being resolved.
+        decision:
+          type: string
+          enum: [approve, reject]
+        comment:
+          type: string
+          description: Optional human note attached to the ApprovalRecord.
+
+    # Mirror of distributed-core's `PendingApprovalRow`, surfaced via
+    # `PipelineModule.getPendingApprovals()`. Kept in lockstep with the
+    # `PendingApprovalRow` interface in `routes/pipelineTriggers.ts`.
+    PendingApprovalRow:
+      type: object
+      required: [runId, stepId, pipelineId, approvers, requestedAt]
+      properties:
+        runId:
+          type: string
+          format: uuid
+        stepId:
+          type: string
+          description: The Approval node id within the run that is waiting.
+        pipelineId:
+          type: string
+        approvers:
+          type: array
+          items:
+            type: object
+            required: [userId]
+            properties:
+              userId: { type: string }
+              teamId: { type: string }
+              role: { type: string }
+        message:
+          type: string
+          description: Optional human-readable prompt set on the Approval node.
+        requestedAt:
+          type: string
+          format: date-time
+
+    RecordApprovalResponse:
+      type: object
+      required: [runId, stepId, decision, userId, at]
+      properties:
+        runId:
+          type: string
+          format: uuid
+        stepId:
+          type: string
+        decision:
+          type: string
+          enum: [approve, reject]
+        userId:
+          type: string
+          description: The token-bearing user that recorded the decision.
+        at:
+          type: string
+          format: date-time
+        runStatus:
+          $ref: '#/components/schemas/RunStatus'
+          description: Run status after the decision is applied.
+
+    # -----------------------------------------------------------------
+    # Profiles (UserPicker)
+    # -----------------------------------------------------------------
+    ProfileSummary:
+      type: object
+      required: [userId, displayName]
+      properties:
+        userId:
+          type: string
+        displayName:
+          type: string
+        avatarUrl:
+          type: string
+          format: uri
+
+    # -----------------------------------------------------------------
+    # Pipeline metrics
+    # -----------------------------------------------------------------
+    PipelineMetrics:
+      type: object
+      required:
+        - runsStarted
+        - runsCompleted
+        - runsFailed
+        - runsActive
+        - runsAwaitingApproval
+        - avgDurationMs
+        - llmTokensIn
+        - llmTokensOut
+        - estimatedCostUsd
+        - asOf
+      properties:
+        runsStarted: { type: integer, minimum: 0 }
+        runsCompleted: { type: integer, minimum: 0 }
+        runsFailed: { type: integer, minimum: 0 }
+        runsActive: { type: integer, minimum: 0 }
+        runsAwaitingApproval: { type: integer, minimum: 0 }
+        avgDurationMs: { type: number, minimum: 0 }
+        llmTokensIn: { type: integer, minimum: 0 }
+        llmTokensOut: { type: integer, minimum: 0 }
+        estimatedCostUsd: { type: number, minimum: 0 }
+        asOf:
+          type: string
+          format: date-time
+
+    # -----------------------------------------------------------------
+    # Node enums + per-type data
+    # -----------------------------------------------------------------
+    NodeType:
+      type: string
+      enum:
+        - trigger
+        - llm
+        - transform
+        - condition
+        - action
+        - fork
+        - join
+        - approval
+
+    TriggerType:
+      type: string
+      enum:
+        - manual
+        - document.finalize
+        - document.comment
+        - document.submit
+        - schedule
+        - webhook
+
+    LLMProvider:
+      type: string
+      enum: [anthropic, bedrock]
+
+    TransformType:
+      type: string
+      enum: [jsonpath, template, javascript]
+
+    ActionType:
+      type: string
+      enum:
+        - update-document
+        - post-comment
+        - notify
+        - webhook
+        - mcp-tool
+
+    JoinMode:
+      type: string
+      enum: [all, any, n_of_m]
+
+    JoinMergeStrategy:
+      type: string
+      enum: [deep-merge, array-collect, last-writer-wins]
+
+    ApprovalTimeoutAction:
+      type: string
+      enum: [reject, approve, escalate]
+
+    Approver:
+      type: object
+      required: [type, value]
+      properties:
+        type:
+          type: string
+          enum: [user, role]
+        value:
+          type: string
+
+    TriggerNodeData:
+      type: object
+      required: [type, triggerType]
+      properties:
+        type:
+          type: string
+          const: trigger
+        triggerType:
+          $ref: '#/components/schemas/TriggerType'
+        documentTypeId:
+          type: string
+          description: Required for `document.*` triggers.
+        schedule:
+          type: string
+          description: Cron expression; required when `triggerType === 'schedule'`.
+        webhookPath:
+          type: string
+          description: Required when `triggerType === 'webhook'`.
+
+    LLMNodeData:
+      type: object
+      required: [type, provider, model, systemPrompt, userPromptTemplate, streaming]
+      properties:
+        type:
+          type: string
+          const: llm
+        provider:
+          $ref: '#/components/schemas/LLMProvider'
+        model:
+          type: string
+        systemPrompt:
+          type: string
+        userPromptTemplate:
+          type: string
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        maxTokens:
+          type: integer
+          minimum: 1
+        streaming:
+          type: boolean
+
+    TransformNodeData:
+      type: object
+      required: [type, transformType, expression]
+      properties:
+        type:
+          type: string
+          const: transform
+        transformType:
+          $ref: '#/components/schemas/TransformType'
+        expression:
+          type: string
+        outputKey:
+          type: string
+
+    ConditionNodeData:
+      type: object
+      required: [type, expression]
+      properties:
+        type:
+          type: string
+          const: condition
+        expression:
+          type: string
+        label:
+          type: string
+
+    ActionNodeData:
+      type: object
+      required: [type, actionType, config]
+      properties:
+        type:
+          type: string
+          const: action
+        actionType:
+          $ref: '#/components/schemas/ActionType'
+        config:
+          type: object
+          additionalProperties: true
+        idempotent:
+          type: boolean
+        onError:
+          type: string
+          enum: [route-error, fail-run]
+
+    ForkNodeData:
+      type: object
+      required: [type, branchCount]
+      properties:
+        type:
+          type: string
+          const: fork
+        branchCount:
+          type: integer
+          minimum: 2
+          maximum: 8
+        branchLabels:
+          type: array
+          items:
+            type: string
+
+    JoinNodeData:
+      type: object
+      required: [type, mode, mergeStrategy]
+      properties:
+        type:
+          type: string
+          const: join
+        mode:
+          $ref: '#/components/schemas/JoinMode'
+        n:
+          type: integer
+          minimum: 1
+          description: Required when `mode === 'n_of_m'`.
+        mergeStrategy:
+          $ref: '#/components/schemas/JoinMergeStrategy'
+
+    ApprovalNodeData:
+      type: object
+      required: [type, approvers, requiredCount]
+      properties:
+        type:
+          type: string
+          const: approval
+        approvers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Approver'
+        requiredCount:
+          type: integer
+          minimum: 1
+        timeoutMs:
+          type: integer
+          minimum: 0
+        timeoutAction:
+          $ref: '#/components/schemas/ApprovalTimeoutAction'
+        message:
+          type: string
+
+    NodeData:
+      oneOf:
+        - $ref: '#/components/schemas/TriggerNodeData'
+        - $ref: '#/components/schemas/LLMNodeData'
+        - $ref: '#/components/schemas/TransformNodeData'
+        - $ref: '#/components/schemas/ConditionNodeData'
+        - $ref: '#/components/schemas/ActionNodeData'
+        - $ref: '#/components/schemas/ForkNodeData'
+        - $ref: '#/components/schemas/JoinNodeData'
+        - $ref: '#/components/schemas/ApprovalNodeData'
+      discriminator:
+        propertyName: type
+        mapping:
+          trigger: '#/components/schemas/TriggerNodeData'
+          llm: '#/components/schemas/LLMNodeData'
+          transform: '#/components/schemas/TransformNodeData'
+          condition: '#/components/schemas/ConditionNodeData'
+          action: '#/components/schemas/ActionNodeData'
+          fork: '#/components/schemas/ForkNodeData'
+          join: '#/components/schemas/JoinNodeData'
+          approval: '#/components/schemas/ApprovalNodeData'
+
+    # -----------------------------------------------------------------
+    # Graph
+    # -----------------------------------------------------------------
+    PipelineNode:
+      type: object
+      required: [id, type, position, data]
+      properties:
+        id:
+          type: string
+        type:
+          $ref: '#/components/schemas/NodeType'
+        position:
+          type: object
+          required: [x, y]
+          properties:
+            x: { type: number }
+            y: { type: number }
+        data:
+          $ref: '#/components/schemas/NodeData'
+
+    PipelineEdge:
+      type: object
+      required: [id, source, sourceHandle, target, targetHandle]
+      properties:
+        id:
+          type: string
+        source:
+          type: string
+        sourceHandle:
+          type: string
+          description: >-
+            'out', 'true'/'false', 'branch-N', 'approved'/'rejected', 'error'.
+        target:
+          type: string
+        targetHandle:
+          type: string
+          description: "'in' or 'in-N' for Join."
+
+    TriggerBinding:
+      type: object
+      required: [event]
+      properties:
+        event:
+          $ref: '#/components/schemas/TriggerType'
+        documentTypeId: { type: string }
+        schedule: { type: string }
+        webhookPath: { type: string }
+        webhookSecret:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            32-byte HMAC-SHA256 secret (64 lowercase hex chars). Minted
+            server-side on first PUT of a webhook-trigger binding; surfaced
+            in `PipelineDefinition` responses so the UI can show it for
+            copy-out into the external webhook source. Absent ⇒ the public
+            `/hooks/pipeline/:path` route accepts unsigned requests
+            (Phase-1 dev fallback).
+
+    PipelineStatus:
+      type: string
+      enum: [draft, published]
+
+    PipelineDefinition:
+      type: object
+      required:
+        - id
+        - name
+        - version
+        - status
+        - nodes
+        - edges
+        - createdAt
+        - updatedAt
+        - createdBy
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+          description: Normalized (lowercase, trimmed) free-form labels.
+        icon:
+          type: string
+        version:
+          type: integer
+          minimum: 0
+          description: Bumped on each save.
+        status:
+          $ref: '#/components/schemas/PipelineStatus'
+        publishedVersion:
+          type: integer
+          minimum: 0
+        publishedSnapshot:
+          $ref: '#/components/schemas/PipelineDefinitionSnapshot'
+          description: |
+            Deep clone of the definition at last publish (minus
+            `publishedSnapshot` itself, to avoid recursion). Drives the
+            VersionDiffModal — populated by `publishPipeline`.
+        triggerBinding:
+          $ref: '#/components/schemas/TriggerBinding'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineEdge'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        createdBy:
+          type: string
+
+    # -----------------------------------------------------------------
+    # Runtime
+    # -----------------------------------------------------------------
+    RunStatus:
+      type: string
+      enum:
+        - pending
+        - running
+        - awaiting_approval
+        - completed
+        - failed
+        - cancelled
+
+    StepStatus:
+      type: string
+      enum:
+        - pending
+        - running
+        - completed
+        - failed
+        - skipped
+        - cancelled
+        - awaiting
+
+    ApprovalRecord:
+      type: object
+      required: [userId, decision, at]
+      properties:
+        userId:
+          type: string
+        decision:
+          type: string
+          enum: [approve, reject]
+        comment:
+          type: string
+        at:
+          type: string
+          format: date-time
+
+    StepExecutionLLM:
+      type: object
+      required: [prompt, response, tokensIn, tokensOut]
+      properties:
+        prompt: { type: string }
+        response: { type: string }
+        tokensIn:
+          type: integer
+          minimum: 0
+        tokensOut:
+          type: integer
+          minimum: 0
+
+    StepExecution:
+      type: object
+      required: [nodeId, status]
+      properties:
+        nodeId:
+          type: string
+        status:
+          $ref: '#/components/schemas/StepStatus'
+        startedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time }
+        durationMs:
+          type: number
+          minimum: 0
+        input: {}
+        output: {}
+        error:
+          type: string
+        llm:
+          $ref: '#/components/schemas/StepExecutionLLM'
+        approvals:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApprovalRecord'
+
+    PipelineRunTrigger:
+      type: object
+      required: [triggerType, payload]
+      properties:
+        userId:
+          type: string
+        triggerType:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+
+    PipelineRunError:
+      type: object
+      required: [nodeId, message]
+      properties:
+        nodeId:
+          type: string
+        message:
+          type: string
+        stack:
+          type: string
+
+    PipelineRun:
+      type: object
+      required:
+        - id
+        - pipelineId
+        - pipelineVersion
+        - status
+        - triggeredBy
+        - ownerNodeId
+        - startedAt
+        - currentStepIds
+        - steps
+        - context
+      properties:
+        id:
+          type: string
+        pipelineId:
+          type: string
+        pipelineVersion:
+          type: integer
+          minimum: 0
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        triggeredBy:
+          $ref: '#/components/schemas/PipelineRunTrigger'
+        ownerNodeId:
+          type: string
+          description: Distributed-core ResourceRouter owner.
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+        durationMs:
+          type: number
+          minimum: 0
+        currentStepIds:
+          type: array
+          items:
+            type: string
+          description: Active frontier — can be > 1 with Fork.
+        steps:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/StepExecution'
+        context:
+          type: object
+          additionalProperties: true
+        error:
+          $ref: '#/components/schemas/PipelineRunError'
+
+    # -----------------------------------------------------------------
+    # Validation (pure client-side result, included for SDK completeness)
+    # -----------------------------------------------------------------
+    ValidationCode:
+      type: string
+      enum:
+        - NO_TRIGGER
+        - MULTIPLE_TRIGGERS
+        - CYCLE_DETECTED
+        - INVALID_HANDLE
+        - MISSING_CONFIG
+        - APPROVAL_NO_APPROVERS
+        - JOIN_INSUFFICIENT_INPUTS
+        - ORPHAN_NODE
+        - DEAD_END
+        - UNUSED_FORK_BRANCH
+        - UNUSED_CONDITION_BRANCH
+        - NO_ERROR_HANDLER
+        - LLM_NO_MAX_TOKENS
+        - UNGUARDED_APPROVAL_TIMEOUT
+        - LARGE_FORK
+        - DEEP_CHAIN
+        - DUPLICATE_NODE_NAME
+        - LOW_TEMPERATURE_NON_DETERMINISTIC_PROMPT
+        - NO_PUBLISHED_VERSION_BUT_TRIGGER_SCHEDULED
+
+    ValidationIssue:
+      type: object
+      required: [code, message, severity]
+      properties:
+        code:
+          $ref: '#/components/schemas/ValidationCode'
+        message:
+          type: string
+        severity:
+          type: string
+          enum: [error, warning]
+        nodeId:
+          type: string
+        edgeId:
+          type: string
+        field:
+          type: string
+
+    ValidationResult:
+      type: object
+      required: [errors, warnings, isValid, canPublish]
+      properties:
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationIssue'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationIssue'
+        isValid:
+          type: boolean
+          description: "`errors.length === 0`."
+        canPublish:
+          type: boolean
+          description: "`errors.length === 0` — blocks publish (and therefore run), not save."
+
+    # -----------------------------------------------------------------
+    # PipelineDefinitionSnapshot — same shape as PipelineDefinition minus
+    # `publishedSnapshot` to avoid recursion. Persisted at publish time.
+    # -----------------------------------------------------------------
+    PipelineDefinitionSnapshot:
+      type: object
+      required:
+        - id
+        - name
+        - version
+        - status
+        - nodes
+        - edges
+        - createdAt
+        - updatedAt
+        - createdBy
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        icon: { type: string }
+        version:
+          type: integer
+          minimum: 0
+        status:
+          $ref: '#/components/schemas/PipelineStatus'
+        publishedVersion:
+          type: integer
+          minimum: 0
+        triggerBinding:
+          $ref: '#/components/schemas/TriggerBinding'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineEdge'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        createdBy: { type: string }
+
+    # -----------------------------------------------------------------
+    # Wire event envelope — wraps every PipelineEventMap event as it
+    # crosses the network boundary. `seq` is monotonic per-run and stable
+    # across replays; clients dedupe on it (NEVER on `emittedAt`).
+    # -----------------------------------------------------------------
+    PipelineEventType:
+      type: string
+      enum:
+        - pipeline.run.started
+        - pipeline.run.completed
+        - pipeline.run.failed
+        - pipeline.run.cancelled
+        - pipeline.run.orphaned
+        - pipeline.run.reassigned
+        - pipeline.step.started
+        - pipeline.step.completed
+        - pipeline.step.failed
+        - pipeline.step.skipped
+        - pipeline.step.cancelled
+        - pipeline.llm.prompt
+        - pipeline.llm.token
+        - pipeline.llm.response
+        - pipeline.approval.requested
+        - pipeline.approval.recorded
+        - pipeline.run.paused
+        - pipeline.run.resumed
+        - pipeline.run.resumeFromStep
+        - pipeline.run.retry
+        - pipeline.join.waiting
+        - pipeline.join.fired
+
+    PipelineWireEvent:
+      type: object
+      required: [eventType, payload, seq, sourceNodeId, emittedAt]
+      properties:
+        eventType:
+          $ref: '#/components/schemas/PipelineEventType'
+        payload:
+          type: object
+          additionalProperties: true
+          description: Shape varies per `eventType`; see PipelineEventMap in pipeline.ts.
+        seq:
+          type: integer
+          minimum: 0
+          description: Monotonic per-run sequence — stable across replays. Clients dedupe on this.
+        sourceNodeId:
+          type: string
+          description: Node id (cluster node, not graph node) that emitted the event.
+        emittedAt:
+          type: integer
+          description: Wall-clock emission time (ms). Re-stamped on replay; NEVER use for dedupe.
+
+    # -----------------------------------------------------------------
+    # Observability dashboard payload — the single-shot read backing /observability
+    # -----------------------------------------------------------------
+    ObservabilityKpi:
+      type: object
+      required: [value]
+      properties:
+        value: { type: number }
+        deltaPct:
+          type: number
+          description: Percent change vs the prior comparable window (negative for decrease).
+        sparkline:
+          type: array
+          items: { type: number }
+
+    ObservabilityClusterNode:
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [healthy, degraded, dead]
+        cpuSamples:
+          type: array
+          items: { type: number }
+          description: Last-60s CPU samples (0..1).
+        connectionCount:
+          type: integer
+          minimum: 0
+        activeRunCount:
+          type: integer
+          minimum: 0
+        role: { type: string }
+        region: { type: string }
+
+    ObservabilityActiveRun:
+      type: object
+      required: [runId, pipelineId, pipelineName, status, ownerNodeId, startedAt]
+      properties:
+        runId: { type: string, format: uuid }
+        pipelineId: { type: string }
+        pipelineName: { type: string }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        currentStepLabel:
+          type: string
+          description: e.g. "step 3/7 (llm)" or "awaiting approval".
+        ownerNodeId: { type: string }
+        startedAt:
+          type: string
+          format: date-time
+        elapsedMs:
+          type: integer
+          minimum: 0
+
+    ObservabilityRecentEvent:
+      type: object
+      required: [eventType, runId, at]
+      properties:
+        eventType:
+          $ref: '#/components/schemas/PipelineEventType'
+        runId: { type: string, format: uuid }
+        pipelineName: { type: string }
+        stepId: { type: string }
+        durationMs: { type: integer, minimum: 0 }
+        at: { type: string, format: date-time }
+
+    ObservabilityAlert:
+      type: object
+      required: [id, severity, message, at]
+      properties:
+        id: { type: string }
+        severity:
+          type: string
+          enum: [info, warning, critical]
+        message: { type: string }
+        contextLink: { type: string }
+        at:
+          type: string
+          format: date-time
+
+    ObservabilityDashboard:
+      type: object
+      required: [kpis, cluster, activeRuns, recentEvents, alerts, asOf]
+      properties:
+        kpis:
+          type: object
+          required: [runsToday, activeNow, pendingApprovals, failed24h]
+          properties:
+            runsToday:
+              $ref: '#/components/schemas/ObservabilityKpi'
+            activeNow:
+              $ref: '#/components/schemas/ObservabilityKpi'
+            pendingApprovals:
+              $ref: '#/components/schemas/ObservabilityKpi'
+            failed24h:
+              $ref: '#/components/schemas/ObservabilityKpi'
+        cluster:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservabilityClusterNode'
+        activeRuns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservabilityActiveRun'
+        recentEvents:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservabilityRecentEvent'
+        alerts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservabilityAlert'
+        asOf:
+          type: string
+          format: date-time

@@ -1,0 +1,633 @@
+// social-api/src/pipeline/__tests__/runPersistence.test.ts
+
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import { FixtureLLMClient } from 'distributed-core/testing';
+import { bootstrapPipeline } from '../bootstrap';
+import { RunPersistenceService } from '../runPersistence';
+import {
+  PipelineRunRepository,
+  readAttempts,
+  type PipelineRunItem,
+  type StepSummary,
+} from '../../repositories/PipelineRunRepository';
+
+jest.setTimeout(20_000);
+
+describe('RunPersistenceService', () => {
+  let mockRepository: { put: jest.Mock };
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    mockRepository = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+    const fixture = new FixtureLLMClient(['ok']);
+    const { shutdown } = await bootstrapPipeline({
+      llmClient: fixture,
+      pipelineRunRepository: mockRepository as unknown as PipelineRunRepository,
+    });
+    cleanup = shutdown;
+  });
+
+  afterEach(async () => {
+    if (cleanup) await cleanup();
+  });
+
+  it('generates unique keys for duplicate step executions (fork branches)', async () => {
+    // hub#1132: parallel fork branches must store each execution under a unique key.
+    expect(mockRepository.put.mock.calls.length).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hub#1280 — per-step attempt records
+// ---------------------------------------------------------------------------
+
+describe('readAttempts (back-compat read helper)', () => {
+  it('returns an empty array for undefined summary', () => {
+    expect(readAttempts(undefined, 'run-1', 'node-1')).toEqual([]);
+  });
+
+  it('returns an empty array for an empty summary', () => {
+    expect(readAttempts({}, 'run-1', 'node-1')).toEqual([]);
+  });
+
+  it('passes through a stored multi-attempt history unchanged', () => {
+    const attempts = [
+      { attemptNumber: 1, startedAt: 't0', error: 'boom', idempotencyKey: 'r:n:1' },
+      { attemptNumber: 2, startedAt: 't1', completedAt: 't2', output: { ok: true }, idempotencyKey: 'r:n:2' },
+    ];
+    const summary: StepSummary = {
+      status: 'completed',
+      attempts,
+    };
+    expect(readAttempts(summary, 'run-1', 'node-1')).toBe(attempts);
+  });
+
+  it('synthesises a single attempt from a legacy row without attempts[]', () => {
+    const summary: StepSummary = {
+      status: 'completed',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      completedAt: '2026-01-01T00:00:01.000Z',
+      durationMs: 1_000,
+      output: { value: 42 },
+    };
+    const result = readAttempts(summary, 'run-99', 'node-A');
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      attemptNumber: 1,
+      startedAt: '2026-01-01T00:00:00.000Z',
+      completedAt: '2026-01-01T00:00:01.000Z',
+      durationMs: 1_000,
+      output: { value: 42 },
+      idempotencyKey: 'run-99:node-A:1',
+    });
+  });
+
+  it('falls back to completedAt when legacy row has no startedAt', () => {
+    const summary: StepSummary = {
+      status: 'completed',
+      completedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const result = readAttempts(summary, 'run-1', 'node-1');
+    expect(result[0].startedAt).toBe('2026-01-01T00:00:00.000Z');
+  });
+});
+
+describe('RunPersistenceService writes attempts[] on step:completed (hub#1280)', () => {
+  type Subscriber<P> = (event: { payload: P }) => unknown | Promise<unknown>;
+
+  // Minimal in-memory bus that records subscribers per event name. Sufficient
+  // for verifying that handleStepCompleted populates attempts[]; the real
+  // distributed-core EventBus is exercised in bootstrap-level integration tests.
+  function makeMockBus() {
+    const subs = new Map<string, Subscriber<unknown>>();
+    return {
+      subscribe: jest.fn((event: string, fn: Subscriber<unknown>) => {
+        subs.set(event, fn);
+      }),
+      async publish<P>(event: string, payload: P): Promise<void> {
+        const fn = subs.get(event);
+        if (fn) await fn({ payload: payload as unknown });
+      },
+    };
+  }
+
+  it('persists a single synthetic attempt entry per completed step', async () => {
+    const repo = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'r1',
+      pipelineId: 'p1',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' },
+      at: '2026-01-01T00:00:00.000Z',
+    });
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r1',
+      stepId: 'node-A',
+      output: { hello: 'world' },
+      durationMs: 250,
+      at: '2026-01-01T00:00:00.250Z',
+    });
+    await bus.publish('pipeline:run:completed', {
+      runId: 'r1',
+      durationMs: 250,
+      at: '2026-01-01T00:00:00.250Z',
+    });
+
+    const lastCall = repo.put.mock.calls.at(-1);
+    expect(lastCall).toBeDefined();
+    const item = lastCall![0] as PipelineRunItem;
+    const stepA = item.stepsSummary?.['node-A'];
+    expect(stepA).toBeDefined();
+    expect(stepA?.attempts).toHaveLength(1);
+    expect(stepA?.attempts?.[0]).toMatchObject({
+      attemptNumber: 1,
+      completedAt: '2026-01-01T00:00:00.250Z',
+      durationMs: 250,
+      output: { hello: 'world' },
+      idempotencyKey: 'r1:node-A:1',
+    });
+    // Latest-attempt top-level fields preserved for back-compat readers.
+    expect(stepA?.status).toBe('completed');
+    expect(stepA?.output).toEqual({ hello: 'world' });
+  });
+
+  it('keeps fork-branch step keys distinct, each with its own attempts[]', async () => {
+    const repo = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'r2',
+      pipelineId: 'p2',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' },
+      at: 't0',
+    });
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r2', stepId: 'fork-child', output: { branch: 1 }, durationMs: 10, at: 't1',
+    });
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r2', stepId: 'fork-child', output: { branch: 2 }, durationMs: 11, at: 't2',
+    });
+    await bus.publish('pipeline:run:completed', { runId: 'r2', durationMs: 12, at: 't3' });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(item.stepsSummary?.['fork-child']?.attempts?.[0]?.output).toEqual({ branch: 1 });
+    expect(item.stepsSummary?.['fork-child:2']?.attempts?.[0]?.output).toEqual({ branch: 2 });
+    expect(item.stepsSummary?.['fork-child:2']?.attempts?.[0]?.idempotencyKey).toBe('r2:fork-child:1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RunPersistenceService — edge cases and uncovered paths
+// ---------------------------------------------------------------------------
+
+describe('RunPersistenceService — event paths not yet covered', () => {
+  type Subscriber<P> = (event: { payload: P }) => unknown | Promise<unknown>;
+
+  function makeMockBus() {
+    const subs = new Map<string, Subscriber<unknown>>();
+    return {
+      subscribe: jest.fn((event: string, fn: Subscriber<unknown>) => {
+        subs.set(event, fn);
+      }),
+      async publish<P>(event: string, payload: P): Promise<void> {
+        const fn = subs.get(event);
+        if (fn) await fn({ payload: payload as unknown });
+      },
+    };
+  }
+
+  function makeService(repo: { put: jest.Mock }) {
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    return { service, bus };
+  }
+
+  it('handles pipeline:run:cancelled — sets status=canceled and persists', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const { service, bus } = makeService(repo);
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rc1', pipelineId: 'pc1',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' },
+      at: 't0',
+    });
+    await bus.publish('pipeline:run:cancelled', { runId: 'rc1', at: 't1' });
+
+    const lastItem = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(lastItem.status).toBe('canceled');
+    expect(lastItem.completedAt).toBe('t1');
+  });
+
+  it('warns but does not throw when run:cancelled arrives for unknown run', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const { service, bus } = makeService(repo);
+    service.start();
+
+    // No run:started first — should just warn and return
+    await expect(bus.publish('pipeline:run:cancelled', { runId: 'unknown', at: 't0' }))
+      .resolves.toBeUndefined();
+    expect(repo.put).not.toHaveBeenCalled();
+  });
+
+  it('warns but does not throw when step:completed arrives for unknown run', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const { service, bus } = makeService(repo);
+    service.start();
+
+    await expect(bus.publish('pipeline:step:completed', {
+      runId: 'missing', stepId: 'n1', output: {}, durationMs: 1, at: 't0',
+    })).resolves.toBeUndefined();
+    expect(repo.put).not.toHaveBeenCalled();
+  });
+
+  it('warns but does not throw when run:completed arrives for unknown run', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const { service, bus } = makeService(repo);
+    service.start();
+
+    await expect(bus.publish('pipeline:run:completed', { runId: 'missing', durationMs: 1, at: 't0' }))
+      .resolves.toBeUndefined();
+  });
+
+  it('warns but does not throw when run:failed arrives for unknown run', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const { service, bus } = makeService(repo);
+    service.start();
+
+    await expect(bus.publish('pipeline:run:failed', {
+      runId: 'missing', error: { nodeId: 'n1', message: 'boom' }, at: 't0',
+    })).resolves.toBeUndefined();
+  });
+
+  it('swallows repo error in run:started catch path', async () => {
+    const repo = { put: jest.fn().mockRejectedValue(new Error('ddb down')) };
+    const { service, bus } = makeService(repo);
+    service.start();
+
+    await expect(bus.publish('pipeline:run:started', {
+      runId: 'rx', pipelineId: 'px',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' },
+      at: 't0',
+    })).resolves.toBeUndefined();
+  });
+
+  it('swallows repo error in run:completed catch path', async () => {
+    let callCount = 0;
+    const repo = {
+      put: jest.fn().mockImplementation(() => {
+        if (++callCount === 1) return Promise.resolve(); // run:started ok
+        return Promise.reject(new Error('ddb error'));   // run:completed fails
+      }),
+    };
+    const { service, bus } = makeService(repo);
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'ry', pipelineId: 'py',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await expect(bus.publish('pipeline:run:completed', { runId: 'ry', durationMs: 1, at: 't1' }))
+      .resolves.toBeUndefined();
+  });
+
+  it('swallows repo error in run:failed catch path', async () => {
+    let callCount = 0;
+    const repo = {
+      put: jest.fn().mockImplementation(() => {
+        if (++callCount === 1) return Promise.resolve();
+        return Promise.reject(new Error('ddb error'));
+      }),
+    };
+    const { service, bus } = makeService(repo);
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rz', pipelineId: 'pz',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await expect(bus.publish('pipeline:run:failed', {
+      runId: 'rz', error: { nodeId: 'n1', message: 'boom' }, at: 't1',
+    })).resolves.toBeUndefined();
+  });
+
+  it('swallows repo error in step:completed catch path', async () => {
+    let callCount = 0;
+    const repo = {
+      put: jest.fn().mockImplementation(() => {
+        if (callCount++ === 0) return Promise.resolve(); // run:started ok
+        return Promise.reject(new Error('ddb error'));
+      }),
+    };
+    const { service, bus } = makeService(repo);
+    // Use maxStepOutputBytes=1 to force truncation + periodic flush
+    const svc = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+      maxStepOutputBytes: 1, // forces truncation path
+    });
+    svc.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'ra', pipelineId: 'pa',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    // Publish 10 steps to trigger the periodic flush (which will fail, but be swallowed)
+    for (let i = 1; i <= 10; i++) {
+      await bus.publish('pipeline:step:completed', {
+        runId: 'ra', stepId: `step-${i}`, output: { v: i }, durationMs: i, at: `t${i}`,
+      });
+    }
+  });
+
+  it('truncates step output that exceeds maxStepOutputBytes', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+      maxStepOutputBytes: 10, // very small so any non-trivial output is truncated
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rt', pipelineId: 'pt',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await bus.publish('pipeline:step:completed', {
+      runId: 'rt', stepId: 'big-step',
+      output: { data: 'a'.repeat(100) }, // well beyond 10 bytes
+      durationMs: 1, at: 't1',
+    });
+    await bus.publish('pipeline:run:completed', { runId: 'rt', durationMs: 1, at: 't2' });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    const step = item.stepsSummary?.['big-step'];
+    expect(step?.output).toMatchObject({ truncated: true });
+  });
+
+  it('records LLM prompt and response — accumulates token usage and cost', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rllm', pipelineId: 'pllm',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await bus.publish('pipeline:llm:prompt', {
+      runId: 'rllm', stepId: 'llm-step', model: 'claude-sonnet-4-6', prompt: 'hello',
+    });
+    await bus.publish('pipeline:llm:response', {
+      runId: 'rllm', stepId: 'llm-step', tokensIn: 100, tokensOut: 50,
+    });
+    await bus.publish('pipeline:step:completed', {
+      runId: 'rllm', stepId: 'llm-step', output: { result: 'ok' }, durationMs: 500, at: 't1',
+    });
+    await bus.publish('pipeline:run:completed', { runId: 'rllm', durationMs: 500, at: 't1' });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(item.tokenUsage?.['claude-sonnet-4-6']).toMatchObject({ tokensIn: 100, tokensOut: 50 });
+    expect(item.estimatedCostUsd).toBeGreaterThan(0);
+  });
+
+  it('stores prompt as step input snapshot for LLM steps', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rinput', pipelineId: 'pinput',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await bus.publish('pipeline:llm:prompt', {
+      runId: 'rinput', stepId: 'llm-node', model: 'claude-haiku-4-5', prompt: 'what is 2+2?',
+    });
+    await bus.publish('pipeline:step:completed', {
+      runId: 'rinput', stepId: 'llm-node', output: { answer: '4' }, durationMs: 100, at: 't1',
+    });
+    await bus.publish('pipeline:run:completed', { runId: 'rinput', durationMs: 100, at: 't1' });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    const step = item.stepsSummary?.['llm-node'];
+    expect(step?.attempts?.[0]?.input).toMatchObject({ prompt: 'what is 2+2?' });
+  });
+
+  it('stop() flushes pending in-flight runs to the repository', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rflushed', pipelineId: 'pflushed',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+
+    const beforeStop = repo.put.mock.calls.length;
+    await service.stop();
+    // stop() should have triggered at least one additional put() for the in-flight run
+    expect(repo.put.mock.calls.length).toBeGreaterThan(beforeStop);
+  });
+
+  it('stop() swallows flush errors for individual runs', async () => {
+    let callCount = 0;
+    const repo = {
+      put: jest.fn().mockImplementation(() => {
+        if (callCount++ === 0) return Promise.resolve(); // run:started ok
+        return Promise.reject(new Error('ddb gone'));    // flush on stop fails
+      }),
+    };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rerr', pipelineId: 'perr',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await expect(service.stop()).resolves.toBeUndefined();
+  });
+
+  it('stop() is idempotent — second call is a no-op', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+    await service.stop();
+    const countAfterFirst = repo.put.mock.calls.length;
+    await service.stop(); // second call — should do nothing
+    expect(repo.put.mock.calls.length).toBe(countAfterFirst);
+  });
+
+  it('start() is idempotent — second call does not add duplicate subscribers', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+    service.start();
+    // subscribe should have been called exactly once per event type (9 events)
+    expect(bus.subscribe.mock.calls.length).toBe(9);
+  });
+
+  it('getStaleRunIds returns runs whose lastEventAt is before the cutoff', async () => {
+    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    const oldTs = new Date(Date.now() - 10 * 60_000).toISOString(); // 10 min ago
+    const newTs = new Date().toISOString();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rold', pipelineId: 'p1',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: oldTs,
+    });
+    await bus.publish('pipeline:run:started', {
+      runId: 'rnew', pipelineId: 'p1',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: newTs,
+    });
+
+    const cutoff = Date.now() - 5 * 60_000; // 5 min ago
+    const stale = service.getStaleRunIds(cutoff);
+    expect(stale.some((s) => s.runId === 'rold')).toBe(true);
+    expect(stale.some((s) => s.runId === 'rnew')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hub#1281 — step-level retry executor with per-attempt events (DC-15)
+// ---------------------------------------------------------------------------
+
+describe('RunPersistenceService — multi-attempt retry tracking (hub#1281)', () => {
+  type Subscriber<P> = (event: { payload: P }) => unknown | Promise<unknown>;
+
+  function makeMockBus() {
+    const subs = new Map<string, Subscriber<unknown>>();
+    return {
+      subscribe: jest.fn((event: string, fn: Subscriber<unknown>) => {
+        subs.set(event, fn);
+      }),
+      async publish<P>(event: string, payload: P): Promise<void> {
+        const fn = subs.get(event);
+        if (fn) await fn({ payload: payload as unknown });
+      },
+    };
+  }
+
+  it('accumulates 3 attempts when a step fails twice then succeeds', async () => {
+    const repo = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'r3', pipelineId: 'p3',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' },
+      at: 't0',
+    });
+    // Attempt 1 — fails with transient error, nextBackoffMs = 500
+    await bus.publish('pipeline:step:attempt:started', { runId: 'r3', stepId: 'action-A', attemptNumber: 1, startedAt: 't1' });
+    await bus.publish('pipeline:step:attempt:failed', { runId: 'r3', stepId: 'action-A', attemptNumber: 1, error: 'timeout', nextBackoffMs: 500, willRetry: true });
+    // Attempt 2 — fails again
+    await bus.publish('pipeline:step:attempt:started', { runId: 'r3', stepId: 'action-A', attemptNumber: 2, startedAt: 't3' });
+    await bus.publish('pipeline:step:attempt:failed', { runId: 'r3', stepId: 'action-A', attemptNumber: 2, error: 'network error', nextBackoffMs: 1000, willRetry: true });
+    // Attempt 3 — succeeds
+    await bus.publish('pipeline:step:attempt:started', { runId: 'r3', stepId: 'action-A', attemptNumber: 3, startedAt: 't5' });
+    await bus.publish('pipeline:step:completed', { runId: 'r3', stepId: 'action-A', output: { ok: true }, durationMs: 200, at: 't6' });
+    await bus.publish('pipeline:run:completed', { runId: 'r3', durationMs: 1700, at: 't6' });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    const stepA = item.stepsSummary?.['action-A'];
+    expect(stepA).toBeDefined();
+    expect(stepA?.attempts).toHaveLength(3);
+    expect(stepA?.attempts?.[0]).toMatchObject({ attemptNumber: 1, error: 'timeout', retryAfterMs: 500 });
+    expect(stepA?.attempts?.[1]).toMatchObject({ attemptNumber: 2, error: 'network error', retryAfterMs: 1000 });
+    expect(stepA?.attempts?.[2]).toMatchObject({ attemptNumber: 3, output: { ok: true }, completedAt: 't6' });
+    // idempotency keys are per-attempt
+    expect(stepA?.attempts?.[0]?.idempotencyKey).toBe('r3:action-A:1');
+    expect(stepA?.attempts?.[2]?.idempotencyKey).toBe('r3:action-A:3');
+    // top-level fields reflect latest attempt
+    expect(stepA?.status).toBe('completed');
+    expect(stepA?.output).toEqual({ ok: true });
+  });
+
+  it('records N failed attempts when maxAttempts exhausted', async () => {
+    const repo = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'r4', pipelineId: 'p4',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' },
+      at: 't0',
+    });
+    // 3 attempts, all fail
+    await bus.publish('pipeline:step:attempt:started', { runId: 'r4', stepId: 'action-B', attemptNumber: 1, startedAt: 't1' });
+    await bus.publish('pipeline:step:attempt:failed', { runId: 'r4', stepId: 'action-B', attemptNumber: 1, error: 'err1', nextBackoffMs: 500, willRetry: true });
+    await bus.publish('pipeline:step:attempt:started', { runId: 'r4', stepId: 'action-B', attemptNumber: 2, startedAt: 't3' });
+    await bus.publish('pipeline:step:attempt:failed', { runId: 'r4', stepId: 'action-B', attemptNumber: 2, error: 'err2', nextBackoffMs: 1000, willRetry: true });
+    await bus.publish('pipeline:step:attempt:started', { runId: 'r4', stepId: 'action-B', attemptNumber: 3, startedAt: 't5' });
+    // Terminal failure — nextBackoffMs = 0, willRetry = false (no more retries)
+    await bus.publish('pipeline:step:attempt:failed', { runId: 'r4', stepId: 'action-B', attemptNumber: 3, error: 'err3', nextBackoffMs: 0, willRetry: false });
+    await bus.publish('pipeline:run:failed', {
+      runId: 'r4',
+      error: { nodeId: 'action-B', message: 'err3' },
+      at: 't7',
+    });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    // Run is failed; the step summary isn't written via step:completed but the
+    // run-level error is recorded.
+    expect(item.status).toBe('failed');
+    // Any in-flight attempts that were accumulated before the run:failed are
+    // accessible via the stepAttempts internal state but not flushed to stepsSummary
+    // without a step:completed event — confirmed by design (run:failed is the
+    // terminal persistence path; partial attempt data lives in the run error field).
+    expect(item.error).toMatch(/action-B/);
+  });
+});

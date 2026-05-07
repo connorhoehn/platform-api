@@ -1,0 +1,25 @@
+{
+  "name": "websocket-gateway-documents",
+  "version": "1.0.0",
+  "description": "MCP server for collaborative document management — comments, reviews, action items",
+  "transport": "stdio",
+  "command": "node",
+  "args": ["src/mcp/document-mcp-server.js"],
+  "env": {
+    "API_BASE_URL": "http://localhost:3001/api",
+    "AUTH_TOKEN": ""
+  },
+  "tools": [
+    "document_list",
+    "document_get",
+    "document_get_comments",
+    "document_add_comment",
+    "document_get_reviews",
+    "document_submit_review",
+    "document_get_items",
+    "document_update_item",
+    "document_get_activity",
+    "my_pending_items",
+    "my_pending_reviews"
+  ]
+}

@@ -1,0 +1,181 @@
+// social-api/src/lib/__tests__/redis-client.test.ts
+//
+// Tests for getRedisClient: singleton connection, throttle behaviour,
+// error handling, and env-var-driven URL construction.
+//
+// The module holds three module-level singletons (client, connecting,
+// lastAttempt). We use jest.resetModules() + re-require in each test for
+// full isolation.
+
+const mockConnect = jest.fn().mockResolvedValue(undefined);
+const mockOn = jest.fn();
+const mockCreateClient = jest.fn();
+
+jest.mock('redis', () => ({
+  createClient: mockCreateClient,
+}));
+
+function makeMockClient(isReady = false) {
+  return {
+    isReady,
+    on: mockOn,
+    connect: mockConnect,
+  };
+}
+
+beforeEach(() => {
+  jest.resetModules();
+  jest.clearAllMocks();
+  // Default: createClient returns a client whose connect resolves
+  // and isReady flips to true after connect is awaited.
+  mockConnect.mockResolvedValue(undefined);
+  mockCreateClient.mockReturnValue(makeMockClient(false));
+});
+
+// ---------------------------------------------------------------------------
+// 1. Returns client when connect succeeds
+// ---------------------------------------------------------------------------
+
+test('returns client when connect succeeds', async () => {
+  const mockClient = makeMockClient(false);
+  mockCreateClient.mockReturnValue(mockClient);
+
+  const { getRedisClient } = require('../redis-client');
+  const result = await getRedisClient();
+
+  expect(result).toBe(mockClient);
+  expect(mockConnect).toHaveBeenCalledTimes(1);
+});
+
+// ---------------------------------------------------------------------------
+// 2. Returns null when connecting=true (concurrent calls)
+// ---------------------------------------------------------------------------
+
+test('returns null when a connection attempt is already in progress', async () => {
+  // Make connect never resolve so the first call stays "connecting"
+  let resolveConnect!: () => void;
+  const neverResolves = new Promise<void>((res) => { resolveConnect = res; });
+  mockConnect.mockReturnValue(neverResolves);
+
+  const mockClient = makeMockClient(false);
+  mockCreateClient.mockReturnValue(mockClient);
+
+  const { getRedisClient } = require('../redis-client');
+
+  // Fire first call — it sets connecting=true and then awaits connect
+  const first = getRedisClient();
+
+  // Second call arrives synchronously before connect resolves
+  const second = await getRedisClient();
+  expect(second).toBeNull();
+
+  // Clean up by letting the first promise settle
+  resolveConnect();
+  await first;
+});
+
+// ---------------------------------------------------------------------------
+// 3. Returns null within RETRY_INTERVAL_MS after a failed connect
+// ---------------------------------------------------------------------------
+
+test('returns null within RETRY_INTERVAL_MS after a failed connect', async () => {
+  mockConnect.mockRejectedValueOnce(new Error('connect failed'));
+
+  const { getRedisClient } = require('../redis-client');
+
+  // First call fails
+  const first = await getRedisClient();
+  expect(first).toBeNull();
+
+  // Immediate second call — lastAttempt was just set, retry interval not elapsed
+  const second = await getRedisClient();
+  expect(second).toBeNull();
+  expect(mockConnect).toHaveBeenCalledTimes(1); // no second attempt
+});
+
+// ---------------------------------------------------------------------------
+// 4. Returns existing client when isReady is true (no re-connect)
+// ---------------------------------------------------------------------------
+
+test('returns existing ready client without reconnecting', async () => {
+  const mockClient = makeMockClient(false);
+  mockCreateClient.mockReturnValue(mockClient);
+
+  const { getRedisClient } = require('../redis-client');
+
+  // First call — connects and stores client
+  const first = await getRedisClient();
+  expect(first).toBe(mockClient);
+
+  // Simulate client now being ready
+  mockClient.isReady = true;
+
+  // Second call — should short-circuit on isReady check
+  const second = await getRedisClient();
+  expect(second).toBe(mockClient);
+
+  // connect was only called once (on first attempt)
+  expect(mockConnect).toHaveBeenCalledTimes(1);
+});
+
+// ---------------------------------------------------------------------------
+// 5. Returns null when connect throws (catch path)
+// ---------------------------------------------------------------------------
+
+test('returns null when connect throws', async () => {
+  mockConnect.mockRejectedValue(new Error('ECONNREFUSED'));
+
+  const { getRedisClient } = require('../redis-client');
+  const result = await getRedisClient();
+
+  expect(result).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// 6. on('error', …) handler is registered
+// ---------------------------------------------------------------------------
+
+test('registers an error handler on the client', async () => {
+  const { getRedisClient } = require('../redis-client');
+  await getRedisClient();
+
+  expect(mockOn).toHaveBeenCalledWith('error', expect.any(Function));
+});
+
+// ---------------------------------------------------------------------------
+// 7. Uses REDIS_ENDPOINT env var in the URL
+// ---------------------------------------------------------------------------
+
+test('uses REDIS_ENDPOINT env var when building the Redis URL', async () => {
+  process.env.REDIS_ENDPOINT = 'my-redis-host';
+  delete process.env.REDIS_PORT;
+
+  jest.resetModules();
+
+  const { getRedisClient } = require('../redis-client');
+  await getRedisClient();
+
+  const [[callArg]] = mockCreateClient.mock.calls as [{ url: string }][];
+  expect(callArg.url).toContain('my-redis-host');
+
+  delete process.env.REDIS_ENDPOINT;
+});
+
+// ---------------------------------------------------------------------------
+// 8. Uses REDIS_PORT env var in the URL
+// ---------------------------------------------------------------------------
+
+test('uses REDIS_PORT env var when building the Redis URL', async () => {
+  delete process.env.REDIS_ENDPOINT;
+  process.env.REDIS_PORT = '6380';
+
+  jest.resetModules();
+
+  const { getRedisClient } = require('../redis-client');
+  await getRedisClient();
+
+  const [[callArg]] = mockCreateClient.mock.calls as [{ url: string }][];
+  expect(callArg.url).toContain('6380');
+
+  delete process.env.REDIS_PORT;
+});
