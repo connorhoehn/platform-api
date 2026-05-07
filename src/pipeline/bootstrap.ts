@@ -104,6 +104,7 @@ import { scanOrphanedRuns } from './scanOrphanedRuns';
 import { runWalPreflight } from './WalPreflight';
 import { createShutdown } from './ShutdownOrchestrator';
 import { withContext } from '../lib/logger';
+import { publishDurable } from '../lib/event-catalog';
 
 // ---------------------------------------------------------------------------
 // Test-mode helpers
@@ -725,6 +726,35 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   runQueueSubIds.push(eventBus.subscribe('pipeline:run:failed', async () => {
     runQueueMetrics.recordFailed();
   }));
+
+  // Publish pipeline lifecycle events through event-catalog for external consumers
+  eventBus.subscribe('pipeline:run:started', async (payload: unknown) => {
+    const data = payload as Record<string, unknown>;
+    void publishDurable('pipeline.run.started', {
+      runId: data.runId as string,
+      pipelineId: data.pipelineId as string,
+      triggeredBy: data.triggeredBy as string | undefined,
+      startedAt: data.at as string || new Date().toISOString(),
+    }).catch(err => console.warn('[pipeline] failed to publish run.started to catalog:', err));
+  });
+
+  eventBus.subscribe('pipeline:run:completed', async (payload: unknown) => {
+    const data = payload as Record<string, unknown>;
+    void publishDurable('pipeline.run.completed', {
+      runId: data.runId as string,
+      durationMs: data.durationMs as number | undefined,
+      completedAt: data.at as string || new Date().toISOString(),
+    }).catch(err => console.warn('[pipeline] failed to publish run.completed to catalog:', err));
+  });
+
+  eventBus.subscribe('pipeline:run:failed', async (payload: unknown) => {
+    const data = payload as Record<string, unknown>;
+    void publishDurable('pipeline.run.failed', {
+      runId: data.runId as string,
+      error: data.error as string | undefined,
+      failedAt: data.at as string || new Date().toISOString(),
+    }).catch(err => console.warn('[pipeline] failed to publish run.failed to catalog:', err));
+  });
 
   // Pipeline run persistence: when pipelineRunRepository is provided, use
   // RunPersistenceService to subscribe to pipeline events and persist full

@@ -312,6 +312,57 @@ catalog.declare({
   },
 });
 
+catalog.declare({
+  name: 'pipeline.run.started',
+  transport: 'durable',
+  producer: 'platform-api',
+  description: 'A pipeline run was started',
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      pipelineId: { type: 'string' },
+      triggeredBy: { type: 'string' },
+      startedAt: { type: 'string' },
+    },
+    required: ['runId', 'pipelineId'],
+  },
+});
+
+catalog.declare({
+  name: 'pipeline.run.completed',
+  transport: 'durable',
+  producer: 'platform-api',
+  description: 'A pipeline run completed successfully',
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      pipelineId: { type: 'string' },
+      durationMs: { type: 'number' },
+      completedAt: { type: 'string' },
+    },
+    required: ['runId'],
+  },
+});
+
+catalog.declare({
+  name: 'pipeline.run.failed',
+  transport: 'durable',
+  producer: 'platform-api',
+  description: 'A pipeline run failed',
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      pipelineId: { type: 'string' },
+      error: { type: 'string' },
+      failedAt: { type: 'string' },
+    },
+    required: ['runId'],
+  },
+});
+
 // ---------------------------------------------------------------------------
 // Gateway-compatible Redis broadcast client
 // ---------------------------------------------------------------------------
