@@ -1,19 +1,14 @@
 # syntax=docker/dockerfile:1
 # platform-api — standalone application platform service.
-# Build context is the PARENT directory (~/projects) so both platform-api/
-# and distributed-core/ are available. distributed-core dist/ is included
-# pre-built so we skip its build script during npm ci.
+# Dependencies (distributed-core, event-catalog) are fetched from GitHub
+# during npm install — no sibling directory COPY needed.
 
 # Stage 1: Build TypeScript
 FROM node:20-alpine AS build
 RUN apk add --no-cache git openssh-client python3 make g++
 WORKDIR /app
-COPY distributed-core/ /distributed-core/
-RUN cd /distributed-core && sed -i '/"build"/d; /"prepare"/d' package.json && npm ci --ignore-scripts
-COPY event-catalog/ /event-catalog/
-RUN cd /event-catalog && npm install --ignore-scripts --omit=dev 2>/dev/null || true
 COPY platform-api/package*.json ./
-RUN npm config set strict-ssl false && npm ci
+RUN npm config set strict-ssl false && npm install
 COPY platform-api/tsconfig.json platform-api/tsconfig.build.json ./
 COPY platform-api/src/ ./src/
 RUN npx tsc --project tsconfig.build.json; test -f dist/index.js
@@ -24,12 +19,8 @@ RUN apk add --no-cache curl git openssh-client python3 make g++ ripgrep
 RUN npm install -g @anthropic-ai/claude-code
 RUN addgroup -g 1001 -S nodejs && adduser -S platformapi -u 1001 -G nodejs
 WORKDIR /app
-COPY distributed-core/ /distributed-core/
-RUN cd /distributed-core && sed -i '/"build"/d; /"prepare"/d' package.json && npm ci --omit=dev --ignore-scripts
-COPY event-catalog/ /event-catalog/
-RUN cd /event-catalog && npm install --ignore-scripts --omit=dev 2>/dev/null || true
 COPY platform-api/package*.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
-RUN npm config set strict-ssl false && npm ci --omit=dev
+RUN npm config set strict-ssl false && npm install --omit=dev
 COPY --from=build /app/dist ./dist/
 COPY platform-api/src/ ./src/
 RUN chown -R platformapi:nodejs /app
