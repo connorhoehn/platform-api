@@ -6,7 +6,8 @@
 # Stage 1: Build TypeScript
 FROM node:20-alpine AS build
 RUN apk add --no-cache git openssh-client python3 make g++
-RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan -p 443 ssh.github.com >> ~/.ssh/known_hosts \
+    && printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  User git\n' > ~/.ssh/config
 WORKDIR /app
 COPY platform-api/package*.json ./
 RUN --mount=type=ssh npm config set strict-ssl false && npm install
@@ -19,7 +20,8 @@ FROM node:20-alpine
 RUN apk add --no-cache curl git openssh-client python3 make g++ ripgrep
 RUN npm install -g @anthropic-ai/claude-code
 RUN addgroup -g 1001 -S nodejs && adduser -S platformapi -u 1001 -G nodejs
-RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan -p 443 ssh.github.com >> ~/.ssh/known_hosts \
+    && printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  User git\n' > ~/.ssh/config
 WORKDIR /app
 COPY platform-api/package*.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
 RUN --mount=type=ssh npm config set strict-ssl false && npm install --omit=dev
