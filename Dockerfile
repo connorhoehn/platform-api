@@ -10,6 +10,8 @@ RUN apk add --no-cache git openssh-client python3 make g++
 WORKDIR /app
 COPY distributed-core/ /distributed-core/
 RUN cd /distributed-core && sed -i '/"build"/d; /"prepare"/d' package.json && npm ci --ignore-scripts
+COPY event-catalog/ /event-catalog/
+RUN cd /event-catalog && sed -i '/"build"/d; /"prepare"/d' package.json && npm ci --ignore-scripts
 COPY platform-api/package*.json ./
 RUN npm config set strict-ssl false && npm ci
 COPY platform-api/tsconfig.json platform-api/tsconfig.build.json ./
@@ -24,6 +26,8 @@ RUN addgroup -g 1001 -S nodejs && adduser -S platformapi -u 1001 -G nodejs
 WORKDIR /app
 COPY distributed-core/ /distributed-core/
 RUN cd /distributed-core && sed -i '/"build"/d; /"prepare"/d' package.json && npm ci --omit=dev --ignore-scripts
+COPY event-catalog/ /event-catalog/
+RUN cd /event-catalog && sed -i '/"build"/d; /"prepare"/d' package.json && npm ci --omit=dev --ignore-scripts
 COPY platform-api/package*.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
 RUN npm config set strict-ssl false && npm ci --omit=dev
 COPY --from=build /app/dist ./dist/
