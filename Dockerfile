@@ -1,14 +1,15 @@
 # syntax=docker/dockerfile:1
 # platform-api — standalone application platform service.
 # Dependencies (distributed-core, event-catalog) are fetched from GitHub
-# during npm install — no sibling directory COPY needed.
+# during npm install. Private repos require SSH agent forwarding via BuildKit.
 
 # Stage 1: Build TypeScript
 FROM node:20-alpine AS build
 RUN apk add --no-cache git openssh-client python3 make g++
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
 WORKDIR /app
 COPY platform-api/package*.json ./
-RUN npm config set strict-ssl false && npm install
+RUN --mount=type=ssh npm config set strict-ssl false && npm install
 COPY platform-api/tsconfig.json platform-api/tsconfig.build.json ./
 COPY platform-api/src/ ./src/
 RUN npx tsc --project tsconfig.build.json; test -f dist/index.js
@@ -18,9 +19,10 @@ FROM node:20-alpine
 RUN apk add --no-cache curl git openssh-client python3 make g++ ripgrep
 RUN npm install -g @anthropic-ai/claude-code
 RUN addgroup -g 1001 -S nodejs && adduser -S platformapi -u 1001 -G nodejs
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
 WORKDIR /app
 COPY platform-api/package*.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
-RUN npm config set strict-ssl false && npm install --omit=dev
+RUN --mount=type=ssh npm config set strict-ssl false && npm install --omit=dev
 COPY --from=build /app/dist ./dist/
 COPY platform-api/src/ ./src/
 RUN chown -R platformapi:nodejs /app
