@@ -17,6 +17,7 @@ import log from './lib/logger';
 import { CatalogIngestEventBus } from './ingest/catalog-event-bus';
 import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
+import { RetryManager } from 'distributed-core/dist/transport/RetryManager';
 import { connectCatalog, disconnectCatalog } from './lib/event-catalog';
 import { startOutboxDrainer } from './services/outbox-drainer';
 
@@ -36,24 +37,50 @@ const server = app.listen(Number(port), () => {
 // Event catalog — connects to Redis + message-queue so domain events can be
 // published to the catalog. Non-fatal: if connection fails the catalog client
 // degrades gracefully (events simply won't publish).
+// The outbox drainer starts unconditionally — it drains from DynamoDB which is
+// independent of the catalog connection.
 // ---------------------------------------------------------------------------
 
-let drainer: { stop: () => void } | null = null;
+const drainer = startOutboxDrainer();
+log.info('outbox-drainer started');
+
+const catalogRetry = new RetryManager({
+  maxRetries: 2,
+  baseDelay: 2000,
+  backoffFactor: 2,
+  jitter: false,
+  enableLogging: false,
+  name: 'catalog-connect',
+});
 
 (async () => {
   try {
-    await connectCatalog();
+    await catalogRetry.execute(() => connectCatalog());
     log.info('event-catalog connected');
-    drainer = startOutboxDrainer();
-    log.info('outbox-drainer started');
   } catch (err: unknown) {
     const e = err as { message?: string };
     log.warn(
       { errMessage: e?.message },
-      'event-catalog connect failed — events will not publish',
+      'event-catalog connect failed after retries — scheduling background reconnect',
     );
+    backgroundCatalogReconnect();
   }
 })();
+
+function backgroundCatalogReconnect(): void {
+  const attempt = (delay: number): void => {
+    setTimeout(() => {
+      connectCatalog()
+        .then(() => log.info('event-catalog connected (background retry)'))
+        .catch(() => {
+          const nextDelay = Math.min(delay * 2, 60_000);
+          log.warn({ nextDelayMs: nextDelay }, 'event-catalog background reconnect failed, retrying');
+          attempt(nextDelay);
+        });
+    }, delay);
+  };
+  attempt(5_000);
+}
 
 // ---------------------------------------------------------------------------
 // Phase-4: bootstrap distributed-core's PipelineModule and wire its surfaces
@@ -216,9 +243,7 @@ async function shutdown(signal: string): Promise<void> {
       log.error({ err }, 'ingest shutdown failed');
     }
   }
-  if (drainer) {
-    drainer.stop();
-  }
+  drainer.stop();
   try { await disconnectCatalog(); } catch (err) {
     log.error({ err }, 'event-catalog disconnect failed');
   }
