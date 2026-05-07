@@ -4,7 +4,8 @@ import {
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { Router, Request, Response } from 'express';
-import { docClient, publishSocialEvent } from '../lib/aws-clients';
+import { docClient } from '../lib/aws-clients';
+import { publishDurable } from '../lib/event-catalog';
 import { publishWithOutbox } from '../services/outbox-publisher';
 import { profileRepo } from '../repositories';
 import {
@@ -88,8 +89,8 @@ socialRouter.delete('/follow/:userId', asyncHandler(async (req: Request, res: Re
   );
 
   res.status(200).json({ message: 'Unfollowed successfully' });
-  // Publish social.unfollow event to EventBridge (log-and-continue)
-  void publishSocialEvent('social.unfollow', {
+  // Publish social.unfollow event via durable transport (log-and-continue)
+  void publishDurable('social.unfollow', {
     followerId,
     followeeId,
   });

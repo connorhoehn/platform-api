@@ -12,7 +12,8 @@ import {
   DeleteCommand,
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { docClient, publishSocialEvent } from '../lib/aws-clients';
+import { docClient } from '../lib/aws-clients';
+import { publishDurable } from '../lib/event-catalog';
 import { broadcastToRoom } from './room-broadcaster';
 import {
   ValidationError,
@@ -96,7 +97,7 @@ export async function createComment(
     createdAt: now,
   });
 
-  void publishSocialEvent('social.comment.created', {
+  void publishDurable('social.comment.created', {
     roomId,
     postId,
     commentId,

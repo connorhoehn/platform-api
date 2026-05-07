@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { sectionItemRepo } from '../repositories';
-import { broadcastService } from '../services/broadcast';
+import { publishSignal } from '../lib/event-catalog';
 import {
   asyncHandler,
   ValidationError,
@@ -34,7 +34,7 @@ sectionItemsRouter.post('/', requireAuth, asyncHandler(async (req: Request, res:
   });
 
   // Broadcast real-time event (non-fatal)
-  void broadcastService.emit(`doc:${documentId}`, 'social:post' as any, {
+  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:item:created',
     documentId,
     sectionId,
@@ -78,7 +78,7 @@ sectionItemsRouter.patch('/:itemId', requireAuth, asyncHandler(async (req: Reque
   const result = await sectionItemRepo.updateItemFields(documentId, sectionId, itemId, updates);
 
   // Broadcast real-time event (non-fatal)
-  void broadcastService.emit(`doc:${documentId}`, 'social:post' as any, {
+  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:item:updated',
     documentId,
     sectionId,
@@ -96,7 +96,7 @@ sectionItemsRouter.delete('/:itemId', requireAuth, asyncHandler(async (req: Requ
   await sectionItemRepo.deleteItemById(documentId, sectionId, itemId);
 
   // Broadcast real-time event (non-fatal)
-  void broadcastService.emit(`doc:${documentId}`, 'social:post' as any, {
+  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:item:deleted',
     documentId,
     sectionId,
@@ -120,7 +120,7 @@ sectionItemsRouter.post('/:itemId/ack', requireAuth, asyncHandler(async (req: Re
   );
 
   // Broadcast real-time event (non-fatal)
-  void broadcastService.emit(`doc:${documentId}`, 'social:post' as any, {
+  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:item:acked',
     documentId,
     sectionId,

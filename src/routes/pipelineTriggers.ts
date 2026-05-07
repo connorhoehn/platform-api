@@ -266,7 +266,7 @@ pipelineTriggersRouter.post(
               Promise.resolve(
                 bridge!.trigger!({
                   pipelineId,
-                  definition: body.definition,
+                  definition: resolvedDefinition,
                   triggerPayload: body.triggerPayload,
                   triggeredBy: { userId },
                   breakpoints: body.breakpoints,

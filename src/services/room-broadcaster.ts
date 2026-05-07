@@ -19,11 +19,9 @@
  * No-ops silently if the room can't be found — matches existing behavior
  * (routes do not return 404 when broadcast fan-out fails to locate the room).
  */
-import { broadcastService } from './broadcast';
+import { publishSignal } from '../lib/event-catalog';
 import { getCachedRoom, setCachedRoom } from '../lib/cache';
 import { roomRepo } from '../repositories';
-
-type SocialEventType = Parameters<typeof broadcastService.emit>[1];
 
 interface RoomForBroadcast {
   channelId: string;
@@ -39,7 +37,7 @@ interface RoomForBroadcast {
  */
 export async function broadcastToRoom(
   roomId: string,
-  eventType: SocialEventType,
+  eventType: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
   let roomData = await getCachedRoom<RoomForBroadcast>(roomId);
@@ -51,6 +49,6 @@ export async function broadcastToRoom(
     }
   }
   if (roomData) {
-    void broadcastService.emit(roomData.channelId, eventType, payload);
+    void publishSignal(roomData.channelId, eventType, payload);
   }
 }

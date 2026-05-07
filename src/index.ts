@@ -14,9 +14,11 @@ import { PipelineRunRepository } from './repositories/PipelineRunRepository';
 import { DLQRepository } from './repositories/DLQRepository';
 import { docClient } from './lib/aws-clients';
 import log from './lib/logger';
-import { RedisIngestEventBus } from './ingest/redis-event-bus';
+import { CatalogIngestEventBus } from './ingest/catalog-event-bus';
 import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
+import { connectCatalog, disconnectCatalog } from './lib/event-catalog';
+import { startOutboxDrainer } from './services/outbox-drainer';
 
 const port = process.env.PORT ?? '3001';
 
@@ -29,6 +31,29 @@ const app = createApp();
 const server = app.listen(Number(port), () => {
   log.info({ port }, 'platform-api listening');
 });
+
+// ---------------------------------------------------------------------------
+// Event catalog — connects to Redis + message-queue so domain events can be
+// published to the catalog. Non-fatal: if connection fails the catalog client
+// degrades gracefully (events simply won't publish).
+// ---------------------------------------------------------------------------
+
+let drainer: { stop: () => void } | null = null;
+
+(async () => {
+  try {
+    await connectCatalog();
+    log.info('event-catalog connected');
+    drainer = startOutboxDrainer();
+    log.info('outbox-drainer started');
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    log.warn(
+      { errMessage: e?.message },
+      'event-catalog connect failed — events will not publish',
+    );
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // Phase-4: bootstrap distributed-core's PipelineModule and wire its surfaces
@@ -79,9 +104,10 @@ bootstrapPipeline({ pipelineRunRepository, dlqRepository })
   });
 
 // ---------------------------------------------------------------------------
-// Ingest engine bootstrap — wires IngestEngine with Redis-backed event bus so
-// progress events flow to the gateway via Redis pub/sub (decoupled from
-// gateway process). Non-fatal: routes return 503 if engine isn't available.
+// Ingest engine bootstrap — wires IngestEngine with catalog-backed event bus
+// so progress events flow to the gateway via event-catalog's signal transport
+// (Redis pub/sub under the hood). Non-fatal: routes return 503 if engine
+// isn't available.
 // ---------------------------------------------------------------------------
 
 let ingestShutdown: (() => Promise<void>) | null = null;
@@ -91,8 +117,7 @@ let ingestShutdown: (() => Promise<void>) | null = null;
     const { ingestSourceRepo, ingestItemRepo, syncCursorRepo } = await import('./ingest/repositories');
     const { typedDocumentRepo } = await import('./repositories');
 
-    const eventBus = new RedisIngestEventBus({ logger: log });
-    await eventBus.connect();
+    const eventBus = new CatalogIngestEventBus();
 
     const engine = new IngestEngine({
       sourceRepository: ingestSourceRepo,
@@ -107,10 +132,9 @@ let ingestShutdown: (() => Promise<void>) | null = null;
 
     ingestShutdown = async () => {
       await engine.stop();
-      await eventBus.disconnect();
     };
 
-    log.info('IngestEngine bootstrapped (Redis event bus)');
+    log.info('IngestEngine bootstrapped (catalog event bus)');
   } catch (err: unknown) {
     const e = err as { message?: string };
     log.error(
@@ -191,6 +215,12 @@ async function shutdown(signal: string): Promise<void> {
     try { await ingestShutdown(); } catch (err) {
       log.error({ err }, 'ingest shutdown failed');
     }
+  }
+  if (drainer) {
+    drainer.stop();
+  }
+  try { await disconnectCatalog(); } catch (err) {
+    log.error({ err }, 'event-catalog disconnect failed');
   }
   try { await tracingShutdown(); } catch (err) {
     log.error({ err }, 'tracing shutdown failed');

@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth';
-import { broadcastService } from '../services/broadcast';
+import { publishSignal } from '../lib/event-catalog';
 import { documentCommentRepo } from '../repositories';
 import {
   asyncHandler,
@@ -41,7 +41,7 @@ documentCommentsRouter.post('/:documentId/comments', requireAuth, asyncHandler(a
   });
 
   // Broadcast doc:comment_added to document channel (non-fatal if Redis unavailable)
-  void broadcastService.emit(`doc-comments:${documentId}`, 'doc:comment_added', {
+  void publishSignal(`doc-comments:${documentId}`, 'doc:comment_added', {
     documentId,
     comment,
   });
@@ -83,7 +83,7 @@ documentCommentsRouter.patch('/:documentId/comments/:commentId', requireAuth, as
   }
 
   // Broadcast resolve/unresolve event (non-fatal if Redis unavailable)
-  void broadcastService.emit(`doc-comments:${documentId}`, 'doc:comment_resolved', {
+  void publishSignal(`doc-comments:${documentId}`, 'doc:comment_resolved', {
     documentId,
     commentId,
     resolved,
@@ -107,7 +107,7 @@ documentCommentsRouter.delete('/:documentId/comments/:commentId', requireAuth, a
   await documentCommentRepo.deleteComment(documentId, commentId);
 
   // Broadcast delete event (non-fatal if Redis unavailable)
-  void broadcastService.emit(`doc-comments:${documentId}`, 'doc:comment_deleted', {
+  void publishSignal(`doc-comments:${documentId}`, 'doc:comment_deleted', {
     documentId,
     commentId,
   });

@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { sectionReviewRepo, profileRepo } from '../repositories';
-import { broadcastService } from '../services/broadcast';
+import { publishSignal } from '../lib/event-catalog';
 import {
   asyncHandler,
   ValidationError,
@@ -38,7 +38,7 @@ sectionReviewsRouter.post('/', requireAuth, asyncHandler(async (req: Request, re
   });
 
   // Broadcast real-time event (non-fatal)
-  void broadcastService.emit(`doc:${documentId}`, 'social:post' as any, {
+  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:review',
     documentId,
     sectionId,

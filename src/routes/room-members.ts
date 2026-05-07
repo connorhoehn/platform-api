@@ -1,7 +1,6 @@
 import { ulid } from 'ulid';
 import { Router, Request, Response } from 'express';
-import { broadcastService } from '../services/broadcast';
-import { publishSocialEvent } from '../lib/aws-clients';
+import { publishSignal, publishDurable } from '../lib/event-catalog';
 import { getCachedRoom, setCachedRoom } from '../lib/cache';
 import { roomRepo } from '../repositories';
 import type { RoomItem, RoomMemberItem } from '../repositories';
@@ -56,7 +55,7 @@ roomMembersRouter.post('/join', asyncHandler(async (req: Request, res: Response)
 
   // Broadcast social:member_joined to room channel (non-fatal if Redis unavailable)
   // We already have roomItem in hand from the membership check — avoid another cache lookup
-  void broadcastService.emit(roomItem.channelId, 'social:member_joined', {
+  void publishSignal(roomItem.channelId, 'social:member_joined', {
     roomId: req.params.roomId, userId: req.user!.sub, joinedAt: now,
   });
   // No publishSocialEvent — outbox record handles delivery
@@ -87,11 +86,11 @@ roomMembersRouter.delete('/leave', asyncHandler(async (req: Request, res: Respon
   res.status(200).json({ roomId: req.params.roomId, userId: req.user!.sub, left: true });
 
   // Broadcast social:member_left to room channel (non-fatal if Redis unavailable)
-  void broadcastService.emit(roomItem.channelId, 'social:member_left', {
+  void publishSignal(roomItem.channelId, 'social:member_left', {
     roomId: req.params.roomId, userId: req.user!.sub, leftAt: new Date().toISOString(),
   });
-  // Publish social.room.leave event to EventBridge (log-and-continue)
-  void publishSocialEvent('social.room.leave', {
+  // Publish social.room.leave event via durable transport (log-and-continue)
+  void publishDurable('social.room.leave', {
     roomId: req.params.roomId,
     userId: req.user!.sub,
   });

@@ -4,7 +4,6 @@
  * Used by:
  * - Cache layer (profile, room, group lookups)
  * - Health check endpoint
- * - BroadcastService (via its own private client — not shared here)
  *
  * Connection is lazy: getRedisClient() connects on first call and
  * reuses the connection thereafter. If Redis is down, callers get null
