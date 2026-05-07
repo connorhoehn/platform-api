@@ -103,7 +103,7 @@ import { StuckRunDetector } from './StuckRunDetector';
 import { scanOrphanedRuns } from './scanOrphanedRuns';
 import { runWalPreflight } from './WalPreflight';
 import { createShutdown } from './ShutdownOrchestrator';
-import { withContext } from '../lib/logger';
+import log, { withContext } from '../lib/logger';
 import { publishDurable } from '../lib/event-catalog';
 
 // ---------------------------------------------------------------------------
@@ -730,30 +730,36 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // Publish pipeline lifecycle events through event-catalog for external consumers
   eventBus.subscribe('pipeline:run:started', async (payload: unknown) => {
     const data = payload as Record<string, unknown>;
-    void publishDurable('pipeline.run.started', {
+    publishDurable('pipeline.run.started', {
       runId: data.runId as string,
       pipelineId: data.pipelineId as string,
       triggeredBy: data.triggeredBy as string | undefined,
       startedAt: data.at as string || new Date().toISOString(),
-    }).catch(err => console.warn('[pipeline] failed to publish run.started to catalog:', err));
+    }).catch((err: unknown) => {
+      log.error({ event: 'pipeline.run.started', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
+    });
   });
 
   eventBus.subscribe('pipeline:run:completed', async (payload: unknown) => {
     const data = payload as Record<string, unknown>;
-    void publishDurable('pipeline.run.completed', {
+    publishDurable('pipeline.run.completed', {
       runId: data.runId as string,
       durationMs: data.durationMs as number | undefined,
       completedAt: data.at as string || new Date().toISOString(),
-    }).catch(err => console.warn('[pipeline] failed to publish run.completed to catalog:', err));
+    }).catch((err: unknown) => {
+      log.error({ event: 'pipeline.run.completed', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
+    });
   });
 
   eventBus.subscribe('pipeline:run:failed', async (payload: unknown) => {
     const data = payload as Record<string, unknown>;
-    void publishDurable('pipeline.run.failed', {
+    publishDurable('pipeline.run.failed', {
       runId: data.runId as string,
       error: data.error as string | undefined,
       failedAt: data.at as string || new Date().toISOString(),
-    }).catch(err => console.warn('[pipeline] failed to publish run.failed to catalog:', err));
+    }).catch((err: unknown) => {
+      log.error({ event: 'pipeline.run.failed', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
+    });
   });
 
   // Pipeline run persistence: when pipelineRunRepository is provided, use

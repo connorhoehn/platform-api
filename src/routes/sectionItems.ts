@@ -6,6 +6,7 @@ import {
   asyncHandler,
   ValidationError,
 } from '../middleware/error-handler';
+import log from '../lib/logger';
 
 export const sectionItemsRouter = Router({ mergeParams: true });
 export const myItemsRouter = Router();
@@ -33,12 +34,13 @@ sectionItemsRouter.post('/', requireAuth, asyncHandler(async (req: Request, res:
     ...(category ? { category } : {}),
   });
 
-  // Broadcast real-time event (non-fatal)
-  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
+  publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:item:created',
     documentId,
     sectionId,
     item,
+  }).catch((err: unknown) => {
+    log.error({ event: 'doc:section_updated', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
 
   res.status(201).json({ item });
@@ -77,13 +79,14 @@ sectionItemsRouter.patch('/:itemId', requireAuth, asyncHandler(async (req: Reque
 
   const result = await sectionItemRepo.updateItemFields(documentId, sectionId, itemId, updates);
 
-  // Broadcast real-time event (non-fatal)
-  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
+  publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:item:updated',
     documentId,
     sectionId,
     itemId,
     updates,
+  }).catch((err: unknown) => {
+    log.error({ event: 'doc:section_updated', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
 
   res.status(200).json({ item: result });
@@ -95,12 +98,13 @@ sectionItemsRouter.delete('/:itemId', requireAuth, asyncHandler(async (req: Requ
 
   await sectionItemRepo.deleteItemById(documentId, sectionId, itemId);
 
-  // Broadcast real-time event (non-fatal)
-  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
+  publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:item:deleted',
     documentId,
     sectionId,
     itemId,
+  }).catch((err: unknown) => {
+    log.error({ event: 'doc:section_updated', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
 
   res.status(204).send();
@@ -119,13 +123,14 @@ sectionItemsRouter.post('/:itemId/ack', requireAuth, asyncHandler(async (req: Re
     new Date().toISOString(),
   );
 
-  // Broadcast real-time event (non-fatal)
-  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
+  publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:item:acked',
     documentId,
     sectionId,
     itemId,
     ackedBy: userId,
+  }).catch((err: unknown) => {
+    log.error({ event: 'doc:section_updated', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
 
   res.status(200).json({ item: result });

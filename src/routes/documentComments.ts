@@ -6,6 +6,7 @@ import {
   asyncHandler,
   ValidationError,
 } from '../middleware/error-handler';
+import log from '../lib/logger';
 
 // documentCommentsRouter is mounted at /documents — mergeParams:true exposes :documentId
 export const documentCommentsRouter = Router({ mergeParams: true });
@@ -40,10 +41,11 @@ documentCommentsRouter.post('/:documentId/comments', requireAuth, asyncHandler(a
     ...(parentCommentId ? { parentCommentId } : {}),
   });
 
-  // Broadcast doc:comment_added to document channel (non-fatal if Redis unavailable)
-  void publishSignal(`doc-comments:${documentId}`, 'doc:comment_added', {
+  publishSignal(`doc-comments:${documentId}`, 'doc:comment_added', {
     documentId,
     comment,
+  }).catch((err: unknown) => {
+    log.error({ event: 'doc:comment_added', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
 
   res.status(201).json({ comment });
@@ -82,12 +84,13 @@ documentCommentsRouter.patch('/:documentId/comments/:commentId', requireAuth, as
     await documentCommentRepo.unresolveThread(documentId, commentId);
   }
 
-  // Broadcast resolve/unresolve event (non-fatal if Redis unavailable)
-  void publishSignal(`doc-comments:${documentId}`, 'doc:comment_resolved', {
+  publishSignal(`doc-comments:${documentId}`, 'doc:comment_resolved', {
     documentId,
     commentId,
     resolved,
     ...(resolved ? { resolvedBy: userId, resolvedAt: now } : {}),
+  }).catch((err: unknown) => {
+    log.error({ event: 'doc:comment_resolved', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
 
   res.status(200).json({
@@ -106,10 +109,11 @@ documentCommentsRouter.delete('/:documentId/comments/:commentId', requireAuth, a
 
   await documentCommentRepo.deleteComment(documentId, commentId);
 
-  // Broadcast delete event (non-fatal if Redis unavailable)
-  void publishSignal(`doc-comments:${documentId}`, 'doc:comment_deleted', {
+  publishSignal(`doc-comments:${documentId}`, 'doc:comment_deleted', {
     documentId,
     commentId,
+  }).catch((err: unknown) => {
+    log.error({ event: 'doc:comment_deleted', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
 
   res.status(204).send();

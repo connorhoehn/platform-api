@@ -21,6 +21,7 @@ import {
   ForbiddenError,
 } from '../middleware/error-handler';
 import { tableName } from '../lib/ddb-table-name';
+import log from '../lib/logger';
 
 const COMMENTS_TABLE = tableName('social-comments');
 const POSTS_TABLE = tableName('social-posts');
@@ -97,11 +98,13 @@ export async function createComment(
     createdAt: now,
   });
 
-  void publishDurable('social.comment.created', {
+  publishDurable('social.comment.created', {
     roomId,
     postId,
     commentId,
     authorId,
+  }).catch((err: unknown) => {
+    log.error({ event: 'social.comment.created', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
   });
 
   return item;

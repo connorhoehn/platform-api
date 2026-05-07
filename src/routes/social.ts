@@ -13,6 +13,7 @@ import {
   ValidationError,
   NotFoundError,
 } from '../middleware/error-handler';
+import log from '../lib/logger';
 import { tableName } from '../lib/ddb-table-name';
 const REL_TABLE = tableName('social-relationships');
 
@@ -89,10 +90,11 @@ socialRouter.delete('/follow/:userId', asyncHandler(async (req: Request, res: Re
   );
 
   res.status(200).json({ message: 'Unfollowed successfully' });
-  // Publish social.unfollow event via durable transport (log-and-continue)
-  void publishDurable('social.unfollow', {
+  publishDurable('social.unfollow', {
     followerId,
     followeeId,
+  }).catch((err: unknown) => {
+    log.error({ event: 'social.unfollow', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
   });
 }));
 

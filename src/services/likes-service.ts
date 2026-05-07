@@ -22,6 +22,7 @@ import {
   ConflictError,
 } from '../middleware/error-handler';
 import { tableName } from '../lib/ddb-table-name';
+import log from '../lib/logger';
 
 const LIKES_TABLE = tableName('social-likes');
 const POSTS_TABLE = tableName('social-posts');
@@ -106,11 +107,13 @@ export async function likePost(
     targetId, userId, postId, action: 'liked', createdAt,
   });
 
-  void publishDurable('social.like', {
+  publishDurable('social.like', {
     targetId,
     userId,
     roomId,
     postId,
+  }).catch((err: unknown) => {
+    log.error({ event: 'social.like', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
   });
 
   return { targetId, userId, type: 'like', createdAt };
@@ -177,11 +180,13 @@ export async function likeComment(
     targetId, userId, postId, commentId, action: 'liked', createdAt,
   });
 
-  void publishDurable('social.like', {
+  publishDurable('social.like', {
     targetId,
     userId,
     roomId,
     commentId,
+  }).catch((err: unknown) => {
+    log.error({ event: 'social.like', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
   });
 
   return { targetId, userId, type: 'like', createdAt };

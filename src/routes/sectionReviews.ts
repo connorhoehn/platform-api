@@ -6,6 +6,7 @@ import {
   asyncHandler,
   ValidationError,
 } from '../middleware/error-handler';
+import log from '../lib/logger';
 
 export const sectionReviewsRouter = Router({ mergeParams: true });
 export const myReviewsRouter = Router();
@@ -37,12 +38,13 @@ sectionReviewsRouter.post('/', requireAuth, asyncHandler(async (req: Request, re
     ...(comment !== undefined && { comment }),
   });
 
-  // Broadcast real-time event (non-fatal)
-  void publishSignal(`doc:${documentId}`, 'doc:section_updated', {
+  publishSignal(`doc:${documentId}`, 'doc:section_updated', {
     type: 'section:review',
     documentId,
     sectionId,
     review,
+  }).catch((err: unknown) => {
+    log.error({ event: 'doc:section_updated', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
 
   res.status(201).json({ review });

@@ -22,6 +22,7 @@
 import { publishSignal } from '../lib/event-catalog';
 import { getCachedRoom, setCachedRoom } from '../lib/cache';
 import { roomRepo } from '../repositories';
+import log from '../lib/logger';
 
 interface RoomForBroadcast {
   channelId: string;
@@ -49,6 +50,8 @@ export async function broadcastToRoom(
     }
   }
   if (roomData) {
-    void publishSignal(roomData.channelId, eventType, payload);
+    publishSignal(roomData.channelId, eventType, payload).catch((err: unknown) => {
+      log.error({ event: eventType, err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
+    });
   }
 }

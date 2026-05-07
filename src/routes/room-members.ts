@@ -10,6 +10,7 @@ import {
   ForbiddenError,
   ConflictError,
 } from '../middleware/error-handler';
+import log from '../lib/logger';
 
 export const roomMembersRouter = Router({ mergeParams: true });
 
@@ -53,12 +54,11 @@ roomMembersRouter.post('/join', asyncHandler(async (req: Request, res: Response)
 
   res.status(201).json({ roomId: req.params.roomId, userId: req.user!.sub, role: 'member', joinedAt: now });
 
-  // Broadcast social:member_joined to room channel (non-fatal if Redis unavailable)
-  // We already have roomItem in hand from the membership check — avoid another cache lookup
-  void publishSignal(roomItem.channelId, 'social:member_joined', {
+  publishSignal(roomItem.channelId, 'social:member_joined', {
     roomId: req.params.roomId, userId: req.user!.sub, joinedAt: now,
+  }).catch((err: unknown) => {
+    log.error({ event: 'social:member_joined', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
-  // No publishSocialEvent — outbox record handles delivery
 }));
 
 // DELETE /api/rooms/:roomId/leave — leave a room (RTIM-04 leave half)
@@ -85,14 +85,16 @@ roomMembersRouter.delete('/leave', asyncHandler(async (req: Request, res: Respon
 
   res.status(200).json({ roomId: req.params.roomId, userId: req.user!.sub, left: true });
 
-  // Broadcast social:member_left to room channel (non-fatal if Redis unavailable)
-  void publishSignal(roomItem.channelId, 'social:member_left', {
+  publishSignal(roomItem.channelId, 'social:member_left', {
     roomId: req.params.roomId, userId: req.user!.sub, leftAt: new Date().toISOString(),
+  }).catch((err: unknown) => {
+    log.error({ event: 'social:member_left', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed');
   });
-  // Publish social.room.leave event via durable transport (log-and-continue)
-  void publishDurable('social.room.leave', {
+  publishDurable('social.room.leave', {
     roomId: req.params.roomId,
     userId: req.user!.sub,
+  }).catch((err: unknown) => {
+    log.error({ event: 'social.room.leave', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
   });
 }));
 

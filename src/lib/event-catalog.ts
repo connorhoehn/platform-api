@@ -3,10 +3,15 @@
  *
  * Declares all events this service produces (both signal and durable),
  * provides `publishSignal` for gateway-compatible Redis broadcasts,
- * and `publishDurable` for at-least-once message-queue delivery.
+ * and `publishDurable` for at-least-once message-queue delivery via DynamoDB outbox.
  */
 import { EventCatalog } from '@connorhoehn/event-catalog';
 import { createClient, RedisClientType } from 'redis';
+import { PutCommand } from '@aws-sdk/lib-dynamodb';
+import { ulid } from 'ulid';
+import { docClient } from './aws-clients';
+import { tableName } from './ddb-table-name';
+import log from './logger';
 
 // ---------------------------------------------------------------------------
 // Catalog instance
@@ -22,6 +27,8 @@ export const catalog = new EventCatalog({
   serviceName: 'platform-api',
   registryUrl: EVENT_CATALOG_URL || undefined,
 });
+
+const OUTBOX_TABLE = tableName('social-outbox');
 
 // ---------------------------------------------------------------------------
 // Signal event declarations (Redis pub/sub, ephemeral)
@@ -453,15 +460,30 @@ export async function publishSignal(
 }
 
 // ---------------------------------------------------------------------------
-// publishDurable — thin wrapper for at-least-once delivery
+// publishDurable — writes to DynamoDB outbox for at-least-once delivery
 // ---------------------------------------------------------------------------
 
 /**
- * Publishes a durable event via the message-queue transport.
+ * Writes a durable event to the outbox table. The outbox-drainer picks it up
+ * and publishes via the message-queue transport, guaranteeing at-least-once
+ * delivery even if the message-queue is temporarily unavailable.
  */
 export async function publishDurable(
   eventName: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  await catalog.publish(eventName, payload);
+  const now = new Date().toISOString();
+  await docClient.send(
+    new PutCommand({
+      TableName: OUTBOX_TABLE,
+      Item: {
+        outboxId: ulid(),
+        status: 'UNPROCESSED',
+        eventType: eventName,
+        queueName: 'platform-events',
+        payload: JSON.stringify(payload),
+        createdAt: now,
+      },
+    }),
+  );
 }
