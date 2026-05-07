@@ -51,8 +51,10 @@ npm run dev
 | `COGNITO_REGION` | AWS region for Cognito user pool | `us-east-1` |
 | `COGNITO_USER_POOL_ID` | Cognito user pool ID | `us-east-1_localdev000` |
 | `SKIP_AUTH` | Skip JWT verification in local dev | `true` |
-| `REDIS_ENDPOINT` | Redis host | `localhost` |
+| `REDIS_ENDPOINT` | Redis host for signal transport pub/sub | `redis` |
 | `REDIS_PORT` | Redis port | `6379` |
+| `EVENT_CATALOG_URL` | URL of the event-catalog registry server. When set, platform-api registers all its events with the catalog at startup for topology visibility. | (empty = disabled) |
+| `MESSAGE_QUEUE_URL` | URL of the message-queue service for durable event delivery | `http://localhost:3004` |
 | `LOCALSTACK_ENDPOINT` | DynamoDB-local endpoint | `http://localhost:8000` |
 | `AWS_REGION` | AWS region for DynamoDB | `us-east-1` |
 | `VIDEO_API_URL` | live-video-streaming service URL | (empty = disabled) |
