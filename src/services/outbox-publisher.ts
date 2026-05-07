@@ -26,6 +26,9 @@ import { tableName } from '../lib/ddb-table-name';
 
 const OUTBOX_TABLE = tableName('social-outbox');
 
+/** 7 days in seconds — initial TTL for newly created outbox rows. */
+const CREATION_TTL_SECONDS = 7 * 24 * 60 * 60;
+
 export interface TargetPut {
   TableName: string;
   Item: Record<string, unknown>;
@@ -57,6 +60,11 @@ export async function publishWithOutbox(params: PublishWithOutboxParams): Promis
   const now = new Date().toISOString();
   const outboxId = ulid();
 
+  // TTL: epoch seconds — DynamoDB auto-deletes rows after this time.
+  // NOTE: DynamoDB TTL must be enabled on the table for attribute "ttl"
+  // via AWS console or CLI: aws dynamodb update-time-to-live --table-name <table> --time-to-live-specification Enabled=true,AttributeName=ttl
+  const ttl = Math.floor(Date.now() / 1000) + CREATION_TTL_SECONDS;
+
   const outboxItem: Record<string, unknown> = {
     outboxId,
     status: 'UNPROCESSED',
@@ -64,6 +72,7 @@ export async function publishWithOutbox(params: PublishWithOutboxParams): Promis
     queueName,
     payload: JSON.stringify({ ...eventPayload, timestamp: now }),
     createdAt: now,
+    ttl,
   };
 
   const input: TransactWriteCommandInput = {

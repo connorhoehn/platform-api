@@ -11,6 +11,9 @@ const LOCK_KEY = { outboxId: 'OUTBOX_LOCK#drainer' };
 const LEASE_TTL_MS = 30_000;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 
+/** 24 hours in seconds — shortened TTL for completed/failed rows (kept briefly for debugging). */
+const TERMINAL_TTL_SECONDS = 24 * 60 * 60;
+
 const OWNER_ID = `${process.pid}@${hostname()}-${randomUUID()}`;
 
 export interface OutboxDrainerConfig {
@@ -152,15 +155,20 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
 
       await publishDurable(row.eventType, parsedPayload);
 
+      const completedAt = new Date().toISOString();
+      const ttl = Math.floor(Date.now() / 1000) + TERMINAL_TTL_SECONDS;
+
       await docClient.send(
         new UpdateCommand({
           TableName: OUTBOX_TABLE,
           Key: { outboxId: row.outboxId },
-          UpdateExpression: 'SET #status = :processed, processedAt = :now',
-          ExpressionAttributeNames: { '#status': 'status' },
+          UpdateExpression: 'SET #status = :processed, processedAt = :now, completedAt = :completedAt, #ttl = :ttl',
+          ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
           ExpressionAttributeValues: {
             ':processed': 'PROCESSED',
-            ':now': new Date().toISOString(),
+            ':now': completedAt,
+            ':completedAt': completedAt,
+            ':ttl': ttl,
           },
         }),
       );
@@ -177,15 +185,20 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       const newRetryCount = currentRetryCount + 1;
 
       if (newRetryCount >= maxRetriesCount) {
+        const failedAt = new Date().toISOString();
+        const ttl = Math.floor(Date.now() / 1000) + TERMINAL_TTL_SECONDS;
+
         await docClient.send(
           new UpdateCommand({
             TableName: OUTBOX_TABLE,
             Key: { outboxId: row.outboxId },
-            UpdateExpression: 'SET #status = :failed, retryCount = :retryCount',
-            ExpressionAttributeNames: { '#status': 'status' },
+            UpdateExpression: 'SET #status = :failed, retryCount = :retryCount, failedAt = :failedAt, #ttl = :ttl',
+            ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
             ExpressionAttributeValues: {
               ':failed': 'FAILED',
               ':retryCount': newRetryCount,
+              ':failedAt': failedAt,
+              ':ttl': ttl,
             },
           }),
         );
