@@ -1,4 +1,4 @@
-// social-api/src/pipeline/executor-audit-subscriber.ts
+// platform-api/src/pipeline/executor-audit-subscriber.ts
 //
 // Wave 2 of hub#2224 — subscribes to PipelineModule's EventBus and persists
 // every executor lifecycle event into the pipeline-audit table so operators

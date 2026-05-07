@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineDefinitions.ts
+// platform-api/src/routes/pipelineDefinitions.ts
 //
 // REST endpoints for pipeline definitions, backed by DynamoDB via the
 // `definitionsRepo` singleton (see `../pipeline/definitions-repository.ts`).

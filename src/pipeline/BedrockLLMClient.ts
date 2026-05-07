@@ -1,4 +1,4 @@
-// social-api/src/pipeline/BedrockLLMClient.ts
+// platform-api/src/pipeline/BedrockLLMClient.ts
 //
 // AWS Bedrock provider implementation of LLMClient. Lazy-requires
 // @aws-sdk/client-bedrock-runtime so module load doesn't fail when the SDK

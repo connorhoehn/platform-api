@@ -1,4 +1,4 @@
-// social-api/src/pipeline/runPersistence.ts
+// platform-api/src/pipeline/runPersistence.ts
 //
 // Pipeline run persistence service — subscribes to pipeline events and persists
 // full run state to DynamoDB for historical queries and checkpoint-based resume.

@@ -1,4 +1,4 @@
-// social-api/src/ingest/repositories/IngestAuditRepository.ts
+// platform-api/src/ingest/repositories/IngestAuditRepository.ts
 //
 // Persistence for the ingest audit log (hub#2213 — foundation slice for
 // the audit-viewer feature). Every mapping decision, source change, and

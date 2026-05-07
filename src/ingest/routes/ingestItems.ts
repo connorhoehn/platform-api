@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestItems.ts
+// platform-api/src/ingest/routes/ingestItems.ts
 //
 // REST endpoints for ingest item inspection and manual intervention.
 //

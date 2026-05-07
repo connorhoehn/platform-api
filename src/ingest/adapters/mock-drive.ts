@@ -1,4 +1,4 @@
-// social-api/src/ingest/adapters/mock-drive.ts
+// platform-api/src/ingest/adapters/mock-drive.ts
 //
 // Mock Google Drive-like adapter with nested folder structure, file metadata
 // (tags, owners, shared status), and tag-based filtering. Simulates change

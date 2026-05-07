@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ClaudeCodeLLMClient.ts
+// platform-api/src/pipeline/ClaudeCodeLLMClient.ts
 //
 // Claude Code CLI subprocess provider. Shells out to `claude -p` so an
 // operator running on a machine with only a Claude Code subscription
@@ -31,9 +31,8 @@ const KILL_GRACE_MS = 500;
 // aliases natively and the translation here would actively break it.
 //
 // `bedrockMode()` reads the env at call time so a single deployment can
-// flip via `CLAUDE_CODE_USE_BEDROCK=1` (see k8s/helm/websocket-gateway/
-// values.yaml: socialApi.env.CLAUDE_CODE_USE_BEDROCK and the
-// values-bedrock-local.yaml overlay).
+// flip via `CLAUDE_CODE_USE_BEDROCK=1` (see platform-api deployment
+// config: env.CLAUDE_CODE_USE_BEDROCK and the Bedrock overlay).
 const BEDROCK_MODEL_ALIAS: Record<string, string> = {
   'opus':   'us.anthropic.claude-opus-4-20250514-v1:0',
   'sonnet': 'us.anthropic.claude-sonnet-4-20250514-v1:0',

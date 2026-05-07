@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestConfluenceWebhook.ts
+// platform-api/src/ingest/routes/ingestConfluenceWebhook.ts
 //
 // Confluence-specific webhook receiver. Mounted (in app.ts) at
 //   POST /api/ingest/webhook/confluence/:sourceId

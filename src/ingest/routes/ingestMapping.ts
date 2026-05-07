@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestMapping.ts
+// platform-api/src/ingest/routes/ingestMapping.ts
 //
 // REST endpoints for ingest mapping preview (dry-run) + needs-review queue.
 //

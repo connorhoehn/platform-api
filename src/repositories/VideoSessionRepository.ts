@@ -11,7 +11,8 @@ export interface VideoSessionParticipant {
 export interface VideoSessionRecord {
   documentId: string;
   sessionId: string;
-  vnlSessionId: string;
+  channelArn: string;
+  streamKey: string;
   status: 'active' | 'ended';
   startedAt: string;
   endedAt?: string;

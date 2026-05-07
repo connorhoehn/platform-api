@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/types.ts
+// platform-api/src/pipeline/ingest-steps/types.ts
 //
 // Local type contracts for the four ingest-aware pipeline step types
 // (`ingest:fetch`, `ingest:map`, `ingest:materialize`, `ingest:writeback`),

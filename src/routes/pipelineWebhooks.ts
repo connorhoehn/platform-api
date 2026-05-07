@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineWebhooks.ts
+// platform-api/src/routes/pipelineWebhooks.ts
 //
 // Public webhook endpoints for pipeline triggers. Mounted at /hooks/pipeline
 // in app.ts BEFORE the Cognito auth middleware so external systems (Stripe,

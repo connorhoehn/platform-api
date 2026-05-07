@@ -1,4 +1,4 @@
-// social-api/src/ingest/audit/append.ts
+// platform-api/src/ingest/audit/append.ts
 //
 // Single-call helper for appending a row to the ingest audit log. Used by
 // hub#2215's call-site instrumentation pass; the repository itself lives

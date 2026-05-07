@@ -1,8 +1,8 @@
-// social-api/src/observability/metrics.ts
+// platform-api/src/observability/metrics.ts
 //
-// Prometheus shadow metrics layer for social-api. Mirrors
+// Prometheus shadow metrics layer for platform-api. Mirrors
 // gateway's src/observability/metrics.js so a Prometheus scrape
-// at `GET /internal/metrics` on social-api returns the same
+// at `GET /internal/metrics` on platform-api returns the same
 // connection/message/reconnect counters PLUS pipeline-lifecycle
 // counters (triggers, approvals, cancels, errors).
 //
@@ -14,7 +14,7 @@
 import os from 'os';
 import { MetricsRegistry, formatPrometheus, QueueMetrics } from 'distributed-core';
 
-const SERVICE = process.env.WSG_SERVICE_NAME || 'social-api';
+const SERVICE = process.env.WSG_SERVICE_NAME || 'platform-api';
 const NODE_ID = process.env.WSG_NODE_ID || os.hostname();
 const BASE_LABELS = { service: SERVICE, node_id: NODE_ID };
 
@@ -98,7 +98,7 @@ registry.counter('typed_documents_validation_errors_total', { ...BASE_LABELS, er
 // can query these metrics via PromQL on the /internal/metrics endpoint.
 //
 // Example PromQL queries (for Grafana dashboards):
-//   - Current Raft role:          raft_role_leader{service="social-api"}
+//   - Current Raft role:          raft_role_leader{service="platform-api"}
 //   - Election frequency:         rate(raft_elections_started[5m])
 //   - Proposal commit latency:    histogram_quantile(0.95, raft_proposal_latency_seconds)
 //   - Replication lag:            raft_replication_lag_entries{follower="node-2"}

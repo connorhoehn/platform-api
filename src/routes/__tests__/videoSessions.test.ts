@@ -1,12 +1,11 @@
 // Integration tests for videoSessions routes.
 //
-// Mocks vnl-auth, videoSessionRepo, and auth at module level so we
-// exercise VNL proxy, local record persistence, and error paths
-// without touching any external APIs.
+// Mocks video-auth, videoSessionRepo, and auth at module level so we
+// exercise live-video-streaming proxy, local record persistence, and error
+// paths without touching any external APIs.
 
 import express, { type NextFunction, type Request, type Response } from 'express';
 
-const mockGetVnlAuthToken = jest.fn();
 const mockCreateSession = jest.fn();
 const mockAddParticipant = jest.fn();
 const mockEndSession = jest.fn();
@@ -18,9 +17,8 @@ jest.mock('../../middleware/auth', () => ({
   optionalAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
 }));
 
-jest.mock('../../lib/vnl-auth', () => ({
-  getVnlAuthToken: (...args: unknown[]) => mockGetVnlAuthToken(...args),
-  VNL_API_URL: 'https://vnl.test',
+jest.mock('../../lib/video-auth', () => ({
+  VIDEO_API_URL: 'https://video.test',
 }));
 
 jest.mock('../../repositories', () => ({
@@ -116,16 +114,15 @@ function buildApp(): express.Express {
   return app;
 }
 
-function vnlOk(data: Record<string, unknown> = {}) {
+function apiOk(data: Record<string, unknown> = {}) {
   return { ok: true, status: 200, json: async () => data, text: async () => '' } as unknown as globalThis.Response;
 }
 
-function vnlFail(status = 500) {
+function apiFail(status = 500) {
   return { ok: false, status, json: async () => ({}), text: async () => 'err' } as unknown as globalThis.Response;
 }
 
 beforeEach(() => {
-  mockGetVnlAuthToken.mockReset().mockResolvedValue('vnl-token-123');
   mockCreateSession.mockReset().mockResolvedValue(undefined);
   mockAddParticipant.mockReset().mockResolvedValue(undefined);
   mockEndSession.mockReset().mockResolvedValue(undefined);
@@ -141,37 +138,44 @@ afterEach(() => jest.restoreAllMocks());
 describe('POST /api/video/sessions — non-AppError outer catch', () => {
   it('returns 500 when fetch itself throws (network error)', async () => {
     mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
-    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: {} });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
     expect(res.statusCode).toBe(500);
   });
 });
 
 describe('POST /api/video/sessions', () => {
-  it('returns 201 on successful VNL create', async () => {
-    mockFetch.mockResolvedValue(vnlOk({ sessionId: 'vs-1' }));
+  it('returns 201 with sessionId on successful channel create', async () => {
+    mockFetch.mockResolvedValue(apiOk({ arn: 'arn:channel:1', streamKey: 'sk-1', name: 'doc-1' }));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
       body: { documentId: 'doc-1', displayName: 'Alice' },
     });
     expect(res.statusCode).toBe(201);
-    expect((res.body as { sessionId: string }).sessionId).toBe('vs-1');
+    expect((res.body as { sessionId: string }).sessionId).toBeDefined();
     expect(mockCreateSession).toHaveBeenCalledTimes(1);
+    expect(mockCreateSession).toHaveBeenCalledWith(
+      expect.objectContaining({ channelArn: 'arn:channel:1', streamKey: 'sk-1' }),
+    );
   });
 
-  it('skips local record when no documentId', async () => {
-    mockFetch.mockResolvedValue(vnlOk({ sessionId: 'vs-2' }));
+  it('calls channel API with generated name when no documentId', async () => {
+    mockFetch.mockResolvedValue(apiOk({ arn: 'arn:channel:2', streamKey: 'sk-2', name: 'random' }));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: {} });
     expect(res.statusCode).toBe(201);
-    expect(mockCreateSession).not.toHaveBeenCalled();
+    // fetch should have been called with a UUID-like name in the body
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://video.test/api/channels',
+      expect.objectContaining({ method: 'POST' }),
+    );
   });
 
-  it('returns VNL error status on failure', async () => {
-    mockFetch.mockResolvedValue(vnlFail(502));
-    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: {} });
+  it('returns video API error status on channel create failure', async () => {
+    mockFetch.mockResolvedValue(apiFail(502));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
     expect(res.statusCode).toBe(502);
   });
 
   it('still returns 201 when local DB write fails', async () => {
-    mockFetch.mockResolvedValue(vnlOk({ sessionId: 'vs-3' }));
+    mockFetch.mockResolvedValue(apiOk({ arn: 'arn:channel:3', streamKey: 'sk-3' }));
     mockCreateSession.mockRejectedValue(new Error('DDB error'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
       body: { documentId: 'doc-1' },
@@ -181,23 +185,46 @@ describe('POST /api/video/sessions', () => {
 });
 
 describe('POST /api/video/sessions/:sessionId/join', () => {
-  it('returns 200 on successful join', async () => {
-    mockFetch.mockResolvedValue(vnlOk({ token: 'ivs-token' }));
+  const session = { documentId: 'doc-1', sessionId: 'vs-1', channelArn: 'arn:ch:1', streamKey: 'sk-1', status: 'active' };
+
+  it('returns 200 with token on successful join', async () => {
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue(apiOk({ token: 'ivs-token', participantId: 'p-1' }));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
       body: { documentId: 'doc-1', displayName: 'Bob' },
     });
     expect(res.statusCode).toBe(200);
+    expect((res.body as { token: string }).token).toBe('ivs-token');
+    expect((res.body as { participantId: string }).participantId).toBe('p-1');
+    expect((res.body as { userId: string }).userId).toBe('tester');
     expect(mockAddParticipant).toHaveBeenCalledWith('doc-1', 'vs-1', expect.objectContaining({ userId: 'tester' }));
   });
 
-  it('returns VNL error status on failure', async () => {
-    mockFetch.mockResolvedValue(vnlFail(404));
+  it('returns 400 when documentId missing from body', async () => {
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', { body: {} });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('returns 404 when session not found in DB', async () => {
+    mockGetSession.mockResolvedValue(null);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { documentId: 'doc-1' },
+    });
     expect(res.statusCode).toBe(404);
   });
 
+  it('returns video API error status on token request failure', async () => {
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue(apiFail(403));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { documentId: 'doc-1' },
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
   it('still returns 200 when addParticipant throws (non-fatal DB failure)', async () => {
-    mockFetch.mockResolvedValue(vnlOk({ token: 'ivs-token' }));
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue(apiOk({ token: 'ivs-token' }));
     mockAddParticipant.mockRejectedValue(new Error('DDB write failed'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
       body: { documentId: 'doc-1', displayName: 'Bob' },
@@ -206,15 +233,21 @@ describe('POST /api/video/sessions/:sessionId/join', () => {
   });
 
   it('returns 500 when fetch throws (non-AppError outer catch)', async () => {
+    mockGetSession.mockResolvedValue(session);
     mockFetch.mockRejectedValue(new Error('network down'));
-    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', { body: {} });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { documentId: 'doc-1' },
+    });
     expect(res.statusCode).toBe(500);
   });
 });
 
 describe('POST /api/video/sessions/:sessionId/end', () => {
+  const session = { documentId: 'doc-1', sessionId: 'vs-1', channelArn: 'arn:ch:1', streamKey: 'sk-1', status: 'active' };
+
   it('returns 200 on successful end', async () => {
-    mockFetch.mockResolvedValue(vnlOk({ ended: true }));
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue(apiOk({}));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
       body: { documentId: 'doc-1' },
     });
@@ -222,14 +255,31 @@ describe('POST /api/video/sessions/:sessionId/end', () => {
     expect(mockEndSession).toHaveBeenCalledWith('doc-1', 'vs-1', expect.any(String));
   });
 
-  it('returns VNL error status on failure', async () => {
-    mockFetch.mockResolvedValue(vnlFail(503));
+  it('returns 400 when documentId missing from body', async () => {
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', { body: {} });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('returns 404 when session not found in DB', async () => {
+    mockGetSession.mockResolvedValue(null);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { documentId: 'doc-1' },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('returns video API error status on channel delete failure', async () => {
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue(apiFail(503));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { documentId: 'doc-1' },
+    });
     expect(res.statusCode).toBe(503);
   });
 
   it('still returns 200 when endSession throws (non-fatal DB failure)', async () => {
-    mockFetch.mockResolvedValue(vnlOk({ ended: true }));
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue(apiOk({}));
     mockEndSession.mockRejectedValue(new Error('DDB write failed'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
       body: { documentId: 'doc-1' },
@@ -239,8 +289,11 @@ describe('POST /api/video/sessions/:sessionId/end', () => {
   });
 
   it('returns 500 when fetch throws (non-AppError outer catch)', async () => {
+    mockGetSession.mockResolvedValue(session);
     mockFetch.mockRejectedValue(new Error('network error'));
-    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', { body: {} });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { documentId: 'doc-1' },
+    });
     expect(res.statusCode).toBe(500);
   });
 });

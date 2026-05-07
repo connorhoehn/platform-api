@@ -56,7 +56,7 @@ import { ingestProposalsRouter } from '../ingest/routes/ingestProposals';
 import { ingestAuditRouter } from '../ingest/routes/ingestAudit';
 
 // Module-shaped pipeline router (Phase A of the distributed-core absorption
-// — see .planning/HANDOFF-distributed-core-social-api-absorption.md). Lives
+// — see .planning/HANDOFF-distributed-core-platform-api-absorption.md). Lives
 // under /api/v2/* during the migration so the legacy `/api/pipelines/*`
 // surface keeps working unchanged. New routes land here first; they get
 // promoted to /api/* once the legacy counterpart is removed.

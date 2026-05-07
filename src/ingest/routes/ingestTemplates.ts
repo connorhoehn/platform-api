@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestTemplates.ts
+// platform-api/src/ingest/routes/ingestTemplates.ts
 //
 // REST endpoints for ingest pipeline templates — pre-built knowledge workflow
 // definitions that can be browsed and instantiated into real pipelines.

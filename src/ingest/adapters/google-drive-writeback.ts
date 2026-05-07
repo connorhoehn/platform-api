@@ -1,4 +1,4 @@
-// social-api/src/ingest/adapters/google-drive-writeback.ts
+// platform-api/src/ingest/adapters/google-drive-writeback.ts
 //
 // Google Drive write-back driver — peer of GoogleDriveAdapter.
 //

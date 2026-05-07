@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/default-pipeline-resolver.ts
+// platform-api/src/pipeline/ingest-steps/default-pipeline-resolver.ts
 //
 // Resolves the pipeline that should run after an item materializes.
 //

@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestWebhooks.ts
+// platform-api/src/ingest/routes/ingestWebhooks.ts
 //
 // Public webhook endpoint for ingest source change notifications.
 // Accepts push notifications from external sources (S3, Drive, etc.) and

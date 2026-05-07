@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineCost.ts
+// platform-api/src/routes/pipelineCost.ts
 //
 // GET /api/pipelines/:pipelineId/cost — aggregate LLM cost for all persisted
 // runs of a pipeline. Reads from PipelineRunRepository and sums tokenUsage /

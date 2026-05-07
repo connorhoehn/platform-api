@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestProposals.ts
+// platform-api/src/ingest/routes/ingestProposals.ts
 //
 // Operator promotion queue for auto-discovered DocType proposals.
 // AGENTIC_ETL_VISION §B Tier 3 — when the LLM mapper sees N similar files

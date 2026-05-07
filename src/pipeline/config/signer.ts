@@ -1,4 +1,4 @@
-// social-api/src/pipeline/config/signer.ts
+// platform-api/src/pipeline/config/signer.ts
 //
 // Per-node `RaftRpcSigner` factory. Distributed-core's
 // `RaftConfig.signer?` slot accepts any value satisfying the duck-typed

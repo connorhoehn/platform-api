@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineReplay.ts
+// platform-api/src/routes/pipelineReplay.ts
 //
 // Pipeline run replay — re-execute a completed/failed run from historical state.
 //
@@ -30,7 +30,7 @@ import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { getDynamoClient } from '../lib/ddb-client';
 
 const log = withContext({ route: 'pipelineReplay' });
-const tracer = trace.getTracer('social-api');
+const tracer = trace.getTracer('platform-api');
 
 /** Fire-and-forget audit write — mirrors the pipelineTriggers pattern. */
 function fireAndForgetAudit(event: AuditEvent): void {

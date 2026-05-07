@@ -1,4 +1,4 @@
-// social-api/src/pipeline/config/hintedHandoffQueue.ts
+// platform-api/src/pipeline/config/hintedHandoffQueue.ts
 //
 // Wire `HintedHandoffQueue` (distributed-core v0.9.0 / Phase F4) as an OPT-IN
 // cross-node delivery primitive. When a peer is in the MembershipTable but
@@ -34,7 +34,7 @@
 //   PIPELINE_HINTED_HANDOFF_ENABLED   'true' | 'false' (default 'false' — opt-in).
 //   PIPELINE_HINTED_HANDOFF_PATH      Filesystem dir for durable per-target logs.
 //                                     Required-by-default when enabled, falls back
-//                                     to '/var/lib/social-api/pipeline-handoff' in
+//                                     to '/var/lib/platform-api/pipeline-handoff' in
 //                                     production / '/tmp/pipeline-handoff' in dev.
 //                                     Parent dir writability is verified via
 //                                     `verifyWalParentWritable` before construction.
@@ -131,7 +131,7 @@ function resolveDataDir(explicit: string | undefined): string {
   const env = process.env.PIPELINE_HINTED_HANDOFF_PATH;
   if (env !== undefined && env !== '') return env;
   return process.env.NODE_ENV === 'production'
-    ? '/var/lib/social-api/pipeline-handoff'
+    ? '/var/lib/platform-api/pipeline-handoff'
     : '/tmp/pipeline-handoff';
 }
 

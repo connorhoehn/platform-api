@@ -99,7 +99,7 @@ class BroadcastService {
           timestamp: new Date().toISOString(),
         },
         excludeClientId: null,
-        fromNode: 'social-api',
+        fromNode: 'platform-api',
         seq: 0,
         timestamp: new Date().toISOString(),
         targetNodes,

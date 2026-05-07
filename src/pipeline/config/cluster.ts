@@ -1,4 +1,4 @@
-// social-api/src/pipeline/config/cluster.ts
+// platform-api/src/pipeline/config/cluster.ts
 //
 // Pure builder for the distributed-core `ClusterConfig` literal that is fed
 // into `Cluster.create()`. Splits each concern (transport, pubsub, registry,
@@ -63,7 +63,7 @@ export interface BuildClusterConfigArgs {
   basePort: number;
   /**
    * Seed nodes for TCP transport discovery. Comma-separated host:port list
-   * (e.g. "social-api-0:7100,social-api-1:7100,social-api-2:7100").
+   * (e.g. "platform-api-0:7100,platform-api-1:7100,platform-api-2:7100").
    * Only used when `transport === 'tcp'`; ignored for in-memory.
    */
   seedNodes: string[];
@@ -113,7 +113,7 @@ export interface BuildClusterConfigArgs {
    * bootstrap entry; passed through here so the builder stays env-agnostic.
    */
   fastTimers: boolean;
-  /** social-api's MetricsRegistry singleton. Threaded into ResourceRouter / DistributedLock. */
+  /** platform-api's MetricsRegistry singleton. Threaded into ResourceRouter / DistributedLock. */
   metricsRegistry: MetricsRegistry;
 }
 
@@ -188,7 +188,7 @@ export interface BuildRegistryConfigArgs {
  *
  * 'raft' threads `metrics` and `signer` into `RaftConfig` so RaftNode emits
  * proposal / election / replication / snapshot counters into the same registry
- * the rest of social-api uses, and signs every RPC when a per-node KeyManager
+ * the rest of platform-api uses, and signs every RPC when a per-node KeyManager
  * is provisioned.
  */
 export function buildRegistryConfig(args: BuildRegistryConfigArgs): RegistryConfig {
@@ -207,7 +207,7 @@ export function buildRegistryConfig(args: BuildRegistryConfigArgs): RegistryConf
       if (!args.raftDataDir || args.raftDataDir.trim() === '') {
         throw new Error(
           `[pipeline:config] buildRegistryConfig: 'raft' mode requires a raftDataDir. `
-          + `Set PIPELINE_RAFT_DATA_DIR to a writable path (e.g. /var/lib/social-api/raft).`,
+          + `Set PIPELINE_RAFT_DATA_DIR to a writable path (e.g. /var/lib/platform-api/raft).`,
         );
       }
       const raftConfig: RaftConfig = {

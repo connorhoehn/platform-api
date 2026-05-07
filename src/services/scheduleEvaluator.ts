@@ -1,4 +1,4 @@
-// social-api/src/services/scheduleEvaluator.ts
+// platform-api/src/services/scheduleEvaluator.ts
 //
 // Polls a server-side store of pipeline definitions (Phase 1: same in-memory
 // stub as the definitions endpoint) once per minute and fires any pipelines

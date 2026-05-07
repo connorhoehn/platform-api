@@ -8,7 +8,7 @@
 //   that breaks the wire contract becomes a frontend compile error.
 //
 //   Constraints:
-//     - Zero framework imports (no Express, no social-api middleware, no
+//     - Zero framework imports (no Express, no platform-api middleware, no
 //       distributed-core internals). Plain TypeScript interfaces only.
 //     - Zero runtime side effects.
 //     - When PipelineModule moves into distributed-core, this file moves
@@ -16,7 +16,7 @@
 //       imports continues to compile across the relocation.
 //
 // Refs:
-//   - .planning/HANDOFF-distributed-core-social-api-absorption.md
+//   - .planning/HANDOFF-distributed-core-platform-api-absorption.md
 //     §"What 'module-shaped' actually means"
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@
 
 /**
  * Identity attached to every request handled by the pipeline router. The
- * host (social-api today, distributed-core later) populates this from its
+ * host (platform-api today, distributed-core later) populates this from its
  * own auth middleware and injects a getter into the router factory; the
  * route handlers themselves never speak to Cognito / IAM / etc.
  *

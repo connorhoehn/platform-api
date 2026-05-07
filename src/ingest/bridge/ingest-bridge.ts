@@ -1,4 +1,4 @@
-// social-api/src/ingest/bridge/ingest-bridge.ts
+// platform-api/src/ingest/bridge/ingest-bridge.ts
 //
 // Bridge between ingest EventBus and WebSocket clients. Subscribes to ingest
 // progress events and forwards them to WebSocket channel `ingest:progress`.

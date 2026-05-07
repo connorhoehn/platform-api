@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/fetch-step.ts
+// platform-api/src/pipeline/ingest-steps/fetch-step.ts
 //
 // `ingest:fetch` step type. Given (sourceId, path), calls the source
 // adapter's `fetch()` and surfaces the resulting `FileDescriptor` +

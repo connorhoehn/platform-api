@@ -1,4 +1,4 @@
-// social-api/src/ingest/mapping/type-generator.ts
+// platform-api/src/ingest/mapping/type-generator.ts
 //
 // LLM-powered document type matching and generation for the ingest subsystem.
 // Used when rule-based mapping (rule-matcher.ts) fails to match a file to an

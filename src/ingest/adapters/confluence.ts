@@ -1,4 +1,4 @@
-// social-api/src/ingest/adapters/confluence.ts
+// platform-api/src/ingest/adapters/confluence.ts
 //
 // Confluence connector — Tier 2 source adapter + write-back driver pair.
 //

@@ -1,4 +1,4 @@
-// social-api/src/pipeline/config/failureDetectorBridge.ts
+// platform-api/src/pipeline/config/failureDetectorBridge.ts
 //
 // Wires distributed-core's `FailureDetectorBridge` + `PubSubHeartbeatSource`
 // onto the bootstrap's already-constructed `Cluster` facade, providing an

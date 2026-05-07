@@ -1,4 +1,4 @@
-// social-api/src/ingest/templates/index.ts
+// platform-api/src/ingest/templates/index.ts
 //
 // Pre-built pipeline definition templates for common knowledge workflows in
 // the ingest subsystem. These templates can be instantiated via the
@@ -11,7 +11,7 @@
 
 // ---------------------------------------------------------------------------
 // Structural types — mirrors frontend/src/types/pipeline.ts shapes. The
-// social-api does NOT depend on the frontend package; these definitions are
+// platform-api does NOT depend on the frontend package; these definitions are
 // the minimum needed to produce well-typed template graphs that the pipeline
 // executor and definitions-repository accept as valid PipelineDefinition JSON.
 // ---------------------------------------------------------------------------

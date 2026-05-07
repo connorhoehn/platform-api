@@ -1,7 +1,7 @@
-// social-api/src/pipeline/createBridge.ts
+// platform-api/src/pipeline/createBridge.ts
 //
 // Wraps a live distributed-core `PipelineModule` instance behind the
-// `PipelineBridge` shape that social-api routes consume. This is the boundary
+// `PipelineBridge` shape that platform-api routes consume. This is the boundary
 // where Phase-4 wiring meets the existing route stub paths — when a bridge is
 // installed, every route's `if (bridge?.X)` branch hits this implementation;
 // otherwise the in-memory stubRunStore stays in charge.
@@ -149,7 +149,7 @@ function parseStoredError(stored: string): { message: string; nodeId: string; er
 // internal types. That shape uses `id` (not `runId`) as the run identifier,
 // while the `applicationData` envelope produced by `listActiveRuns` uses
 // `runId`. Both arrive here, so we accept either spelling and project to the
-// `runId`-keyed `PipelineRunSnapshot` the social-api routes consume.
+// `runId`-keyed `PipelineRunSnapshot` the platform-api routes consume.
 //
 // Returns a SHALLOW COPY rather than mutating the input — the live
 // `PipelineRun` from `module.getRun()` is the executor's own object, and
@@ -239,7 +239,7 @@ export function createBridge(
     async getHistory(runId: string, fromVersion: number): Promise<BusEvent[]> {
       // Per the cross-repo contract: `getHistory` returns [] (no throw) when
       // the underlying EventBus has no walFilePath configured. PipelineModule
-      // honors that already; pass-through. social-api's `BusEvent` extends
+      // honors that already; pass-through. platform-api's `BusEvent` extends
       // DC's `PublicBusEvent`, so a structural cast is enough — DC's wider
       // internal envelope (`id`, `sourceNodeId`, `version`, `v`) is dropped
       // by the route, but the runtime payload carries them harmlessly.

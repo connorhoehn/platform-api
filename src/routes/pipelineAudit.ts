@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineAudit.ts
+// platform-api/src/routes/pipelineAudit.ts
 //
 // hub#2225 — Read-only query API over the `pipeline-audit` DDB table.
 // Closes the loop on Wave 2 (hub#2224) which wired every mutating route +

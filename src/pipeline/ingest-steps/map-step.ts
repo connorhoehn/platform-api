@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/map-step.ts
+// platform-api/src/pipeline/ingest-steps/map-step.ts
 //
 // `ingest:map` step type. Calls the mapping engine on a previously-fetched
 // file descriptor (from a prior `ingest:fetch` step in the same run) and

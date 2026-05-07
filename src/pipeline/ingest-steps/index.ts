@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/index.ts
+// platform-api/src/pipeline/ingest-steps/index.ts
 //
 // Public surface for the ingest-aware pipeline step types. The integrator
 // imports `registerIngestSteps()` and the resolver/trigger constructors;

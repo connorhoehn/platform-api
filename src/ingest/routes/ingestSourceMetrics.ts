@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestSourceMetrics.ts
+// platform-api/src/ingest/routes/ingestSourceMetrics.ts
 //
 // Per-source SLO panel data — AGENTIC_ETL_VISION §F. Returns three time
 // series operators read to spot a connector dragging vs. healthy state:

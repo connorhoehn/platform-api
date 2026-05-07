@@ -35,7 +35,7 @@ export async function publishSocialEvent(
       new PutEventsCommand({
         Entries: [
           {
-            Source: 'social-api',
+            Source: 'platform-api',
             DetailType: detailType,
             Detail: JSON.stringify({ ...detail, timestamp: new Date().toISOString() }),
             EventBusName: EVENT_BUS_NAME,

@@ -1,4 +1,4 @@
-// social-api/src/lib/webhookSignature.ts
+// platform-api/src/lib/webhookSignature.ts
 //
 // HMAC-SHA256 signature helpers for the public pipeline webhook endpoint.
 //

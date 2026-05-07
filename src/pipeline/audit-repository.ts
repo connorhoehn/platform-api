@@ -1,4 +1,4 @@
-// social-api/src/pipeline/audit-repository.ts
+// platform-api/src/pipeline/audit-repository.ts
 //
 // Append-only audit trail for pipeline operations (trigger, approve, reject,
 // cancel, webhook, definition mutations) AND executor lifecycle events

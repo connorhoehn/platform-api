@@ -1,4 +1,4 @@
-// social-api/src/pipeline/config/identity.ts
+// platform-api/src/pipeline/config/identity.ts
 //
 // Resolve the cluster's stable node identity. When PIPELINE_IDENTITY_FILE is
 // configured, distributed-core's `loadOrCreateNodeId()` atomically reads-or-

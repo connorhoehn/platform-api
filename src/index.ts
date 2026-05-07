@@ -27,7 +27,7 @@ if (!process.env.COGNITO_REGION || !process.env.COGNITO_USER_POOL_ID) {
 
 const app = createApp();
 const server = app.listen(Number(port), () => {
-  log.info({ port }, 'social-api listening');
+  log.info({ port }, 'platform-api listening');
 });
 
 // ---------------------------------------------------------------------------

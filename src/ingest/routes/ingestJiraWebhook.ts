@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestJiraWebhook.ts
+// platform-api/src/ingest/routes/ingestJiraWebhook.ts
 //
 // Public webhook endpoint for inbound Jira issue + comment updates.
 // Mounted at /api/ingest/webhook/jira/:sourceId in app.ts BEFORE the auth

@@ -1,4 +1,4 @@
-// social-api/src/ingest/dlq-singleton.ts
+// platform-api/src/ingest/dlq-singleton.ts
 //
 // Lazy singleton for the ingest DeadLetterQueue. Mirrors engine-singleton:
 // bootstrap calls setIngestDLQ(dlq) at startup; routes call getIngestDLQ()

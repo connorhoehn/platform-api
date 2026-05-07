@@ -1,4 +1,4 @@
-// social-api/src/pipeline/config/pipelineModule.ts
+// platform-api/src/pipeline/config/pipelineModule.ts
 //
 // Pure builder for `PipelineModuleConfig`. distributed-core v0.7.2's
 // `PipelineModule.onInitialize()` threads the EventBus passthrough fields

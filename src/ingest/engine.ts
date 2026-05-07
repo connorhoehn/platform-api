@@ -1,4 +1,4 @@
-// social-api/src/ingest/engine.ts
+// platform-api/src/ingest/engine.ts
 //
 // Core orchestration logic for the ingest subsystem. Manages the lifecycle of
 // syncing sources and processing ingest items through the pipeline:

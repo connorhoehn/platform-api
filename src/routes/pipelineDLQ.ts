@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineDLQ.ts
+// platform-api/src/routes/pipelineDLQ.ts
 //
 // Operator surface for the EventBus dead-letter queue, backed by
 // distributed-core v0.11.0 T9 (lib-expansion-3) `InMemoryDeadLetterQueue`.
@@ -36,7 +36,7 @@
 // directly here — 10 writes / min / user — to keep destructive blast radius
 // bounded even when an operator script gets carried away. The library does
 // NOT ship authz, the gateway is responsible for any role gating. Today the
-// social-api does not yet have an admin-role middleware in /api/pipelines, so
+// platform-api does not yet have an admin-role middleware in /api/pipelines, so
 // these endpoints reuse the same Cognito-authenticated session as the rest of
 // the pipeline routes; folding in an admin gate when one exists is a Phase 50
 // follow-up.

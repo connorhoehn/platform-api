@@ -1,4 +1,4 @@
-// social-api/src/pipeline/definitions-repository.ts
+// platform-api/src/pipeline/definitions-repository.ts
 //
 // Wave 1 of the pipeline-definitions persistence migration.
 // Replaces the in-memory `stubStore` in routes/pipelineDefinitions.ts with a

@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestDLQ.ts
+// platform-api/src/ingest/routes/ingestDLQ.ts
 //
 // REST endpoints for the ingest DeadLetterQueue (T9 / library-expansion-3
 // from distributed-core). Per AGENTIC_ETL_VISION §F + slice I, operators

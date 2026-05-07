@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/registry.ts
+// platform-api/src/pipeline/ingest-steps/registry.ts
 //
 // Step-handler registry for ingest-aware pipeline node types. The pipeline
 // executor in distributed-core dispatches a fixed set of node types

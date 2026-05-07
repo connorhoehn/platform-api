@@ -1,5 +1,5 @@
 /**
- * Structured JSON logger (pino) for social-api.
+ * Structured JSON logger (pino) for platform-api.
  *
  * Usage:
  *   import log, { withContext } from './lib/logger';
@@ -7,14 +7,14 @@
  *   reqLog.info({ action: 'trigger.create' }, 'pipeline triggered');
  *
  * Configuration:
- *   - SERVICE_NAME (default: 'social-api')
+ *   - SERVICE_NAME (default: 'platform-api')
  *   - LOG_LEVEL    (default: 'info')
  *   - NODE_ENV=development uses pino-pretty if available, else plain JSON.
  */
 
 import pino, { Logger, LoggerOptions } from 'pino';
 
-const serviceName = process.env.SERVICE_NAME || 'social-api';
+const serviceName = process.env.SERVICE_NAME || 'platform-api';
 const level = process.env.LOG_LEVEL || 'info';
 const isDev = process.env.NODE_ENV === 'development';
 

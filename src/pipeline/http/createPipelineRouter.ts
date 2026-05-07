@@ -2,15 +2,15 @@
 //
 // IMPORTANT — module-shaped artifact:
 //   This file is the seam where the pipeline HTTP surface stops being
-//   "social-api code" and becomes "PipelineModule code that happens to be
-//   hosted in social-api today". It's structured so that, when the module
+//   "platform-api code" and becomes "PipelineModule code that happens to be
+//   hosted in platform-api today". It's structured so that, when the module
 //   relocates into distributed-core, the file itself is `git mv`ed
-//   without modification. The host (today: social-api/src/app.ts) injects
+//   without modification. The host (today: platform-api/src/app.ts) injects
 //   everything that varies between hosts via the `PipelineRouterDeps`
 //   options bag — auth, persistence lookup, the bridge into the runtime.
 //
 //   Constraints:
-//     - Only `express` is imported. No social-api middleware, no Cognito,
+//     - Only `express` is imported. No platform-api middleware, no Cognito,
 //       no DDB clients, no distributed-core internals.
 //     - All cross-process knowledge (who the user is, where definitions
 //       live, how to call the runtime) flows through `deps`.
@@ -19,7 +19,7 @@
 //       and the route handlers themselves are unchanged.
 //
 // Refs:
-//   - .planning/HANDOFF-distributed-core-social-api-absorption.md
+//   - .planning/HANDOFF-distributed-core-platform-api-absorption.md
 //     §"Reframe item 1", §"Item 2 is the most important to get right"
 
 import {
@@ -115,10 +115,10 @@ export interface PipelineRouterDeps {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers — no `express` middleware imported from social-api.
+// Internal helpers — no `express` middleware imported from platform-api.
 // ---------------------------------------------------------------------------
 
-/** Local async-handler wrapper so we don't depend on social-api's. */
+/** Local async-handler wrapper so we don't depend on platform-api's. */
 function wrap(
   fn: (req: Request, res: Response, next: NextFunction) => Promise<void>,
 ): RequestHandler {

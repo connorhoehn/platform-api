@@ -1,4 +1,4 @@
-// social-api/src/pipeline/AnthropicLLMClient.ts
+// platform-api/src/pipeline/AnthropicLLMClient.ts
 //
 // Anthropic provider implementation of LLMClient. Lazy-requires
 // @anthropic-ai/sdk so the module is only loaded when stream() is called —

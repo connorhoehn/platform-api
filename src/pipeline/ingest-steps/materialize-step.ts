@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/materialize-step.ts
+// platform-api/src/pipeline/ingest-steps/materialize-step.ts
 //
 // `ingest:materialize` step type. Given (item, mappingDecision), writes a
 // typed document via the materializer. After materializing, runs the

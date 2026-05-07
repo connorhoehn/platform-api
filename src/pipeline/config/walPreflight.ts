@@ -1,4 +1,4 @@
-// social-api/src/pipeline/config/walPreflight.ts
+// platform-api/src/pipeline/config/walPreflight.ts
 //
 // Fail-fast writability check for WAL parent directories. Run BEFORE
 // Cluster.create() so operators get a clear, actionable error instead of an

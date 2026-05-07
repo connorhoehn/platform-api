@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineHealth.ts
+// platform-api/src/routes/pipelineHealth.ts
 //
 // GET /api/pipelines/health — runtime introspection for the pipeline subsystem.
 //

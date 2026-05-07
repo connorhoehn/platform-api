@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineResume.ts
+// platform-api/src/routes/pipelineResume.ts
 //
 // hub#2223 — Resume a failed pipeline run from a specific step. Unlike
 // `pipelineRetry.ts` (which spawns a brand-new run that consumes the original
@@ -35,7 +35,7 @@ import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { getDynamoClient } from '../lib/ddb-client';
 
 const log = withContext({ route: 'pipelineResume' });
-const tracer = trace.getTracer('social-api');
+const tracer = trace.getTracer('platform-api');
 
 /** Fire-and-forget audit write — mirrors the pipelineRetry pattern. */
 function fireAndForgetAudit(event: AuditEvent): void {

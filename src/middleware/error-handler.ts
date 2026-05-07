@@ -1,5 +1,5 @@
 /**
- * Central error middleware for social-api.
+ * Central error middleware for platform-api.
  *
  * Usage in route handlers:
  *   throw new NotFoundError('Post not found');

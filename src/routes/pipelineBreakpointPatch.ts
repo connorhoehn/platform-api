@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineBreakpointPatch.ts
+// platform-api/src/routes/pipelineBreakpointPatch.ts
 //
 // hub#2226 — edit-and-continue HTTP surface for paused-run context patching.
 // Sits next to pipelineBreakpointRouter (resolve) and shares the same URL
@@ -38,7 +38,7 @@ import { getPipelineBridge, type PipelineRunSnapshot } from '../pipeline/bridge-
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 
 const log = withContext({ route: 'pipelineBreakpointPatch' });
-const tracer = trace.getTracer('social-api');
+const tracer = trace.getTracer('platform-api');
 
 function fireAndForgetAudit(event: AuditEvent): void {
   auditRepo.record(event).catch((err: unknown) => {

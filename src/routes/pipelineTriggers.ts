@@ -31,7 +31,7 @@ export {
 export { stubRunStore, ACTIVE_STATUSES, type StubRunRecord, type StubRunStatus } from '../pipeline/stub-run-store';
 
 const log = withContext({ route: 'pipelineTriggers' });
-const tracer = trace.getTracer('social-api');
+const tracer = trace.getTracer('platform-api');
 
 function fireAndForgetAudit(
   event: Parameters<typeof auditRepo.record>[0],

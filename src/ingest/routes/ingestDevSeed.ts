@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestDevSeed.ts
+// platform-api/src/ingest/routes/ingestDevSeed.ts
 //
 // Dev-only seed-fake-content endpoint. AGENTIC_ETL_VISION slice J — operators
 // (and devs evaluating the UI) can hit a button instead of dropping to a shell

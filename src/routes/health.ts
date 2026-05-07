@@ -39,7 +39,7 @@ router.get('/', async (_req, res) => {
 
   res.status(statusCode).json({
     status: allHealthy ? 'ok' : 'degraded',
-    service: 'social-api',
+    service: 'platform-api',
     checks,
   });
 });

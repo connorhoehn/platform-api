@@ -17,7 +17,8 @@ const docClient = { send: mockSend } as unknown as DynamoDBDocumentClient;
 const SESSION: VideoSessionRecord = {
   documentId: 'doc-1',
   sessionId: 'sess-1',
-  vnlSessionId: 'vnl-abc',
+  channelArn: 'arn:aws:ivs:us-east-1:123:channel/abc',
+  streamKey: 'sk-abc123',
   status: 'active',
   startedAt: '2026-01-01T10:00:00Z',
   startedBy: 'user-1',

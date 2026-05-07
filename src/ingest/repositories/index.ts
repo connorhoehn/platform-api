@@ -1,5 +1,5 @@
 // Singleton instances for ingest repositories — mirrors the pattern in
-// social-api/src/repositories/index.ts. Share the same docClient so
+// platform-api/src/repositories/index.ts. Share the same docClient so
 // connection pooling is centralized.
 
 import { docClient } from '../../lib/aws-clients';

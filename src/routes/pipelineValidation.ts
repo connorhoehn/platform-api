@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineValidation.ts
+// platform-api/src/routes/pipelineValidation.ts
 //
 // POST /api/pipelines/validate
 //
@@ -31,7 +31,7 @@
 //
 // IMPORTANT: this file is intentionally a near-duplicate of the frontend
 // validator's structural-rules subset. Cross-tree imports between
-// `frontend/` and `social-api/` get messy (different tsconfigs, build
+// `frontend/` and `platform-api/` get messy (different tsconfigs, build
 // targets, dependency graphs), so the two stay separate by design.
 
 import { Router, type Request, type Response } from 'express';

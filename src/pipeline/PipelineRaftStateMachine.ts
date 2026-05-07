@@ -1,4 +1,4 @@
-// social-api/src/pipeline/PipelineRaftStateMachine.ts
+// platform-api/src/pipeline/PipelineRaftStateMachine.ts
 //
 // Raft-replicated state machine for pipeline-run lifecycle. Implements
 // `IRaftStateMachine<TCommand, TResult>` from distributed-core's Raft surface

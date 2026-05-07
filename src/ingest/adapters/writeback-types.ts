@@ -1,4 +1,4 @@
-// social-api/src/ingest/adapters/writeback-types.ts
+// platform-api/src/ingest/adapters/writeback-types.ts
 //
 // Local minimal definition of the WriteBackDriver contract from the
 // Agentic ETL vision doc (section D "Bidirectional sync").

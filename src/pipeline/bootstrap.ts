@@ -1,7 +1,7 @@
-// social-api/src/pipeline/bootstrap.ts
+// platform-api/src/pipeline/bootstrap.ts
 //
 // Bootstrap that stands up an in-process distributed-core Cluster +
-// PipelineModule for the social-api service. This file is the *composition
+// PipelineModule for the platform-api service. This file is the *composition
 // layer* — it resolves env-derived options, calls each `config/*` builder,
 // then stitches the cluster lifecycle (Cluster.create / start, registry
 // start, module register/initialize, shutdown) together.
@@ -38,7 +38,7 @@
 //                                Default 7100 (matches Phase 4 planning).
 //   SEED_NODES                  Comma-separated host:port list for TCP
 //                                transport discovery (e.g.
-//                                "social-api-0:7100,social-api-1:7100").
+//                                "platform-api-0:7100,platform-api-1:7100").
 //                                Only used when PIPELINE_CLUSTER_TRANSPORT=tcp.
 //   PIPELINE_PUBSUB_MODE        'memory' | 'redis'. Default 'memory'. Multi-node
 //                                deploys use 'redis' for cross-replica pubsub.
@@ -47,7 +47,7 @@
 //                                "redis://localhost:6379").
 //   PIPELINE_WAL_PATH           EventBus WAL path. When set, pipeline run
 //                                state survives restart. Default:
-//                                  '/var/lib/social-api/pipeline-wal.log' (prod)
+//                                  '/var/lib/platform-api/pipeline-wal.log' (prod)
 //                                  '/tmp/pipeline-wal.log'                 (dev)
 //                                Set =disabled to opt out and run in-memory.
 //   PIPELINE_REGISTRY_WAL_PATH  ResourceRegistry entity WAL path. When set,
@@ -282,7 +282,7 @@ function resolveOptions(opts: BootstrapOptions): ResolvedBootstrapOptions {
     }
   } else {
     walFilePath = process.env.NODE_ENV === 'production'
-      ? '/var/lib/social-api/pipeline-wal.log'
+      ? '/var/lib/platform-api/pipeline-wal.log'
       : '/tmp/pipeline-wal.log';
   }
 
@@ -310,8 +310,8 @@ function resolveOptions(opts: BootstrapOptions): ResolvedBootstrapOptions {
     identityFilePath = undefined;
   } else {
     identityFilePath = process.env.NODE_ENV === 'production'
-      ? '/var/lib/social-api/node-identity'
-      : '/tmp/social-api-node-identity';
+      ? '/var/lib/platform-api/node-identity'
+      : '/tmp/platform-api-node-identity';
   }
 
   // Registry WAL: tests fall through to undefined → 'memory' for hermetic
@@ -330,8 +330,8 @@ function resolveOptions(opts: BootstrapOptions): ResolvedBootstrapOptions {
     ?? process.env.PIPELINE_RAFT_DATA_DIR
     ?? (registryMode === 'raft'
       ? (process.env.NODE_ENV === 'production'
-          ? '/var/lib/social-api/raft'
-          : `/tmp/social-api-raft-${process.pid}`)
+          ? '/var/lib/platform-api/raft'
+          : `/tmp/platform-api-raft-${process.pid}`)
       : undefined);
 
   // Raft signer dir: per-node KeyManager secrets directory. Off by default
@@ -407,7 +407,7 @@ function resolveRegistryWalPath(explicit: string | undefined): string | undefine
   if (envValue !== undefined && envValue !== '') return envValue;
   if (isPipelineTestEnv()) return undefined;
   return process.env.NODE_ENV === 'production'
-    ? '/var/lib/social-api/pipeline-registry-wal.log'
+    ? '/var/lib/platform-api/pipeline-registry-wal.log'
     : '/tmp/pipeline-registry-wal.log';
 }
 

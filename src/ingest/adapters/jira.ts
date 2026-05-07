@@ -1,4 +1,4 @@
-// social-api/src/ingest/adapters/jira.ts
+// platform-api/src/ingest/adapters/jira.ts
 //
 // Jira connector — Tier 2 in the agentic-ETL vision (Agent D slice).
 //

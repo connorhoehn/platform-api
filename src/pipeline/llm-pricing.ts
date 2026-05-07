@@ -1,4 +1,4 @@
-// social-api/src/pipeline/llm-pricing.ts
+// platform-api/src/pipeline/llm-pricing.ts
 //
 // Hardcoded LLM pricing table for cost estimation. Prices are per million tokens.
 // Can be made configurable (env or DDB table) in a later iteration.

@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestConflicts.ts
+// platform-api/src/ingest/routes/ingestConflicts.ts
 //
 // Backend endpoints for the operator write-back conflict queue.
 //

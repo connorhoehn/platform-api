@@ -1,4 +1,4 @@
-// social-api/src/pipeline/definitions-cache.ts
+// platform-api/src/pipeline/definitions-cache.ts
 //
 // Cross-user, in-memory cache of pipeline definitions, refreshed on a fixed
 // interval (default 60s) by calling `definitionsRepo.listAll()`.

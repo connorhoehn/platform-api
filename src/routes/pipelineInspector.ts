@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineInspector.ts
+// platform-api/src/routes/pipelineInspector.ts
 //
 // Operator introspection endpoints for the pipeline run-queue, backed by
 // distributed-core v0.11.0 T13 (lib-expansion-3) `QueueInspector`. Reads

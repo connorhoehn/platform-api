@@ -1,4 +1,4 @@
-// social-api/src/pipeline/StuckRunDetector.ts
+// platform-api/src/pipeline/StuckRunDetector.ts
 //
 // Hub task #1285 — detect pipeline runs whose steps have gone silent past a
 // configurable threshold. Strategy: RunPersistenceService tracks `lastEventAt`

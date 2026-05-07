@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineLLMStream.ts
+// platform-api/src/routes/pipelineLLMStream.ts
 //
 // POST /api/pipelines/llm/stream — server-side LLM streaming proxy.
 //

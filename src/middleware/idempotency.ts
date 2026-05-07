@@ -1,4 +1,4 @@
-// social-api/src/middleware/idempotency.ts
+// platform-api/src/middleware/idempotency.ts
 //
 // Idempotency-Key middleware + in-memory cache helper.
 //

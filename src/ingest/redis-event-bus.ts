@@ -44,7 +44,7 @@ export class RedisIngestEventBus implements IngestEventBus {
   }
 
   emit(event: IngestEvent): void {
-    // Local handlers (for in-process consumers like the social-api bridge)
+    // Local handlers (for in-process consumers like the platform-api bridge)
     for (const handler of this.handlers) {
       try {
         handler(event);

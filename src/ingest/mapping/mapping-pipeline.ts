@@ -1,4 +1,4 @@
-// social-api/src/ingest/mapping/mapping-pipeline.ts
+// platform-api/src/ingest/mapping/mapping-pipeline.ts
 //
 // Mapping engine v2 — chained fast-path + LLM fallback + needs-review queue
 // + DocType-proposal queue. Wraps the existing rule-matcher (rule-matcher.ts)

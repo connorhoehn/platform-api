@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestSources.ts
+// platform-api/src/ingest/routes/ingestSources.ts
 //
 // REST endpoints for ingest source configuration and lifecycle.
 //

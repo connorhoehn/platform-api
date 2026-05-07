@@ -6,7 +6,7 @@
 //
 // Env:
 //   OTEL_TRACING_DISABLED=true      → skip entirely (no-op shutdown)
-//   OTEL_SERVICE_NAME               → service.name attribute (default: social-api)
+//   OTEL_SERVICE_NAME               → service.name attribute (default: platform-api)
 //   OTEL_EXPORTER_OTLP_ENDPOINT     → OTLP HTTP collector base URL
 //                                     (default: http://localhost:4318)
 
@@ -26,7 +26,7 @@ export function start(): TracingShutdown {
     return NOOP_SHUTDOWN;
   }
 
-  const serviceName = process.env.OTEL_SERVICE_NAME ?? 'social-api';
+  const serviceName = process.env.OTEL_SERVICE_NAME ?? 'platform-api';
   const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://localhost:4318';
 
   // OTLPTraceExporter expects the traces signal URL. The OTLP HTTP convention

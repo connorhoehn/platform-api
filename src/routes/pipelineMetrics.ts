@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineMetrics.ts
+// platform-api/src/routes/pipelineMetrics.ts
 //
 // Two routers in one file (kept colocated for owner-bookkeeping reasons):
 //
@@ -15,7 +15,7 @@
 //        GET /api/observability/dashboard → cluster dashboard snapshot
 //        GET /api/observability/metrics   → Prom-style metrics summary
 //      Both endpoints stub-fill synthetic data when no live cluster is wired
-//      so the frontend dashboards can light up against social-api.
+//      so the frontend dashboards can light up against platform-api.
 //
 // Both stubs are deterministic-ish (bucketed by minute/hour) so the dashboard
 // shows lifelike change without flickering wildly between polls.

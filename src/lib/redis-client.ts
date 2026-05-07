@@ -1,5 +1,5 @@
 /**
- * Shared Redis client for the social-api.
+ * Shared Redis client for the platform-api.
  *
  * Used by:
  * - Cache layer (profile, room, group lookups)

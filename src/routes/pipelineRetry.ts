@@ -1,4 +1,4 @@
-// social-api/src/routes/pipelineRetry.ts
+// platform-api/src/routes/pipelineRetry.ts
 //
 // Pipeline run retry from specific node — resume execution from a failed step
 // without re-running succeeded upstream nodes.
@@ -32,7 +32,7 @@ import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { getDynamoClient } from '../lib/ddb-client';
 
 const log = withContext({ route: 'pipelineRetry' });
-const tracer = trace.getTracer('social-api');
+const tracer = trace.getTracer('platform-api');
 
 /** Fire-and-forget audit write — mirrors the pipelineTriggers pattern. */
 function fireAndForgetAudit(event: AuditEvent): void {

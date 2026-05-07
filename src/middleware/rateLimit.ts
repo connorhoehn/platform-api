@@ -1,4 +1,4 @@
-// social-api/src/middleware/rateLimit.ts
+// platform-api/src/middleware/rateLimit.ts
 //
 // Per-key token-bucket rate limiter, structured to match
 // `middleware/idempotency.ts`:

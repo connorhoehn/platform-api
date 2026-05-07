@@ -1,4 +1,4 @@
-// social-api/src/ingest/routes/ingestAudit.ts
+// platform-api/src/ingest/routes/ingestAudit.ts
 //
 // Read-side route for the ingest audit log (hub#2214 — slice 2/3 of the
 // audit-viewer feature; foundation slice was hub#2213). Operators ask

@@ -1,4 +1,4 @@
-// social-api/src/pipeline/scanOrphanedRuns.ts
+// platform-api/src/pipeline/scanOrphanedRuns.ts
 //
 // Hub task #1282 — single-node restart recovery. Per ADR-DURABLE-PIPELINE-EXECUTION D2.
 //

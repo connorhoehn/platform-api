@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/event-trigger.ts
+// platform-api/src/pipeline/ingest-steps/event-trigger.ts
 //
 // `ingest:event` trigger node. Subscribes to the ingest event bus and, for
 // every event matching a pipeline's binding criteria, asks the supplied

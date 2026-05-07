@@ -1,4 +1,4 @@
-// social-api/src/ingest/bootstrap.ts
+// platform-api/src/ingest/bootstrap.ts
 //
 // Bootstrap for the ingest engine. Wires up distributed-core primitives:
 // - InMemoryBatchedQueue (sync tasks) + InMemoryBatchedQueue (ingest items)

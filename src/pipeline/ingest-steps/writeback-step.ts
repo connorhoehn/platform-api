@@ -1,4 +1,4 @@
-// social-api/src/pipeline/ingest-steps/writeback-step.ts
+// platform-api/src/pipeline/ingest-steps/writeback-step.ts
 //
 // `ingest:writeback` step type. Given (documentId, change), enqueues a
 // `WriteBackChange` on the writeback dispatcher. The dispatcher (Agent F)

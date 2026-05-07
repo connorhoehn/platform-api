@@ -1,4 +1,4 @@
-// social-api/src/pipeline/config/registries.ts
+// platform-api/src/pipeline/config/registries.ts
 //
 // Construct the application-layer registries that ApplicationRegistry passes
 // into PipelineModule's context. These are sibling concepts to the Cluster
