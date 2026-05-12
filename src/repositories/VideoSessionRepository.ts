@@ -81,4 +81,39 @@ export class VideoSessionRepository extends BaseRepository {
     // Sort by startedAt descending (newest first) since sessionId (UUID) is not temporal
     return results.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
   }
+
+  /**
+   * Find the newest active session for a given lobby name (a/k/a documentId —
+   * lobbyName is just a more honest field name now that this powers global /
+   * 1:1 / room lobbies in addition to document-scoped calls). Returns null
+   * if no active session exists.
+   *
+   * Used by `findOrCreate` on POST /api/video/sessions to dedupe concurrent
+   * joiners onto the same SFU channel.
+   */
+  async findActiveByLobbyName(lobbyName: string): Promise<VideoSessionRecord | null> {
+    const all = await this.getSessionsByDocument(lobbyName);
+    return all.find(s => s.status === 'active') ?? null;
+  }
+
+  /**
+   * Remove a participant from a session (by userId). Read-modify-write
+   * because DDB doesn't support "filter array by attribute" in a single op.
+   * Returns the new participants array length so callers can ref-count.
+   */
+  async removeParticipant(
+    documentId: string,
+    sessionId: string,
+    userId: string,
+  ): Promise<{ remaining: number } | null> {
+    const session = await this.getSession(documentId, sessionId);
+    if (!session) return null;
+    const next = (session.participants ?? []).filter(p => p.userId !== userId);
+    await this.updateItem({
+      Key: { documentId, sessionId },
+      UpdateExpression: 'SET participants = :participants',
+      ExpressionAttributeValues: { ':participants': next },
+    });
+    return { remaining: next.length };
+  }
 }
