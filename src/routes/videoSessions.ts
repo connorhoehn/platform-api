@@ -81,9 +81,19 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       }
     }
 
+    // The SFU gates POST /api/channels behind adminAuth (added in the
+    // recent live-video-streaming reconciliation). Platform-api is the only
+    // trusted in-cluster caller, so we send a Bearer ADMIN_TOKEN. The token
+    // is provisioned via `hack/genadmin.sh` in live-video-streaming and
+    // injected into our pod from the `admin-token` Secret. Falls back to
+    // literal 'admin' which matches the SFU's `||'admin'` default.
+    const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
     const channelRes = await fetch(`${VIDEO_API_URL}/api/channels`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
       body: JSON.stringify({ name: lobbyName }),
     });
 
