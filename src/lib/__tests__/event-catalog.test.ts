@@ -30,6 +30,8 @@ const mockCatalogPublish = jest.fn().mockResolvedValue(undefined);
 const mockGetSignalTransport = jest.fn();
 
 jest.mock('@connorhoehn/event-catalog', () => ({
+  // Pure pass-through for envelope helpers (no state, no I/O).
+  ...jest.requireActual('@connorhoehn/event-catalog'),
   EventCatalog: jest.fn().mockImplementation(() => ({
     connect: mockCatalogConnect,
     disconnect: mockCatalogDisconnect,

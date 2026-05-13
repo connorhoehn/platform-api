@@ -5,7 +5,13 @@
  * provides `publishSignal` for gateway-compatible Redis broadcasts,
  * and `publishDurable` for at-least-once message-queue delivery via DynamoDB outbox.
  */
-import { EventCatalog } from '@connorhoehn/event-catalog';
+import {
+  EventCatalog,
+  buildChannelMessageEnvelope,
+  buildSignalMessage,
+  channelMessageRedisChannel,
+  channelNodesRedisKey,
+} from '@connorhoehn/event-catalog';
 import { createClient, RedisClientType } from 'redis';
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
@@ -435,28 +441,24 @@ export async function publishSignal(
   const client = await getBroadcastClient();
 
   // Look up which gateway nodes are subscribed to this channel
-  const targetNodes = await client.sMembers(`websocket:channel:${channelId}:nodes`);
+  const targetNodes = await client.sMembers(channelNodesRedisKey(channelId));
   if (targetNodes.length === 0) return; // No listeners, skip
 
   const now = new Date().toISOString();
-
-  const envelope = {
-    type: 'channel_message',
+  const envelope = buildChannelMessageEnvelope({
     channel: channelId,
-    message: {
-      type: eventName,
+    message: buildSignalMessage({
+      eventName,
       channel: channelId,
       payload,
       timestamp: now,
-    },
-    excludeClientId: null,
+    }),
     fromNode: 'platform-api',
-    seq: 0,
     timestamp: now,
     targetNodes,
-  };
+  });
 
-  await client.publish(`websocket:route:${channelId}`, JSON.stringify(envelope));
+  await client.publish(channelMessageRedisChannel(channelId), JSON.stringify(envelope));
 }
 
 // ---------------------------------------------------------------------------
