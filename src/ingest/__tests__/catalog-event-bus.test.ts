@@ -4,11 +4,15 @@
 // publishing, error resilience, and on/off handler management.
 
 const mockSignalPublish = jest.fn<Promise<void>, [string, unknown]>();
+const mockValidate = jest.fn<{ valid: boolean; errors?: Array<{ message: string }> }, [string, unknown]>();
 
 jest.mock('../../lib/event-catalog', () => ({
   catalog: {
     getSignalTransport: jest.fn(() => ({
       publish: mockSignalPublish,
+    })),
+    getRegistry: jest.fn(() => ({
+      validate: mockValidate,
     })),
   },
 }));
@@ -23,6 +27,7 @@ import type { IngestEvent } from '../types';
 beforeEach(() => {
   jest.clearAllMocks();
   mockSignalPublish.mockResolvedValue(undefined);
+  mockValidate.mockReturnValue({ valid: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -136,5 +141,52 @@ describe('on/off', () => {
     const handler = jest.fn();
 
     expect(() => bus.off(handler)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase P3.2 — discriminator validation (registry-backed)
+// ---------------------------------------------------------------------------
+
+describe('emit — discriminator validation (Phase P3.2)', () => {
+  it('calls registry.validate with ingest:progress and the event payload', () => {
+    const bus = new CatalogIngestEventBus();
+    const event = makeEvent({ type: 'sync.started' });
+    bus.emit(event);
+    expect(mockValidate).toHaveBeenCalledTimes(1);
+    expect(mockValidate).toHaveBeenCalledWith('ingest:progress', event);
+  });
+
+  it('warns when validation fails (e.g. unknown discriminator value)', () => {
+    mockValidate.mockReturnValue({
+      valid: false,
+      errors: [{ message: 'must be equal to one of the allowed values' }],
+    });
+    const bus = new CatalogIngestEventBus();
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    bus.emit(makeEvent({ type: 'sync.invented' as unknown as 'sync.started' }));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ingest:progress validation failed'));
+    warn.mockRestore();
+  });
+
+  it('valid sub-type does NOT log a warning', () => {
+    mockValidate.mockReturnValue({ valid: true });
+    const bus = new CatalogIngestEventBus();
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    bus.emit(makeEvent({ type: 'sync.started' }));
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('still publishes to signal transport even when validation fails', () => {
+    mockValidate.mockReturnValue({
+      valid: false,
+      errors: [{ message: 'discriminator mismatch' }],
+    });
+    const bus = new CatalogIngestEventBus();
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    bus.emit(makeEvent({ type: 'sync.invented' as unknown as 'sync.started' }));
+    expect(mockSignalPublish).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 });

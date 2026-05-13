@@ -192,17 +192,38 @@ catalog.declare({
   },
 });
 
+// `ingest:progress` is an envelope event carrying 10 distinct sub-shapes
+// discriminated by `payload.type`. The actual sub-type union is
+// IngestEvent in src/ingest/types.ts — keep this list in sync.
+// Phase P3.2 — exercises event-catalog Phase E3.6 discriminator validation.
+export const INGEST_PROGRESS_DISCRIMINATOR_VALUES = [
+  'sync.started',
+  'sync.file.fetched',
+  'item.status',
+  'item.mapped',
+  'item.materialized',
+  'item.pipeline.spawned',
+  'item.failed',
+  'item.review.triggered',
+  'sync.completed',
+  'source.status',
+] as const;
+
 catalog.declare({
   name: 'ingest:progress',
   transport: 'signal',
   producer: 'platform-api',
-  description: 'Ingest pipeline progress event (various shapes with type discriminator)',
+  description: 'Ingest pipeline progress event — envelope carrying 10 sub-shapes discriminated by payload.type.',
   schema: {
     type: 'object',
     properties: {
-      type: { type: 'string' },
+      type: { type: 'string', enum: [...INGEST_PROGRESS_DISCRIMINATOR_VALUES] },
     },
     required: ['type'],
+  },
+  discriminator: {
+    field: 'type',
+    values: [...INGEST_PROGRESS_DISCRIMINATOR_VALUES],
   },
 });
 

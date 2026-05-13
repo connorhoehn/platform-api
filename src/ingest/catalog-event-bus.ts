@@ -27,6 +27,22 @@ export class CatalogIngestEventBus implements IngestEventBus {
       }
     }
 
+    // Phase P3.2 — defensive validation against the registered schema
+    // (which now carries the discriminator's enum constraint). Surfaces
+    // sub-type drift at publish time; logged-only so a bad event never
+    // blocks the ingest loop.
+    try {
+      const result = catalog.getRegistry().validate('ingest:progress', event);
+      if (!result.valid) {
+        const errors = result.errors?.map((e) => e.message).join('; ') ?? 'unknown';
+        console.warn(
+          `[catalog-ingest-event-bus] ingest:progress validation failed for type="${event.type}": ${errors}`,
+        );
+      }
+    } catch {
+      // Registry lookup failures (e.g. event not yet declared) are non-fatal.
+    }
+
     // Publish to Redis via the catalog's signal transport (fire-and-forget)
     const envelope: EventEnvelope = {
       eventName: 'ingest:progress',
