@@ -9,9 +9,7 @@ import { createScheduleEvaluator } from './services/scheduleEvaluator';
 import { createDDBSchedulerLeaderLock } from './services/scheduler-leader-lock';
 import { pipelineDefinitionsCache } from './pipeline/definitions-cache';
 import { startInvalidationSubscriber } from './pipeline/definitions-invalidator';
-import { setPipelineBridge } from './routes/pipelineTriggers';
-import { bootstrapPipeline } from './pipeline/bootstrap';
-import { createBridge } from './pipeline/createBridge';
+import { wirePipelineBridge } from './pipeline/wire-bridge';
 import { PipelineRunRepository } from './repositories/PipelineRunRepository';
 import { DLQRepository } from './repositories/DLQRepository';
 import { docClient } from './lib/aws-clients';
@@ -128,28 +126,12 @@ const dlqRepository = dlqPersistenceEnabled
   ? new DLQRepository(docClient)
   : undefined;
 
-bootstrapPipeline({ pipelineRunRepository, dlqRepository })
-  .then(({ module, nodeId, dlq, shutdown }) => {
-    pipelineShutdown = shutdown;
-    setPipelineBridge(createBridge(module, dlq, pipelineRunRepository));
-    log.info({
-      nodeId,
-      runPersistence: runPersistenceEnabled,
-      dlqPersistence: dlqPersistenceEnabled
-    }, 'PipelineModule bootstrapped');
-  })
-  .catch((err: unknown) => {
-    const e = err as { message?: string; stack?: string; name?: string };
-    log.error(
-      {
-        errName: e?.name,
-        errMessage: e?.message,
-        errStack: e?.stack,
-      },
-      'PipelineModule bootstrap FAILED — pipeline bridge is NOT wired; ' +
-        'all triggers will fall back to in-memory stub and runs will NOT persist',
-    );
-  });
+const pipelineWiring = wirePipelineBridge({
+  pipelineRunRepository,
+  dlqRepository,
+  log,
+});
+pipelineShutdown = pipelineWiring.shutdown;
 
 // ---------------------------------------------------------------------------
 // Ingest engine bootstrap — wires IngestEngine with catalog-backed event bus
