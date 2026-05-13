@@ -1,8 +1,7 @@
 // Jest config for platform-api unit tests.
 //
-// Hoists transformer + paths so `cd platform-api && npx jest <pattern>` works
-// without needing jest installed in the platform-api workspace — the root
-// repo provides `jest` and `ts-jest` via its devDependencies.
+// platform-api is a standalone repo (extracted from websocket-gateway/social-api);
+// jest + ts-jest are installed in its own devDependencies.
 
 const path = require('path');
 
@@ -22,8 +21,7 @@ module.exports = {
   setupFiles: ['<rootDir>/jest.setup.js'],
   transform: {
     '^.+\\.tsx?$': [
-      // ts-jest is hoisted to the workspace root.
-      path.resolve(__dirname, '..', 'node_modules', 'ts-jest'),
+      'ts-jest',
       {
         // Keep type-checks fast: rely on `tsc --noEmit` for full typing.
         // ts-jest's per-file isolatedModules option moved into tsconfig in
