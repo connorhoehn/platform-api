@@ -248,7 +248,7 @@ describe('ScheduleEvaluator.start / stop', () => {
     expect(() => evaluator.stop()).not.toThrow();
   });
 
-  test('tick() errors inside the interval are caught by start()', () => {
+  test('tick() errors inside the interval are caught by start()', async () => {
     jest.useFakeTimers();
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     let call = 0;
@@ -259,7 +259,11 @@ describe('ScheduleEvaluator.start / stop', () => {
       now: () => new Date(2026, 3, 23, 10, 30, 0),
     });
     evaluator.start();
-    jest.advanceTimersByTime(150); // triggers the tick which throws
+    // Phase 54.6.1: runProtectedTick is async; advance fake timers AND let
+    // the resulting promise chain settle so the .catch() fires.
+    jest.advanceTimersByTime(150);
+    await Promise.resolve();
+    await Promise.resolve();
     evaluator.stop();
     expect(errSpy).toHaveBeenCalledWith(
       '[scheduleEvaluator] tick error',
@@ -285,6 +289,95 @@ describe('ScheduleEvaluator.tick — trigger error catch', () => {
       expect.any(Error),
     );
     errSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 54.6.1 — leader lock integration
+// ---------------------------------------------------------------------------
+
+describe('ScheduleEvaluator.runProtectedTick — leader lock', () => {
+  function makeFakeLock(acquireResult: boolean) {
+    const calls = { acquire: 0, release: 0, ttlMsSeen: [] as number[] };
+    return {
+      calls,
+      acquire: async (ttlMs: number) => {
+        calls.acquire += 1;
+        calls.ttlMsSeen.push(ttlMs);
+        return acquireResult;
+      },
+      release: async () => { calls.release += 1; },
+    };
+  }
+
+  test('runs the tick when no lock is configured (legacy behavior)', async () => {
+    const fired: string[] = [];
+    const evaluator = createScheduleEvaluator({
+      listPipelines: () => [pipeline({ id: 'no-lock' })],
+      trigger: async (id) => { fired.push(id); },
+    });
+    const ran = await evaluator.runProtectedTick(new Date(2026, 3, 23, 10, 30, 0));
+    expect(ran).toBe(true);
+    await Promise.resolve();
+    expect(fired).toEqual(['no-lock']);
+  });
+
+  test('skips the tick when lock cannot be acquired (another replica is leader)', async () => {
+    const fired: string[] = [];
+    const lock = makeFakeLock(false);
+    const evaluator = createScheduleEvaluator({
+      listPipelines: () => [pipeline({ id: 'should-skip' })],
+      trigger: async (id) => { fired.push(id); },
+      leaderLock: lock,
+    });
+    const ran = await evaluator.runProtectedTick(new Date(2026, 3, 23, 10, 30, 0));
+    expect(ran).toBe(false);
+    expect(lock.calls.acquire).toBe(1);
+    expect(lock.calls.release).toBe(0); // never acquired, no release
+    expect(fired).toEqual([]);
+  });
+
+  test('runs the tick when lock is acquired and releases after', async () => {
+    const fired: string[] = [];
+    const lock = makeFakeLock(true);
+    const evaluator = createScheduleEvaluator({
+      listPipelines: () => [pipeline({ id: 'is-leader' })],
+      trigger: async (id) => { fired.push(id); },
+      leaderLock: lock,
+    });
+    const ran = await evaluator.runProtectedTick(new Date(2026, 3, 23, 10, 30, 0));
+    expect(ran).toBe(true);
+    expect(lock.calls.acquire).toBe(1);
+    expect(lock.calls.release).toBe(1);
+    await Promise.resolve();
+    expect(fired).toEqual(['is-leader']);
+  });
+
+  test('passes 2x pollIntervalMs as the lock TTL', async () => {
+    const lock = makeFakeLock(true);
+    const evaluator = createScheduleEvaluator({
+      pollIntervalMs: 30_000,
+      listPipelines: () => [],
+      trigger: async () => { /* no-op */ },
+      leaderLock: lock,
+    });
+    await evaluator.runProtectedTick(new Date(2026, 3, 23, 10, 30, 0));
+    expect(lock.calls.ttlMsSeen[0]).toBe(60_000); // 2 * 30_000
+  });
+
+  test('release errors do not propagate (best-effort)', async () => {
+    const lock = {
+      acquire: async () => true,
+      release: async () => { throw new Error('ddb timeout'); },
+    };
+    const evaluator = createScheduleEvaluator({
+      listPipelines: () => [pipeline({ id: 'release-error' })],
+      trigger: async () => { /* no-op */ },
+      leaderLock: lock,
+    });
+    await expect(
+      evaluator.runProtectedTick(new Date(2026, 3, 23, 10, 30, 0)),
+    ).resolves.toBe(true);
   });
 });
 

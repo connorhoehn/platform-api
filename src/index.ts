@@ -6,6 +6,7 @@ const tracingShutdown = startTracing();
 
 import { createApp } from './app';
 import { createScheduleEvaluator } from './services/scheduleEvaluator';
+import { createDDBSchedulerLeaderLock } from './services/scheduler-leader-lock';
 import { pipelineDefinitionsCache } from './pipeline/definitions-cache';
 import { setPipelineBridge } from './routes/pipelineTriggers';
 import { bootstrapPipeline } from './pipeline/bootstrap';
@@ -243,6 +244,15 @@ const scheduler = createScheduleEvaluator({
     // Phase 1: log only. Phase 4 will create a pipeline run via ResourceRouter.
     log.info({ pipelineId, payload }, 'scheduler firing');
   },
+  // Phase 54.6.1 — multi-replica safe leader election. Without this, every
+  // replica's tick would fire every matching cron pipeline once per minute,
+  // causing N-fold duplicate runs. The DDB-conditional lock here mirrors
+  // outbox-drainer's lease pattern. Owner id includes hostname + pid so
+  // operators can identify which replica is currently the leader from the
+  // DDB row.
+  leaderLock: createDDBSchedulerLeaderLock(
+    `${process.env.HOSTNAME ?? 'localhost'}-${process.pid}`,
+  ),
 });
 scheduler.start();
 

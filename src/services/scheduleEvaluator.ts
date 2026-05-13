@@ -32,7 +32,16 @@ export interface ScheduleEvaluatorOptions {
   listPipelines: () => Iterable<PipelineForSchedule>;
   /** For deterministic tests — defaults to `() => new Date()`. */
   now?: () => Date;
+  /**
+   * Phase 54.6.1 — leader-lock for multi-replica safety. When set, the
+   * timer-driven tick acquires the lock first; if another replica holds
+   * it, this replica skips the tick. When unset, every replica's timer
+   * fires every tick (legacy single-node behavior).
+   */
+  leaderLock?: SchedulerLeaderLock;
 }
+
+import type { SchedulerLeaderLock } from './scheduler-leader-lock';
 
 interface ParsedField {
   // Either '*' or an explicit Set<number> of valid values.
@@ -172,16 +181,45 @@ export class ScheduleEvaluator {
   start(): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      try {
-        this.tick();
-      } catch (err) {
+      this.runProtectedTick().catch(err => {
         console.error('[scheduleEvaluator] tick error', err);
-      }
+      });
     }, this.pollIntervalMs);
     // Don't keep the event loop alive solely for this timer (test ergonomics +
     // graceful shutdown — match the convention used by gateway timers).
     if (typeof this.timer === 'object' && this.timer && 'unref' in this.timer) {
       (this.timer as unknown as { unref: () => void }).unref();
+    }
+  }
+
+  /**
+   * Phase 54.6.1 — leader-gated tick. The timer calls this on every
+   * interval; it acquires the leader lock (if configured) and runs
+   * `tick()` only if leadership is granted. Returns true if the tick
+   * actually executed (acquired leader) or false if skipped (another
+   * replica holds the lock).
+   *
+   * When no `leaderLock` is configured, this degenerates to a direct
+   * tick() call — preserving the legacy single-node behavior.
+   */
+  async runProtectedTick(now: Date = this.nowFn()): Promise<boolean> {
+    if (!this.opts.leaderLock) {
+      this.tick(now);
+      return true;
+    }
+    // TTL: 2x the poll interval. Gives the tick body time to complete
+    // (typically << 1s) plus a buffer; auto-expires before the next tick
+    // so failover is bounded to a single skipped interval.
+    const ttlMs = this.pollIntervalMs * 2;
+    const acquired = await this.opts.leaderLock.acquire(ttlMs);
+    if (!acquired) {
+      return false;
+    }
+    try {
+      this.tick(now);
+      return true;
+    } finally {
+      await this.opts.leaderLock.release().catch(() => {});
     }
   }
 
