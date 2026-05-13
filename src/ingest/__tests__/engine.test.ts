@@ -134,6 +134,7 @@ function makeDeps(overrides: Partial<IngestEngineDeps> = {}): IngestEngineDeps {
         cursorRepository: makeCursorRepo(),
         documentRepository: makeDocumentRepo(),
         eventBus: makeEventBus(),
+        enqueueItem: jest.fn(async () => {}),
         ...overrides,
     };
 }

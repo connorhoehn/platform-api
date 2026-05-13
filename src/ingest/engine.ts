@@ -4,10 +4,13 @@
 // syncing sources and processing ingest items through the pipeline:
 //   fetch → map type → materialize document → update status
 //
-// Partitioned processing: each sourceId gets its own FIFO queue and worker
-// coroutine. Items within a source are processed in order; sources run in
-// parallel. When distributed-core publishes InMemoryConsumerGroup, the
-// ensurePartitionWorker / runPartitionWorker hooks are where it wires in.
+// Phase 54.6.3 — partition queues + per-source worker coroutines were removed
+// in favor of the durable `ingest:item.queued` event. The engine produces by
+// calling the injected `enqueueItem` dep; the IngestQueueConsumer (separate
+// module) subscribes to the durable queue and routes each delivery to
+// `processItem(ingestId, tags)`. Per-source FIFO ordering is preserved by the
+// message-queue's FIFO + partitionKey:sourceId configuration. This makes the
+// processing path safe for multi-replica deployment.
 
 import { randomUUID } from 'crypto';
 import type { IngestSourceRepository } from './repositories/IngestSourceRepository';
@@ -52,12 +55,24 @@ export interface IngestEventBus {
   off(handler: (event: IngestEvent) => void): void;
 }
 
+/**
+ * Phase 54.6.3 — publish a discovered ingest item to the durable queue.
+ * Default production binding is `publishDurable('ingest:item.queued', …)`;
+ * tests inject a fake that captures + replays into a fake consumer.
+ */
+export type EnqueueItem = (params: {
+  ingestId: string;
+  sourceId: string;
+  tags?: string[];
+}) => Promise<void>;
+
 export interface IngestEngineDeps {
   sourceRepository: IngestSourceRepository;
   itemRepository: IngestItemRepository;
   cursorRepository: SyncCursorRepository;
   documentRepository: TypedDocumentRepository;
   eventBus: IngestEventBus;
+  enqueueItem: EnqueueItem;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,18 +85,10 @@ export class IngestEngine {
   private readonly cursorRepo: SyncCursorRepository;
   private readonly documentRepo: TypedDocumentRepository;
   private readonly eventBus: IngestEventBus;
+  private readonly enqueueItem: EnqueueItem;
 
   private running = false;
   private scheduleTimer: ReturnType<typeof setInterval> | null = null;
-
-  // Partitioned queues: sourceId → ordered list of ingestIds.
-  // One worker coroutine runs per non-empty partition; items within a
-  // partition are processed sequentially; partitions run in parallel.
-  private readonly partitionQueues = new Map<string, string[]>();
-  private readonly partitionWorkers = new Map<string, Promise<void>>();
-
-  // Cache of file tags by ingestId — populated during sync, consumed during processItem
-  private readonly fileTags: Map<string, string[]> = new Map();
 
   constructor(deps: IngestEngineDeps) {
     this.sourceRepo = deps.sourceRepository;
@@ -89,6 +96,7 @@ export class IngestEngine {
     this.cursorRepo = deps.cursorRepository;
     this.documentRepo = deps.documentRepository;
     this.eventBus = deps.eventBus;
+    this.enqueueItem = deps.enqueueItem;
   }
 
   // -------------------------------------------------------------------------
@@ -100,15 +108,11 @@ export class IngestEngine {
     this.running = true;
 
     // Schedule checker — evaluates cron expressions every 60s.
+    // Phase 54.6.3b will leader-elect this via DistributedLock.
     this.scheduleTimer = setInterval(() => {
       void this.evaluateSchedules();
     }, 60_000);
     this.scheduleTimer.unref();
-
-    // Start workers for any items that were enqueued before start().
-    for (const [sourceId, queue] of this.partitionQueues) {
-      if (queue.length > 0) this.ensurePartitionWorker(sourceId);
-    }
   }
 
   async stop(): Promise<void> {
@@ -119,9 +123,6 @@ export class IngestEngine {
       clearInterval(this.scheduleTimer);
       this.scheduleTimer = null;
     }
-
-    // Wait for all active partition workers to finish their current item.
-    await Promise.all([...this.partitionWorkers.values()]);
   }
 
   // -------------------------------------------------------------------------
@@ -231,8 +232,12 @@ export class IngestEngine {
             documentId: null,
           });
 
-          // Enqueue for processing into the sourceId partition
-          this.enqueueForSource(sourceId, ingestId, file.tags);
+          // Phase 54.6.3 — publish to durable queue; consumer in any
+          // replica picks it up. Tags travel in the payload so the
+          // processing replica doesn't need a producer-replica cache.
+          await this.enqueueItem({ ingestId, sourceId, tags: file.tags });
+          recordIngestItem('queued');
+          recordIngestQueueDepthDelta(1);
 
           this.eventBus.emit({
             type: 'sync.file.fetched',
@@ -353,7 +358,9 @@ export class IngestEngine {
         documentId: null,
       });
 
-      this.enqueueForSource(sourceId, ingestId, file.tags);
+      await this.enqueueItem({ ingestId, sourceId, tags: file.tags });
+      recordIngestItem('queued');
+      recordIngestQueueDepthDelta(1);
     }
   }
 
@@ -361,9 +368,14 @@ export class IngestEngine {
    * Process a single ingest item through the pipeline:
    *   queued → mapping → materializing → triggering → done
    *
+   * Phase 54.6.3 — `tags` is supplied by the IngestQueueConsumer (which
+   * pulled the durable `ingest:item.queued` payload). Tags formerly lived
+   * in an in-process Map populated by `triggerSync` on the producer
+   * replica; that cache is gone — any replica can process any item.
+   *
    * On failure, the item is marked 'failed' with the error message.
    */
-  async processItem(ingestId: string): Promise<void> {
+  async processItem(ingestId: string, tags?: string[]): Promise<void> {
     const item = await this.itemRepo.getById(ingestId);
     if (!item) {
       return; // Item may have been deleted — skip silently
@@ -383,7 +395,7 @@ export class IngestEngine {
       }
 
       // Build a FileDescriptor from the item for rule matching
-      const cachedTags = this.fileTags.get(ingestId);
+      const cachedTags = tags;
       const fileDescriptor: FileDescriptor = {
         path: item.filePath,
         name: item.filePath.split('/').pop() || item.filePath,
@@ -493,7 +505,6 @@ export class IngestEngine {
 
       // --- Done ---
       await this.transitionStatus(item, 'done');
-      this.fileTags.delete(ingestId);
       recordIngestItem('done');
       recordIngestQueueDepthDelta(-1);
     } catch (err) {
@@ -503,7 +514,6 @@ export class IngestEngine {
         attempts: (item.attempts ?? 0) + 1,
       });
 
-      this.fileTags.delete(ingestId);
       recordIngestItem('failed');
       recordIngestQueueDepthDelta(-1);
       if ((item.attempts ?? 0) + 1 >= 3) {
@@ -564,46 +574,6 @@ export class IngestEngine {
     const elapsedMs = now.getTime() - lastSync.getTime();
 
     return elapsedMs >= intervalMinutes * 60_000;
-  }
-
-  // -------------------------------------------------------------------------
-  // Private — partitioned queue helpers
-  // -------------------------------------------------------------------------
-
-  private enqueueForSource(sourceId: string, ingestId: string, tags?: string[]): void {
-    let queue = this.partitionQueues.get(sourceId);
-    if (!queue) {
-      queue = [];
-      this.partitionQueues.set(sourceId, queue);
-    }
-    queue.push(ingestId);
-    if (tags && tags.length > 0) {
-      this.fileTags.set(ingestId, [...tags]);
-    }
-    recordIngestItem('queued');
-    recordIngestQueueDepthDelta(1);
-    if (this.running) this.ensurePartitionWorker(sourceId);
-  }
-
-  private ensurePartitionWorker(sourceId: string): void {
-    if (this.partitionWorkers.has(sourceId)) return;
-    const promise = this.runPartitionWorker(sourceId);
-    this.partitionWorkers.set(sourceId, promise);
-    void promise.finally(() => {
-      this.partitionWorkers.delete(sourceId);
-      // If items arrived while we were finishing, restart immediately.
-      const q = this.partitionQueues.get(sourceId);
-      if (q && q.length > 0 && this.running) this.ensurePartitionWorker(sourceId);
-    });
-  }
-
-  private async runPartitionWorker(sourceId: string): Promise<void> {
-    const queue = this.partitionQueues.get(sourceId);
-    if (!queue) return;
-    while (this.running && queue.length > 0) {
-      const ingestId = queue.shift()!;
-      await this.processItem(ingestId);
-    }
   }
 
   // -------------------------------------------------------------------------

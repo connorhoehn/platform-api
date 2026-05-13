@@ -397,6 +397,40 @@ catalog.declare({
   },
 });
 
+// Phase 54.6.3 — `ingest:item.queued` is the durable handoff between the
+// ingest sync stage (file discovery) and the ingest processing stage
+// (mapping → materialization → pipeline trigger). The previous in-process
+// partition queue could only fan out within a single replica; the durable
+// queue lets any platform-api replica pick the item up. FIFO with
+// `partitionKey: sourceId` preserves per-source ordering through the queue.
+//
+// Tags are embedded in the payload so the consumer doesn't need an in-memory
+// tag cache from the producer replica.
+catalog.declare({
+  name: 'ingest:item.queued',
+  transport: 'durable',
+  producer: 'platform-api',
+  queue: 'ingest-items',
+  fifo: true,
+  partitionKey: (payload: unknown) => {
+    const p = payload as { sourceId?: string };
+    return p.sourceId ?? 'unknown';
+  },
+  retention: 7 * 24 * 60 * 60, // 7 days
+  dlqAfterAttempts: 3,
+  description: 'A newly synced ingest item is ready to be processed (mapped, materialized, pipeline-triggered). Replaces the in-memory partition queue.',
+  schema: {
+    type: 'object',
+    properties: {
+      ingestId: { type: 'string' },
+      sourceId: { type: 'string' },
+      tags: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['ingestId', 'sourceId'],
+  },
+  tags: ['service:ingest', 'phase:54.6.3'],
+});
+
 // Phase 57b — `activity.recorded` is produced by websocket-gateway as
 // transport:'both' (declared in gateway-event-declarations.js). We declare
 // it locally so platform-api can `catalog.subscribe()` to the durable side

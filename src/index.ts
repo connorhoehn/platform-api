@@ -19,8 +19,9 @@ import log from './lib/logger';
 import { CatalogIngestEventBus } from './ingest/catalog-event-bus';
 import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
+import { startIngestQueueConsumer } from './ingest/queue-consumer';
 import { RetryManager } from 'distributed-core/dist/transport/RetryManager';
-import { connectCatalog, disconnectCatalog } from './lib/event-catalog';
+import { connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
 import { ensureOutboxTTL } from './lib/dynamo-setup';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
@@ -172,16 +173,23 @@ let ingestShutdown: (() => Promise<void>) | null = null;
       cursorRepository: syncCursorRepo,
       documentRepository: typedDocumentRepo,
       eventBus,
+      // Phase 54.6.3 — durable handoff to IngestQueueConsumer (below).
+      enqueueItem: async ({ ingestId, sourceId, tags }) => {
+        await publishDurable('ingest:item.queued', { ingestId, sourceId, tags });
+      },
     });
 
     await engine.start();
     setIngestEngine(engine);
 
+    const queueConsumer = startIngestQueueConsumer({ engine });
+
     ingestShutdown = async () => {
+      await queueConsumer.stop();
       await engine.stop();
     };
 
-    log.info('IngestEngine bootstrapped (catalog event bus)');
+    log.info('IngestEngine bootstrapped (catalog event bus + durable queue consumer)');
   } catch (err: unknown) {
     const e = err as { message?: string };
     log.error(

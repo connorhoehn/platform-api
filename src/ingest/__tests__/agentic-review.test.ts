@@ -150,13 +150,22 @@ describe('Agentic review trigger', () => {
     documentRepo = new FakeDocumentRepo();
     eventBus = new FakeEventBus();
 
+    // Phase 54.6.3 — inline "enqueue → process" so triggerSync exercises
+    // the same path the production IngestQueueConsumer takes. Tags flow
+    // through the enqueueItem payload, matching the durable contract.
+    let engineRef: IngestEngine;
+    const enqueueItem = async ({ ingestId, tags }: { ingestId: string; sourceId: string; tags?: string[] }) => {
+      await engineRef.processItem(ingestId, tags);
+    };
     engine = new IngestEngine({
       sourceRepository: sourceRepo,
       itemRepository: itemRepo,
       cursorRepository: cursorRepo,
       documentRepository: documentRepo,
       eventBus,
+      enqueueItem,
     } as unknown as IngestEngineDeps);
+    engineRef = engine;
 
     // Seed the mock adapter with a file tagged "needs-review"
     sharedAdapter.seed([
@@ -293,13 +302,19 @@ describe('checkTagTriggers', () => {
     documentRepo = new FakeDocumentRepo();
     eventBus = new FakeEventBus();
 
+    let engineRef: IngestEngine;
+    const enqueueItem = async ({ ingestId, tags }: { ingestId: string; sourceId: string; tags?: string[] }) => {
+      await engineRef.processItem(ingestId, tags);
+    };
     engine = new IngestEngine({
       sourceRepository: sourceRepo,
       itemRepository: itemRepo,
       cursorRepository: cursorRepo,
       documentRepository: documentRepo,
       eventBus,
+      enqueueItem,
     } as unknown as IngestEngineDeps);
+    engineRef = engine;
 
     sharedAdapter.seed([
       {
