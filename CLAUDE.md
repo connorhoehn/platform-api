@@ -4,6 +4,11 @@ Application platform API service. Manages users, content, documents,
 pipelines, ingest/ETL, and social features. Sits behind identity-server
 for authentication.
 
+**Read `.agent/CONSTITUTION.md` first** — agent's north star and
+backlog priorities. Read `ROADMAP.md` for Phase P1–P7 progression
+(M1 event-catalog adoption, M2 ingest durable-backbone flip, M4
+pipeline-worker extraction).
+
 ## Architecture
 
 - **Express HTTP API** — all domain routes
