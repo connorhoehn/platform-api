@@ -529,7 +529,58 @@ export class RunPersistenceService {
       ttl,
     };
 
-    await this.repository.put(item);
+    await this.putWithRetry(item, state);
+  }
+
+  /**
+   * Exponential-backoff retry around `repository.put`. Previously the DDB
+   * write was wrapped in a bare `.catch()` at the subscriber level, so a
+   * single transient blip silently orphaned the run: the in-memory cache
+   * had the entry but no DDB row was ever written, leaving the run
+   * un-queryable after a restart.
+   *
+   * Now: up to 3 retries with delays of 100ms, 400ms, 1600ms (4 total
+   * attempts). On exhaustion we log at error level with the run identifiers
+   * so the failure is visibly surfaced — operators have something to grep
+   * for instead of a silent loss.
+   *
+   * Stays fire-and-forget from the caller's perspective: the wrapping
+   * `.catch()` on each subscribe handler still swallows the final rejection
+   * (after our retry budget is spent and the error has been logged).
+   */
+  private async putWithRetry(item: PipelineRunItem, state: RunState): Promise<void> {
+    const delays = [100, 400, 1600]; // ms — exponential-ish (×4)
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      try {
+        await this.repository.put(item);
+        if (attempt > 0) {
+          log.info(
+            { runId: state.runId, pipelineId: state.pipelineId, attempt: attempt + 1 },
+            'run persistence succeeded after retry',
+          );
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < delays.length) {
+          await new Promise((r) => setTimeout(r, delays[attempt]));
+          continue;
+        }
+        // All attempts exhausted — surface visibly at error level.
+        log.error(
+          {
+            runId: state.runId,
+            pipelineId: state.pipelineId,
+            status: state.status,
+            attempts: attempt + 1,
+            err: String(err),
+          },
+          'run persistence failed after all retries — DDB row will not exist for this run',
+        );
+        throw lastErr;
+      }
+    }
   }
 }
 

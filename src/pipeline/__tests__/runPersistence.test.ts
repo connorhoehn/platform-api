@@ -1,5 +1,27 @@
 // social-api/src/pipeline/__tests__/runPersistence.test.ts
 
+// Mock the logger so retry tests (P1 #7) can assert that error-level surfaces
+// after the DDB retry budget is exhausted. Other tests in this file don't
+// assert against log calls, so swapping in jest.fn()s is safe.
+jest.mock('../../lib/logger', () => {
+  const noop = () => undefined;
+  const fakeLogger: Record<string, unknown> = {
+    info: jest.fn(noop),
+    warn: jest.fn(noop),
+    error: jest.fn(noop),
+    debug: jest.fn(noop),
+    trace: jest.fn(noop),
+    fatal: jest.fn(noop),
+  };
+  fakeLogger.child = jest.fn(() => fakeLogger);
+  return {
+    __esModule: true,
+    default: fakeLogger,
+    withContext: jest.fn(() => fakeLogger),
+    __fakeLogger: fakeLogger,
+  };
+});
+
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import { FixtureLLMClient } from 'distributed-core/testing';
 import { bootstrapPipeline } from '../bootstrap';
@@ -10,6 +32,11 @@ import {
   type PipelineRunItem,
   type StepSummary,
 } from '../../repositories/PipelineRunRepository';
+
+// Handle to the mocked logger so retry tests can spy on log.error et al.
+const fakeLogger = (jest.requireMock('../../lib/logger') as {
+  __fakeLogger: { error: jest.Mock; info: jest.Mock; warn: jest.Mock };
+}).__fakeLogger;
 
 jest.setTimeout(20_000);
 
@@ -637,5 +664,218 @@ describe('RunPersistenceService — multi-attempt retry tracking (hub#1281)', ()
     // without a step:completed event — confirmed by design (run:failed is the
     // terminal persistence path; partial attempt data lives in the run error field).
     expect(item.error).toMatch(/action-B/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 #7 — DDB persistence retry-with-backoff
+//
+// Previously a single `.catch()` swallowed transient DDB failures, leaving
+// the in-memory runCache populated but the DB row missing — orphaned runs
+// invisible after a restart. These tests pin the new behavior: up to 3
+// retries (4 total attempts) with 100/400/1600ms backoff, error-level log
+// after exhaustion.
+// ---------------------------------------------------------------------------
+
+describe('RunPersistenceService — DDB retry policy (P1 #7)', () => {
+  type Subscriber<P> = (event: { payload: P }) => unknown | Promise<unknown>;
+
+  function makeMockBus() {
+    const subs = new Map<string, Subscriber<unknown>>();
+    return {
+      subscribe: jest.fn((event: string, fn: Subscriber<unknown>) => {
+        subs.set(event, fn);
+      }),
+      async publish<P>(event: string, payload: P): Promise<void> {
+        const fn = subs.get(event);
+        if (fn) await fn({ payload: payload as unknown });
+      },
+    };
+  }
+
+  beforeEach(() => {
+    fakeLogger.error.mockClear();
+    fakeLogger.info.mockClear();
+    fakeLogger.warn.mockClear();
+  });
+
+  it('success on first try — no retry delay, no error log', async () => {
+    jest.useFakeTimers();
+    try {
+      const repo = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+      const bus = makeMockBus();
+      const service = new RunPersistenceService({
+        eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+        repository: repo as unknown as PipelineRunRepository,
+      });
+      service.start();
+
+      await bus.publish('pipeline:run:started', {
+        runId: 'r-ok-1', pipelineId: 'p-ok-1',
+        triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+      });
+
+      // No setTimeout should be pending — we never had to back off.
+      expect(jest.getTimerCount()).toBe(0);
+      expect(repo.put).toHaveBeenCalledTimes(1);
+      expect(fakeLogger.error).not.toHaveBeenCalled();
+      // "succeeded after retry" info log only fires for attempt > 0.
+      expect(
+        fakeLogger.info.mock.calls.find((c) => /succeeded after retry/.test(String(c[1]))),
+      ).toBeUndefined();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('success on attempt 2 — backs off ~100ms then succeeds, no error log', async () => {
+    jest.useFakeTimers();
+    try {
+      let calls = 0;
+      const repo = {
+        put: jest.fn().mockImplementation(() => {
+          calls += 1;
+          if (calls === 1) return Promise.reject(new Error('transient ddb blip'));
+          return Promise.resolve();
+        }),
+      };
+      const bus = makeMockBus();
+      const service = new RunPersistenceService({
+        eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+        repository: repo as unknown as PipelineRunRepository,
+      });
+      service.start();
+
+      // Kick off the publish; it awaits internally so we hand back via a promise.
+      const pub = bus.publish('pipeline:run:started', {
+        runId: 'r-retry-2', pipelineId: 'p-retry-2',
+        triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+      });
+
+      // Drive the first attempt + its rejection through the microtask queue.
+      await Promise.resolve();
+      await Promise.resolve();
+      // Advance past the 100ms backoff so the 2nd attempt fires.
+      await jest.advanceTimersByTimeAsync(100);
+      await pub;
+
+      expect(repo.put).toHaveBeenCalledTimes(2);
+      expect(fakeLogger.error).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('success on attempt 3 — backs off 100ms+400ms then succeeds, no error log', async () => {
+    jest.useFakeTimers();
+    try {
+      let calls = 0;
+      const repo = {
+        put: jest.fn().mockImplementation(() => {
+          calls += 1;
+          if (calls < 3) return Promise.reject(new Error('still blipping'));
+          return Promise.resolve();
+        }),
+      };
+      const bus = makeMockBus();
+      const service = new RunPersistenceService({
+        eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+        repository: repo as unknown as PipelineRunRepository,
+      });
+      service.start();
+
+      const pub = bus.publish('pipeline:run:started', {
+        runId: 'r-retry-3', pipelineId: 'p-retry-3',
+        triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+      });
+
+      // Drain the first attempt + its rejection.
+      await Promise.resolve();
+      await Promise.resolve();
+      // 100ms → attempt 2, fails → schedules 400ms wait.
+      await jest.advanceTimersByTimeAsync(100);
+      // 400ms → attempt 3, succeeds.
+      await jest.advanceTimersByTimeAsync(400);
+      await pub;
+
+      expect(repo.put).toHaveBeenCalledTimes(3);
+      expect(fakeLogger.error).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('failure after all 4 attempts — surfaces error log with run identifiers', async () => {
+    jest.useFakeTimers();
+    try {
+      const repo = {
+        put: jest.fn().mockImplementation(() => Promise.reject(new Error('ddb consistently down'))),
+      };
+      const bus = makeMockBus();
+      const service = new RunPersistenceService({
+        eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+        repository: repo as unknown as PipelineRunRepository,
+      });
+      service.start();
+
+      const pub = bus.publish('pipeline:run:started', {
+        runId: 'r-doomed', pipelineId: 'p-doomed',
+        triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+      });
+
+      // Walk through all 3 backoff windows: 100ms, 400ms, 1600ms.
+      await Promise.resolve();
+      await Promise.resolve();
+      await jest.advanceTimersByTimeAsync(100);
+      await jest.advanceTimersByTimeAsync(400);
+      await jest.advanceTimersByTimeAsync(1600);
+      await pub;
+
+      // 1 initial + 3 retries.
+      expect(repo.put).toHaveBeenCalledTimes(4);
+
+      // Error log surfaces with the run identifiers.
+      expect(fakeLogger.error).toHaveBeenCalledTimes(1);
+      const errCall = fakeLogger.error.mock.calls[0];
+      expect(errCall[0]).toMatchObject({
+        runId: 'r-doomed',
+        pipelineId: 'p-doomed',
+        attempts: 4,
+      });
+      expect(String(errCall[1])).toMatch(/run persistence failed after all retries/);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('caller-side fire-and-forget contract preserved — subscriber does not throw', async () => {
+    // The retry layer rethrows on exhaustion; the subscribe-level .catch()
+    // must still swallow that so the EventBus subscriber contract is honored.
+    jest.useFakeTimers();
+    try {
+      const repo = {
+        put: jest.fn().mockImplementation(() => Promise.reject(new Error('ddb gone for good'))),
+      };
+      const bus = makeMockBus();
+      const service = new RunPersistenceService({
+        eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+        repository: repo as unknown as PipelineRunRepository,
+      });
+      service.start();
+
+      const pub = bus.publish('pipeline:run:started', {
+        runId: 'r-fnf', pipelineId: 'p-fnf',
+        triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await jest.advanceTimersByTimeAsync(100);
+      await jest.advanceTimersByTimeAsync(400);
+      await jest.advanceTimersByTimeAsync(1600);
+      await expect(pub).resolves.toBeUndefined();
+      expect(fakeLogger.error).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
