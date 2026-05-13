@@ -398,6 +398,101 @@ catalog.declare({
 });
 
 // ---------------------------------------------------------------------------
+// distributed-core signal-transport pipeline events (Phase P3.3)
+//
+// Declared by platform-api on distributed-core's behalf because DC is a
+// library, not a service — it cannot register itself with the central
+// catalog. The events flow over DC's in-process EventBus inside this
+// service and are bridged to gateway WS clients via the pipeline-bridge
+// service.
+//
+// IMPORTANT: these are SEPARATE events from the durable `pipeline.run.*`
+// declarations above, despite the name-string overlap on the deprecated
+// dot-form alias. Different transports, different schemas:
+//   - colon-form (here):  in-process bus; payload uses `at`
+//   - dot-form (above):   durable queue; payload uses `completedAt`/`failedAt`/`startedAt`
+//
+// PipelineExecutor.ts also dual-emits a deprecated dot-form alias on the
+// same in-process bus (e.g. `pipeline.run.completed` alongside the
+// canonical colon-form). The gateway's pipeline-bridge maintains a
+// DEPRECATED_DUAL_EMIT_ALIASES Set to suppress the dot-form half — that
+// hardcoded list must stay in sync with distributed-core's
+// CANONICAL_TO_DEPRECATED map in PipelineExecutor.ts:85.
+// ---------------------------------------------------------------------------
+
+catalog.declare({
+  name: 'pipeline:run:started',
+  transport: 'signal',
+  producer: 'distributed-core',
+  description:
+    'In-process EventBus event from PipelineExecutor when a run starts. '
+    + 'Bridged to gateway WS clients via pipeline:event frames. The platform-api '
+    + 'durable counterpart `pipeline.run.started` (declared separately above) '
+    + 'subscribes to this and re-publishes to message-queue with a renamed '
+    + '`startedAt` field instead of `at`.',
+  tags: ['producer:distributed-core', 'pipeline'],
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      pipelineId: { type: 'string' },
+      triggeredBy: { type: 'object', additionalProperties: true },
+      at: { type: 'string', description: 'ISO-8601 timestamp' },
+    },
+    required: ['runId', 'pipelineId', 'at'],
+  },
+});
+
+catalog.declare({
+  name: 'pipeline:run:completed',
+  transport: 'signal',
+  producer: 'distributed-core',
+  description:
+    'In-process EventBus event from PipelineExecutor when a run completes. '
+    + 'Bridged to gateway WS clients via pipeline:event frames. The platform-api '
+    + 'durable counterpart `pipeline.run.completed` (declared separately above) '
+    + 'subscribes to this and re-publishes to message-queue with `completedAt` instead of `at`.',
+  tags: ['producer:distributed-core', 'pipeline'],
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      durationMs: { type: 'number' },
+      at: { type: 'string', description: 'ISO-8601 timestamp' },
+    },
+    required: ['runId', 'durationMs', 'at'],
+  },
+});
+
+catalog.declare({
+  name: 'pipeline:run:failed',
+  transport: 'signal',
+  producer: 'distributed-core',
+  description:
+    'In-process EventBus event from PipelineExecutor when a run fails. '
+    + 'Bridged to gateway WS clients via pipeline:event frames. The platform-api '
+    + 'durable counterpart `pipeline.run.failed` (declared separately above) '
+    + 'subscribes to this and re-publishes to message-queue with `failedAt` instead of `at`.',
+  tags: ['producer:distributed-core', 'pipeline'],
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      error: {
+        type: 'object',
+        properties: {
+          nodeId: { type: 'string' },
+          message: { type: 'string' },
+        },
+        required: ['message'],
+      },
+      at: { type: 'string', description: 'ISO-8601 timestamp' },
+    },
+    required: ['runId', 'error', 'at'],
+  },
+});
+
+// ---------------------------------------------------------------------------
 // Gateway-compatible Redis broadcast client
 // ---------------------------------------------------------------------------
 
