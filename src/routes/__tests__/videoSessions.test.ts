@@ -34,7 +34,11 @@ jest.mock('../../repositories', () => ({
 const mockFetch = jest.fn();
 (globalThis as unknown as { fetch: typeof mockFetch }).fetch = mockFetch;
 
-import { videoSessionsRouter } from '../videoSessions';
+import {
+  videoSessionsRouter,
+  __resetSfuBreakerForTests,
+  __configureSfuBreakerForTests,
+} from '../videoSessions';
 import { errorHandler } from '../../middleware/error-handler';
 
 interface MockRes {
@@ -122,6 +126,13 @@ function apiFail(status = 500) {
   return { ok: false, status, json: async () => ({}), text: async () => 'err' } as unknown as globalThis.Response;
 }
 
+// Shape of the error Node's fetch throws when AbortSignal.timeout fires.
+function makeTimeoutError(): Error {
+  const e = new Error('The operation was aborted due to timeout');
+  e.name = 'TimeoutError';
+  return e;
+}
+
 beforeEach(() => {
   mockCreateSession.mockReset().mockResolvedValue(undefined);
   mockAddParticipant.mockReset().mockResolvedValue(undefined);
@@ -131,15 +142,24 @@ beforeEach(() => {
   mockFetch.mockReset();
   jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'error').mockImplementation(() => {});
+  // Reset breaker to CLOSED + restore default thresholds between cases so
+  // failure counts from one test don't leak into the next.
+  __resetSfuBreakerForTests();
+  __configureSfuBreakerForTests({
+    failureThreshold: 5,
+    successThreshold: 2,
+    resetTimeout: 30_000,
+    halfOpenMaxCalls: 1,
+  });
 });
 
 afterEach(() => jest.restoreAllMocks());
 
 describe('POST /api/video/sessions — non-AppError outer catch', () => {
-  it('returns 500 when fetch itself throws (network error)', async () => {
+  it('returns 502 when fetch itself throws (network error → bad-gateway)', async () => {
     mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
-    expect(res.statusCode).toBe(500);
+    expect(res.statusCode).toBe(502);
   });
 });
 
@@ -168,7 +188,13 @@ describe('POST /api/video/sessions', () => {
     );
   });
 
-  it('returns video API error status on channel create failure', async () => {
+  it('forwards 4xx from upstream without tripping the breaker', async () => {
+    mockFetch.mockResolvedValue(apiFail(404));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('forwards upstream 5xx status (counted as breaker failure)', async () => {
     mockFetch.mockResolvedValue(apiFail(502));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
     expect(res.statusCode).toBe(502);
@@ -187,7 +213,7 @@ describe('POST /api/video/sessions', () => {
 describe('POST /api/video/sessions/:sessionId/join', () => {
   const session = { documentId: 'doc-1', sessionId: 'vs-1', channelArn: 'arn:ch:1', streamKey: 'sk-1', status: 'active' };
 
-  it('returns 200 with token on successful join', async () => {
+  it('returns 200 with token on successful join (breaker stays closed)', async () => {
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockResolvedValue(apiOk({ token: 'ivs-token', participantId: 'p-1' }));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
@@ -213,7 +239,7 @@ describe('POST /api/video/sessions/:sessionId/join', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  it('returns video API error status on token request failure', async () => {
+  it('forwards 4xx from upstream on token request failure', async () => {
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockResolvedValue(apiFail(403));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
@@ -232,13 +258,150 @@ describe('POST /api/video/sessions/:sessionId/join', () => {
     expect(res.statusCode).toBe(200);
   });
 
-  it('returns 500 when fetch throws (non-AppError outer catch)', async () => {
+  it('returns 502 when fetch throws (network error → bad-gateway)', async () => {
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockRejectedValue(new Error('network down'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
       body: { documentId: 'doc-1' },
     });
-    expect(res.statusCode).toBe(500);
+    expect(res.statusCode).toBe(502);
+  });
+});
+
+// --- Circuit breaker + timeout coverage (P1 #4) ---------------------------
+
+describe('SFU resilience — fetch timeouts', () => {
+  it('returns 504 when the upstream fetch times out (TimeoutError)', async () => {
+    mockFetch.mockRejectedValue(makeTimeoutError());
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    expect(res.statusCode).toBe(504);
+  });
+
+  it('returns 504 on AbortError shape too', async () => {
+    const abort = new Error('aborted');
+    abort.name = 'AbortError';
+    mockFetch.mockRejectedValue(abort);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    expect(res.statusCode).toBe(504);
+  });
+
+  it('passes an AbortSignal on every SFU fetch', async () => {
+    mockFetch.mockResolvedValue(apiOk({ arn: 'a', streamKey: 's' }));
+    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    const init = mockFetch.mock.calls[0][1] as { signal?: AbortSignal };
+    expect(init.signal).toBeDefined();
+    expect(typeof init.signal!.aborted).toBe('boolean');
+  });
+});
+
+describe('SFU resilience — circuit breaker', () => {
+  it('counts 5xx responses as failures and opens the breaker after threshold', async () => {
+    // Threshold = 5. After 5 consecutive 5xx responses the breaker should
+    // open and the 6th call should fast-fail with 503 — note that fetch is
+    // NOT invoked for the 6th call (no timer waste).
+    mockFetch.mockResolvedValue(apiFail(502));
+    for (let i = 0; i < 5; i++) {
+      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` } });
+      expect(res.statusCode).toBe(502);
+    }
+    expect(mockFetch).toHaveBeenCalledTimes(5);
+
+    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' } });
+    expect(tripped.statusCode).toBe(503);
+    // Crucial: with breaker OPEN, we MUST NOT have called fetch again.
+    expect(mockFetch).toHaveBeenCalledTimes(5);
+  });
+
+  it('counts thrown fetch errors (e.g. ECONNREFUSED) as failures and trips after threshold', async () => {
+    mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+    for (let i = 0; i < 5; i++) {
+      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` } });
+      expect(res.statusCode).toBe(502);
+    }
+    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' } });
+    expect(tripped.statusCode).toBe(503);
+    expect(mockFetch).toHaveBeenCalledTimes(5);
+  });
+
+  it('counts upstream timeouts as failures and opens after threshold', async () => {
+    mockFetch.mockRejectedValue(makeTimeoutError());
+    for (let i = 0; i < 5; i++) {
+      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` } });
+      expect(res.statusCode).toBe(504);
+    }
+    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' } });
+    expect(tripped.statusCode).toBe(503);
+  });
+
+  it('half-open probe: success closes the breaker after cooldown', async () => {
+    jest.useFakeTimers();
+    __resetSfuBreakerForTests();
+    __configureSfuBreakerForTests({
+      failureThreshold: 2,
+      successThreshold: 1,
+      resetTimeout: 100,
+      halfOpenMaxCalls: 1,
+    });
+
+    // Trip the breaker with 2 failures.
+    mockFetch.mockResolvedValue(apiFail(503));
+    let r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'a' } });
+    expect(r.statusCode).toBe(503);
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'b' } });
+    expect(r.statusCode).toBe(503);
+
+    // Breaker open → next call is fast-fail 503 without hitting fetch.
+    const callsBeforeProbe = mockFetch.mock.calls.length;
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'c' } });
+    expect(r.statusCode).toBe(503);
+    expect(mockFetch.mock.calls.length).toBe(callsBeforeProbe);
+
+    // Advance past cooldown — breaker transitions to HALF_OPEN.
+    jest.advanceTimersByTime(150);
+
+    // Probe call succeeds → breaker closes. The probe consumes a fetch.
+    mockFetch.mockResolvedValue(apiOk({ arn: 'arn:probe', streamKey: 'sk-probe' }));
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'd' } });
+    expect(r.statusCode).toBe(201);
+    expect(mockFetch.mock.calls.length).toBe(callsBeforeProbe + 1);
+
+    // Subsequent calls succeed normally (breaker closed).
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'e' } });
+    expect(r.statusCode).toBe(201);
+
+    jest.useRealTimers();
+  });
+
+  it('half-open probe: failure re-opens the breaker', async () => {
+    jest.useFakeTimers();
+    __resetSfuBreakerForTests();
+    __configureSfuBreakerForTests({
+      failureThreshold: 2,
+      successThreshold: 1,
+      resetTimeout: 100,
+      halfOpenMaxCalls: 1,
+    });
+
+    // Trip the breaker with 2 failures.
+    mockFetch.mockResolvedValue(apiFail(503));
+    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'a' } });
+    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'b' } });
+
+    // Advance past cooldown → HALF_OPEN.
+    jest.advanceTimersByTime(150);
+
+    // Probe still fails → breaker re-opens.
+    mockFetch.mockResolvedValue(apiFail(503));
+    let r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'probe' } });
+    expect(r.statusCode).toBe(503);
+
+    // Next call (no further cooldown) is fast-fail without fetch.
+    const callsAfterProbe = mockFetch.mock.calls.length;
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'after' } });
+    expect(r.statusCode).toBe(503);
+    expect(mockFetch.mock.calls.length).toBe(callsAfterProbe);
+
+    jest.useRealTimers();
   });
 });
 
