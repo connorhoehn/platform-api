@@ -6,6 +6,13 @@
 //   - is idempotent for re-delivery of the same envelope
 //   - skips anonymous events (no userId)
 //   - re-throws DDB errors so the durable transport redelivers
+//
+// P1 #6 — error-replay coverage hardening:
+//   - DDB rejection propagates the original Error instance (not a copy)
+//   - Redelivered envelopes produce byte-identical Item shapes (full equality,
+//     not just sort-key equality) so consumers never write divergent rows
+//   - stop() is graceful under unsubscribe failure and logs a warning so
+//     operators can detect transport teardown issues
 
 const mockSend = jest.fn<Promise<unknown>, [unknown]>();
 jest.mock('../../lib/aws-clients', () => ({
@@ -18,6 +25,18 @@ jest.mock('../../lib/ddb-table-name', () => ({
 
 jest.mock('../../lib/event-catalog', () => ({
   catalog: { subscribe: jest.fn() },
+}));
+
+const mockLogWarn = jest.fn();
+const mockLogError = jest.fn();
+jest.mock('../../lib/logger', () => ({
+  __esModule: true,
+  default: {
+    info: jest.fn(),
+    warn: (...args: unknown[]) => mockLogWarn(...args),
+    error: (...args: unknown[]) => mockLogError(...args),
+    debug: jest.fn(),
+  },
 }));
 
 import { startActivityConsumer } from '../activity-consumer';
@@ -42,6 +61,8 @@ function makeEnvelope(payload: ActivityPayload, id = 'evt-01'): EventEnvelope<Ac
 beforeEach(() => {
   jest.clearAllMocks();
   mockSend.mockResolvedValue({});
+  mockLogWarn.mockReset();
+  mockLogError.mockReset();
 });
 
 describe('startActivityConsumer (Phase 57b)', () => {
@@ -140,5 +161,117 @@ describe('startActivityConsumer (Phase 57b)', () => {
     const subscribe = jest.fn().mockReturnValue({ unsubscribe });
     const handle = startActivityConsumer({ _catalog: { subscribe } });
     await expect(handle.stop()).resolves.toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------------
+  // P1 #6 — error-replay hardening
+  // ---------------------------------------------------------------------
+
+  it('propagates the original Error instance (not just message) so the durable transport can inspect it', async () => {
+    let handler!: (env: EventEnvelope<ActivityPayload>) => Promise<void>;
+    const subscribe = jest.fn().mockImplementation((_name, h) => {
+      handler = h;
+      return { unsubscribe: async () => {} };
+    });
+    startActivityConsumer({ _catalog: { subscribe } });
+
+    const original = new Error('ProvisionedThroughputExceededException');
+    (original as Error & { name: string }).name = 'ProvisionedThroughputExceededException';
+    mockSend.mockRejectedValueOnce(original);
+
+    let caught: unknown;
+    try {
+      await handler(makeEnvelope({
+        eventType: 'doc.created',
+        timestamp: '2026-05-13T00:00:00.000Z',
+        userId: 'u-1',
+      }));
+    } catch (err) {
+      caught = err;
+    }
+    // Identity equality — the consumer must re-throw the SAME Error so
+    // the durable transport's redelivery classifier sees the real name.
+    expect(caught).toBe(original);
+    expect(mockLogError).toHaveBeenCalledTimes(1);
+  });
+
+  it('writes byte-identical Item shapes on redelivery (full equality, not just sort key)', async () => {
+    let handler!: (env: EventEnvelope<ActivityPayload>) => Promise<void>;
+    const subscribe = jest.fn().mockImplementation((_name, h) => {
+      handler = h;
+      return { unsubscribe: async () => {} };
+    });
+    startActivityConsumer({ _catalog: { subscribe } });
+
+    const env = makeEnvelope({
+      eventType: 'doc.updated',
+      detail: { docId: 'd-7', diff: { title: 'new' } },
+      timestamp: '2026-05-13T00:00:00.000Z',
+      userId: 'u-9',
+      displayName: 'Bob',
+    }, 'redeliver-1');
+
+    await handler(env);
+    await handler(env); // redelivery
+
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    const first = mockSend.mock.calls[0][0] as { input: { Item: Record<string, unknown> } };
+    const second = mockSend.mock.calls[1][0] as { input: { Item: Record<string, unknown> } };
+    // Idempotency contract: every Item field must match exactly so DDB
+    // PutItem on the same key produces a no-op overwrite.
+    expect(second.input.Item).toEqual(first.input.Item);
+  });
+
+  it('stop() logs a warning when unsubscribe throws (operators need visibility on teardown failures)', async () => {
+    const unsubscribe = jest.fn().mockRejectedValue(new Error('transport offline'));
+    const subscribe = jest.fn().mockReturnValue({ unsubscribe });
+    const handle = startActivityConsumer({ _catalog: { subscribe } });
+
+    await expect(handle.stop()).resolves.toBeUndefined();
+    expect(mockLogWarn).toHaveBeenCalledTimes(1);
+    const [logCtx] = mockLogWarn.mock.calls[0] as [{ err?: string }];
+    expect(logCtx.err).toBe('transport offline');
+  });
+
+  it('does not write to DDB or log errors when userId is undefined (distinct from null)', async () => {
+    let handler!: (env: EventEnvelope<ActivityPayload>) => Promise<void>;
+    const subscribe = jest.fn().mockImplementation((_name, h) => {
+      handler = h;
+      return { unsubscribe: async () => {} };
+    });
+    startActivityConsumer({ _catalog: { subscribe } });
+
+    await handler(makeEnvelope({
+      eventType: 'ping',
+      timestamp: '2026-05-13T00:00:00.000Z',
+      // userId omitted entirely
+    }));
+
+    expect(mockSend).not.toHaveBeenCalled();
+    expect(mockLogError).not.toHaveBeenCalled();
+  });
+
+  it('one failed envelope does not stop the consumer from processing the next', async () => {
+    // Failure mode contract: re-throw is fine because the durable transport
+    // owns redelivery; the in-process handler reference must remain usable
+    // for subsequent deliveries.
+    let handler!: (env: EventEnvelope<ActivityPayload>) => Promise<void>;
+    const subscribe = jest.fn().mockImplementation((_name, h) => {
+      handler = h;
+      return { unsubscribe: async () => {} };
+    });
+    startActivityConsumer({ _catalog: { subscribe } });
+
+    mockSend.mockRejectedValueOnce(new Error('throttle'));
+    mockSend.mockResolvedValueOnce({});
+
+    await expect(
+      handler(makeEnvelope({ eventType: 'a', timestamp: 't1', userId: 'u-1' }, 'e1')),
+    ).rejects.toThrow('throttle');
+    await expect(
+      handler(makeEnvelope({ eventType: 'b', timestamp: 't2', userId: 'u-1' }, 'e2')),
+    ).resolves.toBeUndefined();
+
+    expect(mockSend).toHaveBeenCalledTimes(2);
   });
 });
