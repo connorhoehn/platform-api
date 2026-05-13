@@ -13,6 +13,8 @@
 // processing path safe for multi-replica deployment.
 
 import { randomUUID } from 'crypto';
+import { hostname } from 'os';
+import { PutCommand, UpdateCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 import type { IngestSourceRepository } from './repositories/IngestSourceRepository';
 import type { IngestItemRepository } from './repositories/IngestItemRepository';
 import type { SyncCursorRepository } from './repositories/SyncCursorRepository';
@@ -31,6 +33,8 @@ import type {
 import { createAdapter } from './adapters/adapter';
 import { matchByRules } from './mapping/rule-matcher';
 import { getPipelineBridge } from '../pipeline/bridge-types';
+import { docClient } from '../lib/aws-clients';
+import { tableName } from '../lib/ddb-table-name';
 import {
   recordIngestItem,
   recordIngestSyncDuration,
@@ -66,6 +70,21 @@ export type EnqueueItem = (params: {
   tags?: string[];
 }) => Promise<void>;
 
+/**
+ * Phase 54.6.3b — leader-elect primitive for the 60s schedule timer. The
+ * engine acquires this lease before running evaluateSchedules so only one
+ * replica fires cron-driven syncs per tick window. Test deps inject a fake;
+ * production gets the default DDB-backed implementation.
+ */
+export interface IngestLeaderLock {
+  /** Attempt to claim/renew leadership; returns true if held by us. */
+  acquire(ttlMs: number): Promise<boolean>;
+  /** Heartbeat-renew while we still own it; throws if ownership lost. */
+  renew(ttlMs: number): Promise<void>;
+  /** Best-effort release; idempotent. */
+  release(): Promise<void>;
+}
+
 export interface IngestEngineDeps {
   sourceRepository: IngestSourceRepository;
   itemRepository: IngestItemRepository;
@@ -73,6 +92,75 @@ export interface IngestEngineDeps {
   documentRepository: TypedDocumentRepository;
   eventBus: IngestEventBus;
   enqueueItem: EnqueueItem;
+  /** Optional override (tests). Production gets a DDB-backed default. */
+  leaderLock?: IngestLeaderLock;
+}
+
+// ---------------------------------------------------------------------------
+// Leader-lock (default DDB-backed)
+// ---------------------------------------------------------------------------
+
+const LEADER_LOCK_TABLE = tableName(process.env.DYNAMODB_OUTBOX_TABLE || 'social-outbox');
+const LEADER_LOCK_KEY = { outboxId: 'INGEST_SCHEDULE_LOCK#evaluator' };
+const LEADER_LEASE_TTL_MS = 30_000;
+const LEADER_HEARTBEAT_MS = 10_000;
+
+/**
+ * DDB-conditional leader lock for the ingest schedule timer. Mirrors the
+ * scheduler-leader-lock + outbox-drainer patterns: PutItem with a
+ * non-existence-or-expired condition, UpdateItem heartbeat gated on owner,
+ * DeleteItem release gated on owner.
+ */
+export function createDDBIngestLeaderLock(ownerId: string): IngestLeaderLock {
+  return {
+    async acquire(ttlMs: number): Promise<boolean> {
+      const now = Date.now();
+      try {
+        await docClient.send(
+          new PutCommand({
+            TableName: LEADER_LOCK_TABLE,
+            Item: { ...LEADER_LOCK_KEY, owner: ownerId, expiresAt: now + ttlMs, acquiredAt: now },
+            ConditionExpression: 'attribute_not_exists(outboxId) OR expiresAt < :now',
+            ExpressionAttributeValues: { ':now': now },
+          }),
+        );
+        return true;
+      } catch (err: unknown) {
+        if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+        // Treat any other error as non-acquired — safer than firing duplicates.
+        return false;
+      }
+    },
+
+    async renew(ttlMs: number): Promise<void> {
+      await docClient.send(
+        new UpdateCommand({
+          TableName: LEADER_LOCK_TABLE,
+          Key: LEADER_LOCK_KEY,
+          UpdateExpression: 'SET expiresAt = :expiresAt',
+          ConditionExpression: '#owner = :owner',
+          ExpressionAttributeNames: { '#owner': 'owner' },
+          ExpressionAttributeValues: { ':expiresAt': Date.now() + ttlMs, ':owner': ownerId },
+        }),
+      );
+    },
+
+    async release(): Promise<void> {
+      try {
+        await docClient.send(
+          new DeleteCommand({
+            TableName: LEADER_LOCK_TABLE,
+            Key: LEADER_LOCK_KEY,
+            ConditionExpression: '#owner = :owner',
+            ExpressionAttributeNames: { '#owner': 'owner' },
+            ExpressionAttributeValues: { ':owner': ownerId },
+          }),
+        );
+      } catch {
+        // Best-effort; lease auto-expires via TTL if delete fails.
+      }
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -86,9 +174,12 @@ export class IngestEngine {
   private readonly documentRepo: TypedDocumentRepository;
   private readonly eventBus: IngestEventBus;
   private readonly enqueueItem: EnqueueItem;
+  private readonly leaderLock: IngestLeaderLock;
 
   private running = false;
   private scheduleTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private leaseHeld = false;
 
   constructor(deps: IngestEngineDeps) {
     this.sourceRepo = deps.sourceRepository;
@@ -97,6 +188,9 @@ export class IngestEngine {
     this.documentRepo = deps.documentRepository;
     this.eventBus = deps.eventBus;
     this.enqueueItem = deps.enqueueItem;
+    this.leaderLock = deps.leaderLock ?? createDDBIngestLeaderLock(
+      `${process.pid}@${hostname()}-${randomUUID()}`,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -107,10 +201,11 @@ export class IngestEngine {
     if (this.running) return;
     this.running = true;
 
-    // Schedule checker — evaluates cron expressions every 60s.
-    // Phase 54.6.3b will leader-elect this via DistributedLock.
+    // Schedule checker — evaluates cron expressions every 60s. Phase 54.6.3b
+    // gates the tick behind a DDB-backed leader lease so only one replica
+    // fires cron syncs per minute.
     this.scheduleTimer = setInterval(() => {
-      void this.evaluateSchedules();
+      void this.tickSchedule();
     }, 60_000);
     this.scheduleTimer.unref();
   }
@@ -123,6 +218,53 @@ export class IngestEngine {
       clearInterval(this.scheduleTimer);
       this.scheduleTimer = null;
     }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.leaseHeld) {
+      this.leaseHeld = false;
+      await this.leaderLock.release().catch(() => {});
+    }
+  }
+
+  /**
+   * Leader-gated 60s tick. Attempts to acquire the lease; on success the
+   * caller becomes (or remains) the leader, starts a heartbeat if not
+   * already running, and runs evaluateSchedules. On failure, skips.
+   */
+  private async tickSchedule(): Promise<void> {
+    if (!this.running) return;
+
+    const acquired = await this.leaderLock.acquire(LEADER_LEASE_TTL_MS).catch(() => false);
+    if (!acquired) {
+      // Lost (or never had) the lease — make sure any prior heartbeat stops.
+      if (this.leaseHeld) {
+        this.leaseHeld = false;
+        if (this.heartbeatTimer) {
+          clearInterval(this.heartbeatTimer);
+          this.heartbeatTimer = null;
+        }
+      }
+      return;
+    }
+
+    if (!this.leaseHeld) {
+      this.leaseHeld = true;
+      this.heartbeatTimer = setInterval(() => {
+        this.leaderLock.renew(LEADER_LEASE_TTL_MS).catch(() => {
+          // Renewal lost — drop the lease so the next tick re-races cleanly.
+          this.leaseHeld = false;
+          if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+          }
+        });
+      }, LEADER_HEARTBEAT_MS);
+      this.heartbeatTimer.unref();
+    }
+
+    await this.evaluateSchedules();
   }
 
   // -------------------------------------------------------------------------
