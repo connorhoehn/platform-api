@@ -397,6 +397,30 @@ catalog.declare({
   },
 });
 
+// Phase 57b — `activity.recorded` is produced by websocket-gateway as
+// transport:'both' (declared in gateway-event-declarations.js). We declare
+// it locally so platform-api can `catalog.subscribe()` to the durable side
+// and drain into the user-activity table.
+catalog.declare({
+  name: 'activity.recorded',
+  transport: 'both',
+  producer: 'websocket-gateway',
+  description: 'User-initiated activity feed event consumed by platform-api into the user-activity DDB table.',
+  schema: {
+    type: 'object',
+    properties: {
+      eventType: { type: 'string' },
+      detail: { type: 'object', additionalProperties: true },
+      timestamp: { type: 'string' },
+      userId: { type: ['string', 'null'] },
+      displayName: { type: 'string' },
+    },
+    required: ['eventType', 'timestamp'],
+    additionalProperties: true,
+  },
+  tags: ['service:activity', 'phase:57'],
+});
+
 // ---------------------------------------------------------------------------
 // distributed-core signal-transport pipeline events (Phase P3.3)
 //

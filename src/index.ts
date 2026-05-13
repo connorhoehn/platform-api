@@ -21,6 +21,7 @@ import { RetryManager } from 'distributed-core/dist/transport/RetryManager';
 import { connectCatalog, disconnectCatalog } from './lib/event-catalog';
 import { ensureOutboxTTL } from './lib/dynamo-setup';
 import { startOutboxDrainer } from './services/outbox-drainer';
+import { startActivityConsumer } from './services/activity-consumer';
 
 const port = process.env.PORT ?? '3001';
 
@@ -58,10 +59,22 @@ const catalogRetry = new RetryManager({
   name: 'catalog-connect',
 });
 
+let activityConsumer: { stop: () => Promise<void> } | null = null;
+
 (async () => {
   try {
     await catalogRetry.execute(() => connectCatalog());
     log.info('event-catalog connected');
+    // Phase 57b — start the activity.recorded consumer after the catalog
+    // has connected. Non-fatal — if the subscribe throws (e.g. event not
+    // declared, durable transport down), we log and continue without it.
+    try {
+      activityConsumer = startActivityConsumer();
+      log.info('activity-consumer started');
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      log.warn({ errMessage: e?.message }, 'activity-consumer failed to start (non-fatal)');
+    }
   } catch (err: unknown) {
     const e = err as { message?: string };
     log.warn(
@@ -249,6 +262,11 @@ async function shutdown(signal: string): Promise<void> {
     }
   }
   drainer.stop();
+  if (activityConsumer) {
+    try { await activityConsumer.stop(); } catch (err) {
+      log.error({ err }, 'activity-consumer stop failed');
+    }
+  }
   try { await disconnectCatalog(); } catch (err) {
     log.error({ err }, 'event-catalog disconnect failed');
   }
