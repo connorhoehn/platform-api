@@ -27,7 +27,7 @@ import express, { Router, type Request, type Response } from 'express';
 import {
   SIGNATURE_HEADER,
   verifySignature,
-} from '../lib/webhookSignature';
+} from '@connorhoehn/service-runtime';
 import { withContext } from '../lib/logger';
 import {
   recordPipelineTrigger,

@@ -34,7 +34,7 @@ jest.mock('../../lib/logger', () => ({
   }),
 }));
 
-jest.mock('../../lib/webhookSignature', () => ({
+jest.mock('@connorhoehn/service-runtime', () => ({
   generateWebhookSecret: () => 'wh-secret-test',
 }));
 

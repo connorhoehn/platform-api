@@ -8,7 +8,7 @@ import {
     generateWebhookSecret,
     computeSignature,
     verifySignature,
-} from '../src/lib/webhookSignature';
+} from '@connorhoehn/service-runtime';
 
 // ─── generateWebhookSecret ────────────────────────────────────────────────
 

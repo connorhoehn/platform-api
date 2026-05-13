@@ -79,7 +79,7 @@
 //   4xx / 5xx → { error: { code?, message } }
 // On non-200, the bridge throws BridgeRpcError carrying status + body.
 
-import { signEnvelope } from '../lib/service-auth';
+import { signEnvelope } from '@connorhoehn/service-runtime';
 import type {
   PipelineBridge,
   PipelineBridgeMetrics,

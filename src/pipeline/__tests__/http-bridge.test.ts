@@ -14,7 +14,7 @@ import http from 'http';
 import { AddressInfo } from 'net';
 
 import { HTTPPipelineBridge, BridgeRpcError } from '../http-bridge';
-import { verifyEnvelope } from '../../lib/service-auth';
+import { verifyEnvelope } from '@connorhoehn/service-runtime';
 
 // ---------------------------------------------------------------------------
 // Test harness — minimal Express app whose handlers we register per-test

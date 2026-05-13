@@ -28,7 +28,7 @@
 
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import type { PipelineBridge } from './bridge-types';
-import { verifyEnvelope } from '../lib/service-auth';
+import { verifyEnvelope } from '@connorhoehn/service-runtime';
 import type { Logger } from 'pino';
 
 export interface WorkerRouterOptions {

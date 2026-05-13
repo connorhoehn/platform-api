@@ -115,7 +115,7 @@ import {
   computeSignature,
   generateWebhookSecret,
   SIGNATURE_HEADER,
-} from '../../lib/webhookSignature';
+} from '@connorhoehn/service-runtime';
 import { auditRepo } from '../../pipeline/audit-repository';
 
 const mockLog = (globalThis as unknown as {

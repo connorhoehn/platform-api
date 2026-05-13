@@ -14,7 +14,7 @@ import type { AddressInfo } from 'net';
 import { createWorkerRouter } from '../worker-router';
 import { HTTPPipelineBridge } from '../http-bridge';
 import type { PipelineBridge } from '../bridge-types';
-import { signEnvelope } from '../../lib/service-auth';
+import { signEnvelope } from '@connorhoehn/service-runtime';
 
 // Tiny supertest-shaped helper so the existing `request(app).post(...)` calls
 // below stay readable. Spins up the express app on an ephemeral port for the
