@@ -14,6 +14,8 @@ import { asyncHandler, NotFoundError } from '../../middleware/error-handler';
 import { withContext } from '../../lib/logger';
 import { ingestPipelineTemplates } from '../templates';
 import { definitionsRepo } from '../../pipeline/definitions-repository';
+import { pipelineDefinitionsCache } from '../../pipeline/definitions-cache';
+import { publishInvalidate } from '../../pipeline/definitions-invalidator';
 
 const log = withContext({ route: 'ingestTemplates' });
 
@@ -78,6 +80,11 @@ ingestTemplatesRouter.post(
     };
 
     await definitionsRepo.put(userId, definition);
+
+    // Phase 54.6.2: local + cross-replica cache invalidation so the new
+    // pipeline is visible to webhook + schedule paths immediately.
+    pipelineDefinitionsCache.refresh().catch(() => { /* logged by cache */ });
+    void publishInvalidate('definition.template-instantiate');
 
     log.info(
       { templateId: template.id, pipelineId, userId, action: 'template.instantiate' },

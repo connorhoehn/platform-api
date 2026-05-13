@@ -35,24 +35,28 @@ import { asyncHandler } from '../middleware/error-handler';
 import { generateWebhookSecret } from '../lib/webhookSignature';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { pipelineDefinitionsCache } from '../pipeline/definitions-cache';
+import { publishInvalidate } from '../pipeline/definitions-invalidator';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { withContext } from '../lib/logger';
 
 const log = withContext({ route: 'pipelineDefinitions' });
 
 /**
- * Best-effort cache poke after a write. Errors are swallowed because the
- * cache will refresh again within `intervalMs` (default 60s) — losing one
- * write-side refresh is strictly less bad than failing the response. We
- * fire-and-forget so the HTTP latency is unaffected by the Scan.
+ * Best-effort cache poke after a write. Refreshes the LOCAL cache
+ * immediately AND publishes a Redis invalidation message so other
+ * replicas refresh their own caches within milliseconds instead of
+ * waiting for their 60s timer (Phase 54.6.2). Both paths are
+ * fire-and-forget — neither failure mode affects HTTP latency.
  */
-function pokeCacheAfterWrite(): void {
+function pokeCacheAfterWrite(reason: string): void {
   pipelineDefinitionsCache.refresh().catch((err) => {
     log.error(
       { err: err instanceof Error ? err.message : String(err) },
       'pipelineDefinitionsCache refresh-after-write failed',
     );
   });
+  // Cross-replica push invalidation (Phase 54.6.2).
+  void publishInvalidate(reason);
 }
 
 /**
@@ -192,7 +196,7 @@ pipelineDefinitionsRouter.put(
 
     // Refresh the cross-user cache so the webhook router and the schedule
     // evaluator see the new definition without waiting for the next tick.
-    pokeCacheAfterWrite();
+    pokeCacheAfterWrite('definition.upsert');
 
     log.info({ pipelineId, action: 'def.put' }, 'definition updated');
     fireAndForgetAudit({
@@ -242,7 +246,7 @@ pipelineDefinitionsRouter.delete(
 
     // Refresh the cross-user cache so removed definitions stop firing
     // schedules / matching webhook paths immediately.
-    pokeCacheAfterWrite();
+    pokeCacheAfterWrite('definition.delete');
 
     log.info({ pipelineId, action: 'def.delete' }, 'definition deleted');
     fireAndForgetAudit({
@@ -325,7 +329,7 @@ pipelineDefinitionsRouter.post(
       return;
     }
 
-    pokeCacheAfterWrite();
+    pokeCacheAfterWrite('definition.publish');
 
     log.info(
       { pipelineId, version: next.version, action: 'def.publish' },

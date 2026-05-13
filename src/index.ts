@@ -8,6 +8,7 @@ import { createApp } from './app';
 import { createScheduleEvaluator } from './services/scheduleEvaluator';
 import { createDDBSchedulerLeaderLock } from './services/scheduler-leader-lock';
 import { pipelineDefinitionsCache } from './pipeline/definitions-cache';
+import { startInvalidationSubscriber } from './pipeline/definitions-invalidator';
 import { setPipelineBridge } from './routes/pipelineTriggers';
 import { bootstrapPipeline } from './pipeline/bootstrap';
 import { createBridge } from './pipeline/createBridge';
@@ -207,6 +208,20 @@ pipelineDefinitionsCache.start().catch((err: unknown) => {
   log.error({ err }, 'pipelineDefinitionsCache initial refresh failed (will retry on tick)');
 });
 
+// Phase 54.6.2: cross-replica push invalidation. The 60s timer above is
+// the safety net; this subscriber gives sub-second freshness when a
+// sibling replica writes. Failure to start is non-fatal — falls back to
+// the timer.
+let definitionsInvalidationSubscriber: { stop: () => Promise<void> } | null = null;
+void startInvalidationSubscriber(pipelineDefinitionsCache).then((sub) => {
+  definitionsInvalidationSubscriber = sub;
+}).catch((err: unknown) => {
+  log.warn(
+    { errMessage: err instanceof Error ? err.message : String(err) },
+    'definitions-invalidate subscriber failed to start (timer will still refresh)',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Schedule evaluator — fires pipelines whose triggerBinding.event === 'schedule'
 // on their cron expression. Phase 1: logs only; Phase 4 will call the pipeline
@@ -261,6 +276,11 @@ async function shutdown(signal: string): Promise<void> {
   log.info({ signal }, 'received shutdown signal');
   scheduler.stop();
   pipelineDefinitionsCache.stop();
+  if (definitionsInvalidationSubscriber) {
+    try { await definitionsInvalidationSubscriber.stop(); } catch (err) {
+      log.warn({ err }, 'definitions-invalidate subscriber stop failed');
+    }
+  }
   if (pipelineShutdown) {
     try { await pipelineShutdown(); } catch (err) {
       log.error({ err }, 'pipeline shutdown failed');
