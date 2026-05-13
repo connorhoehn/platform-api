@@ -75,7 +75,7 @@ describe('GET /api/health', () => {
     const res = await getJson(server, '/api/health');
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('ok');
-    expect(res.body.service).toBe('social-api');
+    expect(res.body.service).toBe('platform-api');
     expect(res.body.checks.dynamodb.status).toBe('ok');
     expect(res.body.checks.redis.status).toBe('ok');
     expect(typeof res.body.checks.dynamodb.latencyMs).toBe('number');

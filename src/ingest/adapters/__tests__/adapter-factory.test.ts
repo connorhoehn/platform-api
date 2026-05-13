@@ -8,6 +8,8 @@ import { MockLocalAdapter } from '../mock-local';
 import { MockWebhookAdapter } from '../mock-webhook';
 import { S3Adapter } from '../s3';
 import { GoogleDriveAdapter } from '../google-drive';
+import { ConfluenceSourceAdapter } from '../confluence';
+import { JiraSourceAdapter } from '../jira';
 import type { IngestSource } from '../../types';
 
 function makeSource(type: string): IngestSource {
@@ -39,8 +41,16 @@ describe('createAdapter', () => {
         expect(createAdapter(makeSource('google-drive'))).toBeInstanceOf(GoogleDriveAdapter);
     });
 
+    test('returns ConfluenceSourceAdapter for type="confluence"', () => {
+        expect(createAdapter(makeSource('confluence'))).toBeInstanceOf(ConfluenceSourceAdapter);
+    });
+
+    test('returns JiraSourceAdapter for type="jira"', () => {
+        expect(createAdapter(makeSource('jira'))).toBeInstanceOf(JiraSourceAdapter);
+    });
+
     test('throws for unsupported type', () => {
-        expect(() => createAdapter(makeSource('confluence'))).toThrow('Unsupported source type: confluence');
+        expect(() => createAdapter(makeSource('salesforce'))).toThrow('Unsupported source type: salesforce');
     });
 
     test('each call returns a new instance', () => {

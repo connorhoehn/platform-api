@@ -337,44 +337,59 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
     expect(args[idx + 1]).toBe('my-system-prompt');
   });
 
-  it('includes --model when model is non-empty', async () => {
-    mockSpawn.mockReturnValue(makeMockChild([
-      resultLine({ input_tokens: 2, output_tokens: 1 }),
-    ]) as ReturnType<typeof mockSpawn>);
+  // The Bedrock-alias resolution path is gated on CLAUDE_CODE_USE_BEDROCK=1
+  // (see ClaudeCodeLLMClient.bedrockMode). These tests exercise that path,
+  // so they enable the env var locally and restore it afterwards.
+  describe('Bedrock alias resolution (CLAUDE_CODE_USE_BEDROCK=1)', () => {
+    let prevBedrock: string | undefined;
+    beforeEach(() => {
+      prevBedrock = process.env.CLAUDE_CODE_USE_BEDROCK;
+      process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+    });
+    afterEach(() => {
+      if (prevBedrock === undefined) delete process.env.CLAUDE_CODE_USE_BEDROCK;
+      else process.env.CLAUDE_CODE_USE_BEDROCK = prevBedrock;
+    });
 
-    const client = new ClaudeCodeLLMClient();
-    for await (const _ of client.stream('claude-haiku-4-5-20251001', 'sys', 'hi')) { /* drain */ }
+    it('includes --model when model is non-empty', async () => {
+      mockSpawn.mockReturnValue(makeMockChild([
+        resultLine({ input_tokens: 2, output_tokens: 1 }),
+      ]) as ReturnType<typeof mockSpawn>);
 
-    const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
-    expect(args).toContain('--model');
-    const idx = args.indexOf('--model');
-    expect(args[idx + 1]).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0');
-  });
+      const client = new ClaudeCodeLLMClient();
+      for await (const _ of client.stream('claude-haiku-4-5-20251001', 'sys', 'hi')) { /* drain */ }
 
-  it('resolves short alias "sonnet" to full model ID', async () => {
-    mockSpawn.mockReturnValue(makeMockChild([
-      resultLine({ input_tokens: 2, output_tokens: 1 }),
-    ]) as ReturnType<typeof mockSpawn>);
+      const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+      expect(args).toContain('--model');
+      const idx = args.indexOf('--model');
+      expect(args[idx + 1]).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0');
+    });
 
-    const client = new ClaudeCodeLLMClient();
-    for await (const _ of client.stream('sonnet', 'sys', 'hi')) { /* drain */ }
+    it('resolves short alias "sonnet" to full model ID', async () => {
+      mockSpawn.mockReturnValue(makeMockChild([
+        resultLine({ input_tokens: 2, output_tokens: 1 }),
+      ]) as ReturnType<typeof mockSpawn>);
 
-    const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
-    const idx = args.indexOf('--model');
-    expect(args[idx + 1]).toBe('us.anthropic.claude-sonnet-4-20250514-v1:0');
-  });
+      const client = new ClaudeCodeLLMClient();
+      for await (const _ of client.stream('sonnet', 'sys', 'hi')) { /* drain */ }
 
-  it('resolves short alias "opus" to full model ID', async () => {
-    mockSpawn.mockReturnValue(makeMockChild([
-      resultLine({ input_tokens: 2, output_tokens: 1 }),
-    ]) as ReturnType<typeof mockSpawn>);
+      const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+      const idx = args.indexOf('--model');
+      expect(args[idx + 1]).toBe('us.anthropic.claude-sonnet-4-20250514-v1:0');
+    });
 
-    const client = new ClaudeCodeLLMClient();
-    for await (const _ of client.stream('opus', 'sys', 'hi')) { /* drain */ }
+    it('resolves short alias "opus" to full model ID', async () => {
+      mockSpawn.mockReturnValue(makeMockChild([
+        resultLine({ input_tokens: 2, output_tokens: 1 }),
+      ]) as ReturnType<typeof mockSpawn>);
 
-    const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
-    const idx = args.indexOf('--model');
-    expect(args[idx + 1]).toBe('us.anthropic.claude-opus-4-20250514-v1:0');
+      const client = new ClaudeCodeLLMClient();
+      for await (const _ of client.stream('opus', 'sys', 'hi')) { /* drain */ }
+
+      const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+      const idx = args.indexOf('--model');
+      expect(args[idx + 1]).toBe('us.anthropic.claude-opus-4-20250514-v1:0');
+    });
   });
 
   it('includes --output-format stream-json and --include-partial-messages', async () => {

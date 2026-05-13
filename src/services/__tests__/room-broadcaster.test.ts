@@ -1,6 +1,10 @@
-const mockEmit = jest.fn();
-jest.mock('../broadcast', () => ({
-  broadcastService: { emit: (...args: unknown[]) => mockEmit(...args) },
+// `services/broadcast` was removed in 6d884ea; room-broadcaster now calls
+// publishSignal from lib/event-catalog. Route through the existing
+// mockEmit so test assertions still hold.
+const mockEmit = jest.fn().mockResolvedValue(undefined);
+jest.mock('../../lib/event-catalog', () => ({
+  publishSignal: (...args: unknown[]) => mockEmit(...args),
+  publishDurable: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockGetCachedRoom = jest.fn();
@@ -19,6 +23,9 @@ import { broadcastToRoom } from '../room-broadcaster';
 
 beforeEach(() => {
   mockEmit.mockReset();
+  // publishSignal returns a Promise that the source code .catches on.
+  // Keep that contract after reset.
+  mockEmit.mockResolvedValue(undefined);
   mockGetCachedRoom.mockReset();
   mockSetCachedRoom.mockReset();
   mockGetRoom.mockReset();

@@ -21,6 +21,16 @@ jest.mock('../../lib/redis-client', () => ({
   getRedisClient: async () => null,
 }));
 
+// Stub aws-clients so BaseRepository's docClient calls don't trigger the
+// AWS SDK credential-provider's dynamic ESM import — Jest aborts with
+// ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING_FLAG otherwise. The tests below
+// don't exercise real DDB behavior; route logic is what's covered.
+jest.mock('../../lib/aws-clients', () => ({
+  docClient: { send: jest.fn().mockResolvedValue({ Item: undefined, Items: [] }) },
+  ddbClient: { send: jest.fn().mockResolvedValue({}) },
+  sqsClient: { send: jest.fn().mockResolvedValue({}) },
+}));
+
 import { errorHandler } from '../../middleware/error-handler';
 import {
   pipelineTriggersRouter,

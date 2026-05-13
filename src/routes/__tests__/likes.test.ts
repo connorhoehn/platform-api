@@ -143,7 +143,7 @@ describe('DELETE /api/rooms/:roomId/posts/:postId/likes', () => {
     mockUnlikePost.mockResolvedValue(undefined);
     const res = await run(buildApp(), 'DELETE', POST_BASE);
     expect(res.statusCode).toBe(204);
-    expect(mockUnlikePost).toHaveBeenCalledWith(POST, 'tester');
+    expect(mockUnlikePost).toHaveBeenCalledWith('room-1', POST, 'tester');
   });
 
   it('passes through NotFoundError as 404', async () => {

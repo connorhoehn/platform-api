@@ -63,9 +63,22 @@ jest.mock('../../middleware/auth', () => ({
   },
 }));
 
-// Broadcast — no-op; we don't test WebSocket fanout here
-jest.mock('../../services/broadcast', () => ({
-  broadcastService: { emit: jest.fn() },
+// `services/broadcast` was removed in 6d884ea; routes publish via
+// `lib/event-catalog` now. Mock that instead.
+jest.mock('../../lib/event-catalog', () => ({
+  catalog: {
+    declare: jest.fn(),
+    publish: jest.fn().mockResolvedValue(undefined),
+    getSignalTransport: jest.fn(),
+    getDurableTransport: jest.fn(),
+    connect: jest.fn().mockResolvedValue(undefined),
+    disconnect: jest.fn().mockResolvedValue(undefined),
+  },
+  publishSignal: jest.fn().mockResolvedValue(undefined),
+  publishDurable: jest.fn().mockResolvedValue(undefined),
+  publishWithOutbox: jest.fn().mockResolvedValue(undefined),
+  connectCatalog: jest.fn().mockResolvedValue(undefined),
+  disconnectCatalog: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../../repositories', () => ({

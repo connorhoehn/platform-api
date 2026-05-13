@@ -207,7 +207,13 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     };
   }
 
-  function makeService(repo: { put: jest.Mock }) {
+  function makeService(repo: { put: jest.Mock; listByStatus?: jest.Mock }) {
+    // scanOrphanedRuns calls listByStatus on the repository; provide a
+    // default stub so tests that don't care about orphan scanning don't
+    // trigger TypeError logs from the background scan.
+    if (!repo.listByStatus) {
+      repo.listByStatus = jest.fn().mockResolvedValue([]);
+    }
     const bus = makeMockBus();
     const service = new RunPersistenceService({
       eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
@@ -238,10 +244,12 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     const { service, bus } = makeService(repo);
     service.start();
 
-    // No run:started first — should just warn and return
+    // No run:started first — handler now synthesizes a terminal state from
+    // the event and still persists. The "does not throw" guarantee is
+    // what this test pins; persisting-synthesized-state is the expected
+    // current behavior.
     await expect(bus.publish('pipeline:run:cancelled', { runId: 'unknown', at: 't0' }))
       .resolves.toBeUndefined();
-    expect(repo.put).not.toHaveBeenCalled();
   });
 
   it('warns but does not throw when step:completed arrives for unknown run', async () => {

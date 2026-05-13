@@ -121,17 +121,17 @@ describe('listRoomPosts', () => {
     mockSend.mockResolvedValue({ Items: [{ postId: 'p-1' }] });
     const result = await listRoomPosts('r-1');
     expect(result.posts).toHaveLength(1);
-    expect(result.nextCursor).toBeNull();
+    expect(result.lastKey).toBeUndefined();
   });
 
-  it('returns nextCursor when LastEvaluatedKey is present', async () => {
+  it('returns lastKey when LastEvaluatedKey is present', async () => {
     mockSend.mockResolvedValue({
       Items: [{ postId: 'p-1' }],
       LastEvaluatedKey: { roomId: 'r-1', postId: 'p-1' },
     });
     const result = await listRoomPosts('r-1');
-    expect(result.nextCursor).toBeTruthy();
-    const decoded = JSON.parse(Buffer.from(result.nextCursor!, 'base64').toString('utf8'));
+    expect(result.lastKey).toBeTruthy();
+    const decoded = JSON.parse(Buffer.from(result.lastKey!, 'base64').toString('utf8'));
     expect(decoded).toEqual({ roomId: 'r-1', postId: 'p-1' });
   });
 

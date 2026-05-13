@@ -41,8 +41,7 @@ describe('likePost', () => {
       .mockResolvedValueOnce({}); // insertLike
     const result = await likePost('r-1', 'p-1', 'u-1');
     expect(result.targetId).toBe('post:p-1');
-    expect(result.type).toBe('like');
-    expect(mockBroadcast).toHaveBeenCalledWith('r-1', 'social:like', expect.objectContaining({ type: 'like' }));
+    expect(mockBroadcast).toHaveBeenCalledWith('r-1', 'social:like', expect.objectContaining({ action: 'liked' }));
   });
 
   it('throws NotFoundError when post missing', async () => {

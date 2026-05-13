@@ -12,7 +12,7 @@ const mockUpdateItemFields = jest.fn();
 const mockDeleteItemById = jest.fn();
 const mockAckItem = jest.fn();
 const mockGetItemsByAssignee = jest.fn();
-const mockEmit = jest.fn();
+const mockEmit = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (_req: Request, _res: Response, next: NextFunction) => {
@@ -32,8 +32,20 @@ jest.mock('../../repositories', () => ({
   },
 }));
 
-jest.mock('../../services/broadcast', () => ({
-  broadcastService: { emit: mockEmit },
+jest.mock('../../lib/event-catalog', () => ({
+  catalog: {
+    declare: jest.fn(),
+    publish: jest.fn().mockResolvedValue(undefined),
+    getSignalTransport: jest.fn(),
+    getDurableTransport: jest.fn(),
+    connect: jest.fn().mockResolvedValue(undefined),
+    disconnect: jest.fn().mockResolvedValue(undefined),
+  },
+  publishSignal: mockEmit,
+  publishDurable: jest.fn().mockResolvedValue(undefined),
+  publishWithOutbox: jest.fn().mockResolvedValue(undefined),
+  connectCatalog: jest.fn().mockResolvedValue(undefined),
+  disconnectCatalog: jest.fn().mockResolvedValue(undefined),
 }));
 
 import { sectionItemsRouter, myItemsRouter } from '../sectionItems';

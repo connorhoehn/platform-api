@@ -6,7 +6,9 @@
 import { createAdapter } from '../adapter';
 import { MockLocalAdapter } from '../mock-local';
 import { MockWebhookAdapter } from '../mock-webhook';
-import { MockDriveAdapter } from '../mock-drive';
+import { GoogleDriveAdapter } from '../google-drive';
+import { ConfluenceSourceAdapter } from '../confluence';
+import { JiraSourceAdapter } from '../jira';
 import type { IngestSource } from '../../types';
 
 function makeSource(type: string): IngestSource {
@@ -37,14 +39,22 @@ describe('createAdapter', () => {
     expect(adapter).toBeInstanceOf(MockWebhookAdapter);
   });
 
-  test('returns MockDriveAdapter instance for type "google-drive"', () => {
+  test('returns GoogleDriveAdapter instance for type "google-drive"', () => {
     const adapter = createAdapter(makeSource('google-drive'));
-    expect(adapter).toBeInstanceOf(MockDriveAdapter);
+    expect(adapter).toBeInstanceOf(GoogleDriveAdapter);
+  });
+
+  test('returns ConfluenceSourceAdapter for type "confluence"', () => {
+    expect(createAdapter(makeSource('confluence'))).toBeInstanceOf(ConfluenceSourceAdapter);
+  });
+
+  test('returns JiraSourceAdapter for type "jira"', () => {
+    expect(createAdapter(makeSource('jira'))).toBeInstanceOf(JiraSourceAdapter);
   });
 
   test('throws for unknown type and includes the type string in the message', () => {
-    expect(() => createAdapter(makeSource('confluence'))).toThrow('confluence');
-    expect(() => createAdapter(makeSource('jira'))).toThrow('jira');
+    expect(() => createAdapter(makeSource('salesforce'))).toThrow('salesforce');
+    expect(() => createAdapter(makeSource('notion'))).toThrow('notion');
     expect(() => createAdapter(makeSource('unknown-xyz'))).toThrow('unknown-xyz');
   });
 

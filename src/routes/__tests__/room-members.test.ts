@@ -32,12 +32,28 @@ jest.mock('../../lib/cache', () => ({
   setCachedRoom: jest.fn().mockResolvedValue(undefined),
 }));
 
-jest.mock('../../services/broadcast', () => ({
-  broadcastService: { emit: jest.fn().mockResolvedValue(undefined) },
+// `services/broadcast` was removed in 6d884ea — broadcasting now flows
+// through `lib/event-catalog`'s publishSignal/publishDurable. Mock that
+// instead so the route's catalog imports don't try to connect.
+jest.mock('../../lib/event-catalog', () => ({
+  catalog: {
+    declare: jest.fn(),
+    publish: jest.fn().mockResolvedValue(undefined),
+    getSignalTransport: jest.fn(),
+    getDurableTransport: jest.fn(),
+    connect: jest.fn().mockResolvedValue(undefined),
+    disconnect: jest.fn().mockResolvedValue(undefined),
+  },
+  publishSignal: jest.fn().mockResolvedValue(undefined),
+  publishDurable: jest.fn().mockResolvedValue(undefined),
+  publishWithOutbox: jest.fn().mockResolvedValue(undefined),
+  connectCatalog: jest.fn().mockResolvedValue(undefined),
+  disconnectCatalog: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../../lib/aws-clients', () => ({
   publishSocialEvent: jest.fn().mockResolvedValue(undefined),
+  docClient: { send: jest.fn().mockResolvedValue({}) },
 }));
 
 import { roomMembersRouter, myRoomsRouter } from '../room-members';

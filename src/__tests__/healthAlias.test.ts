@@ -75,7 +75,7 @@ describe('GET /api/health alias (hub task #6)', () => {
     const alias = await getJson(server, '/api/health');
 
     expect(alias.status).toBe(root.status);
-    expect(alias.body.service).toBe('social-api');
+    expect(alias.body.service).toBe('platform-api');
     expect(alias.body.status).toBe(root.body.status);
     expect(alias.body.checks).toMatchObject({
       dynamodb: { status: 'ok' },

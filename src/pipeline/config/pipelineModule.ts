@@ -22,9 +22,18 @@ import type {
   MetricsRegistry,
   BusEvent,
   EventBusCompactionOptions,
-  OnBeforeActionHook,
 } from 'distributed-core';
 import { InMemoryDedupStore } from 'distributed-core';
+
+/**
+ * Inlined replacement for distributed-core's previously-exported
+ * `OnBeforeActionHook` type — the type was dropped from the public
+ * surface in v0.15-v0.17 narrowing. The shape matches what
+ * PipelineModuleConstructorConfig.onBeforeAction still expects
+ * structurally; if upstream changes the signature, this declaration
+ * needs to follow.
+ */
+type OnBeforeActionHook = (ctx: { idempotencyKey: string }) => Promise<'proceed' | 'skip'>;
 
 // PipelineModule's config interface lives in the applications/pipeline
 // barrel; the gateway reaches it through the top-level `distributed-core`

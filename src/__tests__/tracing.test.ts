@@ -166,7 +166,7 @@ describe('tracing.start()', () => {
     const start = loadStart();
     start();
 
-    expect(process.env.OTEL_SERVICE_NAME).toBe('social-api');
+    expect(process.env.OTEL_SERVICE_NAME).toBe('platform-api');
   });
 
   // 9. When OTEL_SERVICE_NAME is already set, it is not overwritten
