@@ -289,7 +289,7 @@ describe('POST /api/pipelines/defs/:pipelineId/publish', () => {
 describe('pokeCacheAfterWrite — refresh error is swallowed', () => {
   it('does not affect the response when cache refresh rejects', async () => {
     // Import the cache mock to make refresh reject
-    const { pipelineDefinitionsCache } = await import('../../pipeline/definitions-cache');
+    const { pipelineDefinitionsCache } = await import('../../pipeline/definitions-cache.js');
     (pipelineDefinitionsCache.refresh as jest.Mock).mockRejectedValueOnce(new Error('cache exploded'));
 
     mockGet.mockResolvedValue({ id: 'p-1', status: 'draft' });

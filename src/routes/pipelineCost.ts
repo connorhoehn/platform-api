@@ -56,7 +56,7 @@ pipelineCostRouter.get('/', asyncHandler(async (req: Request<{ pipelineId: strin
   }
 
   // Compute per-model cost from the aggregated tokens using the same pricing logic
-  const { computeCost } = await import('../pipeline/llm-pricing');
+  const { computeCost } = await import('../pipeline/llm-pricing.js');
   for (const [model, agg] of Object.entries(byModel)) {
     agg.costUsd = Math.round(computeCost(model, agg.tokensIn, agg.tokensOut) * 1_000_000) / 1_000_000;
   }

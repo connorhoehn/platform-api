@@ -180,7 +180,7 @@ describe('GET /pipelines/metrics', () => {
   });
 
   test('200 with source=bridge when bridge returns full metrics — every field passes through', async () => {
-    const triggers = await import('../pipelineTriggers');
+    const triggers = await import('../pipelineTriggers.js');
     const fake = {
       getMetrics: async () => ({
         runsStarted: 100,
@@ -238,7 +238,7 @@ describe('GET /pipelines/metrics', () => {
   });
 
   test('200 with source=bridge when only runsAwaitingApproval is returned — other fields null', async () => {
-    const triggers = await import('../pipelineTriggers');
+    const triggers = await import('../pipelineTriggers.js');
     // Older distributed-core (pre-v0.3.x) only exposed the approval count.
     const fake = {
       getMetrics: async () => ({ runsAwaitingApproval: 7 }),
@@ -272,7 +272,7 @@ describe('GET /pipelines/metrics', () => {
   });
 
   test('estimatedCostUsd is null when only one token side is available', async () => {
-    const triggers = await import('../pipelineTriggers');
+    const triggers = await import('../pipelineTriggers.js');
     const fake = {
       getMetrics: async () => ({
         runsAwaitingApproval: 3,
@@ -294,7 +294,7 @@ describe('GET /pipelines/metrics', () => {
   });
 
   test('500 with source=error when bridge.getMetrics throws', async () => {
-    const triggers = await import('../pipelineTriggers');
+    const triggers = await import('../pipelineTriggers.js');
     const fake = {
       getMetrics: async () => {
         throw new Error('boom');
@@ -375,7 +375,7 @@ describe('GET /pipelines/dashboard-data', () => {
   });
 
   test('passes through bridge payload when wired', async () => {
-    const triggers = await import('../pipelineTriggers');
+    const triggers = await import('../pipelineTriggers.js');
     const fake = {
       getDashboardData: async () => ({
         moduleId: 'pipeline',
@@ -417,7 +417,7 @@ describe('GET /pipelines/dashboard-data', () => {
   });
 
   test('500 with source=error when bridge.getDashboardData throws', async () => {
-    const triggers = await import('../pipelineTriggers');
+    const triggers = await import('../pipelineTriggers.js');
     const fake = {
       getDashboardData: async () => {
         throw new Error('boom');

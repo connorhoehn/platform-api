@@ -254,7 +254,7 @@ describe('GET /api/profiles?q=<search>', () => {
     ]);
 
     // docClient.send for following query returns empty (tester follows nobody)
-    const { docClient } = await import('../../lib/aws-clients');
+    const { docClient } = await import('../../lib/aws-clients.js');
     (docClient.send as jest.Mock).mockResolvedValue({ Items: [] });
 
     const res = await run(buildApp(), 'GET', '/api/profiles?q=bob', { userId: 'tester' });
@@ -269,7 +269,7 @@ describe('GET /api/profiles?q=<search>', () => {
       { userId: 'tester', displayName: 'Me', visibility: 'private' },
     ]);
 
-    const { docClient } = await import('../../lib/aws-clients');
+    const { docClient } = await import('../../lib/aws-clients.js');
     (docClient.send as jest.Mock).mockResolvedValue({ Items: [] });
 
     const res = await run(buildApp(), 'GET', '/api/profiles?q=me', { userId: 'tester' });
@@ -283,7 +283,7 @@ describe('GET /api/profiles?q=<search>', () => {
       { userId: 'charlie', displayName: 'Charlie', visibility: 'private' },
     ]);
 
-    const { docClient } = await import('../../lib/aws-clients');
+    const { docClient } = await import('../../lib/aws-clients.js');
     // First call: query for who tester follows → charlie is in the list
     // Second call: get-command to verify charlie follows tester back → Item present
     (docClient.send as jest.Mock)
@@ -301,7 +301,7 @@ describe('GET /api/profiles?q=<search>', () => {
       { userId: 'dave', displayName: 'Dave', visibility: 'private' },
     ]);
 
-    const { docClient } = await import('../../lib/aws-clients');
+    const { docClient } = await import('../../lib/aws-clients.js');
     // tester follows dave, but dave does not follow back
     (docClient.send as jest.Mock)
       .mockResolvedValueOnce({ Items: [{ followeeId: 'dave' }] }) // tester follows dave

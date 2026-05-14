@@ -502,7 +502,7 @@ describe('GET /pipelines/health bridge probe', () => {
     // Direct approach: the try block catches throws from probeBridge(). We
     // test it indirectly by checking the 500 response when probeBridge throws.
     // We do that by injecting into the module via jest.spyOn on probeBridge.
-    const { probeBridge: pb } = await import('../pipelineHealth');
+    const { probeBridge: pb } = await import('../pipelineHealth.js');
     const spy = jest.spyOn({ probeBridge: pb }, 'probeBridge').mockRejectedValueOnce(new Error('catastrophic'));
     // We can't easily spy on the module export used inside the route since it's
     // a local variable. Instead, let's cover it via a non-bridge path:

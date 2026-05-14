@@ -176,8 +176,8 @@ let ingestShutdown: (() => Promise<void>) | null = null;
 
 (async () => {
   try {
-    const { ingestSourceRepo, ingestItemRepo, syncCursorRepo } = await import('./ingest/repositories');
-    const { typedDocumentRepo } = await import('./repositories');
+    const { ingestSourceRepo, ingestItemRepo, syncCursorRepo } = await import('./ingest/repositories/index.js');
+    const { typedDocumentRepo } = await import('./repositories/index.js');
 
     const eventBus = new CatalogIngestEventBus();
     const transport = createIngestTransport();
