@@ -14,7 +14,8 @@
 
 import { randomUUID } from 'crypto';
 import { hostname } from 'os';
-import { PutCommand, UpdateCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
+import { LeasedKVLock } from 'distributed-core';
+import { createDDBLeaseStore } from '../lib/ddb-lease-store';
 import type { IngestSourceRepository } from './repositories/IngestSourceRepository';
 import type { IngestItemRepository } from './repositories/IngestItemRepository';
 import type { SyncCursorRepository } from './repositories/SyncCursorRepository';
@@ -70,21 +71,6 @@ export type EnqueueItem = (params: {
   tags?: string[];
 }) => Promise<void>;
 
-/**
- * Phase 54.6.3b — leader-elect primitive for the 60s schedule timer. The
- * engine acquires this lease before running evaluateSchedules so only one
- * replica fires cron-driven syncs per tick window. Test deps inject a fake;
- * production gets the default DDB-backed implementation.
- */
-export interface IngestLeaderLock {
-  /** Attempt to claim/renew leadership; returns true if held by us. */
-  acquire(ttlMs: number): Promise<boolean>;
-  /** Heartbeat-renew while we still own it; throws if ownership lost. */
-  renew(ttlMs: number): Promise<void>;
-  /** Best-effort release; idempotent. */
-  release(): Promise<void>;
-}
-
 export interface IngestEngineDeps {
   sourceRepository: IngestSourceRepository;
   itemRepository: IngestItemRepository;
@@ -92,75 +78,37 @@ export interface IngestEngineDeps {
   documentRepository: TypedDocumentRepository;
   eventBus: IngestEventBus;
   enqueueItem: EnqueueItem;
-  /** Optional override (tests). Production gets a DDB-backed default. */
-  leaderLock?: IngestLeaderLock;
+  /**
+   * Optional override (tests inject a LeasedKVLock backed by an in-memory
+   * LeaseStore). Production gets a DC LeasedKVLock backed by the DDB
+   * adapter — see `createDefaultLeaderLock` below.
+   */
+  leaderLock?: LeasedKVLock;
 }
 
 // ---------------------------------------------------------------------------
-// Leader-lock (default DDB-backed)
+// Leader-lock (default DDB-backed via DC's LeasedKVLock primitive)
 // ---------------------------------------------------------------------------
 
 const LEADER_LOCK_TABLE = tableName(process.env.DYNAMODB_OUTBOX_TABLE || 'social-outbox');
-const LEADER_LOCK_KEY = { outboxId: 'INGEST_SCHEDULE_LOCK#evaluator' };
+const LEADER_LOCK_KEY = 'INGEST_SCHEDULE_LOCK#evaluator';
 const LEADER_LEASE_TTL_MS = 30_000;
-const LEADER_HEARTBEAT_MS = 10_000;
 
 /**
- * DDB-conditional leader lock for the ingest schedule timer. Mirrors the
- * scheduler-leader-lock + outbox-drainer patterns: PutItem with a
- * non-existence-or-expired condition, UpdateItem heartbeat gated on owner,
- * DeleteItem release gated on owner.
+ * Phase 54.6.3b → M4.3a-followup: the inline `createDDBIngestLeaderLock`
+ * was replaced with DC's LeasedKVLock primitive backed by the shared
+ * createDDBLeaseStore adapter. Same DDB row format, same TTL/heartbeat
+ * semantics, less duplicated boilerplate. The LeasedKVLock instance
+ * handles tryClaim → heartbeat → release on its own; the engine just
+ * polls `start()` per tick and runs `evaluateSchedules()` while leader.
  */
-export function createDDBIngestLeaderLock(ownerId: string): IngestLeaderLock {
-  return {
-    async acquire(ttlMs: number): Promise<boolean> {
-      const now = Date.now();
-      try {
-        await docClient.send(
-          new PutCommand({
-            TableName: LEADER_LOCK_TABLE,
-            Item: { ...LEADER_LOCK_KEY, owner: ownerId, expiresAt: now + ttlMs, acquiredAt: now },
-            ConditionExpression: 'attribute_not_exists(outboxId) OR expiresAt < :now',
-            ExpressionAttributeValues: { ':now': now },
-          }),
-        );
-        return true;
-      } catch (err: unknown) {
-        if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
-        // Treat any other error as non-acquired — safer than firing duplicates.
-        return false;
-      }
-    },
-
-    async renew(ttlMs: number): Promise<void> {
-      await docClient.send(
-        new UpdateCommand({
-          TableName: LEADER_LOCK_TABLE,
-          Key: LEADER_LOCK_KEY,
-          UpdateExpression: 'SET expiresAt = :expiresAt',
-          ConditionExpression: '#owner = :owner',
-          ExpressionAttributeNames: { '#owner': 'owner' },
-          ExpressionAttributeValues: { ':expiresAt': Date.now() + ttlMs, ':owner': ownerId },
-        }),
-      );
-    },
-
-    async release(): Promise<void> {
-      try {
-        await docClient.send(
-          new DeleteCommand({
-            TableName: LEADER_LOCK_TABLE,
-            Key: LEADER_LOCK_KEY,
-            ConditionExpression: '#owner = :owner',
-            ExpressionAttributeNames: { '#owner': 'owner' },
-            ExpressionAttributeValues: { ':owner': ownerId },
-          }),
-        );
-      } catch {
-        // Best-effort; lease auto-expires via TTL if delete fails.
-      }
-    },
-  };
+function createDefaultLeaderLock(): LeasedKVLock {
+  return new LeasedKVLock({
+    store: createDDBLeaseStore({ docClient, tableName: LEADER_LOCK_TABLE }),
+    lockKey: LEADER_LOCK_KEY,
+    ttlMs: LEADER_LEASE_TTL_MS,
+    ownerId: `${process.pid}@${hostname()}-${randomUUID()}`,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -174,12 +122,10 @@ export class IngestEngine {
   private readonly documentRepo: TypedDocumentRepository;
   private readonly eventBus: IngestEventBus;
   private readonly enqueueItem: EnqueueItem;
-  private readonly leaderLock: IngestLeaderLock;
+  private readonly leaderLock: LeasedKVLock;
 
   private running = false;
   private scheduleTimer: ReturnType<typeof setInterval> | null = null;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private leaseHeld = false;
 
   constructor(deps: IngestEngineDeps) {
     this.sourceRepo = deps.sourceRepository;
@@ -188,9 +134,7 @@ export class IngestEngine {
     this.documentRepo = deps.documentRepository;
     this.eventBus = deps.eventBus;
     this.enqueueItem = deps.enqueueItem;
-    this.leaderLock = deps.leaderLock ?? createDDBIngestLeaderLock(
-      `${process.pid}@${hostname()}-${randomUUID()}`,
-    );
+    this.leaderLock = deps.leaderLock ?? createDefaultLeaderLock();
   }
 
   // -------------------------------------------------------------------------
@@ -218,52 +162,20 @@ export class IngestEngine {
       clearInterval(this.scheduleTimer);
       this.scheduleTimer = null;
     }
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-    if (this.leaseHeld) {
-      this.leaseHeld = false;
-      await this.leaderLock.release().catch(() => {});
-    }
+    await this.leaderLock.stop();
   }
 
   /**
-   * Leader-gated 60s tick. Attempts to acquire the lease; on success the
-   * caller becomes (or remains) the leader, starts a heartbeat if not
-   * already running, and runs evaluateSchedules. On failure, skips.
+   * Leader-gated 60s tick. `LeasedKVLock.start()` is idempotent — it's a
+   * no-op when we're already leader, and re-attempts acquisition when
+   * we're not. The internal heartbeat keeps the lease alive between
+   * ticks; on heartbeat-renewal failure isLeader() flips false and the
+   * next tick re-races cleanly.
    */
   private async tickSchedule(): Promise<void> {
     if (!this.running) return;
-
-    const acquired = await this.leaderLock.acquire(LEADER_LEASE_TTL_MS).catch(() => false);
-    if (!acquired) {
-      // Lost (or never had) the lease — make sure any prior heartbeat stops.
-      if (this.leaseHeld) {
-        this.leaseHeld = false;
-        if (this.heartbeatTimer) {
-          clearInterval(this.heartbeatTimer);
-          this.heartbeatTimer = null;
-        }
-      }
-      return;
-    }
-
-    if (!this.leaseHeld) {
-      this.leaseHeld = true;
-      this.heartbeatTimer = setInterval(() => {
-        this.leaderLock.renew(LEADER_LEASE_TTL_MS).catch(() => {
-          // Renewal lost — drop the lease so the next tick re-races cleanly.
-          this.leaseHeld = false;
-          if (this.heartbeatTimer) {
-            clearInterval(this.heartbeatTimer);
-            this.heartbeatTimer = null;
-          }
-        });
-      }, LEADER_HEARTBEAT_MS);
-      this.heartbeatTimer.unref();
-    }
-
+    const acquired = await this.leaderLock.start();
+    if (!acquired) return;
     await this.evaluateSchedules();
   }
 

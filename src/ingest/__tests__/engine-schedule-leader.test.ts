@@ -1,10 +1,13 @@
 // platform-api/src/ingest/__tests__/engine-schedule-leader.test.ts
 //
-// Phase 54.6.3b — leader-elect the IngestEngine 60s schedule timer.
-// Verifies: leader path runs evaluateSchedules, non-leader path skips it,
-// and engine.stop() releases the lease (and is idempotent).
+// Phase 54.6.3b → M4.3a-followup: leader-elect the IngestEngine 60s
+// schedule timer. After the LeasedKVLock migration, leader gating is
+// expressed via DC's primitive backed by a tiny in-memory LeaseStore
+// for tests. The engine still calls tickSchedule() on its 60s timer;
+// the lock decides whether evaluateSchedules() runs.
 
-import { IngestEngine, type IngestEngineDeps, type IngestEventBus, type IngestLeaderLock } from '../engine';
+import { LeasedKVLock, type LeaseStore } from 'distributed-core';
+import { IngestEngine, type IngestEngineDeps, type IngestEventBus } from '../engine';
 import type { IngestSource } from '../types';
 import type { IngestSourceRepository } from '../repositories/IngestSourceRepository';
 import type { IngestItemRepository } from '../repositories/IngestItemRepository';
@@ -57,22 +60,56 @@ function makeEventBus(): IngestEventBus {
     return { emit: jest.fn(), on: jest.fn(), off: jest.fn() };
 }
 
-function makeFakeLock(acquireReturns: boolean): IngestLeaderLock & {
-    acquireMock: jest.Mock;
-    renewMock: jest.Mock;
-    releaseMock: jest.Mock;
+/**
+ * Minimal in-memory LeaseStore. `firstClaimSucceeds` controls whether the
+ * initial tryClaim returns true; subsequent calls (after release) reset
+ * to claimable. Mirrors DC's contract closely enough for the engine's
+ * leader-vs-contention test paths.
+ */
+function makeInMemoryLeaseStore(opts: { firstClaimSucceeds: boolean }): LeaseStore & {
+    spy: { tryClaim: jest.Mock; releaseIfOwner: jest.Mock };
 } {
-    const acquireMock = jest.fn(async () => acquireReturns);
-    const renewMock = jest.fn(async () => {});
-    const releaseMock = jest.fn(async () => {});
+    let claimed: { owner: string; expiresAt: number } | null = null;
+    let allowFirstClaim = opts.firstClaimSucceeds;
+
+    const tryClaim = jest.fn(async (key: string, value: { owner: string; expiresAt: number }) => {
+        if (claimed && claimed.expiresAt > Date.now()) return false;
+        if (!allowFirstClaim) {
+            // Simulate someone else holding the lease for this contention test.
+            claimed = { owner: 'other-replica', expiresAt: Date.now() + 30_000 };
+            return false;
+        }
+        claimed = { ...value };
+        return true;
+    });
+    const renewIfOwner = jest.fn(async (_key: string, owner: string, newExpiresAt: number) => {
+        if (!claimed || claimed.owner !== owner) throw new Error('not owner');
+        claimed.expiresAt = newExpiresAt;
+    });
+    const releaseIfOwner = jest.fn(async (_key: string, owner: string) => {
+        if (claimed && claimed.owner === owner) claimed = null;
+    });
+
     return {
-        acquire: acquireMock as unknown as IngestLeaderLock['acquire'],
-        renew: renewMock as unknown as IngestLeaderLock['renew'],
-        release: releaseMock as unknown as IngestLeaderLock['release'],
-        acquireMock,
-        renewMock,
-        releaseMock,
+        tryClaim,
+        renewIfOwner,
+        releaseIfOwner,
+        spy: { tryClaim, releaseIfOwner },
     };
+}
+
+function makeLockWithStore(opts: { firstClaimSucceeds: boolean }): {
+    lock: LeasedKVLock;
+    store: ReturnType<typeof makeInMemoryLeaseStore>;
+} {
+    const store = makeInMemoryLeaseStore(opts);
+    const lock = new LeasedKVLock({
+        store,
+        lockKey: 'INGEST_SCHEDULE_LOCK#evaluator-test',
+        ttlMs: 30_000,
+        ownerId: 'test-owner',
+    });
+    return { lock, store };
 }
 
 function makeDeps(over: Partial<IngestEngineDeps> = {}): IngestEngineDeps {
@@ -88,30 +125,28 @@ function makeDeps(over: Partial<IngestEngineDeps> = {}): IngestEngineDeps {
 }
 
 /**
- * The engine's `evaluateSchedules` is private and only invoked from the 60s
- * timer. We exercise it via the internal `tickSchedule` path by reaching the
- * private method through a typed-any cast — keeping the test focused on the
- * gating logic rather than wall-clock timing.
+ * `tickSchedule` is private; tests reach into it to drive a single tick
+ * deterministically rather than waiting for the 60s timer.
  */
 function tickOnce(engine: IngestEngine): Promise<void> {
     return (engine as unknown as { tickSchedule: () => Promise<void> }).tickSchedule();
 }
 
-describe('IngestEngine — leader-elect schedule timer (Phase 54.6.3b)', () => {
+describe('IngestEngine — leader-elect schedule timer (Phase 54.6.3b / M4.3a-followup)', () => {
     beforeEach(() => {
         jest.clearAllMocks();
     });
 
     test('leader path: lock acquired → evaluateSchedules runs (listByStatus called)', async () => {
-        const source = makeSource({ syncSchedule: null }); // null so triggerSync is not invoked
+        const source = makeSource({ syncSchedule: null });
         const sourceRepo = makeSourceRepo([source]);
-        const lock = makeFakeLock(true);
+        const { lock, store } = makeLockWithStore({ firstClaimSucceeds: true });
         const engine = new IngestEngine(makeDeps({ sourceRepository: sourceRepo, leaderLock: lock }));
 
         await engine.start();
         await tickOnce(engine);
 
-        expect(lock.acquireMock).toHaveBeenCalledTimes(1);
+        expect(store.spy.tryClaim).toHaveBeenCalledTimes(1);
         expect(sourceRepo.listByStatus).toHaveBeenCalledWith('active');
 
         await engine.stop();
@@ -119,36 +154,36 @@ describe('IngestEngine — leader-elect schedule timer (Phase 54.6.3b)', () => {
 
     test('contention path: lock NOT acquired → evaluateSchedules does NOT run', async () => {
         const sourceRepo = makeSourceRepo([makeSource()]);
-        const lock = makeFakeLock(false);
+        const { lock, store } = makeLockWithStore({ firstClaimSucceeds: false });
         const engine = new IngestEngine(makeDeps({ sourceRepository: sourceRepo, leaderLock: lock }));
 
         await engine.start();
         await tickOnce(engine);
 
-        expect(lock.acquireMock).toHaveBeenCalledTimes(1);
+        expect(store.spy.tryClaim).toHaveBeenCalledTimes(1);
         expect(sourceRepo.listByStatus).not.toHaveBeenCalled();
 
         await engine.stop();
         // No lease ever held, so release should NOT be called on stop.
-        expect(lock.releaseMock).not.toHaveBeenCalled();
+        expect(store.spy.releaseIfOwner).not.toHaveBeenCalled();
     });
 
     test('stop() releases the lease when this replica was the leader', async () => {
-        const lock = makeFakeLock(true);
+        const { lock, store } = makeLockWithStore({ firstClaimSucceeds: true });
         const engine = new IngestEngine(makeDeps({
             sourceRepository: makeSourceRepo([]),
             leaderLock: lock,
         }));
 
         await engine.start();
-        await tickOnce(engine); // become leader
+        await tickOnce(engine);
         await engine.stop();
 
-        expect(lock.releaseMock).toHaveBeenCalledTimes(1);
+        expect(store.spy.releaseIfOwner).toHaveBeenCalledTimes(1);
     });
 
     test('stop() is idempotent — does not double-release the lease', async () => {
-        const lock = makeFakeLock(true);
+        const { lock, store } = makeLockWithStore({ firstClaimSucceeds: true });
         const engine = new IngestEngine(makeDeps({
             sourceRepository: makeSourceRepo([]),
             leaderLock: lock,
@@ -159,6 +194,6 @@ describe('IngestEngine — leader-elect schedule timer (Phase 54.6.3b)', () => {
         await engine.stop();
         await engine.stop(); // second stop must be a no-op
 
-        expect(lock.releaseMock).toHaveBeenCalledTimes(1);
+        expect(store.spy.releaseIfOwner).toHaveBeenCalledTimes(1);
     });
 });

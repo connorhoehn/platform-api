@@ -1,35 +1,26 @@
 // platform-api/src/services/scheduler-leader-lock.ts
 //
-// Phase 54.6.1 — leader-lock primitive for the schedule evaluator.
+// Phase 54.6.1 — leader-lock for the schedule evaluator's per-tick window.
 //
-// The schedule evaluator's tick() fires cron-scheduled pipeline triggers. In
-// a multi-replica deployment, two replicas tick'ing within the same minute
-// would each fire every matching pipeline — duplicate runs, billing noise,
-// surprise side effects.
+// Acts as a thin per-batch wrapper over distributed-core's LeaseStore
+// (DDB-backed via createDDBLeaseStore). The acquire-per-tick / release
+// pattern is intentionally NOT LeasedKVLock — that primitive runs
+// continuous heartbeats for long-lived leadership, which is overkill
+// for sub-second tick windows. This file just delegates to LeaseStore's
+// tryClaim + releaseIfOwner.
 //
-// This lock gates each tick so only one replica holds the leader role for
-// the tick window. The other replicas attempt to acquire, see the lock is
-// held, and skip the tick. After the TTL the lock auto-expires; on the next
-// tick whichever replica wins the race becomes leader for that tick.
-//
-// Pattern mirrors `services/outbox-drainer.ts` for operator consistency:
-// DDB-backed conditional PutItem, same outbox table, same shape.
+// Other lock sites in this repo (ingest engine schedule timer) DO use
+// the long-lived LeasedKVLock pattern; the underlying DDB row format
+// is identical thanks to the shared LeaseStore adapter.
 
-import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
+import { createDDBLeaseStore } from '../lib/ddb-lease-store';
 import log from '../lib/logger';
 
 const OUTBOX_TABLE = tableName(process.env.DYNAMODB_OUTBOX_TABLE || 'social-outbox');
+const LOCK_KEY = 'SCHEDULE_LOCK#scheduleEvaluator';
 
-/** Single-row lock identifier in the outbox table. */
-const LOCK_KEY = { outboxId: 'SCHEDULE_LOCK#scheduleEvaluator' };
-
-/**
- * Leader-lock contract. The schedule evaluator calls `acquire()` at the
- * start of each tick, runs work if true, then calls `release()`. Failures
- * to release are non-fatal — the lease will expire on its own.
- */
 export interface SchedulerLeaderLock {
   /**
    * Attempts to claim leadership for the next `ttlMs`. Returns true if
@@ -41,39 +32,25 @@ export interface SchedulerLeaderLock {
 }
 
 /**
- * DDB-conditional lock (no distributed-core dependency). Stores the lock
- * row in the outbox table, conditional on either non-existence or
- * past-expiry. Same pattern as outbox-drainer's lease.
+ * DDB-conditional lock built on the shared LeaseStore adapter. Implements
+ * the per-batch SchedulerLeaderLock contract scheduleEvaluator expects.
  */
 export function createDDBSchedulerLeaderLock(ownerId: string): SchedulerLeaderLock {
+  const store = createDDBLeaseStore({ docClient, tableName: OUTBOX_TABLE });
   let held = false;
 
   return {
     async acquire(ttlMs: number): Promise<boolean> {
-      const now = Date.now();
-      const expiresAt = now + ttlMs;
       try {
-        await docClient.send(
-          new PutCommand({
-            TableName: OUTBOX_TABLE,
-            Item: {
-              ...LOCK_KEY,
-              owner: ownerId,
-              expiresAt,
-              acquiredAt: now,
-            },
-            ConditionExpression: 'attribute_not_exists(outboxId) OR expiresAt < :now',
-            ExpressionAttributeValues: { ':now': now },
-          }),
-        );
-        held = true;
-        return true;
+        const claimed = await store.tryClaim(LOCK_KEY, {
+          owner: ownerId,
+          expiresAt: Date.now() + ttlMs,
+        });
+        if (claimed) held = true;
+        return claimed;
       } catch (err: unknown) {
-        if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
-          return false;
-        }
-        // Treat any other error as non-acquired so we don't fire duplicates
-        // on a transient DDB hiccup. Log so it's visible to operators.
+        // Treat any unexpected error as non-acquired so we don't fire
+        // duplicates on a transient DDB hiccup. Log so it's visible.
         log.warn(
           { err: err instanceof Error ? err.message : String(err) },
           '[scheduler-leader-lock] acquire failed (treating as non-leader)',
@@ -85,11 +62,10 @@ export function createDDBSchedulerLeaderLock(ownerId: string): SchedulerLeaderLo
     async release(): Promise<void> {
       if (!held) return;
       held = false;
-      // We rely on TTL-based expiry rather than a hard delete to keep this
-      // implementation simple. A future tick by ANY replica will see the
-      // lock and either find it expired (and overwrite) or held (and skip).
-      // Net effect: ttl-bounded leadership handoff with zero coordination
-      // cost on release. Aligns with the outbox-drainer fallback model.
+      // Best-effort delete; lease will TTL-expire naturally if the
+      // delete fails. The next replica's tick sees the expired row and
+      // overwrites it, so leadership handoff is bounded by ttlMs.
+      await store.releaseIfOwner(LOCK_KEY, ownerId);
     },
   };
 }

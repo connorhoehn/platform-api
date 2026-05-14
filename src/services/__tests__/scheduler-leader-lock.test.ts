@@ -44,7 +44,9 @@ describe('createDDBSchedulerLeaderLock', () => {
   it('writes the correct conditional PutItem shape', async () => {
     mockSend.mockResolvedValue({});
     const lock = createDDBSchedulerLeaderLock('replica-4');
+    const before = Date.now();
     await lock.acquire(120_000);
+    const after = Date.now();
     const cmd = mockSend.mock.calls[0][0] as { input: Record<string, unknown> };
     expect(cmd.input).toMatchObject({
       ConditionExpression: 'attribute_not_exists(outboxId) OR expiresAt < :now',
@@ -53,9 +55,10 @@ describe('createDDBSchedulerLeaderLock', () => {
     expect(item.outboxId).toBe('SCHEDULE_LOCK#scheduleEvaluator');
     expect(item.owner).toBe('replica-4');
     expect(typeof item.expiresAt).toBe('number');
-    expect(typeof item.acquiredAt).toBe('number');
-    // TTL ~= 120s from acquiredAt
-    expect((item.expiresAt as number) - (item.acquiredAt as number)).toBe(120_000);
+    // TTL ~= 120s from now (sanity bound; the LeaseStore adapter no longer
+    // writes acquiredAt — the row format is owner + expiresAt only)
+    expect((item.expiresAt as number)).toBeGreaterThanOrEqual(before + 120_000);
+    expect((item.expiresAt as number)).toBeLessThanOrEqual(after + 120_000);
   });
 
   it('release() is a no-op on a lock that was never acquired', async () => {
@@ -64,12 +67,19 @@ describe('createDDBSchedulerLeaderLock', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
-  it('release() is a no-op even after acquire (TTL-based expiry, not delete)', async () => {
+  it('release() issues a conditional DeleteItem when the lock was held', async () => {
+    // Post-LeasedKVLock migration: release() now performs an
+    // owner-conditional delete via the shared LeaseStore adapter for
+    // immediate leadership handoff. Old behavior (TTL-only, no delete)
+    // is gone — we hand off in milliseconds instead of waiting out the lease.
     mockSend.mockResolvedValue({});
     const lock = createDDBSchedulerLeaderLock('replica-6');
     await lock.acquire(60_000);
     await lock.release();
-    // Only the acquire call hit DDB; release is in-memory only.
-    expect(mockSend).toHaveBeenCalledTimes(1);
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    const releaseCmd = mockSend.mock.calls[1][0] as { input: Record<string, unknown> };
+    expect(releaseCmd.input).toMatchObject({
+      ConditionExpression: '#owner = :owner',
+    });
   });
 });
