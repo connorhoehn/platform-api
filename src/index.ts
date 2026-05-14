@@ -20,9 +20,9 @@ import log from './lib/logger';
 import { CatalogIngestEventBus } from './ingest/catalog-event-bus';
 import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
-import { startIngestQueueConsumer } from './ingest/queue-consumer';
+import { createIngestTransport } from './ingest/transport';
 import { RetryManager } from 'distributed-core/dist/transport/RetryManager';
-import { connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
+import { connectCatalog, disconnectCatalog } from './lib/event-catalog';
 import { ensureOutboxTTL } from './lib/dynamo-setup';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
@@ -153,6 +153,10 @@ void pipelineWiring.ready.then((bridge) => {
 // so progress events flow to the gateway via event-catalog's signal transport
 // (Redis pub/sub under the hood). Non-fatal: routes return 503 if engine
 // isn't available.
+//
+// Wave2-PA-2: the producer/consumer handoff is now transport-pluggable via
+// `PLATFORM_API_INGEST_TRANSPORT` (default `memory`, optional `mq`). See
+// src/ingest/transport.ts for the rationale + restart-safety trade-offs.
 // ---------------------------------------------------------------------------
 
 let ingestShutdown: (() => Promise<void>) | null = null;
@@ -163,6 +167,7 @@ let ingestShutdown: (() => Promise<void>) | null = null;
     const { typedDocumentRepo } = await import('./repositories');
 
     const eventBus = new CatalogIngestEventBus();
+    const transport = createIngestTransport();
 
     const engine = new IngestEngine({
       sourceRepository: ingestSourceRepo,
@@ -170,23 +175,23 @@ let ingestShutdown: (() => Promise<void>) | null = null;
       cursorRepository: syncCursorRepo,
       documentRepository: typedDocumentRepo,
       eventBus,
-      // Phase 54.6.3 — durable handoff to IngestQueueConsumer (below).
-      enqueueItem: async ({ ingestId, sourceId, tags }) => {
-        await publishDurable('ingest:item.queued', { ingestId, sourceId, tags });
-      },
+      enqueueItem: transport.enqueueItem,
     });
 
     await engine.start();
     setIngestEngine(engine);
 
-    const queueConsumer = startIngestQueueConsumer({ engine });
+    const consumer = transport.startConsumer(engine);
 
     ingestShutdown = async () => {
-      await queueConsumer.stop();
+      await consumer.stop();
       await engine.stop();
     };
 
-    log.info('IngestEngine bootstrapped (catalog event bus + durable queue consumer)');
+    log.info(
+      { transport: transport.mode },
+      'IngestEngine bootstrapped',
+    );
   } catch (err: unknown) {
     const e = err as { message?: string };
     log.error(

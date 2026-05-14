@@ -62,6 +62,7 @@ npm run dev
 | `DDB_TABLE_PREFIX` | Table name prefix for shared DDB | (none) |
 | `PIPELINE_RUN_PERSISTENCE_ENABLED` | Persist pipeline runs to DDB | `true` |
 | `PIPELINE_DLQ_PERSISTENCE_ENABLED` | Persist DLQ entries to DDB | `true` |
+| `PLATFORM_API_INGEST_TRANSPORT` | Ingest item handoff transport: `memory` (in-process FIFO per sourceId; lost on restart) or `mq` (durable via message-queue; survives restart, multi-replica safe). See `src/ingest/transport.ts`. | `memory` |
 
 ## Service Domains
 
