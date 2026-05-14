@@ -5,14 +5,7 @@
  * provides `publishSignal` for gateway-compatible Redis broadcasts,
  * and `publishDurable` for at-least-once message-queue delivery via DynamoDB outbox.
  */
-import {
-  EventCatalog,
-  buildChannelMessageEnvelope,
-  buildSignalMessage,
-  channelMessageRedisChannel,
-  channelNodesRedisKey,
-} from '@connorhoehn/event-catalog';
-import { createClient, RedisClientType } from 'redis';
+import { EventCatalog } from '@connorhoehn/event-catalog';
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
 import { docClient } from './aws-clients';
@@ -551,88 +544,45 @@ catalog.declare({
 });
 
 // ---------------------------------------------------------------------------
-// Gateway-compatible Redis broadcast client
-// ---------------------------------------------------------------------------
-
-let broadcastClient: RedisClientType | null = null;
-
-async function getBroadcastClient(): Promise<RedisClientType> {
-  if (broadcastClient?.isReady) return broadcastClient;
-
-  const client = createClient({ url: REDIS_URL }) as RedisClientType;
-  client.on('error', (err: Error) => {
-    console.warn('[event-catalog] broadcast Redis error:', err.message);
-  });
-  await client.connect();
-  broadcastClient = client;
-  return broadcastClient;
-}
-
-// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
 export async function connectCatalog(): Promise<void> {
   await catalog.connect();
-  await getBroadcastClient();
   console.log('[event-catalog] connected');
 }
 
 export async function disconnectCatalog(): Promise<void> {
   await catalog.disconnect();
-  if (broadcastClient?.isReady) {
-    await broadcastClient.disconnect();
-    broadcastClient = null;
-  }
   console.log('[event-catalog] disconnected');
 }
 
 // ---------------------------------------------------------------------------
-// publishSignal — gateway-compatible broadcast
+// publishSignal — gateway-compatible broadcast (wave1-ec-3)
 // ---------------------------------------------------------------------------
 
 /**
- * Publishes a signal event to the websocket-gateway via Redis pub/sub
- * using the gateway's expected envelope format.
+ * Publishes a signal event to the websocket-gateway via the
+ * `@connorhoehn/event-catalog` library's `EventCatalog.publishSignal()`
+ * (wave1-ec-3).
  *
- * The gateway listens on `websocket:route:{channelId}` and expects:
- * {
- *   type: "channel_message",
- *   channel: channelId,
- *   message: { type: eventName, channel: channelId, payload, timestamp },
- *   excludeClientId: null,
- *   fromNode: "platform-api",
- *   seq: 0,
- *   timestamp: iso,
- *   targetNodes: [...]
- * }
+ * Compared to the prior direct-Redis bypass, the library hop adds:
+ *   - Schema validation against the declared event (throws on bad
+ *     payload); warns when the event is undeclared and continues.
+ *   - Discriminator validation (used by `ingest:progress` sub-types).
+ *   - Centralized envelope construction (the gateway's
+ *     `channel_message` shape) + target-nodes lookup against the
+ *     `websocket:channel:{channelId}:nodes` Redis set.
+ *
+ * Audit reference: `.agent/platform-audit-2026-05-14/event-catalog.md`
+ * P0 — "Schema validation on the signal path."
  */
 export async function publishSignal(
   channelId: string,
   eventName: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  const client = await getBroadcastClient();
-
-  // Look up which gateway nodes are subscribed to this channel
-  const targetNodes = await client.sMembers(channelNodesRedisKey(channelId));
-  if (targetNodes.length === 0) return; // No listeners, skip
-
-  const now = new Date().toISOString();
-  const envelope = buildChannelMessageEnvelope({
-    channel: channelId,
-    message: buildSignalMessage({
-      eventName,
-      channel: channelId,
-      payload,
-      timestamp: now,
-    }),
-    fromNode: 'platform-api',
-    timestamp: now,
-    targetNodes,
-  });
-
-  await client.publish(channelMessageRedisChannel(channelId), JSON.stringify(envelope));
+  await catalog.publishSignal(channelId, eventName, payload);
 }
 
 // ---------------------------------------------------------------------------
