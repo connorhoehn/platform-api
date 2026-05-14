@@ -21,6 +21,9 @@ import { CatalogIngestEventBus } from './ingest/catalog-event-bus';
 import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
 import { createIngestTransport } from './ingest/transport';
+// TODO(wave9-9a): waiting on DC public export — RetryManager is not re-exported from any named
+// subpath in distributed-core's exports map; using the ./dist/* wildcard path until DC adds a
+// public './transport' or root-barrel export.
 import { RetryManager } from 'distributed-core/dist/transport/RetryManager';
 import { connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
 import { ensureOutboxTTL, ensureVideoSessionsTTL } from './lib/dynamo-setup';
