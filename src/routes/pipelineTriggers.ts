@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { CORRELATION_ID_HEADER } from '@connorhoehn/service-runtime';
 import { randomUUID } from 'crypto';
 import { trace, SpanStatusCode, type Span } from '@opentelemetry/api';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
@@ -157,7 +158,7 @@ interface BridgeErrorBody {
 
 /** Pull the correlation id (if any) off the request headers. */
 function correlationIdOf(req: { headers: Record<string, unknown> }): string | undefined {
-  const raw = req.headers['x-correlation-id'];
+  const raw = req.headers[CORRELATION_ID_HEADER];
   if (typeof raw === 'string') return raw;
   if (Array.isArray(raw) && typeof raw[0] === 'string') return raw[0];
   return undefined;

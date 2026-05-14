@@ -1,7 +1,9 @@
 {
   "name": "@connorhoehn/platform-api",
   "version": "0.1.0",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "description": "Application platform API — user management, content, pipelines, ingest, social features",
   "scripts": {
     "dev": "COGNITO_REGION=us-east-1 COGNITO_USER_POOL_ID=us-east-1_localdev000 SKIP_AUTH=true LOCALSTACK_ENDPOINT=http://localhost:8000 REDIS_ENDPOINT=localhost AWS_REGION=us-east-1 ts-node-dev --respawn --transpile-only src/index.ts",
@@ -21,14 +23,14 @@
     "@aws-sdk/lib-dynamodb": "^3.1010.0",
     "@connorhoehn/event-catalog": "github:connorhoehnslalom/event-catalog#v0.3.2",
     "@connorhoehn/pipeline-runtime": "github:connorhoehn/pipeline-runtime#v0.1.0",
-    "@connorhoehn/service-runtime": "github:connorhoehn/service-runtime#v0.1.0",
+    "@connorhoehn/service-runtime": "github:connorhoehn/service-runtime#v0.1.1",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/auto-instrumentations-node": "^0.73.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.215.0",
     "@opentelemetry/sdk-node": "^0.215.0",
     "@types/uuid": "^10.0.0",
     "csv-parse": "^6.2.1",
-    "distributed-core": "github:connorhoehn/distributed-core#v0.19.1",
+    "distributed-core": "github:connorhoehn/distributed-core#86c4a2b1c808636c0263bb503ffc2c34aee6b27b",
     "express": "^4.18.2",
     "googleapis": "^171.4.0",
     "jsonwebtoken": "^9.0.3",
