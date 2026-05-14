@@ -1,15 +1,16 @@
-import { ScanCommand, UpdateCommand, PutCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
+import { ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { randomUUID } from 'crypto';
 import { hostname } from 'os';
+import { LeasedKVLock } from 'distributed-core';
 import { docClient } from '../lib/aws-clients';
 import { publishDurable } from '../lib/event-catalog';
 import { tableName } from '../lib/ddb-table-name';
+import { createDDBLeaseStore } from '../lib/ddb-lease-store';
 import log from '../lib/logger';
 
 const OUTBOX_TABLE = tableName('social-outbox');
-const LOCK_KEY = { outboxId: 'OUTBOX_LOCK#drainer' };
+const LOCK_KEY = 'OUTBOX_LOCK#drainer';
 const LEASE_TTL_MS = 30_000;
-const HEARTBEAT_INTERVAL_MS = 10_000;
 
 /** 24 hours in seconds — shortened TTL for completed/failed rows (kept briefly for debugging). */
 const TERMINAL_TTL_SECONDS = 24 * 60 * 60;
@@ -32,77 +33,43 @@ interface OutboxRow {
   retryCount?: number;
 }
 
-// In-memory mirror of the lease deadline written to DDB. Updated on every
-// successful acquire/renew, cleared on renewal failure. processRow gates on
-// `Date.now() < leaseExpiresAt` to refuse publishing once the lease has
-// lapsed — preventing a stale drainer from clobbering rows another replica
-// is now processing.
-let leaseExpiresAt = 0;
+// M4.3a-followup completion: the inline acquire/renew/release lease loop +
+// in-memory `leaseExpiresAt` mirror were replaced with DC's LeasedKVLock,
+// backed by the shared createDDBLeaseStore adapter (same DDB row format,
+// same conditional-write semantics — the row keyed at OUTBOX_LOCK#drainer
+// is byte-compatible with the previous Phase 54.6.5 layout).
+//
+// The Phase 54.6.5 hardening guarantees are preserved at TWO independent
+// fences:
+//   - Lock-level fence: `lock.isLeader()` gates publish + status writes;
+//     mirrors the prior `leaseValid()` helper. LeasedKVLock's heartbeat
+//     handler clears its own in-memory `leaseExpiresAt` on renewal
+//     failure, so `isLeader()` flips false the same way the inline impl
+//     did, just without us owning the timer.
+//   - Row-level fence: per-row UpdateCommands keep their
+//     `attribute_exists(outboxId) AND #status = :unprocessed` condition
+//     so a stale drainer that beats the lock fence still cannot clobber
+//     a row another replica is now terminal-writing.
+//
+// Per-poll-cycle pattern is preserved (acquire → drain batch → release
+// per cycle, NOT continuous leadership). Each `poll()` constructs and
+// drives a fresh LeasedKVLock instance via start()/stop() so leadership
+// handoff is bounded by pollIntervalMs.
 
-function leaseValid(): boolean {
-  return Date.now() < leaseExpiresAt;
-}
-
-async function acquireLease(): Promise<boolean> {
-  const now = Date.now();
-  const expiresAt = now + LEASE_TTL_MS;
-
-  try {
-    await docClient.send(
-      new PutCommand({
-        TableName: OUTBOX_TABLE,
-        Item: {
-          ...LOCK_KEY,
-          owner: OWNER_ID,
-          expiresAt,
-        },
-        ConditionExpression: 'attribute_not_exists(outboxId) OR expiresAt < :now',
-        ExpressionAttributeValues: { ':now': now },
-      }),
-    );
-    leaseExpiresAt = expiresAt;
-    return true;
-  } catch (err: unknown) {
-    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
-      return false;
-    }
-    throw err;
-  }
-}
-
-async function renewLease(): Promise<void> {
-  const expiresAt = Date.now() + LEASE_TTL_MS;
-  await docClient.send(
-    new UpdateCommand({
-      TableName: OUTBOX_TABLE,
-      Key: LOCK_KEY,
-      UpdateExpression: 'SET expiresAt = :expiresAt',
-      ConditionExpression: '#owner = :owner',
-      ExpressionAttributeNames: { '#owner': 'owner' },
-      ExpressionAttributeValues: {
-        ':expiresAt': expiresAt,
-        ':owner': OWNER_ID,
-      },
-    }),
-  );
-  leaseExpiresAt = expiresAt;
-}
-
-async function releaseLease(): Promise<void> {
-  leaseExpiresAt = 0;
-  try {
-    await docClient.send(
-      new DeleteCommand({
-        TableName: OUTBOX_TABLE,
-        Key: LOCK_KEY,
-        ConditionExpression: '#owner = :owner',
-        ExpressionAttributeNames: { '#owner': 'owner' },
-        ExpressionAttributeValues: { ':owner': OWNER_ID },
-      }),
-    );
-  } catch {
-    // Best-effort release; lease will expire naturally if this fails
-  }
+function createDrainerLock(): LeasedKVLock {
+  return new LeasedKVLock({
+    store: createDDBLeaseStore({ docClient, tableName: OUTBOX_TABLE }),
+    lockKey: LOCK_KEY,
+    ttlMs: LEASE_TTL_MS,
+    ownerId: OWNER_ID,
+    onLeaseLost: () => {
+      // Renewal failed mid-batch — surface for ops visibility. The lock
+      // already cleared its in-memory state, so isLeader() returns false
+      // and any in-flight processRow() will refuse the status write on
+      // its own (lock-level fence below + row-level fence on the write).
+      log.warn({}, 'outbox-drainer lease renewal failed');
+    },
+  });
 }
 
 export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => void } {
@@ -111,7 +78,7 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
   const maxRetries = config?.maxRetries ?? 3;
 
   let timer: ReturnType<typeof setInterval> | null = null;
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let activeLock: LeasedKVLock | null = null;
   let running = false;
   let stopping = false;
 
@@ -119,23 +86,21 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
     if (running || stopping) return;
     running = true;
 
+    const lock = createDrainerLock();
+    activeLock = lock;
+
     try {
-      const acquired = await acquireLease();
+      let acquired = false;
+      try {
+        acquired = await lock.start();
+      } catch (err: unknown) {
+        const e = err as { message?: string };
+        log.error({ errMessage: e?.message }, 'outbox-drainer lease acquire failed');
+        return;
+      }
       if (!acquired) {
         return;
       }
-
-      heartbeatTimer = setInterval(() => {
-        renewLease().catch((err: unknown) => {
-          const e = err as { message?: string };
-          // Renewal failed — drop in-memory lease so subsequent processRow
-          // calls abort cleanly rather than racing against whoever steals
-          // the lease next. The current batch may already have rows in flight
-          // (see leaseValid() gate below), so this is best-effort fencing.
-          leaseExpiresAt = 0;
-          log.warn({ errMessage: e?.message }, 'outbox-drainer lease renewal failed');
-        });
-      }, HEARTBEAT_INTERVAL_MS);
 
       try {
         const result = await docClient.send(
@@ -151,32 +116,33 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         const rows = (result.Items ?? []) as OutboxRow[];
 
         for (const row of rows) {
-          if (!leaseValid()) {
+          if (!lock.isLeader()) {
             log.warn(
               { remainingRows: rows.length - rows.indexOf(row) },
               'outbox-drainer aborting batch — lease lapsed mid-scan',
             );
             break;
           }
-          await processRow(row, maxRetries);
+          await processRow(lock, row, maxRetries);
         }
       } finally {
-        if (heartbeatTimer) {
-          clearInterval(heartbeatTimer);
-          heartbeatTimer = null;
-        }
-        await releaseLease();
+        await lock.stop();
       }
     } catch (err: unknown) {
       const e = err as { message?: string };
       log.error({ errMessage: e?.message }, 'outbox-drainer poll failed');
     } finally {
+      activeLock = null;
       running = false;
     }
   }
 
-  async function processRow(row: OutboxRow, maxRetriesCount: number): Promise<void> {
-    if (!leaseValid()) {
+  async function processRow(
+    lock: LeasedKVLock,
+    row: OutboxRow,
+    maxRetriesCount: number,
+  ): Promise<void> {
+    if (!lock.isLeader()) {
       log.warn(
         { outboxId: row.outboxId },
         'outbox-drainer skipping row — lease no longer valid',
@@ -193,7 +159,7 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       // Refusing the status write here is safe — UNPROCESSED rows stay
       // claimable; the worst case is a duplicate publish next round, which
       // downstream consumers must handle as part of at-least-once semantics.
-      if (!leaseValid()) {
+      if (!lock.isLeader()) {
         log.warn(
           { outboxId: row.outboxId },
           'outbox-drainer skipping status update — lease lapsed during publish',
@@ -239,7 +205,7 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         'outbox-drainer publish failed',
       );
 
-      if (!leaseValid()) {
+      if (!lock.isLeader()) {
         log.warn(
           { outboxId: row.outboxId },
           'outbox-drainer skipping retry-count update — lease lapsed',
@@ -315,11 +281,13 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         clearInterval(timer);
         timer = null;
       }
-      if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
+      // Best-effort release of any in-flight lock; if the poll cycle is
+      // still running it will hit its own finally + lock.stop(). The lock
+      // itself swallows release errors and the lease will TTL-expire.
+      const inflight = activeLock;
+      if (inflight) {
+        void inflight.stop();
       }
-      void releaseLease();
     },
   };
 }
