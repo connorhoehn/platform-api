@@ -118,7 +118,7 @@ describe('runWalPreflight — raft path', () => {
   });
 
   it('wraps non-Error thrown value as string', async () => {
-    mockMkdirSync.mockImplementation(() => { throw 'EACCES'; }); // eslint-disable-line @typescript-eslint/no-throw-literal
+    mockMkdirSync.mockImplementation(() => { throw 'EACCES'; }); // eslint-disable-line @typescript-eslint/only-throw-error
     await expect(
       runWalPreflight({ ...BASE, registryMode: 'raft', raftDataDir: '/data/raft' }),
     ).rejects.toThrow(/PIPELINE_RAFT_DATA_DIR.*EACCES/);

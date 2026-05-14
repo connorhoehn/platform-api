@@ -8,7 +8,6 @@ import { describe, it, expect, beforeEach } from '@jest/globals';
 
 // We import the exported hook and test it directly — no need to boot the
 // full PipelineModule stack.
-// eslint-disable-next-line import/no-relative-packages
 import { onBeforeActionHook } from '../pipelineModule';
 import type { OnBeforeActionContext } from 'distributed-core';
 
