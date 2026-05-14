@@ -7,6 +7,8 @@ import { DocumentSectionRepository } from './DocumentSectionRepository';
 import { DocumentCommentRepository } from './DocumentCommentRepository';
 import { SectionReviewRepository } from './SectionReviewRepository';
 import { VideoSessionRepository } from './VideoSessionRepository';
+import { createVideoSessionStore } from './videoSessionStoreFactory';
+import type { VideoSessionStore } from './VideoSessionStore';
 import { DocumentTypeRepository } from './DocumentTypeRepository';
 import { TypedDocumentRepository } from './TypedDocumentRepository';
 import { ApprovalRepository } from './ApprovalRepository';
@@ -21,7 +23,10 @@ export const sectionItemRepo = new SectionItemRepository(docClient);
 export const documentSectionRepo = new DocumentSectionRepository(docClient);
 export const documentCommentRepo = new DocumentCommentRepository(docClient);
 export const sectionReviewRepo = new SectionReviewRepository(docClient);
-export const videoSessionRepo = new VideoSessionRepository(docClient);
+// videoSessionRepo is typed as the VideoSessionStore interface so callers
+// don't bind to the DDB implementation. The factory honours the
+// VIDEO_SESSIONS_STORE env flag — see videoSessionStoreFactory.ts.
+export const videoSessionRepo: VideoSessionStore = createVideoSessionStore(docClient);
 export const documentTypeRepo = new DocumentTypeRepository(docClient);
 export const typedDocumentRepo = new TypedDocumentRepository(docClient);
 export const approvalRepo = new ApprovalRepository(docClient);
@@ -36,7 +41,20 @@ export { SectionItemRepository, SectionItemFields, CreateSectionItemInput } from
 export { DocumentSectionRepository, DocumentSectionFields, CreateDocumentSectionInput } from './DocumentSectionRepository';
 export { DocumentCommentRepository, DocumentComment } from './DocumentCommentRepository';
 export { SectionReviewRepository, SectionReview } from './SectionReviewRepository';
-export { VideoSessionRepository, VideoSessionRecord, VideoSessionParticipant } from './VideoSessionRepository';
+export { VideoSessionRepository } from './VideoSessionRepository';
+export {
+  VideoSessionStore,
+  VideoSessionRecord,
+  VideoSessionParticipant,
+  DEFAULT_VIDEO_SESSION_TTL_DAYS,
+  computeEndedSessionTtl,
+} from './VideoSessionStore';
+export { MemoryVideoSessionStore } from './MemoryVideoSessionStore';
+export {
+  createVideoSessionStore,
+  resolveVideoSessionStoreMode,
+  VideoSessionStoreMode,
+} from './videoSessionStoreFactory';
 export {
   DocumentTypeRepository,
   DocumentTypeItem,

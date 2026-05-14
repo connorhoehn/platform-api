@@ -1,33 +1,35 @@
+// DDB-backed implementation of `VideoSessionStore`. See
+// `VideoSessionStore.ts` for the interface contract + design notes.
+//
+// Schema:
+//   PK = documentId  (lobbyName — see VideoSessionStore docstring)
+//   SK = sessionId
+//   TTL attribute = `ttl` (epoch seconds). Set automatically by endSession
+//   so ended sessions get GC'd after the configured grace window.
+//   `ensureVideoSessionsTTL()` in src/lib/dynamo-setup.ts enables it on
+//   the table at startup (idempotent).
+
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
+import {
+  VideoSessionRecord,
+  VideoSessionParticipant,
+  VideoSessionStore,
+  computeEndedSessionTtl,
+} from './VideoSessionStore';
 
-export interface VideoSessionParticipant {
-  userId: string;
-  displayName: string;
-  joinedAt: string;
-}
+export type {
+  VideoSessionRecord,
+  VideoSessionParticipant,
+  VideoSessionStore,
+} from './VideoSessionStore';
 
-export interface VideoSessionRecord {
-  documentId: string;
-  sessionId: string;
-  channelArn: string;
-  streamKey: string;
-  status: 'active' | 'ended';
-  startedAt: string;
-  endedAt?: string;
-  startedBy: string;
-  participants: VideoSessionParticipant[];
-  transcriptStatus?: 'pending' | 'processing' | 'available' | 'failed';
-  transcript?: string;
-  aiSummary?: string;
-}
+export const VIDEO_SESSIONS_TABLE = tableName('document-video-sessions');
 
-const TABLE_NAME = tableName('document-video-sessions');
-
-export class VideoSessionRepository extends BaseRepository {
+export class VideoSessionRepository extends BaseRepository implements VideoSessionStore {
   constructor(docClient: DynamoDBDocumentClient) {
-    super(TABLE_NAME, docClient);
+    super(VIDEO_SESSIONS_TABLE, docClient);
   }
 
   async createSession(record: VideoSessionRecord): Promise<VideoSessionRecord> {
@@ -40,13 +42,17 @@ export class VideoSessionRepository extends BaseRepository {
     sessionId: string,
     endedAt: string,
   ): Promise<void> {
+    // Stamp TTL alongside the status change so the row eventually GCs.
+    // Per-deployment override via VIDEO_SESSION_TTL_DAYS (see computeEndedSessionTtl).
+    const ttl = computeEndedSessionTtl(endedAt);
     await this.updateItem({
       Key: { documentId, sessionId },
-      UpdateExpression: 'SET #status = :status, endedAt = :endedAt',
-      ExpressionAttributeNames: { '#status': 'status' },
+      UpdateExpression: 'SET #status = :status, endedAt = :endedAt, #ttl = :ttl',
+      ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
       ExpressionAttributeValues: {
         ':status': 'ended',
         ':endedAt': endedAt,
+        ':ttl': ttl,
       },
     });
   }

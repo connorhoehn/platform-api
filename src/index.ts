@@ -22,8 +22,9 @@ import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
 import { createIngestTransport } from './ingest/transport';
 import { RetryManager } from 'distributed-core/dist/transport/RetryManager';
-import { connectCatalog, disconnectCatalog } from './lib/event-catalog';
-import { ensureOutboxTTL } from './lib/dynamo-setup';
+import { connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
+import { ensureOutboxTTL, ensureVideoSessionsTTL } from './lib/dynamo-setup';
+import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
 
@@ -53,6 +54,18 @@ log.info('outbox-drainer started');
 ensureOutboxTTL().catch((err: unknown) => {
   log.warn({ err }, 'outbox TTL auto-provision failed');
 });
+
+// Video sessions TTL is only meaningful when we're on the DDB store; the
+// in-memory store enforces TTL itself. Skipping the DDB describe call when
+// the operator has explicitly flipped to memory mode avoids a noisy warn
+// in environments that don't even have the table provisioned.
+const videoStoreMode = resolveVideoSessionStoreMode();
+log.info({ mode: videoStoreMode }, 'video-session store mode');
+if (videoStoreMode === 'ddb') {
+  ensureVideoSessionsTTL().catch((err: unknown) => {
+    log.warn({ err }, 'video-sessions TTL auto-provision failed');
+  });
+}
 
 const catalogRetry = new RetryManager({
   maxRetries: 2,

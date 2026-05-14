@@ -73,6 +73,19 @@ describe('VideoSessionRepository.endSession', () => {
     expect(cmd.input.ExpressionAttributeValues[':status']).toBe('ended');
     expect(cmd.input.ExpressionAttributeValues[':endedAt']).toBe('2026-01-01T11:00:00Z');
   });
+
+  it('stamps a TTL ~7 days past endedAt for DDB native expiry', async () => {
+    const repo = new VideoSessionRepository(docClient);
+    const endedAt = '2026-01-01T11:00:00Z';
+    await repo.endSession('doc-1', 'sess-1', endedAt);
+
+    const cmd = mockSend.mock.calls[0][0];
+    expect(cmd.input.UpdateExpression).toContain('#ttl');
+    expect(cmd.input.ExpressionAttributeNames['#ttl']).toBe('ttl');
+    const ttl = cmd.input.ExpressionAttributeValues[':ttl'] as number;
+    const expected = Math.floor(Date.parse(endedAt) / 1000) + 7 * 24 * 60 * 60;
+    expect(ttl).toBe(expected);
+  });
 });
 
 // ---------------------------------------------------------------------------
