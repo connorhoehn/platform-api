@@ -28,10 +28,7 @@
 
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
-// TODO(wave9-9a): waiting on DC public export — CircuitBreaker/CircuitState are not re-exported
-// from any named subpath in distributed-core's exports map; using the ./dist/* wildcard path
-// until DC adds a public './transport' or root-barrel export.
-import { CircuitBreaker, CircuitState } from 'distributed-core/dist/transport/CircuitBreaker';
+import { CircuitBreaker, CircuitState } from 'distributed-core/transport';
 import { requireAuth, optionalAuth } from '../middleware/auth';
 import { VIDEO_API_URL } from '../lib/video-auth';
 import { videoSessionRepo } from '../repositories';
