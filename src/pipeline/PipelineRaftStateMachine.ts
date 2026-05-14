@@ -287,7 +287,10 @@ export class PipelineRaftStateMachine extends RaftStateMachineBase<
       checkpoint: {},
     };
     this.runs.set(cmd.runId, slot);
-    this.emit('pipeline:run:started', { runId: cmd.runId, slot });
+    // NOTE wave2-pa-1: namespaced under `pipeline:raft:` to disambiguate from
+    // DC's PipelineExecutor's `pipeline:run:started` (different producer +
+    // payload). Declared in src/lib/event-catalog.ts.
+    this.emit('pipeline:raft:run:started', { runId: cmd.runId, slot });
     return { runId: cmd.runId, status: slot.status, applied: 'created' };
   }
 
@@ -314,7 +317,9 @@ export class PipelineRaftStateMachine extends RaftStateMachineBase<
         checkpoint: {},
       };
       this.runs.set(cmd.runId, synthesized);
-      this.emit('pipeline:run:synthesized', { runId: cmd.runId, slot: synthesized });
+      // wave2-pa-1: namespaced under `pipeline:raft:`. Declared in
+      // src/lib/event-catalog.ts.
+      this.emit('pipeline:raft:run:synthesized', { runId: cmd.runId, slot: synthesized });
       return { runId: cmd.runId, status: cmd.status, applied: 'updated' };
     }
     if (entry.index <= slot.lastAppliedIndex) {
@@ -329,7 +334,9 @@ export class PipelineRaftStateMachine extends RaftStateMachineBase<
     slot.lastEvent = cmd.eventName;
     slot.lastEventAt = cmd.at;
     slot.lastAppliedIndex = entry.index;
-    this.emit('pipeline:run:updated', { runId: cmd.runId, slot });
+    // wave2-pa-1: namespaced under `pipeline:raft:`. Declared in
+    // src/lib/event-catalog.ts.
+    this.emit('pipeline:raft:run:updated', { runId: cmd.runId, slot });
     return { runId: cmd.runId, status: slot.status, applied: 'updated' };
   }
 
@@ -363,7 +370,9 @@ export class PipelineRaftStateMachine extends RaftStateMachineBase<
     slot.lastEvent = 'run-checkpointed';
     slot.lastEventAt = cmd.at;
     slot.lastAppliedIndex = entry.index;
-    this.emit('pipeline:run:checkpointed', { runId: cmd.runId, slot });
+    // wave2-pa-1: namespaced under `pipeline:raft:`. Declared in
+    // src/lib/event-catalog.ts.
+    this.emit('pipeline:raft:run:checkpointed', { runId: cmd.runId, slot });
     return { runId: cmd.runId, status: slot.status, applied: 'checkpointed' };
   }
 
@@ -387,7 +396,9 @@ export class PipelineRaftStateMachine extends RaftStateMachineBase<
         checkpoint: cmd.error ? { error: cmd.error } : {},
       };
       this.runs.set(cmd.runId, synthesized);
-      this.emit('pipeline:run:terminated', { runId: cmd.runId, slot: synthesized });
+      // wave2-pa-1: namespaced under `pipeline:raft:`. Declared in
+      // src/lib/event-catalog.ts.
+      this.emit('pipeline:raft:run:terminated', { runId: cmd.runId, slot: synthesized });
       return { runId: cmd.runId, status: cmd.status, applied: 'terminated' };
     }
     if (entry.index <= slot.lastAppliedIndex) {
@@ -405,7 +416,9 @@ export class PipelineRaftStateMachine extends RaftStateMachineBase<
     if (cmd.error) {
       slot.checkpoint = { ...slot.checkpoint, error: cmd.error };
     }
-    this.emit('pipeline:run:terminated', { runId: cmd.runId, slot });
+    // wave2-pa-1: namespaced under `pipeline:raft:`. Declared in
+    // src/lib/event-catalog.ts.
+    this.emit('pipeline:raft:run:terminated', { runId: cmd.runId, slot });
     return { runId: cmd.runId, status: slot.status, applied: 'terminated' };
   }
 }

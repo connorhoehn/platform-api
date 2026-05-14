@@ -544,6 +544,180 @@ catalog.declare({
 });
 
 // ---------------------------------------------------------------------------
+// platform-api Raft state-machine signal events (wave2-pa-1)
+//
+// `PipelineRaftStateMachine` (src/pipeline/PipelineRaftStateMachine.ts) is a
+// per-replica RaftStateMachineBase (Node EventEmitter) that emits lifecycle
+// events to in-process listeners. Distinct from DC's `PipelineExecutor`
+// (which uses a shared EventBus and the `pipeline:run:*` colon-form names):
+//
+//   - DC executor:        pipeline:run:started  (producer: distributed-core)
+//   - platform-api Raft:  pipeline:raft:run:started (producer: platform-api)
+//
+// The Raft SM previously emitted `pipeline:run:started` directly, which
+// collided with DC's identically-named EventBus event. wave2-pa-1 renames
+// the Raft emissions to the `pipeline:raft:run:*` namespace to disambiguate
+// producer + payload (Raft SM emits `{ runId, slot }`; DC emits
+// `{ runId, pipelineId, triggeredBy, at }`).
+//
+// Transport is `signal` (in-process), but these never cross the gateway
+// bridge — they exist for in-process consumers (the eventual MultiRaft
+// coordinator, postmortem aggregators, the SM unit test suite). No
+// gateway-side declaration is required.
+// ---------------------------------------------------------------------------
+
+catalog.declare({
+  name: 'pipeline:raft:run:started',
+  transport: 'signal',
+  producer: 'platform-api',
+  description:
+    'Emitted by PipelineRaftStateMachine when a run-started command applies. '
+    + 'Distinct from DC executor\'s `pipeline:run:started` (which has a different '
+    + 'payload + producer). Payload is the full Raft slot record.',
+  tags: ['producer:platform-api', 'pipeline', 'raft'],
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      slot: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string' },
+          pipelineId: { type: 'string' },
+          pipelineVersion: { type: 'number' },
+          ownerNodeId: { type: 'string' },
+          status: { type: 'string' },
+          lastEvent: { type: 'string' },
+          lastEventAt: { type: 'string' },
+          lastAppliedIndex: { type: 'number' },
+          checkpoint: { type: 'object', additionalProperties: true },
+        },
+        required: ['runId', 'status', 'lastAppliedIndex'],
+      },
+    },
+    required: ['runId', 'slot'],
+  },
+});
+
+catalog.declare({
+  name: 'pipeline:raft:run:updated',
+  transport: 'signal',
+  producer: 'platform-api',
+  description:
+    'Emitted by PipelineRaftStateMachine when a run-updated command transitions '
+    + 'an existing run\'s status. Payload is the full Raft slot record after '
+    + 'mutation.',
+  tags: ['producer:platform-api', 'pipeline', 'raft'],
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      slot: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string' },
+          status: { type: 'string' },
+          lastEvent: { type: 'string' },
+          lastEventAt: { type: 'string' },
+          lastAppliedIndex: { type: 'number' },
+        },
+        required: ['runId', 'status', 'lastAppliedIndex'],
+      },
+    },
+    required: ['runId', 'slot'],
+  },
+});
+
+catalog.declare({
+  name: 'pipeline:raft:run:synthesized',
+  transport: 'signal',
+  producer: 'platform-api',
+  description:
+    'Emitted by PipelineRaftStateMachine when a run-updated command arrives for '
+    + 'a runId with no existing slot (proposer\'s view of its own run-started '
+    + 'commit lagged). A placeholder slot is synthesized rather than dropping '
+    + 'the command. Operators should surface this as a warning.',
+  tags: ['producer:platform-api', 'pipeline', 'raft'],
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      slot: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string' },
+          status: { type: 'string' },
+          lastEvent: { type: 'string' },
+          lastEventAt: { type: 'string' },
+          lastAppliedIndex: { type: 'number' },
+        },
+        required: ['runId', 'status', 'lastAppliedIndex'],
+      },
+    },
+    required: ['runId', 'slot'],
+  },
+});
+
+catalog.declare({
+  name: 'pipeline:raft:run:checkpointed',
+  transport: 'signal',
+  producer: 'platform-api',
+  description:
+    'Emitted by PipelineRaftStateMachine when a run-checkpointed command lands. '
+    + 'Payload is the full Raft slot record with the new checkpoint blob.',
+  tags: ['producer:platform-api', 'pipeline', 'raft'],
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      slot: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string' },
+          status: { type: 'string' },
+          lastEvent: { type: 'string' },
+          lastEventAt: { type: 'string' },
+          lastAppliedIndex: { type: 'number' },
+          checkpoint: { type: 'object', additionalProperties: true },
+        },
+        required: ['runId', 'status', 'lastAppliedIndex', 'checkpoint'],
+      },
+    },
+    required: ['runId', 'slot'],
+  },
+});
+
+catalog.declare({
+  name: 'pipeline:raft:run:terminated',
+  transport: 'signal',
+  producer: 'platform-api',
+  description:
+    'Emitted by PipelineRaftStateMachine when a run-terminated command lands '
+    + '(completed | failed | cancelled). Terminal status is sticky — subsequent '
+    + 'terminations on the same runId are no-ops and DO NOT re-emit.',
+  tags: ['producer:platform-api', 'pipeline', 'raft'],
+  schema: {
+    type: 'object',
+    properties: {
+      runId: { type: 'string' },
+      slot: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string' },
+          status: { type: 'string', enum: ['completed', 'failed', 'cancelled'] },
+          lastEvent: { type: 'string' },
+          lastEventAt: { type: 'string' },
+          lastAppliedIndex: { type: 'number' },
+          checkpoint: { type: 'object', additionalProperties: true },
+        },
+        required: ['runId', 'status', 'lastAppliedIndex'],
+      },
+    },
+    required: ['runId', 'slot'],
+  },
+});
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 

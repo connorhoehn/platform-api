@@ -68,3 +68,60 @@ describe('Phase P3.3 — distributed-core pipeline event declarations', () => {
     expect(colon!.producer).not.toBe(dot!.producer);
   });
 });
+
+// ---------------------------------------------------------------------------
+// wave2-pa-1 — platform-api Raft state-machine event declarations
+//
+// PipelineRaftStateMachine emits in-process signal events to local listeners.
+// The Raft variants live under the `pipeline:raft:run:*` namespace to
+// disambiguate from DC's executor `pipeline:run:*` events (different
+// producer + payload).
+// ---------------------------------------------------------------------------
+
+describe('wave2-pa-1 — Raft state-machine event declarations', () => {
+  it('declares pipeline:raft:run:started as a signal-transport event from platform-api', () => {
+    const decl = declareCalls.find((d) => d.name === 'pipeline:raft:run:started');
+    expect(decl).toBeDefined();
+    expect(decl!.transport).toBe('signal');
+    expect(decl!.producer).toBe('platform-api');
+    expect(decl!.tags).toEqual(expect.arrayContaining(['producer:platform-api', 'pipeline', 'raft']));
+  });
+
+  it('declares pipeline:raft:run:updated as a signal-transport event from platform-api', () => {
+    const decl = declareCalls.find((d) => d.name === 'pipeline:raft:run:updated');
+    expect(decl).toBeDefined();
+    expect(decl!.transport).toBe('signal');
+    expect(decl!.producer).toBe('platform-api');
+  });
+
+  it('declares pipeline:raft:run:synthesized as a signal-transport event from platform-api', () => {
+    const decl = declareCalls.find((d) => d.name === 'pipeline:raft:run:synthesized');
+    expect(decl).toBeDefined();
+    expect(decl!.transport).toBe('signal');
+    expect(decl!.producer).toBe('platform-api');
+  });
+
+  it('declares pipeline:raft:run:checkpointed as a signal-transport event from platform-api', () => {
+    const decl = declareCalls.find((d) => d.name === 'pipeline:raft:run:checkpointed');
+    expect(decl).toBeDefined();
+    expect(decl!.transport).toBe('signal');
+    expect(decl!.producer).toBe('platform-api');
+  });
+
+  it('declares pipeline:raft:run:terminated as a signal-transport event from platform-api', () => {
+    const decl = declareCalls.find((d) => d.name === 'pipeline:raft:run:terminated');
+    expect(decl).toBeDefined();
+    expect(decl!.transport).toBe('signal');
+    expect(decl!.producer).toBe('platform-api');
+  });
+
+  it('Raft `pipeline:raft:run:started` is distinct from DC `pipeline:run:started` (different producer)', () => {
+    const dcStarted = declareCalls.find((d) => d.name === 'pipeline:run:started');
+    const raftStarted = declareCalls.find((d) => d.name === 'pipeline:raft:run:started');
+    expect(dcStarted).toBeDefined();
+    expect(raftStarted).toBeDefined();
+    expect(dcStarted!.name).not.toBe(raftStarted!.name);
+    expect(dcStarted!.producer).toBe('distributed-core');
+    expect(raftStarted!.producer).toBe('platform-api');
+  });
+});

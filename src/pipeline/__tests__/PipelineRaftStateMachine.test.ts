@@ -209,10 +209,12 @@ describe('PipelineRaftStateMachine', () => {
     test('emits domain events on each command type', () => {
       const sm = new PipelineRaftStateMachine(defaultPipelineRaftClusterConfig(NODE));
       const events: string[] = [];
-      sm.on('pipeline:run:started', () => events.push('started'));
-      sm.on('pipeline:run:updated', () => events.push('updated'));
-      sm.on('pipeline:run:checkpointed', () => events.push('checkpointed'));
-      sm.on('pipeline:run:terminated', () => events.push('terminated'));
+      // wave2-pa-1: `pipeline:raft:run:*` namespace disambiguates from DC's
+      // PipelineExecutor `pipeline:run:*` events on the EventBus.
+      sm.on('pipeline:raft:run:started', () => events.push('started'));
+      sm.on('pipeline:raft:run:updated', () => events.push('updated'));
+      sm.on('pipeline:raft:run:checkpointed', () => events.push('checkpointed'));
+      sm.on('pipeline:raft:run:terminated', () => events.push('terminated'));
 
       sm.apply(
         entry<PipelineRunCommand>(1, 1, {
