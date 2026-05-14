@@ -9,7 +9,10 @@ import { createScheduleEvaluator } from './services/scheduleEvaluator';
 import { createDDBSchedulerLeaderLock } from './services/scheduler-leader-lock';
 import { pipelineDefinitionsCache } from './pipeline/definitions-cache';
 import { startInvalidationSubscriber } from './pipeline/definitions-invalidator';
-import { wirePipelineBridge } from './pipeline/wire-bridge';
+import { wirePipelineBridge } from '@connorhoehn/pipeline-runtime';
+import { setPipelineBridge } from './pipeline/bridge-types';
+import { bootstrapPipeline } from './pipeline/bootstrap';
+import { createBridge } from './pipeline/createBridge';
 import { PipelineRunRepository } from './repositories/PipelineRunRepository';
 import { DLQRepository } from './repositories/DLQRepository';
 import { docClient } from './lib/aws-clients';
@@ -127,11 +130,23 @@ const dlqRepository = dlqPersistenceEnabled
   : undefined;
 
 const pipelineWiring = wirePipelineBridge({
-  pipelineRunRepository,
-  dlqRepository,
   log,
+  inProcessBootstrap: async () => {
+    const { module, dlq, shutdown } = await bootstrapPipeline({
+      pipelineRunRepository,
+      dlqRepository,
+    });
+    return {
+      bridge: createBridge(module, dlq, pipelineRunRepository),
+      shutdown,
+    };
+  },
 });
 pipelineShutdown = pipelineWiring.shutdown;
+// Install the bridge into the platform-api singleton once the wiring resolves.
+void pipelineWiring.ready.then((bridge) => {
+  if (bridge) setPipelineBridge(bridge);
+});
 
 // ---------------------------------------------------------------------------
 // Ingest engine bootstrap — wires IngestEngine with catalog-backed event bus
