@@ -1,53 +1,27 @@
 /**
- * Structured JSON logger (pino) for platform-api.
+ * Structured JSON logger for platform-api.
  *
- * Usage:
+ * Adopts @connorhoehn/service-runtime's `createLogger` so platform-api
+ * is its own first end-user of the extracted observability conventions.
+ * The pino-pretty dev-mode try-require + ISO timestamps + base service
+ * field all live in the shared lib now.
+ *
+ * Usage unchanged for callers:
  *   import log, { withContext } from './lib/logger';
  *   const reqLog = withContext({ correlationId, userId });
  *   reqLog.info({ action: 'trigger.create' }, 'pipeline triggered');
  *
- * Configuration:
- *   - SERVICE_NAME (default: 'platform-api')
- *   - LOG_LEVEL    (default: 'info')
- *   - NODE_ENV=development uses pino-pretty if available, else plain JSON.
+ * Configuration (read by createLogger from process.env):
+ *   - SERVICE_NAME  (default: 'platform-api')
+ *   - LOG_LEVEL     (default: 'info')
+ *   - NODE_ENV=development → pino-pretty if installed, else plain JSON
  */
 
-import pino, { Logger, LoggerOptions } from 'pino';
+import { createLogger, type Logger } from '@connorhoehn/service-runtime';
 
 const serviceName = process.env.SERVICE_NAME || 'platform-api';
-const level = process.env.LOG_LEVEL || 'info';
-const isDev = process.env.NODE_ENV === 'development';
 
-const baseOptions: LoggerOptions = {
-  level,
-  base: { service: serviceName },
-  timestamp: pino.stdTimeFunctions.isoTime,
-};
-
-let logger: Logger;
-
-if (isDev) {
-  let prettyTransport: LoggerOptions['transport'] | undefined;
-  try {
-    // try-require pino-pretty; if not installed, fall back to plain JSON.
-    require.resolve('pino-pretty');
-    prettyTransport = {
-      target: 'pino-pretty',
-      options: {
-        colorize: true,
-        translateTime: 'SYS:standard',
-        ignore: 'pid,hostname',
-      },
-    };
-  } catch {
-    prettyTransport = undefined;
-  }
-  logger = prettyTransport
-    ? pino({ ...baseOptions, transport: prettyTransport })
-    : pino(baseOptions);
-} else {
-  logger = pino(baseOptions);
-}
+const logger = createLogger({ service: serviceName });
 
 /**
  * Returns a child logger with the given fields bound to every log line.

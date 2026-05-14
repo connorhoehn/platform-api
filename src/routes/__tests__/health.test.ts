@@ -1,6 +1,11 @@
-// Integration tests for /api/health route — covers healthy, degraded, and
+// Integration tests for /api/health route — covers healthy, unhealthy, and
 // partial-failure states. The healthAlias.test.ts covers route aliasing;
 // this file covers the actual health-check logic paths.
+//
+// Body schema is the @connorhoehn/service-runtime `observability-base`
+// shape (status: 'healthy' | 'unhealthy' | 'degraded'; checks is an array
+// of {name, ok, durationMs, error?, details?}; service + version + ISO
+// timestamp at top level). Adopted in M4.3a-followup.
 
 import express from 'express';
 import http from 'http';
@@ -24,10 +29,20 @@ jest.mock('../../lib/redis-client', () => {
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const healthRouter = require('../health').default as express.Router;
 
+interface HealthCheckReport {
+  name: string;
+  ok: boolean;
+  durationMs: number;
+  details?: unknown;
+  error?: string;
+}
+
 interface HealthBody {
-  status: string;
+  status: 'healthy' | 'unhealthy' | 'degraded';
   service: string;
-  checks: Record<string, { status: string; latencyMs?: number; error?: string }>;
+  version: string;
+  timestamp: string;
+  checks: HealthCheckReport[];
 }
 
 interface JsonResponse { status: number; body: HealthBody }
@@ -53,6 +68,10 @@ function buildApp(): express.Application {
   return app;
 }
 
+function findCheck(body: HealthBody, name: string): HealthCheckReport | undefined {
+  return body.checks.find((c) => c.name === name);
+}
+
 describe('GET /api/health', () => {
   let server: http.Server;
 
@@ -71,42 +90,48 @@ describe('GET /api/health', () => {
     mockGetRedisClient.mockReset().mockResolvedValue({ ping: mockRedisPing });
   });
 
-  it('returns 200 + ok when both DynamoDB and Redis are healthy', async () => {
+  it('returns 200 + healthy when both DynamoDB and Redis are healthy', async () => {
     const res = await getJson(server, '/api/health');
     expect(res.status).toBe(200);
-    expect(res.body.status).toBe('ok');
+    expect(res.body.status).toBe('healthy');
     expect(res.body.service).toBe('platform-api');
-    expect(res.body.checks.dynamodb.status).toBe('ok');
-    expect(res.body.checks.redis.status).toBe('ok');
-    expect(typeof res.body.checks.dynamodb.latencyMs).toBe('number');
+    expect(typeof res.body.version).toBe('string');
+    expect(typeof res.body.timestamp).toBe('string');
+    expect(findCheck(res.body, 'dynamodb')?.ok).toBe(true);
+    expect(findCheck(res.body, 'redis')?.ok).toBe(true);
+    expect(typeof findCheck(res.body, 'dynamodb')?.durationMs).toBe('number');
   });
 
-  it('returns 503 + degraded when DynamoDB is down', async () => {
+  it('returns 503 + unhealthy when DynamoDB is down', async () => {
     mockDdbSend.mockRejectedValue(new Error('connection refused'));
     const res = await getJson(server, '/api/health');
     expect(res.status).toBe(503);
-    expect(res.body.status).toBe('degraded');
-    expect(res.body.checks.dynamodb.status).toBe('error');
-    expect(res.body.checks.dynamodb.error).toBe('connection refused');
-    expect(res.body.checks.redis.status).toBe('ok');
+    expect(res.body.status).toBe('unhealthy');
+    expect(findCheck(res.body, 'dynamodb')?.ok).toBe(false);
+    expect(findCheck(res.body, 'dynamodb')?.error).toBe('connection refused');
+    expect(findCheck(res.body, 'redis')?.ok).toBe(true);
   });
 
-  it('returns 503 + degraded when Redis is down', async () => {
+  it('returns 503 + unhealthy when Redis is down', async () => {
     mockRedisPing.mockRejectedValue(new Error('ECONNREFUSED'));
     const res = await getJson(server, '/api/health');
     expect(res.status).toBe(503);
-    expect(res.body.status).toBe('degraded');
-    expect(res.body.checks.dynamodb.status).toBe('ok');
-    expect(res.body.checks.redis.status).toBe('error');
-    expect(res.body.checks.redis.error).toBe('ECONNREFUSED');
+    expect(res.body.status).toBe('unhealthy');
+    expect(findCheck(res.body, 'dynamodb')?.ok).toBe(true);
+    expect(findCheck(res.body, 'redis')?.ok).toBe(false);
+    expect(findCheck(res.body, 'redis')?.error).toBe('ECONNREFUSED');
   });
 
   it('returns 503 when Redis client is unavailable (null)', async () => {
     mockGetRedisClient.mockResolvedValue(null);
     const res = await getJson(server, '/api/health');
     expect(res.status).toBe(503);
-    expect(res.body.checks.redis.status).toBe('error');
-    expect(res.body.checks.redis.error).toBe('Redis client unavailable');
+    const redis = findCheck(res.body, 'redis');
+    expect(redis?.ok).toBe(false);
+    // ok:false from a check returning {ok:false, details:...} surfaces as
+    // unhealthy without an `error` field — the details (string here) carry
+    // the explanation. This matches the observability-base contract.
+    expect(redis?.details).toBe('Redis client unavailable');
   });
 
   it('returns 503 when both services are down', async () => {
@@ -114,15 +139,15 @@ describe('GET /api/health', () => {
     mockRedisPing.mockRejectedValue(new Error('Redis timeout'));
     const res = await getJson(server, '/api/health');
     expect(res.status).toBe(503);
-    expect(res.body.status).toBe('degraded');
-    expect(res.body.checks.dynamodb.status).toBe('error');
-    expect(res.body.checks.redis.status).toBe('error');
+    expect(res.body.status).toBe('unhealthy');
+    expect(findCheck(res.body, 'dynamodb')?.ok).toBe(false);
+    expect(findCheck(res.body, 'redis')?.ok).toBe(false);
   });
 
-  it('includes latencyMs on both checks even when errored', async () => {
+  it('includes durationMs on both checks even when errored', async () => {
     mockDdbSend.mockRejectedValue(new Error('timeout'));
     const res = await getJson(server, '/api/health');
-    expect(typeof res.body.checks.dynamodb.latencyMs).toBe('number');
-    expect(typeof res.body.checks.redis.latencyMs).toBe('number');
+    expect(typeof findCheck(res.body, 'dynamodb')?.durationMs).toBe('number');
+    expect(typeof findCheck(res.body, 'redis')?.durationMs).toBe('number');
   });
 });

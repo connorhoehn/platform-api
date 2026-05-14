@@ -23,7 +23,12 @@ const healthRouter = require('../routes/health').default as express.Router;
 
 interface JsonResponse {
   status: number;
-  body: { status?: string; service?: string; checks?: Record<string, unknown> };
+  body: {
+    status?: string;
+    service?: string;
+    version?: string;
+    checks?: Array<{ name: string; ok: boolean; durationMs: number }>;
+  };
 }
 
 async function getJson(server: http.Server, path: string): Promise<JsonResponse> {
@@ -77,9 +82,12 @@ describe('GET /api/health alias (hub task #6)', () => {
     expect(alias.status).toBe(root.status);
     expect(alias.body.service).toBe('platform-api');
     expect(alias.body.status).toBe(root.body.status);
-    expect(alias.body.checks).toMatchObject({
-      dynamodb: { status: 'ok' },
-      redis: { status: 'ok' },
-    });
+    // Body schema is the @connorhoehn/service-runtime observability-base
+    // shape: checks is an array of {name, ok, durationMs}.
+    expect(Array.isArray(alias.body.checks)).toBe(true);
+    const dynamodb = alias.body.checks?.find((c) => c.name === 'dynamodb');
+    const redis = alias.body.checks?.find((c) => c.name === 'redis');
+    expect(dynamodb?.ok).toBe(true);
+    expect(redis?.ok).toBe(true);
   });
 });
