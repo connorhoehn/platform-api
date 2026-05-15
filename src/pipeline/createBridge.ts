@@ -36,7 +36,7 @@ import type {
   DeadLetterQueue,
   StepExecution,
 } from 'distributed-core';
-import { wrap, InMemoryQueueInspector } from 'distributed-core';
+import { wrap, InMemoryQueueInspector } from 'distributed-core/messaging-queue';
 // hub#2226 — see bridge-types.ts for why these aren't imported from
 // distributed-core (the v0.14.2 pin predates the type re-exports).
 import type { ContextPatch, PatchResult } from './bridge-types';

@@ -12,7 +12,8 @@
 // is additive and side-effect-free w.r.t. existing dashboards.
 
 import os from 'os';
-import { MetricsRegistry, formatPrometheus, QueueMetrics } from 'distributed-core';
+import { MetricsRegistry, formatPrometheus } from 'distributed-core';
+import { QueueMetrics } from 'distributed-core/messaging-queue';
 
 const SERVICE = process.env.WSG_SERVICE_NAME || 'platform-api';
 const NODE_ID = process.env.WSG_NODE_ID || os.hostname();

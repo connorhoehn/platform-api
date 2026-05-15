@@ -22,7 +22,7 @@
 // would plug into a MultiRaftCoordinator slot if we owned a RaftNode
 // directly). Its contract is pinned by PipelineRaftStateMachine.test.ts.
 
-import { FixtureLLMClient } from 'distributed-core';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 import * as fs from 'fs';
 import * as path from 'path';

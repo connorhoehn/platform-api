@@ -9,7 +9,7 @@
 //   - Per-source confidence threshold + model overrides are honored.
 //   - Audit row is persisted in every branch with method/latency/model.
 
-import { FixtureLLMClient } from 'distributed-core';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import {
   runMappingPipeline,
   DEFAULT_CONFIDENCE_THRESHOLD,

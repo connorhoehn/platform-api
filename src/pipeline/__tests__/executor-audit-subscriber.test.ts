@@ -382,4 +382,166 @@ describe('ExecutorAuditSubscriber', () => {
     // No audit calls expected from start() itself.
     expect(recordMock).not.toHaveBeenCalled();
   });
+
+  // ---------------------------------------------------------------------------
+  // P2 wave21-b — orphan / reassign / resume-from-step + join lifecycle.
+  // ---------------------------------------------------------------------------
+
+  it('maps pipeline:run:orphaned → pipeline.run.orphaned (error) with previousOwner in trace', async () => {
+    const { bus, records } = makeSubscriber();
+    await bus.emit('pipeline:run:started', {
+      runId: 'r-orphan',
+      pipelineId: 'p-orphan',
+      triggeredBy: { userId: 'u' },
+      at: 't',
+    });
+    await bus.emit('pipeline:run:orphaned', {
+      runId: 'r-orphan',
+      previousOwner: 'node-1',
+      at: '2026-05-15T10:00:00Z',
+    });
+    await flush();
+    const row = records.find((r) => r.action === 'pipeline.run.orphaned');
+    expect(row).toMatchObject({
+      action: 'pipeline.run.orphaned',
+      actorUserId: 'system',
+      pipelineId: 'p-orphan',
+      runId: 'r-orphan',
+      outcome: 'error',
+      trace: { previousOwner: 'node-1', at: '2026-05-15T10:00:00Z' },
+    });
+  });
+
+  it('maps pipeline:run:reassigned → pipeline.run.reassigned (success) with from/to in trace', async () => {
+    const { bus, records } = makeSubscriber();
+    await bus.emit('pipeline:run:started', {
+      runId: 'r-reassign',
+      pipelineId: 'p-reassign',
+      triggeredBy: { userId: 'u' },
+      at: 't',
+    });
+    await bus.emit('pipeline:run:reassigned', {
+      runId: 'r-reassign',
+      from: 'node-1',
+      to: 'node-2',
+      at: '2026-05-15T10:01:00Z',
+    });
+    await flush();
+    const row = records.find((r) => r.action === 'pipeline.run.reassigned');
+    expect(row).toMatchObject({
+      action: 'pipeline.run.reassigned',
+      actorUserId: 'system',
+      pipelineId: 'p-reassign',
+      runId: 'r-reassign',
+      outcome: 'success',
+      trace: { from: 'node-1', to: 'node-2', at: '2026-05-15T10:01:00Z' },
+    });
+  });
+
+  it('maps pipeline:run:resumed-from-step → pipeline.run.resumed-from-step with fromNodeId in trace', async () => {
+    const { bus, records } = makeSubscriber();
+    await bus.emit('pipeline:run:started', {
+      runId: 'r-resume',
+      pipelineId: 'p-resume',
+      triggeredBy: { userId: 'u' },
+      at: 't',
+    });
+    await bus.emit('pipeline:run:resumed-from-step', {
+      runId: 'r-resume',
+      fromNodeId: 'step-3',
+      originalFailedStepId: 'step-2',
+      at: '2026-05-15T10:02:00Z',
+    });
+    await flush();
+    const row = records.find((r) => r.action === 'pipeline.run.resumed-from-step');
+    expect(row).toMatchObject({
+      action: 'pipeline.run.resumed-from-step',
+      actorUserId: 'system',
+      pipelineId: 'p-resume',
+      runId: 'r-resume',
+      outcome: 'success',
+      trace: {
+        fromNodeId: 'step-3',
+        originalFailedStepId: 'step-2',
+        at: '2026-05-15T10:02:00Z',
+      },
+    });
+  });
+
+  it('omits originalFailedStepId from trace when not provided by run:resumed-from-step', async () => {
+    const { bus, records } = makeSubscriber();
+    await bus.emit('pipeline:run:started', {
+      runId: 'r-resume-2',
+      pipelineId: 'p-resume-2',
+      triggeredBy: { userId: 'u' },
+      at: 't',
+    });
+    await bus.emit('pipeline:run:resumed-from-step', {
+      runId: 'r-resume-2',
+      fromNodeId: 'step-5',
+      at: '2026-05-15T10:03:00Z',
+    });
+    await flush();
+    const row = records.find((r) => r.action === 'pipeline.run.resumed-from-step');
+    expect(row).toBeDefined();
+    expect((row!.trace as Record<string, unknown>).fromNodeId).toBe('step-5');
+    expect('originalFailedStepId' in (row!.trace as Record<string, unknown>)).toBe(false);
+  });
+
+  it('maps pipeline:join:waiting → pipeline.join.waiting with received/required in trace', async () => {
+    const { bus, records } = makeSubscriber();
+    await bus.emit('pipeline:run:started', {
+      runId: 'r-join-w',
+      pipelineId: 'p-join-w',
+      triggeredBy: { userId: 'u' },
+      at: 't',
+    });
+    await bus.emit('pipeline:join:waiting', {
+      runId: 'r-join-w',
+      stepId: 'join-1',
+      received: 1,
+      required: 3,
+      at: '2026-05-15T10:04:00Z',
+    });
+    await flush();
+    const row = records.find((r) => r.action === 'pipeline.join.waiting');
+    expect(row).toMatchObject({
+      action: 'pipeline.join.waiting',
+      actorUserId: 'system',
+      pipelineId: 'p-join-w',
+      runId: 'r-join-w',
+      outcome: 'success',
+      trace: { stepId: 'join-1', received: 1, required: 3, at: '2026-05-15T10:04:00Z' },
+    });
+  });
+
+  it('maps pipeline:join:fired → pipeline.join.fired with inputs array in trace', async () => {
+    const { bus, records } = makeSubscriber();
+    await bus.emit('pipeline:run:started', {
+      runId: 'r-join-f',
+      pipelineId: 'p-join-f',
+      triggeredBy: { userId: 'u' },
+      at: 't',
+    });
+    await bus.emit('pipeline:join:fired', {
+      runId: 'r-join-f',
+      stepId: 'join-1',
+      inputs: ['branch-a', 'branch-b', 'branch-c'],
+      at: '2026-05-15T10:05:00Z',
+    });
+    await flush();
+    const row = records.find((r) => r.action === 'pipeline.join.fired');
+    expect(row).toMatchObject({
+      action: 'pipeline.join.fired',
+      actorUserId: 'system',
+      pipelineId: 'p-join-f',
+      runId: 'r-join-f',
+      outcome: 'success',
+      trace: {
+        stepId: 'join-1',
+        inputs: ['branch-a', 'branch-b', 'branch-c'],
+        at: '2026-05-15T10:05:00Z',
+      },
+    });
+  });
 });

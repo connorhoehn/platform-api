@@ -409,6 +409,101 @@ export class ExecutorAuditSubscriber {
       }),
     );
 
+    // -----------------------------------------------------------------------
+    // P2 run-lifecycle — orphan, reassign, resume-from-step (wave21-b)
+    // -----------------------------------------------------------------------
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:run:orphaned', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.run.orphaned',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'error',
+          trace: {
+            previousOwner: event.payload.previousOwner,
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:run:reassigned', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.run.reassigned',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'success',
+          trace: {
+            from: event.payload.from,
+            to: event.payload.to,
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:run:resumed-from-step', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.run.resumed-from-step',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'success',
+          trace: {
+            fromNodeId: event.payload.fromNodeId,
+            ...(event.payload.originalFailedStepId !== undefined
+              ? { originalFailedStepId: event.payload.originalFailedStepId }
+              : {}),
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
+    // -----------------------------------------------------------------------
+    // P2 join-node lifecycle — waiting + fired (wave21-b)
+    // -----------------------------------------------------------------------
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:join:waiting', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.join.waiting',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'success',
+          trace: {
+            stepId: event.payload.stepId,
+            received: event.payload.received,
+            required: event.payload.required,
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:join:fired', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.join.fired',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'success',
+          trace: {
+            stepId: event.payload.stepId,
+            inputs: event.payload.inputs,
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
     log.info(
       { checkpointSampleRate: this.checkpointSampleRate },
       'executor audit subscriber started',

@@ -94,7 +94,12 @@ export type AuditAction =
   // P1 wave19-c additions — run-lifecycle + context-patch unvalidated variant.
   | 'pipeline.run.cancelled'
   | 'pipeline.run.stuck'
-  | 'pipeline.step.context.patched-unvalidated';
+  | 'pipeline.step.context.patched-unvalidated'
+  // P2 wave21-b additions — orphan/reassign + join lifecycle.
+  | 'pipeline.run.orphaned'
+  | 'pipeline.run.reassigned'
+  | 'pipeline.join.waiting'
+  | 'pipeline.join.fired';
 
 /** Optional decision tag attached to the event. */
 export type AuditDecision =

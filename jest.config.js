@@ -35,6 +35,7 @@ module.exports = {
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json'],
   // Map ESM-only local packages so jest's CJS resolver can find them.
   moduleNameMapper: {
+    '^(\\.{1,2}/.*)\\.js$': '$1',
     '^@connorhoehn/event-catalog$': '<rootDir>/node_modules/@connorhoehn/event-catalog/dist/index.js',
   },
 };

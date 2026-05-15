@@ -3,7 +3,7 @@
 // Tests for suggestTypeMatch, generateTypeProposal, buildStoredProposal.
 // Uses FixtureLLMClient from distributed-core for deterministic LLM simulation.
 
-import { FixtureLLMClient } from 'distributed-core';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import {
     suggestTypeMatch,
     generateTypeProposal,

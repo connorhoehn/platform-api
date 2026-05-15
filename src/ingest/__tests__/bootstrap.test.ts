@@ -4,7 +4,7 @@
 // producer deduplication, DLQ wiring, createSession per-source identity,
 // and shutdown teardown.
 
-import { wrap } from 'distributed-core';
+import { wrap } from 'distributed-core/messaging-queue';
 import { bootstrapIngest, type IngestBootstrapDeps } from '../bootstrap';
 import type { IngestSourceRepository } from '../repositories/IngestSourceRepository';
 import type { IngestItemRepository } from '../repositories/IngestItemRepository';

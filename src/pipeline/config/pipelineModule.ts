@@ -23,7 +23,7 @@ import type {
   BusEvent,
   EventBusCompactionOptions,
 } from 'distributed-core';
-import { InMemoryDedupStore } from 'distributed-core';
+import { InMemoryDedupStore } from 'distributed-core/messaging-queue';
 
 /**
  * Inlined replacement for distributed-core's previously-exported
