@@ -500,6 +500,30 @@ catalog.declareAll(pipelineEventDeclarations);
 export async function connectCatalog(): Promise<void> {
   await catalog.connect();
   log.info('[event-catalog] connected');
+
+  // wave22-c — fingerprint drift report at boot. Compares every
+  // locally-declared event's fingerprint against what the registry
+  // has and logs a one-line summary plus per-event detail when any
+  // are stale. Best-effort: failures degrade to a warn log so a flaky
+  // catalog doesn't block boot.
+  try {
+    const reports = await catalog.checkAllSchemaFreshness();
+    const stale = reports.filter(r => r.status === 'stale');
+    const unknown = reports.filter(r => r.status === 'unknown');
+    const fresh = reports.length - stale.length - unknown.length;
+    log.info(
+      { fresh, stale: stale.length, unknown: unknown.length, total: reports.length },
+      '[event-catalog] schema-freshness report',
+    );
+    for (const r of stale) {
+      log.warn(
+        { eventName: r.eventName, localFingerprint: r.localFingerprint.slice(0, 12), remoteFingerprint: (r.remoteFingerprint ?? '').slice(0, 12) },
+        '[event-catalog] schema drift detected — local declaration is out of sync with registry',
+      );
+    }
+  } catch (err) {
+    log.warn({ err: (err as Error).message }, '[event-catalog] schema-freshness check failed (non-fatal)');
+  }
 }
 
 export async function disconnectCatalog(): Promise<void> {
