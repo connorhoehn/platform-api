@@ -5,7 +5,12 @@
  * provides `publishSignal` for gateway-compatible Redis broadcasts,
  * and `publishDurable` for at-least-once message-queue delivery via DynamoDB outbox.
  */
-import { EventCatalog, pipelineRaftDeclarations, pipelineEventDeclarations } from '@connorhoehn/event-catalog';
+import {
+  EventCatalog,
+  pipelineRaftDeclarations,
+  pipelineRaftStateMachineDeclarations,
+  pipelineEventDeclarations,
+} from '@connorhoehn/event-catalog';
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
 import { docClient } from './aws-clients';
@@ -449,130 +454,46 @@ catalog.declare({
 });
 
 // ---------------------------------------------------------------------------
-// distributed-core signal-transport pipeline events (Phase P3.3)
-//
-// Declared by platform-api on distributed-core's behalf because DC is a
-// library, not a service — it cannot register itself with the central
-// catalog. The events flow over DC's in-process EventBus inside this
-// service and are bridged to gateway WS clients via the pipeline-bridge
-// service.
-//
-// IMPORTANT: these are SEPARATE events from the durable `pipeline.run.*`
-// declarations above, despite the name-string overlap on the deprecated
-// dot-form alias. Different transports, different schemas:
-//   - colon-form (here):  in-process bus; payload uses `at`
-//   - dot-form (above):   durable queue; payload uses `completedAt`/`failedAt`/`startedAt`
-//
-// PipelineExecutor.ts also dual-emits a deprecated dot-form alias on the
-// same in-process bus (e.g. `pipeline.run.completed` alongside the
-// canonical colon-form). The gateway's pipeline-bridge maintains a
-// DEPRECATED_DUAL_EMIT_ALIASES Set to suppress the dot-form half — that
-// hardcoded list must stay in sync with distributed-core's
-// CANONICAL_TO_DEPRECATED map in PipelineExecutor.ts:85.
-// ---------------------------------------------------------------------------
-
-catalog.declare({
-  name: 'pipeline:run:started',
-  transport: 'signal',
-  producer: 'distributed-core',
-  description:
-    'In-process EventBus event from PipelineExecutor when a run starts. '
-    + 'Bridged to gateway WS clients via pipeline:event frames. The platform-api '
-    + 'durable counterpart `pipeline.run.started` (declared separately above) '
-    + 'subscribes to this and re-publishes to message-queue with a renamed '
-    + '`startedAt` field instead of `at`.',
-  tags: ['producer:distributed-core', 'pipeline'],
-  schema: {
-    type: 'object',
-    properties: {
-      runId: { type: 'string' },
-      pipelineId: { type: 'string' },
-      triggeredBy: { type: 'object', additionalProperties: true },
-      at: { type: 'string', description: 'ISO-8601 timestamp' },
-    },
-    required: ['runId', 'pipelineId', 'at'],
-  },
-});
-
-catalog.declare({
-  name: 'pipeline:run:completed',
-  transport: 'signal',
-  producer: 'distributed-core',
-  description:
-    'In-process EventBus event from PipelineExecutor when a run completes. '
-    + 'Bridged to gateway WS clients via pipeline:event frames. The platform-api '
-    + 'durable counterpart `pipeline.run.completed` (declared separately above) '
-    + 'subscribes to this and re-publishes to message-queue with `completedAt` instead of `at`.',
-  tags: ['producer:distributed-core', 'pipeline'],
-  schema: {
-    type: 'object',
-    properties: {
-      runId: { type: 'string' },
-      durationMs: { type: 'number' },
-      at: { type: 'string', description: 'ISO-8601 timestamp' },
-    },
-    required: ['runId', 'durationMs', 'at'],
-  },
-});
-
-catalog.declare({
-  name: 'pipeline:run:failed',
-  transport: 'signal',
-  producer: 'distributed-core',
-  description:
-    'In-process EventBus event from PipelineExecutor when a run fails. '
-    + 'Bridged to gateway WS clients via pipeline:event frames. The platform-api '
-    + 'durable counterpart `pipeline.run.failed` (declared separately above) '
-    + 'subscribes to this and re-publishes to message-queue with `failedAt` instead of `at`.',
-  tags: ['producer:distributed-core', 'pipeline'],
-  schema: {
-    type: 'object',
-    properties: {
-      runId: { type: 'string' },
-      error: {
-        type: 'object',
-        properties: {
-          nodeId: { type: 'string' },
-          message: { type: 'string' },
-        },
-        required: ['message'],
-      },
-      at: { type: 'string', description: 'ISO-8601 timestamp' },
-    },
-    required: ['runId', 'error', 'at'],
-  },
-});
-
-// ---------------------------------------------------------------------------
-// platform-api Raft state-machine signal events (wave2-pa-1 / wave9-d)
+// platform-api Raft state-machine signal events (wave2-pa-1 / wave9-d / wave20-c)
 //
 // `PipelineRaftStateMachine` (src/pipeline/PipelineRaftStateMachine.ts) is a
 // per-replica RaftStateMachineBase (Node EventEmitter) that emits lifecycle
-// events to in-process listeners. Distinct from DC's `PipelineExecutor`
-// (which uses a shared EventBus and the `pipeline:run:*` colon-form names):
+// events under the `pipeline:raft:*` namespace to disambiguate from DC's
+// PipelineExecutor:
 //
 //   - DC executor:        pipeline:run:started  (producer: distributed-core)
 //   - platform-api Raft:  pipeline:raft:run:started (producer: platform-api)
 //
-// Transport is `signal` (in-process), but these never cross the gateway
-// bridge — they exist for in-process consumers (the eventual MultiRaft
-// coordinator, postmortem aggregators, the SM unit test suite).
+// Transport is `signal` (in-process). These events never cross the gateway
+// bridge — they exist for in-process consumers (MultiRaft coordinator,
+// postmortem aggregators, SM unit test suite).
 //
-// wave9-d: declarations moved to @connorhoehn/event-catalog
-// src/declarations/pipeline-raft.ts (pipelineRaftDeclarations). Registered
-// here via the bulk array so the canonical EC registry stays authoritative.
+// wave20-c: Register pipelineRaftStateMachineDeclarations (the 4 SM state-
+// transition events: synthesized, updated, checkpointed, terminated) in
+// addition to the full pipelineRaftDeclarations for the creation event.
 // ---------------------------------------------------------------------------
 
 for (const decl of pipelineRaftDeclarations) {
   catalog.declare(decl);
 }
 
-// wave19-c — P0+P1 pipeline event declarations (from @connorhoehn/event-catalog v0.3.8).
-// These cover the 14 consolidated events: approval (both transports), checkpoint,
-// run:cancelled/stuck, step:started/completed/failed/breakpoint/context-mutations,
-// and llm:prompt/response. The Registry's additive schema-compat check ensures
-// re-declaration of events already declared above (run:started/completed/failed) is
-// backward-compatible and does not overwrite existing declarations incompatibly.
+// wave20-c — Raft SM state-transition declarations (synthesized/updated/
+// checkpointed/terminated). Declared separately from pipelineRaftDeclarations
+// so consumers that only care about post-create state changes can register
+// from this list. The EC registry's additive compat check treats re-declarations
+// of already-registered events as benign no-ops.
+for (const decl of pipelineRaftStateMachineDeclarations) {
+  catalog.declare(decl);
+}
+
+// wave20-c — P0+P1+P2 pipeline event declarations (from @connorhoehn/event-catalog v0.3.12).
+// Covers 23 consolidated events: approval (both transports), checkpoint,
+// run:cancelled/stuck/started/completed/failed/orphaned/reassigned/resumed-from-step/retry,
+// step:started/completed/failed/breakpoint/context-mutations, llm:prompt/response,
+// join:waiting/fired.
+// NOTE: pipeline:run:started/completed/failed were previously declared inline
+// here (Phase P3.3). Those inline declarations were removed in wave20-c since
+// pipelineEventDeclarations now carries the authoritative P2 schemas.
 for (const decl of pipelineEventDeclarations) {
   catalog.declare(decl);
 }
