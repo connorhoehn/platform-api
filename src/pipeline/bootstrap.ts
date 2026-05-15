@@ -66,7 +66,9 @@
 // routes the six bridge surfaces (getRun, getHistory, listActiveRuns,
 // getMetrics, getPendingApprovals, pipeline.run.reassigned) into WebSockets.
 
-import { Cluster, PipelineModule, InMemoryDeadLetterQueue, wrap } from 'distributed-core';
+import { Cluster } from 'distributed-core';
+import { PipelineModule } from 'distributed-core/applications/pipeline';
+import { InMemoryDeadLetterQueue, wrap } from 'distributed-core/messaging-queue';
 import type {
   BusEvent,
   LLMClient,
@@ -727,6 +729,24 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     runQueueMetrics.recordFailed();
   }));
 
+  // Two separate subscriptions to `pipeline:run:completed` below are
+  // INTENTIONAL and not a race — they serve completely different purposes:
+  //
+  //   1. (above, line ~725) Queue-metrics subscriber: records a counter tick
+  //      for the 'run-queue' throughput metric. No external side-effects.
+  //
+  //   2. (below, line ~745) Durable-publish subscriber: fans the event out
+  //      to event-catalog (`publishDurable('pipeline.run.completed', …)`) so
+  //      external consumers can subscribe to the durable event stream.
+  //
+  // There is no dual-fire risk: `pipeline:run:completed` is emitted exactly
+  // once per run by DC's PipelineExecutor (src in distributed-core:
+  // PipelineExecutor.ts). The PipelineRaftStateMachine (defined locally in
+  // src/pipeline/PipelineRaftStateMachine.ts) emits only `pipeline:raft:run:*`
+  // namespaced events on its OWN internal emitter — it is NOT wired to this
+  // EventBus and is not instantiated in the production bootstrap. No second
+  // source for `pipeline:run:completed` exists.
+  //
   // Publish pipeline lifecycle events through event-catalog for external consumers
   eventBus.subscribe('pipeline:run:started', async (payload: unknown) => {
     const data = payload as Record<string, unknown>;
