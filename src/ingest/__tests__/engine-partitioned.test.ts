@@ -176,10 +176,14 @@ function makeFakeCatalog() {
     subscribe: jest.fn(
       <T>(_name: string, h: EventHandler<T>): Subscription => {
         handler = h as EventHandler<unknown>;
+        let paused = false;
         return {
           unsubscribe: async () => {
             handler = null;
           },
+          pause: () => { paused = true; },
+          resume: () => { paused = false; },
+          isPaused: () => paused,
         };
       },
     ),

@@ -473,30 +473,25 @@ catalog.declare({
 // addition to the full pipelineRaftDeclarations for the creation event.
 // ---------------------------------------------------------------------------
 
-for (const decl of pipelineRaftDeclarations) {
-  catalog.declare(decl);
-}
+// wave20-g — collapse the three for-loops into single declareAll() calls.
+// Same semantics (`declare()` is local-only; the HTTP bulk happens later
+// in `syncToRemoteRegistry`), but the intent — "register this whole
+// imported list" — reads cleanly at the call site.
+catalog.declareAll(pipelineRaftDeclarations);
 
 // wave20-c — Raft SM state-transition declarations (synthesized/updated/
 // checkpointed/terminated). Declared separately from pipelineRaftDeclarations
 // so consumers that only care about post-create state changes can register
 // from this list. The EC registry's additive compat check treats re-declarations
 // of already-registered events as benign no-ops.
-for (const decl of pipelineRaftStateMachineDeclarations) {
-  catalog.declare(decl);
-}
+catalog.declareAll(pipelineRaftStateMachineDeclarations);
 
-// wave20-c — P0+P1+P2 pipeline event declarations (from @connorhoehn/event-catalog v0.3.12).
+// wave20-c — P0+P1+P2 pipeline event declarations (from @connorhoehn/event-catalog v0.3.18).
 // Covers 23 consolidated events: approval (both transports), checkpoint,
 // run:cancelled/stuck/started/completed/failed/orphaned/reassigned/resumed-from-step/retry,
 // step:started/completed/failed/breakpoint/context-mutations, llm:prompt/response,
 // join:waiting/fired.
-// NOTE: pipeline:run:started/completed/failed were previously declared inline
-// here (Phase P3.3). Those inline declarations were removed in wave20-c since
-// pipelineEventDeclarations now carries the authoritative P2 schemas.
-for (const decl of pipelineEventDeclarations) {
-  catalog.declare(decl);
-}
+catalog.declareAll(pipelineEventDeclarations);
 
 // ---------------------------------------------------------------------------
 // Lifecycle

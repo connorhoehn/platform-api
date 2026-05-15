@@ -80,10 +80,14 @@ function makeMultiReplicaBus() {
       active: true,
     };
     handlers.push(entry);
+    let paused = false;
     return {
       unsubscribe: async () => {
         entry.active = false;
       },
+      pause: () => { paused = true; },
+      resume: () => { paused = false; },
+      isPaused: () => paused,
     };
   }
 
