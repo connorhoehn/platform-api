@@ -2,6 +2,7 @@
 //
 // Bootstrap for the ingest engine. Wires up distributed-core primitives:
 // - InMemoryBatchedQueue (sync tasks) + InMemoryBatchedQueue (ingest items)
+//   OR DurableIngestQueue when INGEST_QUEUE_DURABLE=true (crash-safe WAL path)
 // - InMemoryIdempotentProducer for deduplicating re-syncs (with InMemoryDedupStore)
 // - SourceSyncLock for per-source sync locking (simple in-memory mutex)
 // - EventBus for progress events
@@ -10,21 +11,32 @@
 // Follows the composition-layer pattern from pipeline/bootstrap.ts but
 // scoped to ingest concerns. Single-node posture (in-memory transport)
 // consistent with CONSTITUTION path-(a).
+//
+// Durability gate:
+//   INGEST_QUEUE_DURABLE=true  → WalQueueStore backed DurableIngestQueue
+//   unset / false              → InMemoryBatchedQueue (legacy, default)
 
 import {
   InMemoryBatchedQueue,
   InMemoryIdempotentProducer,
   InMemoryDedupStore,
-  EventBusFactory,
   InMemoryDeadLetterQueue,
-} from 'distributed-core';
-import type { EventBus, ProducerSink, Envelope } from 'distributed-core';
-
+} from 'distributed-core/messaging-queue';
+import type { ProducerSink, Envelope } from 'distributed-core/messaging-queue';
 import type {
   BatchedQueue,
   IdempotentProducer,
   DeadLetterQueue,
-} from 'distributed-core';
+} from 'distributed-core/messaging-queue';
+import { EventBusFactory } from 'distributed-core';
+import type { EventBus } from 'distributed-core';
+
+import {
+  DurableIngestQueue,
+  InMemoryQueueStore,
+  WalQueueStore,
+  type QueueStore,
+} from './durable-queue';
 
 import type { IngestSourceRepository } from './repositories/IngestSourceRepository';
 import type { IngestItemRepository } from './repositories/IngestItemRepository';
@@ -49,6 +61,12 @@ export interface IngestBootstrapDeps {
   itemRepository: IngestItemRepository;
   cursorRepository: SyncCursorRepository;
   documentRepository: TypedDocumentRepository;
+  /**
+   * Optional queue store override for durability. When omitted, the env var
+   * `INGEST_QUEUE_DURABLE=true` selects WalQueueStore automatically;
+   * otherwise InMemoryQueueStore (no-op / legacy) is used.
+   */
+  queueStore?: QueueStore;
 }
 
 export interface IngestBootstrapHandle {
@@ -100,11 +118,39 @@ export async function bootstrapIngest(
     dlqCapacity = 10,
   } = opts;
 
+  // Resolve queue store: explicit override > env gate > no-op in-memory
+  const durable =
+    deps.queueStore !== undefined
+      ? deps.queueStore
+      : process.env.INGEST_QUEUE_DURABLE === 'true'
+        ? new WalQueueStore()
+        : new InMemoryQueueStore();
+
+  const isDurable = !(durable instanceof InMemoryQueueStore);
+
+  // Initialise store (no-op for InMemoryQueueStore)
+  await durable.init('sync-queue');
+  await durable.init('ingest-queue');
+
   // Sync task queue (manual/scheduled sync triggers)
-  const syncQueue = new InMemoryBatchedQueue<SyncTask>();
+  let syncQueue: InMemoryBatchedQueue<SyncTask>;
+  if (isDurable) {
+    const dq = new DurableIngestQueue<SyncTask>({ store: durable, queueName: 'sync-queue' });
+    await dq.hydrateFromStore();
+    syncQueue = dq;
+  } else {
+    syncQueue = new InMemoryBatchedQueue<SyncTask>();
+  }
 
   // Ingest item queue (files discovered during sync)
-  const ingestQueue = new InMemoryBatchedQueue<IngestItem>();
+  let ingestQueue: InMemoryBatchedQueue<IngestItem>;
+  if (isDurable) {
+    const dq = new DurableIngestQueue<IngestItem>({ store: durable, queueName: 'ingest-queue' });
+    await dq.hydrateFromStore();
+    ingestQueue = dq;
+  } else {
+    ingestQueue = new InMemoryBatchedQueue<IngestItem>();
+  }
 
   // Dead-letter queue for failed ingest items
   const dlq = new InMemoryDeadLetterQueue<IngestItem>({
@@ -173,6 +219,7 @@ export async function bootstrapIngest(
     if (shutdownCalled) return;
     shutdownCalled = true;
     locks.clear();
+    await durable.shutdown();
   };
 
   return {
