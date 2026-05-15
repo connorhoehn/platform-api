@@ -306,6 +306,109 @@ export class ExecutorAuditSubscriber {
       }),
     );
 
+    // -----------------------------------------------------------------------
+    // P1 run-lifecycle — cancellation and stuck detection (wave19-c)
+    // -----------------------------------------------------------------------
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:run:cancelled', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.run.cancelled',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'success',
+          decision: 'cancelled',
+          trace: {
+            at: event.payload.at,
+          },
+        });
+        // Run is terminal — drop the runId→pipelineId index entry.
+        this.runIndex.delete(event.payload.runId);
+      }),
+    );
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:run:stuck', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.run.stuck',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'error',
+          trace: {
+            lastHeartbeatAt: event.payload.lastHeartbeatAt,
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
+    // -----------------------------------------------------------------------
+    // P1 context-patch mutations — edit-and-continue at breakpoints (wave19-c)
+    // -----------------------------------------------------------------------
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:step:context.patched', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.step.context.patched',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'success',
+          trace: {
+            stepId: event.payload.stepId,
+            patchId: event.payload.patchId,
+            mode: event.payload.mode,
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:step:context.patched-unvalidated', async (event) => {
+        log.warn(
+          {
+            runId: event.payload.runId,
+            stepId: event.payload.stepId,
+            patchId: event.payload.patchId,
+          },
+          'context patch applied without schema validation (no ContextValidator registered for node type)',
+        );
+        this.fireAndForget({
+          action: 'pipeline.step.context.patched-unvalidated',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'success',
+          trace: {
+            stepId: event.payload.stepId,
+            patchId: event.payload.patchId,
+            mode: event.payload.mode,
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
+    this.subscriptionIds.push(
+      this.eventBus.subscribe('pipeline:step:context.patch-reverted', async (event) => {
+        this.fireAndForget({
+          action: 'pipeline.step.context.patch-reverted',
+          actorUserId: 'system',
+          pipelineId: this.lookupPipelineId(event.payload.runId),
+          runId: event.payload.runId,
+          outcome: 'success',
+          trace: {
+            stepId: event.payload.stepId,
+            patchId: event.payload.patchId,
+            at: event.payload.at,
+          },
+        });
+      }),
+    );
+
     log.info(
       { checkpointSampleRate: this.checkpointSampleRate },
       'executor audit subscriber started',

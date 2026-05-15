@@ -90,7 +90,11 @@ export type AuditAction =
   // per-token and would explode the audit row count.)
   | 'pipeline.llm.prompt'
   | 'pipeline.llm.response'
-  | 'pipeline.llm.stream.opened';
+  | 'pipeline.llm.stream.opened'
+  // P1 wave19-c additions — run-lifecycle + context-patch unvalidated variant.
+  | 'pipeline.run.cancelled'
+  | 'pipeline.run.stuck'
+  | 'pipeline.step.context.patched-unvalidated';
 
 /** Optional decision tag attached to the event. */
 export type AuditDecision =

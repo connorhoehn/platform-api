@@ -5,7 +5,7 @@
  * provides `publishSignal` for gateway-compatible Redis broadcasts,
  * and `publishDurable` for at-least-once message-queue delivery via DynamoDB outbox.
  */
-import { EventCatalog, pipelineRaftDeclarations } from '@connorhoehn/event-catalog';
+import { EventCatalog, pipelineRaftDeclarations, pipelineEventDeclarations } from '@connorhoehn/event-catalog';
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
 import { docClient } from './aws-clients';
@@ -564,6 +564,16 @@ catalog.declare({
 // ---------------------------------------------------------------------------
 
 for (const decl of pipelineRaftDeclarations) {
+  catalog.declare(decl);
+}
+
+// wave19-c — P0+P1 pipeline event declarations (from @connorhoehn/event-catalog v0.3.8).
+// These cover the 14 consolidated events: approval (both transports), checkpoint,
+// run:cancelled/stuck, step:started/completed/failed/breakpoint/context-mutations,
+// and llm:prompt/response. The Registry's additive schema-compat check ensures
+// re-declaration of events already declared above (run:started/completed/failed) is
+// backward-compatible and does not overwrite existing declarations incompatibly.
+for (const decl of pipelineEventDeclarations) {
   catalog.declare(decl);
 }
 
