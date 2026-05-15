@@ -13,6 +13,20 @@
 import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 
+// Mock publishDurable so the durable-publish subscriptions wired in
+// bootstrap.ts don't throw (no catalog server in test). We capture the
+// calls via jest.fn() so tests can assert on call counts.
+jest.mock('../../lib/event-catalog', () => ({
+  publishDurable: jest.fn(async () => {}),
+  // wave24-b: stub the catalog/connectCatalog surface used at module level.
+  catalog: {
+    declareAll: jest.fn(),
+    connect: jest.fn(async () => {}),
+    checkAllSchemaFreshness: jest.fn(async () => []),
+  },
+  connectCatalog: jest.fn(async () => {}),
+}));
+
 // The cluster's gossip + transport timers are slow enough that 5s default
 // timeouts are tight. Bump for this suite.
 jest.setTimeout(20_000);
@@ -112,5 +126,63 @@ describe('bootstrapPipeline — lifecycle', () => {
     } finally {
       try { fs.unlinkSync(identityFile); } catch { /* ok */ }
     }
+  });
+
+  // wave24-b — single-source emission regression test.
+  //
+  // Invariant: each of pipeline:run:{started,completed,failed} fires exactly
+  // once per occurrence. bootstrap.ts wires MULTIPLE SUBSCRIPTIONS to the same
+  // event (queue-metrics + durable-publish) but that is the subscriber count,
+  // not the producer count. The single authoritative producer is DC's
+  // PipelineExecutor; PipelineRaftStateMachine is a separate in-process
+  // construct that emits only `pipeline:raft:run:*` events and is never
+  // instantiated in this bootstrap path.
+  //
+  // We verify this by injecting a synthetic bus publication and asserting that
+  // each external listener attached by bootstrap fires exactly once per event.
+  test('pipeline:run:* bus events fire exactly once per occurrence (no dual-emission)', async () => {
+    const { publishDurable } = await import('../../lib/event-catalog');
+    const publishDurableMock = publishDurable as jest.MockedFunction<typeof publishDurable>;
+    publishDurableMock.mockClear();
+
+    const fixture = new FixtureLLMClient(['ok']);
+    const { module, shutdown } = await bootstrapPipeline({ llmClient: fixture });
+
+    const bus = module.getEventBus();
+
+    // Counters for an external subscriber that we add AFTER bootstrap has
+    // attached its own listeners. If the bootstrap were accidentally
+    // re-emitting the event, our counter would exceed 1.
+    const fired: Record<string, number> = {
+      'pipeline:run:started': 0,
+      'pipeline:run:completed': 0,
+      'pipeline:run:failed': 0,
+    };
+    for (const event of Object.keys(fired)) {
+      bus.subscribe(event as Parameters<typeof bus.subscribe>[0], async () => {
+        fired[event]++;
+      });
+    }
+
+    // Simulate a single DC PipelineExecutor emission for each event type.
+    const now = new Date().toISOString();
+    await bus.publish('pipeline:run:started', { runId: 'r1', pipelineId: 'p1', at: now });
+    await bus.publish('pipeline:run:completed', { runId: 'r1', durationMs: 42, at: now });
+    await bus.publish('pipeline:run:failed', { runId: 'r1', error: 'boom', at: now });
+
+    // Our counter subscriber fired exactly once per event — no double-fire.
+    expect(fired['pipeline:run:started']).toBe(1);
+    expect(fired['pipeline:run:completed']).toBe(1);
+    expect(fired['pipeline:run:failed']).toBe(1);
+
+    // publishDurable was called exactly 3 times (once per event) — the
+    // durable-publish subscribers in bootstrap are also single-fire.
+    expect(publishDurableMock).toHaveBeenCalledTimes(3);
+    const durableNames = publishDurableMock.mock.calls.map(c => c[0]);
+    expect(durableNames).toContain('pipeline.run.started');
+    expect(durableNames).toContain('pipeline.run.completed');
+    expect(durableNames).toContain('pipeline.run.failed');
+
+    await shutdown();
   });
 });
