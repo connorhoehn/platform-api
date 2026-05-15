@@ -4,7 +4,7 @@
   "engines": {
     "node": ">=20"
   },
-  "description": "Application platform API \u2014 user management, content, pipelines, ingest, social features",
+  "description": "Application platform API — user management, content, pipelines, ingest, social features",
   "scripts": {
     "dev": "COGNITO_REGION=us-east-1 COGNITO_USER_POOL_ID=us-east-1_localdev000 SKIP_AUTH=true LOCALSTACK_ENDPOINT=http://localhost:8000 REDIS_ENDPOINT=localhost AWS_REGION=us-east-1 ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc -p tsconfig.build.json",
@@ -32,7 +32,7 @@
     "@opentelemetry/sdk-node": "^0.215.0",
     "@types/uuid": "^10.0.0",
     "csv-parse": "^6.2.1",
-    "distributed-core": "github:connorhoehn/distributed-core#v0.19.3",
+    "distributed-core": "github:connorhoehn/distributed-core#v0.19.4",
     "express": "^4.18.2",
     "googleapis": "^171.4.0",
     "jsonwebtoken": "^9.0.3",
@@ -44,18 +44,18 @@
     "uuid": "^13.0.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.0.0",
     "@types/express": "^4.17.21",
     "@types/jest": "^30.0.0",
     "@types/jsonwebtoken": "^9.0.6",
     "@types/multer": "^2.1.0",
     "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
     "jest": "^30.0.0",
     "ts-jest": "^29.3.0",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "~5.6.3",
-    "@eslint/js": "^9.0.0",
-    "eslint": "^9.0.0",
     "typescript-eslint": "^8.0.0"
   }
 }
