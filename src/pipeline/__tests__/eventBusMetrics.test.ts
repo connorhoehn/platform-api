@@ -25,7 +25,7 @@
 // `distributed-core/testing` is a real subpath export — Jest resolves it via
 // package `exports`. tsc with `module: commonjs` (classic resolver) doesn't
 // honor `exports`. Same suppression as bootstrap.test.ts.
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 import { getRegistry } from '../../observability/metrics';
 

@@ -10,7 +10,7 @@
 // (classic resolver) doesn't honor `exports`. Suppressing here rather
 // than flipping the project to `moduleResolution: nodenext`, which
 // would require explicit `.js` extensions across the codebase.
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 
 // The cluster's gossip + transport timers are slow enough that 5s default

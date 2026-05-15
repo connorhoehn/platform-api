@@ -5,7 +5,7 @@
 // the configured dataDir when enabled, returns null when disabled, and that
 // bootstrapPipeline() integrates cleanly in both modes.
 
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { HintedHandoffQueue } from 'distributed-core';
 import * as fs from 'fs';
 import * as os from 'os';

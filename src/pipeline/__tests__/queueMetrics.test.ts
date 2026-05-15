@@ -11,7 +11,7 @@
 // typed against the bus's PipelineEventMap and the assertion is on the
 // counter, not the executor.
 
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 import { getRegistry } from '../../observability/metrics';
 

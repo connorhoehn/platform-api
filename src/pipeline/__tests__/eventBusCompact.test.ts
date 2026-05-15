@@ -24,7 +24,7 @@ import * as fs from 'fs';
 // `distributed-core/testing` is a real subpath export — Jest resolves it via
 // package `exports`. tsc with our current `module: commonjs` (classic
 // resolver) doesn't honor `exports`. Suppressing here matches bootstrap.test.ts.
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 
 jest.setTimeout(20_000);

@@ -25,7 +25,7 @@
 // it via package `exports`. tsc with our current `module: commonjs`
 // (classic resolver) doesn't honor `exports`. Same suppression used in
 // bootstrap.test.ts.
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 import { getRegistry } from '../../observability/metrics';
 

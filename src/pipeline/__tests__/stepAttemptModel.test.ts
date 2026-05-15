@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 
 jest.setTimeout(30_000);
 import { readAttempts, type StepSummary } from '../../repositories/PipelineRunRepository';
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 import { PipelineRunRepository } from '../../repositories/PipelineRunRepository';
 

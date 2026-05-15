@@ -23,7 +23,7 @@ jest.mock('../../lib/logger', () => {
 });
 
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 import { RunPersistenceService } from '../runPersistence';
 import {

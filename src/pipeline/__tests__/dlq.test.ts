@@ -8,7 +8,7 @@
 // a known-throwing handler then publish — and inspect the DLQ via the
 // bootstrap return value (T9 adds `dlq` to the bootstrap result).
 
-import { FixtureLLMClient } from 'distributed-core/testing';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { bootstrapPipeline } from '../bootstrap';
 
 jest.setTimeout(20_000);
