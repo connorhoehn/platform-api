@@ -10,6 +10,7 @@
  * and should fall back to DynamoDB directly.
  */
 import { createClient, RedisClientType } from 'redis';
+import log from './logger';
 
 const REDIS_URL = `redis://${process.env.REDIS_ENDPOINT ?? 'redis'}:${process.env.REDIS_PORT ?? '6379'}`;
 const RETRY_INTERVAL_MS = 5_000;
@@ -36,7 +37,7 @@ export async function getRedisClient(): Promise<RedisClientType | null> {
       },
     }) as RedisClientType;
     c.on('error', (err: Error) => {
-      console.warn('[redis-client] Redis error:', err.message);
+      log.warn({ err: err.message }, '[redis-client] Redis error');
       client = null;
     });
     await c.connect();
@@ -44,7 +45,7 @@ export async function getRedisClient(): Promise<RedisClientType | null> {
     connecting = false;
     return c;
   } catch (err) {
-    console.warn('[redis-client] Redis connect failed:', (err as Error).message);
+    log.warn({ err: (err as Error).message }, '[redis-client] Redis connect failed');
     client = null;
     connecting = false;
     return null;

@@ -7,6 +7,7 @@ import {
   AppError,
 } from '../middleware/error-handler';
 import { tableName } from '../lib/ddb-table-name';
+import log from '../lib/logger';
 
 const TABLE = tableName('user-activity');
 
@@ -51,7 +52,7 @@ activityRouter.get('/', asyncHandler(async (req: Request, res: Response): Promis
   } catch (err) {
     // Preserve the original domain-specific 500 message by wrapping in AppError.
     // The central error middleware will log + render `{ error: 'Failed to load activity log' }`.
-    console.error('[activity] Failed to query activity log:', err);
+    log.error({ err }, '[activity] Failed to query activity log');
     throw new AppError(500, 'Failed to load activity log');
   }
 }));

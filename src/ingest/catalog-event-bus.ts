@@ -11,6 +11,7 @@ import type { IngestEventBus } from './engine';
 import type { IngestEvent } from './types';
 import { catalog } from '../lib/event-catalog';
 import type { EventEnvelope } from '@connorhoehn/event-catalog';
+import log from '../lib/logger';
 
 const CHANNEL = 'ingest:events';
 
@@ -23,7 +24,7 @@ export class CatalogIngestEventBus implements IngestEventBus {
       try {
         handler(event);
       } catch (err) {
-        console.warn('[catalog-ingest-event-bus] local handler threw', err);
+        log.warn({ err }, '[catalog-ingest-event-bus] local handler threw');
       }
     }
 
@@ -35,9 +36,7 @@ export class CatalogIngestEventBus implements IngestEventBus {
       const result = catalog.getRegistry().validate('ingest:progress', event);
       if (!result.valid) {
         const errors = result.errors?.map((e) => e.message).join('; ') ?? 'unknown';
-        console.warn(
-          `[catalog-ingest-event-bus] ingest:progress validation failed for type="${event.type}": ${errors}`,
-        );
+        log.warn({ eventType: event.type, errors }, '[catalog-ingest-event-bus] ingest:progress validation failed');
       }
     } catch {
       // Registry lookup failures (e.g. event not yet declared) are non-fatal.
@@ -57,7 +56,7 @@ export class CatalogIngestEventBus implements IngestEventBus {
     const signal = catalog.getSignalTransport();
     signal.publish(CHANNEL, envelope).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
-      console.warn('[catalog-ingest-event-bus] publish failed:', msg);
+      log.warn({ err: msg }, '[catalog-ingest-event-bus] publish failed');
     });
   }
 

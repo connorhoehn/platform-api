@@ -8,6 +8,7 @@
 
 import type { IngestEventBus } from '../engine';
 import type { IngestEvent } from '../types';
+import log from '../../lib/logger';
 
 /**
  * WebSocket broadcast function signature. Implementations send messages to all
@@ -47,19 +48,19 @@ export function createIngestBridge(config: IngestBridgeConfig): IngestBridge {
     try {
       broadcast(INGEST_CHANNEL, event);
     } catch (err) {
-      console.error('[ingest-bridge] Failed to broadcast event:', err);
+      log.error({ err }, '[ingest-bridge] Failed to broadcast event');
     }
   };
 
   // Subscribe to event bus
   eventBus.on(handler);
 
-  console.log(`[ingest-bridge] Started, forwarding to channel: ${INGEST_CHANNEL}`);
+  log.info({ channel: INGEST_CHANNEL }, '[ingest-bridge] Started, forwarding to channel');
 
   // Shutdown
   const stop = (): void => {
     eventBus.off(handler);
-    console.log('[ingest-bridge] Stopped');
+    log.info('[ingest-bridge] Stopped');
   };
 
   return { stop };

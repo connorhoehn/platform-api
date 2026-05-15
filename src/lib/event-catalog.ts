@@ -573,12 +573,12 @@ for (const decl of pipelineRaftDeclarations) {
 
 export async function connectCatalog(): Promise<void> {
   await catalog.connect();
-  console.log('[event-catalog] connected');
+  log.info('[event-catalog] connected');
 }
 
 export async function disconnectCatalog(): Promise<void> {
   await catalog.disconnect();
-  console.log('[event-catalog] disconnected');
+  log.info('[event-catalog] disconnected');
 }
 
 // ---------------------------------------------------------------------------

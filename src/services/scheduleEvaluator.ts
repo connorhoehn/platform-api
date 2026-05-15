@@ -14,6 +14,8 @@
 // a caller-supplied side-effect (logging in production startup, capturing in
 // tests).
 
+import log from '../lib/logger';
+
 export interface PipelineForSchedule {
   id: string;
   status: string;
@@ -182,7 +184,7 @@ export class ScheduleEvaluator {
     if (this.timer) return;
     this.timer = setInterval(() => {
       this.runProtectedTick().catch(err => {
-        console.error('[scheduleEvaluator] tick error', err);
+        log.error({ err }, '[scheduleEvaluator] tick error');
       });
     }, this.pollIntervalMs);
     // Don't keep the event loop alive solely for this timer (test ergonomics +
@@ -242,7 +244,7 @@ export class ScheduleEvaluator {
         triggerType: 'schedule',
         firedAt: now.toISOString(),
       }).catch(err => {
-        console.error('[scheduleEvaluator] trigger failed', id, err);
+        log.error({ pipelineId: id, err }, '[scheduleEvaluator] trigger failed');
       });
     }
     // Bound the dedupe set: keep only entries from the last ~10 minutes.
@@ -268,7 +270,7 @@ export class ScheduleEvaluator {
       if (!expr) continue;
       const cron = parseCronExpression(expr);
       if (!cron) {
-        console.error('[scheduleEvaluator] invalid cron, skipping', p.id, expr);
+        log.error({ pipelineId: p.id, expr }, '[scheduleEvaluator] invalid cron, skipping');
         continue;
       }
       if (cronMatches(cron, now)) out.push(p.id);
@@ -286,7 +288,7 @@ export class ScheduleEvaluator {
       firedAt: this.nowFn().toISOString(),
       manual: true,
     }).catch(err => {
-      console.error('[scheduleEvaluator] manual trigger failed', pipelineId, err);
+      log.error({ pipelineId, err }, '[scheduleEvaluator] manual trigger failed');
     });
   }
 }

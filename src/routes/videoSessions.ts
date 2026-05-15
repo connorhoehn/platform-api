@@ -39,6 +39,7 @@ import {
   ValidationError,
   NotFoundError,
 } from '../middleware/error-handler';
+import log from '../lib/logger';
 
 export const videoSessionsRouter = Router();
 
@@ -201,7 +202,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     if (findOrCreate) {
       const existing = await videoSessionRepo.findActiveByLobbyName(lobbyName);
       if (existing && await sfuChannelIsAlive(existing.channelArn)) {
-        console.log('[videoSessions] findOrCreate hit', existing.sessionId, 'lobby', lobbyName);
+        log.info({ sessionId: existing.sessionId, lobbyName }, '[videoSessions] findOrCreate hit');
         res.status(200).json({ sessionId: existing.sessionId, reused: true });
         return;
       }
@@ -230,7 +231,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
 
     if (!channelRes.ok) {
       const errorBody = await channelRes.text().catch(() => 'Unknown error');
-      console.error('[videoSessions] create channel failed:', channelRes.status, errorBody);
+      log.error({ status: channelRes.status, body: errorBody }, '[videoSessions] create channel failed');
       throw new AppError(channelRes.status, `Video API error: ${channelRes.status}`);
     }
 
@@ -261,16 +262,16 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
 
     try {
       await videoSessionRepo.createSession(record);
-      console.log('[videoSessions] Created session', sessionId, 'lobby', lobbyName, 'channel', channelArn);
+      log.info({ sessionId, lobbyName, channelArn }, '[videoSessions] Created session');
     } catch (dbErr) {
       // Log but don't fail — the channel was created successfully
-      console.error('[videoSessions] Failed to persist local record:', dbErr);
+      log.error({ err: dbErr }, '[videoSessions] Failed to persist local record');
     }
 
     res.status(201).json({ sessionId, reused: false });
   } catch (err) {
     if (err instanceof AppError) throw err;
-    console.error('[videoSessions] POST /sessions error:', err);
+    log.error({ err }, '[videoSessions] POST /sessions error');
     throw new AppError(500, 'Failed to create video session');
   }
 }));
@@ -311,7 +312,7 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
 
     if (!tokenRes.ok) {
       const errorBody = await tokenRes.text().catch(() => 'Unknown error');
-      console.error('[videoSessions] participant-token request failed:', tokenRes.status, errorBody);
+      log.error({ status: tokenRes.status, body: errorBody }, '[videoSessions] participant-token request failed');
       throw new AppError(tokenRes.status, `Video API error: ${tokenRes.status}`);
     }
 
@@ -329,9 +330,9 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
           displayName: displayName || userId,
           joinedAt: now,
         });
-        console.log('[videoSessions] Added participant', userId, 'to session', sessionId);
+        log.info({ userId, sessionId }, '[videoSessions] Added participant to session');
       } catch (dbErr) {
-        console.error('[videoSessions] Failed to add participant to local record:', dbErr);
+        log.error({ err: dbErr }, '[videoSessions] Failed to add participant to local record');
       }
     }
 
@@ -342,7 +343,7 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
     });
   } catch (err) {
     if (err instanceof AppError) throw err;
-    console.error('[videoSessions] POST /sessions/:id/join error:', err);
+    log.error({ err }, '[videoSessions] POST /sessions/:id/join error');
     throw new AppError(500, 'Failed to join video session');
   }
 }));
@@ -387,7 +388,7 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
     }
 
     if (remaining > 0) {
-      console.log('[videoSessions] participant', userId ?? '(anon)', 'left session', sessionId, '— still', remaining, 'remaining');
+      log.info({ userId: userId ?? '(anon)', sessionId, remaining }, '[videoSessions] participant left session');
       res.status(200).json({ remaining, ended: false });
       return;
     }
@@ -397,15 +398,15 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
     const now = new Date().toISOString();
     try {
       await videoSessionRepo.endSession(lobbyName, sessionId, now);
-      console.log('[videoSessions] Ended session', sessionId, '(last participant out)');
+      log.info({ sessionId }, '[videoSessions] Ended session (last participant out)');
     } catch (dbErr) {
-      console.error('[videoSessions] Failed to update local record on end:', dbErr);
+      log.error({ err: dbErr }, '[videoSessions] Failed to update local record on end');
     }
 
     res.status(200).json({ remaining: 0, ended: true });
   } catch (err) {
     if (err instanceof AppError) throw err;
-    console.error('[videoSessions] POST /sessions/:id/end error:', err);
+    log.error({ err }, '[videoSessions] POST /sessions/:id/end error');
     throw new AppError(500, 'Failed to end video session');
   }
 }));
@@ -418,7 +419,7 @@ videoSessionsRouter.get('/sessions/document/:documentId', requireAuth, asyncHand
     res.status(200).json({ sessions });
   } catch (err) {
     if (err instanceof AppError) throw err;
-    console.error('[videoSessions] GET /sessions/document/:documentId error:', err);
+    log.error({ err }, '[videoSessions] GET /sessions/document/:documentId error');
     throw new AppError(500, 'Failed to fetch video sessions');
   }
 }));
@@ -442,7 +443,7 @@ videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async 
     res.status(200).json(session);
   } catch (err) {
     if (err instanceof AppError) throw err;
-    console.error('[videoSessions] GET /sessions/:sessionId error:', err);
+    log.error({ err }, '[videoSessions] GET /sessions/:sessionId error');
     throw new AppError(500, 'Failed to fetch video session');
   }
 }));
