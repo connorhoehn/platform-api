@@ -9,9 +9,11 @@
 const mockCatalogConnect = jest.fn().mockResolvedValue(undefined);
 const mockCatalogDisconnect = jest.fn().mockResolvedValue(undefined);
 const mockCatalogDeclare = jest.fn();
+const mockCatalogDeclareAll = jest.fn();
 const mockCatalogPublish = jest.fn().mockResolvedValue(undefined);
 const mockCatalogPublishSignal = jest.fn().mockResolvedValue(0);
 const mockGetSignalTransport = jest.fn();
+const mockCheckAllSchemaFreshness = jest.fn().mockResolvedValue([]);
 
 jest.mock('@connorhoehn/event-catalog', () => ({
   // Pure pass-through for envelope helpers (no state, no I/O).
@@ -20,9 +22,11 @@ jest.mock('@connorhoehn/event-catalog', () => ({
     connect: mockCatalogConnect,
     disconnect: mockCatalogDisconnect,
     declare: mockCatalogDeclare,
+    declareAll: mockCatalogDeclareAll,
     publish: mockCatalogPublish,
     publishSignal: mockCatalogPublishSignal,
     getSignalTransport: mockGetSignalTransport,
+    checkAllSchemaFreshness: mockCheckAllSchemaFreshness,
   })),
 }));
 
