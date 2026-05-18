@@ -25,7 +25,10 @@ pipeline-worker extraction).
 
 ## Dependencies
 
-- **`distributed-core`** — local pin via `file:../distributed-core`
+- **`distributed-core`** — GitHub-pinned (`github:connorhoehn/distributed-core#v0.20.x`); imports route through the public subpath exports (`distributed-core/applications/pipeline`, `distributed-core/messaging-queue`, `distributed-core/transport`)
+- **`@connorhoehn/event-catalog`** — durable + signal event registry
+- **`@connorhoehn/pipeline-runtime`** — HTTPPipelineBridge to `pipeline-worker`
+- **`@connorhoehn/service-runtime`** — service-auth (`signEnvelope`/`verifyEnvelope`), `createLogger`, `makeHealthHandler`
 - **`identity-server`** — OIDC provider (future auth migration from Cognito)
 
 ## Local dev

@@ -80,7 +80,7 @@ What's not:
 - [x] Write `.agent/CONSTITUTION.md` (charter, anti-goals, platform context,
   self-driven backlog).
 - [x] Write `ROADMAP.md` (this file).
-- [ ] Update `CLAUDE.md` to reference the new docs.
+- [x] Update `CLAUDE.md` to reference the new docs.
 
 ### Phase P2 — Multi-replica safety (1–2 weeks)
 
