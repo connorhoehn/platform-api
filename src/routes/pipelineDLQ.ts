@@ -42,7 +42,8 @@
 // follow-up.
 
 import { Router, type Response } from 'express';
-import type { BusEvent as DCBusEvent, DeadLetterQueue } from 'distributed-core';
+import type { BusEvent as DCBusEvent } from 'distributed-core';
+import type { DeadLetterQueue } from 'distributed-core/messaging-queue';
 import { asyncHandler } from '../middleware/error-handler';
 import { pipelineWriteRateLimit } from '../middleware/rateLimit';
 import { getPipelineBridge } from './pipelineTriggers';

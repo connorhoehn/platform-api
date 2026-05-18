@@ -18,11 +18,11 @@
 // is independent of the bus-level metrics field.
 
 import type {
-  LLMClient,
   MetricsRegistry,
   BusEvent,
   EventBusCompactionOptions,
 } from 'distributed-core';
+import type { LLMClient } from 'distributed-core/applications/pipeline';
 import { InMemoryDedupStore } from 'distributed-core/messaging-queue';
 
 /**

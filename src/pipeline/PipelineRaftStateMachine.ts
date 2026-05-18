@@ -46,8 +46,8 @@ import type {
   RaftClusterConfig,
   RaftLogEntry,
   RaftSnapshot,
-  RunStatus,
 } from 'distributed-core';
+import type { RunStatus } from 'distributed-core/applications/pipeline';
 
 // ---------------------------------------------------------------------------
 // Public command + state types

@@ -26,16 +26,20 @@
 // bridge in src/pipeline-bridge/pipeline-bridge.js — not here.
 
 import type {
-  PipelineModule,
   PublicBusEvent,
   BusEvent as DCBusEvent,
+} from 'distributed-core';
+import type {
+  PipelineModule,
+  StepExecution,
+} from 'distributed-core/applications/pipeline';
+import type {
   Envelope,
   LeaseLike,
   DLQEntryLike,
   QueueInspector,
   DeadLetterQueue,
-  StepExecution,
-} from 'distributed-core';
+} from 'distributed-core/messaging-queue';
 import { wrap, InMemoryQueueInspector } from 'distributed-core/messaging-queue';
 // hub#2226 — see bridge-types.ts for why these aren't imported from
 // distributed-core (the v0.14.2 pin predates the type re-exports).

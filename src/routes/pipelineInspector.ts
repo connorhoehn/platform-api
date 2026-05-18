@@ -17,7 +17,7 @@
 // for GETs. No additional middleware here.
 
 import { Router, type Response } from 'express';
-import type { QueueInspector } from 'distributed-core';
+import type { QueueInspector } from 'distributed-core/messaging-queue';
 import { asyncHandler } from '../middleware/error-handler';
 import { getPipelineBridge } from './pipelineTriggers';
 import type { PipelineRunSnapshot } from './pipelineTriggers';

@@ -32,6 +32,7 @@
 //   PIPELINE_FD_BRIDGE_HEARTBEAT_MS   — Publish interval. Default 1000.
 
 import {
+  DistributedLock,
   FailureDetectorBridge,
   PubSubHeartbeatSource,
 } from 'distributed-core';
@@ -123,13 +124,15 @@ export async function setupFailureDetectorBridge(
   );
 
   // FailureDetectorBridgeTargets shape is { router?, connectionRegistry?, lock? }.
-  // We supply the cluster facade's router + lock; the gateway has no
-  // ConnectionRegistry at this layer (that's a connections-fabric concern,
-  // not a pipeline concern), so we leave it undefined. All fields are
-  // optional — the bridge no-ops on missing collaborators.
+  // The `lock` field is typed `DistributedLock` (concrete class) but
+  // `cluster.lock` is the wider `LockProvider` interface in DC v0.20.0+.
+  // The bridge only invokes `handleRemoteNodeFailure` which exists on
+  // DistributedLock; we runtime-narrow + drop the field otherwise so the
+  // bridge no-ops gracefully when a non-DistributedLock provider is wired.
+  const lock = cluster.lock instanceof DistributedLock ? cluster.lock : undefined;
   const targets: FailureDetectorBridgeTargets = {
     router: cluster.router,
-    lock: cluster.lock,
+    ...(lock ? { lock } : {}),
   };
 
   const bridge = new FailureDetectorBridge(

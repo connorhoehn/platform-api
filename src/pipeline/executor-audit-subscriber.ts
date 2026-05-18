@@ -44,7 +44,8 @@
 // route handlers — the executor must not be slowed down by audit-table
 // hiccups, and a missed audit row never warrants stalling pipeline progress.
 
-import type { EventBus, PipelineEventMap } from 'distributed-core';
+import type { EventBus } from 'distributed-core';
+import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import type { AuditEvent, AuditRepository } from './audit-repository';
 import { withContext } from '../lib/logger';
 

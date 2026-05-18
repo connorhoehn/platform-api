@@ -23,7 +23,8 @@
 //   - TTL on completed runs (configurable, default 90 days)
 //   - Full step outputs stored for replay, but limited to 100KB per step
 
-import type { EventBus, PipelineEventMap } from 'distributed-core';
+import type { EventBus } from 'distributed-core';
+import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import {
   PipelineRunRepository,
   type PipelineRunItem,

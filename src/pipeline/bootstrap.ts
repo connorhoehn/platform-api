@@ -71,11 +71,10 @@ import { PipelineModule } from 'distributed-core/applications/pipeline';
 import { InMemoryDeadLetterQueue, wrap } from 'distributed-core/messaging-queue';
 import type {
   BusEvent,
-  LLMClient,
   EventBusCompactionOptions,
-  DeadLetterQueue,
-  Envelope,
 } from 'distributed-core';
+import type { LLMClient } from 'distributed-core/applications/pipeline';
+import type { DeadLetterQueue, Envelope } from 'distributed-core/messaging-queue';
 
 import { createLLMClient } from './factories/LLMClientFactory';
 import { ExecutorAuditSubscriber } from './executor-audit-subscriber';
