@@ -79,6 +79,11 @@ describe('tracing.start()', () => {
       delete process.env[key];
     }
 
+    // DC v0.22 startTracing auto-disables under NODE_ENV=test unless the
+    // operator opts back in. Default tests to OPTED-IN; the
+    // OTEL_TRACING_DISABLED=true cases override below.
+    process.env.OTEL_TRACING_DISABLED = 'false';
+
     // Clear call state on shared mock fns.
     sdkMocks.start.mockClear();
     sdkMocks.shutdown.mockClear().mockResolvedValue(undefined);
