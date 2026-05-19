@@ -66,7 +66,7 @@
 // routes the six bridge surfaces (getRun, getHistory, listActiveRuns,
 // getMetrics, getPendingApprovals, pipeline.run.reassigned) into WebSockets.
 
-import { Cluster } from 'distributed-core';
+import { Cluster, IS_TEST_ENV } from 'distributed-core';
 import { PipelineModule } from 'distributed-core/applications/pipeline';
 import { InMemoryDeadLetterQueue, wrap } from 'distributed-core/messaging-queue';
 import type {
@@ -111,12 +111,8 @@ import { publishDurable } from '../lib/event-catalog';
 // Test-mode helpers
 // ---------------------------------------------------------------------------
 
-function isPipelineTestEnv(): boolean {
-  return process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID !== undefined;
-}
-
 function isPipelineFastTestModeEnabled(): boolean {
-  if (!isPipelineTestEnv()) return false;
+  if (!IS_TEST_ENV) return false;
   const raw = process.env.PIPELINE_TEST_FAST_MODE;
   if (raw == null) return true;
   return raw.trim().toLowerCase() !== 'false';
@@ -308,7 +304,7 @@ function resolveOptions(opts: BootstrapOptions): ResolvedBootstrapOptions {
     } else {
       identityFilePath = rawIdentityEnv;
     }
-  } else if (isPipelineTestEnv()) {
+  } else if (IS_TEST_ENV) {
     identityFilePath = undefined;
   } else {
     identityFilePath = process.env.NODE_ENV === 'production'
@@ -407,7 +403,7 @@ function resolveRegistryWalPath(explicit: string | undefined): string | undefine
   if (explicit !== undefined && explicit !== '') return explicit;
   const envValue = process.env.PIPELINE_REGISTRY_WAL_PATH;
   if (envValue !== undefined && envValue !== '') return envValue;
-  if (isPipelineTestEnv()) return undefined;
+  if (IS_TEST_ENV) return undefined;
   return process.env.NODE_ENV === 'production'
     ? '/var/lib/platform-api/pipeline-registry-wal.log'
     : '/tmp/pipeline-registry-wal.log';
@@ -884,7 +880,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   const auditSweeperEnabled = (() => {
     const raw = process.env.PIPELINE_AUDIT_SWEEPER_ENABLED;
     if (raw !== undefined) return raw.trim().toLowerCase() !== 'false';
-    return !isPipelineTestEnv();
+    return !IS_TEST_ENV;
   })();
   let auditSweeperStop: (() => void) | null = null;
   if (auditSweeperEnabled) {

@@ -24,6 +24,7 @@
 //   - Full step outputs stored for replay, but limited to 100KB per step
 
 import type { EventBus } from 'distributed-core';
+import { retryWithBackoff } from 'distributed-core';
 import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import {
   PipelineRunRepository,
@@ -550,37 +551,38 @@ export class RunPersistenceService {
    * (after our retry budget is spent and the error has been logged).
    */
   private async putWithRetry(item: PipelineRunItem, state: RunState): Promise<void> {
-    const delays = [100, 400, 1600]; // ms — exponential-ish (×4)
-    let lastErr: unknown;
-    for (let attempt = 0; attempt <= delays.length; attempt++) {
-      try {
-        await this.repository.put(item);
-        if (attempt > 0) {
+    // Backoff ladder: 100ms, 400ms, 1600ms (3 sleeps between 4 total attempts).
+    // Equivalent to the historical [100, 400, 1600] array via multiplier=4:
+    //   sleep(n) = min(100 * 4^(n-1), 1600) → 100, 400, 1600.
+    try {
+      await retryWithBackoff(() => this.repository.put(item), {
+        maxAttempts: 4,
+        initialDelayMs: 100,
+        multiplier: 4,
+        maxDelayMs: 1600,
+        onRetry: (_err, attempt) => {
+          // Logged after the first failure, before the next sleep — matches the
+          // spirit of the prior "succeeded after retry" log (which fired only on
+          // success). We keep telemetry visible at info level either way.
           log.info(
             { runId: state.runId, pipelineId: state.pipelineId, attempt: attempt + 1 },
-            'run persistence succeeded after retry',
+            'run persistence retry scheduled',
           );
-        }
-        return;
-      } catch (err) {
-        lastErr = err;
-        if (attempt < delays.length) {
-          await new Promise((r) => setTimeout(r, delays[attempt]));
-          continue;
-        }
-        // All attempts exhausted — surface visibly at error level.
-        log.error(
-          {
-            runId: state.runId,
-            pipelineId: state.pipelineId,
-            status: state.status,
-            attempts: attempt + 1,
-            err: String(err),
-          },
-          'run persistence failed after all retries — DDB row will not exist for this run',
-        );
-        throw lastErr;
-      }
+        },
+      });
+    } catch (err) {
+      // All attempts exhausted — surface visibly at error level.
+      log.error(
+        {
+          runId: state.runId,
+          pipelineId: state.pipelineId,
+          status: state.status,
+          attempts: 4,
+          err: String(err),
+        },
+        'run persistence failed after all retries — DDB row will not exist for this run',
+      );
+      throw err;
     }
   }
 }
