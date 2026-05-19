@@ -18,7 +18,7 @@
 
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
-import { trace, SpanStatusCode } from '@opentelemetry/api';
+import { withSpan } from 'distributed-core';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
 import { idempotency } from '../middleware/idempotency';
 import { withContext } from '../lib/logger';
@@ -30,7 +30,6 @@ import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { getDynamoClient } from '../lib/ddb-client';
 
 const log = withContext({ route: 'pipelineReplay' });
-const tracer = trace.getTracer('platform-api');
 
 /** Fire-and-forget audit write — mirrors the pipelineTriggers pattern. */
 function fireAndForgetAudit(event: AuditEvent): void {
@@ -119,37 +118,22 @@ pipelineReplayRouter.post(
     let newRunId: string = '';
 
     try {
-      await tracer.startActiveSpan(
+      await withSpan(
         'pipeline.replay',
         {
-          attributes: {
-            'pipeline.id': pipelineId,
-            'pipeline.original_run_id': runId,
-            'pipeline.user_id': userId,
-          },
+          'pipeline.id': pipelineId,
+          'pipeline.original_run_id': runId,
+          'pipeline.user_id': userId,
         },
         async (span) => {
-          try {
-            const result = await bridge.trigger!({
-              pipelineId,
-              definition,
-              triggerPayload,
-              triggeredBy: { userId },
-            });
-            newRunId = result.runId;
-
-            span.setAttribute('pipeline.new_run_id', newRunId);
-            span.setStatus({ code: SpanStatusCode.OK });
-          } catch (err) {
-            span.recordException(err as Error);
-            span.setStatus({
-              code: SpanStatusCode.ERROR,
-              message: err instanceof Error ? err.message : String(err),
-            });
-            throw err;
-          } finally {
-            span.end();
-          }
+          const result = await bridge.trigger!({
+            pipelineId,
+            definition,
+            triggerPayload,
+            triggeredBy: { userId },
+          });
+          newRunId = result.runId;
+          span.setAttribute('pipeline.new_run_id', newRunId);
         },
       );
     } catch (err) {

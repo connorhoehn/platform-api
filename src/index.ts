@@ -17,6 +17,7 @@ import { PipelineRunRepository } from './repositories/PipelineRunRepository';
 import { DLQRepository } from './repositories/DLQRepository';
 import { docClient } from './lib/aws-clients';
 import log from './lib/logger';
+import { assertRequiredInProd } from 'distributed-core';
 import { CatalogIngestEventBus } from './ingest/catalog-event-bus';
 import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
@@ -30,10 +31,27 @@ import { startActivityConsumer } from './services/activity-consumer';
 
 const port = process.env.PORT ?? '3001';
 
-if (!process.env.COGNITO_REGION || !process.env.COGNITO_USER_POOL_ID) {
-  log.error({ env: { COGNITO_REGION: !!process.env.COGNITO_REGION, COGNITO_USER_POOL_ID: !!process.env.COGNITO_USER_POOL_ID } }, 'FATAL: COGNITO_REGION and COGNITO_USER_POOL_ID must be set');
-  process.exit(1);
-}
+// Cognito env-var gate. In prod (or COGNITO_REQUIRED=true) exit(1) when the
+// required vars are missing; in dev COGNITO_REQUIRED=false explicitly allows
+// boot to continue (e.g. when running with SKIP_AUTH=true). Matches the
+// previous hard fast-fail behaviour for the default (prod) case.
+void assertRequiredInProd(
+  {
+    name: 'cognito',
+    ping: async () => {
+      const missing: string[] = [];
+      if (!process.env.COGNITO_REGION) missing.push('COGNITO_REGION');
+      if (!process.env.COGNITO_USER_POOL_ID) missing.push('COGNITO_USER_POOL_ID');
+      if (missing.length > 0) {
+        throw new Error(`Cognito env vars missing: ${missing.join(', ')}`);
+      }
+    },
+  },
+  {
+    requiredEnvVar: 'COGNITO_REQUIRED',
+    logger: log,
+  },
+);
 
 const app = createApp();
 const server = app.listen(Number(port), () => {
@@ -51,9 +69,20 @@ const server = app.listen(Number(port), () => {
 const drainer = startOutboxDrainer();
 log.info('outbox-drainer started');
 
-ensureOutboxTTL().catch((err: unknown) => {
-  log.warn({ err }, 'outbox TTL auto-provision failed');
-});
+// DDB TTL provisioning. In prod (or DDB_TTL_REQUIRED=true) we refuse to boot
+// if TTL can't be configured on the outbox / video-sessions tables — silent
+// degradation here means stale rows accumulate forever. Dev still gets a
+// warn-and-continue so a missing table doesn't block local work.
+void assertRequiredInProd(
+  {
+    name: 'ddb-outbox-ttl',
+    ping: () => ensureOutboxTTL(),
+  },
+  {
+    requiredEnvVar: 'DDB_TTL_REQUIRED',
+    logger: log,
+  },
+);
 
 // Video sessions TTL is only meaningful when we're on the DDB store; the
 // in-memory store enforces TTL itself. Skipping the DDB describe call when
@@ -62,9 +91,16 @@ ensureOutboxTTL().catch((err: unknown) => {
 const videoStoreMode = resolveVideoSessionStoreMode();
 log.info({ mode: videoStoreMode }, 'video-session store mode');
 if (videoStoreMode === 'ddb') {
-  ensureVideoSessionsTTL().catch((err: unknown) => {
-    log.warn({ err }, 'video-sessions TTL auto-provision failed');
-  });
+  void assertRequiredInProd(
+    {
+      name: 'ddb-video-sessions-ttl',
+      ping: () => ensureVideoSessionsTTL(),
+    },
+    {
+      requiredEnvVar: 'DDB_TTL_REQUIRED',
+      logger: log,
+    },
+  );
 }
 
 const catalogRetry = new RetryManager({

@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
 import { CORRELATION_ID_HEADER } from '@connorhoehn/service-runtime';
-import { trace, SpanStatusCode, type Span } from '@opentelemetry/api';
+import { withSpan } from 'distributed-core';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
 import { idempotency } from '../middleware/idempotency';
 import { createRateLimiter } from '../middleware/rateLimit';
@@ -32,7 +32,6 @@ export {
 export { stubRunStore, ACTIVE_STATUSES, type StubRunRecord, type StubRunStatus } from '../pipeline/stub-run-store';
 
 const log = withContext({ route: 'pipelineTriggers' });
-const tracer = trace.getTracer('platform-api');
 
 function fireAndForgetAudit(
   event: Parameters<typeof auditRepo.record>[0],
@@ -43,32 +42,6 @@ function fireAndForgetAudit(
       { action: event.action, pipelineId: event.pipelineId, runId: event.runId, err: message },
       'audit write failed',
     );
-  });
-}
-
-async function withSpan<T>(
-  name: string,
-  attributes: Record<string, string | number | boolean | undefined>,
-  fn: (span: Span) => Promise<T>,
-): Promise<T> {
-  return tracer.startActiveSpan(name, async (span) => {
-    for (const [k, v] of Object.entries(attributes)) {
-      if (v !== undefined) span.setAttribute(k, v);
-    }
-    try {
-      const out = await fn(span);
-      span.setStatus({ code: SpanStatusCode.OK });
-      return out;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
-    } finally {
-      span.end();
-    }
   });
 }
 

@@ -44,22 +44,35 @@ jest.mock('../../observability/metrics', () => ({
   recordPipelineError: jest.fn(),
 }));
 
-jest.mock('@opentelemetry/api', () => ({
-  trace: {
-    getTracer: () => ({
-      startActiveSpan: jest.fn(
-        (_name: string, _opts: unknown, cb: (span: unknown) => Promise<void>) =>
-          cb({
-            setAttribute: jest.fn(),
-            setStatus: jest.fn(),
-            recordException: jest.fn(),
-            end: jest.fn(),
-          }),
-      ),
-    }),
-  },
-  SpanStatusCode: { OK: 1, ERROR: 2 },
-}));
+// DC v0.21 withSpan calls `tracer.startActiveSpan(name, async (span) => ...)`
+// (2-arg). Mock supports both 2-arg (DC) and 3-arg (legacy) shapes so older
+// call sites that pass a SpanOptions still work.
+jest.mock('@opentelemetry/api', () => {
+  const fakeSpan = {
+    setAttribute: jest.fn(),
+    setAttributes: jest.fn(),
+    setStatus: jest.fn(),
+    recordException: jest.fn(),
+    end: jest.fn(),
+    spanContext: () => ({ traceId: '0'.repeat(32), spanId: '0'.repeat(16), traceFlags: 0 }),
+    isRecording: () => false,
+  };
+  return {
+    trace: {
+      getTracer: () => ({
+        startActiveSpan: jest.fn((..._args: unknown[]) => {
+          const cb = _args.find((a) => typeof a === 'function') as
+            | ((span: unknown) => unknown)
+            | undefined;
+          return cb ? cb(fakeSpan) : undefined;
+        }),
+      }),
+    },
+    context: { active: () => ({}) },
+    propagation: { inject: jest.fn() },
+    SpanStatusCode: { OK: 1, ERROR: 2 },
+  };
+});
 
 const mockGetPipelineBridge = jest.fn().mockReturnValue(null);
 jest.mock('../pipelineTriggers', () => ({

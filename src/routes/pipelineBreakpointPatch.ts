@@ -31,14 +31,13 @@
 // distributed-core type pin (the bridge layer already does the cast).
 
 import { Router } from 'express';
-import { trace, SpanStatusCode, type Span } from '@opentelemetry/api';
+import { withSpan } from 'distributed-core';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
 import { withContext } from '../lib/logger';
 import { getPipelineBridge, type PipelineRunSnapshot } from '../pipeline/bridge-types';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 
 const log = withContext({ route: 'pipelineBreakpointPatch' });
-const tracer = trace.getTracer('platform-api');
 
 function fireAndForgetAudit(event: AuditEvent): void {
   auditRepo.record(event).catch((err: unknown) => {
@@ -47,32 +46,6 @@ function fireAndForgetAudit(event: AuditEvent): void {
       { action: event.action, pipelineId: event.pipelineId, runId: event.runId, err: message },
       'audit write failed',
     );
-  });
-}
-
-async function withSpan<T>(
-  name: string,
-  attributes: Record<string, string | number | boolean | undefined>,
-  fn: (span: Span) => Promise<T>,
-): Promise<T> {
-  return tracer.startActiveSpan(name, async (span) => {
-    for (const [k, v] of Object.entries(attributes)) {
-      if (v !== undefined) span.setAttribute(k, v);
-    }
-    try {
-      const out = await fn(span);
-      span.setStatus({ code: SpanStatusCode.OK });
-      return out;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
-    } finally {
-      span.end();
-    }
   });
 }
 
