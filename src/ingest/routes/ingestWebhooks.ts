@@ -6,7 +6,7 @@
 // BEFORE the auth middleware so external systems can call without a JWT.
 
 import { Router, type Request, type Response } from 'express';
-import { createHmac, timingSafeEqual } from 'crypto';
+import { verifySignature } from 'distributed-core';
 import { withContext } from '../../lib/logger';
 import { ingestSourceRepo } from '../repositories';
 import { getIngestEngine } from '../engine-singleton';
@@ -41,25 +41,6 @@ export interface FileChange {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
-
-/**
- * Verify HMAC-SHA256 signature with `sha256=` prefix. Returns true when
- * the digest matches or when no secret is configured (skip validation).
- */
-function verifyHmac(secret: string, bodyString: string, headerValue: string | undefined): boolean {
-  if (!headerValue || typeof headerValue !== 'string') return false;
-  const prefix = 'sha256=';
-  const withoutPrefix = headerValue.startsWith(prefix)
-    ? headerValue.slice(prefix.length)
-    : headerValue;
-  const expected = createHmac('sha256', secret).update(bodyString).digest('hex');
-  if (expected.length !== withoutPrefix.length) return false;
-  try {
-    return timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(withoutPrefix, 'utf8'));
-  } catch {
-    return false;
-  }
-}
 
 /** Extract FileChange list from Google Drive change notification payload. */
 function parseDrivePayload(obj: Record<string, unknown>): FileChange[] {
@@ -136,7 +117,7 @@ export function createIngestWebhookRoutes(deps: WebhookDeps): Router {
     if (typeof webhookSecret === 'string' && webhookSecret.length > 0) {
       const bodyString = JSON.stringify(req.body);
       const signature = req.headers['x-webhook-signature'] as string | undefined;
-      if (!verifyHmac(webhookSecret, bodyString, signature)) {
+      if (!verifySignature(webhookSecret, Buffer.from(bodyString, 'utf8'), signature)) {
         log.error({ sourceId }, 'ingest webhook signature verification failed');
         return res.status(403).json({ error: 'invalid webhook signature' });
       }

@@ -27,7 +27,7 @@ import express, { Router, type Request, type Response } from 'express';
 import {
   SIGNATURE_HEADER,
   verifySignature,
-} from '@connorhoehn/service-runtime';
+} from 'distributed-core';
 import { withContext } from '../lib/logger';
 import {
   recordPipelineTrigger,
