@@ -38,6 +38,11 @@ jest.mock('@connorhoehn/service-runtime', () => ({
   generateWebhookSecret: () => 'wh-secret-test',
 }));
 
+jest.mock('distributed-core', () => ({
+  ...jest.requireActual('distributed-core'),
+  generateWebhookSecret: () => 'wh-secret-test',
+}));
+
 import { pipelineDefinitionsRouter } from '../pipelineDefinitions';
 import { errorHandler } from '../../middleware/error-handler';
 

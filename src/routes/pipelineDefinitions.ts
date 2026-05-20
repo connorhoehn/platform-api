@@ -32,7 +32,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import { asyncHandler } from '../middleware/error-handler';
-import { generateWebhookSecret } from '@connorhoehn/service-runtime';
+import { generateWebhookSecret } from 'distributed-core';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { pipelineDefinitionsCache } from '../pipeline/definitions-cache';
 import { publishInvalidate } from '../pipeline/definitions-invalidator';
