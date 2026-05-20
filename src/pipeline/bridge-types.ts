@@ -1,13 +1,14 @@
 // platform-api/src/pipeline/bridge-types.ts
 //
 // Phase M4.3c — the type surface lives in @connorhoehn/pipeline-runtime
-// now (shared with pipeline-worker). This file re-exports them and keeps
-// the platform-api-local singleton (`setPipelineBridge` /
-// `getPipelineBridge`) so existing route imports don't change.
+// now. This file re-exports them and keeps the platform-api-local
+// singleton (`setPipelineBridge` / `getPipelineBridge`) so existing
+// route imports don't change.
 //
-// The singleton is intentionally NOT in the package — pipeline-worker
-// constructs its own bridge directly inside its boot path; only
-// platform-api needs the route-side accessor pattern.
+// The singleton is intentionally NOT in the package — platform-api
+// owns the only consumer of this accessor pattern. The historical
+// peer (pipeline-worker, decommissioned 2026-05-19) constructed its
+// own bridge inline at boot time.
 
 import type { PipelineBridge } from '@connorhoehn/pipeline-runtime';
 
