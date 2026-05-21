@@ -16,6 +16,10 @@ import { bootstrapPipeline } from '../bootstrap';
 // Mock publishDurable so the durable-publish subscriptions wired in
 // bootstrap.ts don't throw (no catalog server in test). We capture the
 // calls via jest.fn() so tests can assert on call counts.
+//
+// catalog.getRegistry() is called by createValidatingPublisher in bootstrap.ts.
+// Return a minimal Registry stub that treats every event as valid (safe in
+// warn mode — publish proceeds regardless).
 jest.mock('../../lib/event-catalog', () => ({
   publishDurable: jest.fn(async () => {}),
   // wave24-b: stub the catalog/connectCatalog surface used at module level.
@@ -23,6 +27,8 @@ jest.mock('../../lib/event-catalog', () => ({
     declareAll: jest.fn(),
     connect: jest.fn(async () => {}),
     checkAllSchemaFreshness: jest.fn(async () => []),
+    // Required by createValidatingPublisher in bootstrap.ts (warn mode — always passes).
+    getRegistry: jest.fn(() => ({ validate: () => ({ valid: true, errors: [] }) })),
   },
   connectCatalog: jest.fn(async () => {}),
 }));

@@ -105,7 +105,8 @@ import { scanOrphanedRuns } from './scanOrphanedRuns';
 import { runWalPreflight } from './WalPreflight';
 import { createShutdown } from './ShutdownOrchestrator';
 import log, { withContext } from '../lib/logger';
-import { publishDurable } from '../lib/event-catalog';
+import { publishDurable, catalog } from '../lib/event-catalog';
+import { createValidatingPublisher } from '@connorhoehn/event-catalog';
 
 // ---------------------------------------------------------------------------
 // Test-mode helpers
@@ -746,10 +747,32 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // It is a complete but dormant stub for future multi-node pipeline consensus.
   // Retained for its test coverage. Activate via MultiRaftCoordinator when needed.
   //
-  // Publish pipeline lifecycle events through event-catalog for external consumers
+  // Publish pipeline lifecycle events through event-catalog for external consumers.
+  // Wrapped with createValidatingPublisher (warn mode) — schema validation failures
+  // log a warning but do NOT block the publish. Event names use dot-notation to
+  // match the durable declarations in src/lib/event-catalog.ts (pipeline.run.*).
+  const publishRunStarted = createValidatingPublisher(
+    catalog.getRegistry(),
+    'pipeline.run.started',
+    (payload: Record<string, unknown>) => publishDurable('pipeline.run.started', payload),
+    { mode: 'warn' },
+  );
+  const publishRunCompleted = createValidatingPublisher(
+    catalog.getRegistry(),
+    'pipeline.run.completed',
+    (payload: Record<string, unknown>) => publishDurable('pipeline.run.completed', payload),
+    { mode: 'warn' },
+  );
+  const publishRunFailed = createValidatingPublisher(
+    catalog.getRegistry(),
+    'pipeline.run.failed',
+    (payload: Record<string, unknown>) => publishDurable('pipeline.run.failed', payload),
+    { mode: 'warn' },
+  );
+
   eventBus.subscribe('pipeline:run:started', async (payload: unknown) => {
     const data = payload as Record<string, unknown>;
-    publishDurable('pipeline.run.started', {
+    publishRunStarted({
       runId: data.runId as string,
       pipelineId: data.pipelineId as string,
       triggeredBy: data.triggeredBy as string | undefined,
@@ -761,7 +784,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
 
   eventBus.subscribe('pipeline:run:completed', async (payload: unknown) => {
     const data = payload as Record<string, unknown>;
-    publishDurable('pipeline.run.completed', {
+    publishRunCompleted({
       runId: data.runId as string,
       durationMs: data.durationMs as number | undefined,
       completedAt: data.at as string || new Date().toISOString(),
@@ -772,7 +795,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
 
   eventBus.subscribe('pipeline:run:failed', async (payload: unknown) => {
     const data = payload as Record<string, unknown>;
-    publishDurable('pipeline.run.failed', {
+    publishRunFailed({
       runId: data.runId as string,
       error: data.error as string | undefined,
       failedAt: data.at as string || new Date().toISOString(),
