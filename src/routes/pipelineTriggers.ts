@@ -15,6 +15,7 @@ import {
 import { classifyPipelineError, type ErrorCategory } from '../pipeline/error-classification';
 import { auditRepo, type AuditAction, type AuditDecision } from '../pipeline/audit-repository';
 import { getPipelineBridge, type PendingApprovalRow } from '../pipeline/bridge-types';
+import type { InlinePipelineDefinition } from '../pipeline/http/contracts';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { stubRunStore } from '../pipeline/stub-run-store';
@@ -89,10 +90,9 @@ const triggerRateLimiter = createRateLimiter({
 // Request/response shapes.
 // ---------------------------------------------------------------------------
 
-export interface InlinePipelineDefinition {
-  id: string;
-  [key: string]: unknown;
-}
+// `InlinePipelineDefinition` is canonical in pipeline/http/contracts.ts —
+// re-export so existing importers of this module don't break.
+export type { InlinePipelineDefinition } from '../pipeline/http/contracts';
 
 export interface TriggerRunRequest {
   triggerPayload?: Record<string, unknown>;

@@ -29,6 +29,7 @@ import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import {
   PipelineRunRepository,
   type PipelineRunItem,
+  type RunItemStatus,
   type StepAttempt,
   type StepSummary,
   type TokenUsageByModel,
@@ -57,7 +58,7 @@ export interface RunPersistenceOptions {
 interface RunState {
   pipelineId: string;
   runId: string;
-  status: string;
+  status: RunItemStatus;
   triggeredBy: string;
   triggerType: string;
   startedAt: string;

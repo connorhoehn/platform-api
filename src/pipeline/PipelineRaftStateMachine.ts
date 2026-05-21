@@ -19,7 +19,7 @@
 //     test we DO exercise (apply / snapshot / restore).
 //
 // State shape — `runId → { status, lastEvent, checkpoint }`:
-//   - `status` is the canonical RunStatus from distributed-core's pipeline
+//   - `status` is the canonical PipelineRunStatus from distributed-core's pipeline
 //     module (pending / running / awaiting_approval / completed / failed /
 //     cancelled).
 //   - `lastEvent` is a free-form discriminator captured from the most
@@ -47,7 +47,7 @@ import type {
   RaftLogEntry,
   RaftSnapshot,
 } from 'distributed-core';
-import type { RunStatus } from 'distributed-core/applications/pipeline';
+import type { PipelineRunStatus } from '@connorhoehn/pipeline-runtime';
 
 // ---------------------------------------------------------------------------
 // Public command + state types
@@ -71,7 +71,7 @@ export type PipelineRunCommand =
   | {
       type: 'run-updated';
       runId: string;
-      status: RunStatus;
+      status: PipelineRunStatus;
       eventName: string;
       at: string;
     }
@@ -85,7 +85,7 @@ export type PipelineRunCommand =
       type: 'run-terminated';
       runId: string;
       /** Must be a terminal status: completed | failed | cancelled. */
-      status: Extract<RunStatus, 'completed' | 'failed' | 'cancelled'>;
+      status: Extract<PipelineRunStatus, 'completed' | 'failed' | 'cancelled'>;
       at: string;
       error?: { message: string; nodeId?: string };
     };
@@ -98,7 +98,7 @@ export type PipelineRunCommand =
  */
 export interface PipelineRunApplyResult {
   runId: string;
-  status: RunStatus;
+  status: PipelineRunStatus;
   applied: 'created' | 'updated' | 'checkpointed' | 'terminated' | 'idempotent-skip';
 }
 
@@ -108,7 +108,7 @@ export interface PipelineRunSlot {
   pipelineId: string;
   pipelineVersion: number;
   ownerNodeId: string;
-  status: RunStatus;
+  status: PipelineRunStatus;
   lastEvent: string;
   /** Wall-clock ISO of the most recent transition. */
   lastEventAt: string;
@@ -126,9 +126,9 @@ export interface PipelineRaftSnapshotState {
   runs: Record<string, PipelineRunSlot>;
 }
 
-const TERMINAL_STATUSES: ReadonlyArray<RunStatus> = ['completed', 'failed', 'cancelled'];
+const TERMINAL_STATUSES: ReadonlyArray<PipelineRunStatus> = ['completed', 'failed', 'cancelled'];
 
-function isTerminal(status: RunStatus): boolean {
+function isTerminal(status: PipelineRunStatus): boolean {
   return TERMINAL_STATUSES.includes(status);
 }
 

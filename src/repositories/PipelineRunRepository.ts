@@ -5,8 +5,19 @@
 // `/api/pipelines/:pipelineId/runs` operator-facing surface.
 
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import type { PipelineRunStatus, PipelineStepStatus } from '@connorhoehn/pipeline-runtime';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
+
+/**
+ * Platform-api run status — canonical `PipelineRunStatus` plus legacy aliases
+ * and platform-api-specific lifecycle states:
+ *   - `succeeded` — legacy alias for `completed` (used by runPersistence event handlers)
+ *   - `canceled`  — legacy alias for `cancelled` (US-spelling; used in HTTP responses)
+ *   - `interrupted` — orphan-scan transition: `running` with no heartbeat after restart
+ *   - `stuck`       — StuckRunDetector: no heartbeat within stuckThresholdMs
+ */
+export type RunItemStatus = PipelineRunStatus | 'succeeded' | 'canceled' | 'interrupted' | 'stuck';
 
 export interface TokenUsageByModel {
   tokensIn: number;
@@ -37,7 +48,7 @@ export interface StepAttempt {
  * carries the full history when present.
  */
 export interface StepSummary {
-  status?: string;
+  status?: PipelineStepStatus;
   startedAt?: string;
   completedAt?: string;
   durationMs?: number;
@@ -49,7 +60,8 @@ export interface StepSummary {
 export interface PipelineRunItem {
   pipelineId: string;
   runId: string;
-  status: string; // 'pending' | 'running' | 'succeeded' | 'failed' | 'canceled' | 'interrupted'
+  /** Canonical run status. `interrupted` and `stuck` are platform-api lifecycle extensions. */
+  status: RunItemStatus;
   triggeredBy: string; // userId or 'system'
   triggerType: string; // 'manual' | 'schedule' | 'webhook' | 'document-event'
   startedAt: string; // ISO timestamp

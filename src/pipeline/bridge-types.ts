@@ -21,6 +21,17 @@ export type {
   ContextPatch,
   PatchResult,
   JsonPatchOperation,
+  // v0.3.4 canonical execution types — re-exported so route-layer code
+  // can import them from this central bridge-types hub rather than
+  // reaching directly into @connorhoehn/pipeline-runtime.
+  PipelineRun,
+  PipelineRunStatus,
+  PipelineStep,
+  PipelineStepStatus,
+  PipelineContext,
+  PipelineResult,
+  PipelineApprovalRequest,
+  PipelineApprovalDecision,
 } from '@connorhoehn/pipeline-runtime';
 
 let bridge: PipelineBridge | null = null;
