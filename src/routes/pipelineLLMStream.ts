@@ -6,19 +6,53 @@
 // configured LLM provider (PIPELINE_LLM_PROVIDER env, default 'anthropic').
 // The API key lives server-side only — the frontend never sees it.
 //
-// SSE event format:
-//   data: {"done":false,"token":"Hello"}
-//   data: {"done":true,"response":"Hello world","tokensIn":42,"tokensOut":8}
+// SSE event format (AG-UI shapes):
+//   data: {"type":"RUN_STARTED","runId":"<uuid>","threadId":"<uuid>"}
+//   data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"<uuid>","delta":"Hello"}
+//   data: {"type":"RUN_FINISHED","runId":"<uuid>"}
+//   data: {"type":"RUN_ERROR","message":"...","code":"LLM_STREAM_ERROR"}
 //
-// The stream terminates with a final `done: true` chunk followed by closing
+// The stream terminates after RUN_FINISHED / RUN_ERROR followed by closing
 // the connection. On client disconnect (AbortController), the LLM stream is
 // cancelled via AbortSignal to avoid wasting tokens.
+//
+// Wire format is unchanged: data: <json>\n\n (standard SSE).
 
+import { randomUUID } from 'crypto';
 import { Router } from 'express';
 import { createLLMClient } from '../pipeline/createLLMClient';
 import { asyncHandler, ValidationError } from '../middleware/error-handler';
 import { createRateLimiter } from '../middleware/rateLimit';
 import { withContext } from '../lib/logger';
+
+// ---------------------------------------------------------------------------
+// AG-UI SSE event shapes
+// ---------------------------------------------------------------------------
+
+interface AgUiRunStarted {
+  type: 'RUN_STARTED';
+  runId: string;
+  threadId?: string;
+}
+
+interface AgUiTextMessageContent {
+  type: 'TEXT_MESSAGE_CONTENT';
+  messageId: string;
+  delta: string;
+}
+
+interface AgUiRunFinished {
+  type: 'RUN_FINISHED';
+  runId: string;
+}
+
+interface AgUiRunError {
+  type: 'RUN_ERROR';
+  message: string;
+  code?: string;
+}
+
+type AgUiSseEvent = AgUiRunStarted | AgUiTextMessageContent | AgUiRunFinished | AgUiRunError;
 
 const log = withContext({ route: 'pipelineLLMStream' });
 
@@ -84,8 +118,12 @@ pipelineLLMStreamRouter.post(
       throw new ValidationError('maxTokens must be a number between 1 and 8192');
     }
 
+    const runId = randomUUID();
+    const messageId = randomUUID();
+    const threadId = randomUUID();
+
     log.info(
-      { userId, model: body.model, maxTokens: body.maxTokens },
+      { userId, model: body.model, maxTokens: body.maxTokens, runId },
       'llm stream started',
     );
 
@@ -102,6 +140,12 @@ pipelineLLMStreamRouter.post(
       'X-Accel-Buffering': 'no',
     });
 
+    function writeEvent(event: AgUiSseEvent): void {
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+      }
+    }
+
     try {
       const client = createLLMClient();
       const modelId = resolveModelId(body.model);
@@ -111,21 +155,31 @@ pipelineLLMStreamRouter.post(
         signal: abortController.signal,
       });
 
+      writeEvent({ type: 'RUN_STARTED', runId, threadId });
+
       for await (const chunk of stream) {
         if (res.writableEnded) break;
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        if (!chunk.done) {
+          writeEvent({ type: 'TEXT_MESSAGE_CONTENT', messageId, delta: chunk.token });
+        }
+        // done:true chunk (with response/tokensIn/tokensOut) is consumed silently;
+        // RUN_FINISHED is emitted after the loop to signal stream completion.
       }
+
+      writeEvent({ type: 'RUN_FINISHED', runId });
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') {
-        log.info({ userId, model: body.model }, 'llm stream aborted by client');
+        log.info({ userId, model: body.model, runId }, 'llm stream aborted by client');
       } else {
         log.error(
-          { userId, model: body.model, err: err instanceof Error ? err.message : String(err) },
+          { userId, model: body.model, runId, err: err instanceof Error ? err.message : String(err) },
           'llm stream error',
         );
-        if (!res.writableEnded) {
-          res.write(`data: ${JSON.stringify({ error: err instanceof Error ? err.message : 'LLM stream failed' })}\n\n`);
-        }
+        writeEvent({
+          type: 'RUN_ERROR',
+          message: err instanceof Error ? err.message : 'LLM stream failed',
+          code: 'LLM_STREAM_ERROR',
+        });
       }
     } finally {
       if (!res.writableEnded) {

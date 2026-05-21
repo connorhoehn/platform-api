@@ -207,8 +207,14 @@ describe('POST /pipelines/llm/stream — input validation', () => {
 // SSE streaming — happy path with mocked LLM
 // ---------------------------------------------------------------------------
 
+function parseSseChunk(chunk: string): Record<string, unknown> {
+  // SSE wire format: "data: <json>\n\n"
+  const jsonStr = chunk.replace(/^data: /, '').trimEnd();
+  return JSON.parse(jsonStr) as Record<string, unknown>;
+}
+
 describe('POST /pipelines/llm/stream — SSE happy path', () => {
-  test('streams token chunks and a done=true final event', async () => {
+  test('emits RUN_STARTED, TEXT_MESSAGE_CONTENT per token, RUN_FINISHED (AG-UI shapes)', async () => {
     async function* fakeStream() {
       yield { done: false, token: 'Hello' };
       yield { done: false, token: ' world' };
@@ -224,10 +230,46 @@ describe('POST /pipelines/llm/stream — SSE happy path', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.headers['Content-Type']).toBe('text/event-stream');
-    expect(res.chunks).toHaveLength(3);
-    expect(res.chunks[0]).toContain('"token":"Hello"');
-    expect(res.chunks[1]).toContain('"token":" world"');
-    expect(res.chunks[2]).toContain('"done":true');
+
+    // 1 RUN_STARTED + 2 TEXT_MESSAGE_CONTENT + 1 RUN_FINISHED = 4 chunks
+    expect(res.chunks).toHaveLength(4);
+
+    const events = res.chunks.map(parseSseChunk);
+
+    // RUN_STARTED
+    expect(events[0]).toMatchObject({ type: 'RUN_STARTED' });
+    expect(typeof (events[0] as { runId: string }).runId).toBe('string');
+    expect(typeof (events[0] as { threadId: string }).threadId).toBe('string');
+
+    // TEXT_MESSAGE_CONTENT for each token
+    expect(events[1]).toMatchObject({ type: 'TEXT_MESSAGE_CONTENT', delta: 'Hello' });
+    expect(events[2]).toMatchObject({ type: 'TEXT_MESSAGE_CONTENT', delta: ' world' });
+
+    // Both token events share the same stable messageId
+    expect((events[1] as { messageId: string }).messageId).toBe((events[2] as { messageId: string }).messageId);
+
+    // RUN_FINISHED
+    expect(events[3]).toMatchObject({ type: 'RUN_FINISHED' });
+    expect((events[3] as { runId: string }).runId).toBe((events[0] as { runId: string }).runId);
+  });
+
+  test('done:true LLM chunk does not emit an extra SSE event', async () => {
+    async function* fakeStream() {
+      yield { done: true, response: 'empty', tokensIn: 1, tokensOut: 1 };
+    }
+    mockStream.mockReturnValue(fakeStream());
+
+    const res = await runPost(buildApp(), {
+      model: 'claude-sonnet-4-6',
+      systemPrompt: 'sys',
+      userPrompt: 'user',
+    });
+
+    // RUN_STARTED + RUN_FINISHED only — no TEXT_MESSAGE_CONTENT for done:true
+    expect(res.chunks).toHaveLength(2);
+    const events = res.chunks.map(parseSseChunk);
+    expect(events[0]).toMatchObject({ type: 'RUN_STARTED' });
+    expect(events[1]).toMatchObject({ type: 'RUN_FINISHED' });
   });
 
   test('calls stream with correct model, prompts and defaults', async () => {
@@ -248,7 +290,7 @@ describe('POST /pipelines/llm/stream — SSE happy path', () => {
     );
   });
 
-  test('writes an error SSE event when LLM throws a non-abort error', async () => {
+  test('writes a RUN_ERROR SSE event when LLM throws a non-abort error', async () => {
     async function* failing(): AsyncGenerator<never> {
       throw new Error('LLM overloaded');
       // unreachable, needed to satisfy TS generator return type
@@ -263,12 +305,13 @@ describe('POST /pipelines/llm/stream — SSE happy path', () => {
     });
 
     expect(res.statusCode).toBe(200); // SSE headers already sent
-    const errorChunk = res.chunks.find((c) => c.includes('"error"'));
+    const errorChunk = res.chunks.find((c) => c.includes('"RUN_ERROR"'));
     expect(errorChunk).toBeDefined();
-    expect(errorChunk).toContain('LLM overloaded');
+    const event = parseSseChunk(errorChunk!);
+    expect(event).toMatchObject({ type: 'RUN_ERROR', message: 'LLM overloaded', code: 'LLM_STREAM_ERROR' });
   });
 
-  test('logs AbortError as info, not error, and does not write error chunk', async () => {
+  test('logs AbortError as info and does not write RUN_ERROR chunk', async () => {
     async function* abortStream(): AsyncGenerator<never> {
       const err = new Error('Request aborted');
       err.name = 'AbortError';
@@ -283,8 +326,8 @@ describe('POST /pipelines/llm/stream — SSE happy path', () => {
       userPrompt: 'user',
     });
 
-    // AbortError does not write an error SSE chunk to the client
-    expect(res.chunks.every((c) => !c.includes('"error"'))).toBe(true);
+    // AbortError does not write a RUN_ERROR SSE chunk to the client
+    expect(res.chunks.every((c) => !c.includes('"RUN_ERROR"'))).toBe(true);
   });
 
   test('resolves Bedrock model ID when PIPELINE_LLM_PROVIDER=bedrock', async () => {
