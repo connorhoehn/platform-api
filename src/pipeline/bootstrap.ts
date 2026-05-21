@@ -742,6 +742,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // EventBus and is not instantiated in the production bootstrap. No second
   // source for `pipeline:run:completed` exists.
   //
+  // DECISION (2026-05-21): PipelineRaftStateMachine is intentionally not wired here.
+  // It is a complete but dormant stub for future multi-node pipeline consensus.
+  // Retained for its test coverage. Activate via MultiRaftCoordinator when needed.
+  //
   // Publish pipeline lifecycle events through event-catalog for external consumers
   eventBus.subscribe('pipeline:run:started', async (payload: unknown) => {
     const data = payload as Record<string, unknown>;
