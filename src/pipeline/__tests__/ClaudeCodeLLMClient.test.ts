@@ -147,7 +147,7 @@ describe('ClaudeCodeLLMClient.stream() — stream_event token parsing', () => {
       streamEventLine('Hello'),
       streamEventLine(' world'),
       resultLine({ input_tokens: 10, output_tokens: 5 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
@@ -162,14 +162,14 @@ describe('ClaudeCodeLLMClient.stream() — stream_event token parsing', () => {
     mockSpawn.mockReturnValue(makeMockChild([
       streamEventLine('Hi'),
       resultLine({ input_tokens: 5, output_tokens: 2 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
     const last = chunks[chunks.length - 1];
 
     expect(last.done).toBe(true);
-    expect(last.response).toBe('Hi');
+    expect((last as Extract<typeof last, { done: true }>).response).toBe('Hi');
   });
 
   it('skips blank lines without throwing', async () => {
@@ -178,7 +178,7 @@ describe('ClaudeCodeLLMClient.stream() — stream_event token parsing', () => {
       '',
       streamEventLine('ok'),
       resultLine({ input_tokens: 2, output_tokens: 1 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
@@ -192,7 +192,7 @@ describe('ClaudeCodeLLMClient.stream() — stream_event token parsing', () => {
       'not-json',
       streamEventLine('fine'),
       resultLine({ input_tokens: 2, output_tokens: 1 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
@@ -210,34 +210,34 @@ describe('ClaudeCodeLLMClient.stream() — result event', () => {
   it('reads tokensIn from result usage.input_tokens', async () => {
     mockSpawn.mockReturnValue(makeMockChild([
       resultLine({ input_tokens: 99, output_tokens: 4 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
-    expect(chunks[chunks.length - 1].tokensIn).toBe(99);
+    expect((chunks[chunks.length - 1] as Extract<(typeof chunks)[number], { done: true }>).tokensIn).toBe(99);
   });
 
   it('reads tokensOut from result usage.output_tokens', async () => {
     mockSpawn.mockReturnValue(makeMockChild([
       resultLine({ input_tokens: 5, output_tokens: 77 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
-    expect(chunks[chunks.length - 1].tokensOut).toBe(77);
+    expect((chunks[chunks.length - 1] as Extract<(typeof chunks)[number], { done: true }>).tokensOut).toBe(77);
   });
 
   it('uses result string as fullResponse when no stream_events were seen', async () => {
     mockSpawn.mockReturnValue(makeMockChild([
       resultLine({ input_tokens: 3, output_tokens: 2 }, 'direct result text'),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
     // One non-done chunk + one done chunk since fullResponse was '' before result
     const last = chunks[chunks.length - 1];
     expect(last.done).toBe(true);
-    expect(last.response).toBe('direct result text');
+    expect((last as Extract<typeof last, { done: true }>).response).toBe('direct result text');
   });
 });
 
@@ -250,7 +250,7 @@ describe('ClaudeCodeLLMClient.stream() — assistant message fallback', () => {
     mockSpawn.mockReturnValue(makeMockChild([
       assistantLine(['Full reply text']),
       resultLine({ input_tokens: 5, output_tokens: 3 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
@@ -264,7 +264,7 @@ describe('ClaudeCodeLLMClient.stream() — assistant message fallback', () => {
       streamEventLine('partial'),
       assistantLine(['ignored']),
       resultLine({ input_tokens: 5, output_tokens: 3 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks = await collectChunks(client);
@@ -282,7 +282,7 @@ describe('ClaudeCodeLLMClient.stream() — fallback token counting', () => {
     mockSpawn.mockReturnValue(makeMockChild([
       // result event with no usage fields
       JSON.stringify({ type: 'result' }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const userPrompt = 'twelve chars'; // 12 → 3
     const client = new ClaudeCodeLLMClient();
@@ -296,7 +296,7 @@ describe('ClaudeCodeLLMClient.stream() — fallback token counting', () => {
     mockSpawn.mockReturnValue(makeMockChild([
       streamEventLine('abcdefgh'),
       JSON.stringify({ type: 'result' }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     const chunks: Array<{ done: boolean; tokensOut?: number }> = [];
@@ -311,7 +311,7 @@ describe('ClaudeCodeLLMClient.stream() — fallback token counting', () => {
 
 describe('ClaudeCodeLLMClient.stream() — exit code', () => {
   it('throws when claude exits with non-zero code', async () => {
-    mockSpawn.mockReturnValue(makeMockChild([], 1, 'authentication failed') as ReturnType<typeof mockSpawn>);
+    mockSpawn.mockReturnValue(makeMockChild([], 1, 'authentication failed') as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     await expect(collectChunks(client)).rejects.toThrow('claude exited 1');
@@ -326,12 +326,12 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
   it('includes --append-system-prompt when systemPrompt is non-empty', async () => {
     mockSpawn.mockReturnValue(makeMockChild([
       resultLine({ input_tokens: 2, output_tokens: 1 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     for await (const _ of client.stream('model', 'my-system-prompt', 'hi')) { /* drain */ }
 
-    const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+    const args = (mockSpawn.mock.calls[0] as unknown as [string, string[]])[1];
     expect(args).toContain('--append-system-prompt');
     const idx = args.indexOf('--append-system-prompt');
     expect(args[idx + 1]).toBe('my-system-prompt');
@@ -354,12 +354,12 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
     it('includes --model when model is non-empty', async () => {
       mockSpawn.mockReturnValue(makeMockChild([
         resultLine({ input_tokens: 2, output_tokens: 1 }),
-      ]) as ReturnType<typeof mockSpawn>);
+      ]) as unknown as ReturnType<typeof mockSpawn>);
 
       const client = new ClaudeCodeLLMClient();
       for await (const _ of client.stream('claude-haiku-4-5-20251001', 'sys', 'hi')) { /* drain */ }
 
-      const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+      const args = (mockSpawn.mock.calls[0] as unknown as [string, string[]])[1];
       expect(args).toContain('--model');
       const idx = args.indexOf('--model');
       expect(args[idx + 1]).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0');
@@ -368,12 +368,12 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
     it('resolves short alias "sonnet" to full model ID', async () => {
       mockSpawn.mockReturnValue(makeMockChild([
         resultLine({ input_tokens: 2, output_tokens: 1 }),
-      ]) as ReturnType<typeof mockSpawn>);
+      ]) as unknown as ReturnType<typeof mockSpawn>);
 
       const client = new ClaudeCodeLLMClient();
       for await (const _ of client.stream('sonnet', 'sys', 'hi')) { /* drain */ }
 
-      const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+      const args = (mockSpawn.mock.calls[0] as unknown as [string, string[]])[1];
       const idx = args.indexOf('--model');
       expect(args[idx + 1]).toBe('us.anthropic.claude-sonnet-4-20250514-v1:0');
     });
@@ -381,12 +381,12 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
     it('resolves short alias "opus" to full model ID', async () => {
       mockSpawn.mockReturnValue(makeMockChild([
         resultLine({ input_tokens: 2, output_tokens: 1 }),
-      ]) as ReturnType<typeof mockSpawn>);
+      ]) as unknown as ReturnType<typeof mockSpawn>);
 
       const client = new ClaudeCodeLLMClient();
       for await (const _ of client.stream('opus', 'sys', 'hi')) { /* drain */ }
 
-      const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+      const args = (mockSpawn.mock.calls[0] as unknown as [string, string[]])[1];
       const idx = args.indexOf('--model');
       expect(args[idx + 1]).toBe('us.anthropic.claude-opus-4-20250514-v1:0');
     });
@@ -395,12 +395,12 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
   it('includes --output-format stream-json and --include-partial-messages', async () => {
     mockSpawn.mockReturnValue(makeMockChild([
       resultLine({ input_tokens: 2, output_tokens: 1 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     for await (const _ of client.stream('model', 'sys', 'hi')) { /* drain */ }
 
-    const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+    const args = (mockSpawn.mock.calls[0] as unknown as [string, string[]])[1];
     expect(args).toContain('--output-format');
     expect(args).toContain('stream-json');
     expect(args).toContain('--include-partial-messages');
@@ -409,12 +409,12 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
   it('appends the user prompt as the last argument', async () => {
     mockSpawn.mockReturnValue(makeMockChild([
       resultLine({ input_tokens: 2, output_tokens: 1 }),
-    ]) as ReturnType<typeof mockSpawn>);
+    ]) as unknown as ReturnType<typeof mockSpawn>);
 
     const client = new ClaudeCodeLLMClient();
     for await (const _ of client.stream('model', 'sys', 'the user query')) { /* drain */ }
 
-    const args = (mockSpawn.mock.calls[0] as [string, string[]])[1];
+    const args = (mockSpawn.mock.calls[0] as unknown as [string, string[]])[1];
     expect(args[args.length - 1]).toBe('the user query');
   });
 });

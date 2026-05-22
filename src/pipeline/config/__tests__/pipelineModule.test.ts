@@ -6,7 +6,8 @@
 
 import { describe, it, expect, jest } from '@jest/globals';
 import { buildPipelineModuleConfig } from '../pipelineModule';
-import type { LLMClient, MetricsRegistry } from 'distributed-core';
+import type { LLMClient } from 'distributed-core/applications/pipeline';
+import type { MetricsRegistry } from 'distributed-core';
 
 // ---------------------------------------------------------------------------
 // Stubs

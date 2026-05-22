@@ -211,7 +211,7 @@ describe('readAttempts', () => {
 
   it('synthesises a single attempt from top-level fields for legacy rows', () => {
     const summary: StepSummary = {
-      status: 'succeeded',
+      status: 'completed',
       startedAt: '2026-05-06T09:00:00.000Z',
       completedAt: '2026-05-06T09:00:05.000Z',
       durationMs: 5000,

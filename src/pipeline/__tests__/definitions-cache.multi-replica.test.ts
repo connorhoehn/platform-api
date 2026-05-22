@@ -127,7 +127,7 @@ describe('definitions-cache — 2-replica push invalidation', () => {
     // Subscribe B (replica B is the one that needs to be notified of A's write).
     const fakeClientB = makeFakeClient();
     await startInvalidationSubscriber(cacheB, {
-      _client: fakeClientB as unknown as Parameters<typeof startInvalidationSubscriber>[1]['_client'],
+      _client: fakeClientB as unknown as import('redis').RedisClientType,
     });
 
     // Replica A writes (simulating routes/pipelineDefinitions PUT).
@@ -158,7 +158,7 @@ describe('definitions-cache — 2-replica push invalidation', () => {
 
     const fakeClientB = makeFakeClient();
     await startInvalidationSubscriber(cacheB, {
-      _client: fakeClientB as unknown as Parameters<typeof startInvalidationSubscriber>[1]['_client'],
+      _client: fakeClientB as unknown as import('redis').RedisClientType,
     });
 
     // Replica A deletes w-1.
@@ -180,7 +180,7 @@ describe('definitions-cache — 2-replica push invalidation', () => {
 
     const fakeClientB = makeFakeClient();
     await startInvalidationSubscriber(cacheB, {
-      _client: fakeClientB as unknown as Parameters<typeof startInvalidationSubscriber>[1]['_client'],
+      _client: fakeClientB as unknown as import('redis').RedisClientType,
     });
 
     // These are exactly the strings emitted by every production write path:
@@ -243,7 +243,7 @@ describe('definitions-cache — 2-replica push invalidation', () => {
     const cacheB = new PipelineDefinitionsCache({ loader, intervalMs: 60_000 });
     const fakeClientB = makeFakeClient();
     await startInvalidationSubscriber(cacheB, {
-      _client: fakeClientB as unknown as Parameters<typeof startInvalidationSubscriber>[1]['_client'],
+      _client: fakeClientB as unknown as import('redis').RedisClientType,
     });
 
     // Fire 5 invalidations in quick succession.

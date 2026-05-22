@@ -147,7 +147,7 @@ describe('bootstrapPipeline — lifecycle', () => {
   // We verify this by injecting a synthetic bus publication and asserting that
   // each external listener attached by bootstrap fires exactly once per event.
   test('pipeline:run:* bus events fire exactly once per occurrence (no dual-emission)', async () => {
-    const { publishDurable } = await import('../../lib/event-catalog');
+    const { publishDurable } = await import('../../lib/event-catalog.js');
     const publishDurableMock = publishDurable as jest.MockedFunction<typeof publishDurable>;
     publishDurableMock.mockClear();
 
@@ -172,9 +172,9 @@ describe('bootstrapPipeline — lifecycle', () => {
 
     // Simulate a single DC PipelineExecutor emission for each event type.
     const now = new Date().toISOString();
-    await bus.publish('pipeline:run:started', { runId: 'r1', pipelineId: 'p1', at: now });
+    await bus.publish('pipeline:run:started', { runId: 'r1', pipelineId: 'p1', triggeredBy: { triggerType: 'manual', payload: {} }, at: now });
     await bus.publish('pipeline:run:completed', { runId: 'r1', durationMs: 42, at: now });
-    await bus.publish('pipeline:run:failed', { runId: 'r1', error: 'boom', at: now });
+    await bus.publish('pipeline:run:failed', { runId: 'r1', error: { nodeId: 'n1', message: 'boom' }, at: now });
 
     // Our counter subscriber fired exactly once per event — no double-fire.
     expect(fired['pipeline:run:started']).toBe(1);
@@ -184,7 +184,7 @@ describe('bootstrapPipeline — lifecycle', () => {
     // publishDurable was called exactly 3 times (once per event) — the
     // durable-publish subscribers in bootstrap are also single-fire.
     expect(publishDurableMock).toHaveBeenCalledTimes(3);
-    const durableNames = publishDurableMock.mock.calls.map(c => c[0]);
+    const durableNames = publishDurableMock.mock.calls.map((c: [string, ...unknown[]]) => c[0]);
     expect(durableNames).toContain('pipeline.run.started');
     expect(durableNames).toContain('pipeline.run.completed');
     expect(durableNames).toContain('pipeline.run.failed');

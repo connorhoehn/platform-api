@@ -6,7 +6,8 @@
 // from `pipeline:run:started` and used for downstream events, and that
 // checkpoint sampling drops 4-of-5 events while always keeping seq=1.
 
-import type { EventBus, PipelineEventMap } from 'distributed-core';
+import type { EventBus } from 'distributed-core';
+import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import { ExecutorAuditSubscriber } from '../executor-audit-subscriber';
 import type { AuditEvent } from '../audit-repository';
 

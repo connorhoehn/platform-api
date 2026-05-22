@@ -44,17 +44,17 @@ afterAll(() => {
 describe('createLLMClient — explicit provider argument', () => {
   it('returns an AnthropicLLMClient when provider="anthropic"', () => {
     const client = createLLMClient('anthropic');
-    expect((client as { _type: string })._type).toBe('anthropic');
+    expect((client as unknown as { _type: string })._type).toBe('anthropic');
   });
 
   it('returns a BedrockLLMClient when provider="bedrock"', () => {
     const client = createLLMClient('bedrock');
-    expect((client as { _type: string })._type).toBe('bedrock');
+    expect((client as unknown as { _type: string })._type).toBe('bedrock');
   });
 
   it('returns a ClaudeCodeLLMClient when provider="claude-code"', () => {
     const client = createLLMClient('claude-code');
-    expect((client as { _type: string })._type).toBe('claude-code');
+    expect((client as unknown as { _type: string })._type).toBe('claude-code');
   });
 });
 
@@ -62,25 +62,25 @@ describe('createLLMClient — PIPELINE_LLM_PROVIDER env var', () => {
   it('uses bedrock when env=bedrock and no explicit arg', () => {
     process.env.PIPELINE_LLM_PROVIDER = 'bedrock';
     const client = createLLMClient();
-    expect((client as { _type: string })._type).toBe('bedrock');
+    expect((client as unknown as { _type: string })._type).toBe('bedrock');
   });
 
   it('uses claude-code when env=claude-code and no explicit arg', () => {
     process.env.PIPELINE_LLM_PROVIDER = 'claude-code';
     const client = createLLMClient();
-    expect((client as { _type: string })._type).toBe('claude-code');
+    expect((client as unknown as { _type: string })._type).toBe('claude-code');
   });
 
   it('explicit arg overrides env var', () => {
     process.env.PIPELINE_LLM_PROVIDER = 'bedrock';
     const client = createLLMClient('claude-code');
-    expect((client as { _type: string })._type).toBe('claude-code');
+    expect((client as unknown as { _type: string })._type).toBe('claude-code');
   });
 });
 
 describe('createLLMClient — default fallback', () => {
   it('defaults to anthropic when no arg and no env var', () => {
     const client = createLLMClient();
-    expect((client as { _type: string })._type).toBe('anthropic');
+    expect((client as unknown as { _type: string })._type).toBe('anthropic');
   });
 });

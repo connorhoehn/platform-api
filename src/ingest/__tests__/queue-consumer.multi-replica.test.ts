@@ -182,14 +182,14 @@ describe('ingest queue consumer — 2-replica partition coordination', () => {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'A'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     });
     const transportB = createMqIngestTransport({
       _catalog: {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'B'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     });
 
     transportA.startConsumer(engineA);
@@ -224,14 +224,14 @@ describe('ingest queue consumer — 2-replica partition coordination', () => {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'A'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     }).startConsumer(engineA);
     createMqIngestTransport({
       _catalog: {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'B'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     }).startConsumer(engineB);
 
     bus.enqueue({ ingestId: 'i-1', sourceId: 's-1' });
@@ -259,14 +259,14 @@ describe('ingest queue consumer — 2-replica partition coordination', () => {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'A'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     }).startConsumer(engineA);
     createMqIngestTransport({
       _catalog: {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'B'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     }).startConsumer(engineB);
 
     // Replica A "crashes" before draining anything.
@@ -294,14 +294,14 @@ describe('ingest queue consumer — 2-replica partition coordination', () => {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'A'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     }).startConsumer(engineA);
     createMqIngestTransport({
       _catalog: {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'B'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     }).startConsumer(engineB);
 
     // Enqueue 3 items for s-1 (must go to A in order).
@@ -332,7 +332,7 @@ describe('ingest queue consumer — 2-replica partition coordination', () => {
         subscribe: <T>(name: string, h: EventHandler<T>) =>
           bus.subscribe(name, h, 'B'),
       } as unknown as { subscribe: typeof import('../../lib/event-catalog').catalog.subscribe },
-      _publishDurable: jest.fn(),
+      _publishDurable: jest.fn<() => Promise<void>>(),
     }).startConsumer(engineB);
 
     await bus.drainOnce();

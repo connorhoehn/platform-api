@@ -10,7 +10,7 @@ const putSpy = jest.fn(async () => {});
 
 jest.mock('../../repositories', () => ({
   ingestItemRepo: {
-    put: (...args: unknown[]) => putSpy(...args),
+    put: (...args: Parameters<typeof putSpy>) => putSpy(...args),
   },
 }));
 

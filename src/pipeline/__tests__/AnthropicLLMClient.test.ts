@@ -89,7 +89,7 @@ describe('AnthropicLLMClient.stream() — basic token emission', () => {
 
     const last = chunks[chunks.length - 1];
     expect(last.done).toBe(true);
-    expect(last.response).toBe('Hi');
+    expect((last as Extract<typeof last, { done: true }>).response).toBe('Hi');
   });
 
   it('ignores non-text events (no extra chunks)', async () => {
@@ -121,7 +121,7 @@ describe('AnthropicLLMClient.stream() — usage accounting from events', () => {
     const chunks = await collectChunks(client);
     const last = chunks[chunks.length - 1];
 
-    expect(last.tokensIn).toBe(42);
+    expect((last as Extract<typeof last, { done: true }>).tokensIn).toBe(42);
   });
 
   it('reads tokensOut from message_delta', async () => {
@@ -134,7 +134,7 @@ describe('AnthropicLLMClient.stream() — usage accounting from events', () => {
     const chunks = await collectChunks(client);
     const last = chunks[chunks.length - 1];
 
-    expect(last.tokensOut).toBe(99);
+    expect((last as Extract<typeof last, { done: true }>).tokensOut).toBe(99);
   });
 });
 

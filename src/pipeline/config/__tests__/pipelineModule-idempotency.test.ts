@@ -9,7 +9,17 @@ import { describe, it, expect, beforeEach } from '@jest/globals';
 // We import the exported hook and test it directly — no need to boot the
 // full PipelineModule stack.
 import { onBeforeActionHook } from '../pipelineModule';
-import type { OnBeforeActionContext } from 'distributed-core';
+
+// OnBeforeActionContext was dropped from distributed-core's public surface in
+// v0.15-v0.17. Define locally — the hook only needs `idempotencyKey`; the
+// remaining fields are carried for readability.
+interface OnBeforeActionContext {
+  runId: string;
+  nodeId: string;
+  attempt: number;
+  actionType: string;
+  idempotencyKey: string;
+}
 
 function ctx(overrides?: Partial<OnBeforeActionContext>): OnBeforeActionContext {
   return {

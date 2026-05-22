@@ -6,7 +6,7 @@
 // through the wider pipeline state machine.
 
 import { createBridge, asEnvelope } from '../createBridge';
-import type { PipelineModule } from 'distributed-core';
+import type { PipelineModule } from 'distributed-core/applications/pipeline';
 import type { PipelineRunSnapshot } from '../../routes/pipelineTriggers';
 
 interface MockModule {

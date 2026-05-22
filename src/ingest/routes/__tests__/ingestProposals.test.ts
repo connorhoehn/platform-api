@@ -13,10 +13,10 @@ const resolve = jest.fn(async () => {});
 
 jest.mock('../../repositories', () => ({
   docTypeProposalRepo: {
-    listAllPending: (...args: unknown[]) => listAllPending(...args),
-    listPendingBySource: (...args: unknown[]) => listPendingBySource(...args),
+    listAllPending: (...args: Parameters<typeof listAllPending>) => listAllPending(...args),
+    listPendingBySource: (...args: Parameters<typeof listPendingBySource>) => listPendingBySource(...args),
     getById: (id: string) => getById(id),
-    resolve: (...args: unknown[]) => resolve(...args),
+    resolve: (...args: Parameters<typeof resolve>) => resolve(...args),
   },
 }));
 

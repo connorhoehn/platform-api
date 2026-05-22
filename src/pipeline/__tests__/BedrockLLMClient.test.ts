@@ -113,7 +113,7 @@ describe('BedrockLLMClient.stream() — token emission', () => {
 
     const last = chunks[chunks.length - 1];
     expect(last.done).toBe(true);
-    expect(last.response).toBe('Hi');
+    expect((last as Extract<typeof last, { done: true }>).response).toBe('Hi');
   });
 
   it('handles null response.body gracefully', async () => {
@@ -125,8 +125,8 @@ describe('BedrockLLMClient.stream() — token emission', () => {
     const last = chunks[chunks.length - 1];
     expect(last.done).toBe(true);
     // fallback: input prompt 'hello' = 5 chars → round(5/4)=1; response ''→1
-    expect(last.tokensIn).toBeGreaterThanOrEqual(1);
-    expect(last.tokensOut).toBeGreaterThanOrEqual(1);
+    expect((last as Extract<typeof last, { done: true }>).tokensIn).toBeGreaterThanOrEqual(1);
+    expect((last as Extract<typeof last, { done: true }>).tokensOut).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -145,7 +145,7 @@ describe('BedrockLLMClient.stream() — usage accounting', () => {
     const chunks = await collectChunks(client);
     const last = chunks[chunks.length - 1];
 
-    expect(last.tokensIn).toBe(77);
+    expect((last as Extract<typeof last, { done: true }>).tokensIn).toBe(77);
   });
 
   it('reads tokensOut from decoded message_delta', async () => {
@@ -158,7 +158,7 @@ describe('BedrockLLMClient.stream() — usage accounting', () => {
     const chunks = await collectChunks(client);
     const last = chunks[chunks.length - 1];
 
-    expect(last.tokensOut).toBe(88);
+    expect((last as Extract<typeof last, { done: true }>).tokensOut).toBe(88);
   });
 });
 

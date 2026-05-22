@@ -234,12 +234,12 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     };
   }
 
-  function makeService(repo: { put: jest.Mock; listByStatus?: jest.Mock }) {
+  function makeService(repo: { put: jest.Mock<(item: PipelineRunItem) => Promise<void>>; listByStatus?: jest.Mock<() => Promise<unknown[]>> }) {
     // scanOrphanedRuns calls listByStatus on the repository; provide a
     // default stub so tests that don't care about orphan scanning don't
     // trigger TypeError logs from the background scan.
     if (!repo.listByStatus) {
-      repo.listByStatus = jest.fn().mockResolvedValue([]);
+      repo.listByStatus = jest.fn<() => Promise<unknown[]>>().mockResolvedValue([]);
     }
     const bus = makeMockBus();
     const service = new RunPersistenceService({
@@ -250,7 +250,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   }
 
   it('handles pipeline:run:cancelled — sets status=canceled and persists', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const { service, bus } = makeService(repo);
     service.start();
 
@@ -267,7 +267,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('warns but does not throw when run:cancelled arrives for unknown run', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const { service, bus } = makeService(repo);
     service.start();
 
@@ -280,7 +280,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('warns but does not throw when step:completed arrives for unknown run', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const { service, bus } = makeService(repo);
     service.start();
 
@@ -291,7 +291,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('warns but does not throw when run:completed arrives for unknown run', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const { service, bus } = makeService(repo);
     service.start();
 
@@ -300,7 +300,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('warns but does not throw when run:failed arrives for unknown run', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const { service, bus } = makeService(repo);
     service.start();
 
@@ -310,7 +310,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('swallows repo error in run:started catch path', async () => {
-    const repo = { put: jest.fn().mockRejectedValue(new Error('ddb down')) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockRejectedValue(new Error('ddb down')) };
     const { service, bus } = makeService(repo);
     service.start();
 
@@ -324,7 +324,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   it('swallows repo error in run:completed catch path', async () => {
     let callCount = 0;
     const repo = {
-      put: jest.fn().mockImplementation(() => {
+      put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockImplementation(() => {
         if (++callCount === 1) return Promise.resolve(); // run:started ok
         return Promise.reject(new Error('ddb error'));   // run:completed fails
       }),
@@ -343,7 +343,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   it('swallows repo error in run:failed catch path', async () => {
     let callCount = 0;
     const repo = {
-      put: jest.fn().mockImplementation(() => {
+      put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockImplementation(() => {
         if (++callCount === 1) return Promise.resolve();
         return Promise.reject(new Error('ddb error'));
       }),
@@ -363,7 +363,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   it('swallows repo error in step:completed catch path', async () => {
     let callCount = 0;
     const repo = {
-      put: jest.fn().mockImplementation(() => {
+      put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockImplementation(() => {
         if (callCount++ === 0) return Promise.resolve(); // run:started ok
         return Promise.reject(new Error('ddb error'));
       }),
@@ -390,7 +390,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('truncates step output that exceeds maxStepOutputBytes', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const bus = makeMockBus();
     const service = new RunPersistenceService({
       eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
@@ -416,7 +416,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('records LLM prompt and response — accumulates token usage and cost', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const bus = makeMockBus();
     const service = new RunPersistenceService({
       eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
@@ -445,7 +445,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('stores prompt as step input snapshot for LLM steps', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const bus = makeMockBus();
     const service = new RunPersistenceService({
       eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
@@ -471,7 +471,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('stop() flushes pending in-flight runs to the repository', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const bus = makeMockBus();
     const service = new RunPersistenceService({
       eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
@@ -513,7 +513,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('stop() is idempotent — second call is a no-op', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const bus = makeMockBus();
     const service = new RunPersistenceService({
       eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
@@ -527,7 +527,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('start() is idempotent — second call does not add duplicate subscribers', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const bus = makeMockBus();
     const service = new RunPersistenceService({
       eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
@@ -540,7 +540,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
   });
 
   it('getStaleRunIds returns runs whose lastEventAt is before the cutoff', async () => {
-    const repo = { put: jest.fn().mockResolvedValue(undefined) };
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const bus = makeMockBus();
     const service = new RunPersistenceService({
       eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],

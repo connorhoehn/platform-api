@@ -134,6 +134,10 @@ function makeDeps(
     proposalRepo,
     now: () => counter++,
     ...overrides,
+  } as MappingPipelineDeps & {
+    decisionRepo: ReturnType<typeof makeDecisionRepo>;
+    reviewQueueRepo: ReturnType<typeof makeReviewRepo>;
+    proposalRepo: ReturnType<typeof makeProposalRepo>;
   };
 }
 

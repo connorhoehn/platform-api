@@ -6,13 +6,22 @@
 // boot a real cluster — that's covered by bootstrap.test.ts.
 
 import { createBridge } from '../createBridge';
-import type { PipelineModule } from 'distributed-core';
+import type { PipelineModule } from 'distributed-core/applications/pipeline';
+import type { StepAttempt, StepSummary, PipelineRunItem, PipelineRunRepository } from '../../repositories/PipelineRunRepository';
 import type { PipelineRunSnapshot, PendingApprovalRow } from '../../routes/pipelineTriggers';
-import type { PipelineRunItem, PipelineRunRepository } from '../../repositories/PipelineRunRepository';
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Local test-only extension: `summariesToStepExecutions` spreads `attempts[]`
+ * onto StepExecution objects even though the DC type doesn't declare it.
+ * This type captures what the bridge actually returns so tests can assert
+ * on `attempts` without TypeScript errors.
+ */
+type StepWithAttempts = { attempts?: StepAttempt[]; [k: string]: unknown };
+type StepsMap = Record<string, StepWithAttempts>;
 
 interface MockModule {
   createResource: jest.Mock;
@@ -488,7 +497,7 @@ describe('createBridge — listRuns()', () => {
     const mod = makeMockModule();
     const repo = makeRunRepository();
     const b = bridgeWithRepo(mod, repo);
-    await b.listRuns!('p-1');
+    await (b.listRuns as (id: string, opts?: { limit?: number }) => Promise<unknown>)('p-1');
     expect(repo.listByPipeline).toHaveBeenCalledWith('p-1', { limit: 50 });
   });
 
@@ -594,14 +603,14 @@ describe('createBridge — listRuns()', () => {
     const repo = makeRunRepository([item]);
     const b = bridgeWithRepo(mod, repo);
     const { runs } = await b.listRuns!('p-1', { limit: 1 });
-    const steps = runs[0]!.steps;
-    expect(steps['node-llm']).toMatchObject({
+    const steps = runs[0]!.steps as StepsMap | undefined;
+    expect(steps!['node-llm']).toMatchObject({
       nodeId: 'node-llm',
       status: 'completed',
       durationMs: 3000,
       output: { answer: 'yes' },
     });
-    expect(steps['node-action']).toMatchObject({
+    expect(steps!['node-action']).toMatchObject({
       nodeId: 'node-action',
       status: 'failed',
       error: 'Network unreachable',
@@ -645,6 +654,7 @@ describe('createBridge — listRuns()', () => {
               completedAt: '2026-05-01T10:00:02.000Z',
               durationMs: 1000,
               error: 'temporary glitch',
+              idempotencyKey: 'run-1:node-llm:1',
             },
             {
               attemptNumber: 2,
@@ -652,6 +662,7 @@ describe('createBridge — listRuns()', () => {
               completedAt: '2026-05-01T10:00:04.000Z',
               durationMs: 1000,
               output: { answer: 'yes' },
+              idempotencyKey: 'run-1:node-llm:2',
             },
           ],
         },
@@ -660,7 +671,7 @@ describe('createBridge — listRuns()', () => {
     const repo = makeRunRepository([item]);
     const b = bridgeWithRepo(mod, repo);
     const { runs } = await b.listRuns!('p-1', { limit: 1 });
-    const step = runs[0]!.steps['node-llm'];
+    const step = (runs[0]!.steps as StepsMap | undefined)?.['node-llm'];
     expect(step?.attempts).toHaveLength(2);
     expect(step?.attempts![0]).toMatchObject({ attemptNumber: 1, error: 'temporary glitch' });
     expect(step?.attempts![1]).toMatchObject({ attemptNumber: 2, output: { answer: 'yes' } });
@@ -684,7 +695,7 @@ describe('createBridge — listRuns()', () => {
     const repo = makeRunRepository([item]);
     const b = bridgeWithRepo(mod, repo);
     const { runs } = await b.listRuns!('p-1', { limit: 1 });
-    const step = runs[0]!.steps['node-action'];
+    const step = (runs[0]!.steps as StepsMap | undefined)?.['node-action'];
     expect(step?.attempts).toHaveLength(1);
     expect(step?.attempts![0]).toMatchObject({
       attemptNumber: 1,
@@ -699,13 +710,13 @@ describe('createBridge — listRuns()', () => {
     const mod = makeMockModule();
     const item = minimalItem({
       stepsSummary: {
-        'node-placeholder': {} as { status: string },
+        'node-placeholder': {} as StepSummary,
       },
     });
     const repo = makeRunRepository([item]);
     const b = bridgeWithRepo(mod, repo);
     const { runs } = await b.listRuns!('p-1', { limit: 1 });
-    const step = runs[0]!.steps['node-placeholder'];
+    const step = (runs[0]!.steps as StepsMap | undefined)?.['node-placeholder'];
     // attempts should be absent (not an empty array — we omit rather than inject)
     expect(step?.attempts).toBeUndefined();
   });

@@ -10,7 +10,7 @@ const listBySourceSpy = jest.fn(async () => [] as unknown[]);
 
 jest.mock('../../repositories', () => ({
   ingestItemRepo: {
-    listBySource: (...args: unknown[]) => listBySourceSpy(...args),
+    listBySource: (...args: Parameters<typeof listBySourceSpy>) => listBySourceSpy(...args),
   },
 }));
 

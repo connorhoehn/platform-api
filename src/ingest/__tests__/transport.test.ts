@@ -68,9 +68,10 @@ function makeFakeCatalog() {
         subscribed.push(name);
         handler = h as EventHandler<unknown>;
         return {
-          unsubscribe: async () => {
-            handler = null;
-          },
+          unsubscribe: async () => { handler = null; },
+          pause: () => {},
+          resume: () => {},
+          isPaused: () => false,
         };
       },
     ),
@@ -331,9 +332,10 @@ describe('createMqIngestTransport', () => {
   test('unsubscribe is tolerant of internal errors', async () => {
     const errCatalog = {
       subscribe: jest.fn(<T>(_n: string, _h: EventHandler<T>): Subscription => ({
-        unsubscribe: async () => {
-          throw new Error('redis blip');
-        },
+        unsubscribe: async () => { throw new Error('redis blip'); },
+        pause: () => {},
+        resume: () => {},
+        isPaused: () => false,
       })),
     };
     const t = createMqIngestTransport({

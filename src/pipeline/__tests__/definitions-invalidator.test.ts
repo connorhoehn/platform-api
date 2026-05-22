@@ -79,7 +79,7 @@ describe('startInvalidationSubscriber', () => {
     const { client, calls } = makeFakeClient();
     const cache = makeFakeCache();
     const handle = await startInvalidationSubscriber(cache, {
-      _client: client as unknown as Parameters<typeof startInvalidationSubscriber>[1]['_client'],
+      _client: client as unknown as import('redis').RedisClientType,
     });
     expect(calls.connect).toBe(1);
     expect(calls.subscribe).toBe(1);
@@ -92,7 +92,7 @@ describe('startInvalidationSubscriber', () => {
     const { client } = makeFakeClient();
     const cache = makeFakeCache();
     await startInvalidationSubscriber(cache, {
-      _client: client as unknown as Parameters<typeof startInvalidationSubscriber>[1]['_client'],
+      _client: client as unknown as import('redis').RedisClientType,
     });
     client.deliver(JSON.stringify({ reason: 'test', at: Date.now(), source: 'replica-x' }));
     await new Promise((r) => setImmediate(r));
@@ -103,7 +103,7 @@ describe('startInvalidationSubscriber', () => {
     const { client } = makeFakeClient();
     const cache = makeFakeCache();
     await startInvalidationSubscriber(cache, {
-      _client: client as unknown as Parameters<typeof startInvalidationSubscriber>[1]['_client'],
+      _client: client as unknown as import('redis').RedisClientType,
     });
     expect(() => client.deliver('{not-json')).not.toThrow();
     await new Promise((r) => setImmediate(r));
@@ -120,7 +120,7 @@ describe('startInvalidationSubscriber', () => {
     };
     const cache = makeFakeCache();
     const handle = await startInvalidationSubscriber(cache, {
-      _client: failing as unknown as Parameters<typeof startInvalidationSubscriber>[1]['_client'],
+      _client: failing as unknown as import('redis').RedisClientType,
     });
     await expect(handle.stop()).resolves.toBeUndefined();
   });

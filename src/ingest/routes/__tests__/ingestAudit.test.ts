@@ -13,9 +13,9 @@ const listByActor = jest.fn(async () => [] as unknown[]);
 
 jest.mock('../../repositories', () => ({
   ingestAuditRepo: {
-    listAll: (...args: unknown[]) => listAll(...args),
-    listByTarget: (...args: unknown[]) => listByTarget(...args),
-    listByActor: (...args: unknown[]) => listByActor(...args),
+    listAll: (...args: Parameters<typeof listAll>) => listAll(...args),
+    listByTarget: (...args: Parameters<typeof listByTarget>) => listByTarget(...args),
+    listByActor: (...args: Parameters<typeof listByActor>) => listByActor(...args),
   },
 }));
 
