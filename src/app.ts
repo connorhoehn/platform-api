@@ -10,6 +10,8 @@ import { pipelineWebhooksRouter } from './routes/pipelineWebhooks';
 import { ingestWebhooksRouter } from './ingest/routes/ingestWebhooks';
 import { confluenceWebhookRouter } from './ingest/routes/ingestConfluenceWebhook';
 import { renderPrometheusText } from './observability/metrics';
+import { createCapabilitiesRouter } from './routes/capabilities';
+import { definitionsRepo } from './pipeline/definitions-repository';
 
 export function createApp(): express.Application {
   const app = express();
@@ -75,6 +77,11 @@ export function createApp(): express.Application {
     if (req.method !== 'GET') { next(); return; }
     pipelineGetLimiter(req, res, next);
   });
+
+  // Capabilities — read-only introspection surface for active AgenticPipelines.
+  // Mounted before the main apiRouter so /api/capabilities/* resolves without
+  // competing with any :pipelineId param route inside apiRouter.
+  app.use('/api/capabilities', createCapabilitiesRouter({ definitions: definitionsRepo }));
 
   // API routes (profiles, groups, rooms, etc.) mounted here in later phases
   app.use('/api', apiRouter);
