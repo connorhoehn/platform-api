@@ -1,4 +1,5 @@
 import express from 'express';
+import { requestContextMiddleware } from '@connorhoehn/service-runtime';
 import { requireAuth } from './middleware/auth';
 import { requestLogger } from './middleware/request-logger';
 import { errorHandler } from './middleware/error-handler';
@@ -12,6 +13,10 @@ import { renderPrometheusText } from './observability/metrics';
 
 export function createApp(): express.Application {
   const app = express();
+
+  // Request context — must be FIRST so X-Correlation-ID and AsyncLocalStorage
+  // context are available to all downstream middleware and route handlers.
+  app.use(requestContextMiddleware());
 
   // CORS — allow frontend dev server. Echoes the request Origin so the
   // response is compatible with `credentials: include` fetches (browsers

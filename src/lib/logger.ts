@@ -21,7 +21,11 @@ import { createLogger, type Logger } from '@connorhoehn/service-runtime';
 
 const serviceName = process.env.SERVICE_NAME || 'platform-api';
 
-const logger = createLogger({ service: serviceName });
+const logger = createLogger({
+  service: serviceName,
+  level: process.env.LOG_LEVEL ?? 'info',
+  autoEnrichFromContext: true,
+});
 
 /**
  * Returns a child logger with the given fields bound to every log line.
