@@ -28,6 +28,8 @@ import { ensureOutboxTTL, ensureVideoSessionsTTL } from './lib/dynamo-setup';
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
+import { PipelineConfigSubscriber } from './control-plane/pipeline-config-subscriber';
+import { definitionsRepo } from './pipeline/definitions-repository';
 
 const port = process.env.PORT ?? '3001';
 
@@ -282,6 +284,30 @@ void startInvalidationSubscriber(pipelineDefinitionsCache).then((sub) => {
 });
 
 // ---------------------------------------------------------------------------
+// Control-plane: AgenticPipeline config subscriber.
+//
+// Listens for operator pushes (CRD-derived AgenticPipeline configs) on
+// ControlPlaneChannel and writes them to the definitions repository so the
+// pipeline runtime picks them up on the next evaluation tick. Non-fatal —
+// if Redis is down at startup the subscriber logs a warning and the operator
+// can re-push once Redis recovers.
+// ---------------------------------------------------------------------------
+let pipelineConfigSubscriber: PipelineConfigSubscriber | null = null;
+(async () => {
+  try {
+    pipelineConfigSubscriber = new PipelineConfigSubscriber({
+      definitionsRepository: definitionsRepo,
+    });
+    await pipelineConfigSubscriber.start();
+  } catch (err: unknown) {
+    log.warn(
+      { errMessage: err instanceof Error ? err.message : String(err) },
+      'pipeline-config-subscriber bootstrap failed (non-fatal)',
+    );
+  }
+})();
+
+// ---------------------------------------------------------------------------
 // Schedule evaluator — fires pipelines whose triggerBinding.event === 'schedule'
 // on their cron expression. Phase 1: logs only; Phase 4 will call the pipeline
 // resource to produce a run.
@@ -354,6 +380,11 @@ async function shutdown(signal: string): Promise<void> {
   if (activityConsumer) {
     try { await activityConsumer.stop(); } catch (err) {
       log.error({ err }, 'activity-consumer stop failed');
+    }
+  }
+  if (pipelineConfigSubscriber) {
+    try { await pipelineConfigSubscriber.stop(); } catch (err) {
+      log.warn({ err }, 'pipeline-config-subscriber stop failed');
     }
   }
   try { await disconnectCatalog(); } catch (err) {
