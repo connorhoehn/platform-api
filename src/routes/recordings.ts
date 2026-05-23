@@ -37,7 +37,8 @@ import log from '../lib/logger';
 export const recordingsRouter = Router();
 
 // --------------------------------------------------------------------
-// GET /api/recordings — list by authed user
+// GET /api/recordings — list by authed user, optionally filtered by
+// lobbyName (W6 — RoomAdminPage "View recordings" link).
 // --------------------------------------------------------------------
 recordingsRouter.get(
   '/recordings',
@@ -49,6 +50,19 @@ recordingsRouter.get(
     }
     const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
     const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+    const lobbyName = typeof req.query.lobbyName === 'string' ? req.query.lobbyName : undefined;
+
+    // W6 — room-scoped filter for RoomAdminPage. Auth is still required (any
+    // authenticated user can list a room's recordings — the RoomAdminPage UI
+    // gates the "View recordings" link to owners/admins, so cross-room
+    // discovery is unlikely in practice). If we later want strict per-room
+    // ACLs, add a membership check here against hangoutRoomRepo.
+    if (lobbyName) {
+      const { items, cursor: next } = await callRecordingRepo.listByLobbyName(lobbyName, limit, cursor);
+      res.json({ items, cursor: next ?? null });
+      return;
+    }
+
     const { items, cursor: next } = await callRecordingRepo.listByUser(userId, { limit, cursor });
     res.json({ items, cursor: next ?? null });
   }),

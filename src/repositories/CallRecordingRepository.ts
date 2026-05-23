@@ -28,6 +28,7 @@ import {
   PutCommand,
   GetCommand,
   QueryCommand,
+  ScanCommand,
   DeleteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
@@ -249,6 +250,74 @@ export class CallRecordingRepository extends BaseRepository {
       ? (out.LastEvaluatedKey.startedAtRecordingId as string)
       : undefined;
     return { items, cursor };
+  }
+
+  /**
+   * W6 — List recordings for a given lobby (e.g. `room:lounge`). Used by the
+   * RoomAdminPage "View recordings" filter so room admins can see every
+   * recording produced inside their room.
+   *
+   * TODO: v1 implementation does a Scan filtered by `lobbyName` (capped at
+   * 100 rows per page) since there's no GSI on lobbyName today. Acceptable
+   * because the primary table is bounded by RETENTION_DAYS, but if volume
+   * grows we should promote `lobbyName` to a GSI HASH with `startedAt` as
+   * the RANGE so this becomes a Query.
+   *
+   * The cursor is the opaque LastEvaluatedKey from the prior page (encoded
+   * to a base64 JSON string so it round-trips cleanly through the URL).
+   * Results are returned in whatever order DDB Scan yields — callers that
+   * need recency-ordering should sort client-side.
+   */
+  async listByLobbyName(
+    lobbyName: string,
+    limit = 50,
+    cursor?: string,
+  ): Promise<{
+    items: Array<{
+      callId: string;
+      recordingId: string;
+      startedAt: string;
+      endedAt: string;
+      durationMs: number;
+      channelArn: string;
+      lobbyName: string;
+      thumbnailUrl?: string;
+    }>;
+    cursor?: string;
+  }> {
+    const cappedLimit = Math.max(1, Math.min(100, limit));
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    if (cursor) {
+      try {
+        exclusiveStartKey = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8')) as Record<string, unknown>;
+      } catch {
+        // Bad cursor → ignore and start from the top.
+        exclusiveStartKey = undefined;
+      }
+    }
+    const out = await this.docClient.send(
+      new ScanCommand({
+        TableName: CALL_RECORDINGS_TABLE,
+        FilterExpression: 'lobbyName = :l',
+        ExpressionAttributeValues: { ':l': lobbyName },
+        Limit: cappedLimit,
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }),
+    );
+    const items = (out.Items ?? []).map((i) => ({
+      callId: i.callId as string,
+      recordingId: i.recordingId as string,
+      startedAt: i.startedAt as string,
+      endedAt: i.endedAt as string,
+      durationMs: i.durationMs as number,
+      channelArn: i.channelArn as string,
+      lobbyName: i.lobbyName as string,
+      thumbnailUrl: i.thumbnailUrl as string | undefined,
+    }));
+    const nextCursor = out.LastEvaluatedKey
+      ? Buffer.from(JSON.stringify(out.LastEvaluatedKey), 'utf8').toString('base64')
+      : undefined;
+    return { items, ...(nextCursor ? { cursor: nextCursor } : {}) };
   }
 
   /**
