@@ -15,6 +15,8 @@ import { ApprovalRepository } from './ApprovalRepository';
 import { PipelineRunRepository } from './PipelineRunRepository';
 import { PipelineDLQRepository } from './PipelineDLQRepository';
 import { CallRecordingRepository } from './CallRecordingRepository';
+import { HangoutRoomRepository } from './HangoutRoomRepository';
+import { HangoutRoomMemberRepository } from './HangoutRoomMemberRepository';
 
 // Singleton instances — share the same docClient across all repositories
 export const profileRepo = new ProfileRepository(docClient);
@@ -34,6 +36,8 @@ export const approvalRepo = new ApprovalRepository(docClient);
 export const pipelineRunRepo = new PipelineRunRepository(docClient);
 export const pipelineDLQRepo = new PipelineDLQRepository(docClient);
 export const callRecordingRepo = new CallRecordingRepository(docClient);
+export const hangoutRoomRepo = new HangoutRoomRepository(docClient);
+export const hangoutRoomMemberRepo = new HangoutRoomMemberRepository(docClient);
 
 export { BaseRepository } from './BaseRepository';
 export { ProfileRepository, ProfileItem } from './ProfileRepository';
@@ -95,3 +99,26 @@ export {
   CALL_RECORDINGS_TABLE,
   CALL_RECORDING_PARTICIPANTS_TABLE,
 } from './CallRecordingRepository';
+export {
+  HangoutRoomRepository,
+  HangoutRoom,
+  HangoutRoomSettings,
+  HangoutRoomState,
+  HangoutRoomVisibility,
+  CreateHangoutRoomInput,
+  ListRoomsOpts as ListHangoutRoomsOpts,
+  ListRoomsResult as ListHangoutRoomsResult,
+  RoomSlugConflictError,
+  RoomNotFoundError,
+  RoomAccessDeniedError,
+  RoomArchivedError,
+  HANGOUT_ROOMS_TABLE,
+} from './HangoutRoomRepository';
+export {
+  HangoutRoomMemberRepository,
+  HangoutRoomMember,
+  HangoutRoomMemberRole,
+  ListRoomsForUserOpts,
+  ListRoomsForUserResult,
+  HANGOUT_ROOM_MEMBERS_TABLE,
+} from './HangoutRoomMemberRepository';

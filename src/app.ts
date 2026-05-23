@@ -111,6 +111,15 @@ export function createApp(): express.Application {
   // competing with any :pipelineId param route inside apiRouter.
   app.use('/api/capabilities', createCapabilitiesRouter({ definitions: definitionsRepo }));
 
+  // First-class persistent hangout rooms — mounted BEFORE apiRouter so
+  // `/api/rooms` paths route to the new HangoutRoomRepository-backed
+  // handlers. The legacy social-rooms router (inside apiRouter) still
+  // owns sub-paths like `/api/rooms/:roomId/posts` and `/api/rooms/dm`
+  // because Express falls through to the next matching middleware when
+  // a router has no matching handler.
+  const { hangoutRoomsRouter } = require('./routes/hangoutRooms');
+  app.use('/api/rooms', hangoutRoomsRouter);
+
   // API routes (profiles, groups, rooms, etc.) mounted here in later phases
   app.use('/api', apiRouter);
 
