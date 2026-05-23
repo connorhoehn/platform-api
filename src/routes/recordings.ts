@@ -25,7 +25,7 @@ import { requireAuth } from '../middleware/auth';
 import { callRecordingRepo, videoSessionRepo } from '../repositories';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
-import { VIDEO_API_URL } from '../lib/video-auth';
+import { VIDEO_API_URL, VIDEO_PUBLIC_URL } from '../lib/video-auth';
 import {
   asyncHandler,
   AppError,
@@ -181,7 +181,7 @@ recordingsRouter.post(
       to: detail.endedAt,
       ...(token ? { token } : {}),
     });
-    const playlistUrl = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(arn)}/dvr/playlist.m3u8?${params}`;
+    const playlistUrl = `${VIDEO_PUBLIC_URL}/api/channels/${encodeURIComponent(arn)}/dvr/playlist.m3u8?${params}`;
 
     res.json({ playlistUrl, token: token || null, expiresAt: expiresAt || null });
   }),
@@ -267,7 +267,7 @@ recordingsRouter.get(
       from: detail.startedAt,
       to: detail.endedAt,
     });
-    const playlistUrl = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(link.channelArn)}/dvr/playlist.m3u8?${params}`;
+    const playlistUrl = `${VIDEO_PUBLIC_URL}/api/channels/${encodeURIComponent(link.channelArn)}/dvr/playlist.m3u8?${params}`;
     res.json({ playlistUrl, expiresAt: link.expiresAt });
   }),
 );
