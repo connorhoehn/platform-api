@@ -22,7 +22,7 @@ import { Router, Request, Response } from 'express';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
-import { callRecordingRepo } from '../repositories';
+import { callRecordingRepo, videoSessionRepo } from '../repositories';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { VIDEO_API_URL } from '../lib/video-auth';
@@ -119,23 +119,34 @@ recordingsRouter.post(
     // Mint an LVS playback token. We hit LVS as the authoritative
     // signer; LVS validates the channel's `authorized` flag and
     // returns a JWT with 1-hour TTL.
+    //
+    // Auth: the LVS playback-tokens route requires `allowStreamKey` or
+    // `allowJwt` with role=publisher — the admin bearer is REJECTED.
+    // Look up the matching VideoSession by lobbyName to grab the
+    // channel's streamKey (same path videoSessions.ts uses for
+    // participant-token mints at line 367).
     const arn = detail.channelArn;
+    let streamKey: string | null = null;
+    try {
+      const session = await videoSessionRepo.findActiveByLobbyName(detail.lobbyName);
+      if (session && session.channelArn === arn) {
+        streamKey = session.streamKey ?? null;
+      }
+    } catch (e: any) {
+      log.warn({ err: e?.message ?? e, lobbyName: detail.lobbyName }, '[recordings] streamKey lookup failed');
+    }
     let token: string;
     let expiresAt: string;
     try {
-      // LVS mint route requires the admin bearer token — without it, LVS
-      // returns 401 and the FE shows "HTTP 502" beside every recording.
-      // Mirrors the auth header pattern used by videoSessions.ts for
-      // channel creation.
-      const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (streamKey) {
+        headers.Authorization = `Bearer ${streamKey}`;
+      }
       const lvsRes = await fetch(
         `${VIDEO_API_URL}/api/channels/${encodeURIComponent(arn)}/playback-tokens`,
         {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${adminToken}`,
-          },
+          headers,
           body: JSON.stringify({ ttlSeconds: 3600 }),
         },
       );
