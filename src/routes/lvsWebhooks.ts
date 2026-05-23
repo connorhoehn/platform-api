@@ -43,7 +43,7 @@ import {
 } from '../repositories';
 import { tableName } from '../lib/ddb-table-name';
 import log from '../lib/logger';
-import { docClient } from '../lib/aws-clients';
+import { ddbClient } from '../lib/aws-clients';
 
 export const lvsWebhooksRouter = Router();
 
@@ -137,7 +137,14 @@ function verifyHmac(req: Request): boolean {
 // Resolve callId from lobbyName by querying the gateway's
 // call-session-bindings table. The gateway is the writer; platform-api
 // is a read-only consumer of that table. (Same DDB account.)
-const ddbRaw = new DynamoDBClient({});
+//
+// Reuse the shared `ddbClient` from aws-clients so DYNAMODB_ENDPOINT /
+// LOCALSTACK_ENDPOINT are honored. The previous `new DynamoDBClient({})`
+// instantiation bypassed that config, so in local-dev (Tilt + dynamodb-local)
+// every callId lookup silently failed → recordings were always persisted
+// under a synthetic `unknown-<arn>-<recordingId>` callId, untraceable from
+// the gateway side.
+const ddbRaw = ddbClient;
 
 async function resolveCallIdByLobby(lobbyName: string): Promise<string | null> {
   // The binding table indexes by callId (PK). To find by lobbyName we
@@ -226,16 +233,36 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
   }
 
   // Normalize across the two envelope shapes the dispatcher emits:
-  //   EventBridge: `{ 'detail-type': '...', detail: { event_name, stream_id, ...data } }`
-  //   Bare:        `{ id, type, channelArn, occurredAt, data: { ...payload } }`
+  //   EventBridge: `{ 'detail-type': 'IVS Recording State Change',
+  //                   detail: { event_name: 'recording.completed', stream_id, ...data },
+  //                   resources: [channelArn] }`
+  //   Bare:        `{ id, type: 'recording.completed', channelArn, occurredAt,
+  //                   data: { recordingId, segments, totalSize, durationMs, destination } }`
   // The fields we care about (recordingId, segments, totalSize, durationMs,
   // destination, thumbnailUrl) live under `detail` in EB and under `data`
   // in bare — flatten both into one `detail` view so downstream reads are
   // shape-agnostic.
-  const eventType: string = payload['detail-type'] ?? payload.type ?? '';
+  //
+  // For event-type matching we prefer `payload.detail.event_name` over
+  // `payload['detail-type']` when present — EB's detail-type is a category
+  // label ('IVS Recording State Change') and doesn't include the action
+  // ('completed'), so a naive `.includes('completed')` check would skip
+  // every EB envelope. The bare shape exposes the action directly on
+  // `payload.type`.
   const detail = payload.detail
     ?? (payload.data ? { ...payload, ...payload.data } : payload);
-  const arn: string = detail.arn ?? detail.channelArn ?? payload.channelArn ?? '';
+  const eventType: string =
+    detail?.event_name
+    ?? payload.type
+    ?? payload['detail-type']
+    ?? '';
+  const arn: string =
+    detail.arn
+    ?? detail.channelArn
+    ?? detail.stream_id
+    ?? payload.channelArn
+    ?? (Array.isArray(payload.resources) ? payload.resources[0] : '')
+    ?? '';
   const recordingId: string = detail.recordingId ?? '';
 
   // W5 — successful-receive log emitted right after HMAC verifies + the
@@ -353,7 +380,16 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       segments: Array.isArray(detail.segments) ? detail.segments : [],
       destination: detail.destination === 's3' ? 's3' : 'local',
       participants,
-      startedBy: session?.createdBy ?? participants[0]?.userId,
+      // VideoSessionRecord exposes the creator as `startedBy` (NOT
+      // `createdBy` — that field doesn't exist on the record). Reading
+      // the wrong field left `startedBy` undefined on every persisted
+      // recording, which (a) silently broke owner-only delete (delete
+      // route fails-closed on `!detail.startedBy`) and (b) made the
+      // recording invisible to the owner when participants[] was empty
+      // (because the fan-out only writes rows for participants).
+      // Fall through to participants[0]?.userId for legacy rows that
+      // somehow lack startedBy.
+      startedBy: session?.startedBy ?? participants[0]?.userId,
       // W8 — thumbnail surfaced by LVS RecordingManager. May be a
       // file:// URL in dev (hostPath) or a backend-specific URL in
       // prod (S3 signed / CloudFront / etc.). Null when ffmpeg

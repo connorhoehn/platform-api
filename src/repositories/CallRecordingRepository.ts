@@ -88,23 +88,43 @@ export class CallRecordingRepository extends BaseRepository {
    * Persist a completed recording + fan out one row per participant
    * into the reverse-index table. Idempotent — re-running the same
    * webhook payload overwrites both tables without duplicate entries.
+   *
+   * Visibility guarantee: even when `participants[]` is empty (the
+   * session never had a /join, e.g. recording started but caller dropped
+   * before the SFU minted a participant token), we still write a single
+   * fan-out row keyed by `startedBy` so the recording owner sees their
+   * own recording in `GET /api/recordings`. Without this, the row was
+   * stranded in the primary table and undiscoverable by user-scoped
+   * queries — the most common cause of "Past Calls is empty" in dev.
    */
   async putRecording(rec: Omit<CallRecording, 'ttl'>): Promise<void> {
     const ttl = Math.floor(Date.now() / 1000) + RETENTION_DAYS * 86400;
     const full: CallRecording = { ...rec, ttl };
     await this.putItem(full as unknown as Record<string, unknown>);
 
+    // Build the de-duplicated set of userIds that should see this recording.
+    // Participants are the canonical set; if absent, fall back to `startedBy`
+    // so the owner can still find their recording. Dedup so multiple tabs
+    // (same userId, different participantId) collapse to one fan-out row.
+    const fanoutUserIds = new Set<string>();
+    for (const p of rec.participants) {
+      if (p.userId) fanoutUserIds.add(p.userId);
+    }
+    if (fanoutUserIds.size === 0 && rec.startedBy) {
+      fanoutUserIds.add(rec.startedBy);
+    }
+
     // Fan out participant index rows. Promise.all is fine — DDB
     // PutItem is independent per row, and we want one round-trip-batch
     // not 5 serial calls for a 5-person call.
-    if (rec.participants.length > 0) {
+    if (fanoutUserIds.size > 0) {
       await Promise.all(
-        rec.participants.map((p) =>
+        Array.from(fanoutUserIds).map((userId) =>
           this.docClient.send(
             new PutCommand({
               TableName: this.participantsTable,
               Item: {
-                userId: p.userId,
+                userId,
                 startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}`,
                 callId: rec.callId,
                 recordingId: rec.recordingId,
@@ -141,19 +161,32 @@ export class CallRecordingRepository extends BaseRepository {
    */
   async deleteRecording(callId: string, recordingId: string): Promise<void> {
     const rec = await this.getRecording(callId, recordingId);
-    if (rec && rec.participants?.length) {
-      await Promise.all(
-        rec.participants.map((p) =>
-          this.docClient
-            .send(
-              new DeleteCommand({
-                TableName: this.participantsTable,
-                Key: { userId: p.userId, startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}` },
-              }),
-            )
-            .catch(() => { /* swallow — participant index is fan-out, not source of truth */ }),
-        ),
-      );
+    if (rec) {
+      // Mirror putRecording's fan-out set: participants ∪ startedBy
+      // (when participants[] is empty). Without including startedBy
+      // here, owner-only recordings would leave a stranded fan-out row
+      // that keeps showing up in GET /api/recordings even after delete.
+      const fanoutUserIds = new Set<string>();
+      for (const p of rec.participants ?? []) {
+        if (p.userId) fanoutUserIds.add(p.userId);
+      }
+      if (fanoutUserIds.size === 0 && rec.startedBy) {
+        fanoutUserIds.add(rec.startedBy);
+      }
+      if (fanoutUserIds.size > 0) {
+        await Promise.all(
+          Array.from(fanoutUserIds).map((userId) =>
+            this.docClient
+              .send(
+                new DeleteCommand({
+                  TableName: this.participantsTable,
+                  Key: { userId, startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}` },
+                }),
+              )
+              .catch(() => { /* swallow — participant index is fan-out, not source of truth */ }),
+          ),
+        );
+      }
     }
     await this.docClient.send(
       new DeleteCommand({
