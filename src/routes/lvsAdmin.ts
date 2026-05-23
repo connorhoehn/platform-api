@@ -36,7 +36,17 @@ import { getRecentDeliveries } from './lvsWebhooks';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { VIDEO_SESSIONS_TABLE } from '../repositories/VideoSessionRepository';
+import {
+  HANGOUT_ROOMS_TABLE,
+  type HangoutRoom,
+} from '../repositories/HangoutRoomRepository';
+import { hangoutRoomMemberRepo } from '../repositories';
 import log from '../lib/logger';
+
+// Cap on cross-org room listing — admin endpoint only, but we still
+// don't want a `/api/admin/rooms` call to drag back every row of a
+// 10k-row table. Tracks the spec's "Cap at 200 rows for list".
+const ADMIN_ROOMS_LIST_MAX = 200;
 
 export const lvsAdminRouter = Router();
 
@@ -190,5 +200,145 @@ lvsAdminRouter.get(
       );
     }
     res.json({ bindings: items, count: items.length });
+  }),
+);
+
+// --------------------------------------------------------------------
+// GET /api/admin/rooms
+//
+// Cross-org listing of hangout rooms for ops dashboards. The
+// HangoutRoomRepository.listRoomsByOrg helper is org-scoped (its
+// underlying GSI is keyed on orgId) — for an all-orgs view we Scan the
+// base table directly. Capped at ADMIN_ROOMS_LIST_MAX to keep the
+// response bounded even in worst-case fleet sizes.
+//
+// Returns {rooms, totalCount} so the dashboard can render "showing N of
+// M" hints; totalCount is the number returned (i.e. equals rooms.length
+// today; we don't pre-COUNT because that's a second Scan).
+// --------------------------------------------------------------------
+lvsAdminRouter.get(
+  '/rooms',
+  requireAdmin,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    log.info(
+      { path: req.path, ip: req.ip },
+      '[lvs-admin] GET /api/admin/rooms',
+    );
+    let items: HangoutRoom[] = [];
+    try {
+      const out = await docClient.send(
+        new DocScanCommand({
+          TableName: HANGOUT_ROOMS_TABLE,
+          Limit: ADMIN_ROOMS_LIST_MAX,
+        }),
+      );
+      items = (out.Items ?? []) as HangoutRoom[];
+    } catch (e: any) {
+      log.warn(
+        { err: e?.message ?? e, table: HANGOUT_ROOMS_TABLE },
+        '[lvs-admin] hangout-rooms scan failed',
+      );
+    }
+
+    // Sort newest-active-first to match the sidebar's listRoomsByOrg
+    // ordering — admins eyeballing the dashboard expect "recent" at top.
+    items.sort((a, b) => {
+      const av = String(a.lastActiveAt ?? a.createdAt ?? '');
+      const bv = String(b.lastActiveAt ?? b.createdAt ?? '');
+      return bv.localeCompare(av);
+    });
+
+    const rooms = items.slice(0, ADMIN_ROOMS_LIST_MAX);
+    res.json({ rooms, totalCount: rooms.length });
+  }),
+);
+
+// --------------------------------------------------------------------
+// GET /api/admin/rooms/:slug
+//
+// Full detail view for a single room: the HangoutRoom row, its current
+// member list (HangoutRoomMember rows by roomId), and basic stats.
+// "Recent activity" — the spec mentions occupancy-delta history, which
+// the gateway broadcasts ephemerally over WebSocket and does not
+// persist; for now we surface the static stats (createdAt /
+// lastActiveAt / archivedAt / member count) instead. If the gateway
+// later writes a per-room activity log, this endpoint is the natural
+// place to attach it.
+//
+// Slug → roomId resolution requires the orgId on the GSI; we Scan with
+// a FilterExpression on slug because admins don't know which org owns
+// a slug. Bounded by HANGOUT_ROOMS_TABLE's row count (small in MVP).
+// --------------------------------------------------------------------
+lvsAdminRouter.get(
+  '/rooms/:slug',
+  requireAdmin,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const slug = String(req.params.slug ?? '').trim();
+    log.info(
+      { path: req.path, slug, ip: req.ip },
+      '[lvs-admin] GET /api/admin/rooms/:slug',
+    );
+    if (!slug) {
+      res.status(400).json({ error: 'slug is required' });
+      return;
+    }
+
+    // Locate the room by slug. We don't know the orgId here, so Scan
+    // with a FilterExpression rather than Query. Capped by the table
+    // size; OK for the admin-only surface.
+    let room: HangoutRoom | null = null;
+    try {
+      const out = await docClient.send(
+        new DocScanCommand({
+          TableName: HANGOUT_ROOMS_TABLE,
+          FilterExpression: 'slug = :s',
+          ExpressionAttributeValues: { ':s': slug },
+          Limit: ADMIN_ROOMS_LIST_MAX,
+        }),
+      );
+      const found = (out.Items ?? []) as HangoutRoom[];
+      room = found[0] ?? null;
+    } catch (e: any) {
+      log.warn(
+        { err: e?.message ?? e, slug },
+        '[lvs-admin] hangout-rooms slug lookup failed',
+      );
+    }
+
+    if (!room) {
+      res.status(404).json({ error: `Room not found: ${slug}` });
+      return;
+    }
+
+    // Member list — HangoutRoomMemberRepository.listMembers keys on
+    // roomId so we can answer for both `org` and `private` rooms
+    // uniformly (for org rooms the table will be empty, which is fine).
+    let members: unknown[] = [];
+    try {
+      members = await hangoutRoomMemberRepo.listMembers(room.roomId);
+    } catch (e: any) {
+      log.warn(
+        { err: e?.message ?? e, roomId: room.roomId },
+        '[lvs-admin] member listMembers failed',
+      );
+    }
+
+    res.json({
+      room,
+      members,
+      stats: {
+        memberCount: members.length,
+        createdAt: room.createdAt,
+        lastActiveAt: room.lastActiveAt,
+        archivedAt: room.archivedAt ?? null,
+        state: room.state,
+      },
+      // Recent occupancy activity is broadcast ephemerally by the
+      // gateway and not persisted; the dashboard should subscribe to
+      // the rooms-index WS feed for live deltas. We return an empty
+      // array here for a stable shape — future change can plug in a
+      // gateway-side ring buffer if/when one is added.
+      recentActivity: [],
+    });
   }),
 );
