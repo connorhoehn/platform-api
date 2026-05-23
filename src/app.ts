@@ -34,7 +34,19 @@ export function createApp(): express.Application {
     next();
   });
 
-  app.use(express.json());
+  // Global JSON parser — skipped for /hooks/lvs/* so the LVS webhook
+  // receiver can read the raw bytes for HMAC verification. Once the
+  // global parser consumes the stream, the route-level raw parser
+  // can't re-read it; req.body would arrive as a parsed Object and
+  // the HMAC update() would crash with ERR_INVALID_ARG_TYPE.
+  app.use(express.json({
+    type: (req) => {
+      const url = (req as any).url || '';
+      if (url.startsWith('/hooks/lvs')) return false;
+      const ct = req.headers['content-type'] || '';
+      return ct.includes('application/json');
+    },
+  }));
   app.use(requestLogger);
 
   // Health check — no auth required. Mounted at /health (canonical) and

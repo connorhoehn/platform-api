@@ -58,8 +58,26 @@ const SECRET = process.env.LVS_WEBHOOK_SECRET ?? '';
 function verifyHmac(req: Request): boolean {
   if (!SECRET) return true; // dev: skip
   const header = req.header('X-LVS-Signature') ?? '';
+  // Defense in depth: if a parent middleware accidentally parsed the
+  // body into an Object (express.json ran before our raw parser),
+  // Hmac.update would crash with ERR_INVALID_ARG_TYPE — taking down
+  // the whole pod. Coerce to a Buffer-of-bytes so the verify fails
+  // loudly (returns false) rather than crashing. The app.ts json
+  // parser is configured to skip /hooks/lvs but this guard catches
+  // any future regression.
+  const body = req.body;
+  let bodyBytes: Buffer;
+  if (Buffer.isBuffer(body)) {
+    bodyBytes = body;
+  } else if (typeof body === 'string') {
+    bodyBytes = Buffer.from(body, 'utf-8');
+  } else {
+    // Parsed Object — body bytes are lost. Can't verify HMAC.
+    // Log + reject. Returns false → 401 to LVS, which will retry.
+    return false;
+  }
   const expected = createHmac('sha256', SECRET)
-    .update(req.body as Buffer)
+    .update(bodyBytes)
     .digest('hex');
   const provided = header.replace(/^sha256=/, '');
   if (provided.length !== expected.length) return false;
@@ -108,7 +126,18 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
 
   let payload: any;
   try {
-    payload = JSON.parse((req.body as Buffer).toString('utf-8'));
+    // Same defense as verifyHmac — body should be a Buffer (raw parser)
+    // but accept already-parsed Object as a fallback.
+    const body = req.body;
+    if (Buffer.isBuffer(body)) {
+      payload = JSON.parse(body.toString('utf-8'));
+    } else if (typeof body === 'string') {
+      payload = JSON.parse(body);
+    } else if (body && typeof body === 'object') {
+      payload = body;
+    } else {
+      throw new Error('empty body');
+    }
   } catch (e: any) {
     res.status(400).json({ error: 'invalid JSON' });
     return;
