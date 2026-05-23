@@ -41,6 +41,7 @@ import {
   ValidationError,
   AppError,
 } from '../middleware/error-handler';
+import { canCreateRoom } from '../middleware/canCreateRoom';
 import log from '../lib/logger';
 
 export const hangoutRoomsRouter = Router();
@@ -53,6 +54,66 @@ const DEFAULT_ORG_ID = 'default-org';
 const DEFAULT_SOFT_CAP = 25;
 const SLUG_MAX_LEN = 48;
 const SLUG_RETRY_LIMIT = 3;
+
+// Per-user create rate limit: 5 creates / sliding-1h-window / userId.
+// In-memory by design — abuse mitigation, not a hard quota. Multi-replica
+// deployments would each maintain their own bucket; tighten via Redis if
+// that becomes a real concern (the existing `createRateLimiter` in
+// middleware/rateLimit.ts is Redis-backed but is token-bucket rather than
+// sliding-window, so it doesn't fit this spec's "5 per rolling hour" shape).
+const CREATE_RATE_LIMIT_MAX = 5;
+const CREATE_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const createAttemptsByUser = new Map<string, number[]>();
+
+/**
+ * Test-only: clear the in-memory create-rate-limit table so suites don't
+ * leak attempt counts across tests.
+ */
+export function _resetCreateRateLimit(): void {
+  createAttemptsByUser.clear();
+}
+
+/**
+ * Record one create attempt for the user. Returns false when the user has
+ * already hit the cap within the rolling window; true otherwise. Sliding
+ * window — old timestamps are pruned before each check.
+ */
+function recordCreateAttempt(userId: string): boolean {
+  const now = Date.now();
+  const cutoff = now - CREATE_RATE_LIMIT_WINDOW_MS;
+  const prior = (createAttemptsByUser.get(userId) ?? []).filter((t) => t > cutoff);
+  if (prior.length >= CREATE_RATE_LIMIT_MAX) {
+    // Persist the pruned list so the next denial check is honest.
+    createAttemptsByUser.set(userId, prior);
+    return false;
+  }
+  prior.push(now);
+  createAttemptsByUser.set(userId, prior);
+  return true;
+}
+
+/**
+ * Parse the comma-separated ROOM_ADMIN_USER_IDS env var. Empty / unset
+ * means "no admins" — only the owner can archive. We re-parse on every
+ * call rather than caching so tests + ops can flip the var at runtime.
+ */
+function getRoomAdminUserIds(): Set<string> {
+  const raw = process.env.ROOM_ADMIN_USER_IDS ?? '';
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+}
+
+/**
+ * Returns true if the caller is the room owner OR a configured org-admin.
+ */
+function isRoomOwnerOrAdmin(room: HangoutRoom, userId: string): boolean {
+  if (room.createdBy === userId) return true;
+  return getRoomAdminUserIds().has(userId);
+}
 
 /**
  * Resolve the orgId for the caller. In dev (SKIP_AUTH=true) defaults to
@@ -184,6 +245,16 @@ async function callSelf(
  * (b) any private rooms the user is a member of. We page from the
  * org-recency GSI first; private rooms are merged in best-effort by
  * looking them up individually if they're not already in (a).
+ *
+ * Query params:
+ *   ?state=active|archived  (default: active) — archived rooms include
+ *       archivedAt + ttl fields populated by the repo's archiveRoom().
+ *   ?q=<text>               — case-insensitive substring match against
+ *       name + slug. When present, response is capped at 100 rows and
+ *       the cursor is omitted (search is single-page by design). Empty
+ *       string is treated as no filter.
+ *   ?limit=<n>              — page size for the unfiltered list (1..200).
+ *   ?cursor=<opaque>        — pagination cursor from a prior page.
  */
 hangoutRoomsRouter.get(
   '/',
@@ -194,6 +265,28 @@ hangoutRoomsRouter.get(
     const limitParam = Number(req.query.limit ?? '50');
     const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 200) : 50;
     const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+    const qRaw = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+
+    // Search path — server-side filter against recency-ordered rows.
+    // Capped at 100 rows + no cursor (search is single-page by design).
+    if (qRaw.length > 0) {
+      const candidates = await hangoutRoomRepo.searchRooms(orgId, {
+        q: qRaw,
+        state,
+        limit: 100,
+      });
+      const visible: HangoutRoom[] = [];
+      for (const r of candidates) {
+        if (r.visibility === 'org' || r.createdBy === userId) {
+          visible.push(r);
+          continue;
+        }
+        const isMember = await hangoutRoomMemberRepo.isMember(r.roomId, userId);
+        if (isMember) visible.push(r);
+      }
+      res.status(200).json({ rooms: visible });
+      return;
+    }
 
     const orgPage = await hangoutRoomRepo.listRoomsByOrg(orgId, {
       state,
@@ -259,6 +352,25 @@ hangoutRoomsRouter.post(
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name || name.length > 100) {
       throw new ValidationError('name is required (1–100 chars)');
+    }
+
+    // Permission gate — pluggable hook (default: open). See
+    // middleware/canCreateRoom.ts for wiring + failure-mode semantics.
+    const allowed = await canCreateRoom(userId, orgId);
+    if (!allowed) {
+      res.status(403).json({ error: { code: 'ROOM_CREATE_DENIED' } });
+      return;
+    }
+
+    // Rate limit — 5 creates / rolling 1h / user. Sliding window in-memory.
+    if (!recordCreateAttempt(userId)) {
+      res.status(429).json({
+        error: {
+          code: 'ROOM_CREATE_RATE_LIMITED',
+          message: `Room create limit reached (max ${CREATE_RATE_LIMIT_MAX} per hour).`,
+        },
+      });
+      return;
     }
 
     const visibility: HangoutRoomVisibility =
@@ -341,7 +453,8 @@ hangoutRoomsRouter.patch(
 );
 
 /**
- * POST /api/rooms/:slug/archive — soft-delete. Owner-only.
+ * POST /api/rooms/:slug/archive — soft-delete. Owner OR org-admin (the
+ * `ROOM_ADMIN_USER_IDS` env var, comma-separated). Everyone else gets 403.
  */
 hangoutRoomsRouter.post(
   '/:slug/archive',
@@ -351,7 +464,9 @@ hangoutRoomsRouter.post(
     const { slug } = req.params;
 
     const room = await loadActiveRoom(orgId, slug);
-    assertOwner(room, userId);
+    if (!isRoomOwnerOrAdmin(room, userId)) {
+      throw new RoomAccessDeniedError(slug);
+    }
 
     await hangoutRoomRepo.archiveRoom(orgId, room.roomId);
     res.status(200).json({ ok: true, slug });
@@ -432,14 +547,20 @@ hangoutRoomsRouter.post(
 
     const lobbyName = `room:${slug}`;
 
-    // Step 1 — find-or-create the live VideoSession.
+    // Step 1 — find-or-create the live VideoSession. Pass the room's
+    // recording setting EXPLICITLY (both on + off) so videoSessions.ts
+    // honors per-room intent. Default-on behavior in videoSessions only
+    // applies when no field is sent at all (DM/global calls); rooms
+    // ALWAYS send the explicit choice so an opt-out actually disables
+    // recording downstream.
     const createBody: Record<string, unknown> = {
       lobbyName,
       findOrCreate: true,
+      recordingConfiguration: {
+        enabled: room.settings.recordingEnabled === true,
+        destination: 'local',
+      },
     };
-    if (room.settings.recordingEnabled) {
-      createBody['recordingConfiguration'] = { enabled: true, destination: 'local' };
-    }
     const create = await callSelf(req, '/api/video/sessions', {
       method: 'POST',
       body: createBody,

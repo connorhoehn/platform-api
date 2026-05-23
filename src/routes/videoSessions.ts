@@ -234,6 +234,20 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     // injected into our pod from the `admin-token` Secret. Falls back to
     // literal 'admin' which matches the SFU's `||'admin'` default.
     const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
+    // recordingConfiguration honors the caller's intent — hangoutRooms.ts's
+    // /join route forwards `room.settings.recordingEnabled` as
+    // body.recordingConfiguration; DM/global calls default to enabled
+    // (preserves the legacy "always record" behavior that powers the
+    // Past Calls page). Pass through only if explicit; otherwise default.
+    const incomingRecordingConfig = (body.recordingConfiguration && typeof body.recordingConfiguration === 'object')
+      ? (body.recordingConfiguration as { enabled?: boolean; destination?: string })
+      : null;
+    const recordingConfiguration = incomingRecordingConfig
+      ? {
+          enabled: incomingRecordingConfig.enabled !== false,
+          destination: incomingRecordingConfig.destination ?? 'local',
+        }
+      : { enabled: true, destination: 'local' };
     let channelRes: globalThis.Response;
     try {
       channelRes = await callSfu(`${VIDEO_API_URL}/api/channels`, {
@@ -242,13 +256,9 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
           'Content-Type': 'application/json',
           Authorization: `Bearer ${adminToken}`,
         },
-        // recordingConfiguration MUST be set at channel-create time —
-        // RecordingManager.startRecording bails with cfg.enabled=false
-        // when this is missing, so without it zero recordings are
-        // ever written. The /recordings page would forever stay empty.
         body: JSON.stringify({
           name: lobbyName,
-          recordingConfiguration: { enabled: true, destination: 'local' },
+          recordingConfiguration,
         }),
       });
     } catch (sfuErr) {
