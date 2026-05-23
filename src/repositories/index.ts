@@ -14,6 +14,7 @@ import { TypedDocumentRepository } from './TypedDocumentRepository';
 import { ApprovalRepository } from './ApprovalRepository';
 import { PipelineRunRepository } from './PipelineRunRepository';
 import { PipelineDLQRepository } from './PipelineDLQRepository';
+import { CallRecordingRepository } from './CallRecordingRepository';
 
 // Singleton instances — share the same docClient across all repositories
 export const profileRepo = new ProfileRepository(docClient);
@@ -32,6 +33,7 @@ export const typedDocumentRepo = new TypedDocumentRepository(docClient);
 export const approvalRepo = new ApprovalRepository(docClient);
 export const pipelineRunRepo = new PipelineRunRepository(docClient);
 export const pipelineDLQRepo = new PipelineDLQRepository(docClient);
+export const callRecordingRepo = new CallRecordingRepository(docClient);
 
 export { BaseRepository } from './BaseRepository';
 export { ProfileRepository, ProfileItem } from './ProfileRepository';
@@ -85,3 +87,11 @@ export {
   PipelineDLQRepository,
   PipelineDLQItem,
 } from './PipelineDLQRepository';
+export {
+  CallRecordingRepository,
+  CallRecording,
+  CallRecordingParticipant,
+  RecordingSegment,
+  CALL_RECORDINGS_TABLE,
+  CALL_RECORDING_PARTICIPANTS_TABLE,
+} from './CallRecordingRepository';

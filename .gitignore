@@ -4,3 +4,12 @@ coverage/
 *.tsbuildinfo
 .env
 .env.local
+
+# Sibling source rsynced by the gateway Tiltfile for the platform-api
+# Docker build context — never committed; Tilt regenerates on every
+# reconcile and version-pinning lives in package.json.
+.distributed-core/
+.event-catalog/
+.message-queue/
+.pipeline-runtime/
+.service-runtime/

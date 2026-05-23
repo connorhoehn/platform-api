@@ -66,6 +66,13 @@ export function createApp(): express.Application {
   // the connector spec: /api/ingest/webhook/confluence/:sourceId.
   app.use('/api/ingest/webhook/confluence', confluenceWebhookRouter);
 
+  // LVS recording webhook — receives `recording.started` / `recording.completed`
+  // from live-video-streaming, persists CallRecording rows. HMAC-protected via
+  // LVS_WEBHOOK_SECRET (skipped when env unset for dev). Mounted before
+  // requireAuth because LVS uses HMAC, not Cognito.
+  const { lvsWebhooksRouter } = require('./routes/lvsWebhooks');
+  app.use('/hooks/lvs', lvsWebhooksRouter);
+
   // All routes below this line require a valid Cognito JWT
   app.use(requireAuth);
 

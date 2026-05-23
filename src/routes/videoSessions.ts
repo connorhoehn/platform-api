@@ -251,13 +251,11 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       status: 'active',
       startedAt: now,
       startedBy: userId,
-      participants: [
-        {
-          userId,
-          displayName: displayName || userId,
-          joinedAt: now,
-        },
-      ],
+      // Don't pre-seed participants[] on create — they get added via /join.
+      // Pre-seeding without a per-tab participantId would make /end (keyed
+      // by participantId) unable to clean up the seed entry → orphan
+      // participant blocks "last out" detection.
+      participants: [],
     };
 
     try {
@@ -266,6 +264,26 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     } catch (dbErr) {
       // Log but don't fail — the channel was created successfully
       log.error({ err: dbErr }, '[videoSessions] Failed to persist local record');
+    }
+
+    // P0 — write arn → session reverse index to Redis so the
+    // recording.completed webhook handler can resolve channelArn back
+    // to (sessionId, lobbyName). LVS recording metadata doesn't carry
+    // these; without this index, every recording persists under a
+    // synthetic 'unknown-<arn>-<recordingId>' callId.
+    try {
+      const { getRedisClient } = await import('../lib/redis-client.js');
+      const redis = await getRedisClient();
+      if (redis) {
+        const indexKey = `video:arn-index:${channelArn}`;
+        await redis.set(
+          indexKey,
+          JSON.stringify({ sessionId, lobbyName, createdAt: now }),
+          { EX: 7 * 24 * 60 * 60 }, // 7 days — covers webhook arrival + retries
+        );
+      }
+    } catch (idxErr) {
+      log.warn({ err: idxErr, channelArn }, '[videoSessions] arn-index write failed (recording lookup may degrade)');
     }
 
     res.status(201).json({ sessionId, reused: false });
@@ -318,19 +336,23 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
 
     const tokenData = await tokenRes.json() as Record<string, unknown>;
 
-    // Idempotent participant add — don't double-insert if the same user is
-    // already in this session (e.g. browser refresh on a findOrCreate'd lobby).
+    // Per-tab participant: key participants[] by the SFU-returned participantId,
+    // not userId. Multiple tabs of the same user (real in prod, every tab in
+    // local-dev SKIP_AUTH=true) each get their own slot so individual unloads
+    // ref-count correctly. Dedup against participantId to keep /join idempotent.
     const userId = req.user!.sub;
-    const already = (session.participants ?? []).some(p => p.userId === userId);
+    const participantId = (tokenData.participantId as string) || randomUUID();
+    const already = (session.participants ?? []).some(p => p.participantId === participantId);
     if (!already) {
       const now = new Date().toISOString();
       try {
         await videoSessionRepo.addParticipant(lobbyName, sessionId, {
           userId,
+          participantId,
           displayName: displayName || userId,
           joinedAt: now,
         });
-        log.info({ userId, sessionId }, '[videoSessions] Added participant to session');
+        log.info({ userId, participantId, sessionId }, '[videoSessions] Added participant to session');
       } catch (dbErr) {
         log.error({ err: dbErr }, '[videoSessions] Failed to add participant to local record');
       }
@@ -338,7 +360,7 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
 
     res.status(200).json({
       token: tokenData.token as string,
-      participantId: (tokenData.participantId as string) || randomUUID(),
+      participantId,
       userId,
     });
   } catch (err) {
@@ -374,16 +396,23 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
       throw new NotFoundError('Session not found');
     }
 
-    // Identify caller. requireAuth-style req.user is undefined on optionalAuth
-    // beacon paths; fall back to userId in the body so the FE can hint who's
-    // leaving (it knows its own clientId).
+    // Identify caller's per-tab participant. participantId is the key now
+    // (see /join); fall back to userId-keyed removal only if the FE hasn't
+    // sent participantId yet (older clients).
+    const participantId = typeof body.participantId === 'string' ? body.participantId : undefined;
     const userId =
       req.user?.sub
       ?? (typeof body.userId === 'string' ? body.userId : undefined);
 
     let remaining = (session.participants ?? []).length;
-    if (userId) {
-      const splice = await videoSessionRepo.removeParticipant(lobbyName, sessionId, userId);
+    if (participantId) {
+      const splice = await videoSessionRepo.removeParticipant(lobbyName, sessionId, participantId);
+      if (splice) remaining = splice.remaining;
+    } else if (userId) {
+      // Legacy path — remove ALL participants matching userId. Kept for
+      // backwards-compat with old client builds. New clients always send
+      // participantId so this branch is dead in steady-state.
+      const splice = await videoSessionRepo.removeParticipantByUserId(lobbyName, sessionId, userId);
       if (splice) remaining = splice.remaining;
     }
 

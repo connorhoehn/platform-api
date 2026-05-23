@@ -1,0 +1,110 @@
+/**
+ * lvs-webhook-bootstrap — at platform-api startup, register a global
+ * webhook subscription with LVS so `recording.completed` events land at
+ * /hooks/lvs/recording. Without this, recordings finish silently and
+ * the DDB table stays empty.
+ *
+ * Idempotency story:
+ *   LVS subscription state is in-memory (per the upstream design), so
+ *   restarting LVS forgets all subscriptions. Restarting platform-api
+ *   would otherwise accumulate duplicate subs in LVS. To avoid that we:
+ *     1. List existing subs first (GET /api/event-subscriptions).
+ *     2. If one matching our (url, filter) already exists, no-op.
+ *     3. Otherwise POST a new one.
+ *   Best-effort — failures log + retry on next boot.
+ *
+ * Env contract:
+ *   VIDEO_API_URL              — LVS base URL (already used by videoSessions)
+ *   LVS_WEBHOOK_BOOTSTRAP_URL  — Where LVS should POST events. Skip if unset.
+ *   LVS_WEBHOOK_SECRET         — HMAC secret (passed through to LVS for
+ *                                 outbound signing).
+ *   LVS_ADMIN_TOKEN            — Auth for /api/event-subscriptions (LVS
+ *                                 admin route). Defaults to 'admin' (Tilt).
+ */
+
+import log from './logger';
+
+const FILTER = 'IVS Recording State Change';
+
+interface ExistingSubscription {
+  id?: string;
+  url?: string;
+  filter?: string;
+}
+
+export async function bootstrapLvsWebhook(): Promise<void> {
+  const lvsUrl = process.env.VIDEO_API_URL;
+  const receiverUrl = process.env.LVS_WEBHOOK_BOOTSTRAP_URL;
+  if (!lvsUrl || !receiverUrl) {
+    log.info(
+      { lvsUrl: !!lvsUrl, receiverUrl: !!receiverUrl },
+      '[lvs-webhook-bootstrap] skipping — VIDEO_API_URL or LVS_WEBHOOK_BOOTSTRAP_URL not set',
+    );
+    return;
+  }
+  const adminToken = process.env.VIDEO_ADMIN_TOKEN ?? process.env.LVS_ADMIN_TOKEN ?? 'admin';
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${adminToken}`,
+  };
+
+  // Step 1: list existing subs. Skip if already registered with same
+  // (url, filter). Otherwise we'd accumulate duplicates on every
+  // platform-api restart.
+  try {
+    const listRes = await fetch(`${lvsUrl}/api/event-subscriptions`, { headers });
+    if (listRes.ok) {
+      const body = (await listRes.json()) as { subscriptions?: ExistingSubscription[] };
+      const subs = Array.isArray(body?.subscriptions) ? body.subscriptions : [];
+      const match = subs.find(
+        (s) => s.url === receiverUrl && (s.filter === FILTER || s.filter === '*'),
+      );
+      if (match) {
+        log.info({ subId: match.id }, '[lvs-webhook-bootstrap] existing subscription found — no-op');
+        return;
+      }
+    } else if (listRes.status === 404) {
+      // LVS instance doesn't expose the list endpoint — fall through
+      // to POST. Worst case is a duplicate sub, which is benign
+      // because LVS dispatches once per URL match.
+      log.warn('[lvs-webhook-bootstrap] /api/event-subscriptions GET returned 404 — will POST anyway');
+    } else {
+      log.warn(
+        { status: listRes.status },
+        '[lvs-webhook-bootstrap] list call failed — will attempt POST anyway',
+      );
+    }
+  } catch (e: any) {
+    log.warn(
+      { err: e?.message ?? e },
+      '[lvs-webhook-bootstrap] list call threw — will attempt POST anyway',
+    );
+  }
+
+  // Step 2: POST a fresh subscription.
+  try {
+    const postRes = await fetch(`${lvsUrl}/api/event-subscriptions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ url: receiverUrl, filter: FILTER }),
+    });
+    if (!postRes.ok) {
+      const text = await postRes.text().catch(() => '');
+      log.error(
+        { status: postRes.status, body: text.slice(0, 200) },
+        '[lvs-webhook-bootstrap] subscription POST failed',
+      );
+      return;
+    }
+    const body = (await postRes.json().catch(() => ({}))) as { id?: string };
+    log.info(
+      { subId: body.id, url: receiverUrl, filter: FILTER },
+      '[lvs-webhook-bootstrap] subscription registered',
+    );
+  } catch (e: any) {
+    log.error(
+      { err: e?.message ?? e },
+      '[lvs-webhook-bootstrap] subscription POST threw',
+    );
+  }
+}

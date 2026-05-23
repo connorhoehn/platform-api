@@ -55,9 +55,46 @@ void assertRequiredInProd(
   },
 );
 
+// P0 — video/recording secret gate. Without these, the LVS webhook
+// receiver silently accepts unsigned payloads (HMAC verify skipped) and
+// the LVS admin route defaults to literal "admin". Hard-fail prod boot
+// to make the misconfiguration loud at deploy time, not at the first
+// security incident. SKIP_AUTH is also rejected in prod (C7) so dev
+// shortcuts can never accidentally ship.
+void assertRequiredInProd(
+  {
+    name: 'video-secrets',
+    ping: async () => {
+      const missing: string[] = [];
+      if (!process.env.LVS_WEBHOOK_SECRET) missing.push('LVS_WEBHOOK_SECRET');
+      if (!process.env.VIDEO_ADMIN_TOKEN) missing.push('VIDEO_ADMIN_TOKEN');
+      // Skip the SKIP_AUTH=true escape hatch in prod — it makes every
+      // request authenticate as decoded-but-unverified-JWT, breaking
+      // every authorization invariant downstream.
+      if (process.env.SKIP_AUTH === 'true') {
+        throw new Error('SKIP_AUTH=true is not allowed in production');
+      }
+      if (missing.length > 0) {
+        throw new Error(`video/recording env vars missing: ${missing.join(', ')}`);
+      }
+    },
+  },
+  {
+    requiredEnvVar: 'VIDEO_SECRETS_REQUIRED',
+    logger: log,
+  },
+);
+
 const app = createApp();
 const server = app.listen(Number(port), () => {
   log.info({ port }, 'platform-api listening');
+  // Register the LVS recording webhook subscription on boot so
+  // recording.completed events flow into /hooks/lvs/recording → DDB.
+  // Idempotent + non-fatal — failures log and the recording pipeline
+  // simply won't persist until the next platform-api boot succeeds.
+  void import('./lib/lvs-webhook-bootstrap.js').then(({ bootstrapLvsWebhook }) =>
+    bootstrapLvsWebhook(),
+  ).catch((e: any) => log.warn({ err: e?.message ?? e }, 'lvs-webhook-bootstrap failed'));
 });
 
 // ---------------------------------------------------------------------------

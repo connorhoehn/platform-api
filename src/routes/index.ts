@@ -16,6 +16,7 @@ import { sectionReviewsRouter, documentReviewsRouter, myReviewsRouter } from './
 import { sectionItemsRouter, myItemsRouter } from './sectionItems';
 import { documentImportExportRouter } from './documentImportExport';
 import { videoSessionsRouter } from './videoSessions';
+import { recordingsRouter } from './recordings';
 import {
   pipelineMetricsRouter,
   observabilityRouter,
@@ -95,6 +96,9 @@ router.use('/documents/:documentId/sections/:sectionId/items', sectionItemsRoute
 router.use('/items', myItemsRouter);
 router.use('/documents/:documentId', documentImportExportRouter);
 router.use('/video', videoSessionsRouter);
+// Recordings — mounted at /api directly so paths are
+// /api/recordings, /api/recordings/:id, /api/recordings/:id/playback-token.
+router.use('/', recordingsRouter);
 // Mount metrics (static segment) BEFORE defs — Express resolves mounts in
 // registration order. A hypothetical `/pipelines` mount with a `:pipelineId`
 // param would otherwise swallow `/pipelines/metrics`.
