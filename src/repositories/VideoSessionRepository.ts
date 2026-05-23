@@ -103,11 +103,33 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
   }
 
   /**
-   * Remove a participant from a session (by userId). Read-modify-write
-   * because DDB doesn't support "filter array by attribute" in a single op.
+   * Remove a participant from a session by per-tab participantId. The dedup
+   * key on participants[] (replacing the older userId-keyed approach) so that
+   * multiple tabs of the same user each get their own ref-count slot.
    * Returns the new participants array length so callers can ref-count.
    */
   async removeParticipant(
+    documentId: string,
+    sessionId: string,
+    participantId: string,
+  ): Promise<{ remaining: number } | null> {
+    const session = await this.getSession(documentId, sessionId);
+    if (!session) return null;
+    const next = (session.participants ?? []).filter(p => p.participantId !== participantId);
+    await this.updateItem({
+      Key: { documentId, sessionId },
+      UpdateExpression: 'SET participants = :participants',
+      ExpressionAttributeValues: { ':participants': next },
+    });
+    return { remaining: next.length };
+  }
+
+  /**
+   * Legacy: remove ALL participants matching a userId. Used only on the
+   * /end fallback when an older FE client hasn't sent participantId in the
+   * sendBeacon payload. New clients always send participantId.
+   */
+  async removeParticipantByUserId(
     documentId: string,
     sessionId: string,
     userId: string,

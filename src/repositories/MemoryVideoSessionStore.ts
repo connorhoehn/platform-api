@@ -81,6 +81,18 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
   async removeParticipant(
     documentId: string,
     sessionId: string,
+    participantId: string,
+  ): Promise<{ remaining: number } | null> {
+    const key = makeKey(documentId, sessionId);
+    const rec = this.sessions.get(key);
+    if (!rec) return null;
+    rec.participants = (rec.participants ?? []).filter(p => p.participantId !== participantId);
+    return { remaining: rec.participants.length };
+  }
+
+  async removeParticipantByUserId(
+    documentId: string,
+    sessionId: string,
     userId: string,
   ): Promise<{ remaining: number } | null> {
     const key = makeKey(documentId, sessionId);

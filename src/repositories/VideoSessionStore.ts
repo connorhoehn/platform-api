@@ -28,6 +28,14 @@
 
 export interface VideoSessionParticipant {
   userId: string;
+  /**
+   * Per-tab SFU participant id (returned by /api/channels/:arn/participant-tokens).
+   * Used as the dedup key in participants[] instead of userId — multiple tabs
+   * for the same user (or anon SKIP_AUTH=true sharing userId='dev-user') need
+   * to ref-count separately, otherwise tab-1 unloading the page wipes tab-2's
+   * participant slot and the session ends with the second tab orphaned.
+   */
+  participantId: string;
   displayName: string;
   joinedAt: string;
 }
@@ -69,7 +77,17 @@ export interface VideoSessionStore {
     sessionId: string,
     participant: VideoSessionParticipant,
   ): Promise<void>;
+  /** Remove a participant by per-tab participantId (the SFU-issued id). */
   removeParticipant(
+    documentId: string,
+    sessionId: string,
+    participantId: string,
+  ): Promise<{ remaining: number } | null>;
+  /**
+   * Legacy: remove all participants matching a userId. Kept for back-compat
+   * with FE clients that haven't been updated to send participantId on end.
+   */
+  removeParticipantByUserId(
     documentId: string,
     sessionId: string,
     userId: string,
