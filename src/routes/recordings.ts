@@ -123,11 +123,19 @@ recordingsRouter.post(
     let token: string;
     let expiresAt: string;
     try {
+      // LVS mint route requires the admin bearer token — without it, LVS
+      // returns 401 and the FE shows "HTTP 502" beside every recording.
+      // Mirrors the auth header pattern used by videoSessions.ts for
+      // channel creation.
+      const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
       const lvsRes = await fetch(
         `${VIDEO_API_URL}/api/channels/${encodeURIComponent(arn)}/playback-tokens`,
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${adminToken}`,
+          },
           body: JSON.stringify({ ttlSeconds: 3600 }),
         },
       );
