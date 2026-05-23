@@ -23,9 +23,13 @@ process.env.LVS_WEBHOOK_SECRET = 'test-secret';
 // and stub videoSessionRepo to avoid touching DDB.
 const putRecordingMock = jest.fn().mockResolvedValue(undefined);
 const getSessionMock = jest.fn().mockResolvedValue(null);
+const findByChannelArnMock = jest.fn().mockResolvedValue([]);
 jest.mock('../../repositories', () => ({
   callRecordingRepo: { putRecording: putRecordingMock },
-  videoSessionRepo: { getSession: getSessionMock },
+  videoSessionRepo: {
+    getSession: getSessionMock,
+    findByChannelArn: findByChannelArnMock,
+  },
 }));
 
 // Stub redis-client to return null — webhook then proceeds with
@@ -108,6 +112,8 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
   beforeEach(() => {
     putRecordingMock.mockClear();
     getSessionMock.mockClear();
+    findByChannelArnMock.mockClear();
+    findByChannelArnMock.mockResolvedValue([]);
   });
 
   test('bare recording.completed envelope → putRecording called with recordingId + channelArn', async () => {
@@ -141,6 +147,53 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
     expect(arg.callId).toContain('unknown-arn:x-r1');
     expect(arg.durationMs).toBe(1000);
     expect(arg.destination).toBe('local');
+  });
+
+  // Problem 1 — DM visibility. When Redis arn-index misses (test stub returns null),
+  // the webhook MUST fall back to videoSessionRepo.findByChannelArn AND, when that
+  // also returns nothing, derive participants from the `dm:<a>:<b>` lobby pattern
+  // so the recording is reachable to both DM users from /recordings.
+  test('DM lobby + redis miss + no session → derives participants from dm:<a>:<b>', async () => {
+    // Pretend the DDB scan DID find a session row that maps the arn back
+    // to the DM lobby — exercising the realistic fallback path.
+    findByChannelArnMock.mockResolvedValueOnce([
+      {
+        documentId: 'dm:u-hank:u-carol',
+        sessionId: 'sess-dm-1',
+        channelArn: 'arn:dm',
+        startedAt: '2026-05-23T12:00:00.000Z',
+        startedBy: 'u-hank',
+        participants: [], // empty — simulating mid-call Redis blip
+      },
+    ]);
+
+    const payload = {
+      type: 'recording.completed',
+      channelArn: 'arn:dm',
+      data: {
+        recordingId: 'r-dm',
+        segments: [],
+        totalSize: 0,
+        durationMs: 5000,
+        destination: 'local',
+      },
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+
+    const res = await rawPost(server, '/hooks/lvs/recording', body, {
+      'X-LVS-Signature': signBody(body),
+    });
+    expect(res.status).toBe(204);
+    expect(findByChannelArnMock).toHaveBeenCalledWith('arn:dm');
+
+    expect(putRecordingMock).toHaveBeenCalledTimes(1);
+    const arg = putRecordingMock.mock.calls[0]![0];
+    expect(arg.lobbyName).toBe('dm:u-hank:u-carol');
+    // session.startedBy used — verifies the DDB fallback flowed through.
+    expect(arg.startedBy).toBe('u-hank');
+    // DM participants derived from lobby name (since session.participants was [])
+    const userIds = arg.participants.map((p: { userId: string }) => p.userId).sort();
+    expect(userIds).toEqual(['u-carol', 'u-hank']);
   });
 
   test('invalid HMAC signature → 401, repo NOT called', async () => {

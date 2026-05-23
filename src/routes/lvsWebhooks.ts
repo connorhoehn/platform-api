@@ -341,14 +341,36 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
         if (session) {
           log.info({ arn, sessionId: idx.sessionId, lobbyName: idx.lobbyName }, '[lvs-webhook] resolved arn via Redis index');
         } else {
-          log.warn({ arn, sessionId: idx.sessionId }, '[lvs-webhook] arn-index hit but VideoSession missing — proceeding with limited metadata');
+          log.warn({ arn, sessionId: idx.sessionId }, '[lvs-webhook] arn-index hit but VideoSession missing — proceeding with DDB fallback');
         }
       } else {
-        log.warn({ arn }, '[lvs-webhook] no arn-index entry — proceeding with limited metadata');
+        log.warn({ arn }, '[lvs-webhook] no arn-index entry — proceeding with DDB fallback');
       }
     }
   } catch (lookupErr: any) {
-    log.warn({ err: lookupErr?.message ?? lookupErr, arn }, '[lvs-webhook] arn lookup threw — proceeding with limited metadata');
+    log.warn({ err: lookupErr?.message ?? lookupErr, arn }, '[lvs-webhook] arn lookup threw — proceeding with DDB fallback');
+  }
+
+  // DDB fallback — when Redis miss / Redis down / arn-index expired we
+  // scan document-video-sessions by channelArn. This was the root cause
+  // of "DM recordings never appear in /recordings": DM lobbies create a
+  // fresh VideoSession + arn-index per ring, and any Redis blip between
+  // session-create and recording-completed left the webhook with no
+  // lobbyName → no startedBy → no fan-out row → invisible recording.
+  // Group hangouts dodged this because the static `global-hangout` lobby
+  // had a long-lived arn-index that almost never expired mid-call.
+  if (!session) {
+    try {
+      const matches = await videoSessionRepo.findByChannelArn(arn);
+      if (matches.length > 0) {
+        session = matches[0];
+        log.info({ arn, sessionId: session.sessionId, lobbyName: session.documentId, source: 'ddb-scan' }, '[lvs-webhook] resolved arn via DDB scan fallback');
+      } else {
+        log.warn({ arn }, '[lvs-webhook] DDB scan fallback found no matching VideoSession');
+      }
+    } catch (scanErr: any) {
+      log.warn({ err: scanErr?.message ?? scanErr, arn }, '[lvs-webhook] DDB scan fallback threw');
+    }
   }
 
   const lobbyName = session?.documentId ?? '';
@@ -359,12 +381,30 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
   }
 
   // Convert VideoSession participants → CallRecordingParticipant
-  const participants: CallRecordingParticipant[] = (session?.participants ?? []).map((p: any) => ({
+  let participants: CallRecordingParticipant[] = (session?.participants ?? []).map((p: any) => ({
     userId: p.userId,
     displayName: p.displayName,
     participantId: p.participantId,
     joinedAt: p.joinedAt,
   }));
+
+  // DM-pattern derivation. Final safety net for `dm:<a>:<b>` lobbies when
+  // both the Redis arn-index AND the DDB session-by-arn scan came back
+  // empty (e.g. session row already TTL'd by the time the webhook fires
+  // — rare but happens in soak runs). The lobby name itself encodes the
+  // two participants, so we can fan-out to both userIds and at least keep
+  // the recording reachable from the list view. Display names are
+  // unrecoverable here; FE renders the userId fragment instead.
+  if (participants.length === 0 && lobbyName.startsWith('dm:')) {
+    const ids: string[] = lobbyName
+      .slice(3) // strip "dm:"
+      .split(':')
+      .filter((s: string) => s.length > 0);
+    if (ids.length >= 2) {
+      participants = ids.map((userId: string): CallRecordingParticipant => ({ userId }));
+      log.info({ arn, lobbyName, derivedParticipants: ids.length }, '[lvs-webhook] derived DM participants from lobby name');
+    }
+  }
 
   try {
     await callRecordingRepo.putRecording({

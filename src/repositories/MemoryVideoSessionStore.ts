@@ -126,6 +126,18 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
     return all.find(s => s.status === 'active') ?? null;
   }
 
+  /** Parity with the DDB impl — see VideoSessionStore.findByChannelArn. */
+  async findByChannelArn(channelArn: string): Promise<VideoSessionRecord[]> {
+    const out: VideoSessionRecord[] = [];
+    for (const key of this.sessions.keys()) {
+      const live = this.readOrExpire(key);
+      if (live && live.channelArn === channelArn) {
+        out.push(JSON.parse(JSON.stringify(live)) as VideoSessionRecord);
+      }
+    }
+    return out.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+  }
+
   /** Test helper — clear all state. Not part of the public interface. */
   __clearForTests(): void {
     this.sessions.clear();

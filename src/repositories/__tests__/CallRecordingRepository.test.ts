@@ -63,6 +63,87 @@ describe('CallRecordingRepository.putRecording — owner fan-out', () => {
     expect(item.startedAtRecordingId).toBe('2026-05-23T00:00:00.000Z#r1');
   });
 
+  // ---------------------------------------------------------------------------
+  // DM-vs-room parity (Problem 1). The fan-out path must treat a `dm:…` lobby
+  // the same as `room:…` — historically the route layer dropped DM rows when
+  // session lookup failed (no startedBy → no fan-out → invisible row). Today
+  // we expect the repo to behave identically for both lobby shapes when the
+  // input is identical.
+  // ---------------------------------------------------------------------------
+  test('DM lobby fan-out parity: dm:<a>:<b> writes the same shape as room:<slug>', async () => {
+    const repo = new CallRecordingRepository(docClient);
+
+    // Snapshot the shape under a room: lobby first…
+    await repo.putRecording({
+      callId: 'c-room',
+      recordingId: 'r-room',
+      channelArn: 'arn:room',
+      lobbyName: 'room:lounge',
+      sessionId: 's-room',
+      startedAt: '2026-05-23T10:00:00.000Z',
+      endedAt: '2026-05-23T10:05:00.000Z',
+      durationMs: 300_000,
+      totalBytes: 4096,
+      segments: [],
+      destination: 'local',
+      participants: [
+        { userId: 'u-hank' },
+        { userId: 'u-carol' },
+      ],
+      startedBy: 'u-hank',
+    });
+    const roomFanouts = mockSend.mock.calls
+      .map((c) => c[0])
+      .filter(
+        (cmd) =>
+          cmd instanceof PutCommand &&
+          cmd.input.TableName === 'test-video-call-recording-participants',
+      ) as PutCommand[];
+    expect(roomFanouts).toHaveLength(2);
+
+    mockSend.mockReset();
+    mockSend.mockResolvedValue({});
+
+    // …now under a dm: lobby with the same participants. The fan-out
+    // MUST land the same number of rows (one per userId) regardless of
+    // lobby type. If this regresses, every DM recording becomes orphaned
+    // again (the original bug).
+    await repo.putRecording({
+      callId: 'c-dm',
+      recordingId: 'r-dm',
+      channelArn: 'arn:dm',
+      lobbyName: 'dm:u-hank:u-carol',
+      sessionId: 's-dm',
+      startedAt: '2026-05-23T11:00:00.000Z',
+      endedAt: '2026-05-23T11:05:00.000Z',
+      durationMs: 300_000,
+      totalBytes: 4096,
+      segments: [],
+      destination: 'local',
+      participants: [
+        { userId: 'u-hank' },
+        { userId: 'u-carol' },
+      ],
+      startedBy: 'u-hank',
+    });
+    const dmFanouts = mockSend.mock.calls
+      .map((c) => c[0])
+      .filter(
+        (cmd) =>
+          cmd instanceof PutCommand &&
+          cmd.input.TableName === 'test-video-call-recording-participants',
+      ) as PutCommand[];
+    expect(dmFanouts).toHaveLength(2);
+
+    // Each DM fan-out row carries the lobbyName as-is (FE uses it to
+    // render the DM badge).
+    const lobbyNames = dmFanouts.map((p) => p.input.Item!.lobbyName);
+    expect(lobbyNames).toEqual(['dm:u-hank:u-carol', 'dm:u-hank:u-carol']);
+
+    const userIds = dmFanouts.map((p) => p.input.Item!.userId).sort();
+    expect(userIds).toEqual(['u-carol', 'u-hank']);
+  });
+
   test('empty participants[] AND no startedBy → no fan-out rows written', async () => {
     const repo = new CallRecordingRepository(docClient);
 

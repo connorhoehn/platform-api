@@ -95,6 +95,15 @@ export interface VideoSessionStore {
   getSession(documentId: string, sessionId: string): Promise<VideoSessionRecord | null>;
   getSessionsByDocument(documentId: string): Promise<VideoSessionRecord[]>;
   findActiveByLobbyName(lobbyName: string): Promise<VideoSessionRecord | null>;
+  /**
+   * DDB-only fallback (also implemented by the in-memory store for parity).
+   * Used by the LVS recording-completed webhook when the Redis arn-index
+   * has expired between session-create and call-end. Returns newest-first;
+   * empty array when no session matches. Without this fallback, DM
+   * recordings disappeared whenever Redis dropped the arn-index mid-call
+   * (root cause of the 2026-05-23 "Past Calls hides DMs" bug).
+   */
+  findByChannelArn(channelArn: string): Promise<VideoSessionRecord[]>;
 }
 
 /**

@@ -89,6 +89,34 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
   }
 
   /**
+   * DDB-only fallback used by the LVS recording-completed webhook when the
+   * Redis arn-index has expired or Redis is down. Scans the sessions table
+   * with a FilterExpression on `channelArn`. Costs ~O(table) but the table
+   * is TTL-bounded (VIDEO_SESSION_TTL_DAYS, default 7d) so the scan stays
+   * cheap in practice — and this only fires when Redis missed.
+   *
+   * Returned newest-first. Caller usually wants `[0]` (most recent session
+   * for the arn). Returns [] when no match.
+   *
+   * Without this fallback, DM recordings disappeared whenever Redis dropped
+   * the arn-index between session-create and call-end: the webhook
+   * `lobbyName` would resolve to ''  → `startedBy` undefined → fan-out
+   * skipped → row stranded in primary table, invisible to listByUser.
+   */
+  async findByChannelArn(channelArn: string): Promise<VideoSessionRecord[]> {
+    const { ScanCommand } = await import('@aws-sdk/lib-dynamodb');
+    const out = await this.docClient.send(
+      new ScanCommand({
+        TableName: VIDEO_SESSIONS_TABLE,
+        FilterExpression: 'channelArn = :arn',
+        ExpressionAttributeValues: { ':arn': channelArn },
+      }),
+    );
+    const items = (out.Items ?? []) as VideoSessionRecord[];
+    return items.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+  }
+
+  /**
    * Find the newest active session for a given lobby name (a/k/a documentId —
    * lobbyName is just a more honest field name now that this powers global /
    * 1:1 / room lobbies in addition to document-scoped calls). Returns null
