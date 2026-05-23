@@ -129,6 +129,40 @@ export class CallRecordingRepository extends BaseRepository {
     return this.getItem<CallRecording>({ callId, recordingId });
   }
 
+  /**
+   * Owner-initiated hard delete (audit C4). Removes the primary row from
+   * video-call-recordings AND every fan-out row for the recording from
+   * video-call-recording-participants. The MP4 stays in LVS storage until
+   * the retention sweep — same lifecycle as before.
+   *
+   * Best-effort participant cleanup: per-row failures are swallowed so
+   * one stuck DDB key can't strand the primary deletion. Callers should
+   * not surface the count to end-users.
+   */
+  async deleteRecording(callId: string, recordingId: string): Promise<void> {
+    const rec = await this.getRecording(callId, recordingId);
+    if (rec && rec.participants?.length) {
+      await Promise.all(
+        rec.participants.map((p) =>
+          this.docClient
+            .send(
+              new DeleteCommand({
+                TableName: this.participantsTable,
+                Key: { userId: p.userId, startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}` },
+              }),
+            )
+            .catch(() => { /* swallow — participant index is fan-out, not source of truth */ }),
+        ),
+      );
+    }
+    await this.docClient.send(
+      new DeleteCommand({
+        TableName: CALL_RECORDINGS_TABLE,
+        Key: { callId, recordingId },
+      }),
+    );
+  }
+
   /** All recordings for a given call (usually 1, sometimes 2 if media paused mid-call). */
   async listByCall(callId: string): Promise<CallRecording[]> {
     const out = await this.docClient.send(

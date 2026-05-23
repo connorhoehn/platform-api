@@ -20,7 +20,7 @@
 
 import { Router, Request, Response } from 'express';
 import { randomUUID, randomBytes } from 'crypto';
-import { PutCommand, GetCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
+import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
 import { callRecordingRepo } from '../repositories';
 import { docClient } from '../lib/aws-clients';
@@ -250,15 +250,12 @@ recordingsRouter.delete(
     if (!detail) throw new NotFoundError('recording metadata missing');
     // Only the user who STARTED the recording can delete it. Other
     // participants can untag themselves via deleteByUserId (W11/H7).
-    if (detail.startedBy && detail.startedBy !== userId) {
+    // Fail closed when startedBy is missing — historical rows that
+    // pre-date startedBy must NOT become deletable by anyone (audit C5).
+    if (!detail.startedBy || detail.startedBy !== userId) {
       throw new AppError(403, 'only the recording owner can delete');
     }
-    await docClient.send(
-      new DeleteCommand({
-        TableName: 'video-call-recordings',
-        Key: { callId: match.callId, recordingId },
-      }),
-    );
+    await callRecordingRepo.deleteRecording(match.callId, recordingId);
     log.info({ recordingId, userId }, '[recordings] deleted by owner');
     res.status(204).end();
   }),
