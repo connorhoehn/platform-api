@@ -83,6 +83,18 @@ export interface ListRoomsResult {
   cursor?: string;
 }
 
+export interface SearchRoomsOpts {
+  /** Free-text query — matches case-insensitively against name + slug. */
+  q: string;
+  /** Only return rooms in this state. Defaults to 'active'. */
+  state?: HangoutRoomState;
+  /** Cap on rows returned. Server enforces an upper bound (100). */
+  limit?: number;
+}
+
+/** Hard cap on search results — search is low-volume + intentionally cheap. */
+export const SEARCH_MAX_RESULTS = 100;
+
 // ---------------------------------------------------------------------------
 // Error types — surfaced by the router as their respective HTTP codes via
 // the central error-handler middleware.
@@ -210,6 +222,55 @@ export class HangoutRoomRepository extends BaseRepository {
       : undefined;
 
     return cursor ? { items, cursor } : { items };
+  }
+
+  /**
+   * Search rooms by free-text query against name + slug.
+   *
+   * Cheap by design: walks the recency GSI for the org once (server-side
+   * pagination drained up to SEARCH_MAX_RESULTS rows) then filters in
+   * JavaScript. We deliberately did NOT add a new GSI for this — search
+   * is low-volume + the result set is bounded.
+   *
+   * The query is lowercased and matched as a substring against
+   * `name.toLowerCase()` and `slug` (slugs are already lowercase). An
+   * empty/whitespace `q` returns the unfiltered page (callers should
+   * short-circuit before calling).
+   */
+  async searchRooms(orgId: string, opts: SearchRoomsOpts): Promise<HangoutRoom[]> {
+    const needle = opts.q.toLowerCase();
+    const cap = Math.min(opts.limit ?? SEARCH_MAX_RESULTS, SEARCH_MAX_RESULTS);
+    const stateFilter = opts.state ?? 'active';
+
+    // We page through the recency GSI until we have enough hits OR DDB
+    // has nothing more to return. The page-size is the cap itself —
+    // small enough that we won't blow memory on a wide org.
+    const matches: HangoutRoom[] = [];
+    let cursor: string | undefined;
+    let safety = 10; // hard ceiling on pages walked (10 * cap rows)
+
+    while (matches.length < cap && safety-- > 0) {
+      const page = await this.listRoomsByOrg(orgId, {
+        state: stateFilter,
+        limit: cap,
+        ...(cursor ? { cursor } : {}),
+      });
+
+      for (const room of page.items) {
+        if (
+          (needle === '') ||
+          room.name.toLowerCase().includes(needle) ||
+          room.slug.includes(needle)
+        ) {
+          matches.push(room);
+          if (matches.length >= cap) break;
+        }
+      }
+      if (!page.cursor) break;
+      cursor = page.cursor;
+    }
+
+    return matches;
   }
 
   /**

@@ -235,6 +235,86 @@ describe('HangoutRoomRepository.touchLastActive', () => {
 });
 
 // ---------------------------------------------------------------------------
+// searchRooms — server-side filter on top of the recency GSI
+// ---------------------------------------------------------------------------
+
+describe('HangoutRoomRepository.searchRooms', () => {
+  const ROOM_A: HangoutRoom = {
+    ...SAMPLE_ROOM,
+    roomId: 'r-a',
+    slug: 'engineering-lounge',
+    name: 'Engineering Lounge',
+  };
+  const ROOM_B: HangoutRoom = {
+    ...SAMPLE_ROOM,
+    roomId: 'r-b',
+    slug: 'design-review',
+    name: 'Design Review',
+  };
+  const ROOM_C: HangoutRoom = {
+    ...SAMPLE_ROOM,
+    roomId: 'r-c',
+    slug: 'sales-standup',
+    name: 'Sales Standup',
+  };
+
+  test('filters by case-insensitive substring match on name', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [ROOM_A, ROOM_B, ROOM_C] });
+
+    const repo = new HangoutRoomRepository(docClient);
+    const matches = await repo.searchRooms('org-1', { q: 'LOUNGE' });
+
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.slug).toBe('engineering-lounge');
+  });
+
+  test('matches against slug when name has no overlap', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [ROOM_A, ROOM_B, ROOM_C] });
+
+    const repo = new HangoutRoomRepository(docClient);
+    const matches = await repo.searchRooms('org-1', { q: 'review' });
+
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.slug).toBe('design-review');
+  });
+
+  test('returns empty array when no match', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [ROOM_A, ROOM_B, ROOM_C] });
+
+    const repo = new HangoutRoomRepository(docClient);
+    const matches = await repo.searchRooms('org-1', { q: 'no-such-thing' });
+
+    expect(matches).toEqual([]);
+  });
+
+  test('caps results at SEARCH_MAX_RESULTS (100)', async () => {
+    // Generate 150 matching rooms in a single page.
+    const many: HangoutRoom[] = Array.from({ length: 150 }, (_, i) => ({
+      ...SAMPLE_ROOM,
+      roomId: `r-${i}`,
+      slug: `lounge-${i}`,
+      name: `Lounge ${i}`,
+    }));
+    mockSend.mockResolvedValueOnce({ Items: many });
+
+    const repo = new HangoutRoomRepository(docClient);
+    const matches = await repo.searchRooms('org-1', { q: 'lounge' });
+
+    expect(matches).toHaveLength(100);
+  });
+
+  test('honours state filter — passes state through to listRoomsByOrg', async () => {
+    mockSend.mockResolvedValueOnce({ Items: [] });
+
+    const repo = new HangoutRoomRepository(docClient);
+    await repo.searchRooms('org-1', { q: 'lounge', state: 'archived' });
+
+    const queryCmd = mockSend.mock.calls[0][0] as QueryCommand;
+    expect(queryCmd.input.ExpressionAttributeValues).toMatchObject({ ':st': 'archived' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getRoomBySlug
 // ---------------------------------------------------------------------------
 

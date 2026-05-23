@@ -108,11 +108,13 @@ export {
   CreateHangoutRoomInput,
   ListRoomsOpts as ListHangoutRoomsOpts,
   ListRoomsResult as ListHangoutRoomsResult,
+  SearchRoomsOpts as SearchHangoutRoomsOpts,
   RoomSlugConflictError,
   RoomNotFoundError,
   RoomAccessDeniedError,
   RoomArchivedError,
   HANGOUT_ROOMS_TABLE,
+  SEARCH_MAX_RESULTS as HANGOUT_ROOMS_SEARCH_MAX,
 } from './HangoutRoomRepository';
 export {
   HangoutRoomMemberRepository,
