@@ -24,8 +24,28 @@ export async function requireAuth(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  // Skip auth in local development
+  // Skip auth in local development. We still try to extract the user
+  // identity from the bearer when present — the FE's useAuth ships a
+  // signed dev token whose `sub` is the actual dev userId (e.g. dev-bob
+  // when running with `?as=bob`). Falling back to 'dev-user' for every
+  // request broke per-user fan-outs (every Bob/Alice/Carol call ended
+  // up keyed under 'dev-user' instead of their real identity, so
+  // listByUser returned zero matches for new recordings).
   if (process.env.SKIP_AUTH === 'true') {
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      const token = authHeader.slice(7);
+      try {
+        const decoded = jwt.decode(token) as jwt.JwtPayload | null;
+        if (decoded && typeof decoded.sub === 'string' && decoded.sub.length > 0) {
+          req.user = { sub: decoded.sub, email: (decoded.email as string | undefined) ?? 'dev@local' };
+          next();
+          return;
+        }
+      } catch {
+        /* fall through to generic dev-user */
+      }
+    }
     req.user = { sub: 'dev-user', email: 'dev@local' };
     next();
     return;
@@ -68,6 +88,20 @@ export async function optionalAuth(
   next: NextFunction
 ): Promise<void> {
   if (process.env.SKIP_AUTH === 'true') {
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      const token = authHeader.slice(7);
+      try {
+        const decoded = jwt.decode(token) as jwt.JwtPayload | null;
+        if (decoded && typeof decoded.sub === 'string' && decoded.sub.length > 0) {
+          req.user = { sub: decoded.sub, email: (decoded.email as string | undefined) ?? 'dev@local' };
+          next();
+          return;
+        }
+      } catch {
+        /* fall through */
+      }
+    }
     req.user = { sub: 'dev-user', email: 'dev@local' };
     next();
     return;
