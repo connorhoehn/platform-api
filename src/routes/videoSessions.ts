@@ -193,7 +193,10 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
   try {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const lobbyName = resolveLobbyName(body) ?? randomUUID();
-    const displayName = typeof body.displayName === 'string' ? body.displayName : undefined;
+    // Note: displayName is not read at create-time — participants (and their
+    // display names) are added via /join. Accepting it here used to look
+    // intentional but the value was dropped; removed to avoid hinting at a
+    // contract we don't honor.
     const findOrCreate = body.findOrCreate === true;
 
     // findOrCreate path: return existing active session for this lobby if its
@@ -205,6 +208,22 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
         log.info({ sessionId: existing.sessionId, lobbyName }, '[videoSessions] findOrCreate hit');
         res.status(200).json({ sessionId: existing.sessionId, reused: true });
         return;
+      }
+    } else {
+      // Non-findOrCreate path: explicit create. If an active session
+      // already exists for this lobby, log a warning so duplicate-create
+      // bugs in client code (e.g. a hangout overlay that POSTs on every
+      // mount) are visible. We still proceed with the create — the
+      // caller asked for it — but the warning helps correlate orphaned
+      // participants[] arrays with the FE call that produced them.
+      const existing = await videoSessionRepo.findActiveByLobbyName(lobbyName);
+      if (existing) {
+        log.warn({
+          lobbyName,
+          existingSessionId: existing.sessionId,
+          existingChannelArn: existing.channelArn,
+          participantCount: (existing.participants ?? []).length,
+        }, '[videoSessions] creating new session while an active one exists for this lobby — possible duplicate-create');
       }
     }
 
@@ -278,16 +297,26 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     // to (sessionId, lobbyName). LVS recording metadata doesn't carry
     // these; without this index, every recording persists under a
     // synthetic 'unknown-<arn>-<recordingId>' callId.
+    //
+    // We log explicitly when Redis is unavailable (vs. when the write
+    // throws) — previously the "redis null" branch fell through silently
+    // and the user only saw "recordings persisted under unknown-<arn>"
+    // with no log breadcrumb pointing back to a missing Redis. The two
+    // failure modes have different remediations (restart Redis vs. fix
+    // the call site) so they need different log lines.
     try {
       const { getRedisClient } = await import('../lib/redis-client.js');
       const redis = await getRedisClient();
-      if (redis) {
+      if (!redis) {
+        log.warn({ channelArn, sessionId, lobbyName }, '[videoSessions] arn-index write skipped — Redis unavailable; recording.completed will fall back to unknown-<arn> callIds');
+      } else {
         const indexKey = `video:arn-index:${channelArn}`;
         await redis.set(
           indexKey,
           JSON.stringify({ sessionId, lobbyName, createdAt: now }),
           { EX: 7 * 24 * 60 * 60 }, // 7 days — covers webhook arrival + retries
         );
+        log.debug({ channelArn, sessionId, lobbyName }, '[videoSessions] arn-index written');
       }
     } catch (idxErr) {
       log.warn({ err: idxErr, channelArn }, '[videoSessions] arn-index write failed (recording lookup may degrade)');
