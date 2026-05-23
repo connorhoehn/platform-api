@@ -61,8 +61,14 @@ const SLUG_RETRY_LIMIT = 3;
 // that becomes a real concern (the existing `createRateLimiter` in
 // middleware/rateLimit.ts is Redis-backed but is token-bucket rather than
 // sliding-window, so it doesn't fit this spec's "5 per rolling hour" shape).
-const CREATE_RATE_LIMIT_MAX = 5;
-const CREATE_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+// Default: 5 creates per rolling hour. Override via env so e2e suites
+// (which legitimately need to churn many rooms) don't false-429.
+const CREATE_RATE_LIMIT_MAX = Number(
+  process.env.ROOM_CREATE_RATE_LIMIT_MAX ?? '5',
+);
+const CREATE_RATE_LIMIT_WINDOW_MS = Number(
+  process.env.ROOM_CREATE_RATE_LIMIT_WINDOW_MS ?? String(60 * 60 * 1000),
+); // 1 hour
 const createAttemptsByUser = new Map<string, number[]>();
 
 /**
