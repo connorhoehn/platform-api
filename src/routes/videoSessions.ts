@@ -223,7 +223,14 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
           'Content-Type': 'application/json',
           Authorization: `Bearer ${adminToken}`,
         },
-        body: JSON.stringify({ name: lobbyName }),
+        // recordingConfiguration MUST be set at channel-create time —
+        // RecordingManager.startRecording bails with cfg.enabled=false
+        // when this is missing, so without it zero recordings are
+        // ever written. The /recordings page would forever stay empty.
+        body: JSON.stringify({
+          name: lobbyName,
+          recordingConfiguration: { enabled: true, destination: 'local' },
+        }),
       });
     } catch (sfuErr) {
       throw mapSfuError(sfuErr);
