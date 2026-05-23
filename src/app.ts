@@ -85,6 +85,15 @@ export function createApp(): express.Application {
   const { lvsWebhooksRouter } = require('./routes/lvsWebhooks');
   app.use('/hooks/lvs', lvsWebhooksRouter);
 
+  // LVS admin / observability — operator endpoints for inspecting the
+  // recording pipeline (delivery ring buffer, recent VideoSessions,
+  // call-session-bindings). Mounted BEFORE requireAuth because admin
+  // operators carry an ADMIN_TOKEN shared secret, not a Cognito JWT.
+  // The router applies `requireAdmin` per-route so unauthenticated
+  // callers are rejected.
+  const { lvsAdminRouter } = require('./routes/lvsAdmin');
+  app.use('/api/admin', lvsAdminRouter);
+
   // All routes below this line require a valid Cognito JWT
   app.use(requireAuth);
 

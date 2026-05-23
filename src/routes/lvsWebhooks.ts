@@ -47,6 +47,36 @@ import { docClient } from '../lib/aws-clients';
 
 export const lvsWebhooksRouter = Router();
 
+// --------------------------------------------------------------------
+// W5 — in-memory delivery ring buffer for the admin health endpoint.
+// Bounded at MAX_DELIVERIES; oldest entries are evicted on push. The
+// admin router (src/routes/lvsAdmin.ts) reads this via getRecentDeliveries().
+// Process-local; lost on restart. Cheap, useful for live debugging.
+// --------------------------------------------------------------------
+export interface LvsDeliveryRecord {
+  timestamp: string;
+  eventType: string;
+  arn: string;
+  recordingId: string;
+  hmacOk: boolean;
+  persisted: boolean;
+  error?: string;
+}
+
+const MAX_DELIVERIES = 50;
+const deliveries: LvsDeliveryRecord[] = [];
+
+function recordDelivery(entry: LvsDeliveryRecord): void {
+  deliveries.push(entry);
+  if (deliveries.length > MAX_DELIVERIES) {
+    deliveries.splice(0, deliveries.length - MAX_DELIVERIES);
+  }
+}
+
+export function getRecentDeliveries(): LvsDeliveryRecord[] {
+  return deliveries.slice();
+}
+
 // Capture raw body for HMAC. The router-scoped raw parser leaves
 // req.body as a Buffer; we JSON.parse it after signature verification.
 lvsWebhooksRouter.use(
@@ -55,8 +85,14 @@ lvsWebhooksRouter.use(
 
 const SECRET = process.env.LVS_WEBHOOK_SECRET ?? '';
 
-function verifyHmac(req: Request): boolean {
-  if (!SECRET) return true; // dev: skip
+interface HmacVerifyResult {
+  ok: boolean;
+  /** Computed expected signature length (hex chars) — null when we can't recompute (e.g., body bytes lost). */
+  expectedLen: number | null;
+}
+
+function verifyHmacDetailed(req: Request): HmacVerifyResult {
+  if (!SECRET) return { ok: true, expectedLen: null }; // dev: skip
   const header = req.header('X-LVS-Signature') ?? '';
   // Defense in depth: if a parent middleware accidentally parsed the
   // body into an Object (express.json ran before our raw parser),
@@ -74,18 +110,28 @@ function verifyHmac(req: Request): boolean {
   } else {
     // Parsed Object — body bytes are lost. Can't verify HMAC.
     // Log + reject. Returns false → 401 to LVS, which will retry.
-    return false;
+    return { ok: false, expectedLen: null };
   }
   const expected = createHmac('sha256', SECRET)
     .update(bodyBytes)
     .digest('hex');
   const provided = header.replace(/^sha256=/, '');
-  if (provided.length !== expected.length) return false;
-  try {
-    return timingSafeEqual(Buffer.from(provided, 'hex'), Buffer.from(expected, 'hex'));
-  } catch {
-    return false;
+  if (provided.length !== expected.length) {
+    return { ok: false, expectedLen: expected.length };
   }
+  try {
+    const ok = timingSafeEqual(
+      Buffer.from(provided, 'hex'),
+      Buffer.from(expected, 'hex'),
+    );
+    return { ok, expectedLen: expected.length };
+  } catch {
+    return { ok: false, expectedLen: expected.length };
+  }
+}
+
+function verifyHmac(req: Request): boolean {
+  return verifyHmacDetailed(req).ok;
 }
 
 // Resolve callId from lobbyName by querying the gateway's
@@ -118,8 +164,35 @@ async function resolveCallIdByLobby(lobbyName: string): Promise<string | null> {
 }
 
 lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
-  if (!verifyHmac(req)) {
-    log.warn({ ip: req.ip }, '[lvs-webhook] HMAC verification failed');
+  const hmac = verifyHmacDetailed(req);
+  if (!hmac.ok) {
+    const sigHeader = req.header('X-LVS-Signature') ?? '';
+    const body = req.body;
+    const bodyBytes = Buffer.isBuffer(body)
+      ? body.length
+      : typeof body === 'string'
+        ? body.length
+        : 0;
+    log.warn(
+      {
+        ip: req.ip,
+        hasSig: !!req.header('X-LVS-Signature'),
+        sigLen: sigHeader.length,
+        expectedLen: hmac.expectedLen,
+        bodyType: typeof body,
+        bodyBytes,
+      },
+      '[lvs-webhook] HMAC verification failed',
+    );
+    recordDelivery({
+      timestamp: new Date().toISOString(),
+      eventType: '',
+      arn: '',
+      recordingId: '',
+      hmacOk: false,
+      persisted: false,
+      error: 'hmac verification failed',
+    });
     res.status(401).json({ error: 'invalid signature' });
     return;
   }
@@ -139,6 +212,15 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       throw new Error('empty body');
     }
   } catch (e: any) {
+    recordDelivery({
+      timestamp: new Date().toISOString(),
+      eventType: '',
+      arn: '',
+      recordingId: '',
+      hmacOk: true,
+      persisted: false,
+      error: 'invalid JSON',
+    });
     res.status(400).json({ error: 'invalid JSON' });
     return;
   }
@@ -150,7 +232,30 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
   const arn: string = detail.arn ?? detail.channelArn ?? '';
   const recordingId: string = detail.recordingId ?? '';
 
+  // W5 — successful-receive log emitted right after HMAC verifies + the
+  // envelope is parsed. Helps correlate webhook arrival timing with
+  // downstream persistence logs.
+  log.info(
+    {
+      eventType,
+      arn,
+      recordingId,
+      hasDetail: !!payload.detail,
+      format: payload['detail-type'] ? 'eventbridge' : 'bare',
+    },
+    '[lvs-webhook] received',
+  );
+
   if (!eventType.toLowerCase().includes('recording')) {
+    recordDelivery({
+      timestamp: new Date().toISOString(),
+      eventType,
+      arn,
+      recordingId,
+      hmacOk: true,
+      persisted: false,
+      error: 'non-recording event ignored',
+    });
     res.status(204).end();
     return;
   }
@@ -159,12 +264,30 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
   // need a write path for in-progress recordings only if the FE wants
   // to render a "Recording…" badge — out of scope for MVP.
   if (!eventType.toLowerCase().includes('completed')) {
+    recordDelivery({
+      timestamp: new Date().toISOString(),
+      eventType,
+      arn,
+      recordingId,
+      hmacOk: true,
+      persisted: false,
+      error: 'non-completed event ignored',
+    });
     res.status(204).end();
     return;
   }
 
   if (!arn || !recordingId) {
     log.warn({ eventType, arn, recordingId }, '[lvs-webhook] missing arn/recordingId');
+    recordDelivery({
+      timestamp: new Date().toISOString(),
+      eventType,
+      arn,
+      recordingId,
+      hmacOk: true,
+      persisted: false,
+      error: 'missing arn or recordingId',
+    });
     res.status(400).json({ error: 'missing arn or recordingId' });
     return;
   }
@@ -232,9 +355,26 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       thumbnailUrl: typeof detail.thumbnailUrl === 'string' ? detail.thumbnailUrl : undefined,
     });
     log.info({ callId, recordingId, arn, participants: participants.length }, '[lvs-webhook] recording persisted');
+    recordDelivery({
+      timestamp: new Date().toISOString(),
+      eventType,
+      arn,
+      recordingId,
+      hmacOk: true,
+      persisted: true,
+    });
     res.status(204).end();
   } catch (e: any) {
     log.error({ err: e?.message ?? e, callId, recordingId }, '[lvs-webhook] persist failed');
+    recordDelivery({
+      timestamp: new Date().toISOString(),
+      eventType,
+      arn,
+      recordingId,
+      hmacOk: true,
+      persisted: false,
+      error: typeof e?.message === 'string' ? e.message : String(e),
+    });
     res.status(500).json({ error: 'persist failed' });
   }
 });
