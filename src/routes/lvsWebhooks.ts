@@ -435,6 +435,13 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       // prod (S3 signed / CloudFront / etc.). Null when ffmpeg
       // thumbnail step failed.
       thumbnailUrl: typeof detail.thumbnailUrl === 'string' ? detail.thumbnailUrl : undefined,
+      // R2 — composed grid playback URL + per-peer raw tracks. LVS
+      // emits these on `recording.completed` when the call had ≥2
+      // producers and `composeEnabled !== false`. Missing for
+      // single-producer calls (legacy) — FE falls back to the first
+      // segment[0].url as the playback target.
+      composedUrl: typeof detail.composedUrl === 'string' ? detail.composedUrl : undefined,
+      tracks: Array.isArray(detail.tracks) ? detail.tracks : undefined,
     });
     log.info({ callId, recordingId, arn, participants: participants.length }, '[lvs-webhook] recording persisted');
     recordDelivery({

@@ -144,6 +144,44 @@ describe('CallRecordingRepository.putRecording — owner fan-out', () => {
     expect(userIds).toEqual(['u-carol', 'u-hank']);
   });
 
+  // R2 — composedUrl is denormalized onto the fan-out row so the list view
+  // can pick its playback target without joining back to the primary table.
+  test('composedUrl is denormalized onto the fan-out row', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    await repo.putRecording({
+      callId: 'c3',
+      recordingId: 'r3',
+      channelArn: 'arn:z',
+      lobbyName: 'room:devs',
+      startedAt: '2026-05-23T02:00:00.000Z',
+      endedAt: '2026-05-23T02:05:00.000Z',
+      durationMs: 300_000,
+      totalBytes: 8192,
+      segments: [],
+      destination: 'local',
+      participants: [{ userId: 'u-a' }, { userId: 'u-b' }],
+      startedBy: 'u-a',
+      composedUrl: 'https://storage.test/composed/r3.mp4',
+      tracks: [
+        { participantId: 'p1', userId: 'u-a', key: 'k1', url: 'https://t/1.mp4', size: 100 },
+        { participantId: 'p2', userId: 'u-b', key: 'k2', url: 'https://t/2.mp4', size: 100 },
+      ],
+    });
+
+    const fanouts = mockSend.mock.calls
+      .map((c) => c[0])
+      .filter(
+        (cmd) =>
+          cmd instanceof PutCommand &&
+          cmd.input.TableName === 'test-video-call-recording-participants',
+      ) as PutCommand[];
+    expect(fanouts).toHaveLength(2);
+    for (const f of fanouts) {
+      expect(f.input.Item!.composedUrl).toBe('https://storage.test/composed/r3.mp4');
+      expect(f.input.Item!.participantCount).toBe(2);
+    }
+  });
+
   test('empty participants[] AND no startedBy → no fan-out rows written', async () => {
     const repo = new CallRecordingRepository(docClient);
 

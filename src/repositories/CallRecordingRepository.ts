@@ -46,6 +46,21 @@ export interface RecordingSegment {
   size: number;
 }
 
+/**
+ * One per-peer raw track recording, alongside the composed file. When the
+ * call had a single participant or compose was disabled, this collapses
+ * to `segments[]` and `tracks` is empty.
+ */
+export interface RecordingTrack {
+  participantId?: string;
+  userId?: string;
+  key: string;
+  url: string;
+  size: number;
+  /** 'video' | 'audio' — when ffmpeg recorded a/v together this stays unset. */
+  kind?: 'video' | 'audio' | 'av';
+}
+
 export interface CallRecordingParticipant {
   userId: string;
   displayName?: string;
@@ -73,6 +88,17 @@ export interface CallRecording {
    *  when the webhook payload carried it; null when ffmpeg thumbnail
    *  step failed (rare). Rendered by ui-components <RecordingList>. */
   thumbnailUrl?: string;
+  /**
+   * R2 (this commit) — composed playback file (ffmpeg xstack grid of all
+   * per-peer tracks). When present, the FE uses this as the primary
+   * "playback" target — one video showing all participants tiled — and
+   * surfaces `tracks[]` as a per-peer raw-downloads list. Null when:
+   *   - the call had a single producer (segments[] IS the recording), or
+   *   - compose disabled by config / ffmpeg compose step failed.
+   */
+  composedUrl?: string;
+  /** R2 — per-peer raw track files. Empty for single-producer calls. */
+  tracks?: RecordingTrack[];
 }
 
 const RETENTION_DAYS = Number(process.env.RECORDING_RETENTION_DAYS ?? 30);
@@ -137,6 +163,13 @@ export class CallRecordingRepository extends BaseRepository {
                 // W8 — denormalize so list view doesn't need a join
                 // back to the primary table for thumbnail rendering.
                 thumbnailUrl: rec.thumbnailUrl,
+                // R2 — denormalize composedUrl onto the fan-out row so
+                // the list view can pick "playback target" without a
+                // join. tracks[] stays on the primary record (only the
+                // detail view needs the raw per-peer URLs).
+                composedUrl: rec.composedUrl,
+                // Denormalize participant count for the chip render.
+                participantCount: rec.participants?.length ?? 0,
                 ttl,
               },
             }),
@@ -218,7 +251,7 @@ export class CallRecordingRepository extends BaseRepository {
   async listByUser(
     userId: string,
     opts?: { limit?: number; cursor?: string },
-  ): Promise<{ items: Array<{ callId: string; recordingId: string; startedAt: string; endedAt: string; durationMs: number; channelArn: string; lobbyName: string; }>; cursor?: string }> {
+  ): Promise<{ items: Array<{ callId: string; recordingId: string; startedAt: string; endedAt: string; durationMs: number; channelArn: string; lobbyName: string; thumbnailUrl?: string; composedUrl?: string; participantCount?: number; }>; cursor?: string }> {
     const out = await this.docClient.send(
       new QueryCommand({
         TableName: this.participantsTable,
@@ -245,6 +278,8 @@ export class CallRecordingRepository extends BaseRepository {
       channelArn: i.channelArn as string,
       lobbyName: i.lobbyName as string,
       thumbnailUrl: i.thumbnailUrl as string | undefined,
+      composedUrl: i.composedUrl as string | undefined,
+      participantCount: i.participantCount as number | undefined,
     }));
     const cursor = out.LastEvaluatedKey
       ? (out.LastEvaluatedKey.startedAtRecordingId as string)
@@ -282,6 +317,8 @@ export class CallRecordingRepository extends BaseRepository {
       channelArn: string;
       lobbyName: string;
       thumbnailUrl?: string;
+      composedUrl?: string;
+      participantCount?: number;
     }>;
     cursor?: string;
   }> {
@@ -313,6 +350,10 @@ export class CallRecordingRepository extends BaseRepository {
       channelArn: i.channelArn as string,
       lobbyName: i.lobbyName as string,
       thumbnailUrl: i.thumbnailUrl as string | undefined,
+      composedUrl: (i as Record<string, unknown>).composedUrl as string | undefined,
+      participantCount: Array.isArray((i as Record<string, unknown>).participants)
+        ? ((i as Record<string, unknown>).participants as unknown[]).length
+        : undefined,
     }));
     const nextCursor = out.LastEvaluatedKey
       ? Buffer.from(JSON.stringify(out.LastEvaluatedKey), 'utf8').toString('base64')

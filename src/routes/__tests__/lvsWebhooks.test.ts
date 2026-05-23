@@ -196,6 +196,33 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
     expect(userIds).toEqual(['u-carol', 'u-hank']);
   });
 
+  test('composedUrl + tracks from LVS payload are forwarded to putRecording', async () => {
+    const payload = {
+      type: 'recording.completed',
+      channelArn: 'arn:multi',
+      data: {
+        recordingId: 'r-multi',
+        segments: [],
+        totalSize: 0,
+        durationMs: 1000,
+        destination: 'local',
+        composedUrl: 'https://lvs.test/composed/r-multi.mp4',
+        tracks: [
+          { participantId: 'p1', key: 'k1', url: 'https://t/1.mp4', size: 1 },
+          { participantId: 'p2', key: 'k2', url: 'https://t/2.mp4', size: 2 },
+        ],
+      },
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+    const res = await rawPost(server, '/hooks/lvs/recording', body, {
+      'X-LVS-Signature': signBody(body),
+    });
+    expect(res.status).toBe(204);
+    const arg = putRecordingMock.mock.calls[0]![0];
+    expect(arg.composedUrl).toBe('https://lvs.test/composed/r-multi.mp4');
+    expect(arg.tracks).toHaveLength(2);
+  });
+
   test('invalid HMAC signature → 401, repo NOT called', async () => {
     const payload = {
       type: 'recording.completed',
