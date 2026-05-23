@@ -53,7 +53,10 @@ export const hangoutRoomsRouter = Router();
 const DEFAULT_ORG_ID = 'default-org';
 const DEFAULT_SOFT_CAP = 25;
 const SLUG_MAX_LEN = 48;
-const SLUG_RETRY_LIMIT = 3;
+// E2E suites churn many rooms with similar names and archive is a
+// soft-delete (slug stays reserved on the row), so the default cap of 3
+// retries trips 409 within a few rerun cycles. Make the cap env-overridable.
+const SLUG_RETRY_LIMIT = Number(process.env.ROOM_SLUG_RETRY_LIMIT ?? '3');
 
 // Per-user create rate limit: 5 creates / sliding-1h-window / userId.
 // In-memory by design — abuse mitigation, not a hard quota. Multi-replica
