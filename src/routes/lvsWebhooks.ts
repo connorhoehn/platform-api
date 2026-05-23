@@ -225,11 +225,17 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
     return;
   }
 
-  // Normalize: LVS sends EventBridge envelope `{detail-type, detail:{...}}`
-  // when WEBHOOK_FORMAT=eventbridge, or bare payload otherwise.
+  // Normalize across the two envelope shapes the dispatcher emits:
+  //   EventBridge: `{ 'detail-type': '...', detail: { event_name, stream_id, ...data } }`
+  //   Bare:        `{ id, type, channelArn, occurredAt, data: { ...payload } }`
+  // The fields we care about (recordingId, segments, totalSize, durationMs,
+  // destination, thumbnailUrl) live under `detail` in EB and under `data`
+  // in bare — flatten both into one `detail` view so downstream reads are
+  // shape-agnostic.
   const eventType: string = payload['detail-type'] ?? payload.type ?? '';
-  const detail = payload.detail ?? payload;
-  const arn: string = detail.arn ?? detail.channelArn ?? '';
+  const detail = payload.detail
+    ?? (payload.data ? { ...payload, ...payload.data } : payload);
+  const arn: string = detail.arn ?? detail.channelArn ?? payload.channelArn ?? '';
   const recordingId: string = detail.recordingId ?? '';
 
   // W5 — successful-receive log emitted right after HMAC verifies + the
