@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { hostname } from 'os';
 import { LeasedKVLock } from 'distributed-core';
 import { docClient } from '../lib/aws-clients';
-import { publishDurable } from '../lib/event-catalog';
+import { catalog } from '../lib/event-catalog';
 import { tableName } from '../lib/ddb-table-name';
 import { createDDBLeaseStore } from '../lib/ddb-lease-store';
 import log from '../lib/logger';
@@ -152,7 +152,11 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
     try {
       const parsedPayload = JSON.parse(row.payload) as Record<string, unknown>;
 
-      await publishDurable(row.eventType, parsedPayload);
+      // catalog.publish routes to the durable MQ transport for declared
+      // durable events (e.g. pipeline.run.*). The local `publishDurable`
+      // helper only writes to the outbox table — calling it here would
+      // re-queue the row instead of delivering it.
+      await catalog.publish(row.eventType, parsedPayload);
 
       // Re-check ownership after the network call: publishDurable could have
       // taken seconds, and the lease may have lapsed while we waited.

@@ -770,20 +770,24 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     { mode: 'warn' },
   );
 
-  eventBus.subscribe('pipeline:run:started', async (payload: unknown) => {
-    const data = payload as Record<string, unknown>;
+  // EventBus.subscribe delivers a BusEvent envelope: { id, type, payload, ... }
+  // The actual emitted object lives at `evt.payload`. Reading top-level fields
+  // (`data.runId`) gives undefined and trips schema validation downstream.
+  eventBus.subscribe('pipeline:run:started', async (evt: unknown) => {
+    const data = ((evt as { payload?: Record<string, unknown> })?.payload ?? {}) as Record<string, unknown>;
     publishRunStarted({
       runId: data.runId as string,
       pipelineId: data.pipelineId as string,
-      triggeredBy: data.triggeredBy as string | undefined,
+      // triggeredBy is a PipelineRunTrigger object from DC, not a string.
+      triggeredBy: data.triggeredBy as Record<string, unknown> | undefined,
       startedAt: data.at as string || new Date().toISOString(),
     }).catch((err: unknown) => {
       log.error({ event: 'pipeline.run.started', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
     });
   });
 
-  eventBus.subscribe('pipeline:run:completed', async (payload: unknown) => {
-    const data = payload as Record<string, unknown>;
+  eventBus.subscribe('pipeline:run:completed', async (evt: unknown) => {
+    const data = ((evt as { payload?: Record<string, unknown> })?.payload ?? {}) as Record<string, unknown>;
     publishRunCompleted({
       runId: data.runId as string,
       durationMs: data.durationMs as number | undefined,
@@ -793,11 +797,12 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     });
   });
 
-  eventBus.subscribe('pipeline:run:failed', async (payload: unknown) => {
-    const data = payload as Record<string, unknown>;
+  eventBus.subscribe('pipeline:run:failed', async (evt: unknown) => {
+    const data = ((evt as { payload?: Record<string, unknown> })?.payload ?? {}) as Record<string, unknown>;
     publishRunFailed({
       runId: data.runId as string,
-      error: data.error as string | undefined,
+      // error is a PipelineRunError struct from DC, not a string.
+      error: data.error as Record<string, unknown> | undefined,
       failedAt: data.at as string || new Date().toISOString(),
     }).catch((err: unknown) => {
       log.error({ event: 'pipeline.run.failed', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');

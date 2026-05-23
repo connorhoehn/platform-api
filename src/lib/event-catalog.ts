@@ -354,7 +354,10 @@ catalog.declare({
     properties: {
       runId: { type: 'string' },
       pipelineId: { type: 'string' },
-      triggeredBy: { type: 'string' },
+      // triggeredBy is the PipelineRunTrigger object emitted by DC's
+      // PipelineExecutor: { triggerType, userId?, payload? }. Object — not
+      // string — was the source of strict-mode validation rejections.
+      triggeredBy: { type: 'object', additionalProperties: true },
       startedAt: { type: 'string' },
     },
     required: ['runId', 'pipelineId'],
@@ -388,7 +391,9 @@ catalog.declare({
     properties: {
       runId: { type: 'string' },
       pipelineId: { type: 'string' },
-      error: { type: 'string' },
+      // error is a PipelineRunError struct from DC: { nodeId, message, stack? }.
+      // Object — not string — was the source of strict-mode rejections.
+      error: { type: 'object', additionalProperties: true },
       failedAt: { type: 'string' },
     },
     required: ['runId'],
