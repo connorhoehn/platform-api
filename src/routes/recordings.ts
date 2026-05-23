@@ -126,12 +126,17 @@ recordingsRouter.post(
     // channel's streamKey (same path videoSessions.ts uses for
     // participant-token mints at line 367).
     const arn = detail.channelArn;
+    // Look up the streamKey from ANY session (active OR ended) for this
+    // lobby. Recordings are queried AFTER the call ends, so the session is
+    // no longer 'active' — `findActiveByLobbyName` (used by /sessions
+    // findOrCreate) would always return null here. Scan all sessions for
+    // the lobby and match on channelArn so we pick the right streamKey
+    // even when a lobby's been reused across multiple recordings.
     let streamKey: string | null = null;
     try {
-      const session = await videoSessionRepo.findActiveByLobbyName(detail.lobbyName);
-      if (session && session.channelArn === arn) {
-        streamKey = session.streamKey ?? null;
-      }
+      const all = await videoSessionRepo.getSessionsByDocument(detail.lobbyName);
+      const match = all.find((s) => s.channelArn === arn);
+      streamKey = match?.streamKey ?? null;
     } catch (e: any) {
       log.warn({ err: e?.message ?? e, lobbyName: detail.lobbyName }, '[recordings] streamKey lookup failed');
     }
