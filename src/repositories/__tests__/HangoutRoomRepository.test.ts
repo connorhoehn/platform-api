@@ -142,7 +142,7 @@ describe('HangoutRoomRepository.listRoomsByOrg', () => {
 
     const queryCmd = mockSend.mock.calls[0][0] as QueryCommand;
     expect(queryCmd.input.TableName).toBe('test-hangout-rooms');
-    expect(queryCmd.input.IndexName).toBe('orgId-state-lastActiveAt-index');
+    expect(queryCmd.input.IndexName).toBe('orgId-lastActiveAt-index');
     expect(queryCmd.input.ScanIndexForward).toBe(false);
     expect(queryCmd.input.Limit).toBe(10);
     expect(queryCmd.input.KeyConditionExpression).toBe('orgId = :o');

@@ -13,7 +13,7 @@
  *
  *   GSI1: orgId-slug-index            (PK orgId, SK slug)
  *     → for "find by slug" + slug-uniqueness enforcement
- *   GSI2: orgId-state-lastActiveAt-index (PK orgId, SK lastActiveAt)
+ *   GSI2: orgId-lastActiveAt-index (PK orgId, SK lastActiveAt)
  *     → for sidebar list sorted by recency (ScanIndexForward=false)
  *     NOTE: state is denormalized into the SK key via a filter on the
  *     base attribute; sidebar list calls filter client-side / via
@@ -193,7 +193,7 @@ export class HangoutRoomRepository extends BaseRepository {
     const result = await this.docClient.send(
       new QueryCommand({
         TableName: HANGOUT_ROOMS_TABLE,
-        IndexName: 'orgId-state-lastActiveAt-index',
+        IndexName: 'orgId-lastActiveAt-index',
         KeyConditionExpression: 'orgId = :o',
         FilterExpression: '#st = :st',
         ExpressionAttributeNames: { '#st': 'state' },
@@ -330,7 +330,7 @@ export class HangoutRoomRepository extends BaseRepository {
  *       AttributeName=roomId,KeyType=RANGE \
  *     --global-secondary-indexes \
  *       'IndexName=orgId-slug-index,KeySchema=[...],Projection=ALL' \
- *       'IndexName=orgId-state-lastActiveAt-index,KeySchema=[...],Projection=ALL' \
+ *       'IndexName=orgId-lastActiveAt-index,KeySchema=[...],Projection=ALL' \
  *     --billing-mode PAY_PER_REQUEST
  *
  *   # TTL on `ttl` (only populated on archive — drops the row 90d later)
