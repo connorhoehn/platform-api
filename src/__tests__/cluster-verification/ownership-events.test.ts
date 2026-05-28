@@ -24,13 +24,15 @@
  *
  * Findings during initial validation:
  *
- *   - The shipped `dist/` for distributed-core was stale at HEAD `11fc618`
- *     (v0.3.3). The compiled `dist/routing/ResourceRouter.js` was missing
- *     the `member:joined` / `member:updated` listener subscriptions that
- *     the v0.3.2 fix added in TS source. Consumers installing via
- *     `file:../../distributed-core` need the dist rebuilt; otherwise the
- *     LEAVING-window path silently no-ops. Verified locally by running
- *     `cd ../../distributed-core && npm run build` before this test.
+ *   - Historical (pre-v0.37): the shipped `dist/` for distributed-core was
+ *     stale at HEAD `11fc618` (v0.3.3) — the compiled `ResourceRouter.js`
+ *     was missing the `member:joined`/`member:updated` subscriptions added
+ *     in TS source. No longer applicable: distributed-core is now pinned by
+ *     tag via `github:connorhoehn/distributed-core#distributed-core-v0.37.2`
+ *     in package.json, so the installed package always carries the built
+ *     `dist/` for that exact release. The old `file:../../distributed-core`
+ *     pin and the `cd ../../distributed-core && npm run build` workaround
+ *     are gone.
  *
  *   - On a 2-node cluster with `RebalanceManager` wired against a CRDT
  *     registry but no `ResourceRegistry`, the survivor's

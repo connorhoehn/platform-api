@@ -192,8 +192,19 @@ Module-shaped pipeline router (Phase A of distributed-core absorption). New rout
 
 ## Dependencies
 
+Shared libraries are pinned by published version in `package.json` — `npm install` fetches them from GitHub directly. No side-by-side clone is required, and no `file:../` pins are used. Current pins (also documented in `.agent/CONSTITUTION.md`):
+
 ### distributed-core
-Local pin via `file:../distributed-core`. Provides PipelineModule, EventBus, Cluster primitives, Raft state machine, WAL, and metrics infrastructure. Must be cloned side-by-side.
+`github:connorhoehn/distributed-core#distributed-core-v0.37.2`. Provides PipelineModule, EventBus, Cluster primitives, Raft state machine, WAL, and metrics infrastructure.
+
+### @connorhoehn/event-catalog
+`github:connorhoehnslalom/event-catalog#v0.3.48`. Durable + signal event registry; source of truth for cross-service event schemas (M1 adoption).
+
+### @connorhoehn/service-runtime
+`github:connorhoehn/service-runtime#v0.2.4`. HMAC envelope sign/verify, logger, health handler, request-context middleware, lifecycle helpers.
+
+### @connorhoehn/pipeline-runtime
+`github:connorhoehn/pipeline-runtime#v0.4.0`. HTTPPipelineBridge, PipelineApprovalStateMachine, ApprovalStore, canonical pipeline contracts.
 
 ### live-video-streaming
 Separate service providing IVS-backed video channel management. platform-api composes its primitives (create channel, mint participant token, delete channel) into application-level video sessions. Connected via `VIDEO_API_URL` env var.
@@ -203,6 +214,9 @@ Used for pub/sub event delivery to websocket-gateway. Not used for caching or se
 
 ### DynamoDB
 Primary persistence layer for all domains. Tables are prefixed with `DDB_TABLE_PREFIX` when running against shared DynamoDB-local.
+
+### Docker build auth
+The image is built with BuildKit and expects a GitHub PAT (scope: `repo`) passed via `--mount=type=secret,id=github-token` so `npm install` can fetch the four github: pins above. See the `Dockerfile` header for the exact build invocation.
 
 ## Testing
 

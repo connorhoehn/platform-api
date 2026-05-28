@@ -45,7 +45,7 @@ A unified event registry and transport layer. All inter-service communication go
 ## Dependencies
 
 - **Redis** — Docker container, ephemeral transport for real-time signals
-- **message-queue** (`~/projects/message-queue`) — durable transport, `file:../message-queue` or HTTP client against its API
+- **message-queue** (`~/projects/message-queue`) — durable transport. Historical: this doc was written when sibling repos were pulled via `file:../message-queue`. Current model: github: version pins in `package.json` (or HTTP client against its API).
 - **ui-components** (`~/projects/ui-components`) — component library for the admin UI (optional, can use directly or build standalone)
 
 ## Core Concepts
