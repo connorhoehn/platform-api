@@ -25,10 +25,10 @@ pipeline-worker extraction).
 
 ## Dependencies
 
-- **`distributed-core`** — GitHub-pinned (`github:connorhoehn/distributed-core#v0.20.x`); imports route through the public subpath exports (`distributed-core/applications/pipeline`, `distributed-core/messaging-queue`, `distributed-core/transport`)
-- **`@connorhoehn/event-catalog`** — durable + signal event registry
-- **`@connorhoehn/pipeline-runtime`** — HTTPPipelineBridge to `pipeline-worker`
-- **`@connorhoehn/service-runtime`** — service-auth (`signEnvelope`/`verifyEnvelope`), `createLogger`, `makeHealthHandler`
+- **`distributed-core`** — GitHub-pinned (`github:connorhoehn/distributed-core#distributed-core-v0.37.2`); imports route through the public subpath exports (`distributed-core/applications/pipeline`, `distributed-core/messaging-queue`, `distributed-core/transport`)
+- **`@connorhoehn/event-catalog`** (`github:connorhoehnslalom/event-catalog#v0.3.48`) — durable + signal event registry
+- **`@connorhoehn/pipeline-runtime`** (`github:connorhoehn/pipeline-runtime#v0.4.0`) — HTTPPipelineBridge to `pipeline-worker`
+- **`@connorhoehn/service-runtime`** (`github:connorhoehn/service-runtime#v0.2.4`) — service-auth (`signEnvelope`/`verifyEnvelope`), `createLogger`, `makeHealthHandler`
 - **`identity-server`** — OIDC provider (future auth migration from Cognito)
 
 ## Local dev
