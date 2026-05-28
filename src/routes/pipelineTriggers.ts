@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
-import { CORRELATION_ID_HEADER } from '@connorhoehn/service-runtime';
+import { getCorrelationId } from '@connorhoehn/service-runtime';
 import { withSpan } from 'distributed-core';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
 import { idempotency } from '../middleware/idempotency';
@@ -129,13 +129,10 @@ interface BridgeErrorBody {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Pull the correlation id (if any) off the request headers. */
-function correlationIdOf(req: { headers: Record<string, unknown> }): string | undefined {
-  const raw = req.headers[CORRELATION_ID_HEADER];
-  if (typeof raw === 'string') return raw;
-  if (Array.isArray(raw) && typeof raw[0] === 'string') return raw[0];
-  return undefined;
-}
+// `correlationIdOf(req)` used to scan req.headers for the X-Correlation-ID
+// header. Now sourced from the service-runtime AsyncLocalStorage context that
+// `requestContextMiddleware` populates at the top of app.ts — same value, no
+// `as unknown as { headers: Record<string, unknown> }` casts at the call site.
 
 /**
  * Standard error-tail for a failed bridge call: emit a Prometheus error
@@ -205,7 +202,7 @@ pipelineTriggersRouter.post(
       const userId = req.user!.sub;
       const body = (req.body ?? {}) as TriggerRunRequest;
       const reqLog = log.child({
-        correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+        correlationId: getCorrelationId(),
         userId,
         pipelineId,
       });
@@ -331,7 +328,7 @@ pipelineTriggersRouter.get(
     const { pipelineId } = req.params;
     const userId = req.user!.sub;
     const reqLog = log.child({
-      correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+      correlationId: getCorrelationId(),
       userId,
       pipelineId,
     });
@@ -384,7 +381,7 @@ pipelineTriggersRouter.get(
     const { runId, pipelineId } = req.params;
     const userId = req.user!.sub;
     const reqLog = log.child({
-      correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+      correlationId: getCorrelationId(),
       userId,
       pipelineId,
       runId,
@@ -433,7 +430,7 @@ pipelineTriggersRouter.get(
       const { runId, pipelineId } = req.params;
       const userId = req.user!.sub;
       const reqLog = log.child({
-        correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+        correlationId: getCorrelationId(),
         userId,
         pipelineId,
         runId,
@@ -488,7 +485,7 @@ pipelineActiveRunsRouter.get(
   asyncHandler(async (req, res) => {
     const userId = req.user!.sub;
     const reqLog = log.child({
-      correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+      correlationId: getCorrelationId(),
       userId,
     });
 
@@ -543,7 +540,7 @@ pipelineCancelRouter.post(
     const userId = req.user!.sub;
     const body = (req.body ?? {}) as CancelRunRequest;
     const reqLog = log.child({
-      correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+      correlationId: getCorrelationId(),
       userId,
       runId,
     });
@@ -739,7 +736,7 @@ pipelinePendingApprovalsRouter.get(
     async (req, res) => {
       const userId = req.user?.sub ?? 'anon';
       const reqLog = log.child({
-        correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+        correlationId: getCorrelationId(),
         userId,
       });
 
@@ -868,7 +865,7 @@ pipelineApprovalsRouter.post(
     const userId = req.user!.sub;
     const body = (req.body ?? {}) as ResolveApprovalRequest;
     const reqLog = log.child({
-      correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+      correlationId: getCorrelationId(),
       userId,
       runId,
     });
@@ -1034,7 +1031,7 @@ pipelineBreakpointRouter.post(
     const userId = req.user!.sub;
     const body = (req.body ?? {}) as ResolveBreakpointRequest;
     const reqLog = log.child({
-      correlationId: correlationIdOf(req as unknown as { headers: Record<string, unknown> }),
+      correlationId: getCorrelationId(),
       userId,
       runId,
       stepId,
