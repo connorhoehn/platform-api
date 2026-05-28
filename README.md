@@ -216,7 +216,7 @@ Used for pub/sub event delivery to websocket-gateway. Not used for caching or se
 Primary persistence layer for all domains. Tables are prefixed with `DDB_TABLE_PREFIX` when running against shared DynamoDB-local.
 
 ### Docker build auth
-The image is built with BuildKit and expects a GitHub PAT (scope: `repo`) passed via `--mount=type=secret,id=github-token` so `npm install` can fetch the four github: pins above. See the `Dockerfile` header for the exact build invocation.
+The image is built with BuildKit and uses SSH agent forwarding so `npm install` can fetch the four github: pins above from the private repos. Invoke with `DOCKER_BUILDKIT=1 docker build --ssh default -f platform-api/Dockerfile -t platform-api .` so the host's `ssh-agent` is forwarded into the `RUN --mount=type=ssh` steps. See the `Dockerfile` header for the exact build invocation.
 
 ## Testing
 

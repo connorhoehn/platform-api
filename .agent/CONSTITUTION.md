@@ -220,9 +220,11 @@ A self-driven task is **not** worth claiming if it:
 - **`@connorhoehn/pipeline-runtime`** — pinned to `github:connorhoehn/pipeline-runtime#v0.4.0`.
   Imports `HTTPPipelineBridge`, `PipelineApprovalStateMachine`,
   `ApprovalStore`, canonical pipeline contracts.
-- **Docker build auth**: image expects a GitHub PAT (scope: `repo`) passed
-  via BuildKit secret `id=github-token` to fetch the four github: pins
-  during `npm install`. See `Dockerfile` header for the build invocation.
+- **Docker build auth**: image uses BuildKit SSH agent forwarding
+  (`--ssh default`) so `npm install` can fetch the four github: pins
+  from private repos via `RUN --mount=type=ssh`. Aligned with the
+  websocket-gateway Tilt detox (gateway commit 6783f89 / platform-api
+  commit e9ccbb5). See `Dockerfile` header for the build invocation.
 - **DDB table prefix**: `DDB_TABLE_PREFIX` env var to namespace tables in
   shared-services mode. Helper at `src/lib/ddb-table-name.ts:9` (duplicated
   in gateway — known drift, low priority to unify).
