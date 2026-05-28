@@ -206,13 +206,23 @@ A self-driven task is **not** worth claiming if it:
 
 ## Cross-repo contracts this project depends on
 
-- **`distributed-core`** — currently pinned to `#main`. Imports
-  `PipelineModule`, `Cluster`, `RaftStateMachineBase`, `InMemoryDeadLetterQueue`,
-  `MetricsRegistry`, `HintedHandoffQueue`, `InMemoryDedupStore`,
-  `DEFAULT_RAFT_CONFIG`, `FixtureLLMClient`, `RetryManager`. ~46 imports.
-- **`@connorhoehn/event-catalog`** — currently pinned to `#main`. Imports
-  `EventCatalog`, `EventEnvelope`. ~6 imports. Single consumer of this
-  library today.
+- **`distributed-core`** — pinned to `github:connorhoehn/distributed-core#distributed-core-v0.37.2`.
+  Imports `PipelineModule`, `Cluster`, `RaftStateMachineBase`,
+  `InMemoryDeadLetterQueue`, `MetricsRegistry`, `HintedHandoffQueue`,
+  `InMemoryDedupStore`, `DEFAULT_RAFT_CONFIG`, `FixtureLLMClient`,
+  `RetryManager`. ~46 imports.
+- **`@connorhoehn/event-catalog`** — pinned to `github:connorhoehnslalom/event-catalog#v0.3.48`.
+  Imports `EventCatalog`, `EventEnvelope`. ~6 imports. Single consumer of
+  this library today.
+- **`@connorhoehn/service-runtime`** — pinned to `github:connorhoehn/service-runtime#v0.2.4`.
+  Imports HMAC `signEnvelope`/`verifyEnvelope`, `createLogger`,
+  `makeHealthHandler`, `requestContextMiddleware`, lifecycle helpers.
+- **`@connorhoehn/pipeline-runtime`** — pinned to `github:connorhoehn/pipeline-runtime#v0.4.0`.
+  Imports `HTTPPipelineBridge`, `PipelineApprovalStateMachine`,
+  `ApprovalStore`, canonical pipeline contracts.
+- **Docker build auth**: image expects a GitHub PAT (scope: `repo`) passed
+  via BuildKit secret `id=github-token` to fetch the four github: pins
+  during `npm install`. See `Dockerfile` header for the build invocation.
 - **DDB table prefix**: `DDB_TABLE_PREFIX` env var to namespace tables in
   shared-services mode. Helper at `src/lib/ddb-table-name.ts:9` (duplicated
   in gateway — known drift, low priority to unify).

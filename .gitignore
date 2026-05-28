@@ -5,9 +5,11 @@ coverage/
 .env
 .env.local
 
-# Sibling source rsynced by the gateway Tiltfile for the platform-api
-# Docker build context — never committed; Tilt regenerates on every
-# reconcile and version-pinning lives in package.json.
+# Sibling source dirs — historical from the file: pin pattern (commit
+# 54f11b5, reverted by 829288c). The gateway Tiltfile may still rsync
+# into these paths until that side is updated; keep them ignored so any
+# leftover rsync output doesn't dirty the working tree. Safe to remove
+# these entries once the gateway Tiltfile no longer writes here.
 .distributed-core/
 .event-catalog/
 .message-queue/
