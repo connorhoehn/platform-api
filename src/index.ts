@@ -18,6 +18,7 @@ import { DLQRepository } from './repositories/DLQRepository';
 import { docClient } from './lib/aws-clients';
 import log from './lib/logger';
 import { assertRequiredInProd } from 'distributed-core';
+import { createShutdownManager, drainHttpServer } from '@connorhoehn/service-runtime';
 import { CatalogIngestEventBus } from './ingest/catalog-event-bus';
 import { IngestEngine } from './ingest/engine';
 import { setIngestEngine } from './ingest/engine-singleton';
@@ -393,44 +394,38 @@ const scheduler = createScheduleEvaluator({
 });
 scheduler.start();
 
-// Graceful shutdown — stop the timer so the process can exit cleanly.
-async function shutdown(signal: string): Promise<void> {
-  log.info({ signal }, 'received shutdown signal');
-  scheduler.stop();
-  pipelineDefinitionsCache.stop();
-  if (definitionsInvalidationSubscriber) {
-    try { await definitionsInvalidationSubscriber.stop(); } catch (err) {
-      log.warn({ err }, 'definitions-invalidate subscriber stop failed');
-    }
-  }
-  if (pipelineShutdown) {
-    try { await pipelineShutdown(); } catch (err) {
-      log.error({ err }, 'pipeline shutdown failed');
-    }
-  }
-  if (ingestShutdown) {
-    try { await ingestShutdown(); } catch (err) {
-      log.error({ err }, 'ingest shutdown failed');
-    }
-  }
-  drainer.stop();
-  if (activityConsumer) {
-    try { await activityConsumer.stop(); } catch (err) {
-      log.error({ err }, 'activity-consumer stop failed');
-    }
-  }
-  if (pipelineConfigSubscriber) {
-    try { await pipelineConfigSubscriber.stop(); } catch (err) {
-      log.warn({ err }, 'pipeline-config-subscriber stop failed');
-    }
-  }
-  try { await disconnectCatalog(); } catch (err) {
-    log.error({ err }, 'event-catalog disconnect failed');
-  }
-  try { await tracingShutdown(); } catch (err) {
-    log.error({ err }, 'tracing shutdown failed');
-  }
-  server.close(() => process.exit(0));
-}
-process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
-process.on('SIGINT',  () => { void shutdown('SIGINT'); });
+// Graceful shutdown — registered via service-runtime/lifecycle's ShutdownManager.
+//
+// Hooks run in REVERSE registration order (LIFO), so to preserve the original
+// teardown sequence we register from the OUTSIDE in: http drain LAST, scheduler
+// FIRST. The manager binds SIGTERM/SIGINT itself, applies per-hook timeouts
+// (default 10s) and an overall budget (default 30s) before force-exit, and
+// catches individual hook errors so a single failure no longer aborts the
+// rest of the teardown.
+const sd = createShutdownManager({ logger: log });
+
+// Registered FIRST → drained LAST. Closing the HTTP server is the final step
+// before process exit (matches the original `server.close(() => process.exit(0))`).
+sd.register('http-server', () => drainHttpServer(server));
+sd.register('tracing', () => tracingShutdown());
+sd.register('event-catalog', () => disconnectCatalog());
+sd.register('pipeline-config-subscriber', async () => {
+  if (pipelineConfigSubscriber) await pipelineConfigSubscriber.stop();
+});
+sd.register('activity-consumer', async () => {
+  if (activityConsumer) await activityConsumer.stop();
+});
+sd.register('outbox-drainer', () => { drainer.stop(); });
+sd.register('ingest', async () => {
+  if (ingestShutdown) await ingestShutdown();
+});
+sd.register('pipeline', async () => {
+  if (pipelineShutdown) await pipelineShutdown();
+});
+sd.register('definitions-invalidate', async () => {
+  if (definitionsInvalidationSubscriber) await definitionsInvalidationSubscriber.stop();
+});
+sd.register('definitions-cache', () => { pipelineDefinitionsCache.stop(); });
+// Registered LAST → drained FIRST. Stopping the scheduler timer first ensures
+// no new pipeline triggers fire while downstream resources are being torn down.
+sd.register('scheduler', () => { scheduler.stop(); });
