@@ -30,6 +30,7 @@ import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFa
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
 import { createPipelineConfigRegistration } from './control-plane/pipeline-config-subscriber';
+import { createFileUploadEndpointRegistration } from './control-plane/file-upload-subscriber';
 import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
 import { definitionsRepo } from './pipeline/definitions-repository';
 
@@ -338,6 +339,7 @@ const controlPlaneRegistry = new ControlPlaneSubscriberRegistry({});
 controlPlaneRegistry.register(
   createPipelineConfigRegistration({ definitionsRepository: definitionsRepo }),
 );
+controlPlaneRegistry.register(createFileUploadEndpointRegistration());
 void controlPlaneRegistry.start().catch((err: unknown) => {
   log.warn(
     { errMessage: err instanceof Error ? err.message : String(err) },
