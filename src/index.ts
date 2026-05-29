@@ -29,7 +29,8 @@ import { ensureOutboxTTL, ensureVideoSessionsTTL } from './lib/dynamo-setup';
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
-import { PipelineConfigSubscriber } from './control-plane/pipeline-config-subscriber';
+import { createPipelineConfigRegistration } from './control-plane/pipeline-config-subscriber';
+import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
 import { definitionsRepo } from './pipeline/definitions-repository';
 
 const port = process.env.PORT ?? '3001';
@@ -322,28 +323,27 @@ void startInvalidationSubscriber(pipelineDefinitionsCache).then((sub) => {
 });
 
 // ---------------------------------------------------------------------------
-// Control-plane: AgenticPipeline config subscriber.
+// Control-plane: subscriber registry.
 //
-// Listens for operator pushes (CRD-derived AgenticPipeline configs) on
-// ControlPlaneChannel and writes them to the definitions repository so the
-// pipeline runtime picks them up on the next evaluation tick. Non-fatal —
-// if Redis is down at startup the subscriber logs a warning and the operator
-// can re-push once Redis recovers.
+// Owns a single ControlPlaneChannel + Redis connection shared by every
+// registered handler (today: AgenticPipeline config; future: FileUpload,
+// VideoHangout, CollaborativeDocument, etc.). Without this each new CRD
+// kind would burn its own Redis connection.
+//
+// Non-fatal: if Redis is down at start() time the registry logs a warn
+// and leaves handlers idle until the next start() attempt. The operator
+// re-pushes once Redis recovers.
 // ---------------------------------------------------------------------------
-let pipelineConfigSubscriber: PipelineConfigSubscriber | null = null;
-(async () => {
-  try {
-    pipelineConfigSubscriber = new PipelineConfigSubscriber({
-      definitionsRepository: definitionsRepo,
-    });
-    await pipelineConfigSubscriber.start();
-  } catch (err: unknown) {
-    log.warn(
-      { errMessage: err instanceof Error ? err.message : String(err) },
-      'pipeline-config-subscriber bootstrap failed (non-fatal)',
-    );
-  }
-})();
+const controlPlaneRegistry = new ControlPlaneSubscriberRegistry({});
+controlPlaneRegistry.register(
+  createPipelineConfigRegistration({ definitionsRepository: definitionsRepo }),
+);
+void controlPlaneRegistry.start().catch((err: unknown) => {
+  log.warn(
+    { errMessage: err instanceof Error ? err.message : String(err) },
+    'control-plane registry bootstrap failed (non-fatal)',
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Schedule evaluator — fires pipelines whose triggerBinding.event === 'schedule'
@@ -409,8 +409,8 @@ const sd = createShutdownManager({ logger: log });
 sd.register('http-server', () => drainHttpServer(server));
 sd.register('tracing', () => tracingShutdown());
 sd.register('event-catalog', () => disconnectCatalog());
-sd.register('pipeline-config-subscriber', async () => {
-  if (pipelineConfigSubscriber) await pipelineConfigSubscriber.stop();
+sd.register('control-plane-registry', async () => {
+  await controlPlaneRegistry.stop();
 });
 sd.register('activity-consumer', async () => {
   if (activityConsumer) await activityConsumer.stop();

@@ -24,6 +24,7 @@ import type { ControlPlanePayload, ReconcileAck } from 'distributed-core';
 import type { DefinitionsRepository, PipelineDefinition } from '../pipeline/definitions-repository';
 import { publishInvalidate } from '../pipeline/definitions-invalidator';
 import { withContext } from '../lib/logger';
+import type { RegisteredSubscriber } from './registry';
 
 const log = withContext({ service: 'pipeline-config-subscriber' });
 
@@ -210,4 +211,69 @@ export class PipelineConfigSubscriber {
       throw err;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Registry factory — for use with ControlPlaneSubscriberRegistry.
+//
+// Returns a RegisteredSubscriber so multiple CRD subscribers can share one
+// ControlPlaneChannel + Redis connection instead of each instantiating
+// their own (see registry.ts for the lifecycle contract).
+//
+// The standalone PipelineConfigSubscriber class above is preserved for
+// back-compat with existing tests + any consumer that needs its own
+// channel lifecycle (e.g. a focused integration test).
+// ---------------------------------------------------------------------------
+
+export interface PipelineConfigRegistrationOptions {
+  definitionsRepository: DefinitionsRepository;
+  /** Channel override. Defaults to 'feature.agentic-pipeline.definitions'. */
+  channel?: string;
+  /** Stable node id for ack attribution. Defaults to `${hostname}-${pid}`. */
+  nodeId?: string;
+}
+
+export function createPipelineConfigRegistration(
+  opts: PipelineConfigRegistrationOptions,
+): RegisteredSubscriber<AgenticPipelineConfig> {
+  const channel = opts.channel ?? DEFAULT_CHANNEL;
+  const nodeId = opts.nodeId
+    ?? `${process.env.HOSTNAME ?? 'localhost'}-${process.pid}`;
+  const repo = opts.definitionsRepository;
+
+  return {
+    name: 'pipeline-config',
+    channel,
+    handler: async (payload): Promise<ReconcileAck> => {
+      const { config, version, channel: ch } = payload;
+      const at = new Date().toISOString();
+      try {
+        await repo.put(OPERATOR_USER_ID, {
+          ...config.definition,
+          id: config.name,
+        });
+        void publishInvalidate(`control-plane:v${version}`).catch(() => {
+          // Best-effort — the 60s timer will still surface the change.
+        });
+        log.info(
+          { channel: ch, version, pipelineId: config.name },
+          'agentic-pipeline config applied',
+        );
+        return {
+          channel: ch,
+          appliedVersion: version,
+          appliedAt: at,
+          subscriberNodeId: nodeId,
+          status: 'applied',
+        };
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err.message : String(err);
+        log.warn(
+          { channel: ch, version, pipelineId: config.name, err: error },
+          'agentic-pipeline config write failed',
+        );
+        throw err;
+      }
+    },
+  };
 }
