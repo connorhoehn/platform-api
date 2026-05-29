@@ -523,6 +523,62 @@ videoSessionsRouter.get('/sessions/document/:documentId', requireAuth, asyncHand
   }
 }));
 
+// GET /api/video/sessions/:sessionId/recording — live recording state for the
+// session's LVS channel. Proxies GET ${VIDEO_API_URL}/api/channels/:arn/recording.
+//
+// Returns: { isRecording, recordingId?, startedAt? } from LVS.
+//
+// Used by the gateway FE in-call REC pill (polled every 5s while joined).
+// Public-read on the LVS side; we still require auth here because the
+// proxy hop reveals which sessions exist in this tenant.
+//
+// Failure modes:
+//  - 404 if the session record is unknown.
+//  - LVS upstream failures translate via mapSfuError (504 timeout, 503
+//    breaker-open, etc.). The FE treats any non-2xx as "unknown" and
+//    leaves the pill hidden.
+videoSessionsRouter.get('/sessions/:sessionId/recording', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sessionId } = req.params;
+    const lobbyName = (req.query.lobbyName ?? req.query.documentId) as string | undefined;
+    if (!lobbyName) {
+      throw new ValidationError('lobbyName (or documentId) query parameter is required');
+    }
+
+    const session = await videoSessionRepo.getSession(lobbyName, sessionId);
+    if (!session) {
+      throw new NotFoundError('Session not found');
+    }
+
+    let upstream: globalThis.Response;
+    try {
+      upstream = await callSfu(
+        `${VIDEO_API_URL}/api/channels/${encodeURIComponent(session.channelArn)}/recording`,
+        { method: 'GET' },
+      );
+    } catch (sfuErr) {
+      throw mapSfuError(sfuErr);
+    }
+
+    if (!upstream.ok) {
+      // 404 from LVS means RecordingManager has nothing for this arn —
+      // treat as "not recording" rather than propagating the upstream 404.
+      if (upstream.status === 404) {
+        res.status(200).json({ isRecording: false });
+        return;
+      }
+      throw new AppError(upstream.status, `LVS recording-state upstream ${upstream.status}`);
+    }
+
+    const body = await upstream.json() as { isRecording: boolean; recordingId?: string; startedAt?: string };
+    res.status(200).json(body);
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    log.error({ err }, '[videoSessions] GET /sessions/:sessionId/recording error');
+    throw new AppError(500, 'Failed to fetch recording state');
+  }
+}));
+
 // GET /api/video/sessions/:sessionId — get a single session record
 // Requires lobbyName (or documentId) as a query param since it's the partition key.
 videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
