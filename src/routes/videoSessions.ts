@@ -454,6 +454,30 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
     if (participantId) {
       const splice = await videoSessionRepo.removeParticipant(lobbyName, sessionId, participantId);
       if (splice) remaining = splice.remaining;
+
+      // Fast-path participant teardown — call LVS's explicit reap endpoint
+      // so WHIP/WHEP transports close in milliseconds rather than waiting
+      // for ICE consent timeout (~10-30s). LVS endpoint is idempotent (404
+      // on second call, e.g. when the FE fires both UI-button + sendBeacon)
+      // and reaps the screen-share sibling pid automatically. Best-effort:
+      // failures collapse to the reaper's eventual sweep so /end still
+      // returns 200 to the FE.
+      try {
+        const reapRes = await callSfu(
+          `${VIDEO_API_URL}/api/channels/${encodeURIComponent(session.channelArn)}/participants/${encodeURIComponent(participantId)}`,
+          {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${session.streamKey}` },
+          },
+        );
+        if (reapRes.ok) {
+          log.info({ sessionId, participantId }, '[videoSessions] LVS participant reap ok');
+        } else if (reapRes.status !== 404) {
+          log.warn({ sessionId, participantId, status: reapRes.status }, '[videoSessions] LVS participant reap non-2xx');
+        }
+      } catch (reapErr) {
+        log.warn({ err: reapErr, sessionId, participantId }, '[videoSessions] LVS participant reap failed — relying on SFU reaper');
+      }
     } else if (userId) {
       // Legacy path — remove ALL participants matching userId. Kept for
       // backwards-compat with old client builds. New clients always send
