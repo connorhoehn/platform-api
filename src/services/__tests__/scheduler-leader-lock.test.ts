@@ -15,9 +15,18 @@ jest.mock('../../lib/ddb-table-name', () => ({
 }));
 
 import { createDDBSchedulerLeaderLock } from '../scheduler-leader-lock';
+import { getRegistry } from '../../observability/metrics';
+import type { MetricSample } from 'distributed-core';
+
+function counterValue(samples: MetricSample[], name: string): number {
+  const m = samples.find((s) => s.name === name);
+  if (!m) throw new Error(`metric "${name}" not found`);
+  return m.value as number;
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
+  getRegistry().reset();
 });
 
 describe('createDDBSchedulerLeaderLock', () => {
@@ -80,6 +89,40 @@ describe('createDDBSchedulerLeaderLock', () => {
     const releaseCmd = mockSend.mock.calls[1][0] as { input: Record<string, unknown> };
     expect(releaseCmd.input).toMatchObject({
       ConditionExpression: '#owner = :owner',
+    });
+  });
+
+  // hub#1133 — observability counters
+  describe('observability counters', () => {
+    it('increments scheduler_leader_acquired_total on successful claim', async () => {
+      mockSend.mockResolvedValue({});
+      const lock = createDDBSchedulerLeaderLock('replica-m1');
+      await lock.acquire(60_000);
+      const { metrics } = getRegistry().getSnapshot();
+      expect(counterValue(metrics, 'scheduler_leader_acquired_total')).toBe(1);
+      expect(counterValue(metrics, 'scheduler_leader_skipped_total')).toBe(0);
+      expect(counterValue(metrics, 'scheduler_leader_errors_total')).toBe(0);
+    });
+
+    it('increments scheduler_leader_skipped_total when another replica holds the lease', async () => {
+      const err = Object.assign(new Error('conflict'), { name: 'ConditionalCheckFailedException' });
+      mockSend.mockRejectedValue(err);
+      const lock = createDDBSchedulerLeaderLock('replica-m2');
+      await lock.acquire(60_000);
+      const { metrics } = getRegistry().getSnapshot();
+      expect(counterValue(metrics, 'scheduler_leader_skipped_total')).toBe(1);
+      expect(counterValue(metrics, 'scheduler_leader_acquired_total')).toBe(0);
+      expect(counterValue(metrics, 'scheduler_leader_errors_total')).toBe(0);
+    });
+
+    it('increments scheduler_leader_errors_total when the lease store throws unexpectedly', async () => {
+      mockSend.mockRejectedValue(new Error('ThrottlingException'));
+      const lock = createDDBSchedulerLeaderLock('replica-m3');
+      await lock.acquire(60_000);
+      const { metrics } = getRegistry().getSnapshot();
+      expect(counterValue(metrics, 'scheduler_leader_errors_total')).toBe(1);
+      expect(counterValue(metrics, 'scheduler_leader_acquired_total')).toBe(0);
+      expect(counterValue(metrics, 'scheduler_leader_skipped_total')).toBe(0);
     });
   });
 });

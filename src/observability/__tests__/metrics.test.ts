@@ -43,6 +43,9 @@ import {
   recordReconnectionAttempt,
   recordReconnectionFailure,
   recordReconnectionSuccess,
+  recordSchedulerLeaderAcquired,
+  recordSchedulerLeaderError,
+  recordSchedulerLeaderSkipped,
   recordTypedDocumentBulkImported,
   recordTypedDocumentCreated,
   recordTypedDocumentValidationError,
@@ -591,6 +594,44 @@ describe('outbox drainer metrics', () => {
     expect(text).toContain('outbox_published_total');
     expect(text).toContain('outbox_lease_acquired_total');
     expect(text).toContain('outbox_oldest_pending_seconds');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scheduler leader-lock metrics (hub#1133)
+// ---------------------------------------------------------------------------
+
+describe('scheduler leader-lock metrics', () => {
+  it('recordSchedulerLeaderAcquired increments scheduler_leader_acquired_total', () => {
+    recordSchedulerLeaderAcquired();
+    recordSchedulerLeaderAcquired();
+    expect(
+      counterValue(getRegistry().getSnapshot().metrics, 'scheduler_leader_acquired_total'),
+    ).toBe(2);
+  });
+
+  it('recordSchedulerLeaderSkipped increments scheduler_leader_skipped_total', () => {
+    recordSchedulerLeaderSkipped();
+    expect(
+      counterValue(getRegistry().getSnapshot().metrics, 'scheduler_leader_skipped_total'),
+    ).toBe(1);
+  });
+
+  it('recordSchedulerLeaderError increments scheduler_leader_errors_total', () => {
+    recordSchedulerLeaderError();
+    expect(
+      counterValue(getRegistry().getSnapshot().metrics, 'scheduler_leader_errors_total'),
+    ).toBe(1);
+  });
+
+  it('renderPrometheusText includes all 3 scheduler_leader_* series', () => {
+    recordSchedulerLeaderAcquired();
+    recordSchedulerLeaderSkipped();
+    recordSchedulerLeaderError();
+    const text = renderPrometheusText();
+    expect(text).toContain('scheduler_leader_acquired_total');
+    expect(text).toContain('scheduler_leader_skipped_total');
+    expect(text).toContain('scheduler_leader_errors_total');
   });
 });
 

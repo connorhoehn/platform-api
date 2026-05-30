@@ -469,6 +469,47 @@ export function recordHttpHandlerDuration(routeGroup: string, seconds: number): 
   ).observe(seconds);
 }
 
+// ---------------------------------------------------------------------------
+// Scheduler leader-lock metrics (hub#1133)
+// ---------------------------------------------------------------------------
+//
+// The schedule evaluator went leader-locked via Phase 54.6.1
+// (createDDBSchedulerLeaderLock at src/services/scheduler-leader-lock.ts,
+// wired into prod bootstrap at src/index.ts). Without these counters, a sick
+// DDB or a misconfigured table prefix silently degrades scheduled-pipeline
+// firing to single-replica behavior — the only signal was a log.warn nobody
+// alerts on. Operators can now write
+//   rate(scheduler_leader_errors_total[5m]) > 0.1
+// as a real alert, and inspect skipped/acquired counts to see whether
+// leadership is flapping between replicas.
+const schedulerLeaderAcquiredTotal = registry.counter(
+  'scheduler_leader_acquired_total',
+  BASE_LABELS,
+  'Schedule-evaluator tick attempts that won the DDB lease and ran the tick.',
+);
+const schedulerLeaderSkippedTotal = registry.counter(
+  'scheduler_leader_skipped_total',
+  BASE_LABELS,
+  'Schedule-evaluator tick attempts that yielded (another replica holds the lease).',
+);
+const schedulerLeaderErrorsTotal = registry.counter(
+  'scheduler_leader_errors_total',
+  BASE_LABELS,
+  'Schedule-evaluator tick attempts where the lease store threw (treated as non-leader, no tick).',
+);
+
+export function recordSchedulerLeaderAcquired(): void {
+  schedulerLeaderAcquiredTotal.inc();
+}
+
+export function recordSchedulerLeaderSkipped(): void {
+  schedulerLeaderSkippedTotal.inc();
+}
+
+export function recordSchedulerLeaderError(): void {
+  schedulerLeaderErrorsTotal.inc();
+}
+
 // Renders the registry snapshot as Prometheus 0.0.4 text format.
 // Suitable for `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
 export function renderPrometheusText(): string {

@@ -17,6 +17,11 @@ import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { createDDBLeaseStore } from '../lib/ddb-lease-store';
 import log from '../lib/logger';
+import {
+  recordSchedulerLeaderAcquired,
+  recordSchedulerLeaderError,
+  recordSchedulerLeaderSkipped,
+} from '../observability/metrics';
 
 const OUTBOX_TABLE = tableName(process.env.DYNAMODB_OUTBOX_TABLE || 'social-outbox');
 const LOCK_KEY = 'SCHEDULE_LOCK#scheduleEvaluator';
@@ -46,11 +51,17 @@ export function createDDBSchedulerLeaderLock(ownerId: string): SchedulerLeaderLo
           owner: ownerId,
           expiresAt: Date.now() + ttlMs,
         });
-        if (claimed) held = true;
+        if (claimed) {
+          held = true;
+          recordSchedulerLeaderAcquired();
+        } else {
+          recordSchedulerLeaderSkipped();
+        }
         return claimed;
       } catch (err: unknown) {
         // Treat any unexpected error as non-acquired so we don't fire
         // duplicates on a transient DDB hiccup. Log so it's visible.
+        recordSchedulerLeaderError();
         log.warn(
           { err: err instanceof Error ? err.message : String(err) },
           '[scheduler-leader-lock] acquire failed (treating as non-leader)',
