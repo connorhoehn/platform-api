@@ -24,10 +24,17 @@
  *      account so we can read it. (See videoSessionRepo for prior art.)
  *   4. Persist CallRecording + fan-out participant index rows.
  *
- * HMAC verification: optional `LVS_WEBHOOK_SECRET` env. When set, every
- * incoming request must have `X-LVS-Signature: sha256=<hex>` matching
- * HMAC(secret, rawBody). Missing/invalid → 401. When env unset (dev),
- * we accept all calls — Tilt-only, never deploy without the secret.
+ * HMAC verification (hub#1006):
+ *   - `LVS_WEBHOOK_SECRET` is REQUIRED. When set, every incoming
+ *     request must have `X-LVS-Signature: sha256=<hex>` matching
+ *     HMAC(secret, rawBody). Missing or invalid → 401.
+ *   - When the secret is NOT set, the receiver REJECTS all requests
+ *     (also 401) unless `SKIP_AUTH=true` is explicitly set in the
+ *     environment. SKIP_AUTH is the documented dev-only escape hatch;
+ *     it must NEVER be enabled in production. Pre-hub#1006 behavior
+ *     was "secret unset → accept" — a misconfigured ingress could
+ *     then forge `recording.completed` events. The explicit-escape-
+ *     hatch model closes that gap.
  */
 
 import { Router, Request, Response } from 'express';
@@ -83,17 +90,39 @@ lvsWebhooksRouter.use(
   require('express').raw({ type: 'application/json', limit: '256kb' }),
 );
 
-const SECRET = process.env.LVS_WEBHOOK_SECRET ?? '';
+// Read at request time (not module load) so test cases can vary the
+// secret + SKIP_AUTH env vars without re-importing the module.
+function currentSecret(): string {
+  return process.env.LVS_WEBHOOK_SECRET ?? '';
+}
+
+function isDevSkipAuth(): boolean {
+  return process.env.SKIP_AUTH === 'true';
+}
 
 interface HmacVerifyResult {
   ok: boolean;
   /** Computed expected signature length (hex chars) — null when we can't recompute (e.g., body bytes lost). */
   expectedLen: number | null;
+  /** Reason when ok=false. Surfaced in the rejection log line and the delivery ring buffer. */
+  reason?: 'no-secret-no-skip-auth' | 'missing-header' | 'length-mismatch' | 'parsed-body' | 'sig-mismatch';
 }
 
 function verifyHmacDetailed(req: Request): HmacVerifyResult {
-  if (!SECRET) return { ok: true, expectedLen: null }; // dev: skip
+  const SECRET = currentSecret();
+  if (!SECRET) {
+    // hub#1006: no longer accept blindly when secret is unset — require
+    // explicit SKIP_AUTH=true to opt into dev-mode. Anything else (prod,
+    // misconfigured dev, etc.) is rejected.
+    if (isDevSkipAuth()) {
+      return { ok: true, expectedLen: null };
+    }
+    return { ok: false, expectedLen: null, reason: 'no-secret-no-skip-auth' };
+  }
   const header = req.header('X-LVS-Signature') ?? '';
+  if (!header) {
+    return { ok: false, expectedLen: null, reason: 'missing-header' };
+  }
   // Defense in depth: if a parent middleware accidentally parsed the
   // body into an Object (express.json ran before our raw parser),
   // Hmac.update would crash with ERR_INVALID_ARG_TYPE — taking down
@@ -110,23 +139,23 @@ function verifyHmacDetailed(req: Request): HmacVerifyResult {
   } else {
     // Parsed Object — body bytes are lost. Can't verify HMAC.
     // Log + reject. Returns false → 401 to LVS, which will retry.
-    return { ok: false, expectedLen: null };
+    return { ok: false, expectedLen: null, reason: 'parsed-body' };
   }
   const expected = createHmac('sha256', SECRET)
     .update(bodyBytes)
     .digest('hex');
   const provided = header.replace(/^sha256=/, '');
   if (provided.length !== expected.length) {
-    return { ok: false, expectedLen: expected.length };
+    return { ok: false, expectedLen: expected.length, reason: 'length-mismatch' };
   }
   try {
     const ok = timingSafeEqual(
       Buffer.from(provided, 'hex'),
       Buffer.from(expected, 'hex'),
     );
-    return { ok, expectedLen: expected.length };
+    return { ok, expectedLen: expected.length, reason: ok ? undefined : 'sig-mismatch' };
   } catch {
-    return { ok: false, expectedLen: expected.length };
+    return { ok: false, expectedLen: expected.length, reason: 'sig-mismatch' };
   }
 }
 
@@ -188,6 +217,7 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
         expectedLen: hmac.expectedLen,
         bodyType: typeof body,
         bodyBytes,
+        reason: hmac.reason,
       },
       '[lvs-webhook] HMAC verification failed',
     );

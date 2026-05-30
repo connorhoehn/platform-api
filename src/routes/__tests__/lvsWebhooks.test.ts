@@ -238,4 +238,75 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
     expect(res.status).toBe(401);
     expect(putRecordingMock).not.toHaveBeenCalled();
   });
+
+  // hub#1006: production-safety gate. POST without an X-LVS-Signature header
+  // is rejected when the secret is set — closes the gap where a misconfigured
+  // ingress could forge channel-lifecycle events.
+  test('POST without X-LVS-Signature header → 401 (hub#1006)', async () => {
+    const payload = {
+      type: 'recording.completed',
+      channelArn: 'arn:x',
+      data: { recordingId: 'r1', segments: [], totalSize: 0, durationMs: 1000, destination: 'local' },
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+
+    const res = await rawPost(server, '/hooks/lvs/recording', body, {
+      // Note: no X-LVS-Signature header.
+    });
+
+    expect(res.status).toBe(401);
+    expect(putRecordingMock).not.toHaveBeenCalled();
+  });
+});
+
+// hub#1006: dev-mode behavior. When the secret is unset, the route used to
+// accept blindly — now it rejects unless SKIP_AUTH=true is set as the
+// explicit dev opt-in.
+describe('lvsWebhooks — no-secret gate (hub#1006)', () => {
+  let server: http.Server;
+  let originalSecret: string | undefined;
+  let originalSkipAuth: string | undefined;
+
+  beforeAll(async () => {
+    originalSecret = process.env.LVS_WEBHOOK_SECRET;
+    originalSkipAuth = process.env.SKIP_AUTH;
+    const app = express();
+    app.use('/hooks/lvs', lvsWebhooksRouter);
+    server = http.createServer(app);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  });
+
+  afterAll(async () => {
+    if (originalSecret === undefined) delete process.env.LVS_WEBHOOK_SECRET;
+    else process.env.LVS_WEBHOOK_SECRET = originalSecret;
+    if (originalSkipAuth === undefined) delete process.env.SKIP_AUTH;
+    else process.env.SKIP_AUTH = originalSkipAuth;
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  beforeEach(() => {
+    putRecordingMock.mockClear();
+    delete process.env.LVS_WEBHOOK_SECRET;
+    delete process.env.SKIP_AUTH;
+  });
+
+  test('no secret + no SKIP_AUTH → 401 (production-safe default)', async () => {
+    const body = Buffer.from(JSON.stringify({ type: 'recording.completed' }), 'utf-8');
+    const res = await rawPost(server, '/hooks/lvs/recording', body, {});
+    expect(res.status).toBe(401);
+    expect(putRecordingMock).not.toHaveBeenCalled();
+  });
+
+  test('no secret + SKIP_AUTH=true → 204 (explicit dev opt-in)', async () => {
+    process.env.SKIP_AUTH = 'true';
+    const payload = {
+      type: 'recording.completed',
+      channelArn: 'arn:dev',
+      data: { recordingId: 'r-dev', segments: [], totalSize: 0, durationMs: 1000, destination: 'local' },
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+    const res = await rawPost(server, '/hooks/lvs/recording', body, {});
+    expect(res.status).toBe(204);
+    expect(putRecordingMock).toHaveBeenCalledTimes(1);
+  });
 });
