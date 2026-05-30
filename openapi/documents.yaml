@@ -3,8 +3,8 @@
 # OpenAPI 3.1 spec for the documents surface of platform-api.
 #
 # Coverage status (per hub#1009 option B + blocker #33 re-shape):
-#   - /document-types/*    full schemas  (this commit — hub#1108)
-#   - /typed-documents/*   skeleton      (hub#1109 follow-up)
+#   - /document-types/*    full schemas  (hub#1108)
+#   - /typed-documents/*   full schemas  (this commit — hub#1109)
 #   - /documents/.../comments
 #     + /approvals
 #     + /documents/.../import|export       skeleton  (hub#1110 follow-up)
@@ -20,6 +20,11 @@
 #   src/routes/documentTypes.ts
 #   src/repositories/DocumentTypeRepository.ts (DocumentTypeItem +
 #     DocumentTypeFieldItem + DocumentTypeVersionSnapshot)
+#
+# Authoritative source for /typed-documents/* shapes:
+#   src/routes/typedDocuments.ts
+#   src/repositories/TypedDocumentRepository.ts (TypedDocumentItem +
+#     TypedDocumentValue)
 
 openapi: 3.1.0
 
@@ -44,7 +49,7 @@ tags:
   - name: document-types
     description: Document-type schema registry (definitions + versions + JSON-Schema export).
   - name: typed-documents
-    description: Typed document instances (skeleton — schemas pending).
+    description: Typed document instances + bulk operations.
   - name: document-comments
     description: Comments threaded against a document (skeleton — schemas pending).
   - name: approvals
@@ -336,35 +341,184 @@ paths:
       tags: [section-items]
       responses: { '200': { description: OK } }
 
-  # --- typed documents (skeleton — see hub#1109) --------------------------
-  '/typed-documents':
+  # --- typed documents (full schemas) -------------------------------------
+  /typed-documents:
     get:
-      summary: TODO — schema pending (typedDocuments.ts)
       tags: [typed-documents]
-      responses: { '200': { description: OK } }
+      summary: List typed-document instances for a type
+      operationId: listTypedDocuments
+      parameters:
+        - in: query
+          name: typeId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/TypedDocumentItem' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
     post:
-      summary: TODO — schema pending (typedDocuments.ts)
       tags: [typed-documents]
-      responses: { '200': { description: OK } }
-  '/typed-documents/bulk':
-    post:
-      summary: TODO — schema pending (typedDocuments.ts)
-      tags: [typed-documents]
-      responses: { '200': { description: OK } }
-  '/typed-documents/bulk-import':
-    post:
-      summary: TODO — schema pending (typedDocuments.ts)
-      tags: [typed-documents]
-      responses: { '200': { description: OK } }
-  '/typed-documents/{documentId}':
+      summary: Create a typed-document instance
+      description: |
+        Values are validated against the target DocumentType's field
+        registry (required fields, cardinality, enum options, regex,
+        min/max). Cross-type references are existence-checked.
+      operationId: createTypedDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTypedDocumentRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TypedDocumentItem' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Target DocumentType not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /typed-documents/{documentId}:
+    parameters:
+      - in: path
+        name: documentId
+        required: true
+        schema: { type: string, format: uuid }
     get:
-      summary: TODO — schema pending (typedDocuments.ts)
       tags: [typed-documents]
-      responses: { '200': { description: OK } }
+      summary: Fetch one typed-document instance
+      operationId: getTypedDocument
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TypedDocumentItem' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
     patch:
-      summary: TODO — schema pending (typedDocuments.ts)
       tags: [typed-documents]
-      responses: { '200': { description: OK } }
+      summary: Update field values (partial)
+      description: |
+        Accepts either `{ values: { fieldId: value } }` or the
+        single-field shorthand `{ field, value }`. Merged values are
+        re-validated against the type's schema before persisting.
+      operationId: updateTypedDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateTypedDocumentRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TypedDocumentItem' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /typed-documents/bulk:
+    post:
+      tags: [typed-documents]
+      summary: Bulk create / update / delete (max 100 items per call)
+      description: |
+        Discriminated by `operation`. All items in a single call must
+        pass validation — the route validates everything before any
+        write, so a single bad item aborts the whole batch.
+      operationId: bulkTypedDocumentsOp
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BulkTypedDocumentsRequest' }
+      responses:
+        '200':
+          description: Bulk update or delete result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BulkTypedDocumentsResponse' }
+        '201':
+          description: Bulk create result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BulkTypedDocumentsResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /typed-documents/bulk-import:
+    post:
+      tags: [typed-documents]
+      summary: Bulk-import typed documents from a CSV file
+      description: |
+        Accepts a CSV upload (multipart/form-data, field name `file`,
+        max 5 MiB, max 10000 rows). Column headers are matched against
+        field IDs OR field names on the target type; unknown columns
+        are skipped silently. Multi-value (`cardinality=unlimited`)
+        cells are split on `;`. Returns per-row errors so the
+        frontend can rebuild a CSV of the failed rows for re-upload.
+      operationId: bulkImportTypedDocuments
+      parameters:
+        - in: query
+          name: typeId
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: CSV file.
+      responses:
+        '200':
+          description: Import result (may include per-row errors)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BulkImportResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Target DocumentType not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
 
 components:
   securitySchemes:
@@ -534,3 +688,129 @@ components:
           type: array
           maxItems: 100
           items: { $ref: '#/components/schemas/DocumentTypeFieldItem' }
+
+    # --- typed documents ----------------------------------------------
+    TypedDocumentValue:
+      description: |
+        Value stored in `TypedDocumentItem.values[fieldId]`. The route
+        layer validates each value against the field's `fieldType` and
+        `cardinality` (`unlimited` ⇒ array variant).
+      oneOf:
+        - { type: string }
+        - { type: array, items: { type: string } }
+        - { type: number }
+        - { type: array, items: { type: number } }
+        - { type: boolean }
+
+    TypedDocumentItem:
+      type: object
+      required: [documentId, typeId, values, createdBy, createdAt, updatedAt]
+      properties:
+        documentId: { type: string, format: uuid }
+        typeId:
+          type: string
+          description: References the DocumentType this instance conforms to.
+        values:
+          type: object
+          description: Map of fieldId → TypedDocumentValue.
+          additionalProperties: { $ref: '#/components/schemas/TypedDocumentValue' }
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateTypedDocumentRequest:
+      type: object
+      required: [typeId]
+      properties:
+        typeId: { type: string }
+        values:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/TypedDocumentValue' }
+
+    # PATCH accepts either { values: {...} } or { field, value } shorthand.
+    UpdateTypedDocumentRequest:
+      oneOf:
+        - type: object
+          required: [values]
+          properties:
+            values:
+              type: object
+              additionalProperties: { $ref: '#/components/schemas/TypedDocumentValue' }
+        - type: object
+          required: [field, value]
+          properties:
+            field: { type: string, description: fieldId of the value to update. }
+            value: { $ref: '#/components/schemas/TypedDocumentValue' }
+
+    # Discriminated union — `operation` selects which fields are required.
+    BulkTypedDocumentsRequest:
+      type: object
+      required: [operation]
+      properties:
+        operation:
+          type: string
+          enum: [create, update, delete]
+        typeId:
+          type: string
+          description: Required when `operation=create`.
+        items:
+          type: array
+          maxItems: 100
+          description: |
+            Required when `operation=create`. Each entry is the `values`
+            object (fieldId → TypedDocumentValue map).
+          items:
+            type: object
+            additionalProperties: { $ref: '#/components/schemas/TypedDocumentValue' }
+        updates:
+          type: array
+          maxItems: 100
+          description: Required when `operation=update`.
+          items:
+            type: object
+            required: [documentId, values]
+            properties:
+              documentId: { type: string }
+              values:
+                type: object
+                additionalProperties: { $ref: '#/components/schemas/TypedDocumentValue' }
+        documentIds:
+          type: array
+          maxItems: 100
+          description: Required when `operation=delete`.
+          items: { type: string }
+
+    BulkTypedDocumentsResponse:
+      type: object
+      description: Exactly one of `created`, `updated`, or `deleted` is set.
+      properties:
+        created: { type: integer }
+        updated: { type: integer }
+        deleted: { type: integer }
+
+    BulkImportError:
+      type: object
+      required: [row, reason, rawRow]
+      properties:
+        row:
+          type: integer
+          description: 1-based CSV row number (header is row 1).
+        reason: { type: string }
+        rawRow:
+          type: object
+          additionalProperties: { type: string }
+          description: Original CSV row as a column → string map.
+
+    BulkImportResponse:
+      type: object
+      required: [imported, failed, columns, errors]
+      properties:
+        imported: { type: integer }
+        failed: { type: integer }
+        columns:
+          type: array
+          items: { type: string }
+          description: Original CSV column order (for failed-row CSV rebuild).
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/BulkImportError' }
