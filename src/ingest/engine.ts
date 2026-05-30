@@ -42,7 +42,12 @@ import {
   recordIngestQueueDepthDelta,
   recordIngestMappingConfidence,
   recordIngestDlqDepthDelta,
+  recordIngestLeaderAcquired,
+  recordIngestLeaderSkipped,
+  recordIngestLeaderError,
+  recordIngestLeaderLeaseLost,
 } from '../observability/metrics';
+import log from '../lib/logger';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -108,6 +113,15 @@ function createDefaultLeaderLock(): LeasedKVLock {
     lockKey: LEADER_LOCK_KEY,
     ttlMs: LEADER_LEASE_TTL_MS,
     ownerId: `${process.pid}@${hostname()}-${randomUUID()}`,
+    onLeaseLost: () => {
+      // Heartbeat-renewal failure — DDB hiccup, clock skew, or row
+      // overwritten. The next tickSchedule() will re-race start() cleanly.
+      recordIngestLeaderLeaseLost();
+      log.warn(
+        { lockKey: LEADER_LOCK_KEY },
+        '[ingest-engine] leader lease lost (heartbeat renewal failed)',
+      );
+    },
   });
 }
 
@@ -174,8 +188,25 @@ export class IngestEngine {
    */
   private async tickSchedule(): Promise<void> {
     if (!this.running) return;
-    const acquired = await this.leaderLock.start();
-    if (!acquired) return;
+    let acquired: boolean;
+    try {
+      acquired = await this.leaderLock.start();
+    } catch (err: unknown) {
+      // Treat any unexpected throw as non-acquired so a sick DDB doesn't
+      // crash the setInterval callback as an unhandled rejection. The next
+      // tick will re-race cleanly.
+      recordIngestLeaderError();
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        '[ingest-engine] leader lock acquire failed (treating as non-leader)',
+      );
+      return;
+    }
+    if (!acquired) {
+      recordIngestLeaderSkipped();
+      return;
+    }
+    recordIngestLeaderAcquired();
     await this.evaluateSchedules();
   }
 

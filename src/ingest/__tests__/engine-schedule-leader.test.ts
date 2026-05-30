@@ -27,7 +27,18 @@ jest.mock('../../observability/metrics', () => ({
     recordIngestQueueDepthDelta: jest.fn(),
     recordIngestMappingConfidence: jest.fn(),
     recordIngestDlqDepthDelta: jest.fn(),
+    recordIngestLeaderAcquired: jest.fn(),
+    recordIngestLeaderSkipped: jest.fn(),
+    recordIngestLeaderError: jest.fn(),
+    recordIngestLeaderLeaseLost: jest.fn(),
 }));
+
+import {
+    recordIngestLeaderAcquired,
+    recordIngestLeaderSkipped,
+    recordIngestLeaderError,
+    recordIngestLeaderLeaseLost,
+} from '../../observability/metrics';
 
 function makeSource(overrides: Partial<IngestSource> = {}): IngestSource {
     return {
@@ -195,5 +206,117 @@ describe('IngestEngine — leader-elect schedule timer (Phase 54.6.3b / M4.3a-fo
         await engine.stop(); // second stop must be a no-op
 
         expect(store.spy.releaseIfOwner).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('IngestEngine — leader-lock observability (hub#1150)', () => {
+    beforeEach(() => {
+        jest.clearAllMocks();
+    });
+
+    test('leader path increments ingest_leader_acquired_total', async () => {
+        const { lock } = makeLockWithStore({ firstClaimSucceeds: true });
+        const engine = new IngestEngine(makeDeps({
+            sourceRepository: makeSourceRepo([]),
+            leaderLock: lock,
+        }));
+
+        await engine.start();
+        await tickOnce(engine);
+
+        expect(recordIngestLeaderAcquired).toHaveBeenCalledTimes(1);
+        expect(recordIngestLeaderSkipped).not.toHaveBeenCalled();
+        expect(recordIngestLeaderError).not.toHaveBeenCalled();
+
+        await engine.stop();
+    });
+
+    test('contention path increments ingest_leader_skipped_total (and NOT acquired/errors)', async () => {
+        const { lock } = makeLockWithStore({ firstClaimSucceeds: false });
+        const engine = new IngestEngine(makeDeps({
+            sourceRepository: makeSourceRepo([]),
+            leaderLock: lock,
+        }));
+
+        await engine.start();
+        await tickOnce(engine);
+
+        expect(recordIngestLeaderSkipped).toHaveBeenCalledTimes(1);
+        expect(recordIngestLeaderAcquired).not.toHaveBeenCalled();
+        expect(recordIngestLeaderError).not.toHaveBeenCalled();
+
+        await engine.stop();
+    });
+
+    test('store-throws path increments ingest_leader_errors_total and treats as non-leader', async () => {
+        // Build a lock whose tryClaim throws — the engine should catch
+        // the throw, increment errors, skip evaluateSchedules, and let
+        // the next tick re-race.
+        const throwingStore: LeaseStore = {
+            tryClaim: jest.fn(async () => {
+                throw new Error('ddb-down');
+            }),
+            renewIfOwner: jest.fn(),
+            releaseIfOwner: jest.fn(),
+        };
+        const lock = new LeasedKVLock({
+            store: throwingStore,
+            lockKey: 'INGEST_SCHEDULE_LOCK#evaluator-test',
+            ttlMs: 30_000,
+            ownerId: 'test-owner',
+        });
+        const sourceRepo = makeSourceRepo([makeSource()]);
+        const engine = new IngestEngine(makeDeps({
+            sourceRepository: sourceRepo,
+            leaderLock: lock,
+        }));
+
+        await engine.start();
+        await tickOnce(engine);
+
+        expect(recordIngestLeaderError).toHaveBeenCalledTimes(1);
+        expect(recordIngestLeaderAcquired).not.toHaveBeenCalled();
+        expect(recordIngestLeaderSkipped).not.toHaveBeenCalled();
+        // evaluateSchedules must NOT have run on an error path.
+        expect(sourceRepo.listByStatus).not.toHaveBeenCalled();
+
+        await engine.stop();
+    });
+
+    test('onLeaseLost callback increments ingest_leader_lease_lost_total', async () => {
+        // Drive the createDefaultLeaderLock branch indirectly: build a
+        // lock that *we* construct with onLeaseLost wired to the recorder,
+        // then simulate a failed heartbeat by invoking start() then
+        // making renewIfOwner throw. We bypass the timer and call the
+        // private heartbeat() method, mirroring how the LeasedKVLock
+        // implementation handles renewal failures.
+        let leaseLostFired = false;
+        const store = makeInMemoryLeaseStore({ firstClaimSucceeds: true });
+        const lock = new LeasedKVLock({
+            store,
+            lockKey: 'INGEST_SCHEDULE_LOCK#evaluator-test',
+            ttlMs: 30_000,
+            heartbeatIntervalMs: 30_000, // long enough we don't auto-fire
+            ownerId: 'test-owner',
+            onLeaseLost: () => {
+                leaseLostFired = true;
+                recordIngestLeaderLeaseLost();
+            },
+        });
+
+        // Acquire the lease, then arrange for the next renew to throw.
+        expect(await lock.start()).toBe(true);
+        (store.renewIfOwner as jest.Mock).mockRejectedValueOnce(new Error('not owner'));
+
+        // Drive the heartbeat private method directly (precedent in the
+        // LeasedKVLock dist source — the test imports it via the lock
+        // instance). If the implementation renamed the method, this
+        // test will surface that.
+        await (lock as unknown as { heartbeat: () => Promise<void> }).heartbeat();
+
+        expect(leaseLostFired).toBe(true);
+        expect(recordIngestLeaderLeaseLost).toHaveBeenCalledTimes(1);
+
+        await lock.stop();
     });
 });

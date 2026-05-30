@@ -46,6 +46,10 @@ import {
   recordSchedulerLeaderAcquired,
   recordSchedulerLeaderError,
   recordSchedulerLeaderSkipped,
+  recordIngestLeaderAcquired,
+  recordIngestLeaderSkipped,
+  recordIngestLeaderError,
+  recordIngestLeaderLeaseLost,
   recordTypedDocumentBulkImported,
   recordTypedDocumentCreated,
   recordTypedDocumentValidationError,
@@ -632,6 +636,53 @@ describe('scheduler leader-lock metrics', () => {
     expect(text).toContain('scheduler_leader_acquired_total');
     expect(text).toContain('scheduler_leader_skipped_total');
     expect(text).toContain('scheduler_leader_errors_total');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ingest-engine leader-lock metrics (hub#1150)
+// ---------------------------------------------------------------------------
+
+describe('ingest-engine leader-lock metrics', () => {
+  it('recordIngestLeaderAcquired increments ingest_leader_acquired_total', () => {
+    recordIngestLeaderAcquired();
+    recordIngestLeaderAcquired();
+    expect(
+      counterValue(getRegistry().getSnapshot().metrics, 'ingest_leader_acquired_total'),
+    ).toBe(2);
+  });
+
+  it('recordIngestLeaderSkipped increments ingest_leader_skipped_total', () => {
+    recordIngestLeaderSkipped();
+    expect(
+      counterValue(getRegistry().getSnapshot().metrics, 'ingest_leader_skipped_total'),
+    ).toBe(1);
+  });
+
+  it('recordIngestLeaderError increments ingest_leader_errors_total', () => {
+    recordIngestLeaderError();
+    expect(
+      counterValue(getRegistry().getSnapshot().metrics, 'ingest_leader_errors_total'),
+    ).toBe(1);
+  });
+
+  it('recordIngestLeaderLeaseLost increments ingest_leader_lease_lost_total', () => {
+    recordIngestLeaderLeaseLost();
+    expect(
+      counterValue(getRegistry().getSnapshot().metrics, 'ingest_leader_lease_lost_total'),
+    ).toBe(1);
+  });
+
+  it('renderPrometheusText includes all 4 ingest_leader_* series', () => {
+    recordIngestLeaderAcquired();
+    recordIngestLeaderSkipped();
+    recordIngestLeaderError();
+    recordIngestLeaderLeaseLost();
+    const text = renderPrometheusText();
+    expect(text).toContain('ingest_leader_acquired_total');
+    expect(text).toContain('ingest_leader_skipped_total');
+    expect(text).toContain('ingest_leader_errors_total');
+    expect(text).toContain('ingest_leader_lease_lost_total');
   });
 });
 

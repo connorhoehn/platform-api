@@ -510,6 +510,55 @@ export function recordSchedulerLeaderError(): void {
   schedulerLeaderErrorsTotal.inc();
 }
 
+// ---------------------------------------------------------------------------
+// Ingest-engine leader-lock metrics (hub#1150)
+// ---------------------------------------------------------------------------
+//
+// Mirror of the scheduler_leader_* shape, but for the IngestEngine schedule
+// timer (src/ingest/engine.ts). The engine wraps DC's LeasedKVLock (long-
+// lived heartbeat lease) so it gets one extra observable event over the
+// per-tick scheduler lock: `onLeaseLost`, fired when a heartbeat renewal
+// fails after a successful claim. Without these counters a sick DDB or a
+// flapping network silently degrades ingest-sync firing to single-replica
+// behavior, with no log.warn at all (the engine's tickSchedule did not even
+// try/catch the start() call before this metric pass).
+const ingestLeaderAcquiredTotal = registry.counter(
+  'ingest_leader_acquired_total',
+  BASE_LABELS,
+  'IngestEngine tick attempts that won the DDB lease and ran evaluateSchedules.',
+);
+const ingestLeaderSkippedTotal = registry.counter(
+  'ingest_leader_skipped_total',
+  BASE_LABELS,
+  'IngestEngine tick attempts that yielded (another replica holds the lease).',
+);
+const ingestLeaderErrorsTotal = registry.counter(
+  'ingest_leader_errors_total',
+  BASE_LABELS,
+  'IngestEngine tick attempts where the lease store threw on start() (treated as non-leader).',
+);
+const ingestLeaderLeaseLostTotal = registry.counter(
+  'ingest_leader_lease_lost_total',
+  BASE_LABELS,
+  'IngestEngine leases lost mid-lifetime when LeasedKVLock heartbeat-renewal failed.',
+);
+
+export function recordIngestLeaderAcquired(): void {
+  ingestLeaderAcquiredTotal.inc();
+}
+
+export function recordIngestLeaderSkipped(): void {
+  ingestLeaderSkippedTotal.inc();
+}
+
+export function recordIngestLeaderError(): void {
+  ingestLeaderErrorsTotal.inc();
+}
+
+export function recordIngestLeaderLeaseLost(): void {
+  ingestLeaderLeaseLostTotal.inc();
+}
+
 // Renders the registry snapshot as Prometheus 0.0.4 text format.
 // Suitable for `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
 export function renderPrometheusText(): string {
