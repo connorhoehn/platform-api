@@ -3,9 +3,9 @@
 # OpenAPI 3.1 spec for the social surface of platform-api.
 #
 # Coverage status (per hub#1009 option B + blocker #33 re-shape):
-#   - /profiles/*       full schemas  (this commit — hub#1103)
-#   - /social/*         full schemas  (this commit — hub#1103)
-#   - /groups           skeleton      (hub#1104 follow-up)
+#   - /profiles/*       full schemas  (hub#1103)
+#   - /social/*         full schemas  (hub#1103)
+#   - /groups           full schemas  (hub#1104)
 #   - /groups/{id}/*    skeleton      (hub#1105 follow-up)
 #   - /rooms/*, /posts  skeleton      (hub#1106 / hub#1107 follow-ups)
 #   - /activity         skeleton      (hub#1106 follow-up)
@@ -18,6 +18,10 @@
 #   src/routes/profiles.ts
 #   src/routes/social.ts
 #   src/repositories/ProfileRepository.ts (ProfileItem interface)
+#
+# Authoritative source for /groups (CRUD) shapes:
+#   src/routes/groups.ts
+#   src/repositories/GroupRepository.ts (GroupItem + GroupMemberItem interfaces)
 
 openapi: 3.1.0
 
@@ -43,7 +47,9 @@ tags:
   - name: follow-graph
     description: Follow / unfollow + follower / following / mutual-friend lists.
   - name: groups
-    description: Group CRUD + membership (skeleton — schemas pending).
+    description: Group CRUD. Membership operations live under the `group-membership` tag.
+  - name: group-membership
+    description: Group membership, invitations, join/leave, and group-owned chat rooms (skeleton — schemas pending).
   - name: rooms
     description: Chat rooms + room membership (skeleton — schemas pending). Distinct from video.yaml's hangout rooms.
   - name: posts
@@ -271,26 +277,118 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
-  # --- groups (skeleton — see hub#1104 / #1105) ---------------------------
-  '/groups':
+  # --- groups CRUD (full schemas) -----------------------------------------
+  /groups:
     post:
-      summary: TODO — schema pending (groups.ts)
       tags: [groups]
-      responses: { '200': { description: OK } }
-  '/groups/{groupId}':
+      summary: Create a group
+      description: |
+        Creator becomes the owner (role=`owner`) in the same transaction.
+        Returns the new GroupItem with `role` populated to `owner`.
+      operationId: createGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateGroupRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupWithCallerRole' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Transaction conflict — retry once.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /groups/{groupId}:
+    parameters:
+      - $ref: '#/components/parameters/GroupIdPath'
     get:
-      summary: TODO — schema pending (groups.ts)
       tags: [groups]
-      responses: { '200': { description: OK } }
+      summary: Fetch one group (visibility-gated)
+      description: |
+        Private groups are 403 to non-members. `role` is the caller's
+        role in this group, or `null` when the caller is not a member.
+      operationId: getGroup
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupWithCallerRole' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Group is private and the caller is not a member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
     delete:
-      summary: TODO — schema pending (groups.ts)
       tags: [groups]
-      responses: { '200': { description: OK } }
-  '/groups/{groupId}/visibility':
+      summary: Delete a group (owner only)
+      operationId: deleteGroup
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is not the group owner.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /groups/{groupId}/visibility:
+    parameters:
+      - $ref: '#/components/parameters/GroupIdPath'
     patch:
-      summary: TODO — schema pending (groups.ts)
       tags: [groups]
-      responses: { '200': { description: OK } }
+      summary: Toggle group visibility (owner only)
+      operationId: updateGroupVisibility
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [visibility]
+              properties:
+                visibility: { $ref: '#/components/schemas/GroupVisibility' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupItem' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is not the group owner.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
   '/groups/{groupId}/members':
     get:
       summary: TODO — schema pending (group-members.ts)
@@ -448,6 +546,12 @@ components:
       required: true
       schema: { type: string }
       description: Target user identifier (Cognito sub).
+    GroupIdPath:
+      in: path
+      name: groupId
+      required: true
+      schema: { type: string, format: uuid }
+      description: Group identifier (UUID, minted at create time).
 
   responses:
     BadRequest:
@@ -526,3 +630,64 @@ components:
         visibility:
           type: string
           enum: [public, private]
+
+    # --- groups ---------------------------------------------------------
+    GroupVisibility:
+      type: string
+      enum: [public, private]
+
+    GroupMemberRole:
+      type: string
+      enum: [owner, admin, member]
+
+    # Full group row. Returned by GET /groups/{id} (wrapped in
+    # GroupWithCallerRole) and PATCH /groups/{id}/visibility.
+    GroupItem:
+      type: object
+      required: [groupId, name, description, visibility, ownerId, createdAt, updatedAt]
+      properties:
+        groupId: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 100 }
+        description: { type: string, maxLength: 500 }
+        visibility: { $ref: '#/components/schemas/GroupVisibility' }
+        ownerId: { type: string, description: userId of the group owner. }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    # GroupItem + caller's role in the group. `role` is null when the
+    # caller is not a member (only possible on public groups).
+    GroupWithCallerRole:
+      allOf:
+        - $ref: '#/components/schemas/GroupItem'
+        - type: object
+          required: [role]
+          properties:
+            role:
+              oneOf:
+                - $ref: '#/components/schemas/GroupMemberRole'
+                - type: 'null'
+              description: Caller's role in this group; null if not a member.
+
+    CreateGroupRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        description: { type: string, maxLength: 500 }
+        visibility:
+          $ref: '#/components/schemas/GroupVisibility'
+
+    # Membership row — used by group-membership endpoints (hub#1105).
+    GroupMemberItem:
+      type: object
+      required: [groupId, userId, role, joinedAt]
+      properties:
+        groupId: { type: string, format: uuid }
+        userId: { type: string }
+        role: { $ref: '#/components/schemas/GroupMemberRole' }
+        status:
+          type: string
+          enum: [invited, active]
+          description: Set to `invited` for pending invitations; `active` once accepted.
+        joinedAt: { type: string, format: date-time }
+        invitedAt: { type: string, format: date-time }
