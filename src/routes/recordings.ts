@@ -26,6 +26,7 @@ import { callRecordingRepo, videoSessionRepo } from '../repositories';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { VIDEO_API_URL, VIDEO_PUBLIC_URL } from '../lib/video-auth';
+import { callSfu, mapSfuError } from '../lib/sfu-breaker';
 import {
   asyncHandler,
   AppError,
@@ -147,7 +148,11 @@ recordingsRouter.post(
       if (streamKey) {
         headers.Authorization = `Bearer ${streamKey}`;
       }
-      const lvsRes = await fetch(
+      // Routed through the shared SFU CircuitBreaker (hub#1001) — an open
+      // circuit fast-fails before fetch, and any 5xx from LVS counts as a
+      // breaker failure so other LVS-touching routes (videoSessions.ts) see
+      // the trip too.
+      const lvsRes = await callSfu(
         `${VIDEO_API_URL}/api/channels/${encodeURIComponent(arn)}/playback-tokens`,
         {
           method: 'POST',
@@ -170,8 +175,21 @@ recordingsRouter.post(
         expiresAt = body.expiresAt;
       }
     } catch (e: any) {
-      log.error({ err: e?.message ?? e, recordingId }, '[recordings] playback-token proxy failed');
-      throw new AppError(502, 'playback-token mint failed');
+      // Capture upstream error class + message for triage (hub#1004).
+      // callSfu rejections carry breaker/timeout/upstream context that the
+      // generic "playback-token proxy failed" string would otherwise lose.
+      const errName = e?.name ?? 'Error';
+      const errMessage = e?.message ?? String(e);
+      log.error(
+        { errorName: errName, errorMessage: errMessage, recordingId },
+        '[recordings] playback-token proxy failed',
+      );
+      // Preserve AppError shape if the inner branch threw one (it already
+      // chose the right 502 + message); otherwise translate breaker /
+      // timeout / unreachable into the right status via mapSfuError so the
+      // client sees 503 fast-fail / 504 timeout instead of a uniform 502.
+      if (e instanceof AppError) throw e;
+      throw mapSfuError(e);
     }
 
     // Compose the playable URL. DVR playlist over the recording's time
