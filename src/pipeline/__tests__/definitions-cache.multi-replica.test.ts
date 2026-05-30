@@ -22,6 +22,7 @@ import { describe, it, expect, jest, beforeEach } from '@jest/globals';
 
 jest.mock('../../observability/metrics', () => ({
   recordCacheAccess: jest.fn(),
+  recordPipelineDefinitionsRefresh: jest.fn(),
 }));
 
 jest.mock('../../lib/logger', () => ({
