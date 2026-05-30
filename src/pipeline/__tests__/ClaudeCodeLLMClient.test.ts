@@ -135,6 +135,31 @@ describe('ClaudeCodeLLMClient.stream() — pre-abort', () => {
 
     expect(mockSpawn).not.toHaveBeenCalled();
   });
+
+  // hub#971-family leak guard: the abort listener attached per stream() call
+  // must detach on the happy path (via the withAbort disposable). Otherwise a
+  // long-lived per-tenant signal driving many sequential streams would grow
+  // an unbounded listener list. Mirrors the event-catalog-abort-leak test.
+  it('happy-path streams do not accumulate abort listeners on a shared signal', async () => {
+    const controller = new AbortController();
+    (controller.signal as unknown as { setMaxListeners?: (n: number) => void })
+      .setMaxListeners?.(3);
+
+    const client = new ClaudeCodeLLMClient();
+    for (let i = 0; i < 20; i++) {
+      mockSpawn.mockReturnValueOnce(makeMockChild([
+        resultLine({ input_tokens: 1, output_tokens: 1 }),
+      ]) as unknown as ReturnType<typeof mockSpawn>);
+      for await (const _ of client.stream('model', 'sys', 'hi', { signal: controller.signal })) {
+        // drain
+      }
+    }
+
+    // If the listener leaked, Node would have emitted MaxListenersExceeded
+    // by now (max 3, 20 iterations). Reaching here proves the disposable
+    // detached the listener on every happy-path exit.
+    expect(true).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

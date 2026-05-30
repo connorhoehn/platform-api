@@ -19,6 +19,7 @@
 import { spawn } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import type { ChildProcessByStdio } from 'node:child_process';
+import { withAbort } from 'distributed-core/common';
 import type { LLMClient, LLMChunk, LLMStreamOptions } from './LLMClient';
 
 const CLAUDE_BIN = process.env['CLAUDE_CLI_PATH'] ?? 'claude';
@@ -94,11 +95,12 @@ export class ClaudeCodeLLMClient implements LLMClient {
           stdio: ['ignore', 'pipe', 'pipe'],
         });
 
-        const onAbort = () => {
-          child.kill('SIGTERM');
-          setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, KILL_GRACE_MS);
-        };
-        signal?.addEventListener('abort', onAbort);
+        const abortReg = signal
+          ? withAbort(signal, () => {
+              child.kill('SIGTERM');
+              setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, KILL_GRACE_MS);
+            })
+          : null;
 
         const stderrChunks: Buffer[] = [];
         child.stderr.on('data', (b: Buffer) => stderrChunks.push(b));
@@ -178,7 +180,7 @@ export class ClaudeCodeLLMClient implements LLMClient {
             throw new Error(`claude exited ${code}: ${stderr || '(no stderr)'}`);
           }
         } finally {
-          signal?.removeEventListener('abort', onAbort);
+          abortReg?.dispose();
           if (child.exitCode === null && child.signalCode === null) {
             try { child.kill('SIGTERM'); } catch { /* already exited */ }
           }
