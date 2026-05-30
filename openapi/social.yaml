@@ -6,7 +6,7 @@
 #   - /profiles/*       full schemas  (hub#1103)
 #   - /social/*         full schemas  (hub#1103)
 #   - /groups           full schemas  (hub#1104)
-#   - /groups/{id}/*    skeleton      (hub#1105 follow-up)
+#   - /groups/{id}/*    full schemas  (hub#1105)
 #   - /rooms/*, /posts  skeleton      (hub#1106 / hub#1107 follow-ups)
 #   - /activity         skeleton      (hub#1106 follow-up)
 #
@@ -49,7 +49,7 @@ tags:
   - name: groups
     description: Group CRUD. Membership operations live under the `group-membership` tag.
   - name: group-membership
-    description: Group membership, invitations, join/leave, and group-owned chat rooms (skeleton — schemas pending).
+    description: Group membership, invitations, join/leave, and group-owned chat rooms.
   - name: rooms
     description: Chat rooms + room membership (skeleton — schemas pending). Distinct from video.yaml's hangout rooms.
   - name: posts
@@ -389,36 +389,235 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorBody' }
         '404':
           $ref: '#/components/responses/NotFound'
-  '/groups/{groupId}/members':
+  # --- group membership + invitations + group-rooms (full schemas) --------
+  /groups/{groupId}/members:
+    parameters:
+      - $ref: '#/components/parameters/GroupIdPath'
     get:
-      summary: TODO — schema pending (group-members.ts)
-      tags: [groups]
-      responses: { '200': { description: OK } }
-  '/groups/{groupId}/invite':
+      tags: [group-membership]
+      summary: List active members of a group (visibility-gated)
+      description: |
+        Private groups are 403 to non-members. Returned rows expose only
+        `userId`, `role`, and `joinedAt` (not the full GroupMemberItem).
+      operationId: listGroupMembers
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: '#/components/schemas/GroupMemberSummary' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Group is private and the caller is not an active member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /groups/{groupId}/invite:
+    parameters:
+      - $ref: '#/components/parameters/GroupIdPath'
     post:
-      summary: TODO — schema pending (group-members.ts)
-      tags: [groups]
-      responses: { '200': { description: OK } }
-  '/groups/{groupId}/invitations/{action}':
+      tags: [group-membership]
+      summary: Invite a user to a group (owner or admin only)
+      description: |
+        Creates a pending membership row with `status=invited`. The target
+        user accepts/declines via `POST /groups/{groupId}/invitations/{action}`.
+      operationId: inviteGroupMember
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: string, description: User to invite (cannot equal the caller). }
+      responses:
+        '201':
+          description: Invitation sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groupId, userId, status]
+                properties:
+                  groupId: { type: string, format: uuid }
+                  userId: { type: string }
+                  status:
+                    type: string
+                    enum: [invited]
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is not a group owner or admin.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Target user is already an active member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /groups/{groupId}/invitations/{action}:
+    parameters:
+      - $ref: '#/components/parameters/GroupIdPath'
+      - in: path
+        name: action
+        required: true
+        schema:
+          type: string
+          enum: [accept, decline]
+        description: |
+          `accept` flips the caller's pending membership to active.
+          `decline` removes the pending membership row entirely.
     post:
-      summary: TODO — schema pending (group-members.ts)
-      tags: [groups]
-      responses: { '200': { description: OK } }
-  '/groups/{groupId}/join':
+      tags: [group-membership]
+      summary: Accept or decline a pending group invitation
+      operationId: respondToGroupInvitation
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string }
+                  groupId:
+                    type: string
+                    format: uuid
+                    description: Present only on `accept`.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Group not found OR no pending invitation for the caller.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /groups/{groupId}/join:
+    parameters:
+      - $ref: '#/components/parameters/GroupIdPath'
     post:
-      summary: TODO — schema pending (group-members.ts)
-      tags: [groups]
-      responses: { '200': { description: OK } }
-  '/groups/{groupId}/leave':
+      tags: [group-membership]
+      summary: Self-join a public group (no invitation needed)
+      description: 403 on private groups — those require an invitation.
+      operationId: joinGroup
+      responses:
+        '201':
+          description: Joined
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groupId, userId, role]
+                properties:
+                  groupId: { type: string, format: uuid }
+                  userId: { type: string }
+                  role:
+                    type: string
+                    enum: [member]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Group is private.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Caller is already a member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /groups/{groupId}/leave:
+    parameters:
+      - $ref: '#/components/parameters/GroupIdPath'
     delete:
-      summary: TODO — schema pending (group-members.ts)
-      tags: [groups]
-      responses: { '200': { description: OK } }
-  '/groups/{groupId}/rooms':
+      tags: [group-membership]
+      summary: Leave a group (non-owner members)
+      description: |
+        Owners cannot leave — they must transfer ownership or delete the
+        group first.
+      operationId: leaveGroup
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is the group owner.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Group not found OR caller is not an active member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /groups/{groupId}/rooms:
+    parameters:
+      - $ref: '#/components/parameters/GroupIdPath'
     post:
-      summary: TODO — schema pending (group-rooms.ts)
-      tags: [groups]
-      responses: { '200': { description: OK } }
+      tags: [group-membership]
+      summary: Create a group-scoped chat room (owner or admin only)
+      description: |
+        Creates a `RoomItem` of `type=group` owned by the calling user.
+        See the `rooms` tag (hub#1106) for the full Room shape.
+      operationId: createGroupRoom
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupRoomCreatedResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is not a group owner or admin.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   # --- chat rooms (skeleton — see hub#1106) -------------------------------
   '/rooms':
@@ -676,6 +875,34 @@ components:
         description: { type: string, maxLength: 500 }
         visibility:
           $ref: '#/components/schemas/GroupVisibility'
+
+    # Narrow projection returned by GET /groups/{groupId}/members.
+    GroupMemberSummary:
+      type: object
+      required: [userId, role, joinedAt]
+      properties:
+        userId: { type: string }
+        role: { $ref: '#/components/schemas/GroupMemberRole' }
+        joinedAt: { type: string, format: date-time }
+
+    # Response body for POST /groups/{groupId}/rooms. Mirrors the RoomItem
+    # produced by group-rooms.ts (type=group + groupId carried through).
+    GroupRoomCreatedResponse:
+      type: object
+      required: [roomId, channelId, name, type, groupId, ownerId, role, createdAt]
+      properties:
+        roomId: { type: string, format: uuid }
+        channelId: { type: string, format: uuid }
+        name: { type: string }
+        type:
+          type: string
+          enum: [group]
+        groupId: { type: string, format: uuid }
+        ownerId: { type: string }
+        role:
+          type: string
+          enum: [owner]
+        createdAt: { type: string, format: date-time }
 
     # Membership row — used by group-membership endpoints (hub#1105).
     GroupMemberItem:
