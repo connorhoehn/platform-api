@@ -1,105 +1,147 @@
 // platform-api/src/middleware/rateLimit.ts
 //
-// Per-key token-bucket rate limiter, structured to match
-// `middleware/idempotency.ts`:
+// Per-key token-bucket rate limiter, backed by distributed-core's
+// `RateLimitStore` family (DC v0.41+):
 //
-//   * Redis-backed when `getRedisClient()` returns a live connection — the
-//     bucket state (`tokens`, `lastRefill`) is stored under a single key per
-//     identity and refilled lazily on each request. Multi-replica safe ONLY
-//     in Redis mode (replicas share the bucket state through the same key
-//     space).
+//   * `InMemoryRateLimitStore` (default) — per-process buckets. Same
+//     posture as before: in a multi-replica deployment each replica
+//     enforces the cap independently. Adequate for single-process
+//     platform-api and for unit tests.
 //
-//   * Falls back to a per-process `Map<string, { tokens, lastRefill }>` when
-//     Redis is unavailable so unit tests and dev work without infra. NOTE:
-//     this fallback is per-process; in a multi-replica deployment each
-//     replica would maintain its own bucket and the effective burst rate
-//     scales with replica count. Operate with Redis in production.
+//   * `RedisRateLimitStore` (opt-in via `REDIS_RATE_LIMIT=true`) —
+//     atomic single-`EVAL` per take through Redis. Multi-replica safe:
+//     replicas share bucket state through the same key namespace.
+//     Falls back to in-memory if `getRedisClient()` returns null
+//     (transient Redis outage → degrade to per-process enforcement
+//     rather than dropping the limiter).
 //
-// Algorithm — token bucket:
+// Algorithm — token bucket (implemented inside DC):
 //   - Each identity starts with `capacity` tokens.
-//   - `refillRate` tokens are added every `refillIntervalMs` (computed
-//     fractionally — a request that arrives halfway through the interval
-//     gets credit for half the refill). Tokens cap at `capacity`.
-//   - A request consumes 1 token. If `tokens < 1`, return 429 with a
-//     `Retry-After` header set to ceil(seconds until next whole token) and
-//     an RFC-7807 problem-details JSON body matching the shape used by
+//   - `refillRate` tokens are added per `refillIntervalMs` (computed
+//     fractionally — a request that arrives halfway through the
+//     interval gets credit for half the refill). Tokens cap at
+//     `capacity` (via the matching `maxBurstSeconds` derived below).
+//   - A request consumes 1 token. If `take()` returns `allowed=false`,
+//     respond 429 with a `Retry-After` header (seconds) and an
+//     RFC-7807 problem-details JSON body matching the shape used by
 //     `routes/pipelineWebhooks.ts` for 401s.
 //
-// The middleware does NOT throw on Redis hiccups — a transient Redis error
-// degrades to "allow" rather than "deny" so a Redis outage doesn't take down
-// the API. Failures are logged via structured logging.
+// The middleware does NOT throw on store hiccups — a transient
+// failure degrades to "allow" rather than "deny" so a Redis outage
+// doesn't take down the API.
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import {
+  InMemoryRateLimitStore,
+  RedisRateLimitStore,
+  type RateLimitStore,
+  type RateLimitRedisClient,
+} from 'distributed-core';
 import { getRedisClient } from '../lib/redis-client';
 import log from '../lib/logger';
 
+// Re-export DC's store type so consumers / tests can `import type { RateLimitStore }`
+// from the same module they already use.
+export type { RateLimitStore } from 'distributed-core';
+
 // ---------------------------------------------------------------------------
-// Storage abstraction — same shape as the idempotency middleware so the two
-// stay easy to compare. Tests can inject a fake without booting Redis.
+// Backing-store resolution. Stores are cached per (scope, policy) tuple so
+// repeat `createRateLimiter` calls with the same effective policy share one
+// bucket map (matches the legacy module-level `memBuckets` singleton).
 // ---------------------------------------------------------------------------
 
-/** Persisted bucket state. Both fields are required. */
-export interface BucketState {
-  tokens: number;
-  lastRefill: number; // ms epoch
+interface PolicyKey {
+  scope: string;
+  capacity: number;
+  refillRate: number;
+  refillIntervalMs: number;
 }
 
-/** Pluggable store for bucket state. Tests inject a fake; prod uses Redis. */
-export interface RateLimitStore {
-  get(key: string): Promise<BucketState | null>;
-  /** TTL is informational — Redis sets EXPIRE so abandoned buckets reap. */
-  set(key: string, state: BucketState, ttlSeconds: number): Promise<void>;
+function policyCacheKey(k: PolicyKey): string {
+  return `${k.scope}|${k.capacity}|${k.refillRate}|${k.refillIntervalMs}`;
 }
 
-// Per-process fallback used when Redis is unavailable.
-const memBuckets = new Map<string, BucketState>();
+const storeCache = new Map<string, Promise<RateLimitStore>>();
 
-function memStore(): RateLimitStore {
-  return {
-    async get(key) {
-      return memBuckets.get(key) ?? null;
-    },
-    async set(key, state, _ttlSeconds) {
-      memBuckets.set(key, { ...state });
-    },
-  };
+/**
+ * Test-only: clear all cached backing stores so suites don't leak state
+ * across tests. Kept under the legacy name so the dozen existing call sites
+ * (pipelineDLQ.test.ts, pipelineTriggers.integration.test.ts, …) don't need
+ * to be touched.
+ */
+export function _resetRateLimitMemFallback(): void {
+  storeCache.clear();
 }
 
 /**
- * Test-only: clear the in-memory fallback so suites don't leak state across
- * tests. Has no effect on Redis (which has its own TTL).
+ * Adapt the platform-api `redis` (node-redis v5) client to DC's positional
+ * `eval(script, numKeys, ...args)` + `del(key)` shape. Node-redis v5 uses
+ * `eval(script, { keys, arguments })`; DC's `RateLimitStore.d.ts` calls out
+ * the wrap-or-adapt step explicitly. The adapter is the smallest possible
+ * surface — only the two methods DC actually invokes.
  */
-export function _resetRateLimitMemFallback(): void {
-  memBuckets.clear();
-}
-
-async function resolveStore(override?: RateLimitStore | null): Promise<RateLimitStore> {
-  if (override) return override;
-  const client = await getRedisClient();
-  if (!client) return memStore();
+function redisAdapter(client: Awaited<ReturnType<typeof getRedisClient>>): RateLimitRedisClient | null {
+  if (!client) return null;
   return {
-    async get(key) {
-      const raw = await client.get(key);
-      if (typeof raw !== 'string' || raw.length === 0) return null;
-      try {
-        const parsed = JSON.parse(raw) as Partial<BucketState>;
-        if (
-          typeof parsed.tokens !== 'number' ||
-          typeof parsed.lastRefill !== 'number' ||
-          !Number.isFinite(parsed.tokens) ||
-          !Number.isFinite(parsed.lastRefill)
-        ) {
-          return null;
-        }
-        return { tokens: parsed.tokens, lastRefill: parsed.lastRefill };
-      } catch {
-        return null;
-      }
+    async eval(script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown> {
+      const keys = args.slice(0, numKeys).map(String);
+      const argv = args.slice(numKeys).map(String);
+      return (client as unknown as {
+        eval: (s: string, opts: { keys: string[]; arguments: string[] }) => Promise<unknown>;
+      }).eval(script, { keys, arguments: argv });
     },
-    async set(key, state, ttlSeconds) {
-      await client.set(key, JSON.stringify(state), { EX: ttlSeconds });
+    async del(key: string): Promise<unknown> {
+      return (client as unknown as { del: (k: string) => Promise<unknown> }).del(key);
     },
   };
+}
+
+function redisRateLimitOn(): boolean {
+  const v = process.env['REDIS_RATE_LIMIT'];
+  return v === 'true' || v === '1';
+}
+
+async function buildBackingStore(k: PolicyKey): Promise<RateLimitStore> {
+  // DC's RateLimitStore takes tokens/sec; we expose tokens-per-interval.
+  const tokensPerSecond = (k.refillRate * 1000) / k.refillIntervalMs;
+  // Tune `maxBurstSeconds` so that the effective max tokens equals
+  // `capacity` (DC takes the min of `capacity` and `refillRate * maxBurstSeconds`).
+  const maxBurstSeconds = Math.max(1, Math.ceil(k.capacity / tokensPerSecond));
+
+  if (redisRateLimitOn()) {
+    try {
+      const adapter = redisAdapter(await getRedisClient());
+      if (adapter) {
+        return new RedisRateLimitStore({
+          client: adapter,
+          capacity: k.capacity,
+          refillRate: tokensPerSecond,
+          maxBurstSeconds,
+          keyPrefix: 'ratelimit',
+        });
+      }
+      log.warn({ scope: k.scope }, 'REDIS_RATE_LIMIT=true but redis client unavailable; using in-memory store');
+    } catch (err) {
+      log.warn({ err: (err as Error).message, scope: k.scope }, 'redis store init failed; falling back to in-memory');
+    }
+  }
+
+  return new InMemoryRateLimitStore({
+    capacity: k.capacity,
+    refillRate: tokensPerSecond,
+    maxBurstSeconds,
+  });
+}
+
+async function resolveStore(k: PolicyKey, override?: RateLimitStore | null): Promise<RateLimitStore> {
+  if (override) return override;
+  const cacheKey = policyCacheKey(k);
+  let pending = storeCache.get(cacheKey);
+  if (!pending) {
+    pending = buildBackingStore(k);
+    storeCache.set(cacheKey, pending);
+  }
+  return pending;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,22 +158,17 @@ export interface RateLimitOptions {
   /** Identity extractor. Returns the bucket key (typically userId or IP). */
   key: (req: Request) => string;
   /**
-   * Optional logical scope to namespace the Redis key — lets multiple
-   * limiters share the same store without colliding (e.g. `pipeline-trigger`
+   * Optional logical scope to namespace the bucket — lets multiple limiters
+   * share the same backing store without colliding (e.g. `pipeline-trigger`
    * vs `pipeline-cancel`). Defaults to `'default'`.
    */
   scope?: string;
   /**
    * Test-only hook to inject a fake store. When omitted, the middleware
-   * lazily resolves Redis (and falls back to the in-memory map).
+   * lazily resolves the policy-cached InMemoryRateLimitStore (or
+   * RedisRateLimitStore when `REDIS_RATE_LIMIT=true`).
    */
   store?: RateLimitStore | null;
-  /**
-   * Optional clock injection for deterministic tests. Defaults to
-   * `Date.now()`. Note: jest fake timers also move `Date.now`, so most tests
-   * don't need this.
-   */
-  now?: () => number;
 }
 
 /**
@@ -162,20 +199,12 @@ export function createRateLimiter(opts: RateLimitOptions): RequestHandler {
   }
 
   const scope = opts.scope ?? 'default';
-  const now = opts.now ?? ((): number => Date.now());
-
-  // Tokens-per-millisecond rate. Used for both lazy refill and the
-  // Retry-After computation.
-  const tokensPerMs = opts.refillRate / opts.refillIntervalMs;
-
-  // TTL for abandoned buckets — set generously so we don't churn Redis
-  // writes for every tick, but short enough that idle keys reap. Two refill
-  // intervals beyond a full bucket is plenty: after that, a new bucket would
-  // start at full capacity anyway.
-  const ttlSeconds = Math.max(
-    60,
-    Math.ceil((opts.refillIntervalMs * (opts.capacity / opts.refillRate) * 2) / 1000),
-  );
+  const policy: PolicyKey = {
+    scope,
+    capacity: opts.capacity,
+    refillRate: opts.refillRate,
+    refillIntervalMs: opts.refillIntervalMs,
+  };
 
   return async function rateLimitMiddleware(
     req: Request,
@@ -188,53 +217,28 @@ export function createRateLimiter(opts: RateLimitOptions): RequestHandler {
       next();
       return;
     }
-    const cacheKey = `ratelimit:${scope}:${identity}`;
+    const cacheKey = `${scope}:${identity}`;
 
     let store: RateLimitStore;
     try {
-      store = await resolveStore(opts.store);
+      store = await resolveStore(policy, opts.store);
     } catch (err) {
-      log.warn({ err: (err as Error).message, scope: opts.scope, identity }, 'rateLimit failed to resolve store; failing open');
+      log.warn({ err: (err as Error).message, scope, identity }, 'rateLimit failed to resolve store; failing open');
       next();
       return;
     }
 
-    let state: BucketState | null;
+    let result;
     try {
-      state = await store.get(cacheKey);
+      result = await store.take(cacheKey, 1);
     } catch (err) {
-      log.warn({ err: (err as Error).message, scope: opts.scope, identity, cacheKey }, 'rateLimit store.get failed; failing open');
+      log.warn({ err: (err as Error).message, scope, identity, cacheKey }, 'rateLimit store.take failed; failing open');
       next();
       return;
     }
 
-    const t = now();
-    if (!state) {
-      state = { tokens: opts.capacity, lastRefill: t };
-    } else {
-      // Lazy refill — credit the bucket for time elapsed since lastRefill.
-      const elapsedMs = Math.max(0, t - state.lastRefill);
-      const refilled = elapsedMs * tokensPerMs;
-      state = {
-        tokens: Math.min(opts.capacity, state.tokens + refilled),
-        lastRefill: t,
-      };
-    }
-
-    if (state.tokens < 1) {
-      // Compute time until the bucket holds one whole token. `tokensPerMs`
-      // is positive (validated at construction), so this is finite.
-      const msUntilNextToken = (1 - state.tokens) / tokensPerMs;
-      const retryAfterSec = Math.max(1, Math.ceil(msUntilNextToken / 1000));
-
-      // Persist the (refilled) state so concurrent requests see the same
-      // negative-ish budget and don't all race past it.
-      try {
-        await store.set(cacheKey, state, ttlSeconds);
-      } catch (err) {
-        log.warn({ err: (err as Error).message, scope: opts.scope, identity, cacheKey }, 'rateLimit store.set failed (continuing)');
-      }
-
+    if (!result.allowed) {
+      const retryAfterSec = Math.max(1, Math.ceil(result.retryAfterMs / 1000));
       const problem: RateLimitedProblem = {
         type: 'about:blank',
         title: 'Too Many Requests',
@@ -247,13 +251,6 @@ export function createRateLimiter(opts: RateLimitOptions): RequestHandler {
       return;
     }
 
-    // Consume one token + persist.
-    state.tokens -= 1;
-    try {
-      await store.set(cacheKey, state, ttlSeconds);
-    } catch (err) {
-      log.warn({ err: (err as Error).message, scope: opts.scope, identity, cacheKey }, 'rateLimit store.set failed (allowing request)');
-    }
     next();
   };
 }
@@ -261,7 +258,7 @@ export function createRateLimiter(opts: RateLimitOptions): RequestHandler {
 // ---------------------------------------------------------------------------
 // Preconfigured limiter for pipeline READ endpoints (GET /api/pipelines/*).
 //
-// Policy: 60 req / min / user, bursting up to 60. Keyed by Cognito sub with
+// Policy: 200 req / min / user, bursting up to 200. Keyed by Cognito sub with
 // IP fallback for the unauthed edge cases (shouldn't happen behind
 // `requireAuth`, but defensive). Scope `pipeline:read` namespaces the bucket
 // independently from the trigger / cancel / approval limiters so a heavy
@@ -283,7 +280,6 @@ export function pipelineReadRateLimit(
   storeOverride?: RateLimitStore | null,
 ): RequestHandler {
   return createRateLimiter({
-    // 200 / min — high enough for 500ms polling during active runs.
     capacity: 200,
     refillRate: 200,
     refillIntervalMs: 60_000,
@@ -296,17 +292,6 @@ export function pipelineReadRateLimit(
 // ---------------------------------------------------------------------------
 // Preconfigured limiter for pipeline destructive WRITE endpoints — currently
 // `POST /api/pipelines/dlq/redrive` and `POST /api/pipelines/dlq/purge`.
-//
-// Tighter budget than the read limiter: 10 writes / min / user, no burst
-// beyond the per-minute budget. The intent is operator-grade safety — a
-// fat-finger script that POSTs `{ids: [...]}` in a tight loop will 429
-// well before re-fanning hundreds of failed events across the bus. Trigger,
-// cancel, and approval routes have their own per-route limiters with their
-// own budgets; this one is namespaced (`pipeline:write`) so it does not
-// share a bucket with them.
-//
-// Mounted at the router level on the DLQ POST routes (not via app.ts mount)
-// so it ships co-located with the destructive endpoints.
 // ---------------------------------------------------------------------------
 
 /**

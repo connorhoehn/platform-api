@@ -1,9 +1,10 @@
 // Tests for the per-key token-bucket rate limiter middleware.
 //
 // Mirrors the test rig used in `idempotency.test.ts` — minimal Express-shaped
-// req/res mocks, no supertest dependency. Uses an injected fake store so
-// Redis is never touched. Refill timing is exercised via jest fake timers
-// (Date.now is moved by `jest.advanceTimersByTime`).
+// req/res mocks, no supertest dependency. Tests assert observable behaviour
+// (passes / 429s, headers, body shape, refill timing under fake timers)
+// rather than poking the underlying bucket state, which is now opaque
+// behind DC's `RateLimitStore.take()` interface.
 //
 // Coverage:
 //   - under-limit request returns 200 and consumes a token
@@ -23,8 +24,6 @@ jest.mock('../../lib/redis-client', () => ({
 import {
   _resetRateLimitMemFallback,
   createRateLimiter,
-  type BucketState,
-  type RateLimitStore,
   type RateLimitedProblem,
 } from '../rateLimit';
 
@@ -119,32 +118,6 @@ async function runOnce(
   return { res, passed };
 }
 
-// ---------------------------------------------------------------------------
-// Fake store — gives us full visibility into persisted state.
-// ---------------------------------------------------------------------------
-
-function fakeStore(): RateLimitStore & {
-  dump(): Map<string, BucketState>;
-  clear(): void;
-} {
-  const map = new Map<string, BucketState>();
-  return {
-    async get(key) {
-      const v = map.get(key);
-      return v ? { ...v } : null;
-    },
-    async set(key, state, _ttl) {
-      map.set(key, { ...state });
-    },
-    dump() {
-      return new Map(map);
-    },
-    clear() {
-      map.clear();
-    },
-  };
-}
-
 beforeEach(() => {
   _resetRateLimitMemFallback();
 });
@@ -192,31 +165,47 @@ describe('createRateLimiter — option validation', () => {
 
 describe('rate limiter — under/over limit', () => {
   test('under-limit request passes through with 200', async () => {
-    const store = fakeStore();
     const mw = createRateLimiter({
       capacity: 3,
       refillRate: 1,
       refillIntervalMs: 1000,
       key: (req) => req.user!.sub,
-      store,
+      scope: 'underlimit',
     });
     const { res, passed } = await runOnce(mw, mockReq({ userId: 'alice' }));
     expect(passed).toBe(true);
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ ok: true });
-    // One token consumed → 2 left.
-    const state = store.dump().get('ratelimit:default:alice')!;
-    expect(state.tokens).toBeCloseTo(2, 5);
+  });
+
+  test('successive requests up to capacity all pass; the next one 429s', async () => {
+    const mw = createRateLimiter({
+      capacity: 3,
+      refillRate: 1,
+      refillIntervalMs: 60_000, // slow refill so no drift mid-test
+      key: (req) => req.user!.sub,
+      scope: 'capacity-drain',
+    });
+
+    // Three should pass (the bucket starts at capacity=3).
+    for (let i = 0; i < 3; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await runOnce(mw, mockReq({ userId: 'drain' }));
+      expect(r.passed).toBe(true);
+      expect(r.res.statusCode).toBe(200);
+    }
+    // The fourth should be blocked.
+    const blocked = await runOnce(mw, mockReq({ userId: 'drain' }));
+    expect(blocked.passed).toBe(false);
+    expect(blocked.res.statusCode).toBe(429);
   });
 
   test('over-limit request returns 429 with Retry-After + RFC-7807 body', async () => {
-    const store = fakeStore();
     const mw = createRateLimiter({
       capacity: 2,
       refillRate: 1,
       refillIntervalMs: 60_000, // slow refill so we don't drift mid-test
       key: (req) => req.user!.sub,
-      store,
       scope: 'pipeline-trigger',
     });
 
@@ -242,13 +231,12 @@ describe('rate limiter — under/over limit', () => {
   });
 
   test('429 body type/title match RFC-7807 problem-details shape', async () => {
-    const store = fakeStore();
     const mw = createRateLimiter({
       capacity: 1,
       refillRate: 1,
       refillIntervalMs: 60_000,
       key: () => 'singleton',
-      store,
+      scope: 'shape-check',
     });
     await runOnce(mw, mockReq()); // consume
     const blocked = await runOnce(mw, mockReq());
@@ -275,13 +263,12 @@ describe('rate limiter — refill restores availability', () => {
     jest.useFakeTimers();
     try {
       jest.setSystemTime(new Date('2026-01-01T00:00:00Z'));
-      const store = fakeStore();
       const mw = createRateLimiter({
         capacity: 1,
         refillRate: 1,
         refillIntervalMs: 1000, // 1 token / second
         key: () => 'refill-user',
-        store,
+        scope: 'refill',
       });
 
       // Burn the only token.
@@ -308,13 +295,12 @@ describe('rate limiter — refill restores availability', () => {
     jest.useFakeTimers();
     try {
       jest.setSystemTime(new Date('2026-01-01T00:00:00Z'));
-      const store = fakeStore();
       const mw = createRateLimiter({
         capacity: 1,
         refillRate: 1,
         refillIntervalMs: 1000,
         key: () => 'frac',
-        store,
+        scope: 'partial-refill',
       });
 
       await runOnce(mw, mockReq()); // consume
@@ -337,22 +323,30 @@ describe('rate limiter — refill restores availability', () => {
     jest.useFakeTimers();
     try {
       jest.setSystemTime(new Date('2026-01-01T00:00:00Z'));
-      const store = fakeStore();
       const mw = createRateLimiter({
         capacity: 3,
         refillRate: 1,
         refillIntervalMs: 1000,
         key: () => 'cap',
-        store,
+        scope: 'cap',
       });
 
-      await runOnce(mw, mockReq()); // 3 -> 2
+      // Drain to zero.
+      for (let i = 0; i < 3; i++) {
+        // eslint-disable-next-line no-await-in-loop
+        await runOnce(mw, mockReq());
+      }
       // Idle for an hour — way more than 3 seconds of refill time.
       jest.advanceTimersByTime(60 * 60 * 1000);
-      await runOnce(mw, mockReq()); // 3 -> 2 (capped, then consumed)
-      const state = store.dump().get('ratelimit:default:cap')!;
-      expect(state.tokens).toBeLessThanOrEqual(3);
-      expect(state.tokens).toBeCloseTo(2, 5);
+      // Bucket should be capped at 3 again — three more should pass, fourth blocks.
+      for (let i = 0; i < 3; i++) {
+        // eslint-disable-next-line no-await-in-loop
+        const r = await runOnce(mw, mockReq());
+        expect(r.passed).toBe(true);
+      }
+      const blocked = await runOnce(mw, mockReq());
+      expect(blocked.passed).toBe(false);
+      expect(blocked.res.statusCode).toBe(429);
     } finally {
       jest.useRealTimers();
     }
@@ -365,13 +359,12 @@ describe('rate limiter — refill restores availability', () => {
 
 describe('rate limiter — separate buckets per identity', () => {
   test('two different users do not share a bucket', async () => {
-    const store = fakeStore();
     const mw = createRateLimiter({
       capacity: 1,
       refillRate: 1,
       refillIntervalMs: 60_000,
       key: (req) => req.user!.sub,
-      store,
+      scope: 'isolation',
     });
 
     // Alice burns her token.
@@ -385,21 +378,16 @@ describe('rate limiter — separate buckets per identity', () => {
     const b1 = await runOnce(mw, mockReq({ userId: 'bob' }));
     expect(b1.passed).toBe(true);
     expect(b1.res.statusCode).toBe(200);
-
-    // Two distinct keys persisted.
-    const keys = Array.from(store.dump().keys()).sort();
-    expect(keys).toEqual(['ratelimit:default:alice', 'ratelimit:default:bob']);
   });
 
   test('userId fallback to req.ip when no user is authed', async () => {
-    const store = fakeStore();
     const mw = createRateLimiter({
       capacity: 1,
       refillRate: 1,
       refillIntervalMs: 60_000,
       // Mirror the real wiring: prefer userId, fall back to ip.
       key: (req) => req.user?.sub ?? req.ip ?? 'anon',
-      store,
+      scope: 'ip-fallback',
     });
 
     // Two different "unauthed" callers, distinguished only by IP.
@@ -434,7 +422,8 @@ describe('rate limiter — in-memory fallback', () => {
       refillRate: 1,
       refillIntervalMs: 60_000,
       key: () => 'fallback-user',
-      // No store override — exercises resolveStore() → memStore() path.
+      scope: 'fallback',
+      // No store override — exercises the InMemoryRateLimitStore path.
     });
 
     const r1 = await runOnce(mw, mockReq());
@@ -448,18 +437,60 @@ describe('rate limiter — in-memory fallback', () => {
   });
 
   test('_resetRateLimitMemFallback() clears state across cases', async () => {
-    const mw = createRateLimiter({
+    const mw1 = createRateLimiter({
       capacity: 1,
       refillRate: 1,
       refillIntervalMs: 60_000,
       key: () => 'reset-test',
+      scope: 'reset',
     });
-    const r1 = await runOnce(mw, mockReq());
+    const r1 = await runOnce(mw1, mockReq());
     expect(r1.passed).toBe(true);
-    const r2 = await runOnce(mw, mockReq());
+    const r2 = await runOnce(mw1, mockReq());
     expect(r2.passed).toBe(false);
+
+    // Reset clears the policy-cache so a new middleware on the same policy
+    // gets a fresh store.
     _resetRateLimitMemFallback();
-    const r3 = await runOnce(mw, mockReq());
+
+    const mw2 = createRateLimiter({
+      capacity: 1,
+      refillRate: 1,
+      refillIntervalMs: 60_000,
+      key: () => 'reset-test',
+      scope: 'reset',
+    });
+    const r3 = await runOnce(mw2, mockReq());
     expect(r3.passed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DC RateLimitStore contract — sanity check on the underlying take() shape
+// (matches the acceptance criterion: "a single take() decrements capacity
+// by 1 and that take() at empty returns allowed:false with a retryAfterMs").
+// ---------------------------------------------------------------------------
+
+describe('rate limiter — DC RateLimitStore.take() contract', () => {
+  test('single take() decrements remaining; empty take() returns allowed=false with retryAfterMs', async () => {
+    const { InMemoryRateLimitStore } = await import('distributed-core');
+    const store = new InMemoryRateLimitStore({
+      capacity: 2,
+      refillRate: 1,
+      maxBurstSeconds: 2,
+    });
+
+    const first = await store.take('k', 1);
+    expect(first.allowed).toBe(true);
+    expect(first.remaining).toBeCloseTo(1, 5);
+    expect(first.retryAfterMs).toBe(0);
+
+    const second = await store.take('k', 1);
+    expect(second.allowed).toBe(true);
+    expect(second.remaining).toBeCloseTo(0, 5);
+
+    const third = await store.take('k', 1);
+    expect(third.allowed).toBe(false);
+    expect(third.retryAfterMs).toBeGreaterThan(0);
   });
 });
