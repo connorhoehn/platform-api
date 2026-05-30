@@ -1,0 +1,73 @@
+{
+  "$comment": "Grafana panel JSON for the platform-api outbox drainer health view. Drop into an existing dashboard's panels array; the panel ids are placeholders — set them when integrating. PromQL queries below assume the platform-api `/internal/metrics` scrape target is named `platform-api`.",
+  "title": "Outbox Drainer Health (platform-api)",
+  "panels": [
+    {
+      "id": null,
+      "type": "graph",
+      "title": "Outbox publish throughput (5m rate)",
+      "description": "Rows successfully published per second, broken down by event type. Sustained zero with non-zero queue depth (see oldest_pending) → drainer or upstream MQ problem.",
+      "targets": [
+        {
+          "expr": "sum by (event_type) (rate(outbox_published_total{service=\"platform-api\", event_type!=\"_init\"}[5m]))",
+          "legendFormat": "{{event_type}}"
+        }
+      ]
+    },
+    {
+      "id": null,
+      "type": "graph",
+      "title": "Outbox publish failure rate (5m)",
+      "description": "Publish attempts that threw, per second. Sustained > 0 → upstream MQ or catalog routing problem; rows will be marked FAILED after maxRetries.",
+      "targets": [
+        {
+          "expr": "sum by (event_type) (rate(outbox_publish_failures_total{service=\"platform-api\", event_type!=\"_init\"}[5m]))",
+          "legendFormat": "{{event_type}}"
+        }
+      ]
+    },
+    {
+      "id": null,
+      "type": "stat",
+      "title": "Oldest pending outbox row (seconds)",
+      "description": "Approximate age of the oldest UNPROCESSED row observed in the most recent drainer scan. 0 → backlog drained. Sustained > 60s → drainer can't keep up. Approximate: bounded by batchSize when backlog > batchSize.",
+      "targets": [
+        {
+          "expr": "max(outbox_oldest_pending_seconds{service=\"platform-api\"})"
+        }
+      ],
+      "thresholds": [
+        { "op": "gt", "value": 30, "color": "yellow" },
+        { "op": "gt", "value": 120, "color": "red" }
+      ]
+    },
+    {
+      "id": null,
+      "type": "graph",
+      "title": "Outbox lease acquisitions per minute",
+      "description": "Drainer poll cycles that won the lease. Should be roughly constant (one winner per poll across replicas). Sustained 0 → no replica is acquiring the lease (likely DDB lease-store issue).",
+      "targets": [
+        {
+          "expr": "sum(rate(outbox_lease_acquired_total{service=\"platform-api\"}[1m])) * 60",
+          "legendFormat": "leases/min"
+        }
+      ]
+    }
+  ],
+  "alerts": [
+    {
+      "name": "OutboxBackingUp",
+      "expr": "max(outbox_oldest_pending_seconds{service=\"platform-api\"}) > 120",
+      "for": "5m",
+      "severity": "warning",
+      "summary": "Oldest UNPROCESSED outbox row > 120s — drainer may be falling behind."
+    },
+    {
+      "name": "OutboxLeaseStarvation",
+      "expr": "sum(rate(outbox_lease_acquired_total{service=\"platform-api\"}[5m])) == 0",
+      "for": "5m",
+      "severity": "critical",
+      "summary": "No replica has won the outbox drainer lease in 5 minutes."
+    }
+  ]
+}

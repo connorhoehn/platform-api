@@ -346,6 +346,46 @@ export function recordIngestDlqDepthDelta(delta: number): void {
   else if (delta < 0) ingestDlqDepthGauge.dec(-delta);
 }
 
+// ---------------------------------------------------------------------------
+// Outbox Drainer Metrics (hub#1002)
+// ---------------------------------------------------------------------------
+//
+// The outbox is THE durability primitive (constitution principle #1) — before
+// this, drainer wins/failures/lag were only visible via pino logs. Operators
+// now have a PromQL surface for "outbox is backing up" and "drainer hasn't
+// won lease in N minutes."
+//
+// Pre-registered with event_type='_init' so a scrape sees the counters at
+// zero before the first publish; per-event-type series are minted lazily on
+// the first record* call.
+registry.counter('outbox_published_total', { ...BASE_LABELS, event_type: '_init' }, 'Outbox rows successfully published to the durable MQ, labeled by event type.');
+registry.counter('outbox_publish_failures_total', { ...BASE_LABELS, event_type: '_init' }, 'Outbox publish attempts that threw, labeled by event type. Retries until maxRetries → row marked FAILED.');
+const outboxLeaseAcquiredTotal = registry.counter('outbox_lease_acquired_total', BASE_LABELS, 'Outbox-drainer poll cycles that won the lease and entered the drain phase.');
+const outboxOldestPendingSeconds = registry.gauge('outbox_oldest_pending_seconds', BASE_LABELS, 'Age in seconds of the oldest UNPROCESSED outbox row observed in the most recent drainer scan (0 when the scan returned empty). Approximate — bounded by batchSize.');
+
+export function recordOutboxPublished(eventType: string): void {
+  registry.counter('outbox_published_total', { ...BASE_LABELS, event_type: eventType }).inc();
+}
+
+export function recordOutboxPublishFailure(eventType: string): void {
+  registry.counter('outbox_publish_failures_total', { ...BASE_LABELS, event_type: eventType }).inc();
+}
+
+export function recordOutboxLeaseAcquired(): void {
+  outboxLeaseAcquiredTotal.inc();
+}
+
+/**
+ * Set the "oldest pending" gauge to the age of the oldest UNPROCESSED row
+ * observed in the most recent scan. Pass 0 when the scan returned no rows.
+ * Approximate because DDB Scan does not order results — the oldest in the
+ * batch may not be the oldest table-wide if there are more than `batchSize`
+ * pending rows; treat as a lower bound.
+ */
+export function recordOutboxOldestPendingSeconds(seconds: number): void {
+  outboxOldestPendingSeconds.set(Math.max(0, seconds));
+}
+
 // Renders the registry snapshot as Prometheus 0.0.4 text format.
 // Suitable for `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
 export function renderPrometheusText(): string {

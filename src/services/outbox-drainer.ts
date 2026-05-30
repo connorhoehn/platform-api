@@ -7,6 +7,12 @@ import { catalog } from '../lib/event-catalog';
 import { tableName } from '../lib/ddb-table-name';
 import { createDDBLeaseStore } from '../lib/ddb-lease-store';
 import log from '../lib/logger';
+import {
+  recordOutboxLeaseAcquired,
+  recordOutboxOldestPendingSeconds,
+  recordOutboxPublishFailure,
+  recordOutboxPublished,
+} from '../observability/metrics';
 
 const OUTBOX_TABLE = tableName('social-outbox');
 const LOCK_KEY = 'OUTBOX_LOCK#drainer';
@@ -102,6 +108,11 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         return;
       }
 
+      // PromQL-visible signal that *this* replica won the lease — paired
+      // with `outbox_oldest_pending_seconds` to detect "lease keeps moving
+      // but rows aren't draining" vs "no one's holding the lease."
+      recordOutboxLeaseAcquired();
+
       try {
         const result = await docClient.send(
           new ScanCommand({
@@ -114,6 +125,23 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         );
 
         const rows = (result.Items ?? []) as OutboxRow[];
+
+        // Approximate "oldest pending" — DDB Scan doesn't order results,
+        // so the oldest in this batch is a lower bound on the true oldest
+        // when there are more than batchSize pending rows. Good enough as
+        // a "is the drainer keeping up" signal; an emergency-paging alert
+        // would also watch run-queue depth.
+        let oldestPendingSeconds = 0;
+        if (rows.length > 0) {
+          const nowMs = Date.now();
+          let oldestMs = nowMs;
+          for (const r of rows) {
+            const t = new Date(r.createdAt).getTime();
+            if (Number.isFinite(t) && t < oldestMs) oldestMs = t;
+          }
+          oldestPendingSeconds = Math.max(0, (nowMs - oldestMs) / 1000);
+        }
+        recordOutboxOldestPendingSeconds(oldestPendingSeconds);
 
         for (const row of rows) {
           if (!lock.isLeader()) {
@@ -192,11 +220,15 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       );
 
       log.info({ eventType: row.eventType, outboxId: row.outboxId }, 'outbox-drainer published');
+      recordOutboxPublished(row.eventType);
     } catch (err: unknown) {
       const e = err as { message?: string; name?: string };
       // If another drainer already marked this row PROCESSED/FAILED, the
       // ConditionExpression on our status write will reject — swallow that
       // specific case quietly; it's the desired outcome under contention.
+      // Don't count this as a failure — the row was published successfully
+      // by someone (us or another replica). The conditional-check rejection
+      // is a contention outcome, not a publish error.
       if (e?.name === 'ConditionalCheckFailedException') {
         log.info(
           { outboxId: row.outboxId },
@@ -208,6 +240,7 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         { eventType: row.eventType, outboxId: row.outboxId, errMessage: e?.message },
         'outbox-drainer publish failed',
       );
+      recordOutboxPublishFailure(row.eventType);
 
       if (!lock.isLeader()) {
         log.warn(

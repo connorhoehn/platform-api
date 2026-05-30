@@ -26,6 +26,10 @@ import {
   recordIngestSyncDuration,
   recordLLMTokens,
   recordMessage,
+  recordOutboxLeaseAcquired,
+  recordOutboxOldestPendingSeconds,
+  recordOutboxPublishFailure,
+  recordOutboxPublished,
   recordPipelineApproval,
   recordPipelineApprovalPendingDelta,
   recordPipelineBridgeLatency,
@@ -529,5 +533,62 @@ describe('renderPrometheusText', () => {
     expect(text).toContain('wsg_active_connections');
     expect(text).toContain('pipeline_triggers_total');
     expect(text).toContain('ingest_items_total');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Outbox drainer metrics (hub#1002)
+// ---------------------------------------------------------------------------
+
+describe('outbox drainer metrics', () => {
+  it('recordOutboxPublished mints a per-event-type series', () => {
+    recordOutboxPublished('social.activity.created');
+    recordOutboxPublished('social.activity.created');
+    recordOutboxPublished('pipeline.run.completed');
+    const { metrics } = getRegistry().getSnapshot();
+    expect(
+      counterValue(metrics, 'outbox_published_total', { event_type: 'social.activity.created' }),
+    ).toBe(2);
+    expect(
+      counterValue(metrics, 'outbox_published_total', { event_type: 'pipeline.run.completed' }),
+    ).toBe(1);
+  });
+
+  it('recordOutboxPublishFailure mints a per-event-type series', () => {
+    recordOutboxPublishFailure('social.activity.created');
+    const { metrics } = getRegistry().getSnapshot();
+    expect(
+      counterValue(metrics, 'outbox_publish_failures_total', { event_type: 'social.activity.created' }),
+    ).toBe(1);
+  });
+
+  it('recordOutboxLeaseAcquired increments outbox_lease_acquired_total', () => {
+    recordOutboxLeaseAcquired();
+    recordOutboxLeaseAcquired();
+    expect(
+      counterValue(getRegistry().getSnapshot().metrics, 'outbox_lease_acquired_total'),
+    ).toBe(2);
+  });
+
+  it('recordOutboxOldestPendingSeconds sets outbox_oldest_pending_seconds', () => {
+    recordOutboxOldestPendingSeconds(42.5);
+    expect(
+      gaugeValue(getRegistry().getSnapshot().metrics, 'outbox_oldest_pending_seconds'),
+    ).toBe(42.5);
+    // Replaces, not adds — gauge.set() semantics.
+    recordOutboxOldestPendingSeconds(0);
+    expect(
+      gaugeValue(getRegistry().getSnapshot().metrics, 'outbox_oldest_pending_seconds'),
+    ).toBe(0);
+  });
+
+  it('renderPrometheusText includes outbox_* series', () => {
+    recordOutboxPublished('social.activity.created');
+    recordOutboxLeaseAcquired();
+    recordOutboxOldestPendingSeconds(10);
+    const text = renderPrometheusText();
+    expect(text).toContain('outbox_published_total');
+    expect(text).toContain('outbox_lease_acquired_total');
+    expect(text).toContain('outbox_oldest_pending_seconds');
   });
 });
