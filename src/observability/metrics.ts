@@ -412,6 +412,63 @@ export function recordPipelineDefinitionsRefresh(nowMs: number = Date.now()): vo
   pipelineDefinitionsLastRefresh.set(nowMs / 1000);
 }
 
+// ---------------------------------------------------------------------------
+// M4 SLO trigger gate metrics (hub#1005)
+// ---------------------------------------------------------------------------
+//
+// ROADMAP R5 flagged "P6 trigger ambiguity" as a risk: the M4 trigger
+// condition ("HTTP p99 incidents under pipeline load") was narrative, not
+// auditable. These two series let the trigger be written as a tracked
+// PromQL expression so the gate is decidable from a dashboard, not a
+// retrospective discussion. See .agent/SLO-M4-TRIGGER.md for the fire
+// condition.
+//
+// pipeline_executor_busy_seconds_total accumulates wall-clock time the
+// in-process pipeline executor spent doing run work. Divide by elapsed
+// time over the same window to get fraction-busy (0..1). High busy +
+// degraded HTTP latency on the same window = the M4 trigger.
+const pipelineExecutorBusySeconds = registry.counter(
+  'pipeline_executor_busy_seconds_total',
+  BASE_LABELS,
+  'Wall-clock seconds the in-process pipeline executor spent doing run work. rate() / elapsed gives fraction-busy.',
+);
+
+// http_handler_duration_seconds is a Prometheus-standard request-duration
+// histogram (seconds, not ms — matches the upstream Prometheus convention so
+// `histogram_quantile` queries are portable). Labeled by route_group so
+// cardinality stays bounded (≤ ~10 groups, see deriveRouteGroup).
+registry.histogram(
+  'http_handler_duration_seconds',
+  { ...BASE_LABELS, route_group: '_init' },
+  1000,
+  'HTTP handler duration in seconds, labeled by route_group (bounded enum). M4 SLO trigger watches p99 of api_* groups.',
+);
+
+/**
+ * Add `seconds` to the pipeline_executor_busy_seconds_total counter. Called
+ * from the pipeline executor / runner when it completes (or aborts) a unit
+ * of run work. Operators compute fraction-busy via
+ * `rate(pipeline_executor_busy_seconds_total[1m])`.
+ */
+export function recordPipelineExecutorBusy(seconds: number): void {
+  if (seconds <= 0) return;
+  pipelineExecutorBusySeconds.inc(seconds);
+}
+
+/**
+ * Observe an HTTP handler duration into the histogram under the given
+ * route_group. `seconds` is the elapsed time (NOT ms) — caller is
+ * responsible for the unit. The middleware in src/middleware/http-metrics.ts
+ * is the canonical caller.
+ */
+export function recordHttpHandlerDuration(routeGroup: string, seconds: number): void {
+  registry.histogram(
+    'http_handler_duration_seconds',
+    { ...BASE_LABELS, route_group: routeGroup },
+    1000,
+  ).observe(seconds);
+}
+
 // Renders the registry snapshot as Prometheus 0.0.4 text format.
 // Suitable for `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
 export function renderPrometheusText(): string {

@@ -2,6 +2,7 @@ import express from 'express';
 import { requestContextMiddleware } from '@connorhoehn/service-runtime';
 import { requireAuth } from './middleware/auth';
 import { requestLogger } from './middleware/request-logger';
+import { httpMetrics } from './middleware/http-metrics';
 import { errorHandler } from './middleware/error-handler';
 import { pipelineReadRateLimit } from './middleware/rateLimit';
 import healthRouter from './routes/health';
@@ -48,6 +49,7 @@ export function createApp(): express.Application {
     },
   }));
   app.use(requestLogger);
+  app.use(httpMetrics);
 
   // Health check — no auth required. Mounted at /health (canonical) and
   // /api/health (alias) so callers using the /api/* convention don't 404.
