@@ -4,10 +4,10 @@
 #
 # Coverage status (per hub#1009 option B + blocker #33 re-shape):
 #   - /document-types/*    full schemas  (hub#1108)
-#   - /typed-documents/*   full schemas  (this commit — hub#1109)
+#   - /typed-documents/*   full schemas  (hub#1109)
 #   - /documents/.../comments
 #     + /approvals
-#     + /documents/.../import|export       skeleton  (hub#1110 follow-up)
+#     + /documents/.../import|export       full schemas  (hub#1110)
 #   - /documents/.../sections/.../items
 #     + /documents/.../sections/.../reviews
 #     + /items/mine + /reviews/mine        skeleton  (hub#1111 follow-up)
@@ -51,11 +51,11 @@ tags:
   - name: typed-documents
     description: Typed document instances + bulk operations.
   - name: document-comments
-    description: Comments threaded against a document (skeleton — schemas pending).
+    description: Per-section comment threads (resolve/unresolve + reply chain).
   - name: approvals
-    description: Approval workflow surface (skeleton — schemas pending).
+    description: Append-only approval log (audit mirror of the renderer CRDT).
   - name: document-io
-    description: Import / export (skeleton — schemas pending).
+    description: Whole-document import / export (JSON or Markdown).
   - name: section-items
     description: Per-section task items + acknowledgments (skeleton — schemas pending).
   - name: section-reviews
@@ -247,48 +247,245 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
-  # --- approvals (skeleton — see hub#1110) --------------------------------
-  '/approvals':
+  # --- approvals (full schemas) -------------------------------------------
+  /approvals:
     get:
-      summary: TODO — schema pending (approvals.ts)
       tags: [approvals]
-      responses: { '200': { description: OK } }
+      summary: List approval entries by document OR by decision status
+      description: |
+        Exactly one of `documentId` or `status` is required. Document-scoped
+        queries use the table's main partition; status-scoped queries use
+        the `status-index` GSI and return newest-first.
+      operationId: listApprovals
+      parameters:
+        - in: query
+          name: documentId
+          required: false
+          schema: { type: string }
+          description: Document to list approvals for.
+        - in: query
+          name: status
+          required: false
+          schema: { $ref: '#/components/schemas/ApprovalDecision' }
+          description: Decision to filter by.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ApprovalEntry' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
     post:
-      summary: TODO — schema pending (approvals.ts)
       tags: [approvals]
-      responses: { '200': { description: OK } }
+      summary: Append an approval entry
+      description: |
+        Server mints `workflowId` and `createdAt`. `reviewerId` is taken
+        from the auth token, not the request body.
+      operationId: createApproval
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApprovalCreateRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalEntry' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
-  # --- document comments (skeleton — see hub#1110) ------------------------
-  '/documents/{documentId}/comments':
+  # --- document comments (full schemas) -----------------------------------
+  /documents/{documentId}/comments:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
     get:
-      summary: TODO — schema pending (documentComments.ts)
       tags: [document-comments]
-      responses: { '200': { description: OK } }
+      summary: List comments for a document (optionally scoped to one section)
+      description: |
+        Without `sectionId`, queries the main partition and returns the
+        whole document's comment thread. With `sectionId`, queries the
+        `sectionId-timestamp-index` GSI and returns just that section's
+        thread.
+      operationId: listDocumentComments
+      parameters:
+        - in: query
+          name: sectionId
+          required: false
+          schema: { type: string }
+          description: If set, returns only this section's comments.
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [comments]
+                properties:
+                  comments:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocumentComment' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
     post:
-      summary: TODO — schema pending (documentComments.ts)
       tags: [document-comments]
-      responses: { '200': { description: OK } }
-  '/documents/{documentId}/comments/{commentId}':
+      summary: Post a comment or threaded reply
+      description: |
+        `text` is trimmed and capped at 10000 characters. Pass
+        `parentCommentId` to thread under an existing comment.
+        `displayName` and `color` are denormalized server-side from the
+        caller's profile.
+      operationId: createDocumentComment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentCommentCreateRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [comment]
+                properties:
+                  comment: { $ref: '#/components/schemas/DocumentComment' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /documents/{documentId}/comments/{commentId}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
+      - $ref: '#/components/parameters/CommentIdPath'
     patch:
-      summary: TODO — schema pending (documentComments.ts)
       tags: [document-comments]
-      responses: { '200': { description: OK } }
+      summary: Resolve or unresolve a comment thread
+      description: |
+        `resolved=true` stamps `resolvedBy` (from the auth token) and
+        `resolvedAt` (now). `resolved=false` removes those fields.
+      operationId: setDocumentCommentResolved
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentCommentPatchRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [comment]
+                properties:
+                  comment: { $ref: '#/components/schemas/DocumentCommentResolveResult' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
     delete:
-      summary: TODO — schema pending (documentComments.ts)
       tags: [document-comments]
-      responses: { '200': { description: OK } }
+      summary: Delete a comment
+      operationId: deleteDocumentComment
+      responses:
+        '204':
+          description: Deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
-  # --- document import / export (skeleton — see hub#1110) -----------------
-  '/documents/{documentId}/export':
+  # --- document import / export (full schemas) ---------------------------
+  /documents/{documentId}/export:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
     get:
-      summary: TODO — schema pending (documentImportExport.ts)
       tags: [document-io]
-      responses: { '200': { description: OK } }
-  '/documents/{documentId}/import':
+      summary: Export a document as JSON or Markdown
+      description: |
+        The response Content-Type depends on `format`:
+
+        - `format=json` (default): returns `application/json` with a
+          structured envelope (`DocumentJsonExport`).
+        - `format=md`: returns `text/markdown; charset=utf-8` and sets
+          `Content-Disposition: attachment; filename="<title>.md"` so
+          browsers prompt to save.
+
+        The export is synchronous — the full document is built in
+        memory and returned in one response. No streaming.
+      operationId: exportDocument
+      parameters:
+        - in: query
+          name: format
+          required: false
+          schema:
+            type: string
+            enum: [json, md]
+            default: json
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentJsonExport' }
+            text/markdown:
+              schema:
+                type: string
+                description: Markdown-formatted document (sections, items, comments, reviews).
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /documents/{documentId}/import:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
     post:
-      summary: TODO — schema pending (documentImportExport.ts)
       tags: [document-io]
-      responses: { '200': { description: OK } }
+      summary: Import sections + items into an existing document
+      description: |
+        Accepts a Markdown body (sections parsed from `##` headers) or
+        a JSON envelope (the inverse of `GET /export?format=json`).
+        The target document must already exist — this endpoint adds
+        sections/items, it does not create the document.
+      operationId: importDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentImportRequest' }
+      responses:
+        '201':
+          description: Imported
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentImportResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   # --- section reviews (skeleton — see hub#1111) --------------------------
   '/documents/{documentId}/reviews':
@@ -537,6 +734,18 @@ components:
       required: true
       schema: { type: string }
       description: Document-type identifier (UUID minted at create time).
+    DocumentIdPath:
+      in: path
+      name: documentId
+      required: true
+      schema: { type: string }
+      description: Document identifier (UUID, key of the crdt-documents row).
+    CommentIdPath:
+      in: path
+      name: commentId
+      required: true
+      schema: { type: string }
+      description: Comment identifier (ULID minted on create).
 
   responses:
     BadRequest:
@@ -814,3 +1023,217 @@ components:
         errors:
           type: array
           items: { $ref: '#/components/schemas/BulkImportError' }
+
+    # --- document comments --------------------------------------------
+    DocumentComment:
+      type: object
+      required: [documentId, commentId, sectionId, text, userId, displayName, color, timestamp]
+      properties:
+        documentId: { type: string }
+        commentId:
+          type: string
+          description: ULID minted server-side at create time.
+        sectionId: { type: string }
+        text:
+          type: string
+          minLength: 1
+          maxLength: 10000
+        userId:
+          type: string
+          description: Cognito sub of the author.
+        displayName:
+          type: string
+          description: Author's display name (email fallback) at post time.
+        color:
+          type: string
+          description: Author chip color (currently hard-coded to "#4A90D9").
+        timestamp: { type: string, format: date-time }
+        parentCommentId:
+          type: string
+          description: Set when this comment replies to another in the same thread.
+        resolved:
+          type: boolean
+          description: Absent until the thread is resolved at least once.
+        resolvedBy: { type: string }
+        resolvedAt: { type: string, format: date-time }
+
+    DocumentCommentCreateRequest:
+      type: object
+      required: [sectionId, text]
+      properties:
+        sectionId: { type: string, minLength: 1 }
+        text: { type: string, minLength: 1, maxLength: 10000 }
+        parentCommentId:
+          type: string
+          description: Optional — set to thread under an existing comment.
+
+    DocumentCommentPatchRequest:
+      type: object
+      required: [resolved]
+      properties:
+        resolved: { type: boolean }
+
+    DocumentCommentResolveResult:
+      type: object
+      required: [documentId, commentId, resolved]
+      description: |
+        Subset returned from `PATCH /documents/{documentId}/comments/{commentId}`.
+        Only the resolve-state fields are echoed back — full re-fetch via
+        `GET /documents/{documentId}/comments` if you need the rest.
+      properties:
+        documentId: { type: string }
+        commentId: { type: string }
+        resolved: { type: boolean }
+        resolvedBy: { type: string }
+        resolvedAt: { type: string, format: date-time }
+
+    # --- approvals ----------------------------------------------------
+    ApprovalDecision:
+      type: string
+      enum: [approved, rejected, changes_requested]
+
+    ApprovalEntry:
+      type: object
+      required: [documentId, workflowId, sectionId, reviewerId, decision, workflowStatus, createdAt]
+      properties:
+        documentId: { type: string }
+        workflowId:
+          type: string
+          format: uuid
+          description: Per-entry UUID minted server-side at create time.
+        sectionId: { type: string }
+        reviewerId:
+          type: string
+          description: Cognito sub of the reviewer.
+        reviewerName:
+          type: string
+          description: Denormalized reviewer display name for audit readability.
+        decision: { $ref: '#/components/schemas/ApprovalDecision' }
+        comment: { type: string }
+        workflowStatus:
+          allOf:
+            - $ref: '#/components/schemas/ApprovalDecision'
+          description: Mirrors `decision`; populated to back the `status-index` GSI.
+        createdAt: { type: string, format: date-time }
+
+    ApprovalCreateRequest:
+      type: object
+      required: [documentId, sectionId, decision]
+      properties:
+        documentId: { type: string, minLength: 1 }
+        sectionId: { type: string, minLength: 1 }
+        decision: { $ref: '#/components/schemas/ApprovalDecision' }
+        reviewerName:
+          type: string
+          description: Optional — denormalized for audit logs.
+        comment: { type: string }
+
+    # --- document import / export -------------------------------------
+    DocumentImportRequest:
+      type: object
+      required: [format, content]
+      properties:
+        format:
+          type: string
+          enum: [markdown, json]
+        content:
+          type: string
+          minLength: 1
+          description: |
+            Raw document body. For `markdown`, headers (`##`) become sections
+            and bullet lines under each header become items. For `json`,
+            the envelope must match the shape returned by `GET /export?format=json`.
+
+    DocumentImportResponse:
+      type: object
+      required: [documentId, sectionsCreated, itemsCreated]
+      properties:
+        documentId: { type: string }
+        sectionsCreated: { type: integer, minimum: 0 }
+        itemsCreated: { type: integer, minimum: 0 }
+
+    DocumentJsonExport:
+      type: object
+      description: |
+        Envelope returned by `GET /documents/{documentId}/export?format=json`.
+        Mirrors the renderer's section/item/comment/review groupings.
+      required: [document]
+      properties:
+        document:
+          type: object
+          required: [meta, sections]
+          properties:
+            meta: { $ref: '#/components/schemas/DocumentExportMeta' }
+            sections:
+              type: array
+              items: { $ref: '#/components/schemas/DocumentExportSection' }
+
+    DocumentExportMeta:
+      type: object
+      required: [id, title, type, status, createdBy, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        type: { type: string }
+        status: { type: string }
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        icon: { type: string }
+        description: { type: string }
+
+    DocumentExportSection:
+      type: object
+      required: [id, title, type, sortOrder, items, comments, reviews]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        type: { type: string }
+        sectionType: { type: string }
+        sortOrder: { type: number }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DocumentExportItem' }
+        comments:
+          type: array
+          items: { $ref: '#/components/schemas/DocumentExportComment' }
+        reviews:
+          type: array
+          items: { $ref: '#/components/schemas/DocumentExportReview' }
+
+    DocumentExportItem:
+      type: object
+      required: [id, text, status, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        text: { type: string }
+        status: { type: string }
+        assignee: { type: string }
+        priority: { type: string }
+        dueDate: { type: string }
+        category: { type: string }
+        notes: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    DocumentExportComment:
+      type: object
+      required: [id, text, userId, displayName, timestamp]
+      properties:
+        id: { type: string }
+        text: { type: string }
+        userId: { type: string }
+        displayName: { type: string }
+        timestamp: { type: string, format: date-time }
+        parentCommentId: { type: string }
+        resolved: { type: boolean }
+
+    DocumentExportReview:
+      type: object
+      required: [userId, displayName, status, timestamp]
+      properties:
+        userId: { type: string }
+        displayName: { type: string }
+        status: { type: string }
+        timestamp: { type: string, format: date-time }
+        comment: { type: string }
