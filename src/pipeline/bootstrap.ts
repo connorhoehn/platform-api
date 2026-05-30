@@ -84,6 +84,7 @@ import {
   getRegistry as getMetricsRegistry,
   getQueueMetrics,
   incrementBusDeadLetter,
+  recordPipelineExecutorBusy,
 } from '../observability/metrics';
 import {
   buildClusterConfig,
@@ -788,6 +789,11 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
 
   eventBus.subscribe('pipeline:run:completed', async (evt: unknown) => {
     const data = ((evt as { payload?: Record<string, unknown> })?.payload ?? {}) as Record<string, unknown>;
+    // M4 SLO trigger gate clause-2 wiring. See .agent/SLO-M4-TRIGGER.md.
+    const durationMs = data.durationMs;
+    if (typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs > 0) {
+      recordPipelineExecutorBusy(durationMs / 1000);
+    }
     publishRunCompleted({
       runId: data.runId as string,
       durationMs: data.durationMs as number | undefined,
