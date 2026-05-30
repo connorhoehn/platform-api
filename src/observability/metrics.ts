@@ -386,6 +386,32 @@ export function recordOutboxOldestPendingSeconds(seconds: number): void {
   outboxOldestPendingSeconds.set(Math.max(0, seconds));
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline definitions cache freshness (hub#1008)
+// ---------------------------------------------------------------------------
+//
+// definitions-invalidator.ts falls back silently to the 60s timer when Redis
+// is unavailable — fine for liveness, terrible for visibility. Replicas can
+// drift up to 60s on newly-deployed pipelines. This gauge records the
+// wall-clock time of each successful refresh so operators can write
+// `time() - pipeline_definitions_last_refresh_timestamp > 90` as a freshness
+// alert (90s = 1.5× the default 60s tick).
+const pipelineDefinitionsLastRefresh = registry.gauge(
+  'pipeline_definitions_last_refresh_timestamp',
+  BASE_LABELS,
+  'Unix seconds (decimal) of the most recent successful pipeline-definitions cache refresh.',
+);
+
+/**
+ * Stamp the definitions-cache refresh gauge with the current wall-clock
+ * (Unix seconds, decimal). Called only on a *successful* loader call —
+ * a thrown loader does NOT advance the gauge, so alerts on staleness
+ * fire correctly when the loader is failing.
+ */
+export function recordPipelineDefinitionsRefresh(nowMs: number = Date.now()): void {
+  pipelineDefinitionsLastRefresh.set(nowMs / 1000);
+}
+
 // Renders the registry snapshot as Prometheus 0.0.4 text format.
 // Suitable for `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
 export function renderPrometheusText(): string {

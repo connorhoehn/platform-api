@@ -34,7 +34,10 @@
 // to shrink that window for the common "save then test" UX).
 
 import { withContext } from '../lib/logger';
-import { recordCacheAccess } from '../observability/metrics';
+import {
+  recordCacheAccess,
+  recordPipelineDefinitionsRefresh,
+} from '../observability/metrics';
 import { definitionsRepo, type PipelineDefinition } from './definitions-repository';
 
 const log = withContext({ module: 'pipelineDefinitionsCache' });
@@ -120,6 +123,11 @@ export class PipelineDefinitionsCache {
         this.snapshot = next;
         this.rebuildWebhookIndex(next);
         this.primed = true;
+        // Stamp the freshness gauge AFTER snapshot/index commit so a thrown
+        // loader doesn't advance the timestamp. Alerts like
+        // `time() - pipeline_definitions_last_refresh_timestamp > 90`
+        // then correctly fire when the loader is silently failing.
+        recordPipelineDefinitionsRefresh();
       } catch (err) {
         // Keep the previous snapshot — we'd rather serve slightly stale
         // data than nothing. Mark `primed` so the schedule evaluator

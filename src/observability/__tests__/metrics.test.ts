@@ -30,6 +30,7 @@ import {
   recordOutboxOldestPendingSeconds,
   recordOutboxPublishFailure,
   recordOutboxPublished,
+  recordPipelineDefinitionsRefresh,
   recordPipelineApproval,
   recordPipelineApprovalPendingDelta,
   recordPipelineBridgeLatency,
@@ -590,5 +591,33 @@ describe('outbox drainer metrics', () => {
     expect(text).toContain('outbox_published_total');
     expect(text).toContain('outbox_lease_acquired_total');
     expect(text).toContain('outbox_oldest_pending_seconds');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pipeline definitions cache freshness (hub#1008)
+// ---------------------------------------------------------------------------
+
+describe('recordPipelineDefinitionsRefresh', () => {
+  it('sets pipeline_definitions_last_refresh_timestamp to (now / 1000)', () => {
+    const fixedMs = 1_700_000_000_000;
+    recordPipelineDefinitionsRefresh(fixedMs);
+    expect(
+      gaugeValue(
+        getRegistry().getSnapshot().metrics,
+        'pipeline_definitions_last_refresh_timestamp',
+      ),
+    ).toBe(fixedMs / 1000);
+  });
+
+  it('subsequent calls move the gauge forward', () => {
+    recordPipelineDefinitionsRefresh(1_000_000_000_000);
+    recordPipelineDefinitionsRefresh(2_000_000_000_000);
+    expect(
+      gaugeValue(
+        getRegistry().getSnapshot().metrics,
+        'pipeline_definitions_last_refresh_timestamp',
+      ),
+    ).toBe(2_000_000_000);
   });
 });

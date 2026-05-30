@@ -6,6 +6,7 @@ import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals
 
 jest.mock('../../observability/metrics', () => ({
   recordCacheAccess: jest.fn(),
+  recordPipelineDefinitionsRefresh: jest.fn(),
 }));
 
 jest.mock('../../lib/logger', () => ({
@@ -24,6 +25,7 @@ jest.mock('../definitions-repository', () => ({
 }));
 
 import { PipelineDefinitionsCache } from '../definitions-cache';
+import { recordPipelineDefinitionsRefresh } from '../../observability/metrics';
 import type { PipelineDefinition } from '../definitions-repository';
 
 function makeWebhookDef(
@@ -103,6 +105,30 @@ describe('PipelineDefinitionsCache', () => {
       cache = new PipelineDefinitionsCache({ loader: jest.fn(async () => defs), intervalMs: 60_000 });
       await cache.refresh();
       expect(cache.all()).toHaveLength(2);
+    });
+
+    it('advances pipeline_definitions_last_refresh_timestamp gauge after each successful refresh (hub#1008)', async () => {
+      const stamp = recordPipelineDefinitionsRefresh as unknown as jest.Mock;
+      stamp.mockClear();
+      cache = new PipelineDefinitionsCache({
+        loader: jest.fn(async () => [makeManualDef('p1')]),
+        intervalMs: 60_000,
+      });
+      await cache.refresh();
+      expect(stamp).toHaveBeenCalledTimes(1);
+      await cache.refresh();
+      expect(stamp).toHaveBeenCalledTimes(2);
+    });
+
+    it('does NOT advance pipeline_definitions_last_refresh_timestamp gauge when the loader throws (hub#1008)', async () => {
+      const stamp = recordPipelineDefinitionsRefresh as unknown as jest.Mock;
+      stamp.mockClear();
+      cache = new PipelineDefinitionsCache({
+        loader: jest.fn(async () => { throw new Error('boom'); }),
+        intervalMs: 60_000,
+      });
+      await expect(cache.refresh()).rejects.toThrow('boom');
+      expect(stamp).not.toHaveBeenCalled();
     });
 
     it('coalesces concurrent callers onto one in-flight fetch', async () => {
