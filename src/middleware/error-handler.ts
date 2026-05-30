@@ -97,5 +97,13 @@ export function errorHandler(
   // Unknown error — log the real thing server-side, return a generic message.
   const label = (err as Error | undefined)?.name ?? 'Error';
   log.error({ err, errorType: label }, 'unhandled error');
+  // Stash for the request-logger so the structured "http request" line on the
+  // 500 carries errorMessage/errorName/errorStackTop. Operators reading the
+  // request log no longer have to cross-reference a separate "unhandled error"
+  // entry to see why the request failed. `res.locals` may be undefined when
+  // callers pass a hand-rolled mock response (tests), so guard defensively.
+  if (res.locals) {
+    (res.locals as { __loggedError?: unknown }).__loggedError = err;
+  }
   res.status(500).json({ error: 'Internal server error' });
 }
