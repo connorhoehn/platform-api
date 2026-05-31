@@ -11,6 +11,13 @@ const mockAddParticipant = jest.fn();
 const mockEndSession = jest.fn();
 const mockGetSessionsByDocument = jest.fn();
 const mockGetSession = jest.fn();
+// findActiveByLobbyName default returns null (no existing active session)
+// so the create/findOrCreate paths in videoSessions.ts:169 + :182 fall
+// through to the create branch. Individual tests can mockResolvedValue
+// a record to exercise the reuse branch.
+const mockFindActiveByLobbyName = jest.fn().mockResolvedValue(null);
+const mockRemoveParticipant = jest.fn();
+const mockRemoveParticipantByUserId = jest.fn();
 
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
@@ -28,6 +35,9 @@ jest.mock('../../repositories', () => ({
     endSession: (...args: unknown[]) => mockEndSession(...args),
     getSessionsByDocument: (...args: unknown[]) => mockGetSessionsByDocument(...args),
     getSession: (...args: unknown[]) => mockGetSession(...args),
+    findActiveByLobbyName: (...args: unknown[]) => mockFindActiveByLobbyName(...args),
+    removeParticipant: (...args: unknown[]) => mockRemoveParticipant(...args),
+    removeParticipantByUserId: (...args: unknown[]) => mockRemoveParticipantByUserId(...args),
   },
 }));
 
