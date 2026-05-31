@@ -40,6 +40,10 @@ import {
 } from '../middleware/error-handler';
 import log from '../lib/logger';
 import { callSfu, mapSfuError } from '../lib/sfu-breaker';
+import {
+  recordLvsParticipantReap,
+  type LvsReapOutcome,
+} from '../observability/metrics';
 // Re-export breaker test helpers from the shared module for back-compat
 // with existing test imports — see src/lib/sfu-breaker.ts for the canonical
 // definitions (extracted for hub task #1001).
@@ -59,6 +63,72 @@ export const videoSessionsRouter = Router();
 function resolveLobbyName(body: Record<string, unknown>): string | undefined {
   const raw = body.lobbyName ?? body.documentId;
   return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+}
+
+/**
+ * Reap one LVS participant on /end (hub#1281). LVS's
+ * `DELETE /api/channels/:arn/participants/:participantId` is idempotent
+ * (404 on second call) and reaps the `${pid}:screen` sibling server-side.
+ * One retry on network/5xx because end-call is a high-leverage flow:
+ * failing it triggers ICE-consent-timeout fallback (~30s) which has caused
+ * rapid-reconnect quota lockout. Best-effort overall — the worst case is
+ * we lose the fast-path and fall back to the periodic reaper sweep.
+ */
+export async function reapLvsParticipant(args: {
+  channelArn: string;
+  streamKey: string;
+  participantId: string;
+  sessionId: string;
+}): Promise<LvsReapOutcome> {
+  const url = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(args.channelArn)}/participants/${encodeURIComponent(args.participantId)}`;
+  const init: RequestInit = {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${args.streamKey}` },
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const res = await callSfu(url, init);
+      if (res.ok) {
+        log.info(
+          { sessionId: args.sessionId, participantId: args.participantId, attempt },
+          '[videoSessions] LVS participant reap ok',
+        );
+        return 'reaped';
+      }
+      if (res.status === 404) {
+        log.info(
+          { sessionId: args.sessionId, participantId: args.participantId },
+          '[videoSessions] LVS participant reap 404 (already gone)',
+        );
+        return 'not_found';
+      }
+      // 4xx (non-404) is a client-shape failure that retry won't fix.
+      if (res.status < 500) {
+        log.warn(
+          { sessionId: args.sessionId, participantId: args.participantId, status: res.status },
+          '[videoSessions] LVS participant reap non-retriable 4xx',
+        );
+        return 'error';
+      }
+      // 5xx: retry once before giving up.
+      log.warn(
+        { sessionId: args.sessionId, participantId: args.participantId, status: res.status, attempt },
+        '[videoSessions] LVS participant reap 5xx — retrying',
+      );
+    } catch (reapErr) {
+      // Network / breaker / timeout. Retry once.
+      log.warn(
+        { err: reapErr, sessionId: args.sessionId, participantId: args.participantId, attempt },
+        '[videoSessions] LVS participant reap threw — retrying',
+      );
+    }
+  }
+  log.warn(
+    { sessionId: args.sessionId, participantId: args.participantId },
+    '[videoSessions] LVS participant reap failed after retry — relying on SFU reaper',
+  );
+  return 'error';
 }
 
 /**
@@ -352,25 +422,16 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
       // so WHIP/WHEP transports close in milliseconds rather than waiting
       // for ICE consent timeout (~10-30s). LVS endpoint is idempotent (404
       // on second call, e.g. when the FE fires both UI-button + sendBeacon)
-      // and reaps the screen-share sibling pid automatically. Best-effort:
-      // failures collapse to the reaper's eventual sweep so /end still
-      // returns 200 to the FE.
-      try {
-        const reapRes = await callSfu(
-          `${VIDEO_API_URL}/api/channels/${encodeURIComponent(session.channelArn)}/participants/${encodeURIComponent(participantId)}`,
-          {
-            method: 'DELETE',
-            headers: { Authorization: `Bearer ${session.streamKey}` },
-          },
-        );
-        if (reapRes.ok) {
-          log.info({ sessionId, participantId }, '[videoSessions] LVS participant reap ok');
-        } else if (reapRes.status !== 404) {
-          log.warn({ sessionId, participantId, status: reapRes.status }, '[videoSessions] LVS participant reap non-2xx');
-        }
-      } catch (reapErr) {
-        log.warn({ err: reapErr, sessionId, participantId }, '[videoSessions] LVS participant reap failed — relying on SFU reaper');
-      }
+      // and reaps the screen-share sibling pid automatically. Best-effort
+      // with one retry on transport/5xx (hub#1281); failures collapse to
+      // the reaper's eventual sweep so /end still returns 200 to the FE.
+      const reapOutcome = await reapLvsParticipant({
+        channelArn: session.channelArn,
+        streamKey: session.streamKey,
+        participantId,
+        sessionId,
+      });
+      recordLvsParticipantReap(reapOutcome);
     } else if (userId) {
       // Legacy path — remove ALL participants matching userId. Kept for
       // backwards-compat with old client builds. New clients always send

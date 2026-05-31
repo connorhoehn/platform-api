@@ -38,6 +38,7 @@ import {
   videoSessionsRouter,
   __resetSfuBreakerForTests,
   __configureSfuBreakerForTests,
+  reapLvsParticipant,
 } from '../videoSessions';
 import { errorHandler } from '../../middleware/error-handler';
 
@@ -484,6 +485,76 @@ describe('GET /api/video/sessions/document/:documentId', () => {
     mockGetSessionsByDocument.mockRejectedValue(new Error('DDB scan failed'));
     const res = await run(buildApp(), 'GET', '/api/video/sessions/document/doc-1');
     expect(res.statusCode).toBe(500);
+  });
+});
+
+// --- LVS participant reap on /end (hub#1281) ----------------------------
+
+describe('reapLvsParticipant — LVS reclamation on /end', () => {
+  const args = {
+    channelArn: 'arn:lvs:channel/abc',
+    streamKey: 'sk-test',
+    participantId: 'p-1',
+    sessionId: 'sess-1',
+  };
+
+  it('returns "reaped" on 204', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 204,
+      json: async () => ({}),
+      text: async () => '',
+    } as unknown as globalThis.Response);
+
+    expect(await reapLvsParticipant(args)).toBe('reaped');
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toContain('/api/channels/');
+    expect(url).toContain('/participants/');
+    expect(url).toContain(encodeURIComponent(args.participantId));
+    expect((init as RequestInit).method).toBe('DELETE');
+    expect((init as RequestInit).headers).toMatchObject({
+      Authorization: `Bearer ${args.streamKey}`,
+    });
+  });
+
+  it('returns "not_found" on 404 (idempotent — already reaped)', async () => {
+    mockFetch.mockResolvedValueOnce(apiFail(404));
+    expect(await reapLvsParticipant(args)).toBe('not_found');
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns "error" on non-404 4xx without retry', async () => {
+    mockFetch.mockResolvedValueOnce(apiFail(400));
+    expect(await reapLvsParticipant(args)).toBe('error');
+    // 4xx (non-404) is non-retriable.
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries once on 5xx then returns "error"', async () => {
+    mockFetch.mockResolvedValueOnce(apiFail(503));
+    mockFetch.mockResolvedValueOnce(apiFail(503));
+    expect(await reapLvsParticipant(args)).toBe('error');
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries once on a thrown error then returns "error"', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('ECONNRESET'));
+    mockFetch.mockRejectedValueOnce(new Error('ECONNRESET'));
+    expect(await reapLvsParticipant(args)).toBe('error');
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('5xx then 204 → "reaped" (transient blip)', async () => {
+    mockFetch.mockResolvedValueOnce(apiFail(502));
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 204,
+      json: async () => ({}),
+      text: async () => '',
+    } as unknown as globalThis.Response);
+    expect(await reapLvsParticipant(args)).toBe('reaped');
+    expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 });
 

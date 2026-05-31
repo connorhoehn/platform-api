@@ -285,6 +285,26 @@ export function recordAuditWriteLatency(durationMs: number, success: boolean): v
 registry.histogram('audit_write_latency_ms', { ...BASE_LABELS, status: '_init' }, 1000, 'Audit write latency in milliseconds, labeled by success/failure.');
 
 // ---------------------------------------------------------------------------
+// LVS Participant Reap (hub#1281) — end-call reclamation of LVS slots
+// ---------------------------------------------------------------------------
+//
+// Counted on POST /api/video/sessions/:sessionId/end after the per-tab
+// participant is removed. `outcome` is one of:
+//   - reaped     — LVS returned 2xx (slot freed)
+//   - not_found  — LVS returned 404 (already gone; idempotent success)
+//   - error      — network/timeout/5xx after one retry (best-effort failure)
+//
+// Helps operators confirm that rapid-reconnect quota-lockout (the failure
+// mode hub#1281 fixes) stays at 0 once the FE rolls out.
+registry.counter('lvs_participant_reap_total', { ...BASE_LABELS, outcome: '_init' }, 'LVS participant reap attempts on /sessions/:sid/end, labeled by outcome.');
+
+export type LvsReapOutcome = 'reaped' | 'not_found' | 'error';
+
+export function recordLvsParticipantReap(outcome: LvsReapOutcome): void {
+  registry.counter('lvs_participant_reap_total', { ...BASE_LABELS, outcome }).inc();
+}
+
+// ---------------------------------------------------------------------------
 // Ingest Subsystem Metrics (Task #2136)
 // ---------------------------------------------------------------------------
 //
