@@ -254,7 +254,7 @@ describe('POST /:sourceId — HMAC verification', () => {
     expect(res.statusCode).toBe(403);
   });
 
-  test('200 with matching HMAC-SHA256 signature', async () => {
+  test('200 with matching HMAC-SHA256 signature and fresh timestamp', async () => {
     const secret = 'correct-horse';
     const { app } = buildApp({
       source: makeSource({ config: { spaceKey: 'ENG', webhookSecret: secret } }),
@@ -262,7 +262,21 @@ describe('POST /:sourceId — HMAC verification', () => {
     const payload = { event: 'page_updated', page: { id: '42' } };
     const res = await run(app, '/api/ingest/webhook/confluence/src-confl', payload, {
       'x-webhook-signature': sign(secret, payload),
+      'x-webhook-timestamp': new Date().toISOString(),
     });
     expect(res.statusCode).toBe(200);
+  });
+
+  test('401 when signature is valid but x-webhook-timestamp is stale', async () => {
+    const secret = 'correct-horse';
+    const { app } = buildApp({
+      source: makeSource({ config: { spaceKey: 'ENG', webhookSecret: secret } }),
+    });
+    const payload = { event: 'page_updated', page: { id: '42' } };
+    const res = await run(app, '/api/ingest/webhook/confluence/src-confl', payload, {
+      'x-webhook-signature': sign(secret, payload),
+      'x-webhook-timestamp': new Date(Date.now() - 10 * 60_000).toISOString(),
+    });
+    expect(res.statusCode).toBe(401);
   });
 });

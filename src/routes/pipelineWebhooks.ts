@@ -30,6 +30,10 @@ import {
 } from 'distributed-core';
 import { withContext } from '../lib/logger';
 import {
+  checkReplayWindow,
+  WEBHOOK_TIMESTAMP_HEADER,
+} from '../lib/webhook-replay';
+import {
   recordPipelineTrigger,
   recordPipelineError,
 } from '../observability/metrics';
@@ -189,6 +193,24 @@ pipelineWebhooksRouter.post(
             typeof header === 'string' && header.length > 0
               ? 'X-Pipeline-Signature-256 did not match the expected HMAC-SHA256 of the request body.'
               : 'X-Pipeline-Signature-256 header is required when a webhook secret is configured.',
+        });
+      }
+
+      // hub#1260 — replay-window guard. Paired with HMAC: only enforced
+      // when a secret is configured (signed traffic), so unsigned dev
+      // fixtures continue to work. A captured signed body can otherwise
+      // be replayed indefinitely.
+      const replay = checkReplayWindow(req.headers[WEBHOOK_TIMESTAMP_HEADER]);
+      if (!replay.ok) {
+        log.error(
+          { webhookPath: path, reason: replay.reason },
+          'pipeline-webhook replay-window check failed',
+        );
+        return res.status(401).json({
+          type: 'about:blank',
+          title: 'Invalid webhook timestamp',
+          status: 401,
+          detail: replay.reason,
         });
       }
     }

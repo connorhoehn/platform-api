@@ -535,7 +535,7 @@ describe('POST /hooks/pipeline/:path — HMAC-SHA256 signature', () => {
     // signature suite reuses those mocks rather than re-spying on console.
   });
 
-  test('valid signature → 202', async () => {
+  test('valid signature + fresh timestamp → 202', async () => {
     const { secret } = await seedViaPut({ webhookPath: 'signed-ok' });
     const rawBody = Buffer.from(JSON.stringify({ hello: 'world' }), 'utf8');
     const sig = computeSignature(secret, rawBody);
@@ -543,11 +543,48 @@ describe('POST /hooks/pipeline/:path — HMAC-SHA256 signature', () => {
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/signed-ok', {
       body: rawBody,
-      headers: { [SIGNATURE_HEADER]: sig },
+      headers: {
+        [SIGNATURE_HEADER]: sig,
+        'x-webhook-timestamp': new Date().toISOString(),
+      },
     });
 
     expect(res.statusCode).toBe(202);
     expect((res.body as { accepted: boolean }).accepted).toBe(true);
+  });
+
+  // hub#1260 — replay-window guard
+  test('valid signature but missing x-webhook-timestamp → 401', async () => {
+    const { secret } = await seedViaPut({ webhookPath: 'signed-no-ts' });
+    const rawBody = Buffer.from(JSON.stringify({ hello: 'world' }), 'utf8');
+    const sig = computeSignature(secret, rawBody);
+
+    const app = buildApp();
+    const res = await run(app, 'POST', '/hooks/pipeline/signed-no-ts', {
+      body: rawBody,
+      headers: { [SIGNATURE_HEADER]: sig },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect((res.body as { title: string }).title).toBe('Invalid webhook timestamp');
+  });
+
+  test('valid signature but stale x-webhook-timestamp → 401', async () => {
+    const { secret } = await seedViaPut({ webhookPath: 'signed-stale' });
+    const rawBody = Buffer.from(JSON.stringify({ hello: 'world' }), 'utf8');
+    const sig = computeSignature(secret, rawBody);
+
+    const app = buildApp();
+    const res = await run(app, 'POST', '/hooks/pipeline/signed-stale', {
+      body: rawBody,
+      headers: {
+        [SIGNATURE_HEADER]: sig,
+        'x-webhook-timestamp': new Date(Date.now() - 10 * 60_000).toISOString(),
+      },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect((res.body as { title: string }).title).toBe('Invalid webhook timestamp');
   });
 
   test('invalid signature → 401 with problem-details body', async () => {

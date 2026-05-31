@@ -91,6 +91,14 @@ function signBody(body: Buffer, secret = 'test-secret'): string {
   return 'sha256=' + createHmac('sha256', secret).update(body).digest('hex');
 }
 
+/** Headers for a happy-path signed delivery with a fresh replay-window timestamp (hub#1260). */
+function signedHeaders(body: Buffer, secret = 'test-secret'): Record<string, string> {
+  return {
+    'X-LVS-Signature': signBody(body, secret),
+    'x-webhook-timestamp': new Date().toISOString(),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -129,11 +137,8 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
       },
     };
     const body = Buffer.from(JSON.stringify(payload), 'utf-8');
-    const sig = signBody(body);
 
-    const res = await rawPost(server, '/hooks/lvs/recording', body, {
-      'X-LVS-Signature': sig,
-    });
+    const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
 
     // 204 = persisted OK
     expect(res.status).toBe(204);
@@ -180,9 +185,7 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
     };
     const body = Buffer.from(JSON.stringify(payload), 'utf-8');
 
-    const res = await rawPost(server, '/hooks/lvs/recording', body, {
-      'X-LVS-Signature': signBody(body),
-    });
+    const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
     expect(res.status).toBe(204);
     expect(findByChannelArnMock).toHaveBeenCalledWith('arn:dm');
 
@@ -214,13 +217,42 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
       },
     };
     const body = Buffer.from(JSON.stringify(payload), 'utf-8');
-    const res = await rawPost(server, '/hooks/lvs/recording', body, {
-      'X-LVS-Signature': signBody(body),
-    });
+    const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
     expect(res.status).toBe(204);
     const arg = putRecordingMock.mock.calls[0]![0];
     expect(arg.composedUrl).toBe('https://lvs.test/composed/r-multi.mp4');
     expect(arg.tracks).toHaveLength(2);
+  });
+
+  // hub#1260 — replay-window guard, paired with HMAC.
+  test('valid HMAC + missing x-webhook-timestamp → 401, repo NOT called', async () => {
+    const payload = {
+      type: 'recording.completed',
+      channelArn: 'arn:x',
+      data: { recordingId: 'r1', segments: [], totalSize: 0, durationMs: 1000, destination: 'local' },
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+    const res = await rawPost(server, '/hooks/lvs/recording', body, {
+      'X-LVS-Signature': signBody(body),
+      // No x-webhook-timestamp.
+    });
+    expect(res.status).toBe(401);
+    expect(putRecordingMock).not.toHaveBeenCalled();
+  });
+
+  test('valid HMAC + stale x-webhook-timestamp → 401', async () => {
+    const payload = {
+      type: 'recording.completed',
+      channelArn: 'arn:x',
+      data: { recordingId: 'r1', segments: [], totalSize: 0, durationMs: 1000, destination: 'local' },
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+    const res = await rawPost(server, '/hooks/lvs/recording', body, {
+      'X-LVS-Signature': signBody(body),
+      'x-webhook-timestamp': new Date(Date.now() - 10 * 60_000).toISOString(),
+    });
+    expect(res.status).toBe(401);
+    expect(putRecordingMock).not.toHaveBeenCalled();
   });
 
   test('invalid HMAC signature → 401, repo NOT called', async () => {

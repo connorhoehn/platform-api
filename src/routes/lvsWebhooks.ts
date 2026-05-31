@@ -51,6 +51,10 @@ import {
 import { tableName } from '../lib/ddb-table-name';
 import log from '../lib/logger';
 import { ddbClient } from '../lib/aws-clients';
+import {
+  checkReplayWindow,
+  WEBHOOK_TIMESTAMP_HEADER,
+} from '../lib/webhook-replay';
 
 export const lvsWebhooksRouter = Router();
 
@@ -232,6 +236,31 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
     });
     res.status(401).json({ error: 'invalid signature' });
     return;
+  }
+
+  // hub#1260 — replay-window guard, paired with HMAC. Only enforced when
+  // a secret is actually configured (i.e. we just verified an HMAC);
+  // dev-mode SKIP_AUTH bypasses both. An attacker who captures a signed
+  // body otherwise has indefinite replay rights.
+  if (currentSecret()) {
+    const replay = checkReplayWindow(req.header(WEBHOOK_TIMESTAMP_HEADER));
+    if (!replay.ok) {
+      log.warn(
+        { ip: req.ip, reason: replay.reason },
+        '[lvs-webhook] replay-window check failed',
+      );
+      recordDelivery({
+        timestamp: new Date().toISOString(),
+        eventType: '',
+        arn: '',
+        recordingId: '',
+        hmacOk: true,
+        persisted: false,
+        error: `replay-window: ${replay.reason}`,
+      });
+      res.status(401).json({ error: replay.reason });
+      return;
+    }
   }
 
   let payload: any;

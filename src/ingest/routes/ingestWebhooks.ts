@@ -112,11 +112,16 @@ export function createIngestWebhookRoutes(deps: WebhookDeps): Router {
       return res.status(404).json({ error: `source ${sourceId} not found` });
     }
 
-    // 2. Validate webhook signature if source has a webhookSecret configured
+    // 2. Validate webhook signature + replay-window if source has a
+    //    webhookSecret configured. Status code distinguishes the two
+    //    failure modes (403 for HMAC, 401 for replay-window).
     const verify = verifyWebhookSignature(req, source);
     if (!verify.ok) {
-      log.error({ sourceId }, 'ingest webhook signature verification failed');
-      return res.status(403).json({ error: verify.reason });
+      log.error(
+        { sourceId, reason: verify.reason },
+        'ingest webhook verification failed',
+      );
+      return res.status(verify.status ?? 403).json({ error: verify.reason });
     }
 
     // 3. Parse changed files from body

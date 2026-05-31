@@ -136,15 +136,41 @@ describe('POST /:sourceId — signature validation', () => {
         expect(res.statusCode).toBe(403);
     });
 
-    test('passes with correct HMAC-SHA256 signature', async () => {
+    test('passes with correct HMAC-SHA256 signature and fresh timestamp', async () => {
         const secret = 'correct-secret';
         const payload = { files: [{ path: '/file.txt', action: 'modified' }] };
         const payloadString = JSON.stringify(payload);
         const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(payloadString).digest('hex');
         const source = makeSource({ config: { webhookSecret: secret } });
         const app = buildApp(source);
-        const res = await run(app, '/api/ingest/webhooks/src-1', payload, { 'x-webhook-signature': expected });
+        const res = await run(app, '/api/ingest/webhooks/src-1', payload, {
+            'x-webhook-signature': expected,
+            'x-webhook-timestamp': new Date().toISOString(),
+        });
         expect(res.statusCode).toBe(200);
+    });
+
+    test('401 when signature is valid but x-webhook-timestamp is missing', async () => {
+        const secret = 'correct-secret';
+        const payload = { files: [{ path: '/file.txt', action: 'modified' }] };
+        const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');
+        const source = makeSource({ config: { webhookSecret: secret } });
+        const app = buildApp(source);
+        const res = await run(app, '/api/ingest/webhooks/src-1', payload, { 'x-webhook-signature': expected });
+        expect(res.statusCode).toBe(401);
+    });
+
+    test('401 when signature is valid but x-webhook-timestamp is stale', async () => {
+        const secret = 'correct-secret';
+        const payload = { files: [{ path: '/file.txt', action: 'modified' }] };
+        const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');
+        const source = makeSource({ config: { webhookSecret: secret } });
+        const app = buildApp(source);
+        const res = await run(app, '/api/ingest/webhooks/src-1', payload, {
+            'x-webhook-signature': expected,
+            'x-webhook-timestamp': new Date(Date.now() - 10 * 60_000).toISOString(),
+        });
+        expect(res.statusCode).toBe(401);
     });
 
     test('no-secret source: signature header present but skips real validation', async () => {

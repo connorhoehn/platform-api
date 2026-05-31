@@ -328,7 +328,7 @@ describe('POST /jira/:sourceId — HMAC verification', () => {
     expect(res.statusCode).toBe(403);
   });
 
-  test('200 with matching HMAC-SHA256 signature', async () => {
+  test('200 with matching HMAC-SHA256 signature and fresh timestamp', async () => {
     const secret = 'correct-horse';
     const app = buildApp({
       source: makeJiraSource({ config: { projectKey: 'ENG', webhookSecret: secret } }),
@@ -337,8 +337,26 @@ describe('POST /jira/:sourceId — HMAC verification', () => {
       webhookEvent: 'jira:issue_updated',
       issue: { id: '1', key: 'ENG-1', fields: { project: { key: 'ENG' } } },
     };
-    const res = await run(app, '/api/ingest/webhook/jira/src-jira', payload,
-      { 'x-webhook-signature': sign(secret, payload) });
+    const res = await run(app, '/api/ingest/webhook/jira/src-jira', payload, {
+      'x-webhook-signature': sign(secret, payload),
+      'x-webhook-timestamp': new Date().toISOString(),
+    });
     expect(res.statusCode).toBe(200);
+  });
+
+  test('401 when signature is valid but x-webhook-timestamp is stale', async () => {
+    const secret = 'correct-horse';
+    const app = buildApp({
+      source: makeJiraSource({ config: { projectKey: 'ENG', webhookSecret: secret } }),
+    });
+    const payload = {
+      webhookEvent: 'jira:issue_updated',
+      issue: { id: '1', key: 'ENG-1', fields: { project: { key: 'ENG' } } },
+    };
+    const res = await run(app, '/api/ingest/webhook/jira/src-jira', payload, {
+      'x-webhook-signature': sign(secret, payload),
+      'x-webhook-timestamp': new Date(Date.now() - 10 * 60_000).toISOString(),
+    });
+    expect(res.statusCode).toBe(401);
   });
 });

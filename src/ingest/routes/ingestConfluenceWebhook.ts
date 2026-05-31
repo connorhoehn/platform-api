@@ -116,8 +116,11 @@ export function createConfluenceWebhookRoutes(deps: ConfluenceWebhookDeps): Rout
 
     const verify = verifyWebhookSignature(req, source);
     if (!verify.ok) {
-      log.error({ sourceId }, 'confluence webhook signature verification failed');
-      return res.status(403).json({ error: verify.reason });
+      log.error(
+        { sourceId, reason: verify.reason },
+        'confluence webhook verification failed',
+      );
+      return res.status(verify.status ?? 403).json({ error: verify.reason });
     }
 
     const update = normalizeConfluencePayload(req.body);

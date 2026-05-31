@@ -163,11 +163,16 @@ export function createJiraWebhookRoutes(deps: JiraWebhookDeps): Router {
       return res.status(400).json({ error: `source ${sourceId} is not a jira source` });
     }
 
-    // 1a. Verify HMAC signature when source has a webhookSecret configured.
+    // 1a. Verify HMAC signature + replay-window when source has a
+    //     webhookSecret configured. Status code distinguishes failure
+    //     modes (403 HMAC, 401 replay-window).
     const verify = verifyWebhookSignature(req, source);
     if (!verify.ok) {
-      log.error({ sourceId }, 'jira webhook signature verification failed');
-      return res.status(403).json({ error: verify.reason });
+      log.error(
+        { sourceId, reason: verify.reason },
+        'jira webhook verification failed',
+      );
+      return res.status(verify.status ?? 403).json({ error: verify.reason });
     }
 
     const projectKey = String((source.config as Record<string, unknown>).projectKey ?? '');
