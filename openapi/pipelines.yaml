@@ -1685,6 +1685,153 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorBody' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  # --- /api/v2 — module-shaped pipeline router -----------------------------
+  # Phase A of the distributed-core pipeline absorption: same handler code
+  # that will eventually `git mv` into
+  # distributed-core/src/applications/pipeline/http/. Lives under /api/v2/*
+  # during migration so the legacy /api/pipelines/* surface keeps working
+  # unchanged. New routes land here first; they get promoted to /api/* once
+  # the legacy counterpart is removed. See
+  # src/pipeline/http/createPipelineRouter.ts and contracts.ts.
+
+  /v2/pipelines/{pipelineId}/runs:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+    post:
+      tags: [pipelines]
+      summary: Trigger a pipeline run (module-shaped router)
+      description: |
+        Same trigger surface as the legacy `/api/pipelines/{pipelineId}/runs`,
+        but routed through the host-injected `deps.trigger` so the handler
+        itself has zero platform-api specifics. Body `definition.id`, when
+        supplied, MUST equal `:pipelineId`. The router uses bridge-error
+        `502` (not `503`) when the host's `trigger` throws.
+      operationId: triggerPipelineRunV2
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/V2PipelineTriggerRequest' }
+      responses:
+        '202':
+          description: Trigger accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/V2PipelineTriggerResponse' }
+        '400':
+          description: '`definition.id` does not match `:pipelineId`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/V2PipelineErrorBody' }
+        '502':
+          description: Host-injected `trigger` threw (bridge unwired / framework error)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/V2PipelineErrorBody' }
+
+  /v2/pipelines/{pipelineId}/runs/{runId}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+    get:
+      tags: [pipelines]
+      summary: Fetch a single run snapshot (module-shaped router)
+      description: |
+        Live-then-store fallback. The runtime's in-memory snapshot is the
+        freshest (full step input/output while a run is active), but it
+        gets evicted once the run leaves the active set. The host's
+        durable store is the long-term home. Returns whichever resolves
+        first; 404 when both miss.
+      operationId: getPipelineRunV2
+      responses:
+        '200':
+          description: Run snapshot (live or stored)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/V2PipelineRunDetail' }
+        '404':
+          description: Run not found in either live runtime or durable store
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/V2PipelineErrorBody' }
+
+  # --- /api/capabilities — pipeline capability introspection --------------
+  # Backend-side mirror of the gateway's capabilities surface so consumers
+  # can query which AgenticPipelines are currently active without going
+  # through the gateway. Data sourced from DefinitionsRepository.listAll()
+  # (full operator-managed pipeline-definitions table scan).
+
+  /capabilities/pipelines:
+    get:
+      tags: [pipelines]
+      summary: List all registered pipeline capabilities
+      description: |
+        Operator-managed scan of every published pipeline definition.
+        Returns a compact summary per pipeline so the SPA can render
+        capability-gated UI without loading full definitions.
+      operationId: listPipelineCapabilities
+      responses:
+        '200':
+          description: All registered pipelines (summary form)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pipelines]
+                properties:
+                  pipelines:
+                    type: array
+                    items: { $ref: '#/components/schemas/PipelineCapabilitySummary' }
+        '500':
+          description: Repository scan failed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { type: string, enum: [internal_error] }
+                  detail: { type: string }
+
+  /capabilities/pipelines/{name}:
+    parameters:
+      - in: path
+        name: name
+        required: true
+        schema: { type: string }
+        description: |
+          Pipeline `name` (preferred) or DDB sort-key `id`. The handler
+          matches on either, in that order.
+    get:
+      tags: [pipelines]
+      summary: Detail for a single pipeline capability
+      operationId: getPipelineCapability
+      responses:
+        '200':
+          description: Pipeline detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PipelineCapabilityDetail' }
+        '404':
+          description: Pipeline with that `name`/`id` not found
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { type: string, enum: [pipeline_not_found] }
+        '500':
+          description: Repository scan failed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { type: string, enum: [internal_error] }
+                  detail: { type: string }
+
   # --- Profiles (UserPicker) ----------------------------------------------
   /profiles:
     get:
@@ -2913,3 +3060,120 @@ components:
         asOf:
           type: string
           format: date-time
+
+    # -----------------------------------------------------------------
+    # /api/v2 module-shaped router contracts. Mirrors
+    # src/pipeline/http/contracts.ts — the type-only file that moves
+    # into distributed-core when the module relocates.
+    # -----------------------------------------------------------------
+    V2InlinePipelineDefinition:
+      type: object
+      required: [id]
+      additionalProperties: true
+      properties:
+        id: { type: string }
+
+    V2PipelineTriggerRequest:
+      type: object
+      properties:
+        definition:
+          $ref: '#/components/schemas/V2InlinePipelineDefinition'
+        triggerPayload:
+          type: object
+          additionalProperties: true
+          description: Free-form key/value merged into the trigger node's evaluation context.
+        breakpoints:
+          type: array
+          items: { type: string }
+          description: Node ids at which the run should pause for step-by-step debugging.
+
+    V2PipelineTriggerResponse:
+      type: object
+      required: [runId, pipelineId, triggeredBy, at]
+      properties:
+        runId: { type: string, format: uuid }
+        pipelineId: { type: string }
+        triggeredBy:
+          type: object
+          required: [userId, triggerType]
+          properties:
+            userId: { type: string }
+            triggerType: { type: string, enum: [manual] }
+        at: { type: string, format: date-time }
+
+    V2PipelineRunDetail:
+      type: object
+      required: [runId, pipelineId, status, startedAt, triggeredBy]
+      properties:
+        runId: { type: string, format: uuid }
+        pipelineId: { type: string }
+        status:
+          type: string
+          enum: [running, succeeded, failed, canceled, interrupted]
+        startedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time }
+        triggeredBy:
+          type: object
+          required: [triggerType]
+          properties:
+            userId: { type: string }
+            triggerType: { type: string }
+            payload:
+              type: object
+              additionalProperties: true
+        triggerType: { type: string }
+        steps:
+          type: object
+          additionalProperties: true
+          description: Per-step state map keyed by node id; shape evolves with the framework.
+        error:
+          type: object
+          required: [nodeId, message]
+          additionalProperties: true
+          properties:
+            nodeId: { type: string }
+            message: { type: string }
+            errorCategory: { type: string }
+            retryability: { type: string }
+
+    V2PipelineErrorBody:
+      type: object
+      required: [error, action]
+      properties:
+        error: { type: string }
+        action:
+          type: string
+          description: Logical action attempted (`trigger`, `getRun`, ...).
+
+    # -----------------------------------------------------------------
+    # /api/capabilities — pipeline capability introspection
+    # -----------------------------------------------------------------
+    PipelineCapabilitySummary:
+      type: object
+      required: [name, enabled, triggers]
+      properties:
+        name: { type: string, description: Pipeline display name (falls back to `id`). }
+        enabled:
+          type: boolean
+          description: True when the definition's `disabled` flag is unset/false.
+        version: { type: string }
+        triggers:
+          type: integer
+          minimum: 0
+          description: Count of trigger bindings on the pipeline.
+
+    PipelineCapabilityDetail:
+      type: object
+      required: [name, enabled, steps]
+      properties:
+        name: { type: string }
+        enabled: { type: boolean }
+        version: { type: string }
+        steps:
+          type: integer
+          minimum: 0
+          description: Count of nodes in the pipeline definition.
+        triggers:
+          type: array
+          items: { type: object, additionalProperties: true }
+          description: Full trigger binding list (shape per the definition schema).
