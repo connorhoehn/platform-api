@@ -540,6 +540,89 @@ paths:
                 $ref: '#/components/schemas/PipelineMetrics'
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  # --- Dashboard data (module-driven dashboard pass-through) ---------------
+  /pipelines/dashboard-data:
+    get:
+      tags: [pipelines]
+      summary: PipelineModule dashboard payload (module-driven KPIs + charts + alerts)
+      description: |
+        Pass-through of the embedded distributed-core `PipelineModule.getDashboardData()`.
+        Surfaces a uniform ApplicationModule observability shape (summary KPIs,
+        chart definitions, alerts) so the frontend can render a module-driven
+        dashboard without hand-rolling the same view from `/pipelines/metrics`.
+
+        `source` reports the data origin:
+          - `bridge` — live bridge response
+          - `stub`   — bridge unavailable; synthesized stub
+          - `error`  — bridge threw; `error` field describes what
+      operationId: getPipelineDashboardData
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PipelineDashboardDataResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500':
+          description: Bridge threw
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PipelineDashboardDataError' }
+
+  # --- Health (bridge-probe-instrumented liveness/readiness) ---------------
+  /pipelines/health:
+    get:
+      tags: [pipelines]
+      summary: Pipeline subsystem health + bridge live probes
+      description: |
+        Runtime introspection for the pipeline subsystem. Reports overall
+        status (`ok` | `degraded` | `unwired`), embedded-cluster + LLM-client
+        readiness, last event timestamp, and per-subsystem bridge probe
+        results so operators can distinguish "bridge said zero" from
+        "bridge hung" from "bridge threw".
+
+        Always 200 on probe-individual timeouts/errors — those surface in
+        `probes.<subsystem>.status`. 500 only when the probe itself fails
+        catastrophically (e.g. the bridge accessor throws synchronously).
+      operationId: getPipelineHealth
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PipelineHealth' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500':
+          description: Probe failed catastrophically
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  # --- Pipeline validation (structural lint) -------------------------------
+  /pipelines/validate:
+    post:
+      tags: [pipelines]
+      summary: Structural lint a pipeline definition
+      description: |
+        Pure-function structural validation of a pipeline definition
+        (nodes + edges). Mirrors the frontend's `validatePipelineStructural`
+        so client-side validation and server-side validation agree.
+        Returns the lint result without persisting anything.
+      operationId: validatePipeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ValidatePipelineRequest' }
+      responses:
+        '200':
+          description: Validation result (may include errors/warnings)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   # --- Profiles (UserPicker) ----------------------------------------------
   /profiles:
     get:
@@ -1381,6 +1464,174 @@ components:
         canPublish:
           type: boolean
           description: "`errors.length === 0` — blocks publish (and therefore run), not save."
+
+    # -----------------------------------------------------------------
+    # POST /pipelines/validate request body — looser than PipelineDefinition.
+    # Structural validation only looks at id + nodes + edges; per-node-data
+    # shapes are intentionally not constrained here so frontend drafts
+    # (mid-edit, partially-typed) can still be validated.
+    # -----------------------------------------------------------------
+    ValidatePipelineRequest:
+      type: object
+      required: [definition]
+      properties:
+        definition:
+          type: object
+          required: [id, nodes, edges]
+          properties:
+            id: { type: string }
+            nodes:
+              type: array
+              items:
+                type: object
+                required: [id, type]
+                properties:
+                  id: { type: string }
+                  type: { type: string }
+                  data:
+                    type: object
+                    additionalProperties: true
+                additionalProperties: true
+            edges:
+              type: array
+              items:
+                type: object
+                required: [id, source, target]
+                properties:
+                  id: { type: string }
+                  source: { type: string }
+                  target: { type: string }
+                  sourceHandle: { type: string }
+                  targetHandle: { type: string }
+                additionalProperties: true
+          additionalProperties: true
+
+    # -----------------------------------------------------------------
+    # /pipelines/health — bridge-probe-instrumented liveness/readiness.
+    # -----------------------------------------------------------------
+    PipelineHealthProbeStatus:
+      type: string
+      enum: [ok, timeout, error]
+      description: |
+        `ok` — the probe returned a usable value within the timeout.
+        `timeout` — the probe didn't settle within ~1s.
+        `error` — the probe threw or returned a malformed value.
+
+    PipelineHealthProbeResultBoolean:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/PipelineHealthProbeStatus' }
+        value: { type: boolean }
+        message:
+          type: string
+          description: Present when status is `error`.
+
+    PipelineHealthProbeResultInteger:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/PipelineHealthProbeStatus' }
+        value: { type: integer, minimum: 0 }
+        message:
+          type: string
+          description: Present when status is `error`.
+
+    PipelineHealthProbes:
+      type: object
+      required: [bridgeWired, runsActive, runsAwaitingApproval, pendingApprovals]
+      properties:
+        bridgeWired: { $ref: '#/components/schemas/PipelineHealthProbeResultBoolean' }
+        runsActive: { $ref: '#/components/schemas/PipelineHealthProbeResultInteger' }
+        runsAwaitingApproval: { $ref: '#/components/schemas/PipelineHealthProbeResultInteger' }
+        pendingApprovals: { $ref: '#/components/schemas/PipelineHealthProbeResultInteger' }
+
+    PipelineHealthTokenRate:
+      type: object
+      required: [perSec1s, perSec10s, perSec60s]
+      properties:
+        perSec1s: { type: number, minimum: 0 }
+        perSec10s: { type: number, minimum: 0 }
+        perSec60s: { type: number, minimum: 0 }
+
+    PipelineHealth:
+      type: object
+      required:
+        - status
+        - embeddedClusterReady
+        - llmClientConfigured
+        - pipelineModuleConnected
+        - lastEventAt
+        - tokenRate
+        - asOf
+        - bridgeWired
+        - runsActive
+        - runsAwaitingApproval
+        - pendingApprovals
+        - probes
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, unwired]
+        embeddedClusterReady: { type: boolean }
+        llmClientConfigured: { type: boolean }
+        pipelineModuleConnected: { type: boolean }
+        lastEventAt:
+          type: string
+          format: date-time
+          nullable: true
+        tokenRate:
+          oneOf:
+            - $ref: '#/components/schemas/PipelineHealthTokenRate'
+            - type: 'null'
+        asOf: { type: string, format: date-time }
+        bridgeWired: { type: boolean }
+        runsActive: { type: integer, minimum: 0 }
+        runsAwaitingApproval: { type: integer, minimum: 0 }
+        pendingApprovals: { type: integer, minimum: 0 }
+        probes: { $ref: '#/components/schemas/PipelineHealthProbes' }
+
+    # -----------------------------------------------------------------
+    # /pipelines/dashboard-data — ApplicationModule observability shape.
+    # The bridge / stub payload comes from distributed-core; treated as
+    # opaque here (additionalProperties: true) to avoid duplicating the
+    # upstream schema. `source` carries the data origin.
+    # -----------------------------------------------------------------
+    PipelineDashboardDataResponse:
+      type: object
+      required: [source, moduleId, moduleName, state, summary, charts, alerts]
+      properties:
+        source:
+          type: string
+          enum: [bridge, stub]
+        moduleId: { type: string }
+        moduleName: { type: string }
+        state:
+          type: string
+          description: distributed-core ModuleState (RUNNING, etc.).
+        summary:
+          type: object
+          additionalProperties: true
+        charts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        alerts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      additionalProperties: true
+
+    PipelineDashboardDataError:
+      type: object
+      required: [source, error]
+      properties:
+        source:
+          type: string
+          enum: [error]
+        error: { type: string }
 
     # -----------------------------------------------------------------
     # PipelineDefinitionSnapshot — same shape as PipelineDefinition minus
