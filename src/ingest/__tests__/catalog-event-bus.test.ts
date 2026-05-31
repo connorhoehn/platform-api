@@ -5,6 +5,7 @@
 
 const mockSignalPublish = jest.fn<Promise<void>, [string, unknown]>();
 const mockValidate = jest.fn<{ valid: boolean; errors?: Array<{ message: string }> }, [string, unknown]>();
+const mockLogWarn = jest.fn();
 
 jest.mock('../../lib/event-catalog', () => ({
   catalog: {
@@ -14,6 +15,16 @@ jest.mock('../../lib/event-catalog', () => ({
     getRegistry: jest.fn(() => ({
       validate: mockValidate,
     })),
+  },
+}));
+
+jest.mock('../../lib/logger', () => ({
+  __esModule: true,
+  default: {
+    info: jest.fn(),
+    warn: mockLogWarn,
+    error: jest.fn(),
+    debug: jest.fn(),
   },
 }));
 
@@ -163,19 +174,18 @@ describe('emit — discriminator validation (Phase P3.2)', () => {
       errors: [{ message: 'must be equal to one of the allowed values' }],
     });
     const bus = new CatalogIngestEventBus();
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     bus.emit(makeEvent({ type: 'sync.invented' as unknown as 'sync.started' }));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ingest:progress validation failed'));
-    warn.mockRestore();
+    expect(mockLogWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: 'sync.invented' }),
+      expect.stringContaining('ingest:progress validation failed'),
+    );
   });
 
   it('valid sub-type does NOT log a warning', () => {
     mockValidate.mockReturnValue({ valid: true });
     const bus = new CatalogIngestEventBus();
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
     bus.emit(makeEvent({ type: 'sync.started' }));
-    expect(warn).not.toHaveBeenCalled();
-    warn.mockRestore();
+    expect(mockLogWarn).not.toHaveBeenCalled();
   });
 
   it('still publishes to signal transport even when validation fails', () => {
