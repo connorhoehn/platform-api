@@ -1131,6 +1131,560 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  # --- Ops surface --------------------------------------------------------
+  # Operator-facing pipeline endpoints: active runs, queue inspector,
+  # dead-letter queue, LLM streaming proxy, cross-run audit search, per-
+  # pipeline cost rollup, and run cancellation. Each static segment is
+  # mounted BEFORE the `:pipelineId` mount in src/routes/index.ts so the
+  # words `runs`, `inspector`, `dlq`, `llm`, `audit` don't get captured
+  # as path params.
+
+  /pipelines/runs/active:
+    get:
+      tags: [pipelines]
+      summary: List active runs for the caller
+      description: |
+        Returns the in-flight run summaries the bridge knows about for
+        the caller's userId. Falls back to the in-memory stub store when
+        the bridge isn't wired (Phase 1).
+      operationId: listActivePipelineRuns
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/inspector/pending:
+    get:
+      tags: [pipelines]
+      summary: List pending runs in the executor's queue
+      description: |
+        Paginated listing of pending run envelopes from distributed-core's
+        T13 `QueueInspector` (lib-expansion-3). Returns 503 when the
+        bridge does not expose `getInspector()`.
+      operationId: listPipelineInspectorPending
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 0, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: Opaque pagination cursor from a prior response.
+      responses:
+        '200':
+          description: Page of pending envelopes
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                description: Inspector `Page` shape (items + nextCursor).
+        '503':
+          description: Pipeline inspector unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/inspector/inflight:
+    get:
+      tags: [pipelines]
+      summary: List leased / in-flight inspector entries
+      description: |
+        Returns leased entries from the inspector. Always empty today —
+        the in-memory queue does not lease — kept on the surface for
+        when a durable queue with leases lands.
+      operationId: listPipelineInspectorInflight
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 0, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Leased entries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        '503':
+          description: Pipeline inspector unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/inspector/summary:
+    get:
+      tags: [pipelines]
+      summary: Aggregate inspector snapshot
+      description: |
+        Returns the inspector's aggregate summary (queue depth, inflight
+        count, oldest age, etc.). 503 when the bridge does not expose an
+        inspector.
+      operationId: getPipelineInspectorSummary
+      responses:
+        '200':
+          description: Inspector summary snapshot
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '503':
+          description: Pipeline inspector unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/inspector/peek/{runId}:
+    parameters:
+      - $ref: '#/components/parameters/RunIdPath'
+    get:
+      tags: [pipelines]
+      summary: Peek at a single pending envelope by runId
+      operationId: peekPipelineInspectorRun
+      responses:
+        '200':
+          description: Pending envelope for `runId`
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '404':
+          description: Run not currently in the pending queue
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: Pipeline inspector unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/dlq:
+    get:
+      tags: [pipelines]
+      summary: List EventBus dead-letter entries
+      description: |
+        Paginated list of dead-letter entries from distributed-core's
+        `InMemoryDeadLetterQueue` (T9). Every row is enriched with a
+        derived `errorKind` parsed from the `lastError` prefix.
+      operationId: listPipelineDLQ
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 0, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: sinceMs
+          schema: { type: number, minimum: 0 }
+          description: Lower bound on entry timestamp (epoch ms).
+        - in: query
+          name: errorKind
+          schema: { type: string, pattern: '^[A-Za-z][A-Za-z0-9_]{0,79}$' }
+          description: |
+            Filter to entries whose `lastError` begins with `<errorKind>:`.
+            Rejected with 400 when the value does not match the pattern.
+      responses:
+        '200':
+          description: DLQ page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        errorKind:
+                          type: string
+                          nullable: true
+                          description: Derived from the `lastError` prefix; null when unparseable.
+                  nextCursor: { type: string }
+        '400':
+          description: Malformed `errorKind` filter
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: DLQ unavailable or disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/dlq/peek/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string }
+        description: DLQ entry id.
+    get:
+      tags: [pipelines]
+      summary: Peek a single DLQ entry
+      operationId: peekPipelineDLQEntry
+      responses:
+        '200':
+          description: DLQ entry (enriched with `errorKind`)
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '404':
+          description: DLQ entry not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: DLQ unavailable or disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/dlq/redrive:
+    post:
+      tags: [pipelines]
+      summary: Re-publish selected DLQ entries to the EventBus
+      description: |
+        Pass `{ ids: [...] }` to redrive specific entries. Set
+        `resetAttempts: true` to clear the attempt counter on redrive.
+        Set `preview: true` for a no-op dry-run that returns
+        `{ wouldRedrive, notFound }` without mutating the DLQ. The route
+        attaches `pipelineWriteRateLimit` (10 writes/min/user, shared
+        with /purge).
+      operationId: redrivePipelineDLQ
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items: { type: string }
+                  minItems: 1
+                resetAttempts: { type: boolean, default: false }
+                preview: { type: boolean, default: false }
+      responses:
+        '200':
+          description: 'Redrive result (or `preview: true` dry-run summary)'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  preview: { type: boolean }
+                  resetAttempts: { type: boolean }
+                  wouldRedrive:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+                  notFound:
+                    type: array
+                    items:
+                      type: object
+                      properties: { id: { type: string } }
+        '400':
+          description: '`body.ids` missing or not a string array'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '429':
+          description: Per-user rate limit exceeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: DLQ unavailable or disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/dlq/purge:
+    post:
+      tags: [pipelines]
+      summary: Drop selected DLQ entries
+      description: |
+        Pass `{ ids: [...] }` to purge specific entries. Set
+        `preview: true` for a no-op dry-run. Shares the same
+        `pipelineWriteRateLimit` budget as /redrive.
+      operationId: purgePipelineDLQ
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items: { type: string }
+                  minItems: 1
+                preview: { type: boolean, default: false }
+      responses:
+        '200':
+          description: 'Purge result (or `preview: true` dry-run summary)'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  preview: { type: boolean }
+                  wouldPurge:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+                  notFound:
+                    type: array
+                    items:
+                      type: object
+                      properties: { id: { type: string } }
+        '400':
+          description: '`body.ids` missing or not a string array'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '429':
+          description: Per-user rate limit exceeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: DLQ unavailable or disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/llm/stream:
+    post:
+      tags: [pipelines]
+      summary: Server-side LLM streaming proxy (SSE)
+      description: |
+        Streams token chunks back as Server-Sent Events. The API key
+        lives server-side only — the frontend never sees it. Provider
+        selected by `PIPELINE_LLM_PROVIDER` (`anthropic` default,
+        `bedrock` supported). Rate-limited to 20 requests/min/user.
+
+        ## SSE event shapes (AG-UI)
+        Every event is emitted as `data: <json>\n\n`. The stream emits:
+        - `RUN_STARTED` — opening envelope with `runId` + `threadId`.
+        - `TEXT_MESSAGE_CONTENT` — token-delta chunks (zero or more).
+        - `RUN_FINISHED` — terminal envelope on success.
+        - `RUN_ERROR` — terminal envelope on failure (with `code` +
+          `message`).
+
+        On client disconnect (AbortController), the upstream LLM stream
+        is cancelled to avoid wasting tokens.
+      operationId: streamPipelineLLM
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, systemPrompt, userPrompt]
+              properties:
+                model:
+                  type: string
+                  description: |
+                    Model alias (`opus`/`sonnet`/`haiku`) or full model id.
+                    Aliases resolve to the latest Claude 4.X release.
+                systemPrompt: { type: string }
+                userPrompt: { type: string }
+                temperature: { type: number, minimum: 0, maximum: 2 }
+                maxTokens: { type: integer, minimum: 1, maximum: 8192, default: 1024 }
+      responses:
+        '200':
+          description: SSE token stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Newline-delimited `data: <json>` frames. Each `<json>`
+                  is one of `RUN_STARTED`, `TEXT_MESSAGE_CONTENT`,
+                  `RUN_FINISHED`, or `RUN_ERROR` (see description).
+        '400':
+          description: Missing or invalid request body
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '429':
+          description: Per-user rate limit exceeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/audit/search:
+    get:
+      tags: [pipelines]
+      summary: Cross-run audit log search
+      description: |
+        Read-only search over the `pipeline-audit` DDB table. At least
+        one of `actor` or `pipelineId` MUST be supplied — the query
+        runs against the `actor-time-index` or `pipeline-time-index`
+        GSI accordingly (pipelineId wins when both are present).
+      operationId: searchPipelineAudit
+      parameters:
+        - in: query
+          name: actor
+          schema: { type: string }
+          description: User id filter.
+        - in: query
+          name: pipelineId
+          schema: { type: string }
+          description: Pipeline id filter (wins over `actor` when both are present).
+        - in: query
+          name: action
+          schema: { type: string }
+          description: Comma-separated audit action filter (singular form retained for legacy callers).
+        - in: query
+          name: actions
+          schema: { type: string }
+          description: Comma-separated audit action filter (preferred plural form).
+        - in: query
+          name: since
+          schema: { type: string, format: date-time }
+        - in: query
+          name: until
+          schema: { type: string, format: date-time }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        '200':
+          description: Audit search page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+                  nextCursor: { type: string }
+        '400':
+          description: Neither `actor` nor `pipelineId` supplied, or invalid query
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/cost:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+    get:
+      tags: [pipelines]
+      summary: Aggregate LLM cost rollup for a pipeline
+      description: |
+        Sums `tokenUsage` and `estimatedCostUsd` across all persisted
+        runs of `pipelineId` (capped at 200 most-recent runs).
+        Per-model cost is recomputed from token counts using
+        `llm-pricing.computeCost`.
+      operationId: getPipelineCost
+      responses:
+        '200':
+          description: Cost rollup
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [totalCostUsd, totalTokensIn, totalTokensOut, byModel, runCount]
+                properties:
+                  totalCostUsd: { type: number }
+                  totalTokensIn: { type: integer, minimum: 0 }
+                  totalTokensOut: { type: integer, minimum: 0 }
+                  runCount: { type: integer, minimum: 0 }
+                  byModel:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      required: [tokensIn, tokensOut, costUsd]
+                      properties:
+                        tokensIn: { type: integer, minimum: 0 }
+                        tokensOut: { type: integer, minimum: 0 }
+                        costUsd: { type: number }
+        '400':
+          description: Missing `pipelineId`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{runId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunIdPath'
+    post:
+      tags: [pipelines]
+      summary: Cancel an in-flight pipeline run
+      description: |
+        Cancels the run via the bridge (or stub store when no bridge is
+        wired). Returns the post-cancel run snapshot. Idempotent via
+        `Idempotency-Key` (scope `pipeline-cancel`).
+      operationId: cancelPipelineRun
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: { type: string, maxLength: 200 }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Optional operator-supplied reason recorded in the audit row.
+      responses:
+        '200':
+          description: Cancel applied; returns the updated run snapshot
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: Run is already in a terminal state, or invalid body
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Run not found (or not owned by the caller)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   # --- Profiles (UserPicker) ----------------------------------------------
   /profiles:
     get:
