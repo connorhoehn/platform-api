@@ -24,6 +24,7 @@ import { Router, type Request, type Response } from 'express';
 import { withContext } from '../../lib/logger';
 import type { IngestEvent, IngestSource } from '../types';
 import { issuePath, commentPath } from '../adapters/jira';
+import { verifyWebhookSignature } from './verify-webhook';
 
 const log = withContext({ route: 'ingestJiraWebhook' });
 
@@ -160,6 +161,13 @@ export function createJiraWebhookRoutes(deps: JiraWebhookDeps): Router {
     }
     if (source.type !== 'jira') {
       return res.status(400).json({ error: `source ${sourceId} is not a jira source` });
+    }
+
+    // 1a. Verify HMAC signature when source has a webhookSecret configured.
+    const verify = verifyWebhookSignature(req, source);
+    if (!verify.ok) {
+      log.error({ sourceId }, 'jira webhook signature verification failed');
+      return res.status(403).json({ error: verify.reason });
     }
 
     const projectKey = String((source.config as Record<string, unknown>).projectKey ?? '');

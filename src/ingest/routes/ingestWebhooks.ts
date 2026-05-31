@@ -6,11 +6,11 @@
 // BEFORE the auth middleware so external systems can call without a JWT.
 
 import { Router, type Request, type Response } from 'express';
-import { verifySignature } from 'distributed-core';
 import { withContext } from '../../lib/logger';
 import { ingestSourceRepo } from '../repositories';
 import { getIngestEngine } from '../engine-singleton';
 import type { IngestSource } from '../types';
+import { verifyWebhookSignature } from './verify-webhook';
 
 const log = withContext({ route: 'ingestWebhooks' });
 
@@ -113,14 +113,10 @@ export function createIngestWebhookRoutes(deps: WebhookDeps): Router {
     }
 
     // 2. Validate webhook signature if source has a webhookSecret configured
-    const webhookSecret = (source.config as Record<string, unknown>).webhookSecret;
-    if (typeof webhookSecret === 'string' && webhookSecret.length > 0) {
-      const bodyString = JSON.stringify(req.body);
-      const signature = req.headers['x-webhook-signature'] as string | undefined;
-      if (!verifySignature(webhookSecret, Buffer.from(bodyString, 'utf8'), signature)) {
-        log.error({ sourceId }, 'ingest webhook signature verification failed');
-        return res.status(403).json({ error: 'invalid webhook signature' });
-      }
+    const verify = verifyWebhookSignature(req, source);
+    if (!verify.ok) {
+      log.error({ sourceId }, 'ingest webhook signature verification failed');
+      return res.status(403).json({ error: verify.reason });
     }
 
     // 3. Parse changed files from body

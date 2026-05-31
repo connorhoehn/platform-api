@@ -4,6 +4,7 @@
 // payload → IngestEvent mapping (issue + comment), sync-trigger dedup.
 
 import express, { type NextFunction, type Request, type Response } from 'express';
+import * as crypto from 'crypto';
 import {
   createJiraWebhookRoutes,
   mapJiraPayload,
@@ -75,6 +76,7 @@ async function run(
   app: express.Express,
   url: string,
   body: unknown,
+  extraHeaders: Record<string, string> = {},
 ): Promise<MockRes> {
   const res = mockRes();
   const req = {
@@ -82,7 +84,7 @@ async function run(
     url,
     originalUrl: url,
     path: url,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...extraHeaders },
     query: {},
     body,
     params: {},
@@ -280,5 +282,63 @@ describe('POST /jira/:sourceId — payload roundtrip', () => {
     };
     const res = await run(app, '/api/ingest/webhook/jira/src-jira', payload);
     expect((res.body as { status: string }).status).toBe('sync_in_progress');
+  });
+});
+
+// ─── route — HMAC verification ────────────────────────────────────────────
+
+describe('POST /jira/:sourceId — HMAC verification', () => {
+  function sign(secret: string, body: unknown): string {
+    return 'sha256=' + crypto.createHmac('sha256', secret).update(JSON.stringify(body)).digest('hex');
+  }
+
+  test('passes through when source has no webhookSecret', async () => {
+    const app = buildApp({ source: makeJiraSource({ config: { projectKey: 'ENG' } }) });
+    const payload = {
+      webhookEvent: 'jira:issue_updated',
+      issue: { id: '1', key: 'ENG-1', fields: { project: { key: 'ENG' } } },
+    };
+    const res = await run(app, '/api/ingest/webhook/jira/src-jira', payload);
+    expect(res.statusCode).toBe(200);
+  });
+
+  test('403 when secret configured and signature missing', async () => {
+    const app = buildApp({
+      source: makeJiraSource({ config: { projectKey: 'ENG', webhookSecret: 'shh' } }),
+    });
+    const payload = {
+      webhookEvent: 'jira:issue_updated',
+      issue: { id: '1', key: 'ENG-1', fields: { project: { key: 'ENG' } } },
+    };
+    const res = await run(app, '/api/ingest/webhook/jira/src-jira', payload);
+    expect(res.statusCode).toBe(403);
+    expect((res.body as { error: string }).error).toBe('invalid webhook signature');
+  });
+
+  test('403 when signature is wrong', async () => {
+    const app = buildApp({
+      source: makeJiraSource({ config: { projectKey: 'ENG', webhookSecret: 'shh' } }),
+    });
+    const payload = {
+      webhookEvent: 'jira:issue_updated',
+      issue: { id: '1', key: 'ENG-1', fields: { project: { key: 'ENG' } } },
+    };
+    const res = await run(app, '/api/ingest/webhook/jira/src-jira', payload,
+      { 'x-webhook-signature': 'sha256=bad' });
+    expect(res.statusCode).toBe(403);
+  });
+
+  test('200 with matching HMAC-SHA256 signature', async () => {
+    const secret = 'correct-horse';
+    const app = buildApp({
+      source: makeJiraSource({ config: { projectKey: 'ENG', webhookSecret: secret } }),
+    });
+    const payload = {
+      webhookEvent: 'jira:issue_updated',
+      issue: { id: '1', key: 'ENG-1', fields: { project: { key: 'ENG' } } },
+    };
+    const res = await run(app, '/api/ingest/webhook/jira/src-jira', payload,
+      { 'x-webhook-signature': sign(secret, payload) });
+    expect(res.statusCode).toBe(200);
   });
 });

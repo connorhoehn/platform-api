@@ -5,6 +5,7 @@
 // modes (unknown source, malformed payload, page_removed bypass).
 
 import express, { type NextFunction, type Request, type Response } from 'express';
+import * as crypto from 'crypto';
 import {
   createConfluenceWebhookRoutes,
   normalizeConfluencePayload,
@@ -215,5 +216,53 @@ describe('POST /:sourceId — error/edge cases', () => {
     expect(triggerPageRefetch).not.toHaveBeenCalled();
     // Audit IngestEvent still emitted so the operator UI sees the deletion.
     expect(published).toHaveLength(1);
+  });
+});
+
+describe('POST /:sourceId — HMAC verification', () => {
+  function sign(secret: string, body: unknown): string {
+    return 'sha256=' + crypto.createHmac('sha256', secret).update(JSON.stringify(body)).digest('hex');
+  }
+
+  test('passes through when source has no webhookSecret', async () => {
+    const { app } = buildApp({ source: makeSource({ config: { spaceKey: 'ENG' } }) });
+    const res = await run(app, '/api/ingest/webhook/confluence/src-confl', {
+      event: 'page_updated', page: { id: '1' },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  test('403 when secret configured and signature missing', async () => {
+    const { app } = buildApp({
+      source: makeSource({ config: { spaceKey: 'ENG', webhookSecret: 'shh' } }),
+    });
+    const res = await run(app, '/api/ingest/webhook/confluence/src-confl', {
+      event: 'page_updated', page: { id: '1' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect((res.body as { error: string }).error).toBe('invalid webhook signature');
+  });
+
+  test('403 when signature is wrong', async () => {
+    const { app } = buildApp({
+      source: makeSource({ config: { spaceKey: 'ENG', webhookSecret: 'shh' } }),
+    });
+    const res = await run(app, '/api/ingest/webhook/confluence/src-confl',
+      { event: 'page_updated', page: { id: '1' } },
+      { 'x-webhook-signature': 'sha256=bad' },
+    );
+    expect(res.statusCode).toBe(403);
+  });
+
+  test('200 with matching HMAC-SHA256 signature', async () => {
+    const secret = 'correct-horse';
+    const { app } = buildApp({
+      source: makeSource({ config: { spaceKey: 'ENG', webhookSecret: secret } }),
+    });
+    const payload = { event: 'page_updated', page: { id: '42' } };
+    const res = await run(app, '/api/ingest/webhook/confluence/src-confl', payload, {
+      'x-webhook-signature': sign(secret, payload),
+    });
+    expect(res.statusCode).toBe(200);
   });
 });

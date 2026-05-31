@@ -11,6 +11,7 @@ import { withContext } from '../../lib/logger';
 import { ingestSourceRepo } from '../repositories';
 import { getIngestEngine } from '../engine-singleton';
 import type { IngestEvent, IngestSource } from '../types';
+import { verifyWebhookSignature } from './verify-webhook';
 
 const log = withContext({ route: 'ingestConfluenceWebhook' });
 
@@ -111,6 +112,12 @@ export function createConfluenceWebhookRoutes(deps: ConfluenceWebhookDeps): Rout
     const source = await deps.sourceRepository.get(sourceId);
     if (!source) {
       return res.status(404).json({ error: `source ${sourceId} not found` });
+    }
+
+    const verify = verifyWebhookSignature(req, source);
+    if (!verify.ok) {
+      log.error({ sourceId }, 'confluence webhook signature verification failed');
+      return res.status(403).json({ error: verify.reason });
     }
 
     const update = normalizeConfluencePayload(req.body);
