@@ -392,6 +392,514 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  # --- Per-run lifecycle actions ------------------------------------------
+  # Operator + frontend surface for replay / retry / resume / audit / breakpoint
+  # editing on a single run. All routes are mounted under
+  # `/pipelines/:pipelineId/runs/:runId/...` so the pipelineId + runId path
+  # params thread through and (for replay/retry/resume) idempotency keys are
+  # scoped per-run.
+
+  /pipelines/{pipelineId}/runs/{runId}/replay:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+    post:
+      tags: [pipelines]
+      summary: Re-run a completed/failed run as a fresh run
+      description: |
+        Spawns a NEW run using the original pipeline definition and trigger
+        payload. The new runId is freshly minted — the original row in
+        history is unchanged. Only terminal runs (`succeeded`, `failed`,
+        `canceled`) can be replayed.
+      operationId: replayPipelineRun
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: { type: string, maxLength: 200 }
+          description: |
+            Optional dedupe key (scope `pipeline-replay`). Replays within
+            the 5-minute window return the original 202 response.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                triggerPayload:
+                  type: object
+                  additionalProperties: true
+                  description: |
+                    Optional override of the original run's trigger payload.
+                    Omit to reuse what the original run was started with.
+      responses:
+        '202':
+          description: Replay accepted; new run scheduled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [newRunId, originalRunId, pipelineId, at]
+                properties:
+                  newRunId: { type: string, format: uuid }
+                  originalRunId: { type: string, format: uuid }
+                  pipelineId: { type: string }
+                  at: { type: string, format: date-time }
+        '400':
+          description: Run is not in a terminal state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Run or pipeline definition not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '500':
+          description: Replay trigger failed at the bridge
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: Pipeline bridge not wired (stub mode)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}/retry/{nodeId}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+      - in: path
+        name: nodeId
+        required: true
+        schema: { type: string }
+        description: |
+          DAG node id to retry from. Must have been executed in the original
+          run (i.e. present in `stepsSummary`). All upstream nodes are
+          skipped and their stored outputs supplied as context.
+    post:
+      tags: [pipelines]
+      summary: Spawn a fresh run starting from a specific node
+      description: |
+        Unlike `resume` (which re-enters the SAME run), `retry/:nodeId`
+        spawns a brand-new run that consumes the original run's persisted
+        upstream step outputs as context. Use this when downstream of
+        nodeId needs to be re-executed but you want the upstream outputs
+        frozen (saves LLM cost on a 10-node pipeline being retried from
+        node 8).
+      operationId: retryPipelineRunFromNode
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: { type: string, maxLength: 200 }
+          description: Optional dedupe key (scope `pipeline-retry-from-node`).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                inputs:
+                  type: object
+                  additionalProperties: true
+                  description: Override inputs for the target node.
+                snapshotInput:
+                  type: boolean
+                  description: |
+                    When true, replay uses the persisted input snapshot from
+                    the original attempt (hub#1283) so non-deterministic
+                    upstream nodes produce the same downstream context.
+      responses:
+        '202':
+          description: Retry accepted; new run scheduled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [newRunId, originalRunId, pipelineId, retryFromNodeId, skippedNodes, at]
+                properties:
+                  newRunId: { type: string, format: uuid }
+                  originalRunId: { type: string, format: uuid }
+                  pipelineId: { type: string }
+                  retryFromNodeId: { type: string }
+                  skippedNodes:
+                    type: array
+                    items: { type: string }
+                  at: { type: string, format: date-time }
+        '400':
+          description: Run is not terminal, nodeId unknown, or nodeId was not executed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Run or pipeline definition not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: Pipeline bridge not wired
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}/audit:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+    get:
+      tags: [pipelines]
+      summary: Read-only per-run audit timeline
+      description: |
+        Returns the ordered audit-log entries for `runId` from the
+        `pipeline-audit` DDB table (`runId-time-index` GSI). Read-only —
+        does NOT write an audit row of its own.
+      operationId: listPipelineRunAudit
+      parameters:
+        - in: query
+          name: since
+          required: false
+          schema: { type: string, format: date-time }
+          description: Inclusive lower bound (ISO 8601).
+        - in: query
+          name: until
+          required: false
+          schema: { type: string, format: date-time }
+          description: Exclusive upper bound (ISO 8601).
+        - in: query
+          name: actions
+          required: false
+          schema: { type: string }
+          description: Comma-separated audit action filter (e.g. `pipeline.trigger,pipeline.cancel`).
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+          description: Opaque pagination cursor from a prior response.
+      responses:
+        '200':
+          description: Audit timeline page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+                  nextCursor: { type: string }
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}/resume:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+    post:
+      tags: [pipelines]
+      summary: Resume the SAME run from a specific step
+      description: |
+        Re-enters the existing run via `PipelineModule.resumeFromStep`,
+        preserving the run's accumulated context (LLM tokens, fetched data,
+        transform outputs) and incrementing `replayAttempts` on the
+        original row. Default: only `failed` runs are resumable; pass
+        `allowCompleted: true` in the body to resume a succeeded run for
+        diagnostic re-execution.
+      operationId: resumePipelineRunFromStep
+      parameters:
+        - in: query
+          name: fromNodeId
+          required: true
+          schema: { type: string }
+          description: DAG node id to resume execution from.
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: { type: string, maxLength: 200 }
+          description: Optional dedupe key (scope `pipeline-resume-from-step`).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                allowCompleted:
+                  type: boolean
+                  default: false
+                  description: Allow resuming `succeeded`/`done` runs for diagnostic re-execution.
+                breakpoints:
+                  type: array
+                  items: { type: string }
+                  description: Optional breakpoint list for the resumed dispatch loop.
+      responses:
+        '202':
+          description: Resume accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runId, fromNodeId, replayAttempts, at]
+                properties:
+                  runId: { type: string, format: uuid }
+                  fromNodeId: { type: string }
+                  originalFailedStepId:
+                    type: string
+                    description: Best-effort original failure point — surfaced when the run's `error.nodeId` or `stepsSummary` exposes it.
+                  replayAttempts:
+                    type: integer
+                    minimum: 0
+                    description: Post-increment count of `resumeFromStep` invocations.
+                  at: { type: string, format: date-time }
+        '400':
+          description: Missing `fromNodeId`, unknown node, or non-resumable status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Run or pipeline definition not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: Pipeline bridge does not expose `resumeFromStep`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}/force-fail:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+    post:
+      tags: [pipelines]
+      summary: Operator action — force-fail a stuck run
+      description: |
+        hub#1285 operator action. Transitions a `running` run that has been
+        flagged as `stuck` to `interrupted` (clearing `stuckAt`) so the UI
+        badge clears even if the executor is unresponsive. Best-effort
+        cancel via `bridge.cancelRun` is fire-and-forget — the response is
+        not blocked on it. Use "Retry from failed step" afterward to
+        resume from the stuck node.
+      operationId: forceFailPipelineRun
+      responses:
+        '202':
+          description: Run transitioned to `interrupted`
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runId, status, hint, at]
+                properties:
+                  runId: { type: string, format: uuid }
+                  status: { type: string, enum: [interrupted] }
+                  hint: { type: string }
+                  at: { type: string, format: date-time }
+        '400':
+          description: Run not in `running` status or not flagged stuck
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}/breakpoint/{stepId}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+      - in: path
+        name: stepId
+        required: true
+        schema: { type: string }
+        description: Step id the run is paused at.
+    post:
+      tags: [pipelines]
+      summary: Resume a run paused at a debug breakpoint
+      description: |
+        Resumes execution at a paused breakpoint. Body action selects how
+        to proceed: `continue` (default, single-step past the breakpoint),
+        `step_over`, or `resume_all` (drop all remaining breakpoints).
+      operationId: resolvePipelineBreakpoint
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [continue, step_over, resume_all]
+                  default: continue
+      responses:
+        '204':
+          description: Breakpoint resolved
+        '400':
+          description: Invalid `action` value
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '409':
+          description: Run is not paused at this step
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: Pipeline bridge does not expose `resolveBreakpoint`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}/breakpoint/{stepId}/patch:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+      - in: path
+        name: stepId
+        required: true
+        schema: { type: string }
+        description: Step id the run is paused at.
+    post:
+      tags: [pipelines]
+      summary: Apply a context patch while paused at a breakpoint (edit-and-continue)
+      description: |
+        hub#2226 edit-and-continue surface. Mutates the paused step's
+        context via either a `merge` patch (shallow value override) or a
+        JSON-Patch ops array. The executor's validator may reject the
+        patch with 422; the run state is unchanged on rejection.
+      operationId: applyPipelineBreakpointPatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [patch]
+              properties:
+                patch:
+                  oneOf:
+                    - type: object
+                      required: [mode, values]
+                      properties:
+                        mode: { type: string, enum: [merge] }
+                        values:
+                          type: object
+                          additionalProperties: true
+                    - type: object
+                      required: [mode, ops]
+                      properties:
+                        mode: { type: string, enum: [jsonPatch] }
+                        ops:
+                          type: array
+                          items: { type: object, additionalProperties: true }
+                appliedBy:
+                  type: string
+                  description: Optional override of `actorUserId` for the audit row.
+      responses:
+        '200':
+          description: Patch applied; returns the executor's `PatchResult`
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [patchId]
+                properties:
+                  patchId: { type: string }
+                  before: { type: object, additionalProperties: true }
+                  after: { type: object, additionalProperties: true }
+                  validation:
+                    type: object
+                    properties:
+                      ok: { type: boolean }
+                      reason: { type: string }
+                additionalProperties: true
+        '400':
+          description: Missing or malformed `patch`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '409':
+          description: Run is not paused at this step
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '422':
+          description: Validator rejected the patch (`validation.ok === false`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: Pipeline bridge does not expose `patchPausedContext`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/{pipelineId}/runs/{runId}/breakpoint/{stepId}/patch/{patchId}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineIdPath'
+      - $ref: '#/components/parameters/RunIdPath'
+      - in: path
+        name: stepId
+        required: true
+        schema: { type: string }
+      - in: path
+        name: patchId
+        required: true
+        schema: { type: string }
+        description: Patch id returned by the prior POST /patch.
+    delete:
+      tags: [pipelines]
+      summary: Revert a previously-applied paused-context patch
+      description: |
+        Companion to POST /patch. Reverts the named patch via
+        `bridge.revertContextPatch`. Returns 204 on success.
+      operationId: revertPipelineBreakpointPatch
+      responses:
+        '204':
+          description: Patch reverted
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '409':
+          description: Run is not paused at this step
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: Pipeline bridge does not expose `revertContextPatch`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   # --- Pending approvals queue --------------------------------------------
   # Surfaces `PipelineModule.getPendingApprovals()` to the frontend so the
   # approvals inbox can render across all in-flight runs in one round-trip.
