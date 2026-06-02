@@ -382,14 +382,20 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
 // POST /api/video/sessions/:sessionId/end — ref-counted leave
 // Uses optionalAuth so sendBeacon (no auth header) works on tab close.
 //
-// Behavior:
-//  - Caller's userId is spliced out of participants[].
-//  - If participants[] is still non-empty: just persist, return 200. The SFU
-//    channel stays up so other users keep their connections.
-//  - If participants[] becomes empty: mark session status='ended' in DDB but
-//    DON'T call DELETE on the SFU channel — the channel reaper sweeps idle
-//    channels on its own cadence (currently every 5 min for olderThanSec=300),
-//    which gives "rejoin within grace window = same channel" UX.
+// Authoritative path: LVS sessionStore. Platform-api forwards to
+// LVS POST /api/sessions/:arn/end { participantId } when a Cognito Bearer
+// is present (the common case). LVS does the ref-count, returns
+// `participantsRemaining` + ended:true/false. We mirror to DDB for the
+// past-calls UI; DDB writes are best-effort.
+//
+// Fallback path (sendBeacon, no auth header): direct DDB splice + the
+// LVS reap fast-path. LVS sessionStore drifts until the reaper sweeps —
+// acceptable degraded mode for the tab-close case.
+//
+// The reapLvsParticipant() call (hub#1281 fast WHIP/WHEP transport close)
+// fires in both paths — it's orthogonal to the session ref-count and is
+// what gets the departed participant's transports down in ms instead of
+// the ~10-30s ICE consent timeout.
 videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {
     const { sessionId } = req.params;
@@ -405,26 +411,16 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
       throw new NotFoundError('Session not found');
     }
 
-    // Identify caller's per-tab participant. participantId is the key now
-    // (see /join); fall back to userId-keyed removal only if the FE hasn't
-    // sent participantId yet (older clients).
     const participantId = typeof body.participantId === 'string' ? body.participantId : undefined;
     const userId =
       req.user?.sub
       ?? (typeof body.userId === 'string' ? body.userId : undefined);
+    const authHeader = req.headers.authorization;
 
-    let remaining = (session.participants ?? []).length;
+    // Fast-path reap — close the departed participant's WHIP/WHEP transports
+    // in ms (hub#1281). Fires on both the authoritative and fallback paths.
+    // Best-effort; failures collapse to the reaper's eventual sweep.
     if (participantId) {
-      const splice = await videoSessionRepo.removeParticipant(lobbyName, sessionId, participantId);
-      if (splice) remaining = splice.remaining;
-
-      // Fast-path participant teardown — call LVS's explicit reap endpoint
-      // so WHIP/WHEP transports close in milliseconds rather than waiting
-      // for ICE consent timeout (~10-30s). LVS endpoint is idempotent (404
-      // on second call, e.g. when the FE fires both UI-button + sendBeacon)
-      // and reaps the screen-share sibling pid automatically. Best-effort
-      // with one retry on transport/5xx (hub#1281); failures collapse to
-      // the reaper's eventual sweep so /end still returns 200 to the FE.
       const reapOutcome = await reapLvsParticipant({
         channelArn: session.channelArn,
         streamKey: session.streamKey,
@@ -432,26 +428,78 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
         sessionId,
       });
       recordLvsParticipantReap(reapOutcome);
+    }
+
+    // Authoritative path — forward to LVS sessionStore when we have a
+    // user JWT to forward. LVS is the source of truth for participant
+    // ref-count post Wave 4.
+    if (participantId && authHeader) {
+      let upstream: globalThis.Response;
+      try {
+        upstream = await callSfu(
+          `${VIDEO_API_URL}/api/sessions/${encodeURIComponent(session.channelArn)}/end`,
+          {
+            method: 'POST',
+            headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ participantId }),
+          },
+        );
+      } catch (sfuErr) {
+        throw mapSfuError(sfuErr);
+      }
+
+      if (!upstream.ok && upstream.status !== 404) {
+        // LVS 404 means "session already gone" — treat as hard-ended.
+        // Any other non-2xx is a real upstream failure.
+        const errorBody = await upstream.text().catch(() => 'Unknown error');
+        log.error({ status: upstream.status, body: errorBody, sessionId }, '[videoSessions] LVS /end upstream failed');
+        throw new AppError(upstream.status, `LVS /end upstream ${upstream.status}`);
+      }
+
+      const lvsResult = upstream.ok
+        ? (await upstream.json() as { participantsRemaining?: number; endedAt?: string | null })
+        : { participantsRemaining: 0, endedAt: new Date().toISOString() };
+      const remaining = lvsResult.participantsRemaining ?? 0;
+      const ended = remaining === 0;
+
+      // Mirror to DDB for past-calls UI. Best-effort.
+      try {
+        if (ended) {
+          await videoSessionRepo.endSession(lobbyName, sessionId, lvsResult.endedAt || new Date().toISOString());
+        } else {
+          await videoSessionRepo.removeParticipant(lobbyName, sessionId, participantId);
+        }
+      } catch (dbErr) {
+        log.warn({ err: dbErr, sessionId }, '[videoSessions] DDB mirror on /end failed (non-fatal)');
+      }
+
+      log.info({ userId: userId ?? '(anon)', sessionId, remaining, ended }, '[videoSessions] /end forwarded to LVS');
+      res.status(200).json({ remaining, ended });
+      return;
+    }
+
+    // Fallback path: no auth (sendBeacon) or no participantId (legacy
+    // body-userId only). DDB-direct ref-count. LVS sessionStore drifts
+    // until the reaper sweep — acceptable for tab-close.
+    let remaining = (session.participants ?? []).length;
+    if (participantId) {
+      const splice = await videoSessionRepo.removeParticipant(lobbyName, sessionId, participantId);
+      if (splice) remaining = splice.remaining;
     } else if (userId) {
-      // Legacy path — remove ALL participants matching userId. Kept for
-      // backwards-compat with old client builds. New clients always send
-      // participantId so this branch is dead in steady-state.
       const splice = await videoSessionRepo.removeParticipantByUserId(lobbyName, sessionId, userId);
       if (splice) remaining = splice.remaining;
     }
 
     if (remaining > 0) {
-      log.info({ userId: userId ?? '(anon)', sessionId, remaining }, '[videoSessions] participant left session');
+      log.info({ userId: userId ?? '(anon)', sessionId, remaining }, '[videoSessions] participant left session (fallback)');
       res.status(200).json({ remaining, ended: false });
       return;
     }
 
-    // Last participant out — mark session ended. Channel cleanup is the
-    // reaper's job (see file header).
     const now = new Date().toISOString();
     try {
       await videoSessionRepo.endSession(lobbyName, sessionId, now);
-      log.info({ sessionId }, '[videoSessions] Ended session (last participant out)');
+      log.info({ sessionId }, '[videoSessions] Ended session (fallback last-out)');
     } catch (dbErr) {
       log.error({ err: dbErr }, '[videoSessions] Failed to update local record on end');
     }

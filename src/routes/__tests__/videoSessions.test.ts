@@ -568,6 +568,109 @@ describe('reapLvsParticipant — LVS reclamation on /end', () => {
   });
 });
 
+describe('POST /api/video/sessions/:sessionId/end — LVS authoritative path', () => {
+  it('forwards to LVS /end when auth + participantId present; mirrors soft-end to DDB', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+      participants: [{ participantId: 'p-1' }, { participantId: 'p-2' }],
+    });
+    mockRemoveParticipant.mockResolvedValueOnce({ remaining: 1 });
+
+    // First mockFetch = reapLvsParticipant DELETE; second = LVS POST /end.
+    mockFetch.mockResolvedValueOnce(apiOk({}));  // reap 200
+    mockFetch.mockResolvedValueOnce(apiOk({ participantsRemaining: 1, endedAt: null }));
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { remaining: number; ended: boolean })).toMatchObject({ remaining: 1, ended: false });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    // Second fetch is the LVS /end forward.
+    const [url, init] = mockFetch.mock.calls[1];
+    expect(url).toContain('/api/sessions/');
+    expect(url).toContain(encodeURIComponent('arn:lvs:1'));
+    expect(url).toContain('/end');
+    expect((init as RequestInit).method).toBe('POST');
+    expect(JSON.parse((init as RequestInit).body as string)).toMatchObject({ participantId: 'p-1' });
+    expect(mockRemoveParticipant).toHaveBeenCalledWith('doc-1', 'vs-1', 'p-1');
+  });
+
+  it('hard-end path: LVS returns remaining=0, DDB mirror calls endSession', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+      participants: [{ participantId: 'p-1' }],
+    });
+    mockFetch.mockResolvedValueOnce(apiOk({}));  // reap
+    mockFetch.mockResolvedValueOnce(apiOk({ participantsRemaining: 0, endedAt: '2026-06-02T13:00:00Z' }));
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { ended: boolean })).toMatchObject({ remaining: 0, ended: true });
+    expect(mockEndSession).toHaveBeenCalledWith('doc-1', 'vs-1', '2026-06-02T13:00:00Z');
+  });
+
+  it('LVS 404 (session already ended) → 200 ended:true (idempotent)', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+      participants: [{ participantId: 'p-1' }],
+    });
+    mockFetch.mockResolvedValueOnce(apiOk({}));  // reap
+    mockFetch.mockResolvedValueOnce(apiFail(404));  // LVS /end 404
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { ended: boolean }).ended).toBe(true);
+  });
+
+  it('falls back to DDB-direct when no auth header (sendBeacon path)', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+      participants: [{ participantId: 'p-1' }, { participantId: 'p-2' }],
+    });
+    mockRemoveParticipant.mockResolvedValueOnce({ remaining: 1 });
+    mockFetch.mockResolvedValueOnce(apiOk({}));  // reap only (no LVS /end forward)
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+      // No authorization header — sendBeacon path.
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { remaining: number; ended: boolean })).toMatchObject({ remaining: 1, ended: false });
+    // Exactly one fetch (the reap); no LVS /end forward.
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockRemoveParticipant).toHaveBeenCalled();
+  });
+
+  it('LVS upstream 5xx surfaces as 5xx error', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+      participants: [{ participantId: 'p-1' }],
+    });
+    mockFetch.mockResolvedValueOnce(apiOk({}));  // reap
+    mockFetch.mockResolvedValueOnce(apiFail(503));  // LVS /end 503
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+
+    expect(res.statusCode).toBe(503);
+  });
+});
+
 describe('POST /api/video/sessions/:sessionId/refresh-token', () => {
   it('400 without lobbyName / documentId', async () => {
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
