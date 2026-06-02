@@ -138,26 +138,6 @@ export async function reapLvsParticipant(args: {
   return 'error';
 }
 
-/**
- * HEAD the SFU to confirm the channel still exists. Returns true if 2xx.
- * Used by findOrCreate to detect sessions whose channel was reaped under us.
- *
- * Any breaker rejection / timeout collapses to "channel is not alive", so
- * findOrCreate falls through to the create path. The create path then
- * surfaces the real error to the client, instead of leaking stale records.
- */
-async function sfuChannelIsAlive(channelArn: string): Promise<boolean> {
-  try {
-    const res = await callSfu(
-      `${VIDEO_API_URL}/api/channels/${encodeURIComponent(channelArn)}`,
-      { method: 'GET' },
-    );
-    return res.ok;
-  } catch (_e) {
-    return false;
-  }
-}
-
 // POST /api/video/sessions — find-or-create a session for a lobby
 //
 // Thin proxy → LVS POST /api/sessions { lobbyName, findOrCreate, creatorId,
@@ -433,7 +413,6 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
     if (participantId) {
       const reapOutcome = await reapLvsParticipant({
         channelArn: session.channelArn,
-        streamKey: session.streamKey,
         participantId,
         sessionId,
       });
