@@ -464,6 +464,91 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
   }
 }));
 
+// POST /api/video/sessions/:sessionId/refresh-token — rotate a participant's
+// stage token mid-call. Thin proxy → LVS POST /api/sessions/:arn/refresh-token
+// (hub#1249 third quarter — long-lived calls survive the 1h stage-token expiry
+// without forcing a full WHIP/WHEP re-handshake).
+//
+// Body: { participantId, lobbyName | documentId, role? }
+// Returns: { token, expiresAt, participantId, role }
+//
+// Forwards the caller's Cognito Bearer to LVS. LVS validates participant
+// registration via its sessionStore (LOBBY_TAKEN / not-registered → 4xx).
+videoSessionsRouter.post('/sessions/:sessionId/refresh-token', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sessionId } = req.params;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const lobbyName = resolveLobbyName(body);
+    const participantId = typeof body.participantId === 'string' ? body.participantId : undefined;
+    const role = typeof body.role === 'string' ? body.role : undefined;
+
+    if (!lobbyName) {
+      throw new ValidationError('lobbyName (or documentId) is required in request body');
+    }
+    if (!participantId) {
+      throw new ValidationError('participantId is required in request body');
+    }
+
+    const session = await videoSessionRepo.getSession(lobbyName, sessionId);
+    if (!session) {
+      throw new NotFoundError('Session not found');
+    }
+
+    // LVS's sessionId === channelArn. Forward the caller's Cognito token so
+    // LVS's cognitoAuth middleware validates the same identity that hit us.
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      throw new AppError(401, 'Authorization header required');
+    }
+
+    let upstream: globalThis.Response;
+    try {
+      upstream = await callSfu(
+        `${VIDEO_API_URL}/api/sessions/${encodeURIComponent(session.channelArn)}/refresh-token`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: authHeader,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ participantId, ...(role ? { role } : {}) }),
+        },
+      );
+    } catch (sfuErr) {
+      throw mapSfuError(sfuErr);
+    }
+
+    if (!upstream.ok) {
+      // 404 (participant not registered / session not found) and 410
+      // (session ended) propagate verbatim — they're actionable on the FE.
+      if (upstream.status === 404 || upstream.status === 410) {
+        const errBody = await upstream.json().catch(() => ({ error: 'unknown' }));
+        res.status(upstream.status).json(errBody);
+        return;
+      }
+      const errorBody = await upstream.text().catch(() => 'Unknown error');
+      log.error({ status: upstream.status, body: errorBody, sessionId }, '[videoSessions] refresh-token upstream failed');
+      throw new AppError(upstream.status, `LVS refresh-token upstream ${upstream.status}`);
+    }
+
+    const tokenData = await upstream.json() as {
+      token: string; expiresAt: string; participantId: string; role: string;
+    };
+
+    // LVS sessionStore records lastRefreshAt server-side — we don't mirror
+    // it into our DDB row. Past-calls UI reads its activity signal from
+    // joinedAt / endedAt; mid-call token refreshes aren't part of that
+    // surface today.
+
+    log.info({ sessionId, participantId }, '[videoSessions] participant token refreshed');
+    res.status(200).json(tokenData);
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    log.error({ err }, '[videoSessions] POST /sessions/:id/refresh-token error');
+    throw new AppError(500, 'Failed to refresh participant token');
+  }
+}));
+
 // GET /api/video/sessions/document/:documentId — list all sessions for a lobby
 videoSessionsRouter.get('/sessions/document/:documentId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {

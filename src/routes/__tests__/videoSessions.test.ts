@@ -80,7 +80,7 @@ function mockRes(): MockRes {
   return r;
 }
 
-interface RunOpts { body?: unknown; userId?: string }
+interface RunOpts { body?: unknown; userId?: string; headers?: Record<string, string> }
 
 async function run(
   app: express.Express,
@@ -100,7 +100,7 @@ async function run(
     url,
     originalUrl: url,
     path: qIdx >= 0 ? url.slice(0, qIdx) : url,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...(opts.headers || {}) },
     query,
     body: opts.body,
     user: { sub: opts.userId ?? 'tester' },
@@ -565,6 +565,110 @@ describe('reapLvsParticipant — LVS reclamation on /end', () => {
     } as unknown as globalThis.Response);
     expect(await reapLvsParticipant(args)).toBe('reaped');
     expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('POST /api/video/sessions/:sessionId/refresh-token', () => {
+  it('400 without lobbyName / documentId', async () => {
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { participantId: 'p-1' },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('400 without participantId', async () => {
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1' },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('404 when DDB session record missing', async () => {
+    mockGetSession.mockResolvedValue(null);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('401 when Authorization header missing (cannot forward to LVS)', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+    });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('200 on happy path — forwards user auth + body to LVS, returns LVS response verbatim', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+    });
+    mockFetch.mockResolvedValueOnce(apiOk({
+      token: 'new.jwt.here', expiresAt: '2026-06-02T13:00:00Z',
+      participantId: 'p-1', role: 'publisher',
+    }));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1', role: 'publisher' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { token: string }).token).toBe('new.jwt.here');
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toContain('/api/sessions/');
+    expect(url).toContain('/refresh-token');
+    expect(url).toContain(encodeURIComponent('arn:lvs:1'));
+    expect((init as RequestInit).method).toBe('POST');
+    expect(JSON.parse((init as RequestInit).body as string)).toMatchObject({
+      participantId: 'p-1', role: 'publisher',
+    });
+  });
+
+  it('propagates LVS 404 (participant not registered) verbatim to the FE', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 404,
+      json: async () => ({ error: 'participant not registered in session' }),
+      text: async () => '',
+    } as unknown as globalThis.Response);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-stale' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('propagates LVS 410 (session ended) verbatim', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 410,
+      json: async () => ({ error: 'session ended' }),
+      text: async () => '',
+    } as unknown as globalThis.Response);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(410);
+  });
+
+  it('502 on LVS network error (mapSfuError translation)', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+    });
+    mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(502);
   });
 });
 
