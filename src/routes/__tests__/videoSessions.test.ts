@@ -166,105 +166,256 @@ beforeEach(() => {
 
 afterEach(() => jest.restoreAllMocks());
 
+// LVS POST /api/sessions response shape — used by the new thin-proxy
+// path. createdAt + hostToken are present on the LVS reply but the
+// platform-api response only surfaces { sessionId, reused }.
+function lvsSessionCreated(channelArn = 'arn:channel:1') {
+  return apiOk({
+    sessionId: channelArn,  // LVS sessionId === channelArn
+    channelArn,
+    sessionFound: false,
+    createdAt: '2026-06-02T13:00:00Z',
+    hostToken: 'host.jwt.here',
+  });
+}
+
+function lvsSessionReused(channelArn = 'arn:channel:1') {
+  return apiOk({
+    sessionId: channelArn,
+    channelArn,
+    sessionFound: true,
+    createdAt: '2026-06-02T12:00:00Z',
+    hostToken: 'host.jwt.here',
+  });
+}
+
 describe('POST /api/video/sessions — non-AppError outer catch', () => {
   it('returns 502 when fetch itself throws (network error → bad-gateway)', async () => {
     mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
-    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
     expect(res.statusCode).toBe(502);
   });
 });
 
-describe('POST /api/video/sessions', () => {
-  it('returns 201 with sessionId on successful channel create', async () => {
-    mockFetch.mockResolvedValue(apiOk({ arn: 'arn:channel:1', streamKey: 'sk-1', name: 'doc-1' }));
+describe('POST /api/video/sessions (thin proxy → LVS)', () => {
+  it('returns 201 with sessionId on successful LVS create', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:1'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
       body: { documentId: 'doc-1', displayName: 'Alice' },
+      headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(201);
     expect((res.body as { sessionId: string }).sessionId).toBeDefined();
+    expect((res.body as { reused: boolean }).reused).toBe(false);
     expect(mockCreateSession).toHaveBeenCalledTimes(1);
     expect(mockCreateSession).toHaveBeenCalledWith(
-      expect.objectContaining({ channelArn: 'arn:channel:1', streamKey: 'sk-1' }),
+      expect.objectContaining({ channelArn: 'arn:channel:1', streamKey: '' }),
     );
   });
 
-  it('calls channel API with generated name when no documentId', async () => {
-    mockFetch.mockResolvedValue(apiOk({ arn: 'arn:channel:2', streamKey: 'sk-2', name: 'random' }));
-    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: {} });
-    expect(res.statusCode).toBe(201);
-    // fetch should have been called with a UUID-like name in the body
+  it('forwards to LVS /api/sessions with lobbyName, findOrCreate, creatorId, recordingConfiguration', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:2'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-x', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
     expect(mockFetch).toHaveBeenCalledWith(
-      'https://video.test/api/channels',
+      'https://video.test/api/sessions',
       expect.objectContaining({ method: 'POST' }),
     );
+    const lastCall = mockFetch.mock.calls[mockFetch.mock.calls.length - 1];
+    const init = lastCall[1] as RequestInit;
+    const sentBody = JSON.parse(init.body as string);
+    expect(sentBody).toMatchObject({
+      lobbyName: 'doc-x',
+      findOrCreate: true,
+      creatorId: 'alice',
+      recordingConfiguration: { enabled: true, destination: 'local' },
+    });
+    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer user-jwt');
   });
 
-  it('forwards 4xx from upstream without tripping the breaker', async () => {
+  it('findOrCreate hit: reuses DDB row when channelArn matches', async () => {
+    mockFetch.mockResolvedValue(lvsSessionReused('arn:channel:reused'));
+    mockFindActiveByLobbyName.mockResolvedValue({
+      sessionId: 'existing-vs-id',
+      channelArn: 'arn:channel:reused',
+      status: 'active',
+    });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-1', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { sessionId: string; reused: boolean })).toEqual({
+      sessionId: 'existing-vs-id',
+      reused: true,
+    });
+    // No new DDB row created — we reused the existing one.
+    expect(mockCreateSession).not.toHaveBeenCalled();
+  });
+
+  it('findOrCreate hit but no matching DDB row: creates a fresh DDB row pointing at the LVS-owned channel', async () => {
+    mockFetch.mockResolvedValue(lvsSessionReused('arn:channel:9'));
+    mockFindActiveByLobbyName.mockResolvedValue(null);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-1', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { reused: boolean }).reused).toBe(true);
+    expect(mockCreateSession).toHaveBeenCalled();
+  });
+
+  it('forwards 4xx from LVS without tripping the breaker', async () => {
     mockFetch.mockResolvedValue(apiFail(404));
-    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
     expect(res.statusCode).toBe(404);
   });
 
-  it('forwards upstream 5xx status (counted as breaker failure)', async () => {
+  it('forwards LVS 5xx (counted as breaker failure)', async () => {
     mockFetch.mockResolvedValue(apiFail(502));
-    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
     expect(res.statusCode).toBe(502);
   });
 
+  it('LVS 409 LOBBY_TAKEN surfaces verbatim to the FE', async () => {
+    mockFetch.mockResolvedValue({
+      ok: false, status: 409,
+      json: async () => ({ error: 'lobbyName already claimed', lobbyName: 'doc-1' }),
+      text: async () => '',
+    } as unknown as globalThis.Response);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-1', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
   it('still returns 201 when local DB write fails', async () => {
-    mockFetch.mockResolvedValue(apiOk({ arn: 'arn:channel:3', streamKey: 'sk-3' }));
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:3'));
     mockCreateSession.mockRejectedValue(new Error('DDB error'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(201);
   });
+
+  it('401 when Authorization header missing', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated());
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-1' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
 });
 
-describe('POST /api/video/sessions/:sessionId/join', () => {
-  const session = { documentId: 'doc-1', sessionId: 'vs-1', channelArn: 'arn:ch:1', streamKey: 'sk-1', status: 'active' };
+describe('POST /api/video/sessions/:sessionId/join (thin proxy → LVS)', () => {
+  const session = { documentId: 'doc-1', sessionId: 'vs-1', channelArn: 'arn:ch:1', streamKey: '', status: 'active' };
 
-  it('returns 200 with token on successful join (breaker stays closed)', async () => {
+  function lvsJoinOk() {
+    return apiOk({
+      token: 'lvs.jwt.token',
+      websocketUrl: 'wss://video.test/stage/arn:ch:1',
+      expiresAt: '2026-06-02T14:00:00Z',
+      participantId: 'p-1',
+      role: 'publisher',
+      displayName: 'Bob',
+    });
+  }
+
+  it('returns 200 with token on successful LVS /join', async () => {
     mockGetSession.mockResolvedValue(session);
-    mockFetch.mockResolvedValue(apiOk({ token: 'ivs-token', participantId: 'p-1' }));
+    mockFetch.mockResolvedValue(lvsJoinOk());
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
       body: { documentId: 'doc-1', displayName: 'Bob' },
+      headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(200);
-    expect((res.body as { token: string }).token).toBe('ivs-token');
+    expect((res.body as { token: string }).token).toBe('lvs.jwt.token');
     expect((res.body as { participantId: string }).participantId).toBe('p-1');
     expect((res.body as { userId: string }).userId).toBe('tester');
     expect(mockAddParticipant).toHaveBeenCalledWith('doc-1', 'vs-1', expect.objectContaining({ userId: 'tester' }));
   });
 
+  it('forwards to LVS /api/sessions/:arn/join with userId, displayName, role', async () => {
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue(lvsJoinOk());
+    await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { documentId: 'doc-1', displayName: 'Bob', role: 'subscriber' },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    const lastCall = mockFetch.mock.calls[mockFetch.mock.calls.length - 1];
+    const url = lastCall[0] as string;
+    const init = lastCall[1] as RequestInit;
+    expect(url).toContain('/api/sessions/');
+    expect(url).toContain(encodeURIComponent('arn:ch:1'));
+    expect(url).toContain('/join');
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      userId: 'alice', displayName: 'Bob', role: 'subscriber',
+    });
+  });
+
   it('returns 400 when documentId missing from body', async () => {
-    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', { body: {} });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: {},
+      headers: { authorization: 'Bearer user-jwt' },
+    });
     expect(res.statusCode).toBe(400);
   });
 
   it('returns 404 when session not found in DB', async () => {
     mockGetSession.mockResolvedValue(null);
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(404);
   });
 
-  it('forwards 4xx from upstream on token request failure', async () => {
+  it('forwards 4xx from LVS on token request failure', async () => {
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockResolvedValue(apiFail(403));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(403);
   });
 
+  it('LVS 410 (session ended) propagates verbatim', async () => {
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue({
+      ok: false, status: 410,
+      json: async () => ({ error: 'session ended' }),
+      text: async () => '',
+    } as unknown as globalThis.Response);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+    expect(res.statusCode).toBe(410);
+  });
+
   it('still returns 200 when addParticipant throws (non-fatal DB failure)', async () => {
     mockGetSession.mockResolvedValue(session);
-    mockFetch.mockResolvedValue(apiOk({ token: 'ivs-token' }));
+    mockFetch.mockResolvedValue(lvsJoinOk());
     mockAddParticipant.mockRejectedValue(new Error('DDB write failed'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
       body: { documentId: 'doc-1', displayName: 'Bob' },
+      headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(200);
   });
@@ -273,7 +424,8 @@ describe('POST /api/video/sessions/:sessionId/join', () => {
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockRejectedValue(new Error('network down'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(502);
   });
@@ -284,7 +436,7 @@ describe('POST /api/video/sessions/:sessionId/join', () => {
 describe('SFU resilience — fetch timeouts', () => {
   it('returns 504 when the upstream fetch times out (TimeoutError)', async () => {
     mockFetch.mockRejectedValue(makeTimeoutError());
-    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' } });
     expect(res.statusCode).toBe(504);
   });
 
@@ -292,13 +444,13 @@ describe('SFU resilience — fetch timeouts', () => {
     const abort = new Error('aborted');
     abort.name = 'AbortError';
     mockFetch.mockRejectedValue(abort);
-    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' } });
     expect(res.statusCode).toBe(504);
   });
 
   it('passes an AbortSignal on every SFU fetch', async () => {
-    mockFetch.mockResolvedValue(apiOk({ arn: 'a', streamKey: 's' }));
-    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' } });
+    mockFetch.mockResolvedValue(apiOk({ sessionId: 'arn:a', channelArn: 'arn:a', sessionFound: false }));
+    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' } });
     const init = mockFetch.mock.calls[0][1] as { signal?: AbortSignal };
     expect(init.signal).toBeDefined();
     expect(typeof init.signal!.aborted).toBe('boolean');
@@ -312,12 +464,12 @@ describe('SFU resilience — circuit breaker', () => {
     // NOT invoked for the 6th call (no timer waste).
     mockFetch.mockResolvedValue(apiFail(502));
     for (let i = 0; i < 5; i++) {
-      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` } });
+      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` }, headers: { authorization: 'Bearer u' } });
       expect(res.statusCode).toBe(502);
     }
     expect(mockFetch).toHaveBeenCalledTimes(5);
 
-    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' } });
+    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' }, headers: { authorization: 'Bearer u' } });
     expect(tripped.statusCode).toBe(503);
     // Crucial: with breaker OPEN, we MUST NOT have called fetch again.
     expect(mockFetch).toHaveBeenCalledTimes(5);
@@ -326,10 +478,10 @@ describe('SFU resilience — circuit breaker', () => {
   it('counts thrown fetch errors (e.g. ECONNREFUSED) as failures and trips after threshold', async () => {
     mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
     for (let i = 0; i < 5; i++) {
-      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` } });
+      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` }, headers: { authorization: 'Bearer u' } });
       expect(res.statusCode).toBe(502);
     }
-    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' } });
+    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' }, headers: { authorization: 'Bearer u' } });
     expect(tripped.statusCode).toBe(503);
     expect(mockFetch).toHaveBeenCalledTimes(5);
   });
@@ -337,10 +489,10 @@ describe('SFU resilience — circuit breaker', () => {
   it('counts upstream timeouts as failures and opens after threshold', async () => {
     mockFetch.mockRejectedValue(makeTimeoutError());
     for (let i = 0; i < 5; i++) {
-      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` } });
+      const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: `doc-${i}` }, headers: { authorization: 'Bearer u' } });
       expect(res.statusCode).toBe(504);
     }
-    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' } });
+    const tripped = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'doc-after-open' }, headers: { authorization: 'Bearer u' } });
     expect(tripped.statusCode).toBe(503);
   });
 
@@ -356,14 +508,14 @@ describe('SFU resilience — circuit breaker', () => {
 
     // Trip the breaker with 2 failures.
     mockFetch.mockResolvedValue(apiFail(503));
-    let r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'a' } });
+    let r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'a' }, headers: { authorization: 'Bearer u' } });
     expect(r.statusCode).toBe(503);
-    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'b' } });
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'b' }, headers: { authorization: 'Bearer u' } });
     expect(r.statusCode).toBe(503);
 
     // Breaker open → next call is fast-fail 503 without hitting fetch.
     const callsBeforeProbe = mockFetch.mock.calls.length;
-    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'c' } });
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'c' }, headers: { authorization: 'Bearer u' } });
     expect(r.statusCode).toBe(503);
     expect(mockFetch.mock.calls.length).toBe(callsBeforeProbe);
 
@@ -371,13 +523,13 @@ describe('SFU resilience — circuit breaker', () => {
     jest.advanceTimersByTime(150);
 
     // Probe call succeeds → breaker closes. The probe consumes a fetch.
-    mockFetch.mockResolvedValue(apiOk({ arn: 'arn:probe', streamKey: 'sk-probe' }));
-    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'd' } });
+    mockFetch.mockResolvedValue(apiOk({ sessionId: 'arn:probe', channelArn: 'arn:probe', sessionFound: false }));
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'd' }, headers: { authorization: 'Bearer u' } });
     expect(r.statusCode).toBe(201);
     expect(mockFetch.mock.calls.length).toBe(callsBeforeProbe + 1);
 
     // Subsequent calls succeed normally (breaker closed).
-    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'e' } });
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'e' }, headers: { authorization: 'Bearer u' } });
     expect(r.statusCode).toBe(201);
 
     jest.useRealTimers();
@@ -395,20 +547,20 @@ describe('SFU resilience — circuit breaker', () => {
 
     // Trip the breaker with 2 failures.
     mockFetch.mockResolvedValue(apiFail(503));
-    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'a' } });
-    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'b' } });
+    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'a' }, headers: { authorization: 'Bearer u' } });
+    await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'b' }, headers: { authorization: 'Bearer u' } });
 
     // Advance past cooldown → HALF_OPEN.
     jest.advanceTimersByTime(150);
 
     // Probe still fails → breaker re-opens.
     mockFetch.mockResolvedValue(apiFail(503));
-    let r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'probe' } });
+    let r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'probe' }, headers: { authorization: 'Bearer u' } });
     expect(r.statusCode).toBe(503);
 
     // Next call (no further cooldown) is fast-fail without fetch.
     const callsAfterProbe = mockFetch.mock.calls.length;
-    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'after' } });
+    r = await run(buildApp(), 'POST', '/api/video/sessions', { body: { documentId: 'after' }, headers: { authorization: 'Bearer u' } });
     expect(r.statusCode).toBe(503);
     expect(mockFetch.mock.calls.length).toBe(callsAfterProbe);
 
@@ -434,7 +586,7 @@ describe.skip('POST /api/video/sessions/:sessionId/end [obsolete tests — pre-r
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockResolvedValue(apiOk({}));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
     });
     expect(res.statusCode).toBe(200);
     expect(mockEndSession).toHaveBeenCalledWith('doc-1', 'vs-1', expect.any(String));
@@ -448,7 +600,7 @@ describe.skip('POST /api/video/sessions/:sessionId/end [obsolete tests — pre-r
   it('returns 404 when session not found in DB', async () => {
     mockGetSession.mockResolvedValue(null);
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
     });
     expect(res.statusCode).toBe(404);
   });
@@ -457,7 +609,7 @@ describe.skip('POST /api/video/sessions/:sessionId/end [obsolete tests — pre-r
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockResolvedValue(apiFail(503));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
     });
     expect(res.statusCode).toBe(503);
   });
@@ -467,7 +619,7 @@ describe.skip('POST /api/video/sessions/:sessionId/end [obsolete tests — pre-r
     mockFetch.mockResolvedValue(apiOk({}));
     mockEndSession.mockRejectedValue(new Error('DDB write failed'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
       userId: 'tester',
     });
     expect(res.statusCode).toBe(200);
@@ -477,7 +629,7 @@ describe.skip('POST /api/video/sessions/:sessionId/end [obsolete tests — pre-r
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockRejectedValue(new Error('network error'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
     });
     expect(res.statusCode).toBe(500);
   });
@@ -523,8 +675,10 @@ describe('reapLvsParticipant — LVS reclamation on /end', () => {
     expect(url).toContain('/participants/');
     expect(url).toContain(encodeURIComponent(args.participantId));
     expect((init as RequestInit).method).toBe('DELETE');
+    // Post-Wave-7 thin-proxy migration: reap uses VIDEO_ADMIN_TOKEN
+    // unconditionally (DDB streamKey no longer populated on new sessions).
     expect((init as RequestInit).headers).toMatchObject({
-      Authorization: `Bearer ${args.streamKey}`,
+      Authorization: expect.stringMatching(/^Bearer /),
     });
   });
 
@@ -681,7 +835,7 @@ describe('POST /api/video/sessions/:sessionId/refresh-token', () => {
 
   it('400 without participantId', async () => {
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
-      body: { documentId: 'doc-1' },
+      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
     });
     expect(res.statusCode).toBe(400);
   });

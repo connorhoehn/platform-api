@@ -73,17 +73,24 @@ function resolveLobbyName(body: Record<string, unknown>): string | undefined {
  * failing it triggers ICE-consent-timeout fallback (~30s) which has caused
  * rapid-reconnect quota lockout. Best-effort overall — the worst case is
  * we lose the fast-path and fall back to the periodic reaper sweep.
+ *
+ * Auth: ADMIN_TOKEN. The endpoint accepts either streamKey or admin token;
+ * post-Wave-7 thin-proxy migration the DDB row's `streamKey` is no longer
+ * populated (LVS POST /api/sessions doesn't return it), so we use the
+ * admin token unconditionally. `streamKey` arg retained for compat with
+ * older callers / tests; ignored when present.
  */
 export async function reapLvsParticipant(args: {
   channelArn: string;
-  streamKey: string;
+  streamKey?: string;
   participantId: string;
   sessionId: string;
 }): Promise<LvsReapOutcome> {
   const url = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(args.channelArn)}/participants/${encodeURIComponent(args.participantId)}`;
+  const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
   const init: RequestInit = {
     method: 'DELETE',
-    headers: { Authorization: `Bearer ${args.streamKey}` },
+    headers: { Authorization: `Bearer ${adminToken}` },
   };
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -152,56 +159,25 @@ async function sfuChannelIsAlive(channelArn: string): Promise<boolean> {
 }
 
 // POST /api/video/sessions — find-or-create a session for a lobby
+//
+// Thin proxy → LVS POST /api/sessions { lobbyName, findOrCreate, creatorId,
+// recordingConfiguration }. LVS Redis SETNX is atomic, so concurrent finds
+// for the same lobby converge on a single channel (previously a race
+// between the platform-api findActiveByLobbyName + HEAD-probe + create).
+//
+// DDB mirror-write is best-effort and powers the past-calls UI; LVS
+// sessionStore is the source of truth for "is this lobby live".
 videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const lobbyName = resolveLobbyName(body) ?? randomUUID();
-    // Note: displayName is not read at create-time — participants (and their
-    // display names) are added via /join. Accepting it here used to look
-    // intentional but the value was dropped; removed to avoid hinting at a
-    // contract we don't honor.
     const findOrCreate = body.findOrCreate === true;
+    const userId = req.user!.sub;
 
-    // findOrCreate path: return existing active session for this lobby if its
-    // SFU channel is still alive. Self-heals against reaped channels by
-    // falling through to the create path when HEAD says 404.
-    if (findOrCreate) {
-      const existing = await videoSessionRepo.findActiveByLobbyName(lobbyName);
-      if (existing && await sfuChannelIsAlive(existing.channelArn)) {
-        log.info({ sessionId: existing.sessionId, lobbyName }, '[videoSessions] findOrCreate hit');
-        res.status(200).json({ sessionId: existing.sessionId, reused: true });
-        return;
-      }
-    } else {
-      // Non-findOrCreate path: explicit create. If an active session
-      // already exists for this lobby, log a warning so duplicate-create
-      // bugs in client code (e.g. a hangout overlay that POSTs on every
-      // mount) are visible. We still proceed with the create — the
-      // caller asked for it — but the warning helps correlate orphaned
-      // participants[] arrays with the FE call that produced them.
-      const existing = await videoSessionRepo.findActiveByLobbyName(lobbyName);
-      if (existing) {
-        log.warn({
-          lobbyName,
-          existingSessionId: existing.sessionId,
-          existingChannelArn: existing.channelArn,
-          participantCount: (existing.participants ?? []).length,
-        }, '[videoSessions] creating new session while an active one exists for this lobby — possible duplicate-create');
-      }
-    }
-
-    // The SFU gates POST /api/channels behind adminAuth (added in the
-    // recent live-video-streaming reconciliation). Platform-api is the only
-    // trusted in-cluster caller, so we send a Bearer ADMIN_TOKEN. The token
-    // is provisioned via `hack/genadmin.sh` in live-video-streaming and
-    // injected into our pod from the `admin-token` Secret. Falls back to
-    // literal 'admin' which matches the SFU's `||'admin'` default.
-    const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
-    // recordingConfiguration honors the caller's intent — hangoutRooms.ts's
-    // /join route forwards `room.settings.recordingEnabled` as
-    // body.recordingConfiguration; DM/global calls default to enabled
-    // (preserves the legacy "always record" behavior that powers the
-    // Past Calls page). Pass through only if explicit; otherwise default.
+    // recordingConfiguration: hangoutRooms.ts's /join forwards
+    // `room.settings.recordingEnabled`; DM/global calls default to enabled
+    // to preserve the legacy "always record" behavior that powers Past
+    // Calls. Pass through only if explicit; otherwise default.
     const incomingRecordingConfig = (body.recordingConfiguration && typeof body.recordingConfiguration === 'object')
       ? (body.recordingConfiguration as { enabled?: boolean; destination?: string })
       : null;
@@ -211,91 +187,115 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
           destination: incomingRecordingConfig.destination ?? 'local',
         }
       : { enabled: true, destination: 'local' };
-    let channelRes: globalThis.Response;
+
+    // Forward the caller's Cognito Bearer so LVS validates the same
+    // identity that hit us. Without a header we can't proxy — platform-api
+    // requireAuth ensures one is present.
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      throw new AppError(401, 'Authorization header required');
+    }
+
+    let upstream: globalThis.Response;
     try {
-      channelRes = await callSfu(`${VIDEO_API_URL}/api/channels`, {
+      upstream = await callSfu(`${VIDEO_API_URL}/api/sessions`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${adminToken}`,
-        },
+        headers: { 'Content-Type': 'application/json', Authorization: authHeader },
         body: JSON.stringify({
-          name: lobbyName,
+          lobbyName,
+          findOrCreate,
+          creatorId: userId,
           recordingConfiguration,
+          metadata: body.metadata,
         }),
       });
     } catch (sfuErr) {
       throw mapSfuError(sfuErr);
     }
 
-    if (!channelRes.ok) {
-      const errorBody = await channelRes.text().catch(() => 'Unknown error');
-      log.error({ status: channelRes.status, body: errorBody }, '[videoSessions] create channel failed');
-      throw new AppError(channelRes.status, `Video API error: ${channelRes.status}`);
+    if (!upstream.ok) {
+      // LVS 409 LOBBY_TAKEN — race lost between this caller's
+      // findOrCreate-miss and another caller's claim. Surface verbatim
+      // so the FE can retry with findOrCreate=true to pick up the winner.
+      if (upstream.status === 409) {
+        const errBody = await upstream.json().catch(() => ({ error: 'lobby taken' }));
+        res.status(409).json(errBody);
+        return;
+      }
+      const errorBody = await upstream.text().catch(() => 'Unknown error');
+      log.error({ status: upstream.status, body: errorBody, lobbyName }, '[videoSessions] LVS POST /sessions failed');
+      throw new AppError(upstream.status, `LVS POST /sessions ${upstream.status}`);
     }
 
-    const channelData = await channelRes.json() as Record<string, unknown>;
-    const channelArn = channelData.arn as string;
-    const streamKey = channelData.streamKey as string;
+    const lvsResult = await upstream.json() as {
+      sessionId: string;
+      channelArn: string;
+      createdAt?: string;
+      hostToken?: string;
+      sessionFound?: boolean;
+    };
+    const channelArn = lvsResult.channelArn || lvsResult.sessionId;
+    const reused = lvsResult.sessionFound === true;
 
+    // findOrCreate hit: try to reuse the existing DDB row. If the
+    // lobbyName has an active row for the same channelArn, return that
+    // platform-api sessionId. Otherwise fall through and create a fresh
+    // DDB row pointing at the LVS-owned channel (covers the case where
+    // LVS reused the session but DDB never recorded it locally).
+    if (reused) {
+      const existing = await videoSessionRepo.findActiveByLobbyName(lobbyName);
+      if (existing && existing.channelArn === channelArn) {
+        log.info({ sessionId: existing.sessionId, lobbyName }, '[videoSessions] findOrCreate hit (LVS authoritative)');
+        res.status(200).json({ sessionId: existing.sessionId, reused: true });
+        return;
+      }
+    }
+
+    // Either fresh create or reused-by-LVS-but-not-in-DDB. Write a fresh
+    // DDB row. LVS doesn't return a streamKey on /api/sessions — past-calls
+    // UI doesn't need it, and the reap path uses the user's Cognito JWT
+    // (not streamKey) post-migration. Stub for back-compat with existing
+    // VideoSessionRecord shape until the streamKey field can be dropped.
     const sessionId = randomUUID();
-    const userId = req.user!.sub;
     const now = new Date().toISOString();
-
     const record: VideoSessionRecord = {
       documentId: lobbyName,
       sessionId,
       channelArn,
-      streamKey,
+      streamKey: '',  // LVS no longer exposes; DDB field retained for shape compat
       status: 'active',
       startedAt: now,
       startedBy: userId,
-      // Don't pre-seed participants[] on create — they get added via /join.
-      // Pre-seeding without a per-tab participantId would make /end (keyed
-      // by participantId) unable to clean up the seed entry → orphan
-      // participant blocks "last out" detection.
       participants: [],
     };
 
     try {
       await videoSessionRepo.createSession(record);
-      log.info({ sessionId, lobbyName, channelArn }, '[videoSessions] Created session');
+      log.info({ sessionId, lobbyName, channelArn, reused }, '[videoSessions] DDB row written');
     } catch (dbErr) {
-      // Log but don't fail — the channel was created successfully
+      // Log but don't fail — LVS already has the canonical session.
       log.error({ err: dbErr }, '[videoSessions] Failed to persist local record');
     }
 
-    // P0 — write arn → session reverse index to Redis so the
-    // recording.completed webhook handler can resolve channelArn back
-    // to (sessionId, lobbyName). LVS recording metadata doesn't carry
-    // these; without this index, every recording persists under a
-    // synthetic 'unknown-<arn>-<recordingId>' callId.
-    //
-    // We log explicitly when Redis is unavailable (vs. when the write
-    // throws) — previously the "redis null" branch fell through silently
-    // and the user only saw "recordings persisted under unknown-<arn>"
-    // with no log breadcrumb pointing back to a missing Redis. The two
-    // failure modes have different remediations (restart Redis vs. fix
-    // the call site) so they need different log lines.
+    // arn-index for the recording.completed webhook → callId resolution.
     try {
       const { getRedisClient } = await import('../lib/redis-client.js');
       const redis = await getRedisClient();
       if (!redis) {
-        log.warn({ channelArn, sessionId, lobbyName }, '[videoSessions] arn-index write skipped — Redis unavailable; recording.completed will fall back to unknown-<arn> callIds');
+        log.warn({ channelArn, sessionId, lobbyName }, '[videoSessions] arn-index write skipped — Redis unavailable');
       } else {
         const indexKey = `video:arn-index:${channelArn}`;
         await redis.set(
           indexKey,
           JSON.stringify({ sessionId, lobbyName, createdAt: now }),
-          { EX: 7 * 24 * 60 * 60 }, // 7 days — covers webhook arrival + retries
+          { EX: 7 * 24 * 60 * 60 },
         );
-        log.debug({ channelArn, sessionId, lobbyName }, '[videoSessions] arn-index written');
       }
     } catch (idxErr) {
-      log.warn({ err: idxErr, channelArn }, '[videoSessions] arn-index write failed (recording lookup may degrade)');
+      log.warn({ err: idxErr, channelArn }, '[videoSessions] arn-index write failed');
     }
 
-    res.status(201).json({ sessionId, reused: false });
+    res.status(reused ? 200 : 201).json({ sessionId, reused });
   } catch (err) {
     if (err instanceof AppError) throw err;
     log.error({ err }, '[videoSessions] POST /sessions error');
@@ -303,13 +303,18 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
   }
 }));
 
-// POST /api/video/sessions/:sessionId/join — mint a participant token + (idempotent) add to participants
+// POST /api/video/sessions/:sessionId/join — thin proxy → LVS
+// POST /api/sessions/:arn/join. LVS mints the participant token (with
+// Wave-5 `sub` + `mid` claims) and registers the participant in its
+// sessionStore. Platform-api mirrors the participant into DDB for
+// past-calls history.
 videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {
     const { sessionId } = req.params;
     const body = (req.body ?? {}) as Record<string, unknown>;
     const lobbyName = resolveLobbyName(body);
     const displayName = typeof body.displayName === 'string' ? body.displayName : undefined;
+    const role = typeof body.role === 'string' ? body.role : 'publisher';
 
     if (!lobbyName) {
       throw new ValidationError('lobbyName (or documentId) is required in request body');
@@ -320,37 +325,46 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
       throw new NotFoundError('Session not found');
     }
 
-    let tokenRes: globalThis.Response;
+    const userId = req.user!.sub;
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      throw new AppError(401, 'Authorization header required');
+    }
+
+    let upstream: globalThis.Response;
     try {
-      tokenRes = await callSfu(
-        `${VIDEO_API_URL}/api/channels/${encodeURIComponent(session.channelArn)}/participant-tokens`,
+      upstream = await callSfu(
+        `${VIDEO_API_URL}/api/sessions/${encodeURIComponent(session.channelArn)}/join`,
         {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${session.streamKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ role: 'publisher', ttlSeconds: 3600 }),
+          headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, displayName, role }),
         },
       );
     } catch (sfuErr) {
       throw mapSfuError(sfuErr);
     }
 
-    if (!tokenRes.ok) {
-      const errorBody = await tokenRes.text().catch(() => 'Unknown error');
-      log.error({ status: tokenRes.status, body: errorBody }, '[videoSessions] participant-token request failed');
-      throw new AppError(tokenRes.status, `Video API error: ${tokenRes.status}`);
+    if (!upstream.ok) {
+      // 404 / 410 (session not found / ended) propagate verbatim — both
+      // are actionable on the FE (clear stale local state on 410).
+      if (upstream.status === 404 || upstream.status === 410) {
+        const errBody = await upstream.json().catch(() => ({ error: 'unknown' }));
+        res.status(upstream.status).json(errBody);
+        return;
+      }
+      const errorBody = await upstream.text().catch(() => 'Unknown error');
+      log.error({ status: upstream.status, body: errorBody, sessionId }, '[videoSessions] LVS /join upstream failed');
+      throw new AppError(upstream.status, `LVS /join upstream ${upstream.status}`);
     }
 
-    const tokenData = await tokenRes.json() as Record<string, unknown>;
+    const tokenData = await upstream.json() as {
+      token: string; websocketUrl?: string; expiresAt?: string;
+      participantId: string; role: string; displayName?: string;
+    };
 
-    // Per-tab participant: key participants[] by the SFU-returned participantId,
-    // not userId. Multiple tabs of the same user (real in prod, every tab in
-    // local-dev SKIP_AUTH=true) each get their own slot so individual unloads
-    // ref-count correctly. Dedup against participantId to keep /join idempotent.
-    const userId = req.user!.sub;
-    const participantId = (tokenData.participantId as string) || randomUUID();
+    // Mirror to DDB for past-calls history. Best-effort, idempotent.
+    const participantId = tokenData.participantId;
     const already = (session.participants ?? []).some(p => p.participantId === participantId);
     if (!already) {
       const now = new Date().toISOString();
@@ -361,17 +375,13 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
           displayName: displayName || userId,
           joinedAt: now,
         });
-        log.info({ userId, participantId, sessionId }, '[videoSessions] Added participant to session');
+        log.info({ userId, participantId, sessionId }, '[videoSessions] Added participant to DDB');
       } catch (dbErr) {
         log.error({ err: dbErr }, '[videoSessions] Failed to add participant to local record');
       }
     }
 
-    res.status(200).json({
-      token: tokenData.token as string,
-      participantId,
-      userId,
-    });
+    res.status(200).json({ token: tokenData.token, participantId, userId });
   } catch (err) {
     if (err instanceof AppError) throw err;
     log.error({ err }, '[videoSessions] POST /sessions/:id/join error');
