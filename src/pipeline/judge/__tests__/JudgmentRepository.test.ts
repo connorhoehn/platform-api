@@ -22,6 +22,7 @@ jest.mock('../../../lib/aws-clients', () => ({
 }));
 
 import { JudgmentRepository } from '../JudgmentRepository';
+import { InMemoryRawTextStore, rawTextKeyFor } from '../RawTextStore';
 import type { JudgmentResult } from '../types';
 
 function makeResult(overrides: Partial<JudgmentResult> = {}): JudgmentResult {
@@ -123,6 +124,99 @@ describe('JudgmentRepository — persistJudgment', () => {
 
     const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as Record<string, unknown>;
     expect(item.rawTextTruncated).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v2 — rawText spillover to RawTextStore
+// ---------------------------------------------------------------------------
+
+describe('JudgmentRepository — rawText spillover (v2)', () => {
+  it('uploads oversized rawText to the store and stores the S3 key', async () => {
+    mockSend.mockResolvedValue({});
+    const store = new InMemoryRawTextStore();
+    const repo = new JudgmentRepository(mockDocClient, { rawTextStore: store });
+    const huge = 'x'.repeat(40 * 1024);
+
+    await repo.persistJudgment(makeResult({ judgmentId: 'jdg_big', rawModelText: huge }));
+
+    const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as Record<string, unknown>;
+    expect(item.rawTextTruncated).toBe(true);
+    expect(item.rawModelText).toBeUndefined();
+    expect(item.rawTextS3Key).toBe(rawTextKeyFor('jdg_big'));
+    expect(await store.get(item.rawTextS3Key as string)).toBe(huge);
+  });
+
+  it('does not upload when rawText is under the cap (no store call)', async () => {
+    mockSend.mockResolvedValue({});
+    const store = new InMemoryRawTextStore();
+    const putSpy = jest.spyOn(store, 'put');
+    const repo = new JudgmentRepository(mockDocClient, { rawTextStore: store });
+
+    await repo.persistJudgment(makeResult({ rawModelText: 'tiny' }));
+    expect(putSpy).not.toHaveBeenCalled();
+  });
+
+  it('falls back to v1 behavior (drop body, set truncated flag) when store upload fails', async () => {
+    mockSend.mockResolvedValue({});
+    const store = new InMemoryRawTextStore();
+    jest.spyOn(store, 'put').mockRejectedValue(new Error('S3 down'));
+    const repo = new JudgmentRepository(mockDocClient, { rawTextStore: store });
+    const huge = 'x'.repeat(40 * 1024);
+
+    await repo.persistJudgment(makeResult({ rawModelText: huge }));
+
+    const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as Record<string, unknown>;
+    expect(item.rawTextTruncated).toBe(true);
+    expect(item.rawModelText).toBeUndefined();
+    expect(item.rawTextS3Key).toBeUndefined();
+  });
+
+  it('with no store configured, oversized body is dropped without spillover', async () => {
+    mockSend.mockResolvedValue({});
+    const repo = new JudgmentRepository(mockDocClient); // no rawTextStore
+    const huge = 'x'.repeat(40 * 1024);
+
+    await repo.persistJudgment(makeResult({ rawModelText: huge }));
+
+    const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as Record<string, unknown>;
+    expect(item.rawTextTruncated).toBe(true);
+    expect(item.rawModelText).toBeUndefined();
+    expect(item.rawTextS3Key).toBeUndefined();
+  });
+});
+
+describe('JudgmentRepository — getRawText (v2)', () => {
+  it('returns the inline body when the row was not truncated', async () => {
+    mockSend.mockResolvedValue({
+      Item: { judgmentId: 'jdg_1', rawModelText: 'inline body' },
+    });
+    const repo = new JudgmentRepository(mockDocClient);
+    expect(await repo.getRawText('jdg_1')).toBe('inline body');
+  });
+
+  it('fetches from the store when rawTextS3Key is set', async () => {
+    const store = new InMemoryRawTextStore();
+    await store.put('jdg_big', 'recovered from S3');
+    mockSend.mockResolvedValue({
+      Item: { judgmentId: 'jdg_big', rawTextTruncated: true, rawTextS3Key: rawTextKeyFor('jdg_big') },
+    });
+    const repo = new JudgmentRepository(mockDocClient, { rawTextStore: store });
+    expect(await repo.getRawText('jdg_big')).toBe('recovered from S3');
+  });
+
+  it('returns null when truncated and no store is configured', async () => {
+    mockSend.mockResolvedValue({
+      Item: { judgmentId: 'jdg_1', rawTextTruncated: true, rawTextS3Key: 'judgments/jdg_1.txt' },
+    });
+    const repo = new JudgmentRepository(mockDocClient); // no store
+    expect(await repo.getRawText('jdg_1')).toBeNull();
+  });
+
+  it('returns null when the judgment row does not exist', async () => {
+    mockSend.mockResolvedValue({});
+    const repo = new JudgmentRepository(mockDocClient);
+    expect(await repo.getRawText('jdg_missing')).toBeNull();
   });
 });
 

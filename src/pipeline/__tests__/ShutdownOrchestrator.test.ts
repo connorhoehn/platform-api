@@ -9,6 +9,7 @@ import { createShutdown } from '../ShutdownOrchestrator';
 import type { RunPersistenceService } from '../runPersistence';
 import type { StuckRunDetector } from '../StuckRunDetector';
 import type { ExecutorAuditSubscriber } from '../executor-audit-subscriber';
+import type { JudgeAggregatorSubscriber } from '../judge/judge-aggregator-subscriber';
 
 function makeLogger() {
   return {
@@ -34,6 +35,9 @@ function makeDeps(overrides: Partial<Parameters<typeof createShutdown>[0]> = {})
   const executorAuditSubscriber = stub<ExecutorAuditSubscriber>({
     stop: jest.fn(async () => {}),
   });
+  const judgeAggregatorSubscriber = stub<JudgeAggregatorSubscriber>({
+    stop: jest.fn(async () => {}),
+  });
   const auditSweeperStop = jest.fn();
   const moduleRegistry = { stop: jest.fn(async () => {}) };
   const resourceRegistry = { stop: jest.fn(async () => {}) };
@@ -49,6 +53,7 @@ function makeDeps(overrides: Partial<Parameters<typeof createShutdown>[0]> = {})
     runPersistence,
     stuckRunDetector,
     executorAuditSubscriber,
+    judgeAggregatorSubscriber,
     auditSweeperStop,
     moduleRegistry,
     resourceRegistry,
@@ -97,6 +102,19 @@ describe('createShutdown()', () => {
     const deps = makeDeps();
     await createShutdown(deps)();
     expect((deps.runPersistence as unknown as { stop: ReturnType<typeof jest.fn> }).stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('calls judgeAggregatorSubscriber.stop() when provided', async () => {
+    const deps = makeDeps();
+    await createShutdown(deps)();
+    expect(
+      (deps.judgeAggregatorSubscriber as unknown as { stop: ReturnType<typeof jest.fn> }).stop,
+    ).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips judgeAggregatorSubscriber when null', async () => {
+    const deps = makeDeps({ judgeAggregatorSubscriber: null });
+    await expect(createShutdown(deps)()).resolves.toBeUndefined();
   });
 
   it('skips runPersistence when null', async () => {

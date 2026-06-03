@@ -1,6 +1,7 @@
 import type { RunPersistenceService } from './runPersistence';
 import type { StuckRunDetector } from './StuckRunDetector';
 import type { ExecutorAuditSubscriber } from './executor-audit-subscriber';
+import type { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 
 interface ShutdownDeps {
   keepAlive: ReturnType<typeof setInterval>;
@@ -9,6 +10,7 @@ interface ShutdownDeps {
   runPersistence: RunPersistenceService | null;
   stuckRunDetector: StuckRunDetector | null;
   executorAuditSubscriber: ExecutorAuditSubscriber | null;
+  judgeAggregatorSubscriber: JudgeAggregatorSubscriber | null;
   /** Stop fn for the audit sweeper interval (no-op when sweeper disabled). */
   auditSweeperStop: (() => void) | null;
   moduleRegistry: { stop(): Promise<void> };
@@ -27,6 +29,7 @@ export function createShutdown(deps: ShutdownDeps): () => Promise<void> {
     runPersistence,
     stuckRunDetector,
     executorAuditSubscriber,
+    judgeAggregatorSubscriber,
     auditSweeperStop,
     moduleRegistry,
     resourceRegistry,
@@ -43,6 +46,7 @@ export function createShutdown(deps: ShutdownDeps): () => Promise<void> {
     }
     try { if (auditSweeperStop) auditSweeperStop(); } catch (err) { logger.error({ err: String(err) }, 'auditSweeperStop() failed'); }
     try { if (executorAuditSubscriber) await executorAuditSubscriber.stop(); } catch (err) { logger.error({ err: String(err) }, 'executorAuditSubscriber.stop() failed'); }
+    try { if (judgeAggregatorSubscriber) await judgeAggregatorSubscriber.stop(); } catch (err) { logger.error({ err: String(err) }, 'judgeAggregatorSubscriber.stop() failed'); }
     try { if (stuckRunDetector) stuckRunDetector.stop(); } catch (err) { logger.error({ err: String(err) }, 'stuckRunDetector.stop() failed'); }
     try { if (runPersistence) await runPersistence.stop(); } catch (err) { logger.error({ err: String(err) }, 'runPersistence.stop() failed'); }
     try {

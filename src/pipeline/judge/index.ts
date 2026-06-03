@@ -40,6 +40,28 @@ export type {
 export { JudgeBudgetGuard } from './JudgeBudgetGuard';
 export type { JudgeBudgetGuardOptions } from './JudgeBudgetGuard';
 
+export {
+  JudgmentAggregateRepository,
+  buildAggregateKey,
+  utcDayBucket,
+} from './JudgmentAggregateRepository';
+export type {
+  AggregateRow,
+  JudgmentAggregateRepositoryOptions,
+  ListAggregatesOptions,
+  ListAggregatesResult,
+} from './JudgmentAggregateRepository';
+
+export { JudgeAggregatorSubscriber } from './judge-aggregator-subscriber';
+export type { JudgeAggregatorSubscriberOptions } from './judge-aggregator-subscriber';
+
+export {
+  S3RawTextStore,
+  InMemoryRawTextStore,
+  rawTextKeyFor,
+} from './RawTextStore';
+export type { RawTextStore, S3RawTextStoreOptions } from './RawTextStore';
+
 export type {
   AnthropicUsage,
   CriterionScore,

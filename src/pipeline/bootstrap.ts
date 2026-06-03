@@ -97,6 +97,8 @@ import {
 } from './config/cluster';
 import { buildPipelineModuleConfig } from './config/pipelineModule';
 import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
+import { JudgmentAggregateRepository } from './judge/JudgmentAggregateRepository';
+import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
 import { resolveStableNodeId } from './config/identity';
 import { setupHintedHandoffQueue } from './config/hintedHandoffQueue';
@@ -930,6 +932,28 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     logger.info('executor audit subscriber DISABLED via PIPELINE_AUDIT_LIFECYCLE_ENABLED=false');
   }
 
+  // ── Judge aggregator subscriber ───────────────────────────────────────
+  //
+  // v2 — folds `pipeline:judge:scored` into per-pipeline/per-rubric/per-day
+  // rollups (pipeline-judgment-aggregates table) for trend rendering. In-
+  // process subscriber on the same EventBus the audit subscriber listens
+  // to. Opt-out via JUDGE_AGGREGATOR_ENABLED=false (for envs where the
+  // aggregates table isn't provisioned yet).
+  const judgeAggregatorEnabled =
+    (process.env.JUDGE_AGGREGATOR_ENABLED ?? 'true').trim().toLowerCase() !== 'false';
+  let judgeAggregatorSubscriber: JudgeAggregatorSubscriber | null = null;
+  if (judgeAggregatorEnabled) {
+    const aggregateRepo = new JudgmentAggregateRepository();
+    judgeAggregatorSubscriber = new JudgeAggregatorSubscriber({
+      eventBus,
+      aggregateRepo,
+    });
+    judgeAggregatorSubscriber.start();
+    logger.info('judge aggregator subscriber ENABLED');
+  } else {
+    logger.info('judge aggregator subscriber DISABLED via JUDGE_AGGREGATOR_ENABLED=false');
+  }
+
   // Belt-and-suspenders sweeper for envs where DDB native TTL doesn't fire
   // (DDB-local in particular). Production AWS DDB drops rows via the
   // `ttlEpoch` attribute set at write time, so the sweeper is a no-op there
@@ -982,6 +1006,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     runPersistence,
     stuckRunDetector,
     executorAuditSubscriber,
+    judgeAggregatorSubscriber,
     auditSweeperStop,
     moduleRegistry,
     resourceRegistry,
