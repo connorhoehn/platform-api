@@ -97,7 +97,7 @@ import {
 } from './config/cluster';
 import { buildPipelineModuleConfig } from './config/pipelineModule';
 import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
-import { JudgmentAggregateRepository } from './judge/JudgmentAggregateRepository';
+import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
 import { resolveStableNodeId } from './config/identity';
@@ -943,10 +943,9 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     (process.env.JUDGE_AGGREGATOR_ENABLED ?? 'true').trim().toLowerCase() !== 'false';
   let judgeAggregatorSubscriber: JudgeAggregatorSubscriber | null = null;
   if (judgeAggregatorEnabled) {
-    const aggregateRepo = new JudgmentAggregateRepository();
     judgeAggregatorSubscriber = new JudgeAggregatorSubscriber({
       eventBus,
-      aggregateRepo,
+      aggregateRepo: getJudgmentAggregateRepo(),
     });
     judgeAggregatorSubscriber.start();
     logger.info('judge aggregator subscriber ENABLED');

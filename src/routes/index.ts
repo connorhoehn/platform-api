@@ -37,6 +37,7 @@ import { pipelineRetryRouter, pipelineRunActionsRouter } from './pipelineRetry';
 import { pipelineResumeRouter } from './pipelineResume';
 import { pipelineBreakpointPatchRouter } from './pipelineBreakpointPatch';
 import { pipelineRunAuditRouter, pipelineAuditSearchRouter } from './pipelineAudit';
+import { judgmentsRouter } from './judgments';
 import { pipelineValidationRouter } from './pipelineValidation';
 import { pipelineInspectorRouter } from './pipelineInspector';
 import { pipelineDLQRouter } from './pipelineDLQ';
@@ -136,6 +137,10 @@ router.use('/pipelines/llm/stream', pipelineLLMStreamRouter);
 // Static segment, must precede the `:pipelineId` mount below for the same
 // reason as `/metrics`/`/defs`/`/llm/stream`.
 router.use('/pipelines/audit/search', pipelineAuditSearchRouter);
+// llm:judge data plane — GET /api/judgments/:id/raw-text + /aggregates.
+// Mounted at the top-level so the URL surface stays clean: judgments are
+// addressable by their stable judgmentId rather than parent pipeline/run.
+router.use('/judgments', judgmentsRouter);
 // Per-pipeline cost aggregation — GET /api/pipelines/:pipelineId/cost.
 // Mounted alongside other :pipelineId routes, after static segments.
 router.use('/pipelines/:pipelineId/cost', pipelineCostRouter);

@@ -15,9 +15,8 @@ import type { Logger } from 'pino';
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createJudgeStepHandler } from './JudgeStepHandler';
 import { JudgeClient } from './JudgeClient';
-import { JudgmentRepository } from './JudgmentRepository';
 import { JudgeBudgetGuard } from './JudgeBudgetGuard';
-import { S3RawTextStore } from './RawTextStore';
+import { getJudgmentRepo } from './judgeServices';
 
 /** Mutable reference cell — bootstrap patches `current` after `new PipelineModule(...)`. */
 export interface PipelineModuleRef {
@@ -54,21 +53,11 @@ export function buildJudgeStepHandlers(
   // "unreachable pipeline node type". Diagnostics > silent omission.
   const judgeClient = new JudgeClient();
 
-  // Persistence: pipeline-judgments table. Soft-fail — the handler logs
-  // and continues if the write throws (the JudgmentResult is already on
-  // the EventBus so live observers don't depend on persistence).
-  //
-  // v2 — rawText spillover to S3 when JUDGE_RAW_TEXT_BUCKET is set in
-  // env. Without the bucket, oversized rawModelText is dropped on
-  // persist (only the rawTextTruncated:true flag is preserved). The
-  // live `pipeline:judge:scored` event still carries the full body, so
-  // session observers see everything; only post-hoc audit drill-in
-  // depends on the spillover.
-  const rawTextBucket = process.env.JUDGE_RAW_TEXT_BUCKET?.trim();
-  const rawTextStore = rawTextBucket
-    ? new S3RawTextStore({ bucket: rawTextBucket })
-    : undefined;
-  const repository = new JudgmentRepository(undefined, rawTextStore ? { rawTextStore } : {});
+  // Persistence: shared singleton (see judgeServices.ts). Soft-fail at the
+  // handler — JudgmentResult is already on the EventBus so live observers
+  // don't depend on the write. v2 rawText spillover to S3 is configured
+  // once at the service layer via JUDGE_RAW_TEXT_BUCKET.
+  const repository = getJudgmentRepo();
 
   // Daily budget: $10/day default, override via JUDGE_DAILY_BUDGET_USD_DEFAULT.
   // Soft-fails on Redis outage (returns allow) so a Redis blip doesn't
