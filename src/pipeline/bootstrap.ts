@@ -96,6 +96,7 @@ import {
   type PipelinePubSubMode,
 } from './config/cluster';
 import { buildPipelineModuleConfig } from './config/pipelineModule';
+import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
 import { buildAppLayerRegistries } from './config/registries';
 import { resolveStableNodeId } from './config/identity';
 import { setupHintedHandoffQueue } from './config/hintedHandoffQueue';
@@ -671,6 +672,21 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   logger.info(
     eventBusMetricsEnabled ? 'EventBus metrics ENABLED' : 'EventBus metrics DISABLED',
   );
+  // DC-21: register custom step handlers (llm:judge, image:vision-analyze, …).
+  // Chicken-and-egg: handlers go INTO the module config, so the module ref
+  // gets patched in AFTER construction via the `moduleRef.current` cell.
+  // Each handler is constructed lazily here so the module map is empty when
+  // no custom step is configured (e.g. unit tests). Always non-empty in
+  // production — the judge handler is always registered, even when
+  // ANTHROPIC_API_KEY is missing, so misconfiguration surfaces as a clean
+  // dispatch-time failure rather than "unreachable pipeline node type".
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const judgeModuleRef: { current: any | null } = { current: null };
+  const customStepHandlers = buildJudgeStepHandlers({
+    moduleRef: judgeModuleRef,
+    logger: bootstrapLog,
+  });
+
   const module = new PipelineModule(
     buildPipelineModuleConfig({
       nodeId,
@@ -681,8 +697,12 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       eventBusAutoCompactIntervalMs: effectiveAutoCompactIntervalMs,
       eventBusAutoCompactOptions: effectiveAutoCompactOptions,
       ...(eventBusMetricsEnabled ? { eventBusMetrics: metricsRegistry } : {}),
+      ...(customStepHandlers.size > 0 ? { customStepHandlers } : {}),
     }),
   );
+  // Wire the module ref now that construction is complete — judge handler
+  // can resolve `runId → pipelineId` for budget routing + persistence.
+  judgeModuleRef.current = module;
 
   // Register the module with ApplicationRegistry. The registry auto-wires the
   // 6-field ApplicationModuleContext from its own internal state

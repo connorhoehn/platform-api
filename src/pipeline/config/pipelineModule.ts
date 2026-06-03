@@ -80,6 +80,16 @@ export interface PipelineModuleConstructorConfig {
   eventBusMetrics?: MetricsRegistry;
   /** T2 idempotency hook — see distributed-core `PipelineModuleConfig.onBeforeAction`. */
   onBeforeAction?: OnBeforeActionHook;
+
+  /**
+   * DC-21: custom step-handler registry forwarded to every executor.
+   * Lets downstream projects register handlers for `node.data.type`
+   * strings outside the canonical NodeType union (e.g. 'llm:judge',
+   * 'image:vision-analyze'). See `judge/registerJudgeHandlers.ts` for the
+   * platform-api-side registration site.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  customStepHandlers?: Map<string, any>;
 }
 
 export interface BuildPipelineModuleConfigArgs {
@@ -105,6 +115,9 @@ export interface BuildPipelineModuleConfigArgs {
    * passed as `metricsRegistry` for single-pane-of-glass observability.
    */
   eventBusMetrics?: MetricsRegistry;
+  /** DC-21: custom step-handler registry — see PipelineModuleConstructorConfig. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  customStepHandlers?: Map<string, any>;
 }
 
 /**
@@ -168,6 +181,9 @@ export function buildPipelineModuleConfig(
   }
   if (args.eventBusMetrics !== undefined) {
     config.eventBusMetrics = args.eventBusMetrics;
+  }
+  if (args.customStepHandlers !== undefined) {
+    config.customStepHandlers = args.customStepHandlers;
   }
   return config;
 }
