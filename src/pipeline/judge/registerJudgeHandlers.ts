@@ -55,8 +55,8 @@ export function buildJudgeStepHandlers(
 
   // Persistence: shared singleton (see judgeServices.ts). Soft-fail at the
   // handler — JudgmentResult is already on the EventBus so live observers
-  // don't depend on the write. v2 rawText spillover to S3 is configured
-  // once at the service layer via JUDGE_RAW_TEXT_BUCKET.
+  // don't depend on the write. v2 rawText spillover is configured once at
+  // the service layer via JUDGE_RAW_TEXT_ENABLED (DDB second table).
   const repository = getJudgmentRepo();
 
   // Daily budget: $10/day default, override via JUDGE_DAILY_BUDGET_USD_DEFAULT.

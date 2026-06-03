@@ -24,12 +24,13 @@
 //     trend analysis + rubric tuning).
 //
 // rawText spillover: when `rawModelText` is ≥32KB we strip it from the
-// DDB item to stay under the 400KB cap. v2: if a RawTextStore is wired
-// (S3RawTextStore in production), we upload the full body and store the
-// resulting key on `rawTextS3Key`. Without a store, we just set
-// `rawTextTruncated:true` and the body is lost on persist (still
-// available on the live `pipeline:judge:scored` event). `getRawText()`
-// re-hydrates the full body lazily on demand.
+// primary DDB item to stay under the 400KB cap. v2: if a RawTextStore
+// is wired (DdbRawTextStore in production — writes to a second DDB
+// table), we persist the full body and store the resulting key on
+// `rawTextKey`. Without a store, we just set `rawTextTruncated:true`
+// and the body is dropped at persist time (still available on the live
+// `pipeline:judge:scored` event for session observers).
+// `getRawText()` re-hydrates the full body lazily on demand.
 //
 // `persistJudgment` matches the `JudgmentRepositoryLike` interface in
 // JudgeStepHandler.ts — pass an instance of this class into the
@@ -67,7 +68,7 @@ export interface JudgmentRepositoryOptions {
   /**
    * Optional v2 spillover for >32KB rawModelText bodies. When provided,
    * oversized bodies are uploaded to the store and the resulting key is
-   * persisted on `rawTextS3Key`; `getRawText()` re-hydrates lazily.
+   * persisted on `rawTextKey`; `getRawText()` re-hydrates lazily.
    * When omitted, oversized bodies are dropped and only the
    * `rawTextTruncated:true` flag is set.
    */
@@ -79,8 +80,8 @@ export interface StoredJudgment extends JudgmentResult {
   ttlEpoch: number;
   /** True when rawModelText exceeded RAW_TEXT_INLINE_CAP_BYTES and was stripped. */
   rawTextTruncated?: boolean;
-  /** S3 storage key for the full body (set when a rawTextStore was wired at write). */
-  rawTextS3Key?: string;
+  /** Spillover storage key for the full body (set when a rawTextStore was wired at write). */
+  rawTextKey?: string;
 }
 
 export interface ListJudgmentsOptions {
@@ -137,15 +138,15 @@ export class JudgmentRepository {
       : 0;
     const truncate = rawTextBytes >= RAW_TEXT_INLINE_CAP_BYTES;
 
-    // v2 spillover: upload to S3 first when configured. We do this BEFORE
-    // the DDB write so a successful row always has a valid rawTextS3Key
-    // pointing at a real object. Upload failures don't fail the DDB write
+    // v2 spillover: write to the spillover store BEFORE the primary DDB
+    // row so a successful primary always has a valid rawTextKey pointing
+    // at a real object. Spillover failures don't fail the primary write
     // — we fall back to the v1 behavior (`rawTextTruncated:true`, body
     // dropped) and log. Persistence integrity > spillover completeness.
-    let rawTextS3Key: string | undefined;
+    let rawTextKey: string | undefined;
     if (truncate && this.rawTextStore && result.rawModelText) {
       try {
-        rawTextS3Key = await this.rawTextStore.put(result.judgmentId, result.rawModelText);
+        rawTextKey = await this.rawTextStore.put(result.judgmentId, result.rawModelText);
       } catch (err) {
         console.warn('JudgmentRepository: rawText spillover upload failed', err);
       }
@@ -159,7 +160,7 @@ export class JudgmentRepository {
         ? {
             rawModelText: undefined,
             rawTextTruncated: true,
-            ...(rawTextS3Key ? { rawTextS3Key } : {}),
+            ...(rawTextKey ? { rawTextKey } : {}),
           }
         : {}),
       ttlEpoch,
@@ -170,16 +171,16 @@ export class JudgmentRepository {
 
   /**
    * Lazily fetch the full rawModelText for a judgment. Returns the body
-   * from S3 when the row was spilled, the inline body when it wasn't
-   * truncated, or null when the body is unavailable (no store configured
-   * at write, or S3 fetch failed).
+   * from the spillover store when the row was spilled, the inline body
+   * when it wasn't truncated, or null when the body is unavailable (no
+   * store configured at write, or the spillover fetch failed).
    */
   async getRawText(judgmentId: string): Promise<string | null> {
     const row = await this.getById(judgmentId);
     if (!row) return null;
     if (row.rawModelText) return row.rawModelText;
-    if (row.rawTextS3Key && this.rawTextStore) {
-      return this.rawTextStore.get(row.rawTextS3Key);
+    if (row.rawTextKey && this.rawTextStore) {
+      return this.rawTextStore.get(row.rawTextKey);
     }
     return null;
   }

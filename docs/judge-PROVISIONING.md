@@ -1,12 +1,13 @@
 # Judge v2 — Operator Provisioning Runbook
 
-This document captures the AWS resources the `llm:judge` step depends on
-in production. The application code degrades gracefully when these
-aren't provisioned (see _Fallback behavior_ at the bottom), but
-operators should provision them before going live.
+This document captures the DynamoDB resources the `llm:judge` step
+depends on. The application code degrades gracefully when these aren't
+provisioned (see _Fallback behavior_), but operators should provision
+them before going live.
 
-The application **does NOT** auto-create any of this — IaC happens
-out-of-band per the project's standing convention.
+The application **does NOT** auto-create any of these — IaC happens
+out-of-band per the project's standing convention. All substrate is
+DynamoDB; there are no cloud-only services in the judge feature.
 
 ## Tables
 
@@ -38,6 +39,7 @@ type `AggregateRow` in `JudgmentAggregateRepository.ts`.
 
 ```bash
 aws dynamodb create-table \
+  --endpoint-url "${DDB_ENDPOINT:-http://localhost:8000}" \
   --table-name "${DDB_TABLE_PREFIX:-}pipeline-judgment-aggregates" \
   --attribute-definitions \
     AttributeName=aggregateKey,AttributeType=S \
@@ -59,60 +61,54 @@ aws dynamodb create-table \
   --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
 ```
 
-Switch `--billing-mode PAY_PER_REQUEST` (and drop both
-`ProvisionedThroughput=…` blocks) for on-demand billing.
+Drop `--endpoint-url` for the default AWS DDB endpoint. DDB-local
+ignores `--billing-mode` and the throughput args but accepts them
+without error.
 
-Enable native TTL once the table is `ACTIVE`:
+Enable native TTL once the table is `ACTIVE` (DDB-local enforces TTL
+on read, real AWS DDB on background sweep):
 
 ```bash
 aws dynamodb update-time-to-live \
+  --endpoint-url "${DDB_ENDPOINT:-http://localhost:8000}" \
   --table-name "${DDB_TABLE_PREFIX:-}pipeline-judgment-aggregates" \
   --time-to-live-specification "Enabled=true, AttributeName=ttlEpoch"
 ```
 
-## S3 bucket
+### `pipeline-judgment-rawtext` (v2 — NEW)
 
-### `JUDGE_RAW_TEXT_BUCKET` (v2 — NEW, optional)
-
-Spillover for `rawModelText` bodies ≥ 32KB. Without this, oversized
+Spillover table for `rawModelText` bodies ≥ 32KB. Without this, oversized
 bodies are dropped on persist (only the `rawTextTruncated:true` flag is
-kept on the DDB row). The live `pipeline:judge:scored` event still
-carries the full body — only post-hoc audit drill-in depends on the
-spillover.
+kept on the parent row in `pipeline-judgments`). The live
+`pipeline:judge:scored` event still carries the full body for session
+observers — only post-hoc audit drill-in depends on the spillover.
 
-#### Create the bucket
+Bodies larger than ~390KB still get dropped (DDB's 400KB per-item cap).
+Tail case for LLM responses; not addressed here.
+
+#### Schema
+
+| Attribute | Type | Role |
+| --- | --- | --- |
+| `judgmentId` | S | Primary key — matches the parent row's `judgmentId` |
+| `body` | S | Verbatim `rawModelText` |
+| `ttlEpoch` | N | Unix-seconds — DDB native TTL (default 90 days, matches parent) |
+
+#### `aws ddb create-table` command
 
 ```bash
-aws s3api create-bucket \
-  --bucket your-org-judge-rawtext-prod \
-  --region us-east-1
-```
+aws dynamodb create-table \
+  --endpoint-url "${DDB_ENDPOINT:-http://localhost:8000}" \
+  --table-name "${DDB_TABLE_PREFIX:-}pipeline-judgment-rawtext" \
+  --attribute-definitions AttributeName=judgmentId,AttributeType=S \
+  --key-schema AttributeName=judgmentId,KeyType=HASH \
+  --billing-mode PROVISIONED \
+  --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
 
-#### Recommended bucket-level controls
-
-| Control | Why |
-| --- | --- |
-| Block all public access | Bodies may contain prompt/response data |
-| Server-side encryption (SSE-S3 or SSE-KMS) | Same as above |
-| Lifecycle rule: expire after 90 days | Match `pipeline-judgments` retention |
-| Versioning OFF | Bodies are immutable per judgmentId; versioning would just inflate cost |
-
-#### Bucket policy — IAM permissions for platform-api
-
-The platform-api service role needs `s3:PutObject` + `s3:GetObject` for
-keys under `judgments/*`:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject"],
-      "Resource": "arn:aws:s3:::your-org-judge-rawtext-prod/judgments/*"
-    }
-  ]
-}
+aws dynamodb update-time-to-live \
+  --endpoint-url "${DDB_ENDPOINT:-http://localhost:8000}" \
+  --table-name "${DDB_TABLE_PREFIX:-}pipeline-judgment-rawtext" \
+  --time-to-live-specification "Enabled=true, AttributeName=ttlEpoch"
 ```
 
 ## Environment variables
@@ -120,7 +116,7 @@ keys under `judgments/*`:
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `DDB_TABLE_PREFIX` | _empty_ | Local-dev table-name prefix when sharing one DDB-local instance |
-| `JUDGE_RAW_TEXT_BUCKET` | _unset_ | Enables S3 spillover; without it, oversized rawText is dropped |
+| `JUDGE_RAW_TEXT_ENABLED` | `true` | Set to `false` to skip the spillover write entirely (oversized bodies always drop) |
 | `JUDGE_AGGREGATOR_ENABLED` | `true` | Set to `false` to skip the subscriber when the aggregates table isn't provisioned yet |
 | `JUDGE_DAILY_BUDGET_USD_DEFAULT` | `10` | Per-pipeline-per-day USD cap on judge LLM spend |
 
@@ -129,17 +125,14 @@ keys under `judgments/*`:
 | Missing | Effect |
 | --- | --- |
 | `pipeline-judgment-aggregates` table | Aggregator subscriber writes fail and log a warning. Per-judgment row in `pipeline-judgments` still lands. Trend UI shows empty state. Set `JUDGE_AGGREGATOR_ENABLED=false` to silence the warnings. |
-| `JUDGE_RAW_TEXT_BUCKET` unset | Oversized rawText is dropped on persist; `rawTextTruncated:true` is set on the row. `GET /api/judgments/:id/raw-text` returns 404. Live `pipeline:judge:scored` event still carries the body for session observers. |
-| `S3:GetObject` denied | `GET /api/judgments/:id/raw-text` returns 404 (the store swallows S3 errors silently). Persist still succeeds. |
+| `pipeline-judgment-rawtext` table | Spillover writes fail; JudgmentRepository's soft-fail path drops the body and sets `rawTextTruncated:true`. `GET /api/judgments/:id/raw-text` returns 404. Live `pipeline:judge:scored` event still carries the body for session observers. |
 | Both above | Judge runs work end-to-end; trend + audit-drill-in features show "not available" in the UI. |
 
-## Local-dev (Tilt)
+## Local-dev (Tilt + DDB-local)
 
-DDB-local is already wired in `agent-hub/services/docker-compose.yml`.
-Create the aggregates table at boot with the `aws ddb create-table`
-command above plus `--endpoint-url http://localhost:8000`.
+DDB-local is wired in `agent-hub/services/docker-compose.yml`. Bring it
+up via `start-shared-services.sh`. Create the v2 tables at boot with the
+commands above (they default to `--endpoint-url http://localhost:8000`).
 
-S3 spillover is opt-in for local-dev; leave `JUDGE_RAW_TEXT_BUCKET` unset
-and the v1 truncate-flag path handles oversized bodies fine. If you do
-want spillover locally, point at a LocalStack or MinIO endpoint via the
-standard `AWS_ENDPOINT_URL_S3` env var.
+Both tables persist across container restarts via the `agent-hub-ddb-data`
+volume.

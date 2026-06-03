@@ -1,37 +1,37 @@
 // platform-api/src/pipeline/judge/judgeServices.ts
 //
 // Single source of construction for the judge repositories + stores so
-// that the step handler (registerJudgeHandlers.ts) and the HTTP routes
+// the step handler (registerJudgeHandlers.ts) and the HTTP routes
 // (routes/judgments.ts) share the exact same instances + env wiring.
 //
-// Without this, the route would construct its own JudgmentRepository
-// with no rawTextStore — `getRawText` would always return null for
-// spilled-to-S3 bodies. By centralizing here, both paths see the same
-// store and the same retention configuration.
-//
 // Lazy construction: the `get*` accessors instantiate on first call.
-// This matters for tests + envs where env vars are read at runtime, and
-// keeps the boot cost paid only by the consumer that actually uses the
-// service.
+// This matters for tests + envs where env vars are read at runtime,
+// and keeps the boot cost paid only by the consumer that actually
+// uses the service.
 
 import { JudgmentRepository } from './JudgmentRepository';
 import { JudgmentAggregateRepository } from './JudgmentAggregateRepository';
-import { S3RawTextStore, type RawTextStore } from './RawTextStore';
+import { DdbRawTextStore, type RawTextStore } from './RawTextStore';
 
 let _rawTextStore: RawTextStore | undefined | null = null;
 let _judgmentRepo: JudgmentRepository | null = null;
 let _judgmentAggregateRepo: JudgmentAggregateRepository | null = null;
 
 /**
- * The configured RawTextStore, or undefined when JUDGE_RAW_TEXT_BUCKET
- * is unset. Cached after first read so multiple consumers share one
- * S3Client. Returns `undefined` (not `null`) for ergonomic feature-flag
- * patterns at the call site.
+ * The configured RawTextStore, or undefined when JUDGE_RAW_TEXT_ENABLED
+ * is not 'true'. Cached after first read.
+ *
+ * The store writes to the `pipeline-judgment-rawtext` DDB table — see
+ * docs/judge-PROVISIONING.md for the schema. The application code does
+ * NOT auto-create the table. When the table is missing, the store's
+ * writes fail and JudgmentRepository's existing soft-fail path drops
+ * the body (same behavior as JUDGE_RAW_TEXT_ENABLED=false).
  */
 export function getRawTextStore(): RawTextStore | undefined {
   if (_rawTextStore === null) {
-    const bucket = process.env.JUDGE_RAW_TEXT_BUCKET?.trim();
-    _rawTextStore = bucket ? new S3RawTextStore({ bucket }) : undefined;
+    const enabled =
+      (process.env.JUDGE_RAW_TEXT_ENABLED ?? 'true').trim().toLowerCase() !== 'false';
+    _rawTextStore = enabled ? new DdbRawTextStore() : undefined;
   }
   return _rawTextStore;
 }
@@ -54,9 +54,9 @@ export function getJudgmentAggregateRepo(): JudgmentAggregateRepository {
 }
 
 /**
- * Test-only — drop every cached singleton so the next `get*` call rebuilds
- * with current env vars. Used by integration tests that toggle
- * JUDGE_RAW_TEXT_BUCKET mid-run.
+ * Test-only — drop every cached singleton so the next `get*` call
+ * rebuilds with current env vars. Used by integration tests that
+ * toggle JUDGE_RAW_TEXT_ENABLED mid-run.
  */
 export function __resetJudgeServicesForTests(): void {
   _rawTextStore = null;

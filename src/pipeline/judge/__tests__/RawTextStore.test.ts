@@ -1,24 +1,39 @@
 // platform-api/src/pipeline/judge/__tests__/RawTextStore.test.ts
 //
-// Tests for InMemoryRawTextStore (round-trip, key shape) and
-// S3RawTextStore (PutObjectCommand shape, GetObjectCommand shape,
-// graceful return-null on get errors).
+// Tests for InMemoryRawTextStore (round-trip, key shape, reset) and
+// DdbRawTextStore (PutCommand shape, GetCommand shape, key namespace
+// strip, graceful return-null on get errors).
 
 import {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-} from '@aws-sdk/client-s3';
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+} from '@aws-sdk/lib-dynamodb';
+
+const mockSend = jest.fn();
+const mockDocClient = { send: mockSend } as unknown as DynamoDBDocumentClient;
+
+jest.mock('../../../lib/ddb-table-name', () => ({
+  tableName: (name: string) => `test-${name}`,
+}));
+jest.mock('../../../lib/aws-clients', () => ({
+  docClient: { send: jest.fn() },
+}));
 
 import {
   InMemoryRawTextStore,
-  S3RawTextStore,
+  DdbRawTextStore,
   rawTextKeyFor,
 } from '../RawTextStore';
 
+beforeEach(() => {
+  mockSend.mockReset();
+  mockSend.mockResolvedValue({});
+});
+
 describe('rawTextKeyFor', () => {
-  it('namespaces under judgments/ with .txt extension', () => {
-    expect(rawTextKeyFor('jdg_01H1234ABCDE')).toBe('judgments/jdg_01H1234ABCDE.txt');
+  it('namespaces under body/', () => {
+    expect(rawTextKeyFor('jdg_01H1234ABCDE')).toBe('body/jdg_01H1234ABCDE');
   });
 });
 
@@ -26,13 +41,13 @@ describe('InMemoryRawTextStore', () => {
   it('round-trips put then get under the canonical key', async () => {
     const store = new InMemoryRawTextStore();
     const key = await store.put('jdg_1', 'hello world');
-    expect(key).toBe('judgments/jdg_1.txt');
+    expect(key).toBe('body/jdg_1');
     expect(await store.get(key)).toBe('hello world');
   });
 
   it('returns null when the key was never put', async () => {
     const store = new InMemoryRawTextStore();
-    expect(await store.get('judgments/missing.txt')).toBeNull();
+    expect(await store.get('body/missing')).toBeNull();
   });
 
   it('overwrites on repeat put for the same judgmentId', async () => {
@@ -50,50 +65,60 @@ describe('InMemoryRawTextStore', () => {
   });
 });
 
-describe('S3RawTextStore', () => {
-  it('put sends a PutObjectCommand with the canonical key + UTF-8 content-type', async () => {
-    const send = jest.fn().mockResolvedValue({});
-    const client = { send } as unknown as S3Client;
-    const store = new S3RawTextStore({ bucket: 'my-bucket', client });
-    const key = await store.put('jdg_xyz', 'the body');
+describe('DdbRawTextStore', () => {
+  it('put issues a PutCommand to the pipeline-judgment-rawtext table', async () => {
+    const store = new DdbRawTextStore({ docClient: mockDocClient, now: () => 1_700_000_000_000 });
+    const key = await store.put('jdg_1', 'the body');
 
-    expect(key).toBe('judgments/jdg_xyz.txt');
-    expect(send).toHaveBeenCalledTimes(1);
-    const cmd = send.mock.calls[0][0] as PutObjectCommand;
-    expect(cmd).toBeInstanceOf(PutObjectCommand);
-    expect(cmd.input.Bucket).toBe('my-bucket');
-    expect(cmd.input.Key).toBe('judgments/jdg_xyz.txt');
-    expect(cmd.input.Body).toBe('the body');
-    expect(cmd.input.ContentType).toMatch(/utf-8/);
+    expect(key).toBe('body/jdg_1');
+    const cmd = mockSend.mock.calls[0][0] as PutCommand;
+    expect(cmd).toBeInstanceOf(PutCommand);
+    expect(cmd.input.TableName).toBe('test-pipeline-judgment-rawtext');
+    const item = cmd.input.Item as { judgmentId: string; body: string; ttlEpoch: number };
+    expect(item.judgmentId).toBe('jdg_1');
+    expect(item.body).toBe('the body');
   });
 
-  it('get returns the body via transformToString when available', async () => {
-    const send = jest.fn().mockResolvedValue({
-      Body: { transformToString: async () => 'recovered body' },
+  it('put sets ttlEpoch derived from now + ttlDays', async () => {
+    const fixedNow = 1_700_000_000_000;
+    const store = new DdbRawTextStore({
+      docClient: mockDocClient,
+      now: () => fixedNow,
+      ttlDays: 30,
     });
-    const client = { send } as unknown as S3Client;
-    const store = new S3RawTextStore({ bucket: 'b', client });
-
-    const out = await store.get('judgments/jdg_1.txt');
-    expect(out).toBe('recovered body');
-    const cmd = send.mock.calls[0][0] as GetObjectCommand;
-    expect(cmd).toBeInstanceOf(GetObjectCommand);
-    expect(cmd.input.Key).toBe('judgments/jdg_1.txt');
+    await store.put('jdg_1', 'body');
+    const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as { ttlEpoch: number };
+    expect(item.ttlEpoch).toBe(Math.floor(fixedNow / 1000) + 30 * 24 * 60 * 60);
   });
 
-  it('get returns null when GetObject throws (missing key, network)', async () => {
-    const send = jest.fn().mockRejectedValue(new Error('NoSuchKey'));
-    const client = { send } as unknown as S3Client;
-    const store = new S3RawTextStore({ bucket: 'b', client });
+  it('get issues a GetCommand keyed by the stripped judgmentId', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { judgmentId: 'jdg_1', body: 'recovered' } });
+    const store = new DdbRawTextStore({ docClient: mockDocClient });
+    const out = await store.get('body/jdg_1');
 
-    expect(await store.get('judgments/missing.txt')).toBeNull();
+    expect(out).toBe('recovered');
+    const cmd = mockSend.mock.calls[0][0] as GetCommand;
+    expect(cmd).toBeInstanceOf(GetCommand);
+    expect(cmd.input.Key).toEqual({ judgmentId: 'jdg_1' });
   });
 
-  it('get returns null when Body is missing entirely', async () => {
-    const send = jest.fn().mockResolvedValue({});
-    const client = { send } as unknown as S3Client;
-    const store = new S3RawTextStore({ bucket: 'b', client });
+  it('get accepts a raw judgmentId without the body/ prefix (legacy / robustness)', async () => {
+    mockSend.mockResolvedValueOnce({ Item: { judgmentId: 'jdg_1', body: 'x' } });
+    const store = new DdbRawTextStore({ docClient: mockDocClient });
+    await store.get('jdg_1'); // no namespace prefix
+    const cmd = mockSend.mock.calls[0][0] as GetCommand;
+    expect(cmd.input.Key).toEqual({ judgmentId: 'jdg_1' });
+  });
 
-    expect(await store.get('judgments/empty.txt')).toBeNull();
+  it('get returns null when the item is missing', async () => {
+    mockSend.mockResolvedValueOnce({});
+    const store = new DdbRawTextStore({ docClient: mockDocClient });
+    expect(await store.get('body/missing')).toBeNull();
+  });
+
+  it('get returns null when DDB throws (network, table missing, etc.)', async () => {
+    mockSend.mockRejectedValueOnce(new Error('ResourceNotFoundException'));
+    const store = new DdbRawTextStore({ docClient: mockDocClient });
+    expect(await store.get('body/jdg_1')).toBeNull();
   });
 });

@@ -56,11 +56,11 @@ export { JudgeAggregatorSubscriber } from './judge-aggregator-subscriber';
 export type { JudgeAggregatorSubscriberOptions } from './judge-aggregator-subscriber';
 
 export {
-  S3RawTextStore,
+  DdbRawTextStore,
   InMemoryRawTextStore,
   rawTextKeyFor,
 } from './RawTextStore';
-export type { RawTextStore, S3RawTextStoreOptions } from './RawTextStore';
+export type { RawTextStore, DdbRawTextStoreOptions } from './RawTextStore';
 
 export type {
   AnthropicUsage,
