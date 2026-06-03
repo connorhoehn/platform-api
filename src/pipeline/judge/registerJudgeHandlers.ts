@@ -15,6 +15,8 @@ import type { Logger } from 'pino';
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createJudgeStepHandler } from './JudgeStepHandler';
 import { JudgeClient } from './JudgeClient';
+import { JudgmentRepository } from './JudgmentRepository';
+import { JudgeBudgetGuard } from './JudgeBudgetGuard';
 
 /** Mutable reference cell — bootstrap patches `current` after `new PipelineModule(...)`. */
 export interface PipelineModuleRef {
@@ -50,8 +52,21 @@ export function buildJudgeStepHandlers(
   // claude binary surfaces as a clean dispatch-time failure rather than
   // "unreachable pipeline node type". Diagnostics > silent omission.
   const judgeClient = new JudgeClient();
+
+  // Persistence: pipeline-judgments table. Soft-fail — the handler logs
+  // and continues if the write throws (the JudgmentResult is already on
+  // the EventBus so live observers don't depend on persistence).
+  const repository = new JudgmentRepository();
+
+  // Daily budget: $10/day default, override via JUDGE_DAILY_BUDGET_USD_DEFAULT.
+  // Soft-fails on Redis outage (returns allow) so a Redis blip doesn't
+  // silently disable judge calls.
+  const budgetGuard = new JudgeBudgetGuard();
+
   const judgeHandler: StepHandler = createJudgeStepHandler({
     judgeClient,
+    repository,
+    budgetGuard,
     pipelineIdLookup: (runId: string) => {
       const mod = opts.moduleRef.current;
       if (!mod || typeof mod.getRun !== 'function') return undefined;

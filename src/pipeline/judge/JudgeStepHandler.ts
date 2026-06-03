@@ -61,11 +61,16 @@ export interface JudgeStepHandlerOpts {
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 
 /**
- * Permissive emit cast for the `pipeline:judge:*` event family. DC's
- * `PipelineEventMap` doesn't yet declare these (they will land in
- * event-catalog in wave 3); until then, we publish through the EventBus
- * with a string event name. The DC EventBus accepts arbitrary string
- * topics at runtime — only the TS surface is strict.
+ * Permissive emit cast for the `pipeline:judge:*` event family.
+ *
+ * The wire contract for these events is owned by event-catalog (see
+ * `@connorhoehn/event-catalog/pipeline` — `pipelineJudgeStarted`,
+ * `pipelineJudgeScored`, `pipelineJudgeFailed`, `pipelineJudgeBudgetExceeded`).
+ * DC's `PipelineEventMap` is a TypeScript `type` alias (not an interface)
+ * so it can't be augmented from here. The cast is purely a TS-side bridge;
+ * the runtime EventBus accepts arbitrary string topics. When DC next bumps
+ * its types to include these four entries, the cast can drop without any
+ * payload shape change.
  */
 type LooseEmit = (event: string, payload: unknown) => Promise<void>;
 

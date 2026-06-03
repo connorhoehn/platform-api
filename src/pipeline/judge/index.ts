@@ -29,6 +29,17 @@ export {
   getJudgePricing,
 } from './computeJudgeCost';
 
+export { JudgmentRepository } from './JudgmentRepository';
+export type {
+  StoredJudgment,
+  ListJudgmentsOptions,
+  ListJudgmentsResult,
+  JudgmentRepositoryOptions,
+} from './JudgmentRepository';
+
+export { JudgeBudgetGuard } from './JudgeBudgetGuard';
+export type { JudgeBudgetGuardOptions } from './JudgeBudgetGuard';
+
 export type {
   AnthropicUsage,
   CriterionScore,
