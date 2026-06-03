@@ -166,8 +166,13 @@ export interface AnthropicUsage {
  * normalized before becoming a `JudgmentResult`.
  */
 export interface RawJudgmentToolOutput {
-  /** Per-criterion scores. The model uses criterion.id, NEVER prompt text. */
-  criteria: Array<{ criterionId: string; score: number; rationale: string }>;
+  /**
+   * Per-criterion scores. The model uses criterion.id, NEVER prompt text.
+   * `score` is `number | string` because pass-fail / binary scales come
+   * back as `"pass"` / `"fail"` from the model; normalization happens
+   * downstream in `normalizeCriterionScore()`.
+   */
+  criteria: Array<{ criterionId: string; score: number | string; rationale: string }>;
   /** Optional model-side overall narrative; not used in aggregation. */
   overallNotes?: string;
   /** Optional self-reported confidence 0..1. */

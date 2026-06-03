@@ -14,7 +14,7 @@ export type {
   JudgeBudgetGuardLike,
 } from './JudgeStepHandler';
 
-export { JudgeClient, DEFAULT_JUDGE_SYSTEM_PROMPT, RECORD_JUDGMENT_TOOL } from './JudgeClient';
+export { JudgeClient, DEFAULT_JUDGE_SYSTEM_PROMPT, extractJsonObject } from './JudgeClient';
 export type { JudgeClientCallResult, JudgeClientOpts } from './JudgeClient';
 
 export {
@@ -28,7 +28,6 @@ export {
   computeCacheHitRatio,
   getJudgePricing,
 } from './computeJudgeCost';
-export type { CacheTierPricing } from './computeJudgeCost';
 
 export type {
   AnthropicUsage,

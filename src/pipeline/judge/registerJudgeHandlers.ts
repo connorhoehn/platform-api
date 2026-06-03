@@ -40,20 +40,16 @@ export function buildJudgeStepHandlers(
 ): Map<string, StepHandler> {
   const handlers = new Map<string, StepHandler>();
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    if (opts.logger) {
-      opts.logger.warn(
-        'ANTHROPIC_API_KEY not set — llm:judge step will fail at dispatch ' +
-          '(set ANTHROPIC_API_KEY to enable judge runs)',
-      );
-    }
-    // Still register the handler — it'll surface a clean failure rather
-    // than the executor throwing "unreachable pipeline node type" for the
-    // llm:judge case. Diagnostics > silent omission.
-  }
-
-  const judgeClient = new JudgeClient({ apiKey });
+  // Claude Code CLI authentication: OAuth tokens from the host's Keychain,
+  // mounted at /root/.claude/.credentials.json in containerized deploys
+  // (see ClaudeCodeLLMClient.ts and the Tilt local_resource that extracts
+  // them). No ANTHROPIC_API_KEY required — same auth path the existing
+  // `llm` NodeType uses.
+  //
+  // We still register the handler unconditionally so a misconfigured
+  // claude binary surfaces as a clean dispatch-time failure rather than
+  // "unreachable pipeline node type". Diagnostics > silent omission.
+  const judgeClient = new JudgeClient();
   const judgeHandler: StepHandler = createJudgeStepHandler({
     judgeClient,
     pipelineIdLookup: (runId: string) => {
