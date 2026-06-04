@@ -24,7 +24,7 @@
 //
 // Code parity with platform-api/src/routes/judgments.ts.
 
-import { Router, raw } from 'express';
+import { Router, raw, json as jsonBody } from 'express';
 import { randomUUID } from 'crypto';
 import sharp from 'sharp';
 import { asyncHandler, ValidationError } from '../middleware/error-handler';
@@ -61,6 +61,99 @@ interface MetadataResponse extends ImageMeta {
 export const imagesRouter = Router({ mergeParams: true });
 
 // ---------------------------------------------------------------------------
+// Shared: process + persist a raw image buffer. Extracted from POST / so
+// the URL-fetch path goes through the exact same Sharp pipeline + storage
+// flow (EXIF strip, polyglot defang, dimension extract, size cap).
+//
+// Returns the constructed UploadResponse on success. Caller is responsible
+// for surfacing 4xx/5xx — this helper throws ValidationError for bad input
+// and Error for storage failures.
+// ---------------------------------------------------------------------------
+
+interface ProcessOpts {
+  userId: string;
+  /** Free-form context for the log line (where the bytes came from). */
+  source: 'upload' | 'url';
+  /** When source='url', the URL the bytes were fetched from. */
+  sourceUrl?: string;
+}
+
+async function processAndPersistImage(
+  body: Buffer,
+  contentType: string,
+  opts: ProcessOpts,
+): Promise<UploadResponse> {
+  const reqLog = log.child({
+    userId: opts.userId,
+    source: opts.source,
+    contentType,
+    inputBytes: body.byteLength,
+    ...(opts.sourceUrl ? { sourceUrl: opts.sourceUrl } : {}),
+  });
+
+  let processed: Buffer;
+  let metadata: sharp.Metadata;
+  try {
+    const pipeline = sharp(body, { limitInputPixels: 25_000_000 })
+      .rotate()
+      .resize({
+        width: RESIZE_LONG_EDGE,
+        height: RESIZE_LONG_EDGE,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+    if (contentType === 'image/jpeg') {
+      processed = await pipeline.jpeg({ quality: 85, mozjpeg: true }).toBuffer();
+    } else if (contentType === 'image/png') {
+      processed = await pipeline.png({ compressionLevel: 8 }).toBuffer();
+    } else {
+      processed = await pipeline.webp({ quality: 85 }).toBuffer();
+    }
+    metadata = await sharp(processed).metadata();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    reqLog.warn({ err: msg }, 'image decode/re-encode failed');
+    throw new ValidationError(`could not decode image: ${msg}`);
+  }
+
+  if (processed.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
+    reqLog.warn(
+      { processedBytes: processed.byteLength, cap: IMAGE_BLOB_SIZE_CAP_BYTES },
+      'image exceeds storage cap after resize',
+    );
+    const err = new Error(
+      `image still exceeds storage cap (${IMAGE_BLOB_SIZE_CAP_BYTES} bytes) after server-side resize. Pre-compress on the client.`,
+    );
+    (err as Error & { status?: number }).status = 413;
+    throw err;
+  }
+
+  const imageId = randomUUID();
+  const meta: ImageMeta = {
+    mimeType: contentType,
+    sizeBytes: processed.byteLength,
+    width: metadata.width ?? 0,
+    height: metadata.height ?? 0,
+    uploadedAt: new Date().toISOString(),
+    uploadedBy: opts.userId,
+  };
+
+  await getImageBlobStore().put(imageId, processed, meta);
+
+  reqLog.info(
+    { imageId, outputBytes: processed.byteLength, width: meta.width, height: meta.height },
+    'image stored',
+  );
+  return {
+    imageId,
+    mimeType: meta.mimeType,
+    sizeBytes: meta.sizeBytes,
+    width: meta.width,
+    height: meta.height,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/images — raw-body upload
 // ---------------------------------------------------------------------------
 
@@ -81,83 +174,144 @@ imagesRouter.post(
       throw new ValidationError('request body is empty or not a Buffer (use Content-Type: image/* + raw bytes)');
     }
 
-    const reqLog = log.child({ userId, contentType, inputBytes: body.byteLength });
-
-    // Re-encode via Sharp:
-    //   - Strips EXIF + ICC + other metadata (privacy + security; EXIF
-    //     can carry GPS coordinates)
-    //   - Decodes + re-encodes invalidates polyglot files (JPEG+JS
-    //     hybrid, embedded SVG)
-    //   - Resizes to long-edge 1568 (Anthropic sweet spot)
-    //   - Detects + extracts dimensions
-    // Throws on unsupported / corrupted input — caller gets a clean 400.
-    let processed: Buffer;
-    let metadata: sharp.Metadata;
     try {
-      const pipeline = sharp(body, { limitInputPixels: 25_000_000 })
-        .rotate()                                    // honor EXIF orientation, then strip below
-        .resize({
-          width: RESIZE_LONG_EDGE,
-          height: RESIZE_LONG_EDGE,
-          fit: 'inside',
-          withoutEnlargement: true,
-        });
-
-      // Re-encode to the same family format. Always JPEG quality 85 for
-      // image/jpeg input; PNG/WebP keep their format.
-      const targetMime = contentType;
-      if (targetMime === 'image/jpeg') {
-        processed = await pipeline.jpeg({ quality: 85, mozjpeg: true }).toBuffer();
-      } else if (targetMime === 'image/png') {
-        processed = await pipeline.png({ compressionLevel: 8 }).toBuffer();
-      } else {
-        processed = await pipeline.webp({ quality: 85 }).toBuffer();
+      const result = await processAndPersistImage(body, contentType, { userId, source: 'upload' });
+      res.status(201).json(result);
+    } catch (err) {
+      const status = (err as Error & { status?: number }).status;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (status === 413) {
+        res.status(413).json({ error: msg });
+        return;
       }
-      metadata = await sharp(processed).metadata();
+      throw err;
+    }
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/images/from-url — server-side fetch by URL
+//
+// Body: { url: string }
+//
+// Server fetches the URL with a 5s timeout, validates the response
+// Content-Type against the same ALLOWED_MIME whitelist, caps the body
+// at RAW_UPLOAD_CAP_BYTES, then runs the same Sharp pipeline as the
+// raw-upload route. Returns the same UploadResponse shape so callers
+// can treat both paths identically.
+//
+// Network safety: we do NOT auto-follow to private/loopback addresses
+// (basic SSRF mitigation). When VITE_PLATFORM_API_URL is configured to
+// trust a specific egress proxy, set ALLOW_INTERNAL_IMAGE_FETCH=true
+// to bypass — used in tests + dev. Production should keep it false.
+// ---------------------------------------------------------------------------
+
+const ALLOW_INTERNAL_IMAGE_FETCH = process.env['ALLOW_INTERNAL_IMAGE_FETCH'] === 'true';
+const URL_FETCH_TIMEOUT_MS = 5000;
+
+function isPrivateOrLocalHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  if (lower === 'localhost' || lower === '0.0.0.0' || lower === '::1' || lower === '127.0.0.1') return true;
+  if (lower.startsWith('127.')) return true;
+  // RFC1918 / link-local
+  if (/^10\./.test(lower)) return true;
+  if (/^192\.168\./.test(lower)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(lower)) return true;
+  if (/^169\.254\./.test(lower)) return true;
+  if (lower.endsWith('.local') || lower.endsWith('.internal')) return true;
+  return false;
+}
+
+imagesRouter.post(
+  '/from-url',
+  jsonBody({ limit: '4kb' }),
+  asyncHandler<
+    Record<string, never>,
+    UploadResponse | { error: string }
+  >(async (req, res) => {
+    const userId = req.user?.sub ?? 'anonymous';
+    const body = req.body as { url?: unknown } | undefined;
+    const rawUrl = body?.url;
+    if (typeof rawUrl !== 'string' || rawUrl.trim().length === 0) {
+      throw new ValidationError('body must be { "url": string }');
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl.trim());
+    } catch {
+      throw new ValidationError(`invalid URL: '${rawUrl}'`);
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new ValidationError(`URL protocol must be http or https — got '${parsed.protocol}'`);
+    }
+    if (!ALLOW_INTERNAL_IMAGE_FETCH && isPrivateOrLocalHost(parsed.hostname)) {
+      throw new ValidationError(`refusing to fetch from internal address '${parsed.hostname}' (set ALLOW_INTERNAL_IMAGE_FETCH=true to override)`);
+    }
+
+    const reqLog = log.child({ userId, sourceUrl: parsed.toString() });
+    reqLog.info('fetching image by URL');
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), URL_FETCH_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(parsed.toString(), {
+        method: 'GET',
+        redirect: 'follow',
+        signal: ctrl.signal,
+        headers: { 'User-Agent': 'platform-api/image-fetch' },
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      reqLog.warn({ err: msg }, 'image decode/re-encode failed');
-      throw new ValidationError(`could not decode image: ${msg}`);
+      reqLog.warn({ err: msg }, 'image URL fetch failed');
+      throw new ValidationError(`could not fetch URL: ${msg}`);
+    } finally {
+      clearTimeout(timer);
     }
 
-    if (processed.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
-      reqLog.warn(
-        { processedBytes: processed.byteLength, cap: IMAGE_BLOB_SIZE_CAP_BYTES },
-        'image exceeds storage cap after resize',
-      );
-      res.status(413).json({
-        error: `image still exceeds storage cap (${IMAGE_BLOB_SIZE_CAP_BYTES} bytes) after server-side resize. Pre-compress on the client.`,
-      });
-      return;
+    if (!response.ok) {
+      throw new ValidationError(`URL returned ${response.status} ${response.statusText}`);
     }
 
-    const imageId = randomUUID();
-    const meta: ImageMeta = {
-      mimeType: contentType,
-      sizeBytes: processed.byteLength,
-      width: metadata.width ?? 0,
-      height: metadata.height ?? 0,
-      uploadedAt: new Date().toISOString(),
-      uploadedBy: userId,
-    };
+    const respMime = (response.headers.get('content-type') ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
+    if (!ALLOWED_MIME.has(respMime)) {
+      throw new ValidationError(`URL returned unsupported Content-Type '${respMime}' — must be one of ${[...ALLOWED_MIME].join(', ')}`);
+    }
+
+    const contentLengthHeader = response.headers.get('content-length');
+    if (contentLengthHeader) {
+      const declared = Number.parseInt(contentLengthHeader, 10);
+      if (Number.isFinite(declared) && declared > RAW_UPLOAD_CAP_BYTES) {
+        throw new ValidationError(`URL response is ${declared}B; cap is ${RAW_UPLOAD_CAP_BYTES}B`);
+      }
+    }
+
+    const arrayBuf = await response.arrayBuffer();
+    if (arrayBuf.byteLength === 0) {
+      throw new ValidationError('URL returned empty body');
+    }
+    if (arrayBuf.byteLength > RAW_UPLOAD_CAP_BYTES) {
+      throw new ValidationError(`URL response is ${arrayBuf.byteLength}B; cap is ${RAW_UPLOAD_CAP_BYTES}B`);
+    }
+    const buf = Buffer.from(arrayBuf);
 
     try {
-      await getImageBlobStore().put(imageId, processed, meta);
+      const result = await processAndPersistImage(buf, respMime, {
+        userId,
+        source: 'url',
+        sourceUrl: parsed.toString(),
+      });
+      res.status(201).json(result);
     } catch (err) {
+      const status = (err as Error & { status?: number }).status;
       const msg = err instanceof Error ? err.message : String(err);
-      reqLog.error({ err: msg, imageId }, 'image blob store put failed');
-      res.status(500).json({ error: `image storage failed: ${msg}` });
-      return;
+      if (status === 413) {
+        res.status(413).json({ error: msg });
+        return;
+      }
+      throw err;
     }
-
-    reqLog.info({ imageId, outputBytes: processed.byteLength, width: meta.width, height: meta.height }, 'image uploaded');
-    res.status(201).json({
-      imageId,
-      mimeType: meta.mimeType,
-      sizeBytes: meta.sizeBytes,
-      width: meta.width,
-      height: meta.height,
-    });
   }),
 );
 

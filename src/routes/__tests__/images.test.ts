@@ -237,6 +237,166 @@ describe('GET /api/images/:imageId', () => {
 // GET /api/images/:imageId/metadata
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// POST /api/images/from-url
+// ---------------------------------------------------------------------------
+
+describe('POST /api/images/from-url', () => {
+  const realFetch = global.fetch;
+  const realAllow = process.env.ALLOW_INTERNAL_IMAGE_FETCH;
+
+  beforeAll(() => {
+    process.env.ALLOW_INTERNAL_IMAGE_FETCH = 'true';
+  });
+  afterAll(() => {
+    if (realAllow === undefined) delete process.env.ALLOW_INTERNAL_IMAGE_FETCH;
+    else process.env.ALLOW_INTERNAL_IMAGE_FETCH = realAllow;
+    global.fetch = realFetch;
+  });
+
+  afterEach(() => {
+    global.fetch = realFetch;
+  });
+
+  it('returns 400 when body has no url field', async () => {
+    const res = await rawRequest(server, 'POST', '/api/images/from-url', Buffer.from('{}'), {
+      'Content-Type': 'application/json',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 for an invalid URL string', async () => {
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'not a url' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 for non-http protocols', async () => {
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'file:///etc/passwd' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('fetches the URL, processes, and returns 201 + imageId', async () => {
+    const jpeg = await makeTinyJpeg();
+    global.fetch = jest.fn().mockResolvedValueOnce(
+      new Response(jpeg, {
+        status: 200,
+        headers: { 'content-type': 'image/jpeg', 'content-length': String(jpeg.byteLength) },
+      }),
+    ) as unknown as typeof fetch;
+
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'https://example.com/cat.jpg' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(201);
+    const body = JSON.parse(res.body.toString()) as { imageId: string; mimeType: string };
+    expect(body.imageId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(body.mimeType).toBe('image/jpeg');
+  });
+
+  it('returns 400 when the URL response has an unsupported Content-Type', async () => {
+    global.fetch = jest.fn().mockResolvedValueOnce(
+      new Response('not an image', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      }),
+    ) as unknown as typeof fetch;
+
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'https://example.com/page' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when the URL is unreachable (fetch throws)', async () => {
+    global.fetch = jest.fn().mockRejectedValueOnce(new Error('ENOTFOUND')) as unknown as typeof fetch;
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'https://nowhere.invalid/cat.jpg' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when the upstream returns non-2xx', async () => {
+    global.fetch = jest.fn().mockResolvedValueOnce(
+      new Response('not found', { status: 404, statusText: 'Not Found' }),
+    ) as unknown as typeof fetch;
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'https://example.com/missing.jpg' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('POST /api/images/from-url — SSRF defense', () => {
+  const realAllow = process.env.ALLOW_INTERNAL_IMAGE_FETCH;
+  beforeAll(() => {
+    delete process.env.ALLOW_INTERNAL_IMAGE_FETCH;
+  });
+  afterAll(() => {
+    if (realAllow !== undefined) process.env.ALLOW_INTERNAL_IMAGE_FETCH = realAllow;
+  });
+
+  it('refuses to fetch from 127.0.0.1', async () => {
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'http://127.0.0.1:8000/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses to fetch from 10.0.0.0/8', async () => {
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'http://10.0.0.5/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses to fetch from *.internal', async () => {
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'http://something.internal/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
 describe('GET /api/images/:imageId/metadata', () => {
   it('returns 404 when imageId is unknown', async () => {
     const res = await rawRequest(server, 'GET', '/api/images/img_nope/metadata', null);
