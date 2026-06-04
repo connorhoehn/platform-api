@@ -97,6 +97,7 @@ import {
 } from './config/cluster';
 import { buildPipelineModuleConfig } from './config/pipelineModule';
 import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
+import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
@@ -688,6 +689,16 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     moduleRef: judgeModuleRef,
     logger: bootstrapLog,
   });
+  // Merge image:vision-analyze handler into the same map. Same moduleRef
+  // — both handlers resolve runId→pipelineId through the same module
+  // reference (patched below after `new PipelineModule(...)`).
+  const visionHandlers = buildVisionStepHandlers({
+    moduleRef: judgeModuleRef,
+    logger: bootstrapLog,
+  });
+  for (const [key, handler] of visionHandlers) {
+    customStepHandlers.set(key, handler);
+  }
 
   const module = new PipelineModule(
     buildPipelineModuleConfig({

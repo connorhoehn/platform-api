@@ -38,6 +38,7 @@ import { pipelineResumeRouter } from './pipelineResume';
 import { pipelineBreakpointPatchRouter } from './pipelineBreakpointPatch';
 import { pipelineRunAuditRouter, pipelineAuditSearchRouter } from './pipelineAudit';
 import { judgmentsRouter } from './judgments';
+import { imagesRouter } from './images';
 import { pipelineValidationRouter } from './pipelineValidation';
 import { pipelineInspectorRouter } from './pipelineInspector';
 import { pipelineDLQRouter } from './pipelineDLQ';
@@ -141,6 +142,11 @@ router.use('/pipelines/audit/search', pipelineAuditSearchRouter);
 // Mounted at the top-level so the URL surface stays clean: judgments are
 // addressable by their stable judgmentId rather than parent pipeline/run.
 router.use('/judgments', judgmentsRouter);
+// image:vision-analyze data plane — POST + GET /api/images.
+// Mounted at the top-level (same convention as /judgments). Images are
+// addressable by their stable imageId rather than parent pipeline/run;
+// uploads come in before any pipeline has been triggered.
+router.use('/images', imagesRouter);
 // Per-pipeline cost aggregation — GET /api/pipelines/:pipelineId/cost.
 // Mounted alongside other :pipelineId routes, after static segments.
 router.use('/pipelines/:pipelineId/cost', pipelineCostRouter);

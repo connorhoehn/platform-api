@@ -1,0 +1,261 @@
+// platform-api/src/routes/__tests__/images.test.ts
+//
+// Integration tests for /api/images. We:
+//   - mock visionServices.getImageBlobStore() to return an InMemoryImageBlobStore
+//   - generate tiny valid JPEG/PNG bytes via sharp (no fixture files)
+//   - drive the express app over raw http (same pattern as lvsWebhooks.test.ts)
+//
+// What we cover:
+//   - 201 happy path with Content-Type: image/jpeg → imageId returned, body round-trips
+//   - 400 on unsupported Content-Type
+//   - 400 on empty body
+//   - 400 on corrupted bytes (sharp throws)
+//   - 404 GET when imageId missing
+//   - GET metadata returns mimeType/size/dimensions
+
+import express from 'express';
+import http from 'http';
+import { AddressInfo } from 'net';
+import sharp from 'sharp';
+import { InMemoryImageBlobStore } from '../../pipeline/image/ImageBlobStore';
+import { errorHandler } from '../../middleware/error-handler';
+
+const blobStore = new InMemoryImageBlobStore();
+
+jest.mock('../../pipeline/image/visionServices', () => ({
+  getImageBlobStore: () => blobStore,
+  getVisionResultRepo: jest.fn(),
+  getVisionClient: jest.fn(),
+  __resetVisionServicesForTests: jest.fn(),
+}));
+
+jest.mock('../../lib/aws-clients', () => ({
+  docClient: { send: jest.fn() },
+  ddbClient: { send: jest.fn() },
+}));
+
+jest.mock('../../lib/ddb-table-name', () => ({
+  tableName: (name: string) => `test-${name}`,
+}));
+
+// Import AFTER mocks
+import { imagesRouter } from '../images';
+
+// ---------------------------------------------------------------------------
+// Raw http helpers (mirror lvsWebhooks.test.ts)
+// ---------------------------------------------------------------------------
+
+function rawRequest(
+  server: http.Server,
+  method: 'POST' | 'GET',
+  path: string,
+  body: Buffer | null,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; body: Buffer; headers: http.IncomingHttpHeaders }> {
+  const { port } = server.address() as AddressInfo;
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method,
+        path,
+        headers: {
+          ...(body ? { 'Content-Length': String(body.length) } : {}),
+          ...headers,
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks), headers: res.headers }));
+      },
+    );
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function makeTinyJpeg(): Promise<Buffer> {
+  return sharp({
+    create: {
+      width: 100,
+      height: 100,
+      channels: 3,
+      background: { r: 255, g: 0, b: 0 },
+    },
+  })
+    .jpeg({ quality: 85 })
+    .toBuffer();
+}
+
+async function makeTinyPng(): Promise<Buffer> {
+  return sharp({
+    create: {
+      width: 50,
+      height: 50,
+      channels: 4,
+      background: { r: 0, g: 255, b: 0, alpha: 1 },
+    },
+  })
+    .png()
+    .toBuffer();
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+let server: http.Server;
+
+beforeAll(async () => {
+  const app = express();
+  // Attach a stub req.user so the routes resolve userId.
+  app.use((req, _res, next) => {
+    (req as unknown as { user: { sub: string } }).user = { sub: 'tester' };
+    next();
+  });
+  app.use('/api/images', imagesRouter);
+  app.use(errorHandler);
+  server = http.createServer(app);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+});
+
+afterAll(async () => {
+  await new Promise<void>((r) => server.close(() => r()));
+});
+
+beforeEach(() => {
+  blobStore.reset();
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/images
+// ---------------------------------------------------------------------------
+
+describe('POST /api/images', () => {
+  it('returns 201 + imageId on a valid JPEG upload', async () => {
+    const jpeg = await makeTinyJpeg();
+    const res = await rawRequest(server, 'POST', '/api/images', jpeg, {
+      'Content-Type': 'image/jpeg',
+    });
+    expect(res.status).toBe(201);
+    const body = JSON.parse(res.body.toString()) as { imageId: string; mimeType: string; sizeBytes: number; width: number; height: number };
+    expect(body.imageId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(body.mimeType).toBe('image/jpeg');
+    expect(body.width).toBe(100);
+    expect(body.height).toBe(100);
+    expect(body.sizeBytes).toBeGreaterThan(0);
+  });
+
+  it('persists to the blob store + the bytes round-trip via GET', async () => {
+    const jpeg = await makeTinyJpeg();
+    const post = await rawRequest(server, 'POST', '/api/images', jpeg, {
+      'Content-Type': 'image/jpeg',
+    });
+    const { imageId } = JSON.parse(post.body.toString()) as { imageId: string };
+
+    const get = await rawRequest(server, 'GET', `/api/images/${imageId}`, null);
+    expect(get.status).toBe(200);
+    expect(get.headers['content-type']).toBe('image/jpeg');
+    // Sharp re-encoded so byte-equality is wrong — but the body must
+    // start with the JPEG magic header.
+    expect(get.body[0]).toBe(0xff);
+    expect(get.body[1]).toBe(0xd8);
+  });
+
+  it('accepts PNG uploads', async () => {
+    const png = await makeTinyPng();
+    const res = await rawRequest(server, 'POST', '/api/images', png, {
+      'Content-Type': 'image/png',
+    });
+    expect(res.status).toBe(201);
+    const body = JSON.parse(res.body.toString()) as { mimeType: string; width: number };
+    expect(body.mimeType).toBe('image/png');
+    expect(body.width).toBe(50);
+  });
+
+  it('rejects unsupported Content-Type with 400', async () => {
+    const jpeg = await makeTinyJpeg();
+    const res = await rawRequest(server, 'POST', '/api/images', jpeg, {
+      'Content-Type': 'image/gif',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects missing Content-Type with 400', async () => {
+    const jpeg = await makeTinyJpeg();
+    const res = await rawRequest(server, 'POST', '/api/images', jpeg, {
+      // express-raw uses { type: () => true } so it'll parse but route
+      // explicitly checks Content-Type whitelist after.
+      'Content-Type': '',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects corrupted image bytes with 400 (sharp decode error)', async () => {
+    const garbage = Buffer.from('this is not a jpeg, no matter how hard you try');
+    const res = await rawRequest(server, 'POST', '/api/images', garbage, {
+      'Content-Type': 'image/jpeg',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects empty body with 400', async () => {
+    const res = await rawRequest(server, 'POST', '/api/images', Buffer.alloc(0), {
+      'Content-Type': 'image/jpeg',
+      'Content-Length': '0',
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/images/:imageId
+// ---------------------------------------------------------------------------
+
+describe('GET /api/images/:imageId', () => {
+  it('returns 404 when imageId is unknown', async () => {
+    const res = await rawRequest(server, 'GET', '/api/images/img_nope', null);
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 200 + the raw bytes for a stored image', async () => {
+    const jpeg = await makeTinyJpeg();
+    const post = await rawRequest(server, 'POST', '/api/images', jpeg, {
+      'Content-Type': 'image/jpeg',
+    });
+    const { imageId, sizeBytes } = JSON.parse(post.body.toString()) as { imageId: string; sizeBytes: number };
+    const get = await rawRequest(server, 'GET', `/api/images/${imageId}`, null);
+    expect(get.status).toBe(200);
+    expect(get.body.byteLength).toBe(sizeBytes);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/images/:imageId/metadata
+// ---------------------------------------------------------------------------
+
+describe('GET /api/images/:imageId/metadata', () => {
+  it('returns 404 when imageId is unknown', async () => {
+    const res = await rawRequest(server, 'GET', '/api/images/img_nope/metadata', null);
+    expect(res.status).toBe(404);
+  });
+
+  it('returns the metadata fields without the body bytes', async () => {
+    const jpeg = await makeTinyJpeg();
+    const post = await rawRequest(server, 'POST', '/api/images', jpeg, {
+      'Content-Type': 'image/jpeg',
+    });
+    const { imageId } = JSON.parse(post.body.toString()) as { imageId: string };
+    const meta = await rawRequest(server, 'GET', `/api/images/${imageId}/metadata`, null);
+    expect(meta.status).toBe(200);
+    const body = JSON.parse(meta.body.toString()) as { imageId: string; mimeType: string; width: number; height: number; sizeBytes: number; uploadedAt: string };
+    expect(body.imageId).toBe(imageId);
+    expect(body.mimeType).toBe('image/jpeg');
+    expect(body.width).toBe(100);
+    expect(body.height).toBe(100);
+    expect(typeof body.uploadedAt).toBe('string');
+  });
+});
