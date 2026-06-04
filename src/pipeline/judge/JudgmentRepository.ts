@@ -180,7 +180,20 @@ export class JudgmentRepository {
     if (!row) return null;
     if (row.rawModelText) return row.rawModelText;
     if (row.rawTextKey && this.rawTextStore) {
-      return this.rawTextStore.get(row.rawTextKey);
+      const body = await this.rawTextStore.get(row.rawTextKey);
+      if (body === null) {
+        // The row CLAIMS a spillover key exists but the store can't
+        // serve it — most commonly because the spillover table was
+        // truncated, the write originally failed silently, or the
+        // store impl returned null after a transient DDB error
+        // (DdbRawTextStore logs the underlying cause).
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[JudgmentRepository] spillover key set but body unavailable',
+          { judgmentId, rawTextKey: row.rawTextKey },
+        );
+      }
+      return body;
     }
     return null;
   }

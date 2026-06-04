@@ -118,7 +118,15 @@ export class DdbRawTextStore implements RawTextStore {
       );
       const item = result.Item as RawTextRow | undefined;
       return item?.body ?? null;
-    } catch {
+    } catch (err) {
+      // Soft-fail to null so the HTTP route surfaces a clean 404 instead
+      // of a 500, but log so operators can distinguish "missing row" from
+      // "table doesn't exist", "permission denied", "transient timeout".
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[DdbRawTextStore] get failed; returning null',
+        { judgmentId, table: PIPELINE_JUDGMENT_RAWTEXT_TABLE, err: err instanceof Error ? err.message : String(err) },
+      );
       return null;
     }
   }
