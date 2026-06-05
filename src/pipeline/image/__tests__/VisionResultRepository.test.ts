@@ -98,6 +98,17 @@ describe('VisionResultRepository — persistVisionResult', () => {
     expect(item.rawTextKey).toBeUndefined();
   });
 
+  it('truncated item has rawModelText KEY fully absent (not undefined/null — DDB spread fragility fix)', async () => {
+    const repo = new VisionResultRepository(mockDocClient);
+    const big = 'x'.repeat(33 * 1024);
+    await repo.persistVisionResult(makeResult({ rawModelText: big }));
+    const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as Record<string, unknown>;
+    // The key must not exist at all — DDB marshallers may serialize
+    // `undefined` as a NULL attribute if the key is present.
+    expect(Object.prototype.hasOwnProperty.call(item, 'rawModelText')).toBe(false);
+    expect(item.rawTextTruncated).toBe(true);
+  });
+
   it('spills oversized rawText to the rawTextStore + records the key', async () => {
     const spillover = new InMemoryRawTextStore();
     const repo = new VisionResultRepository(mockDocClient, { rawTextStore: spillover });

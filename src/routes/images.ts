@@ -92,8 +92,12 @@ async function processAndPersistImage(
   });
 
   let processed: Buffer;
-  let metadata: sharp.Metadata;
+  let processedInfo: sharp.OutputInfo;
   try {
+    // Single-pass: toBuffer({ resolveWithObject: true }) returns both
+    // the encoded bytes AND the output dimensions in one Sharp decode.
+    // Previously we re-decoded the output with sharp(processed).metadata()
+    // — a second full decode for no gain.
     const pipeline = sharp(body, { limitInputPixels: 25_000_000 })
       .rotate()
       .resize({
@@ -102,14 +106,16 @@ async function processAndPersistImage(
         fit: 'inside',
         withoutEnlargement: true,
       });
+    let result: { data: Buffer; info: sharp.OutputInfo };
     if (contentType === 'image/jpeg') {
-      processed = await pipeline.jpeg({ quality: 85, mozjpeg: true }).toBuffer();
+      result = await pipeline.jpeg({ quality: 85, mozjpeg: true }).toBuffer({ resolveWithObject: true });
     } else if (contentType === 'image/png') {
-      processed = await pipeline.png({ compressionLevel: 8 }).toBuffer();
+      result = await pipeline.png({ compressionLevel: 8 }).toBuffer({ resolveWithObject: true });
     } else {
-      processed = await pipeline.webp({ quality: 85 }).toBuffer();
+      result = await pipeline.webp({ quality: 85 }).toBuffer({ resolveWithObject: true });
     }
-    metadata = await sharp(processed).metadata();
+    processed = result.data;
+    processedInfo = result.info;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     reqLog.warn({ err: msg }, 'image decode/re-encode failed');
@@ -132,8 +138,8 @@ async function processAndPersistImage(
   const meta: ImageMeta = {
     mimeType: contentType,
     sizeBytes: processed.byteLength,
-    width: metadata.width ?? 0,
-    height: metadata.height ?? 0,
+    width: processedInfo.width ?? 0,
+    height: processedInfo.height ?? 0,
     uploadedAt: new Date().toISOString(),
     uploadedBy: opts.userId,
   };

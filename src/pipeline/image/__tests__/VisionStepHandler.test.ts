@@ -85,12 +85,10 @@ function fakeStreamingClient(
   return {
     analyze: jest.fn().mockImplementation(async (
       _input: unknown,
-      onToken?: (delta: string, accumulated: string) => void,
+      onToken?: (delta: string) => void,
     ) => {
-      let accumulated = '';
       for (const t of tokens) {
-        accumulated += t;
-        onToken?.(t, accumulated);
+        onToken?.(t);
       }
       return result;
     }),
@@ -275,8 +273,10 @@ describe('VisionStepHandler — happy path', () => {
     expect(tokenEvents).toHaveLength(3);
     expect(tokenEvents.map((e) => (e.payload as { delta: string }).delta)).toEqual(['Hello', ' world', '!']);
     expect(tokenEvents.map((e) => (e.payload as { seq: number }).seq)).toEqual([1, 2, 3]);
-    // Last accumulated should equal joined deltas.
-    expect((tokenEvents.at(-1)!.payload as { accumulated: string }).accumulated).toBe('Hello world!');
+    // Token events no longer carry `accumulated` — frontend accumulates locally.
+    expect((tokenEvents[0]!.payload as Record<string, unknown>).accumulated).toBeUndefined();
+    // Token events no longer carry `at` — drop per-event Date allocation on hot path.
+    expect((tokenEvents[0]!.payload as Record<string, unknown>).at).toBeUndefined();
     // Event ordering: started → tokens → analyzed.
     const order = emitted.map((e) => e.event);
     expect(order[0]).toBe('pipeline:image:vision:started');
@@ -405,6 +405,33 @@ describe('VisionStepHandler — failure modes', () => {
     expect(outcome.status).toBe('failed');
     const failed = emitted.find((e) => e.event === 'pipeline:image:vision:failed');
     expect(failed?.payload).toMatchObject({ reason: 'aborted' });
+  });
+
+  it('emits refusal failed when client returns failureReason=refusal', async () => {
+    const blob = new InMemoryImageBlobStore();
+    await blob.put('img_1', IMAGE_BYTES, IMAGE_META);
+    const client = fakeClientReturning({
+      output: null,
+      usage: { input_tokens: 50, output_tokens: 5 },
+      rawText: 'Sorry, I cannot analyze this image.',
+      latencyMs: 300,
+      cacheHit: false,
+      failureReason: 'refusal',
+    });
+    const handler = createVisionStepHandler({
+      visionClient: client,
+      imageBlobStore: blob,
+      pipelineIdLookup: () => 'pl_1',
+    });
+    const { helpers, emitted } = makeHelpers();
+    const outcome = await handler.execute(
+      makeNode(),
+      { trigger: { imageRef: 'img_1' } },
+      helpers,
+    );
+    expect(outcome.status).toBe('failed');
+    const failed = emitted.find((e) => e.event === 'pipeline:image:vision:failed');
+    expect(failed?.payload).toMatchObject({ reason: 'refusal' });
   });
 
   it('persistence failure does NOT fail the step (result already on bus)', async () => {

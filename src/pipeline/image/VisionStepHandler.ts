@@ -26,7 +26,10 @@ import type {
   StepHandlerHelpers,
   StepOutcome,
 } from 'distributed-core/applications/pipeline';
+import { withContext } from '../../lib/logger';
 import { VisionClient } from './VisionClient';
+
+const log = withContext({ handler: 'VisionStepHandler' });
 import { computeVisionCost } from './computeVisionCost';
 import type {
   ImageBlobStore,
@@ -87,7 +90,9 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
       const config = (node.data as unknown as ImageVisionAnalyzeStepConfig);
       const pipelineId = opts.pipelineIdLookup(helpers.runId) ?? 'unknown';
       const visionId = randomUUID();
-      const analyzedAt = new Date().toISOString();
+      // Hoist once — reused for started, analyzed, and failed events so
+      // we avoid repeated Date allocations on the hot path.
+      const stepAt = new Date().toISOString();
       const model = config.model ?? defaultModel;
       const maxOutputTokens = config.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
 
@@ -102,7 +107,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
           pipelineId,
           reason: 'input-resolution' satisfies VisionFailureReason,
           error: (err as Error).message,
-          at: analyzedAt,
+          at: stepAt,
         });
         return { status: 'failed', error: `vision input resolution: ${(err as Error).message}` };
       }
@@ -119,7 +124,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
           imageId,
           reason: 'image-fetch' satisfies VisionFailureReason,
           error: (err as Error).message,
-          at: analyzedAt,
+          at: stepAt,
         });
         return { status: 'failed', error: `vision image-fetch: ${(err as Error).message}` };
       }
@@ -131,7 +136,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
           imageId,
           reason: 'image-fetch' satisfies VisionFailureReason,
           error: `imageId ${imageId} not found in blob store`,
-          at: analyzedAt,
+          at: stepAt,
         });
         return { status: 'failed', error: `vision image-fetch: ${imageId} not found` };
       }
@@ -148,7 +153,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
         imageId,
         visionModel: model,
         hasSchema: !!config.outputSchema,
-        at: analyzedAt,
+        at: stepAt,
       });
 
       // ── 5. Call the vision client + stream tokens to the bus ─────────
@@ -169,17 +174,17 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
       // response phase (after the Read tool returns the image) — exactly
       // mirrors how the LLM node renders incremental output.
       let tokenSeq = 0;
-      const callResult = await opts.visionClient.analyze(input, (delta, accumulated) => {
+      const callResult = await opts.visionClient.analyze(input, (delta) => {
         tokenSeq += 1;
-        void emit('pipeline:image:vision:token', {
+        emit('pipeline:image:vision:token', {
           runId: helpers.runId,
           stepId: node.id,
           pipelineId,
           imageId,
           seq: tokenSeq,
           delta,
-          accumulated,
-          at: new Date().toISOString(),
+        }).catch((err: unknown) => {
+          log.debug({ err }, 'pipeline:image:vision:token emit error (ignored)');
         });
       });
 
@@ -210,7 +215,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
           tokensOut: callResult.usage.output_tokens,
           costUsd,
           latencyMs: callResult.latencyMs,
-          at: analyzedAt,
+          at: stepAt,
         });
         return {
           status: 'failed',
@@ -238,7 +243,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
         latencyMs: callResult.latencyMs,
         costUsd,
         cacheHit: callResult.cacheHit,
-        analyzedAt,
+        analyzedAt: stepAt,
       };
 
       if (opts.repository) {
@@ -267,7 +272,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
         },
         costUsd,
         latencyMs: callResult.latencyMs,
-        at: analyzedAt,
+        at: stepAt,
       });
 
       // Step output carries the full VisionResult so it lands in
@@ -341,14 +346,12 @@ function renderUserPrompt(template: string, context: Record<string, unknown>): s
 
 /** Translate VisionClient's failureReason to the event-catalog enum. */
 function mapFailureReason(
-  reason: 'malformed' | 'overloaded' | 'refusal' | 'aborted' | 'http-error' | 'unknown' | undefined,
+  reason: 'malformed' | 'refusal' | 'aborted' | 'unknown' | undefined,
 ): VisionFailureReason {
   switch (reason) {
     case 'malformed': return 'malformed';
     case 'aborted':   return 'aborted';
-    case 'overloaded':
-    case 'refusal':
-    case 'http-error':
+    case 'refusal':   return 'refusal';
     case 'unknown':
     default:          return 'unknown';
   }

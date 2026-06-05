@@ -159,7 +159,7 @@ describe('VisionClient.analyze — caption mode', () => {
     expect(r.usage.output_tokens).toBe(20);
   });
 
-  it('invokes onToken once per text_delta with accumulated buffer', async () => {
+  it('invokes onToken once per text_delta with just the delta', async () => {
     const stdoutLines = [
       deltaLine('Hello'),
       deltaLine(' world'),
@@ -167,25 +167,52 @@ describe('VisionClient.analyze — caption mode', () => {
     ];
     const spawnImpl = (() => makeFakeChild({ stdoutLines })) as unknown as typeof import('node:child_process').spawn;
     const client = new VisionClient({ spawnImpl });
-    const tokens: Array<{ delta: string; accumulated: string }> = [];
-    await client.analyze(baseInput(), (delta, accumulated) => {
-      tokens.push({ delta, accumulated });
+    const deltas: string[] = [];
+    await client.analyze(baseInput(), (delta) => {
+      deltas.push(delta);
     });
-    expect(tokens).toEqual([
-      { delta: 'Hello', accumulated: 'Hello' },
-      { delta: ' world', accumulated: 'Hello world' },
-    ]);
+    expect(deltas).toEqual(['Hello', ' world']);
   });
 
   it('swallows onToken exceptions so a bad subscriber cannot kill the call', async () => {
     const stdoutLines = [deltaLine('A'), resultLine(1, 1)];
     const spawnImpl = (() => makeFakeChild({ stdoutLines })) as unknown as typeof import('node:child_process').spawn;
     const client = new VisionClient({ spawnImpl });
-    const r = await client.analyze(baseInput(), () => {
+    const r = await client.analyze(baseInput(), (_delta) => {
       throw new Error('subscriber boom');
     });
     expect(r.failureReason).toBeUndefined();
     expect(r.output?.caption).toBe('A');
+  });
+
+  it('throws on unsupported MIME type', async () => {
+    const spawnImpl = (() => makeFakeChild({ stdoutLines: [] })) as unknown as typeof import('node:child_process').spawn;
+    const client = new VisionClient({ spawnImpl });
+    await expect(
+      client.analyze(baseInput({ imageMimeType: 'image/gif' })),
+    ).rejects.toThrow(/unsupported image MIME type/);
+  });
+
+  it('cacheHit is recomputed after retry merge when first attempt had cache reads', async () => {
+    let callCount = 0;
+    const spawnImpl = (() => {
+      callCount += 1;
+      const stdoutLines = callCount === 1
+        ? [
+            deltaLine('not json'),
+            JSON.stringify({ type: 'result', usage: { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 150 } }),
+          ]
+        : [
+            deltaLine('{"caption":"ok"}'),
+            JSON.stringify({ type: 'result', usage: { input_tokens: 110, output_tokens: 8 } }),
+          ];
+      return makeFakeChild({ stdoutLines });
+    }) as unknown as typeof import('node:child_process').spawn;
+    const client = new VisionClient({ spawnImpl });
+    const r = await client.analyze(baseInput({ outputSchema: { type: 'object' } }));
+    expect(callCount).toBe(2);
+    expect(r.cacheHit).toBe(true); // merged cache_read_input_tokens=150 > 0
+    expect(r.usage.cache_read_input_tokens).toBe(150);
   });
 });
 

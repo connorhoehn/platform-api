@@ -147,13 +147,18 @@ export class VisionResultRepository {
       ...result,
       ...(truncate
         ? {
-            rawModelText: undefined,
             rawTextTruncated: true,
             ...(rawTextKey ? { rawTextKey } : {}),
           }
         : {}),
       ttlEpoch,
     };
+    // When truncating, explicitly delete the key so DDB never sees
+    // `rawModelText: undefined` (which some marshallers serialize as a
+    // NULL attribute instead of omitting the field entirely).
+    if (truncate) {
+      delete item.rawModelText;
+    }
 
     await this.store.putItem(item as unknown as Record<string, unknown>);
   }

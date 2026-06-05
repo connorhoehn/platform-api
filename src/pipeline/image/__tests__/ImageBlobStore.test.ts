@@ -172,4 +172,40 @@ describe('DdbImageBlobStore', () => {
     const store = new DdbImageBlobStore({ docClient: mockDocClient });
     expect(await store.get('img_1')).toBeNull();
   });
+
+  it('getMetadata issues a projected GetCommand that does NOT request the body attribute', async () => {
+    mockSend.mockResolvedValueOnce({
+      Item: {
+        imageId: 'img_1',
+        mimeType: 'image/jpeg',
+        sizeBytes: 1000,
+        width: 100,
+        height: 80,
+        uploadedAt: '2026-06-04T10:00:00.000Z',
+      },
+    });
+    const store = new DdbImageBlobStore({ docClient: mockDocClient });
+    const meta = await store.getMetadata('img_1');
+
+    expect(meta?.mimeType).toBe('image/jpeg');
+    expect(meta?.width).toBe(100);
+    const cmd = mockSend.mock.calls[0][0] as GetCommand;
+    expect(cmd).toBeInstanceOf(GetCommand);
+    // ProjectionExpression must be set and must NOT include `body`
+    expect(cmd.input.ProjectionExpression).toBeDefined();
+    expect(cmd.input.ProjectionExpression).not.toContain('body');
+    expect(cmd.input.ProjectionExpression).toContain('mimeType');
+  });
+
+  it('getMetadata returns null when DDB returns no Item', async () => {
+    mockSend.mockResolvedValueOnce({});
+    const store = new DdbImageBlobStore({ docClient: mockDocClient });
+    expect(await store.getMetadata('img_missing')).toBeNull();
+  });
+
+  it('getMetadata returns null when DDB throws', async () => {
+    mockSend.mockRejectedValueOnce(new Error('ConnectionError'));
+    const store = new DdbImageBlobStore({ docClient: mockDocClient });
+    expect(await store.getMetadata('img_1')).toBeNull();
+  });
 });

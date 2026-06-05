@@ -20,6 +20,7 @@ export type VisionFailureReason =
   | 'input-resolution'
   | 'malformed'
   | 'aborted'
+  | 'refusal'
   | 'unknown';
 
 /**

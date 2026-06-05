@@ -166,13 +166,34 @@ export class DdbImageBlobStore implements ImageBlobStore {
   }
 
   async getMetadata(imageId: string): Promise<ImageMeta | null> {
-    // DDB doesn't have a "projection skip body" GetItem option that's
-    // cheaper than fetching the full item — Get pulls the whole row.
-    // For v1 we delegate to get() and drop the body. If image bodies
-    // grow large (multi-MB chunked spillover in some future revision),
-    // revisit with an explicit ProjectionExpression that excludes `body`.
-    const row = await this.get(imageId);
-    return row?.meta ?? null;
+    // Use a ProjectionExpression to fetch only the metadata fields,
+    // skipping the `body` attribute (which can be up to 350 KB).
+    // This saves DDB read-unit cost on metadata-only calls (thumbnails,
+    // listings, HEAD-equivalent checks).
+    try {
+      const result = await this.docClient.send(
+        new GetCommand({
+          TableName: PIPELINE_IMAGES_TABLE,
+          Key: { imageId },
+          ProjectionExpression: 'imageId, mimeType, sizeBytes, #w, #h, uploadedAt, uploadedBy',
+          // `width` and `height` are not reserved words but we alias them
+          // for safety with other DDB expression parsers.
+          ExpressionAttributeNames: { '#w': 'width', '#h': 'height' },
+        }),
+      );
+      const item = result.Item as Partial<ImageRow> | undefined;
+      if (!item?.imageId) return null;
+      return {
+        mimeType: item.mimeType ?? '',
+        sizeBytes: item.sizeBytes ?? 0,
+        width: item.width ?? 0,
+        height: item.height ?? 0,
+        uploadedAt: item.uploadedAt ?? '',
+        ...(item.uploadedBy ? { uploadedBy: item.uploadedBy } : {}),
+      };
+    } catch {
+      return null;
+    }
   }
 }
 

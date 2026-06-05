@@ -109,7 +109,7 @@ export interface VisionClientCallResult {
   rawText: string;
   latencyMs: number;
   cacheHit: boolean;
-  failureReason?: 'malformed' | 'overloaded' | 'refusal' | 'aborted' | 'http-error' | 'unknown';
+  failureReason?: 'malformed' | 'refusal' | 'aborted' | 'unknown';
 }
 
 /**
@@ -134,9 +134,14 @@ export interface VisionClientOpts {
 /**
  * Callback fired once per token delta as the CLI streams stdout. The
  * VisionStepHandler uses this to emit `pipeline:image:vision:token`
- * events so the frontend can render live updates.
+ * events so the frontend can render live updates by accumulating locally.
+ *
+ * Note: `accumulated` was removed from this signature (wave 13a) — the
+ * caller (VisionStepHandler) no longer sends accumulated on the event,
+ * and the frontend accumulates from delta. The internal `attempt` method
+ * still tracks `fullResponse` but doesn't expose it here.
  */
-export type VisionTokenCallback = (delta: string, accumulated: string) => void;
+export type VisionTokenCallback = (delta: string) => void;
 
 /**
  * Spawn-based vision client. Use via the singleton in `visionServices.ts`;
@@ -172,7 +177,14 @@ export class VisionClient {
         ...(first.usage.image_tokens || retry.usage.image_tokens
           ? { image_tokens: (first.usage.image_tokens ?? 0) + (retry.usage.image_tokens ?? 0) }
           : {}),
+        ...(first.usage.cache_read_input_tokens || retry.usage.cache_read_input_tokens
+          ? { cache_read_input_tokens: (first.usage.cache_read_input_tokens ?? 0) + (retry.usage.cache_read_input_tokens ?? 0) }
+          : {}),
       };
+      // Recompute cacheHit from the merged usage — retry.cacheHit alone was
+      // based only on the retry attempt's tokens (bug: first attempt's cache
+      // read was not considered after the merge).
+      retry.cacheHit = (retry.usage.cache_read_input_tokens ?? 0) > 0;
       retry.latencyMs = Date.now() - t0;
       return retry;
     }
@@ -182,7 +194,7 @@ export class VisionClient {
   private async attempt(
     input: VisionAnalyzeInput,
     corrective: boolean,
-    onToken: VisionTokenCallback | undefined,
+    onToken: ((delta: string) => void) | undefined,
   ): Promise<VisionClientCallResult> {
     const t0 = Date.now();
 
@@ -190,7 +202,11 @@ export class VisionClient {
     const baseDir = join(tmpdir(), 'pipeline-vision');
     try { mkdirSync(baseDir, { recursive: true }); } catch { /* ignore */ }
     const callDir = mkdtempSync(join(baseDir, `${randomUUID()}-`));
-    const ext = MIME_TO_EXT[input.imageMimeType] ?? 'jpg';
+    const ext = MIME_TO_EXT[input.imageMimeType];
+    if (!ext) {
+      this.cleanup(callDir);
+      throw new Error(`unsupported image MIME type: '${input.imageMimeType}'`);
+    }
     const imgPath = join(callDir, `img.${ext}`);
     try {
       writeFileSync(imgPath, input.imageBytes);
@@ -313,7 +329,7 @@ export class VisionClient {
                 const token = delta['text'] as string;
                 fullResponse += token;
                 try {
-                  onToken?.(token, fullResponse);
+                  onToken?.(token);
                 } catch {
                   // never let a bad subscriber kill the call
                 }
@@ -362,6 +378,13 @@ export class VisionClient {
     } catch (err) {
       const e = err as Error;
       const isAbort = e.name === 'AbortError' || e.message.includes('aborted');
+      // Reap the child so it doesn't become a zombie. We raced the for-await
+      // loop which means exitPromise was never awaited. Give the process up
+      // to 2 s to die on its own; the finally block will SIGTERM it first.
+      await Promise.race([
+        exitPromise,
+        new Promise<void>((res) => setTimeout(res, 2000)),
+      ]);
       return this.finalize(callDir, {
         output: null,
         usage: { input_tokens: tokensIn, output_tokens: tokensOut },
