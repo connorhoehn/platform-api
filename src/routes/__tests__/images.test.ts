@@ -395,6 +395,96 @@ describe('POST /api/images/from-url — SSRF defense', () => {
     );
     expect(res.status).toBe(400);
   });
+
+  it('refuses to fetch from IPv6 loopback ([::1])', async () => {
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'http://[::1]:8000/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses to fetch from IPv6 link-local (fe80::1)', async () => {
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'http://[fe80::1]/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses to fetch from IPv4-mapped IPv6 (::ffff:10.0.0.1)', async () => {
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'http://[::ffff:10.0.0.1]/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects a 302 redirect that lands on a private address', async () => {
+    // Redirect chain: public URL → private URL. Native fetch with
+    // redirect:'follow' would silently follow. Our ssrfSafeFetch
+    // re-validates at every hop.
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(
+        new Response(null, { status: 302, headers: { location: 'http://10.0.0.5/img' } }),
+      ) as unknown as typeof fetch;
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'https://example.com/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.toString()).toMatch(/internal address/);
+  });
+
+  it('rejects a 302 redirect to a non-http(s) URL', async () => {
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(
+        new Response(null, { status: 302, headers: { location: 'file:///etc/passwd' } }),
+      ) as unknown as typeof fetch;
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'https://example.com/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects after exceeding the max-redirect hop count', async () => {
+    // Chain 7 redirects (one more than our max of 5 hops past the
+    // initial = 6 total fetches). The 7th should error.
+    const redir = (target: string) => new Response(null, { status: 302, headers: { location: target } });
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(redir('https://a.example.com/img'))
+      .mockResolvedValueOnce(redir('https://b.example.com/img'))
+      .mockResolvedValueOnce(redir('https://c.example.com/img'))
+      .mockResolvedValueOnce(redir('https://d.example.com/img'))
+      .mockResolvedValueOnce(redir('https://e.example.com/img'))
+      .mockResolvedValueOnce(redir('https://f.example.com/img'))
+      .mockResolvedValueOnce(redir('https://g.example.com/img')) as unknown as typeof fetch;
+    const res = await rawRequest(
+      server,
+      'POST',
+      '/api/images/from-url',
+      Buffer.from(JSON.stringify({ url: 'https://example.com/img' })),
+      { 'Content-Type': 'application/json' },
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.toString()).toMatch(/too many redirects/);
+  });
 });
 
 describe('GET /api/images/:imageId/metadata', () => {

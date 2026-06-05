@@ -25,7 +25,7 @@
     "@aws-sdk/client-s3": "^3.1044.0",
     "@aws-sdk/client-sqs": "^3.1011.0",
     "@aws-sdk/lib-dynamodb": "^3.1010.0",
-    "@connorhoehn/event-catalog": "github:connorhoehnslalom/event-catalog#c62c23703372380a6d752175c362cb3ea96bf0fa",
+    "@connorhoehn/event-catalog": "github:connorhoehnslalom/event-catalog#36d6d4602a3be347e5a0b2cf8bfe247f170c5f61",
     "@connorhoehn/pipeline-runtime": "github:connorhoehn/pipeline-runtime#v0.4.0",
     "@connorhoehn/service-runtime": "github:connorhoehn/service-runtime#v0.2.4",
     "@opentelemetry/api": "^1.9.1",

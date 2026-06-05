@@ -224,6 +224,12 @@ export class VisionClient {
       ].join('\n');
     }
 
+    // NB: the Claude Code CLI does NOT expose a --max-tokens flag (it has
+    // --max-budget-usd + --max-turns but neither maps to the per-response
+    // token cap our `input.maxOutputTokens` represents). The field is
+    // honored when this client is wired against the Anthropic API or
+    // Bedrock directly; under the CLI it's effectively informational only.
+    // Leaving the field on the interface for API-mode parity + future use.
     const args = [
       '-p',
       '--output-format', 'stream-json',

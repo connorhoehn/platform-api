@@ -186,13 +186,26 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
       // ── 6. Handle non-success paths (non-throwing per rule #1) ───────
       if (!callResult.output) {
         const costUsd = computeVisionCost(model, callResult.usage);
+        // The CLI's stderr (e.g. "API Error: 401 Invalid authentication
+        // credentials" when claude auth expires) lands in
+        // callResult.rawText. Forward it on the failed event so the
+        // frontend can surface the actual cause instead of opaque
+        // "vision unknown". Cap at 400 chars to keep the event payload
+        // bus-friendly + the UI footer readable.
+        const stderrSnippet = callResult.rawText?.trim().slice(0, 400) ?? '';
+        const reasonLabel = callResult.failureReason ?? 'unknown';
+        const composedError = stderrSnippet
+          ? `${reasonLabel}: ${stderrSnippet}`
+          : reasonLabel === 'unknown'
+            ? 'vision call produced no output'
+            : reasonLabel;
         await emit('pipeline:image:vision:failed', {
           runId: helpers.runId,
           stepId: node.id,
           pipelineId,
           imageId,
           reason: mapFailureReason(callResult.failureReason),
-          error: callResult.failureReason ?? 'vision call produced no output',
+          error: composedError,
           tokensIn: callResult.usage.input_tokens,
           tokensOut: callResult.usage.output_tokens,
           costUsd,
@@ -201,7 +214,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
         });
         return {
           status: 'failed',
-          error: `vision ${callResult.failureReason ?? 'failed'}`,
+          error: `vision ${composedError}`,
         };
       }
 

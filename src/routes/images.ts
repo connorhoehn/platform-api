@@ -209,17 +209,86 @@ imagesRouter.post(
 const ALLOW_INTERNAL_IMAGE_FETCH = process.env['ALLOW_INTERNAL_IMAGE_FETCH'] === 'true';
 const URL_FETCH_TIMEOUT_MS = 5000;
 
+/**
+ * Reject hostnames that resolve to private / loopback / link-local /
+ * cloud-metadata addresses. Covers IPv4 + IPv6 + IPv4-mapped IPv6.
+ *
+ * Hardened after audit wave 9: previous version missed IPv6 link-local
+ * (fe80::/10), ULA (fc00::/7), and IPv4-mapped IPv6 (::ffff:10.0.0.1).
+ * Strip IPv6 brackets up front since Node URL.hostname preserves them.
+ */
 function isPrivateOrLocalHost(hostname: string): boolean {
-  const lower = hostname.toLowerCase();
-  if (lower === 'localhost' || lower === '0.0.0.0' || lower === '::1' || lower === '127.0.0.1') return true;
-  if (lower.startsWith('127.')) return true;
-  // RFC1918 / link-local
+  let lower = hostname.toLowerCase();
+  if (lower.startsWith('[') && lower.endsWith(']')) {
+    lower = lower.slice(1, -1);
+  }
+  // Common short forms
+  if (lower === 'localhost' || lower === '0.0.0.0') return true;
+  // IPv4 loopback + RFC1918 + link-local
+  if (lower === '127.0.0.1' || lower.startsWith('127.')) return true;
   if (/^10\./.test(lower)) return true;
   if (/^192\.168\./.test(lower)) return true;
   if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(lower)) return true;
   if (/^169\.254\./.test(lower)) return true;
+  // IPv6 loopback + link-local + ULA
+  if (lower === '::1' || lower === '0:0:0:0:0:0:0:1') return true;
+  if (lower.startsWith('fe80:') || lower.startsWith('fe80::')) return true;
+  if (/^fc[0-9a-f]{2}:/.test(lower) || /^fd[0-9a-f]{2}:/.test(lower)) return true;
+  // IPv4-mapped IPv6 — re-check embedded IPv4 against same private ranges.
+  const v4Mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
+  if (v4Mapped) return isPrivateOrLocalHost(v4Mapped[1]!);
+  // .local / .internal mDNS + intra-cluster
   if (lower.endsWith('.local') || lower.endsWith('.internal')) return true;
   return false;
+}
+
+/**
+ * Bounded redirect-following fetch with re-validation at every hop.
+ * The native `fetch(..., { redirect: 'follow' })` would happily follow
+ * a 301 from a public URL to a private one — bypasses our SSRF check.
+ *
+ * We follow up to MAX_REDIRECTS hops; at each hop we re-run the
+ * private-host check + protocol whitelist. Returns the final Response
+ * along with the resolved final URL (for logging).
+ */
+async function ssrfSafeFetch(
+  initialUrl: URL,
+  opts: { signal: AbortSignal; allowInternal: boolean; maxRedirects?: number; userAgent?: string },
+): Promise<{ response: Response; finalUrl: URL }> {
+  const maxRedirects = opts.maxRedirects ?? 5;
+  let currentUrl = initialUrl;
+  for (let hop = 0; hop <= maxRedirects; hop += 1) {
+    if (!opts.allowInternal && isPrivateOrLocalHost(currentUrl.hostname)) {
+      throw new ValidationError(
+        `refusing to fetch from internal address '${currentUrl.hostname}'${hop > 0 ? ` (reached via redirect from ${initialUrl.toString()})` : ''}`,
+      );
+    }
+    if (currentUrl.protocol !== 'http:' && currentUrl.protocol !== 'https:') {
+      throw new ValidationError(`redirect to non-http(s) URL '${currentUrl.toString()}'`);
+    }
+    const resp = await fetch(currentUrl.toString(), {
+      method: 'GET',
+      redirect: 'manual',
+      signal: opts.signal,
+      headers: { 'User-Agent': opts.userAgent ?? 'platform-api/image-fetch' },
+    });
+    if (resp.status >= 300 && resp.status < 400) {
+      const loc = resp.headers.get('location');
+      if (!loc) {
+        throw new ValidationError(`${resp.status} redirect with no Location header`);
+      }
+      let next: URL;
+      try {
+        next = new URL(loc, currentUrl);
+      } catch {
+        throw new ValidationError(`invalid Location header on redirect: '${loc}'`);
+      }
+      currentUrl = next;
+      continue;
+    }
+    return { response: resp, finalUrl: currentUrl };
+  }
+  throw new ValidationError(`too many redirects (>${maxRedirects})`);
 }
 
 imagesRouter.post(
@@ -255,14 +324,16 @@ imagesRouter.post(
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), URL_FETCH_TIMEOUT_MS);
     let response: Response;
+    let finalUrl: URL;
     try {
-      response = await fetch(parsed.toString(), {
-        method: 'GET',
-        redirect: 'follow',
+      const fetched = await ssrfSafeFetch(parsed, {
         signal: ctrl.signal,
-        headers: { 'User-Agent': 'platform-api/image-fetch' },
+        allowInternal: ALLOW_INTERNAL_IMAGE_FETCH,
       });
+      response = fetched.response;
+      finalUrl = fetched.finalUrl;
     } catch (err) {
+      if (err instanceof ValidationError) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       reqLog.warn({ err: msg }, 'image URL fetch failed');
       throw new ValidationError(`could not fetch URL: ${msg}`);
@@ -272,6 +343,9 @@ imagesRouter.post(
 
     if (!response.ok) {
       throw new ValidationError(`URL returned ${response.status} ${response.statusText}`);
+    }
+    if (finalUrl.toString() !== parsed.toString()) {
+      reqLog.info({ finalUrl: finalUrl.toString() }, 'image URL followed redirects');
     }
 
     const respMime = (response.headers.get('content-type') ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
