@@ -128,6 +128,7 @@ swap the table name. See `docs/judge-PROVISIONING.md`.
 | `DDB_TABLE_PREFIX` | _empty_ | Local-dev table-name prefix when sharing one DDB-local instance |
 | `CLAUDE_CLI_PATH` | `claude` | Override the Claude Code CLI binary path. Defaults to whatever `claude` resolves to on PATH. |
 | `CLAUDE_CODE_USE_BEDROCK` | `false` | When `true`, the CLI is invoked with Bedrock model aliases instead of the public Anthropic API. Useful when the host has Bedrock credentials but not an Anthropic key. |
+| `ALLOW_INTERNAL_IMAGE_FETCH` | `false` | When `true`, the `POST /api/images/from-url` route allows fetching from private/loopback addresses. Required for test environments hitting in-cluster fixtures. Production should keep `false` (SSRF mitigation). |
 
 ## Auth (CLI subprocess)
 
@@ -157,6 +158,31 @@ blocks to the model (empirically verified — base64 images get
    content block automatically (Claude Code 2.1.x+).
 4. Tempdir is cleaned up in `finalize()` on both success and failure.
 
+## HTTP routes
+
+### POST /api/images
+
+Multipart upload of a raw image file. Server re-encodes via Sharp (strips
+EXIF, resizes to 1568px long edge), validates Content-Type, and persists to
+`pipeline-images`. Returns `UploadResponse`: `{imageId, mimeType, sizeBytes,
+width, height}`.
+
+### POST /api/images/from-url
+
+Server-side fetch by URL. Useful when the client already has a public
+image URL and doesn't want to re-upload bytes.
+
+Body: `{ "url": "https://..." }` (JSON, max 4 KB)
+
+Server-side: validates the URL's protocol (http/https only), rejects
+private/loopback hosts (configurable via `ALLOW_INTERNAL_IMAGE_FETCH`),
+follows up to 5 redirects with re-validation at every hop, fetches with
+a 5s timeout, validates Content-Type against the same ALLOWED_MIME set
+as POST /, caps body size before passing to Sharp.
+
+Response: same `UploadResponse` shape as POST / — `{imageId, mimeType,
+sizeBytes, width, height}`. Callers can treat both paths identically.
+
 ## Fallback behavior — what happens without each resource
 
 | Missing | Effect |
@@ -165,6 +191,7 @@ blocks to the model (empirically verified — base64 images get
 | `pipeline-vision-results` table | Vision steps run end-to-end; `pipeline:image:vision:analyzed` events still fire (UI gets live results), but no historical record persists for later drill-in. `VisionResultRepository.persistVisionResult` logs a warning per `VisionStepHandler.ts` — persistence failure does NOT fail the step. |
 | Claude Code CLI not on PATH | Every call returns `failureReason: unknown` with the spawn error in `rawText`. Set `CLAUDE_CLI_PATH` to an absolute path. |
 | Claude Code CLI auth expired | Steps emit `pipeline:image:vision:failed` with the CLI's authentication error in `rawText`. Re-run `claude login`. |
+| Bad `imageRefPath` config | Vision step emits `pipeline:image:vision:failed` with `reason: input-resolution` and the jsonpath traversal error in `error`. Common cause: typo in the JSONPath, or the path resolves through a non-object. Verify the path starts with `$.` and the resolved value is either a string imageId or an `{imageId}` object. |
 
 ## Local-dev (Tilt + DDB-local)
 
