@@ -126,8 +126,36 @@ swap the table name. See `docs/judge-PROVISIONING.md`.
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `DDB_TABLE_PREFIX` | _empty_ | Local-dev table-name prefix when sharing one DDB-local instance |
-| `ANTHROPIC_API_KEY` | _unset_ | Required — `VisionClient` calls Anthropic Messages API directly (the Claude Code CLI does not forward image content blocks, so we can't reuse the judge's OAuth path). Without this set, every vision step returns `failureReason: http-error` and emits `pipeline:image:vision:failed`. |
-| `ANTHROPIC_API_URL` | `https://api.anthropic.com/v1/messages` | Override for Bedrock proxy or testing |
+| `CLAUDE_CLI_PATH` | `claude` | Override the Claude Code CLI binary path. Defaults to whatever `claude` resolves to on PATH. |
+| `CLAUDE_CODE_USE_BEDROCK` | `false` | When `true`, the CLI is invoked with Bedrock model aliases instead of the public Anthropic API. Useful when the host has Bedrock credentials but not an Anthropic key. |
+
+## Auth (CLI subprocess)
+
+`VisionClient` spawns `claude -p` and inherits whatever credentials
+the host's CLI has. There is **no separate `ANTHROPIC_API_KEY`** to
+manage — the same OAuth session that powers the operator's Claude Code
+shell is what drives the vision step. In containerized deploys this
+means mounting `~/.claude` (or the equivalent keychain volume) into
+the pod; in local-dev it's automatic.
+
+If the CLI can't authenticate (no session, expired token), the vision
+step emits `pipeline:image:vision:failed` with the CLI's stderr in the
+event's `error` field. Re-run `claude login` to refresh.
+
+## Image input plumbing
+
+The CLI's stream-json input format does NOT forward image content
+blocks to the model (empirically verified — base64 images get
+"I can't view the image." back). Instead, the client:
+
+1. Writes the image bytes to a per-call tempdir under
+   `/tmp/pipeline-vision/<uuid>/img.<ext>`.
+2. Spawns the CLI with `--allowedTools Read --add-dir <tempdir>
+   --permission-mode acceptEdits` and a prompt that references the
+   file path: `"Read the image at <path> and ..."`.
+3. The CLI's Read tool surfaces the image to the model as a base64
+   content block automatically (Claude Code 2.1.x+).
+4. Tempdir is cleaned up in `finalize()` on both success and failure.
 
 ## Fallback behavior — what happens without each resource
 
@@ -135,7 +163,8 @@ swap the table name. See `docs/judge-PROVISIONING.md`.
 | --- | --- |
 | `pipeline-images` table | `POST /api/images` returns 500 on upload; `GET /api/images/:id` returns 404; vision steps emit `pipeline:image:vision:failed` with `reason: image-fetch`. |
 | `pipeline-vision-results` table | Vision steps run end-to-end; `pipeline:image:vision:analyzed` events still fire (UI gets live results), but no historical record persists for later drill-in. `VisionResultRepository.persistVisionResult` logs a warning per `VisionStepHandler.ts` — persistence failure does NOT fail the step. |
-| `ANTHROPIC_API_KEY` env var | Every call returns `failureReason: http-error` before fetch is attempted; the step emits `pipeline:image:vision:failed` with `reason: unknown` and `error: http-error`. |
+| Claude Code CLI not on PATH | Every call returns `failureReason: unknown` with the spawn error in `rawText`. Set `CLAUDE_CLI_PATH` to an absolute path. |
+| Claude Code CLI auth expired | Steps emit `pipeline:image:vision:failed` with the CLI's authentication error in `rawText`. Re-run `claude login`. |
 
 ## Local-dev (Tilt + DDB-local)
 
@@ -146,6 +175,8 @@ the commands above (they default to `--endpoint-url http://localhost:8000`).
 Both tables persist across container restarts via the `agent-hub-ddb-data`
 volume.
 
-Set `ANTHROPIC_API_KEY` in the platform-api deployment's env. In Tilt
-local-dev, the env is sourced from `.env` (not committed) — add the
-key there and restart the platform-api process.
+For the CLI to work in the platform-api container, the image must
+include the Claude Code binary and a mounted `~/.claude` directory.
+The current Dockerfile installs `@anthropic-ai/claude-code` globally;
+the operator mounts their host keychain volume at `/root/.claude` so
+the OAuth session flows through.
