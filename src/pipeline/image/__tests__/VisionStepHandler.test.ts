@@ -73,6 +73,30 @@ function fakeClientReturning(result: VisionClientCallResult): VisionClient {
   return { analyze: jest.fn().mockResolvedValue(result) } as unknown as VisionClient;
 }
 
+/**
+ * Variant that simulates the CLI streaming tokens — invokes the onToken
+ * callback the step handler passes in, then resolves with `result`. Used
+ * by the streaming test below to assert token events fire.
+ */
+function fakeStreamingClient(
+  result: VisionClientCallResult,
+  tokens: string[],
+): VisionClient {
+  return {
+    analyze: jest.fn().mockImplementation(async (
+      _input: unknown,
+      onToken?: (delta: string, accumulated: string) => void,
+    ) => {
+      let accumulated = '';
+      for (const t of tokens) {
+        accumulated += t;
+        onToken?.(t, accumulated);
+      }
+      return result;
+    }),
+  } as unknown as VisionClient;
+}
+
 function successResult(over: Partial<VisionClientCallResult> = {}): VisionClientCallResult {
   return {
     output: { caption: 'A red apple.', extracted: null },
@@ -172,6 +196,33 @@ describe('VisionStepHandler — happy path', () => {
     );
     expect(outcome.status).toBe('completed');
     expect(emitted[0].payload).toMatchObject({ imageId: 'img_1' });
+  });
+
+  it('emits pipeline:image:vision:token for each streamed delta with monotonic seq', async () => {
+    const blob = new InMemoryImageBlobStore();
+    await blob.put('img_1', IMAGE_BYTES, IMAGE_META);
+    const client = fakeStreamingClient(
+      successResult(),
+      ['Hello', ' world', '!'],
+    );
+    const handler = createVisionStepHandler({
+      visionClient: client,
+      imageBlobStore: blob,
+      pipelineIdLookup: () => 'pl_1',
+    });
+    const { helpers, emitted } = makeHelpers();
+    await handler.execute(makeNode(), { trigger: { imageRef: 'img_1' } }, helpers);
+
+    const tokenEvents = emitted.filter((e) => e.event === 'pipeline:image:vision:token');
+    expect(tokenEvents).toHaveLength(3);
+    expect(tokenEvents.map((e) => (e.payload as { delta: string }).delta)).toEqual(['Hello', ' world', '!']);
+    expect(tokenEvents.map((e) => (e.payload as { seq: number }).seq)).toEqual([1, 2, 3]);
+    // Last accumulated should equal joined deltas.
+    expect((tokenEvents.at(-1)!.payload as { accumulated: string }).accumulated).toBe('Hello world!');
+    // Event ordering: started → tokens → analyzed.
+    const order = emitted.map((e) => e.event);
+    expect(order[0]).toBe('pipeline:image:vision:started');
+    expect(order.at(-1)).toBe('pipeline:image:vision:analyzed');
   });
 
   it('schema mode: passes outputSchema to the client + flags hasSchema:true on started', async () => {

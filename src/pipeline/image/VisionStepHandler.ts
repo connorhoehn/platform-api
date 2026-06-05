@@ -151,7 +151,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
         at: analyzedAt,
       });
 
-      // ── 5. Call the vision client ────────────────────────────────────
+      // ── 5. Call the vision client + stream tokens to the bus ─────────
       const input: VisionAnalyzeInput = {
         model,
         systemPrompt,
@@ -162,7 +162,26 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
         maxOutputTokens,
         ...(helpers.abortSignal ? { abortSignal: helpers.abortSignal } : {}),
       };
-      const callResult = await opts.visionClient.analyze(input);
+
+      // Each token delta from the CLI fires an event. We fire-and-forget so
+      // a slow subscriber can't backpressure the model loop; the in-process
+      // EventBus dispatches inline. Tokens stream during the model's text
+      // response phase (after the Read tool returns the image) — exactly
+      // mirrors how the LLM node renders incremental output.
+      let tokenSeq = 0;
+      const callResult = await opts.visionClient.analyze(input, (delta, accumulated) => {
+        tokenSeq += 1;
+        void emit('pipeline:image:vision:token', {
+          runId: helpers.runId,
+          stepId: node.id,
+          pipelineId,
+          imageId,
+          seq: tokenSeq,
+          delta,
+          accumulated,
+          at: new Date().toISOString(),
+        });
+      });
 
       // ── 6. Handle non-success paths (non-throwing per rule #1) ───────
       if (!callResult.output) {
