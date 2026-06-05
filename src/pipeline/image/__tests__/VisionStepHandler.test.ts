@@ -179,6 +179,64 @@ describe('VisionStepHandler — happy path', () => {
     expect(callArg.userPrompt).toBe('Hello friendly, look here.');
   });
 
+  it('renderUserPrompt: leaves placeholder intact when context path is missing', async () => {
+    const blob = new InMemoryImageBlobStore();
+    await blob.put('img_1', IMAGE_BYTES, IMAGE_META);
+    const client = fakeClientReturning(successResult());
+    const handler = createVisionStepHandler({
+      visionClient: client,
+      imageBlobStore: blob,
+      pipelineIdLookup: () => 'pl_1',
+    });
+    const { helpers } = makeHelpers();
+    await handler.execute(
+      makeNode({ userPrompt: 'Hello {{context.trigger.unknown}}, look.' }),
+      { trigger: { imageRef: 'img_1' } },
+      helpers,
+    );
+    const callArg = (client.analyze as jest.Mock).mock.calls[0][0];
+    // Missing path means the placeholder text is preserved verbatim.
+    expect(callArg.userPrompt).toBe('Hello {{context.trigger.unknown}}, look.');
+  });
+
+  it('renderUserPrompt: serializes non-string context values via JSON.stringify', async () => {
+    const blob = new InMemoryImageBlobStore();
+    await blob.put('img_1', IMAGE_BYTES, IMAGE_META);
+    const client = fakeClientReturning(successResult());
+    const handler = createVisionStepHandler({
+      visionClient: client,
+      imageBlobStore: blob,
+      pipelineIdLookup: () => 'pl_1',
+    });
+    const { helpers } = makeHelpers();
+    await handler.execute(
+      makeNode({ userPrompt: 'Count: {{context.trigger.count}}, list: {{context.trigger.items}}' }),
+      { trigger: { imageRef: 'img_1', count: 42, items: ['a', 'b'] } },
+      helpers,
+    );
+    const callArg = (client.analyze as jest.Mock).mock.calls[0][0];
+    expect(callArg.userPrompt).toBe('Count: 42, list: ["a","b"]');
+  });
+
+  it('renderUserPrompt: resolves deeply nested context paths', async () => {
+    const blob = new InMemoryImageBlobStore();
+    await blob.put('img_1', IMAGE_BYTES, IMAGE_META);
+    const client = fakeClientReturning(successResult());
+    const handler = createVisionStepHandler({
+      visionClient: client,
+      imageBlobStore: blob,
+      pipelineIdLookup: () => 'pl_1',
+    });
+    const { helpers } = makeHelpers();
+    await handler.execute(
+      makeNode({ userPrompt: 'Label: {{context.trigger.meta.deep.label}}' }),
+      { trigger: { imageRef: 'img_1', meta: { deep: { label: 'pinned' } } } },
+      helpers,
+    );
+    const callArg = (client.analyze as jest.Mock).mock.calls[0][0];
+    expect(callArg.userPrompt).toBe('Label: pinned');
+  });
+
   it('resolves imageRefPath to an {imageId} object', async () => {
     const blob = new InMemoryImageBlobStore();
     await blob.put('img_1', IMAGE_BYTES, IMAGE_META);
