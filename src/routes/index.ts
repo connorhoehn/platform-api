@@ -44,6 +44,7 @@ import { pipelineInspectorRouter } from './pipelineInspector';
 import { pipelineDLQRouter } from './pipelineDLQ';
 import { pipelineLLMStreamRouter } from './pipelineLLMStream';
 import { pipelineCostRouter } from './pipelineCost';
+import { pipelineSchemasRouter } from './pipeline-schemas';
 import { documentTypesRouter } from './documentTypes';
 import { typedDocumentsRouter } from './typedDocuments';
 import { approvalsRouter } from './approvals';
@@ -134,6 +135,11 @@ router.use('/pipelines/dlq', pipelineDLQRouter);
 // LLM streaming proxy — POST /api/pipelines/llm/stream. Static segment,
 // must precede the `:pipelineId` mount so `llm` doesn't get captured.
 router.use('/pipelines/llm/stream', pipelineLLMStreamRouter);
+// Output-schema introspection — GET /api/pipeline/output-schemas. Read-only;
+// no auth required (schemas are structural metadata, not user data). Static
+// path with a singular `pipeline` prefix to distinguish from the plural
+// `/pipelines/*` run/definition surface.
+router.use('/pipeline/output-schemas', pipelineSchemasRouter);
 // hub#2225 audit search — GET /api/pipelines/audit/search?actor=&pipelineId=...
 // Static segment, must precede the `:pipelineId` mount below for the same
 // reason as `/metrics`/`/defs`/`/llm/stream`.
