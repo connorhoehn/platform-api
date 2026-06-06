@@ -39,6 +39,8 @@ import { createScatterStepHandler } from '../ScatterStepHandler';
 import { createImageCropStepHandler } from '../ImageCropStepHandler';
 import { createImageSourceStepHandler } from '../ImageSourceStepHandler';
 import { createVisionStepHandler } from '../VisionStepHandler';
+import { createImageAdjustBwStepHandler } from '../ImageAdjustBwStepHandler';
+import { createImageSaveStepHandler } from '../ImageSaveStepHandler';
 import { InMemoryImageBlobStore } from '../ImageBlobStore';
 import type { ImageMeta } from '../types';
 import type { VisionClientLike, VisionClientCallResult } from '../VisionClient';
@@ -361,6 +363,182 @@ describe('Vision pipeline E2E — image-source → vision → scatter → crop',
       .map((r) => `${r.x},${r.y},${r.width},${r.height}`)
       .sort();
     expect(bboxLabels).toEqual(expectedBboxLabels);
+  });
+
+  it('drives the full transform chain: vision → scatter → crop → adjust-bw → save', async () => {
+    // This is the load-bearing demo gate — proves the entire vision-pipeline
+    // feature works end-to-end through the executor with EVERY image handler
+    // wired in. Source image → Sonnet detects 3 regions → scatter fans out
+    // → each arm runs crop → adjust-bw → save in sequence.
+    const blob = new InMemoryImageBlobStore();
+    const { bytes, meta } = await makeSourceImage();
+    const sourceImageId = 'src_e2e_chain';
+    await blob.put(sourceImageId, bytes, meta);
+
+    const regions = [
+      { x: 10, y: 10, width: 80, height: 60, label: 'r1' },
+      { x: 110, y: 10, width: 80, height: 60, label: 'r2' },
+      { x: 60, y: 80, width: 80, height: 60, label: 'r3' },
+    ];
+
+    const customStepHandlers = new Map<string, StepHandler>();
+    customStepHandlers.set('scatter', createScatterStepHandler());
+    customStepHandlers.set('image:crop', createImageCropStepHandler({ imageBlobStore: blob }));
+    customStepHandlers.set('image-source', createImageSourceStepHandler({ imageBlobStore: blob }));
+    customStepHandlers.set('image:adjust-bw', createImageAdjustBwStepHandler({ imageBlobStore: blob }));
+    customStepHandlers.set('image:save', createImageSaveStepHandler({ imageBlobStore: blob }));
+    customStepHandlers.set(
+      'image:vision-analyze',
+      createVisionStepHandler({
+        visionClient: makeStubVisionClient(regions),
+        imageBlobStore: blob,
+        repository: { persistVisionResult: async () => {} },
+        pipelineIdLookup: () => 'pl_e2e_chain',
+      }),
+    );
+
+    // Build the 8-node pipeline definition: trigger → source → vision →
+    // scatter → crop → adjust → save. The transform chain reads each
+    // upstream's output via $.steps.<id>.imageId — Phase 1 / 3 handlers
+    // store the produced imageId at the bare step output level (no
+    // `.output` wrapper, matching execTrigger / execLLM convention).
+    const now = new Date().toISOString();
+    const triggerNode: PipelineNode = {
+      id: 'trigger', type: 'trigger', position: { x: 0, y: 0 },
+      data: { type: 'trigger', triggerType: 'manual' },
+    };
+    const sourceNode: PipelineNode = {
+      id: 'source', type: 'image-source' as never, position: { x: 100, y: 0 },
+      data: { type: 'image-source', mode: 'trigger', triggerPath: '$.trigger.imageRef' } as never,
+    };
+    const visionNode: PipelineNode = {
+      id: 'vision', type: 'image:vision-analyze' as never, position: { x: 200, y: 0 },
+      data: {
+        type: 'image:vision-analyze',
+        imageRefPath: '$.steps.source.imageId',
+        userPrompt: 'Find regions.',
+        outputSchema: { type: 'object', properties: { regions: { type: 'array' } } },
+      } as never,
+    };
+    const scatterNode: PipelineNode = {
+      id: 'scatter', type: 'scatter' as never, position: { x: 300, y: 0 },
+      data: {
+        type: 'scatter',
+        itemsPath: '$.steps.vision.extracted.regions',
+        itemAlias: 'region',
+      } as never,
+    };
+    const cropNode: PipelineNode = {
+      id: 'crop', type: 'image:crop' as never, position: { x: 400, y: 0 },
+      data: { type: 'image:crop', sourceImagePath: '$.steps.source.imageId', bboxPath: '$.region' } as never,
+    };
+    const adjustNode: PipelineNode = {
+      id: 'adjust', type: 'image:adjust-bw' as never, position: { x: 500, y: 0 },
+      data: { type: 'image:adjust-bw', sourceImagePath: '$.steps.crop.imageId', algorithm: 'luminosity' } as never,
+    };
+    const saveNode: PipelineNode = {
+      id: 'save', type: 'image:save' as never, position: { x: 600, y: 0 },
+      data: {
+        type: 'image:save',
+        sourceImagePath: '$.steps.adjust.imageId',
+        filenameTemplate: 'arm-{{region.label}}.png',
+      } as never,
+    };
+    const edges: PipelineEdge[] = [
+      { id: 'e1', source: 'trigger', sourceHandle: 'out', target: 'source', targetHandle: 'in' },
+      { id: 'e2', source: 'source', sourceHandle: 'out', target: 'vision', targetHandle: 'in' },
+      { id: 'e3', source: 'vision', sourceHandle: 'out', target: 'scatter', targetHandle: 'in' },
+      { id: 'e4', source: 'scatter', sourceHandle: 'out', target: 'crop', targetHandle: 'in' },
+      { id: 'e5', source: 'crop', sourceHandle: 'out', target: 'adjust', targetHandle: 'in' },
+      { id: 'e6', source: 'adjust', sourceHandle: 'out', target: 'save', targetHandle: 'in' },
+    ];
+    const definition: PipelineDefinition = {
+      id: 'def-chain-' + randomUUID().slice(0, 8),
+      name: 'full-chain',
+      version: 1,
+      status: 'published',
+      nodes: [triggerNode, sourceNode, visionNode, scatterNode, cropNode, adjustNode, saveNode],
+      edges,
+      createdBy: 'test',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const bus = makeEventBus();
+    await bus.start();
+    const imageEvents: Array<{ stepId: string; imageId: string }> = [];
+    bus.subscribe('pipeline:step:image:produced', async (env) => {
+      const p = (env as unknown as { payload: { stepId: string; imageId: string } }).payload;
+      imageEvents.push({ stepId: p.stepId, imageId: p.imageId });
+    });
+
+    const executor = new PipelineExecutor({
+      definition,
+      ownerNodeId: 'test-node',
+      llmClient: fakeLLMClient,
+      eventBus: bus,
+      speedMultiplier: 0.02,
+      triggerPayload: { trigger: { imageRef: sourceImageId } },
+      customStepHandlers,
+    });
+    const run = await executor.run();
+    expect(run.status).toBe('completed');
+
+    // Pre-scatter steps run once under bare ids.
+    for (const id of ['trigger', 'source', 'vision', 'scatter']) {
+      expect(run.steps[id].status).toBe('completed');
+    }
+
+    // Three arms × three transform nodes (crop, adjust, save).
+    for (const stage of ['crop', 'adjust', 'save']) {
+      for (const arm of [1, 2, 3]) {
+        const key = `${stage}:${arm}`;
+        expect(run.steps[key]?.status).toBe('completed');
+      }
+    }
+
+    // Chain integrity: save's output imageId chains back through adjust →
+    // crop → source. For each arm, save.imageId === adjust.imageId
+    // (image:save doesn't materialize a new buffer, just records the
+    // upstream id as the "final" output).
+    for (const arm of [1, 2, 3]) {
+      const adjustOut = run.steps[`adjust:${arm}`].output as Record<string, unknown>;
+      const saveOut = run.steps[`save:${arm}`].output as Record<string, unknown>;
+      expect(saveOut.imageId).toBe(adjustOut.imageId);
+    }
+
+    // Each adjust-bw arm produced a different imageId from its crop input
+    // — Sharp's grayscale conversion materializes a new buffer per arm.
+    const cropIds = [1, 2, 3].map(
+      (i) => (run.steps[`crop:${i}`].output as Record<string, unknown>).imageId as string,
+    );
+    const adjustIds = [1, 2, 3].map(
+      (i) => (run.steps[`adjust:${i}`].output as Record<string, unknown>).imageId as string,
+    );
+    expect(new Set(adjustIds).size).toBe(3);
+    for (let i = 0; i < 3; i++) {
+      expect(adjustIds[i]).not.toBe(cropIds[i]);
+    }
+
+    // Save handler resolved the filename template per arm using context's
+    // scatter.region.label — proves the {{path.to.value}} substitution
+    // sees the per-arm context that scatter cloned.
+    const saveFilenames = [1, 2, 3].map(
+      (i) => (run.steps[`save:${i}`].output as Record<string, unknown>).filename as string,
+    );
+    expect(saveFilenames.sort()).toEqual(['arm-r1.png', 'arm-r2.png', 'arm-r3.png']);
+
+    // image:produced events fire in the right places: 1 (source) +
+    // 3 (crop arms) + 3 (adjust arms) + 3 (save arms) = 10. Verifies
+    // every transform stage emits an event the canvas can subscribe to.
+    expect(imageEvents).toHaveLength(10);
+    const eventsByPrefix = {
+      source: imageEvents.filter((e) => e.stepId === 'source').length,
+      crop: imageEvents.filter((e) => e.stepId.startsWith('crop:')).length,
+      adjust: imageEvents.filter((e) => e.stepId.startsWith('adjust:')).length,
+      save: imageEvents.filter((e) => e.stepId.startsWith('save:')).length,
+    };
+    expect(eventsByPrefix).toEqual({ source: 1, crop: 3, adjust: 3, save: 3 });
   });
 
   it('produces zero arms when vision returns an empty regions array', async () => {
