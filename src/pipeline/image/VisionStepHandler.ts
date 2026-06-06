@@ -72,6 +72,7 @@ export function createVisionStepHandler(opts: VisionStepHandlerOpts): StepHandle
       getImageRefPath: (data) => data.imageRefPath,
       getModel: (data) => data.model,
       getMaxOutputTokens: (data) => data.maxOutputTokens,
+      getSeedRegions: (data) => data.seedRegions,
     },
     {
       visionClient: opts.visionClient,

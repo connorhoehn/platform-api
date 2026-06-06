@@ -54,6 +54,30 @@ export interface ImageVisionAnalyzeStepConfig {
   outputSchema?: Record<string, unknown>;
   /** Maximum tokens the vision call may emit. Default: 2048. */
   maxOutputTokens?: number;
+  /**
+   * Optional seed regions painted by the user in the BBoxAuthoringCanvas.
+   * When present, the handler appends a focus-hint stanza to the system
+   * prompt before calling the vision client.
+   */
+  seedRegions?: AuthoringBBox[];
+}
+
+/**
+ * Authoring bounding-box painted by the user in the pipeline editor's
+ * BBoxAuthoringCanvas. These are forwarded to the vision call as a
+ * system-prompt hint so the model focuses on the marked regions.
+ */
+export interface AuthoringBBox {
+  /** Stable client-side id (uuid). */
+  id: string;
+  /** Pixel x of the box origin (post-resize). */
+  x: number;
+  /** Pixel y of the box origin (post-resize). */
+  y: number;
+  width: number;
+  height: number;
+  /** Free-form label entered by the author. */
+  label?: string;
 }
 
 /**
@@ -73,6 +97,12 @@ export interface VisionAnalyzeInput {
   maxOutputTokens: number;
   /** Cancellation hook from the executor; SIGTERM → SIGKILL the child. */
   abortSignal?: AbortSignal;
+  /**
+   * Optional seed regions painted by the user in the pipeline editor.
+   * When present, a stanza is appended to the system prompt directing
+   * the model to focus on and include these regions in its output.
+   */
+  seedRegions?: AuthoringBBox[];
 }
 
 /**

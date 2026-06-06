@@ -45,6 +45,7 @@ import { computeVisionCost } from './computeVisionCost';
 import type { ImageBlobStore } from './ImageBlobStore';
 import type { VisionClientLike } from './VisionClient';
 import type {
+  AuthoringBBox,
   ImageMeta,
   VisionAnalyzeInput,
   VisionFailureReason,
@@ -103,6 +104,13 @@ export interface VisionHandlerDescriptor<TNodeData extends { type: string }> {
    * Return undefined to fall back to descriptor.defaultMaxOutputTokens.
    */
   getMaxOutputTokens?(data: TNodeData): number | undefined;
+  /**
+   * Extract the seed regions painted by the user in the BBoxAuthoringCanvas.
+   * When non-empty, the factory appends a focus-hint stanza to the system
+   * prompt before passing the input to the vision client.
+   * Return undefined to skip the stanza.
+   */
+  getSeedRegions?(data: TNodeData): AuthoringBBox[] | undefined;
 }
 
 // ─── Shared opts (injected at construction time) ───────────────────────
@@ -196,7 +204,13 @@ export function createVisionLikeHandler<TNodeData extends { type: string }>(
       // ── 3. Build schema + prompts ────────────────────────────────────
       const outputSchema = descriptor.buildSchema(data);
       const userPrompt = renderUserPrompt(descriptor.buildUserPrompt(data), context);
-      const systemPrompt = descriptor.buildSystemPrompt(data);
+      const baseSysPrompt = descriptor.buildSystemPrompt(data);
+      const seedRegions =
+        descriptor.getSeedRegions ? descriptor.getSeedRegions(data) : undefined;
+      const systemPrompt =
+        seedRegions && seedRegions.length > 0
+          ? buildSeedRegionsStanza(baseSysPrompt, seedRegions)
+          : baseSysPrompt;
 
       // ── 4. Emit started ──────────────────────────────────────────────
       await emit('pipeline:image:vision:started', {
@@ -400,6 +414,22 @@ export function renderUserPrompt(
       return _match;
     }
   });
+}
+
+/**
+ * Appends the seed-regions focus-hint stanza to the system prompt.
+ * When the system prompt is empty the stanza becomes the sole content.
+ */
+export function buildSeedRegionsStanza(
+  systemPrompt: string,
+  seedRegions: AuthoringBBox[],
+): string {
+  const stanza = [
+    'The user has marked the following regions of interest. Focus your',
+    'analysis on these regions; include them in your `regions` output:',
+    JSON.stringify(seedRegions),
+  ].join('\n');
+  return systemPrompt ? `${systemPrompt}\n\n${stanza}` : stanza;
 }
 
 /** Translate VisionClient failureReason to the event-catalog enum. */
