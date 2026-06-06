@@ -22,6 +22,11 @@ import { createImageSourceStepHandler } from './ImageSourceStepHandler';
 import { createImageAdjustBwStepHandler } from './ImageAdjustBwStepHandler';
 import { createImageAdjustLayerStepHandler } from './ImageAdjustLayerStepHandler';
 import { createImageSaveStepHandler } from './ImageSaveStepHandler';
+import { createImageResizeStepHandler } from './ImageResizeStepHandler';
+import { createImageGeometricTransformStepHandler } from './ImageGeometricTransformStepHandler';
+import { createImageFormatConvertStepHandler } from './ImageFormatConvertStepHandler';
+import { createImageSharpenStepHandler } from './ImageSharpenStepHandler';
+import { createImageWatermarkStepHandler } from './ImageWatermarkStepHandler';
 import { getImageBlobStore, getVisionClient, getVisionResultRepo } from './visionServices';
 
 /** Mutable reference cell — bootstrap patches `current` after `new PipelineModule(...)`. */
@@ -89,6 +94,14 @@ export function buildVisionStepHandlers(
   handlers.set('image:adjust-bw', createImageAdjustBwStepHandler({ imageBlobStore }));
   handlers.set('image:adjust-layer', createImageAdjustLayerStepHandler({ imageBlobStore }));
   handlers.set('image:save', createImageSaveStepHandler({ imageBlobStore }));
+
+  // Phase 4 Sharp transform handlers — resize, geometric transforms,
+  // format conversion, sharpening, and watermarking.
+  handlers.set('image:resize', createImageResizeStepHandler({ imageBlobStore }));
+  handlers.set('image:transform', createImageGeometricTransformStepHandler({ imageBlobStore }));
+  handlers.set('image:format-convert', createImageFormatConvertStepHandler({ imageBlobStore }));
+  handlers.set('image:sharpen', createImageSharpenStepHandler({ imageBlobStore }));
+  handlers.set('image:watermark', createImageWatermarkStepHandler({ imageBlobStore }));
 
   return handlers;
 }
