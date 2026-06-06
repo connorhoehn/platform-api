@@ -16,12 +16,14 @@ beforeEach(() => {
   mockDynamoDBClientCtor.mockClear();
   mockDocClientFrom.mockClear();
   delete process.env.AWS_REGION;
+  delete process.env.LOCAL_DDB_ENDPOINT;
   delete process.env.DYNAMODB_ENDPOINT;
   delete process.env.LOCALSTACK_ENDPOINT;
 });
 
 afterEach(() => {
   delete process.env.AWS_REGION;
+  delete process.env.LOCAL_DDB_ENDPOINT;
   delete process.env.DYNAMODB_ENDPOINT;
   delete process.env.LOCALSTACK_ENDPOINT;
 });
@@ -76,7 +78,30 @@ describe('getDynamoClient', () => {
     expect(opts.credentials).toBeUndefined();
   });
 
-  test('injects DYNAMODB_ENDPOINT as endpoint with test credentials', () => {
+  test('injects LOCAL_DDB_ENDPOINT as endpoint with local credentials', () => {
+    process.env.LOCAL_DDB_ENDPOINT = 'http://localhost:18000';
+    mockDocClientFrom.mockReturnValue({});
+    load();
+    getDynamoClient();
+    const opts = mockDynamoDBClientCtor.mock.calls[0][0] as {
+      endpoint: string;
+      credentials: { accessKeyId: string; secretAccessKey: string };
+    };
+    expect(opts.endpoint).toBe('http://localhost:18000');
+    expect(opts.credentials).toEqual({ accessKeyId: 'local', secretAccessKey: 'local' });
+  });
+
+  test('LOCAL_DDB_ENDPOINT takes precedence over DYNAMODB_ENDPOINT', () => {
+    process.env.LOCAL_DDB_ENDPOINT = 'http://managed-nosql-store:8000';
+    process.env.DYNAMODB_ENDPOINT = 'http://dynamodb-local:8000';
+    mockDocClientFrom.mockReturnValue({});
+    load();
+    getDynamoClient();
+    const opts = mockDynamoDBClientCtor.mock.calls[0][0] as { endpoint: string };
+    expect(opts.endpoint).toBe('http://managed-nosql-store:8000');
+  });
+
+  test('injects DYNAMODB_ENDPOINT as endpoint with local credentials', () => {
     process.env.DYNAMODB_ENDPOINT = 'http://localhost:8000';
     mockDocClientFrom.mockReturnValue({});
     load();
@@ -86,10 +111,10 @@ describe('getDynamoClient', () => {
       credentials: { accessKeyId: string; secretAccessKey: string };
     };
     expect(opts.endpoint).toBe('http://localhost:8000');
-    expect(opts.credentials).toEqual({ accessKeyId: 'test', secretAccessKey: 'test' });
+    expect(opts.credentials).toEqual({ accessKeyId: 'local', secretAccessKey: 'local' });
   });
 
-  test('falls back to LOCALSTACK_ENDPOINT when DYNAMODB_ENDPOINT is not set', () => {
+  test('falls back to LOCALSTACK_ENDPOINT when LOCAL_DDB_ENDPOINT and DYNAMODB_ENDPOINT are not set', () => {
     process.env.LOCALSTACK_ENDPOINT = 'http://localhost:4566';
     mockDocClientFrom.mockReturnValue({});
     load();
@@ -99,7 +124,7 @@ describe('getDynamoClient', () => {
       credentials: { accessKeyId: string; secretAccessKey: string };
     };
     expect(opts.endpoint).toBe('http://localhost:4566');
-    expect(opts.credentials).toEqual({ accessKeyId: 'test', secretAccessKey: 'test' });
+    expect(opts.credentials).toEqual({ accessKeyId: 'local', secretAccessKey: 'local' });
   });
 
   test('DYNAMODB_ENDPOINT takes precedence over LOCALSTACK_ENDPOINT', () => {

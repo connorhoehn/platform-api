@@ -2,11 +2,14 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { SQSClient } from '@aws-sdk/client-sqs';
 
-const endpoint = process.env.DYNAMODB_ENDPOINT || process.env.LOCALSTACK_ENDPOINT;
+const endpoint =
+  process.env.LOCAL_DDB_ENDPOINT ||
+  process.env.DYNAMODB_ENDPOINT ||
+  process.env.LOCALSTACK_ENDPOINT;
 const localConfig = endpoint
   ? {
       endpoint,
-      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+      credentials: { accessKeyId: 'local', secretAccessKey: 'local' },
     }
   : {};
 
