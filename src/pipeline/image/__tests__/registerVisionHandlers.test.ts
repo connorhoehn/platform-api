@@ -37,8 +37,9 @@ describe('buildVisionStepHandlers — Map structure', () => {
     expect(map).toBeInstanceOf(Map);
     // Phase 1 expanded the registry from 1 → 4 kinds; Phase 3 adds three
     // more image transform handlers for a total of 7; Phase 4 adds five
-    // Sharp transform handlers for a total of 12.
-    expect(map.size).toBe(12);
+    // Sharp transform handlers for a total of 12; Phase 5 adds three
+    // generative AI (Bedrock) handlers for a total of 15.
+    expect(map.size).toBe(15);
     expect(map.has('image:vision-analyze')).toBe(true);
     expect(map.has('scatter')).toBe(true);
     expect(map.has('image:crop')).toBe(true);
@@ -51,6 +52,9 @@ describe('buildVisionStepHandlers — Map structure', () => {
     expect(map.has('image:format-convert')).toBe(true);
     expect(map.has('image:sharpen')).toBe(true);
     expect(map.has('image:watermark')).toBe(true);
+    expect(map.has('image:generate')).toBe(true);
+    expect(map.has('image:variation')).toBe(true);
+    expect(map.has('image:edit-prompt')).toBe(true);
     // Each handler.kind must equal its map key (executor contract).
     for (const [key, handler] of map) {
       expect(handler.kind).toBe(key);

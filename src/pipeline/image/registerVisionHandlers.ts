@@ -27,6 +27,9 @@ import { createImageGeometricTransformStepHandler } from './ImageGeometricTransf
 import { createImageFormatConvertStepHandler } from './ImageFormatConvertStepHandler';
 import { createImageSharpenStepHandler } from './ImageSharpenStepHandler';
 import { createImageWatermarkStepHandler } from './ImageWatermarkStepHandler';
+import { createImageGenerateStepHandler } from './ImageGenerateStepHandler';
+import { createImageVariationStepHandler } from './ImageVariationStepHandler';
+import { createImageEditPromptStepHandler } from './ImageEditPromptStepHandler';
 import { getImageBlobStore, getVisionClient, getVisionResultRepo } from './visionServices';
 
 /** Mutable reference cell — bootstrap patches `current` after `new PipelineModule(...)`. */
@@ -102,6 +105,11 @@ export function buildVisionStepHandlers(
   handlers.set('image:format-convert', createImageFormatConvertStepHandler({ imageBlobStore }));
   handlers.set('image:sharpen', createImageSharpenStepHandler({ imageBlobStore }));
   handlers.set('image:watermark', createImageWatermarkStepHandler({ imageBlobStore }));
+
+  // Phase 5 generative AI handlers — Bedrock Titan + Nova Canvas.
+  handlers.set('image:generate', createImageGenerateStepHandler({ imageBlobStore }));
+  handlers.set('image:variation', createImageVariationStepHandler({ imageBlobStore }));
+  handlers.set('image:edit-prompt', createImageEditPromptStepHandler({ imageBlobStore }));
 
   return handlers;
 }
