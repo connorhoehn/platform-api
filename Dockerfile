@@ -47,6 +47,12 @@ RUN apk add --no-cache curl git openssh-client python3 make g++ ripgrep \
     && mkdir -p -m 0700 /root/.ssh \
     && ssh-keyscan github.com >> /root/.ssh/known_hosts
 RUN npm install -g @anthropic-ai/claude-code
+# typescript installed globally so Tilt live_update's `npx tsc` step has a
+# compiler to invoke. Without this, the runtime image only has the
+# --omit=dev install below, which excludes typescript (devDep), and the
+# live_update tsc step silently no-ops while the running pod keeps stale
+# dist/. Pinned to the same major as devDeps to avoid lib drift.
+RUN npm install -g typescript@~5.6.3
 RUN addgroup -g 1001 -S nodejs && adduser -S platformapi -u 1001 -G nodejs
 WORKDIR /app
 COPY platform-api/package.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
