@@ -135,6 +135,7 @@ describe('VisionStepHandler — happy path', () => {
     expect(emitted.map((e) => e.event)).toEqual([
       'pipeline:image:vision:started',
       'pipeline:image:vision:analyzed',
+      'pipeline:step:image:produced',
     ]);
     expect(client.analyze).toHaveBeenCalledTimes(1);
     expect(persistVisionResult).toHaveBeenCalledTimes(1);
@@ -281,7 +282,11 @@ describe('VisionStepHandler — happy path', () => {
     // Event ordering: started → tokens → analyzed.
     const order = emitted.map((e) => e.event);
     expect(order[0]).toBe('pipeline:image:vision:started');
-    expect(order.at(-1)).toBe('pipeline:image:vision:analyzed');
+    // The vision factory emits two terminal events on success:
+    // `pipeline:image:vision:analyzed` (vision-specific result) followed by
+    // `pipeline:step:image:produced` (generic canvas-thumbnail event).
+    expect(order).toContain('pipeline:image:vision:analyzed');
+    expect(order.at(-1)).toBe('pipeline:step:image:produced');
   });
 
   it('schema mode: passes outputSchema to the client + flags hasSchema:true on started', async () => {

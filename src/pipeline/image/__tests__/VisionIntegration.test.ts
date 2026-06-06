@@ -154,7 +154,11 @@ describe('VisionIntegration — happy path', () => {
     // Event order: started → token(s) → analyzed
     const events = emitted.map((e) => e.event);
     expect(events[0]).toBe('pipeline:image:vision:started');
-    expect(events.at(-1)).toBe('pipeline:image:vision:analyzed');
+    // `pipeline:image:vision:analyzed` is the vision-specific terminal; the
+    // factory now also emits `pipeline:step:image:produced` after it so the
+    // canvas can render the analyzed image as an inline thumbnail.
+    expect(events).toContain('pipeline:image:vision:analyzed');
+    expect(events.at(-1)).toBe('pipeline:step:image:produced');
 
     // Token events present (3 deltas)
     const tokenEvents = emitted.filter((e) => e.event === 'pipeline:image:vision:token');

@@ -313,6 +313,25 @@ export function createVisionLikeHandler<TNodeData extends { type: string }>(
         at: stepAt,
       });
 
+      // ── 8a. Also emit the generic produced-image event so the canvas
+      // renders an inline thumbnail of the source image on the vision
+      // node body (mirrors crop / adjust / save handlers). The vision
+      // step does not materialize a NEW image — the thumbnail it surfaces
+      // is the source image it analyzed.
+      try {
+        await emit('pipeline:step:image:produced', {
+          runId: helpers.runId,
+          stepId: helpers.stepId,
+          imageId,
+          width: imageRow.meta.width,
+          height: imageRow.meta.height,
+          mimeType: imageRow.meta.mimeType,
+          at: stepAt,
+        });
+      } catch {
+        // never let a subscriber kill the step
+      }
+
       return {
         status: 'completed',
         output: result,

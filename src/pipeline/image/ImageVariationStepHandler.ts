@@ -68,8 +68,9 @@ export interface ImageVariationStepHandlerOpts {
 }
 
 const DEFAULT_MODEL = 'amazon.nova-canvas-v1:0';
-const DEFAULT_SOURCE_PATH = '$.scatter.parentImageId';
-const FALLBACK_SOURCE_PATHS = ['$.trigger.imageRef', '$.trigger.imageId'];
+const DEFAULT_SOURCE_PATH = '$.imageId';
+const FALLBACK_SOURCE_PATHS = ['$.scatter.parentImageId',
+  '$.trigger.imageRef', '$.trigger.imageId'];
 const THROTTLING_NAMES = new Set(['ThrottlingException', 'TooManyRequestsException']);
 
 export function createImageVariationStepHandler(

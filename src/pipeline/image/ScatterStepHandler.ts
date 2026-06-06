@@ -16,7 +16,7 @@
 //
 // === Resolution ===
 // `itemsPath` is a dotted/bracketed path interpreted against the live
-// context (e.g. `$.steps.visionAnalyze.output.extracted.regions`). When
+// context (e.g. `$.steps.visionAnalyze.extracted.regions`). When
 // the path resolves to:
 //   - an Array → fan out to N arms.
 //   - a string → JSON-parse it first (some upstream nodes serialize).
@@ -45,7 +45,7 @@ import type {
 interface ScatterNodeData {
   type: 'scatter';
   /**
-   * JSONPath into context, e.g. `$.steps.visionAnalyze.output.extracted.regions`.
+   * JSONPath into context, e.g. `$.steps.visionAnalyze.extracted.regions`.
    * Leading `$.` is optional and stripped.
    */
   itemsPath: string;

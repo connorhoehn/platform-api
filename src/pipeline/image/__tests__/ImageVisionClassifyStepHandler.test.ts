@@ -102,6 +102,7 @@ describe('ImageVisionClassifyStepHandler — happy path', () => {
     expect(emitted.map((e) => e.event)).toEqual([
       'pipeline:image:vision:started',
       'pipeline:image:vision:analyzed',
+      'pipeline:step:image:produced',
     ]);
     const result = outcome.output as VisionResult;
     expect(result.imageId).toBe('img_cls');

@@ -342,10 +342,11 @@ describe('Vision pipeline E2E — image-source → vision → scatter → crop',
     expect((fanoutEvents[0].payload as Record<string, unknown>).stepId).toBe('scatter');
     expect((fanoutEvents[0].payload as Record<string, unknown>).count).toBe(3);
 
-    // One image:produced per crop arm (3) + one per source (image-source).
-    // The exact count is N crops + 1 source. Both share the same event type.
+    // One image:produced per crop arm (3) + one for the source step + one
+    // for the vision step (vision emits the source image thumbnail so the
+    // canvas can show what was analyzed). N crops + source + vision = 5.
     const imageEvents = events.filter((e) => e.type === 'pipeline:step:image:produced');
-    expect(imageEvents).toHaveLength(4);
+    expect(imageEvents).toHaveLength(5);
     const cropImageEvents = imageEvents.filter(
       (e) =>
         typeof (e.payload as Record<string, unknown>).stepId === 'string' &&
@@ -529,16 +530,18 @@ describe('Vision pipeline E2E — image-source → vision → scatter → crop',
     expect(saveFilenames.sort()).toEqual(['arm-r1.png', 'arm-r2.png', 'arm-r3.png']);
 
     // image:produced events fire in the right places: 1 (source) +
-    // 3 (crop arms) + 3 (adjust arms) + 3 (save arms) = 10. Verifies
-    // every transform stage emits an event the canvas can subscribe to.
-    expect(imageEvents).toHaveLength(10);
+    // 1 (vision — emits the analyzed source thumbnail) + 3 (crop arms) +
+    // 3 (adjust arms) + 3 (save arms) = 11. Every transform stage emits
+    // an event the canvas can subscribe to.
+    expect(imageEvents).toHaveLength(11);
     const eventsByPrefix = {
       source: imageEvents.filter((e) => e.stepId === 'source').length,
+      vision: imageEvents.filter((e) => e.stepId === 'vision').length,
       crop: imageEvents.filter((e) => e.stepId.startsWith('crop:')).length,
       adjust: imageEvents.filter((e) => e.stepId.startsWith('adjust:')).length,
       save: imageEvents.filter((e) => e.stepId.startsWith('save:')).length,
     };
-    expect(eventsByPrefix).toEqual({ source: 1, crop: 3, adjust: 3, save: 3 });
+    expect(eventsByPrefix).toEqual({ source: 1, vision: 1, crop: 3, adjust: 3, save: 3 });
   });
 
   it('produces zero arms when vision returns an empty regions array', async () => {

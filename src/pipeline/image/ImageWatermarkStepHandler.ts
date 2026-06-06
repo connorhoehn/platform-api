@@ -84,8 +84,9 @@ export interface ImageWatermarkStepHandlerOpts {
   imageBlobStore: ImageBlobStore;
 }
 
-const DEFAULT_SOURCE_PATH = '$.scatter.parentImageId';
-const FALLBACK_SOURCE_PATHS = ['$.trigger.imageRef', '$.trigger.imageId'];
+const DEFAULT_SOURCE_PATH = '$.imageId';
+const FALLBACK_SOURCE_PATHS = ['$.scatter.parentImageId',
+  '$.trigger.imageRef', '$.trigger.imageId'];
 
 export function createImageWatermarkStepHandler(
   opts: ImageWatermarkStepHandlerOpts,
@@ -178,6 +179,16 @@ export function createImageWatermarkStepHandler(
       }
 
       // ── Composite ──────────────────────────────────────────────────────
+      // Sharp accepts EITHER `gravity` (anchor relative to source) OR
+      // explicit `left`/`top` pixel coords — not both. Resolve gravity to
+      // absolute pixel coords so offsetX/offsetY actually take effect.
+      const srcW = source.meta.width;
+      const srcH = source.meta.height;
+      const olW = overlay.meta.width;
+      const olH = overlay.meta.height;
+      const absLeft = resolveLeft(gravity, srcW, olW, offsetX);
+      const absTop = resolveTop(gravity, srcH, olH, offsetY);
+
       let outBytes: Buffer;
       let outInfo: { width: number; height: number; format: string };
       try {
@@ -186,16 +197,9 @@ export function createImageWatermarkStepHandler(
           .composite([
             {
               input: overlayWithAlpha,
-              gravity,
+              left: absLeft,
+              top: absTop,
               blend: 'over',
-              left: undefined,
-              top: undefined,
-              // offsetX/offsetY are passed as tile options; Sharp 0.33+
-              // supports gravity + offset via the top/left fields when
-              // gravity is omitted, but the gravity shorthand positions
-              // the overlay and we use offsetX/Y as padding via
-              // gravity-relative offset. We calculate the absolute
-              // position to give precise control.
             },
           ])
           .png()
@@ -267,4 +271,58 @@ export function createImageWatermarkStepHandler(
       };
     },
   };
+}
+
+/**
+ * Resolve gravity-anchored overlay X position into an absolute left pixel
+ * coordinate, applying the user's `offsetX` as an inset from the anchor edge.
+ * Sharp's `composite` accepts either `gravity` OR explicit `left/top` — not
+ * both — so we convert gravity → coords here to make offsetX/offsetY work.
+ */
+function resolveLeft(
+  gravity: WatermarkGravity,
+  srcW: number,
+  olW: number,
+  offsetX: number,
+): number {
+  switch (gravity) {
+    case 'north':
+    case 'south':
+    case 'center':
+      return Math.max(0, Math.round((srcW - olW) / 2));
+    case 'northwest':
+    case 'west':
+    case 'southwest':
+      return Math.max(0, offsetX);
+    case 'northeast':
+    case 'east':
+    case 'southeast':
+      return Math.max(0, srcW - olW - offsetX);
+    default:
+      return 0;
+  }
+}
+
+function resolveTop(
+  gravity: WatermarkGravity,
+  srcH: number,
+  olH: number,
+  offsetY: number,
+): number {
+  switch (gravity) {
+    case 'west':
+    case 'east':
+    case 'center':
+      return Math.max(0, Math.round((srcH - olH) / 2));
+    case 'northwest':
+    case 'north':
+    case 'northeast':
+      return Math.max(0, offsetY);
+    case 'southwest':
+    case 'south':
+    case 'southeast':
+      return Math.max(0, srcH - olH - offsetY);
+    default:
+      return 0;
+  }
 }

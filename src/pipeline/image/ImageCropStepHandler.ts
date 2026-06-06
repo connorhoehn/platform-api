@@ -83,12 +83,24 @@ export interface ImageCropStepHandlerOpts {
   imageBlobStore: ImageBlobStore;
 }
 
-const DEFAULT_SOURCE_PATH = '$.scatter.parentImageId';
+// Source-image resolution convention:
+//   `$.imageId` is the top-level imageId merged into context by the executor's
+//   `accumulateContext` after every image handler returns `{imageId, ...}`.
+//   That makes `$.imageId` the *most-recent* produced imageId, which is what
+//   downstream transforms (crop/adjust/save) want by default. Inside a
+//   scatter arm before any crop has run, this still resolves to the source
+//   image because image-source's output already populated it.
+const DEFAULT_SOURCE_PATH = '$.imageId';
 const FALLBACK_SOURCE_PATHS = [
+  '$.scatter.parentImageId',
   '$.trigger.imageRef',
   '$.trigger.imageId',
 ];
-const DEFAULT_BBOX_PATH = '$.scatter.item.bbox';
+// Scatter writes the per-arm item at `context.scatter.item` AND under the
+// configured itemAlias (default 'item'). Crop reads the bbox from the item
+// — accepts either `{bbox: {...}}` nested or `{x,y,width,height}` flat form
+// via coerceBBox.
+const DEFAULT_BBOX_PATH = '$.scatter.item';
 
 export function createImageCropStepHandler(
   opts: ImageCropStepHandlerOpts,
@@ -253,6 +265,11 @@ export function createImageCropStepHandler(
  * Coerce arbitrary input to a BBox if possible. Accepts the canonical
  * `{x,y,width,height}` shape, plus alternates the vision step sometimes
  * emits (`{left,top,width,height}`, `{x1,y1,x2,y2}` corner form).
+ *
+ * Also unwraps a `.bbox` sub-key when present so callers can default
+ * `bboxPath` to `$.scatter.item` and have the coercer handle BOTH
+ * `{label, bbox: {x,y,w,h}}` nested vision schemas AND
+ * `{x,y,w,h,label}` flat vision schemas transparently.
  */
 function coerceBBox(raw: unknown): BBox | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -260,7 +277,7 @@ function coerceBBox(raw: unknown): BBox | null {
   const num = (v: unknown): number | null =>
     typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : null;
 
-  // Canonical shape.
+  // Canonical flat shape.
   const x = num(r['x']);
   const y = num(r['y']);
   const w = num(r['width']);
@@ -288,6 +305,13 @@ function coerceBBox(raw: unknown): BBox | null {
       width: Math.abs(x2 - x1),
       height: Math.abs(y2 - y1),
     };
+  }
+
+  // Nested-bbox unwrap: try `.bbox` once. Lets callers default the bbox
+  // path to `$.scatter.item` and have it work whether the vision schema
+  // emits the bbox flat or under a `bbox` sub-key.
+  if (r['bbox'] && typeof r['bbox'] === 'object') {
+    return coerceBBox(r['bbox']);
   }
 
   return null;

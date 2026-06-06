@@ -66,8 +66,9 @@ export interface ImageFormatConvertStepHandlerOpts {
   imageBlobStore: ImageBlobStore;
 }
 
-const DEFAULT_SOURCE_PATH = '$.scatter.parentImageId';
-const FALLBACK_SOURCE_PATHS = ['$.trigger.imageRef', '$.trigger.imageId'];
+const DEFAULT_SOURCE_PATH = '$.imageId';
+const FALLBACK_SOURCE_PATHS = ['$.scatter.parentImageId',
+  '$.trigger.imageRef', '$.trigger.imageId'];
 const VALID_FORMATS = new Set<string>(['jpeg', 'png', 'webp', 'avif']);
 
 function formatToMime(format: ConvertFormat): string {
