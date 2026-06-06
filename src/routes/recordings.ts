@@ -22,7 +22,7 @@ import { Router, Request, Response } from 'express';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
-import { callRecordingRepo, videoSessionRepo } from '../repositories';
+import { callRecordingRepo } from '../repositories';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { VIDEO_API_URL, VIDEO_PUBLIC_URL } from '../lib/video-auth';
@@ -121,33 +121,22 @@ recordingsRouter.post(
     // signer; LVS validates the channel's `authorized` flag and
     // returns a JWT with 1-hour TTL.
     //
-    // Auth: the LVS playback-tokens route requires `allowStreamKey` or
-    // `allowJwt` with role=publisher — the admin bearer is REJECTED.
-    // Look up the matching VideoSession by lobbyName to grab the
-    // channel's streamKey (same path videoSessions.ts uses for
-    // participant-token mints at line 367).
+    // Auth: post-Wave-7 thin-proxy migration LVS no longer returns a
+    // streamKey on POST /api/sessions, so the DDB row's streamKey is
+    // always '' and can't be used to authorize this hop (would send no
+    // Authorization header → LVS 401 → 502 to the FE). Use the
+    // ADMIN_TOKEN bearer instead — LVS bearerAuth treats it as a
+    // role=admin wildcard that satisfies `allowJwt` here. Same pattern
+    // as reapLvsParticipant (videoSessions.ts).
     const arn = detail.channelArn;
-    // Look up the streamKey from ANY session (active OR ended) for this
-    // lobby. Recordings are queried AFTER the call ends, so the session is
-    // no longer 'active' — `findActiveByLobbyName` (used by /sessions
-    // findOrCreate) would always return null here. Scan all sessions for
-    // the lobby and match on channelArn so we pick the right streamKey
-    // even when a lobby's been reused across multiple recordings.
-    let streamKey: string | null = null;
-    try {
-      const all = await videoSessionRepo.getSessionsByDocument(detail.lobbyName);
-      const match = all.find((s) => s.channelArn === arn);
-      streamKey = match?.streamKey ?? null;
-    } catch (e: any) {
-      log.warn({ err: e?.message ?? e, lobbyName: detail.lobbyName }, '[recordings] streamKey lookup failed');
-    }
+    const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
     let token: string;
     let expiresAt: string;
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (streamKey) {
-        headers.Authorization = `Bearer ${streamKey}`;
-      }
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      };
       // Routed through the shared SFU CircuitBreaker (hub#1001) — an open
       // circuit fast-fails before fetch, and any 5xx from LVS counts as a
       // breaker failure so other LVS-touching routes (videoSessions.ts) see
@@ -192,16 +181,52 @@ recordingsRouter.post(
       throw mapSfuError(e);
     }
 
-    // Compose the playable URL. DVR playlist over the recording's time
-    // window — LVS stitches the segments into one VOD HLS playlist.
-    const params = new URLSearchParams({
-      from: detail.startedAt,
-      to: detail.endedAt,
-      ...(token ? { token } : {}),
-    });
-    const playlistUrl = `${VIDEO_PUBLIC_URL}/api/channels/${encodeURIComponent(arn)}/dvr/playlist.m3u8?${params}`;
+    // Compose the playable URL.
+    //
+    // The previous implementation returned a `/dvr/playlist.m3u8` URL
+    // pointing at the LVS DVR HLS subsystem — a separate code path that
+    // synthesizes a VOD HLS manifest from time-windowed live segments.
+    // Recordings DO NOT live in that subsystem: the SFU's
+    // RecordingManager writes raw MP4 files (recording_NNNNN.mp4 per
+    // segment, peer_leg-NNN.mp4 per participant, composed.mp4 for the
+    // multi-producer grid) under `<recordingDir>/<arnSafe>/<recordingId>/`
+    // and serves them via `GET /:arn/recordings/:id/segments/:filename`
+    // with byte-range support. The DVR HLS path never had any of these
+    // files, so playback consistently 404'd.
+    //
+    // Adopt the same flow the LVS admin UI uses: hand the FE a direct
+    // MP4 URL and let <video src> handle byte-range playback + seek. No
+    // HLS, no playlist, no token-query-param dance (the segments route
+    // is CORS-open and admin-bypass; token mint is preserved for
+    // potential future use by private-channel callers).
+    //
+    // File-picking order: composed grid → first segment → fallback to
+    // `composed.mp4` literal (so a recording with a pending compose
+    // job will start playing the moment the file lands).
+    const composedKey =
+      (detail as { composedSegment?: { key?: string; url?: string } }).composedSegment?.key
+      ?? (detail as { composedSegment?: { key?: string; url?: string } }).composedSegment?.url;
+    const firstSegmentKey =
+      (detail.segments && detail.segments[0]?.key)
+      ?? (detail.segments && detail.segments[0]?.url);
+    const playbackKey = composedKey ?? firstSegmentKey ?? 'composed.mp4';
+    // `path.basename` strips any `<arnSafe>/<recordingId>/` prefix from
+    // the stored key without pulling node:path into the import surface
+    // unnecessarily — simple string split is enough.
+    const playbackFilename = playbackKey.split('/').pop() ?? 'composed.mp4';
+    const composedUrl = `${VIDEO_PUBLIC_URL}/api/channels/${encodeURIComponent(arn)}/recordings/${encodeURIComponent(recordingId)}/segments/${encodeURIComponent(playbackFilename)}`;
 
-    res.json({ playlistUrl, token: token || null, expiresAt: expiresAt || null });
+    // `playlistUrl` is preserved for backward compatibility with the FE's
+    // RecordingPlayer (it expects a `playlistUrl` field), but is now a
+    // direct MP4 URL — works with both hls.js (which falls back to
+    // native <video src> for non-m3u8 URLs) and bare <video>.
+    // `composedUrl` is the new explicit field; FE checks it first.
+    res.json({
+      playlistUrl: composedUrl,
+      composedUrl,
+      token: token || null,
+      expiresAt: expiresAt || null,
+    });
   }),
 );
 
