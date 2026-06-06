@@ -12,13 +12,14 @@
 //
 // Code parity with platform-api/src/pipeline/judge/judgeServices.ts.
 
-import { VisionClient } from './VisionClient';
+import { VisionClient, type VisionClientLike } from './VisionClient';
+import { AnthropicVisionClient } from './AnthropicVisionClient';
 import { VisionResultRepository } from './VisionResultRepository';
 import { DdbImageBlobStore, type ImageBlobStore } from './ImageBlobStore';
 
 let _imageBlobStore: ImageBlobStore | null = null;
 let _visionResultRepo: VisionResultRepository | null = null;
-let _visionClient: VisionClient | null = null;
+let _visionClient: VisionClientLike | null = null;
 
 /**
  * Singleton DdbImageBlobStore (`pipeline-images` DDB table). Operator
@@ -49,13 +50,28 @@ export function getVisionResultRepo(): VisionResultRepository {
 }
 
 /**
- * Singleton VisionClient. Reads ANTHROPIC_API_KEY at first access.
- * Vision can't use the Claude Code CLI OAuth path (see VisionClient.ts
- * header for the deviation rationale).
+ * Singleton vision client. Selection is env-gated:
+ *
+ *   VISION_CLIENT=anthropic  (default) — SDK path via @anthropic-ai/sdk;
+ *     base64 image content block, real `messages.stream`, parallel-safe.
+ *     Required for scatter / fan-out pipelines where N vision-ish calls
+ *     run concurrently — the CLI path's per-call subprocess overhead is
+ *     prohibitive at N > 1.
+ *
+ *   VISION_CLIENT=cli — legacy subprocess path that spawns `claude -p`
+ *     with a tempfile. Kept as a Bedrock-OAuth fallback for envs where
+ *     ANTHROPIC_API_KEY is unavailable. Will be removed in a follow-up
+ *     once Bedrock support is wired into the SDK client.
+ *
+ * Both clients honor the same `VisionClientLike` interface — handler
+ * code (`VisionStepHandler`) is unaffected by the choice.
  */
-export function getVisionClient(): VisionClient {
+export function getVisionClient(): VisionClientLike {
   if (!_visionClient) {
-    _visionClient = new VisionClient();
+    const mode = (process.env['VISION_CLIENT'] ?? 'anthropic').toLowerCase();
+    _visionClient = mode === 'cli'
+      ? new VisionClient()
+      : new AnthropicVisionClient();
   }
   return _visionClient;
 }

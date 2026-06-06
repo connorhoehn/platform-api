@@ -16,6 +16,9 @@
 import type { Logger } from 'pino';
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createVisionStepHandler } from './VisionStepHandler';
+import { createScatterStepHandler } from './ScatterStepHandler';
+import { createImageCropStepHandler } from './ImageCropStepHandler';
+import { createImageSourceStepHandler } from './ImageSourceStepHandler';
 import { getImageBlobStore, getVisionClient, getVisionResultRepo } from './visionServices';
 
 /** Mutable reference cell — bootstrap patches `current` after `new PipelineModule(...)`. */
@@ -69,5 +72,14 @@ export function buildVisionStepHandlers(
   });
 
   handlers.set('image:vision-analyze', visionHandler);
+
+  // Phase 1 vision-pipeline node types — see PipelineExecutor.ts (DC commit
+  // 6475ad3c) for the `StepOutcome.fanOut` semantics that ScatterStepHandler
+  // returns. All three handlers are non-throwing and share the same
+  // ImageBlobStore singleton so crops + sources see the same DDB rows.
+  handlers.set('scatter', createScatterStepHandler());
+  handlers.set('image:crop', createImageCropStepHandler({ imageBlobStore }));
+  handlers.set('image-source', createImageSourceStepHandler({ imageBlobStore }));
+
   return handlers;
 }

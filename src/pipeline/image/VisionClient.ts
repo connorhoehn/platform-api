@@ -132,6 +132,25 @@ export interface VisionClientOpts {
 }
 
 /**
+ * Structural interface for any vision client. Lets `VisionStepHandler`
+ * accept either the CLI-spawn `VisionClient` or the SDK-based
+ * `AnthropicVisionClient` without committing to the concrete class.
+ *
+ * The two implementations share the same call surface but differ in
+ * transport: the CLI client (legacy) spawns `claude -p` and reads the
+ * Read tool's auto-base64 of a tempfile; the SDK client posts a base64
+ * image content block directly via `@anthropic-ai/sdk`. The SDK path is
+ * the production default — the CLI path stays around as a Bedrock-OAuth
+ * fallback until the v0.4 cleanup.
+ */
+export interface VisionClientLike {
+  analyze(
+    input: VisionAnalyzeInput,
+    onToken?: VisionTokenCallback,
+  ): Promise<VisionClientCallResult>;
+}
+
+/**
  * Callback fired once per token delta as the CLI streams stdout. The
  * VisionStepHandler uses this to emit `pipeline:image:vision:token`
  * events so the frontend can render live updates by accumulating locally.

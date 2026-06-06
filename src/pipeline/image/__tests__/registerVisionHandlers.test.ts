@@ -30,13 +30,22 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('buildVisionStepHandlers — Map structure', () => {
-  it('returns a Map with exactly one entry keyed on image:vision-analyze', () => {
+  it('registers the four vision-pipeline step kinds', () => {
     const ref: PipelineModuleRef = { current: null };
     const map = buildVisionStepHandlers({ moduleRef: ref });
 
     expect(map).toBeInstanceOf(Map);
-    expect(map.size).toBe(1);
+    // Phase 1 expanded the registry from 1 → 4 kinds: the original vision
+    // analyzer plus the three new image-pipeline primitives.
+    expect(map.size).toBe(4);
     expect(map.has('image:vision-analyze')).toBe(true);
+    expect(map.has('scatter')).toBe(true);
+    expect(map.has('image:crop')).toBe(true);
+    expect(map.has('image-source')).toBe(true);
+    // Each handler.kind must equal its map key (executor contract).
+    for (const [key, handler] of map) {
+      expect(handler.kind).toBe(key);
+    }
   });
 
   it('handler.kind equals image:vision-analyze', () => {

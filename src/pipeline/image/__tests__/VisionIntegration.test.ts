@@ -110,6 +110,7 @@ function makeHelpers(): {
     }) as never,
     runId: 'run_integ_1',
     ownerNodeId: 'node_integ',
+    stepId: 'step_integ',
     abortSignal: new AbortController().signal,
     sleep: async () => {},
     isCancelled: () => false,

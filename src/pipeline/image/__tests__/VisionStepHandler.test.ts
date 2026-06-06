@@ -62,6 +62,7 @@ function makeHelpers(): {
     }) as never,
     runId: 'run_1',
     ownerNodeId: 'node_test',
+    stepId: 'step_vision',
     abortSignal: new AbortController().signal,
     sleep: async () => {},
     isCancelled: () => false,

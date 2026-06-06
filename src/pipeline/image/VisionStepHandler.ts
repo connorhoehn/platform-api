@@ -27,7 +27,7 @@ import type {
   StepOutcome,
 } from 'distributed-core/applications/pipeline';
 import { withContext } from '../../lib/logger';
-import { VisionClient } from './VisionClient';
+import { type VisionClientLike } from './VisionClient';
 
 const log = withContext({ handler: 'VisionStepHandler' });
 import { computeVisionCost } from './computeVisionCost';
@@ -47,7 +47,7 @@ export interface VisionResultRepositoryLike {
 }
 
 export interface VisionStepHandlerOpts {
-  visionClient: VisionClient;
+  visionClient: VisionClientLike;
   imageBlobStore: ImageBlobStore;
   repository?: VisionResultRepositoryLike;
   defaultModel?: string;
