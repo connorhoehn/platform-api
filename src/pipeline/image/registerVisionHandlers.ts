@@ -19,6 +19,9 @@ import { createVisionStepHandler } from './VisionStepHandler';
 import { createScatterStepHandler } from './ScatterStepHandler';
 import { createImageCropStepHandler } from './ImageCropStepHandler';
 import { createImageSourceStepHandler } from './ImageSourceStepHandler';
+import { createImageAdjustBwStepHandler } from './ImageAdjustBwStepHandler';
+import { createImageAdjustLayerStepHandler } from './ImageAdjustLayerStepHandler';
+import { createImageSaveStepHandler } from './ImageSaveStepHandler';
 import { getImageBlobStore, getVisionClient, getVisionResultRepo } from './visionServices';
 
 /** Mutable reference cell — bootstrap patches `current` after `new PipelineModule(...)`. */
@@ -80,6 +83,12 @@ export function buildVisionStepHandlers(
   handlers.set('scatter', createScatterStepHandler());
   handlers.set('image:crop', createImageCropStepHandler({ imageBlobStore }));
   handlers.set('image-source', createImageSourceStepHandler({ imageBlobStore }));
+
+  // Phase 3 image transform handlers — B&W conversion, layered adjustments,
+  // and the terminal save node. All share the same ImageBlobStore singleton.
+  handlers.set('image:adjust-bw', createImageAdjustBwStepHandler({ imageBlobStore }));
+  handlers.set('image:adjust-layer', createImageAdjustLayerStepHandler({ imageBlobStore }));
+  handlers.set('image:save', createImageSaveStepHandler({ imageBlobStore }));
 
   return handlers;
 }
