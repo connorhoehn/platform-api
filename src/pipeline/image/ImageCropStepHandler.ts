@@ -56,6 +56,15 @@ interface ImageCropNodeData {
    */
   bboxPath?: string;
   /**
+   * Literal bbox baked into the node config. When present, this is used
+   * VERBATIM and `bboxPath` is ignored — frozen-run pipelines (see
+   * `freezeRun.ts` on the wsg-frontend side) hardcode the detection
+   * result into each cloned CropNode so re-runs are deterministic. The
+   * shape is the same canonical `{x,y,width,height}` integer-pixels in
+   * post-resize coordinate space.
+   */
+  bbox?: { x: number; y: number; width: number; height: number };
+  /**
    * When false, skip persisting the cropped buffer — output carries the
    * computed bbox but no new imageId. Useful for "preview only" pipelines
    * where downstream consumers don't need a stored crop. Default: true.
@@ -117,11 +126,17 @@ export function createImageCropStepHandler(
       }
 
       // ── Resolve bbox ───────────────────────────────────────────────────
-      const bbox = coerceBBox(readPath(context, bboxPath));
+      // Literal `data.bbox` wins over `bboxPath` resolution — frozen-run
+      // pipelines hardcode the detection result into the node config, so
+      // the handler must honor the literal even when no scatter context
+      // exists at execution time.
+      const bbox = coerceBBox(data.bbox) ?? coerceBBox(readPath(context, bboxPath));
       if (!bbox) {
         return {
           status: 'failed',
-          error: `image:crop: bbox at '${bboxPath}' is missing or malformed (expected {x,y,width,height})`,
+          error: data.bbox
+            ? `image:crop: literal data.bbox is malformed (expected {x,y,width,height}, got: ${JSON.stringify(data.bbox)})`
+            : `image:crop: bbox at '${bboxPath}' is missing or malformed (expected {x,y,width,height})`,
         };
       }
 

@@ -223,6 +223,77 @@ describe('ImageCropStepHandler.execute', () => {
     expect(outcome.error).toMatch(/not found/);
   });
 
+  it('honors a literal data.bbox over the context bboxPath (frozen-run path)', async () => {
+    const blob = new InMemoryImageBlobStore();
+    const { bytes, meta } = await makeTestImage();
+    await blob.put('src_frozen', bytes, meta);
+
+    const handler = createImageCropStepHandler({ imageBlobStore: blob });
+    const outcome = await handler.execute(
+      makeNode({
+        // Literal bbox baked into the node config — no scatter context.
+        bbox: { x: 5, y: 5, width: 60, height: 40 },
+      }),
+      {
+        // Source is resolvable via the fallback trigger path.
+        trigger: { imageRef: 'src_frozen' },
+      },
+      makeHelpers().helpers,
+    );
+
+    expect(outcome.status).toBe('completed');
+    const bbox = (outcome.output as Record<string, unknown>).bbox as Record<string, number>;
+    expect(bbox).toEqual({ x: 5, y: 5, width: 60, height: 40 });
+  });
+
+  it('data.bbox literal wins over the context bboxPath when both are set', async () => {
+    const blob = new InMemoryImageBlobStore();
+    const { bytes, meta } = await makeTestImage();
+    await blob.put('src_both', bytes, meta);
+
+    const handler = createImageCropStepHandler({ imageBlobStore: blob });
+    const outcome = await handler.execute(
+      makeNode({ bbox: { x: 1, y: 2, width: 30, height: 40 } }),
+      {
+        scatter: {
+          parentImageId: 'src_both',
+          // Context bbox would be DIFFERENT — handler must ignore it
+          // because data.bbox is set.
+          item: { bbox: { x: 50, y: 50, width: 20, height: 20 } },
+        },
+      },
+      makeHelpers().helpers,
+    );
+    expect(outcome.status).toBe('completed');
+    const bbox = (outcome.output as Record<string, unknown>).bbox as Record<string, number>;
+    expect(bbox).toEqual({ x: 1, y: 2, width: 30, height: 40 });
+  });
+
+  it('falls back to bboxPath when data.bbox is malformed (non-fatal coercion)', async () => {
+    // A malformed literal `data.bbox` returns null from coerceBBox; the
+    // handler should fall through to the context path rather than failing
+    // outright. (Defensive: keeps the wsg-frontend's freeze-run from
+    // breaking a re-run if a future edit zeroes one of the bbox fields.)
+    const blob = new InMemoryImageBlobStore();
+    const { bytes, meta } = await makeTestImage();
+    await blob.put('src_fall', bytes, meta);
+
+    const handler = createImageCropStepHandler({ imageBlobStore: blob });
+    const outcome = await handler.execute(
+      makeNode({ bbox: { foo: 'bar' } as never }),
+      {
+        scatter: {
+          parentImageId: 'src_fall',
+          item: { bbox: { x: 0, y: 0, width: 25, height: 25 } },
+        },
+      },
+      makeHelpers().helpers,
+    );
+    expect(outcome.status).toBe('completed');
+    const bbox = (outcome.output as Record<string, unknown>).bbox as Record<string, number>;
+    expect(bbox.width).toBe(25);
+  });
+
   it('fails when bbox is malformed', async () => {
     const blob = new InMemoryImageBlobStore();
     const { bytes, meta } = await makeTestImage();
