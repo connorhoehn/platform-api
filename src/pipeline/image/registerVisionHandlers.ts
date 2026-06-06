@@ -30,6 +30,10 @@ import { createImageWatermarkStepHandler } from './ImageWatermarkStepHandler';
 import { createImageGenerateStepHandler } from './ImageGenerateStepHandler';
 import { createImageVariationStepHandler } from './ImageVariationStepHandler';
 import { createImageEditPromptStepHandler } from './ImageEditPromptStepHandler';
+import { createImageVisionClassifyStepHandler } from './ImageVisionClassifyStepHandler';
+import { createImageVisionDescribeStepHandler } from './ImageVisionDescribeStepHandler';
+import { createImageVisionTagStepHandler } from './ImageVisionTagStepHandler';
+import { createImageVisionExtractTextStepHandler } from './ImageVisionExtractTextStepHandler';
 import { getImageBlobStore, getVisionClient, getVisionResultRepo } from './visionServices';
 
 /** Mutable reference cell — bootstrap patches `current` after `new PipelineModule(...)`. */
@@ -110,6 +114,28 @@ export function buildVisionStepHandlers(
   handlers.set('image:generate', createImageGenerateStepHandler({ imageBlobStore }));
   handlers.set('image:variation', createImageVariationStepHandler({ imageBlobStore }));
   handlers.set('image:edit-prompt', createImageEditPromptStepHandler({ imageBlobStore }));
+
+  // Phase 6 chained-vision handlers — specialized vision analysis nodes
+  // that delegate to the shared VisionClient via createVisionLikeHandler.
+  const chainedVisionOpts = {
+    visionClient,
+    imageBlobStore,
+    repository,
+    pipelineIdLookup: (runId: string) => {
+      const mod = opts.moduleRef.current;
+      if (!mod || typeof mod.getRun !== 'function') return undefined;
+      try {
+        const run = mod.getRun(runId);
+        return run?.pipelineId;
+      } catch {
+        return undefined;
+      }
+    },
+  };
+  handlers.set('image:vision-classify', createImageVisionClassifyStepHandler(chainedVisionOpts));
+  handlers.set('image:vision-describe', createImageVisionDescribeStepHandler(chainedVisionOpts));
+  handlers.set('image:vision-tag', createImageVisionTagStepHandler(chainedVisionOpts));
+  handlers.set('image:vision-extract-text', createImageVisionExtractTextStepHandler(chainedVisionOpts));
 
   return handlers;
 }

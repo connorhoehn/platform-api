@@ -30,7 +30,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('buildVisionStepHandlers — Map structure', () => {
-  it('registers the twelve vision-pipeline step kinds', () => {
+  it('registers the nineteen vision-pipeline step kinds', () => {
     const ref: PipelineModuleRef = { current: null };
     const map = buildVisionStepHandlers({ moduleRef: ref });
 
@@ -38,8 +38,9 @@ describe('buildVisionStepHandlers — Map structure', () => {
     // Phase 1 expanded the registry from 1 → 4 kinds; Phase 3 adds three
     // more image transform handlers for a total of 7; Phase 4 adds five
     // Sharp transform handlers for a total of 12; Phase 5 adds three
-    // generative AI (Bedrock) handlers for a total of 15.
-    expect(map.size).toBe(15);
+    // generative AI (Bedrock) handlers for a total of 15; Phase 6 adds four
+    // chained-vision handlers for a total of 19.
+    expect(map.size).toBe(19);
     expect(map.has('image:vision-analyze')).toBe(true);
     expect(map.has('scatter')).toBe(true);
     expect(map.has('image:crop')).toBe(true);
@@ -55,6 +56,10 @@ describe('buildVisionStepHandlers — Map structure', () => {
     expect(map.has('image:generate')).toBe(true);
     expect(map.has('image:variation')).toBe(true);
     expect(map.has('image:edit-prompt')).toBe(true);
+    expect(map.has('image:vision-classify')).toBe(true);
+    expect(map.has('image:vision-describe')).toBe(true);
+    expect(map.has('image:vision-tag')).toBe(true);
+    expect(map.has('image:vision-extract-text')).toBe(true);
     // Each handler.kind must equal its map key (executor contract).
     for (const [key, handler] of map) {
       expect(handler.kind).toBe(key);
