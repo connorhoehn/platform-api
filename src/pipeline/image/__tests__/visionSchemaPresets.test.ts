@@ -5,6 +5,8 @@
 
 import {
   buildPresetSchema,
+  getPresetDefaultPrompt,
+  PRESET_DEFAULT_PROMPTS,
   type VisionSchemaPreset,
 } from '../visionSchemaPresets';
 
@@ -203,6 +205,160 @@ describe('buildPresetSchema — detection-regions', () => {
     const conf = itemProps['confidence'] as Record<string, unknown>;
     expect(conf['minimum']).toBe(0);
     expect(conf['maximum']).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// face-detection
+// ---------------------------------------------------------------------------
+
+describe('buildPresetSchema — face-detection', () => {
+  it('produces required field: faces', () => {
+    const schema = buildPresetSchema('face-detection');
+    expect(schema!['required']).toEqual(expect.arrayContaining(['faces']));
+  });
+
+  it('face items require bbox + confidence', () => {
+    const schema = buildPresetSchema('face-detection');
+    const props = schema!['properties'] as Record<string, unknown>;
+    const faces = props['faces'] as Record<string, unknown>;
+    const items = faces['items'] as Record<string, unknown>;
+    expect(items['required']).toEqual(expect.arrayContaining(['bbox', 'confidence']));
+  });
+
+  it('bbox uses normalized [0,1] coordinates', () => {
+    const schema = buildPresetSchema('face-detection');
+    const props = schema!['properties'] as Record<string, unknown>;
+    const faces = props['faces'] as Record<string, unknown>;
+    const items = faces['items'] as Record<string, unknown>;
+    const itemProps = items['properties'] as Record<string, unknown>;
+    const bbox = itemProps['bbox'] as Record<string, unknown>;
+    const bboxProps = bbox['properties'] as Record<string, unknown>;
+    const x = bboxProps['x'] as Record<string, unknown>;
+    expect(x['minimum']).toBe(0);
+    expect(x['maximum']).toBe(1);
+  });
+
+  it('exposes optional age, expression, gaze attributes', () => {
+    const schema = buildPresetSchema('face-detection');
+    const props = schema!['properties'] as Record<string, unknown>;
+    const faces = props['faces'] as Record<string, unknown>;
+    const items = faces['items'] as Record<string, unknown>;
+    const itemProps = items['properties'] as Record<string, unknown>;
+    expect(itemProps['age']).toBeDefined();
+    expect(itemProps['expression']).toBeDefined();
+    expect(itemProps['gaze']).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// color-palette
+// ---------------------------------------------------------------------------
+
+describe('buildPresetSchema — color-palette', () => {
+  it('produces required fields: dominant, temperature', () => {
+    const schema = buildPresetSchema('color-palette');
+    expect(schema!['required']).toEqual(
+      expect.arrayContaining(['dominant', 'temperature']),
+    );
+  });
+
+  it('dominant is an array capped at 5 items', () => {
+    const schema = buildPresetSchema('color-palette');
+    const props = schema!['properties'] as Record<string, unknown>;
+    const dominant = props['dominant'] as Record<string, unknown>;
+    expect(dominant['type']).toBe('array');
+    expect(dominant['maxItems']).toBe(5);
+  });
+
+  it('dominant items require hex + percentage', () => {
+    const schema = buildPresetSchema('color-palette');
+    const props = schema!['properties'] as Record<string, unknown>;
+    const dominant = props['dominant'] as Record<string, unknown>;
+    const items = dominant['items'] as Record<string, unknown>;
+    expect(items['required']).toEqual(expect.arrayContaining(['hex', 'percentage']));
+  });
+
+  it('temperature is an enum of warm/cool/neutral', () => {
+    const schema = buildPresetSchema('color-palette');
+    const props = schema!['properties'] as Record<string, unknown>;
+    const temp = props['temperature'] as Record<string, unknown>;
+    expect(temp['enum']).toEqual(expect.arrayContaining(['warm', 'cool', 'neutral']));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// image-quality-rating
+// ---------------------------------------------------------------------------
+
+describe('buildPresetSchema — image-quality-rating', () => {
+  it('produces all required scoring fields + rationale', () => {
+    const schema = buildPresetSchema('image-quality-rating');
+    expect(schema!['required']).toEqual(
+      expect.arrayContaining([
+        'focus',
+        'exposure',
+        'composition',
+        'overallScore',
+        'rationale',
+      ]),
+    );
+  });
+
+  it('all numeric score fields are integers 0-10', () => {
+    const schema = buildPresetSchema('image-quality-rating');
+    const props = schema!['properties'] as Record<string, unknown>;
+    for (const key of ['focus', 'exposure', 'composition', 'overallScore']) {
+      const field = props[key] as Record<string, unknown>;
+      expect(field['type']).toBe('integer');
+      expect(field['minimum']).toBe(0);
+      expect(field['maximum']).toBe(10);
+    }
+  });
+
+  it('rationale is a string field', () => {
+    const schema = buildPresetSchema('image-quality-rating');
+    const props = schema!['properties'] as Record<string, unknown>;
+    const rationale = props['rationale'] as Record<string, unknown>;
+    expect(rationale['type']).toBe('string');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Preset default prompts
+// ---------------------------------------------------------------------------
+
+describe('PRESET_DEFAULT_PROMPTS', () => {
+  it('has an entry for every preset', () => {
+    const presets: VisionSchemaPreset[] = [
+      'caption-only',
+      'classification-enum',
+      'multi-label-tags',
+      'ocr-records',
+      'detection-regions',
+      'face-detection',
+      'color-palette',
+      'image-quality-rating',
+    ];
+    for (const p of presets) {
+      expect(PRESET_DEFAULT_PROMPTS[p]).toBeTruthy();
+      expect(getPresetDefaultPrompt(p)).toBe(PRESET_DEFAULT_PROMPTS[p]);
+    }
+  });
+
+  it('face-detection prompt restricts to human faces', () => {
+    expect(getPresetDefaultPrompt('face-detection')).toMatch(/human faces/i);
+    expect(getPresetDefaultPrompt('face-detection')).toMatch(/Do NOT detect non-human/);
+  });
+
+  it('color-palette prompt asks for hex codes and temperature', () => {
+    const prompt = getPresetDefaultPrompt('color-palette');
+    expect(prompt).toMatch(/hex/i);
+    expect(prompt).toMatch(/warm\/cool\/neutral/);
+  });
+
+  it('image-quality-rating prompt mentions 30/30/40 weighting', () => {
+    expect(getPresetDefaultPrompt('image-quality-rating')).toMatch(/30\/30\/40/);
   });
 });
 
