@@ -46,6 +46,8 @@ import { pipelineLLMStreamRouter } from './pipelineLLMStream';
 import { pipelineCostRouter } from './pipelineCost';
 import { pipelineLineageRouter } from './pipeline-lineage';
 import { pipelineSchemasRouter } from './pipeline-schemas';
+import { pipelinePreviewAdjustLayerRouter } from './pipeline-preview-adjust-layer';
+import { pipelinePreviewVisionRouter } from './pipeline-preview-vision';
 import { documentTypesRouter } from './documentTypes';
 import { typedDocumentsRouter } from './typedDocuments';
 import { approvalsRouter } from './approvals';
@@ -141,6 +143,10 @@ router.use('/pipelines/llm/stream', pipelineLLMStreamRouter);
 // path with a singular `pipeline` prefix to distinguish from the plural
 // `/pipelines/*` run/definition surface.
 router.use('/pipeline/output-schemas', pipelineSchemasRouter);
+// Preview routes — ephemeral, no storage or run records. Used by live
+// slider panels (adjust-layer) and the vision prompt bench.
+router.use('/pipeline/preview/adjust-layer', pipelinePreviewAdjustLayerRouter);
+router.use('/pipeline/preview/vision', pipelinePreviewVisionRouter);
 // Image lineage DAG — GET /api/pipeline/runs/:runId/image-lineage?pipelineId=<id>.
 // Returns per-run image artifact entries with parent edges for the lineage graph.
 router.use('/pipeline/runs/:runId/image-lineage', pipelineLineageRouter);
