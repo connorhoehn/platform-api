@@ -1,12 +1,14 @@
 // src/routes/__tests__/pipeline-preview-adjust-layer.test.ts
 //
-// 6 cases:
-//   1. 400 missing imageId
-//   2. 404 unknown image
-//   3. 200 single-layer success
-//   4. 200 multi-layer success
-//   5. 413 image too large
+// 8 cases:
+//   1. 400 missing imageId AND imageUrl
+//   2. 404 unknown imageId
+//   3. 200 single-layer success via imageId
+//   4. 200 multi-layer success via imageId
+//   5. 413 image too large via imageId
 //   6. 400 malformed layer kind
+//   7. 200 success via imageUrl (legacy fallback)
+//   8. 404 (passthrough) when only imageId is supplied and store misses
 
 import express from 'express';
 import http from 'http';
@@ -134,13 +136,13 @@ describe('POST /api/pipeline/preview/adjust-layer', () => {
     server.close(done);
   });
 
-  it('400 when imageId is missing', async () => {
+  it('400 when both imageId and imageUrl are missing', async () => {
     const { status, body } = await jsonRequest(server, { layers: [] });
     expect(status).toBe(400);
-    expect((body as { error: string }).error).toMatch(/imageId/);
+    expect((body as { error: string }).error).toMatch(/imageId.*imageUrl|imageUrl.*imageId/);
   });
 
-  it('404 when image is unknown', async () => {
+  it('404 when imageId is unknown', async () => {
     const { status } = await jsonRequest(server, {
       imageId: 'does-not-exist-xyz',
       layers: [],
@@ -206,5 +208,46 @@ describe('POST /api/pipeline/preview/adjust-layer', () => {
     });
     expect(status).toBe(400);
     expect((body as { error: string }).error).toMatch(/kind/i);
+  });
+
+  it('200 success via imageUrl legacy fallback (no imageId)', async () => {
+    const png = await makeTinyPng();
+    const prevFetch = globalThis.fetch;
+    (globalThis as unknown as { fetch: jest.Mock }).fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: {
+        get: (header: string) => {
+          if (header === 'content-type') return 'image/png';
+          if (header === 'content-length') return String(png.length);
+          return null;
+        },
+      },
+      arrayBuffer: async () =>
+        png.buffer.slice(png.byteOffset, png.byteOffset + png.byteLength) as ArrayBuffer,
+    });
+
+    try {
+      const { status, body } = await jsonRequest(server, {
+        imageUrl: 'https://example.com/tiny.png',
+        layers: [{ kind: 'brightness', value: 1.1 }],
+      });
+      expect(status).toBe(200);
+      const b = body as { dataUrl: string; mimeType: string };
+      expect(b.dataUrl).toMatch(/^data:image\/png;base64,/);
+      expect(b.mimeType).toBe('image/png');
+    } finally {
+      globalThis.fetch = prevFetch;
+    }
+  });
+
+  it('404 with unknown imageId even when imageUrl is absent', async () => {
+    const { status, body } = await jsonRequest(server, {
+      imageId: 'totally-missing-id',
+      layers: [{ kind: 'brightness', value: 1.0 }],
+    });
+    expect(status).toBe(404);
+    expect((body as { error: string }).error).toMatch(/not found/i);
   });
 });

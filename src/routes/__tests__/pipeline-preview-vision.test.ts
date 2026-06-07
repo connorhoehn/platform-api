@@ -1,18 +1,21 @@
 // src/routes/__tests__/pipeline-preview-vision.test.ts
 //
-// 6 cases:
-//   1. 400 missing imageUrl
-//   2. 200 caption-only success
-//   3. 200 with structured schema (extracted field present)
-//   4. 413 image too large
+// 8 cases:
+//   1. 400 missing both imageId and imageUrl
+//   2. 200 caption-only success (imageUrl path)
+//   3. 200 with structured schema (extracted field present) (imageUrl path)
+//   4. 413 image too large (imageUrl path)
 //   5. content-policy refusal → 200 with empty caption + failureReason
 //   6. throttled → 429
+//   7. 200 caption-only success (imageId path — no imageUrl)
+//   8. 404 with unknown imageId
 
 import express from 'express';
 import http from 'http';
 import { AddressInfo } from 'net';
 import { _resetRateLimitMemFallback } from '../../middleware/rateLimit';
 import { errorHandler } from '../../middleware/error-handler';
+import { InMemoryImageBlobStore } from '../../pipeline/image/ImageBlobStore';
 import type { Request, Response, NextFunction } from 'express';
 
 // ── Suppress Redis in tests ───────────────────────────────────────────────
@@ -29,10 +32,13 @@ jest.mock('../../middleware/auth', () => ({
   optionalAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
 }));
 
+// ── Shared in-memory blob store (used by the imageId-path tests) ─────────
+const blobStore = new InMemoryImageBlobStore();
+
 // ── Mock vision client factory ────────────────────────────────────────────
 const mockAnalyze = jest.fn();
 jest.mock('../../pipeline/image/visionServices', () => ({
-  getImageBlobStore: jest.fn(),
+  getImageBlobStore: jest.fn(() => blobStore),
   getVisionResultRepo: jest.fn(),
   getVisionClient: () => ({ analyze: mockAnalyze }),
   __resetVisionServicesForTests: jest.fn(),
@@ -149,12 +155,12 @@ describe('POST /api/pipeline/preview/vision', () => {
     server.close(done);
   });
 
-  it('400 when imageUrl is missing', async () => {
+  it('400 when both imageId and imageUrl are missing', async () => {
     const { status, body } = await jsonRequest(server, {
       userPrompt: 'Describe this.',
     });
     expect(status).toBe(400);
-    expect((body as { error: string }).error).toMatch(/imageUrl/);
+    expect((body as { error: string }).error).toMatch(/imageId.*imageUrl|imageUrl.*imageId/);
   });
 
   it('200 caption-only success', async () => {
@@ -238,5 +244,45 @@ describe('POST /api/pipeline/preview/vision', () => {
       statuses.push(status);
     }
     expect(statuses).toContain(429);
+  });
+
+  it('200 caption-only success via imageId (no imageUrl)', async () => {
+    const imageId = 'vision-test-img-' + Date.now();
+    await blobStore.put(imageId, SMALL_PNG, {
+      mimeType: 'image/png',
+      sizeBytes: SMALL_PNG.length,
+      width: 1,
+      height: 1,
+      uploadedAt: new Date().toISOString(),
+    });
+
+    // No fetch should happen for imageId path — make sure global fetch is
+    // un-mocked into a thrower so any accidental URL fetch fails loudly.
+    const prevFetch = globalThis.fetch;
+    (globalThis as unknown as { fetch: jest.Mock }).fetch = jest.fn(() => {
+      throw new Error('fetch should not be called when imageId is provided');
+    });
+
+    try {
+      const { status, body } = await jsonRequest(server, {
+        imageId,
+        userPrompt: 'Describe this image.',
+      });
+      expect(status).toBe(200);
+      const b = body as { caption: string; usage: { inputTokens: number } };
+      expect(b.caption).toBe('A test image.');
+      expect(b.usage.inputTokens).toBe(100);
+    } finally {
+      globalThis.fetch = prevFetch;
+    }
+  });
+
+  it('404 when imageId is unknown', async () => {
+    const { status, body } = await jsonRequest(server, {
+      imageId: 'totally-unknown-vision-id',
+      userPrompt: 'Describe this image.',
+    });
+    expect(status).toBe(404);
+    expect((body as { error: string }).error).toMatch(/not found/i);
   });
 });

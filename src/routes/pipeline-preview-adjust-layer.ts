@@ -12,6 +12,11 @@
 //   - Rate limit: 30 calls/min per authed user (client-side debounce keeps
 //     steady-state well under 2/s; this is a safety ceiling).
 //
+// Image input: caller supplies either `imageId` (preferred — server-side
+// blob-store lookup, works with signed/IP-locked URLs that platform-api
+// itself can't dereference) or `imageUrl` (legacy fallback — fetched via
+// the same SSRF-safe path as the vision preview route).
+//
 // Auth: requireAuth (same as every other /api/pipeline/* route).
 
 import { Router } from 'express';
@@ -20,6 +25,7 @@ import { asyncHandler, ValidationError, NotFoundError } from '../middleware/erro
 import { createRateLimiter } from '../middleware/rateLimit';
 import { requireAuth } from '../middleware/auth';
 import { getImageBlobStore } from '../pipeline/image/visionServices';
+import { fetchPreviewImageFromUrl } from './pipeline-preview-image-fetch';
 import type { AdjustLayer } from '../pipeline/image/ImageAdjustLayerStepHandler';
 
 // ---------------------------------------------------------------------------
@@ -120,7 +126,16 @@ export async function applyAdjustLayers(
 // ---------------------------------------------------------------------------
 
 interface PreviewAdjustLayerRequestBody {
+  /**
+   * Preferred input — server-side blob-store lookup. Works even when the
+   * canonical URL is signed / IP-locked and unreachable by platform-api.
+   */
   imageId?: string;
+  /**
+   * Legacy fallback — fetched via the same SSRF-safe path as the vision
+   * preview route. Ignored when `imageId` is also present.
+   */
+  imageUrl?: string;
   layers?: AdjustLayer[];
 }
 
@@ -144,10 +159,12 @@ pipelinePreviewAdjustLayerRouter.post(
     const body = req.body as PreviewAdjustLayerRequestBody | undefined;
 
     // ── Validate request body ─────────────────────────────────────────────
-    const { imageId, layers } = body ?? {};
+    const { imageId, imageUrl, layers } = body ?? {};
 
-    if (!imageId || typeof imageId !== 'string') {
-      throw new ValidationError('imageId is required');
+    const hasImageId = typeof imageId === 'string' && imageId.length > 0;
+    const hasImageUrl = typeof imageUrl === 'string' && imageUrl.trim().length > 0;
+    if (!hasImageId && !hasImageUrl) {
+      throw new ValidationError('imageId or imageUrl is required');
     }
 
     const layerValidationError = validateLayers(layers);
@@ -158,16 +175,38 @@ pipelinePreviewAdjustLayerRouter.post(
     const safeL = (layers ?? []) as AdjustLayer[];
 
     // ── Fetch source image bytes ──────────────────────────────────────────
-    const store = getImageBlobStore();
-    const source = await store.get(imageId);
+    // Prefer imageId (blob-store lookup) — works with signed/IP-locked URLs
+    // that platform-api itself can't reach. Fall back to imageUrl via the
+    // shared SSRF-safe fetch helper when only the URL is supplied.
+    let sourceBytes: Buffer;
 
-    if (!source) {
-      throw new NotFoundError(`image '${imageId}' not found`);
-    }
+    if (hasImageId) {
+      const store = getImageBlobStore();
+      const source = await store.get(imageId as string);
 
-    if (source.body.byteLength > INPUT_SIZE_CAP_BYTES) {
-      res.status(413).json({ error: `source image exceeds ${INPUT_SIZE_CAP_BYTES} byte preview limit` });
-      return;
+      if (!source) {
+        throw new NotFoundError(`image '${imageId}' not found`);
+      }
+
+      if (source.body.byteLength > INPUT_SIZE_CAP_BYTES) {
+        res.status(413).json({ error: `source image exceeds ${INPUT_SIZE_CAP_BYTES} byte preview limit` });
+        return;
+      }
+      sourceBytes = source.body;
+    } else {
+      try {
+        const fetched = await fetchPreviewImageFromUrl((imageUrl as string).trim(), INPUT_SIZE_CAP_BYTES);
+        sourceBytes = fetched.body;
+      } catch (err) {
+        const status = (err as Error & { status?: number }).status;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (status === 413) {
+          res.status(413).json({ error: msg });
+          return;
+        }
+        if (err instanceof ValidationError) throw err;
+        throw new ValidationError(`image fetch error: ${msg}`);
+      }
     }
 
     // ── Apply layers via Sharp ────────────────────────────────────────────
@@ -176,7 +215,7 @@ pipelinePreviewAdjustLayerRouter.post(
     let height: number;
 
     try {
-      const result = await applyAdjustLayers(source.body, safeL);
+      const result = await applyAdjustLayers(sourceBytes, safeL);
       outData = result.data;
       width = result.width;
       height = result.height;
