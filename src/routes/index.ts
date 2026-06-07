@@ -44,6 +44,7 @@ import { pipelineInspectorRouter } from './pipelineInspector';
 import { pipelineDLQRouter } from './pipelineDLQ';
 import { pipelineLLMStreamRouter } from './pipelineLLMStream';
 import { pipelineCostRouter } from './pipelineCost';
+import { pipelineLineageRouter } from './pipeline-lineage';
 import { pipelineSchemasRouter } from './pipeline-schemas';
 import { documentTypesRouter } from './documentTypes';
 import { typedDocumentsRouter } from './typedDocuments';
@@ -140,6 +141,9 @@ router.use('/pipelines/llm/stream', pipelineLLMStreamRouter);
 // path with a singular `pipeline` prefix to distinguish from the plural
 // `/pipelines/*` run/definition surface.
 router.use('/pipeline/output-schemas', pipelineSchemasRouter);
+// Image lineage DAG — GET /api/pipeline/runs/:runId/image-lineage?pipelineId=<id>.
+// Returns per-run image artifact entries with parent edges for the lineage graph.
+router.use('/pipeline/runs/:runId/image-lineage', pipelineLineageRouter);
 // hub#2225 audit search — GET /api/pipelines/audit/search?actor=&pipelineId=...
 // Static segment, must precede the `:pipelineId` mount below for the same
 // reason as `/metrics`/`/defs`/`/llm/stream`.
