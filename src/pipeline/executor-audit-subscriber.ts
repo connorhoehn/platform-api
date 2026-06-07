@@ -114,6 +114,9 @@ export class ExecutorAuditSubscriber {
             stepId: event.payload.stepId,
             nodeType: event.payload.nodeType,
             at: event.payload.at,
+            ...(event.payload.systemPrompt !== undefined
+              ? { systemPrompt: event.payload.systemPrompt }
+              : {}),
           },
         });
       }),

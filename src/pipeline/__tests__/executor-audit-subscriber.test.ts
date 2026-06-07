@@ -100,6 +100,60 @@ describe('ExecutorAuditSubscriber', () => {
     });
   });
 
+  it('forwards systemPrompt on pipeline:step:started → audit trace.systemPrompt (dcore 84d7058 parity)', async () => {
+    const { bus, records } = makeSubscriber();
+    await bus.emit('pipeline:run:started', {
+      runId: 'r-sp-1',
+      pipelineId: 'p-sp-1',
+      triggeredBy: { userId: 'u' },
+      at: 't',
+    });
+    const systemPrompt =
+      'You are a helpful assistant. Be concise and answer in markdown.';
+    await bus.emit('pipeline:step:started', {
+      runId: 'r-sp-1',
+      stepId: 'llm-step',
+      nodeType: 'llm',
+      at: '2026-06-07T12:00:00Z',
+      systemPrompt,
+    });
+    await flush();
+    const row = records.find((r) => r.action === 'pipeline.step.started');
+    expect(row).toMatchObject({
+      action: 'pipeline.step.started',
+      pipelineId: 'p-sp-1',
+      runId: 'r-sp-1',
+      trace: {
+        stepId: 'llm-step',
+        nodeType: 'llm',
+        at: '2026-06-07T12:00:00Z',
+        systemPrompt,
+      },
+    });
+    // Verbatim — no slicing/truncation.
+    expect((row!.trace as { systemPrompt: string }).systemPrompt).toBe(systemPrompt);
+  });
+
+  it('omits systemPrompt key from audit trace when pipeline:step:started has no systemPrompt', async () => {
+    const { bus, records } = makeSubscriber();
+    await bus.emit('pipeline:run:started', {
+      runId: 'r-sp-2',
+      pipelineId: 'p-sp-2',
+      triggeredBy: { userId: 'u' },
+      at: 't',
+    });
+    await bus.emit('pipeline:step:started', {
+      runId: 'r-sp-2',
+      stepId: 'transform-step',
+      nodeType: 'transform',
+      at: '2026-06-07T12:00:01Z',
+    });
+    await flush();
+    const row = records.find((r) => r.action === 'pipeline.step.started');
+    expect(row).toBeDefined();
+    expect('systemPrompt' in (row!.trace as Record<string, unknown>)).toBe(false);
+  });
+
   it('records pipelineId="unknown" when no run:started was observed for the runId', async () => {
     const { bus, records } = makeSubscriber();
     await bus.emit('pipeline:step:started', {
