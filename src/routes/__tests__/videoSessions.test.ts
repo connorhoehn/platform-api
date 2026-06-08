@@ -259,6 +259,63 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
     expect(mockCreateSession).not.toHaveBeenCalled();
   });
 
+  // Wave 3 / ADR-002 — recordingProfile field flow
+  it('defaults to recordingProfile=hangout when body omits recordingConfiguration', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:p1'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { documentId: 'doc-prof-default', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    const sentBody = JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
+    expect(sentBody.recordingConfiguration.recordingProfile).toBe('hangout');
+  });
+
+  it('accepts explicit recordingProfile in body and forwards it to LVS', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:p2'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: {
+        documentId: 'doc-prof-dm',
+        findOrCreate: true,
+        recordingConfiguration: { enabled: true, recordingProfile: 'dm' },
+      },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    const sentBody = JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
+    expect(sentBody.recordingConfiguration.recordingProfile).toBe('dm');
+  });
+
+  it('rejects unknown recordingProfile strings with 400', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:p3'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: {
+        documentId: 'doc-prof-bad',
+        findOrCreate: true,
+        recordingConfiguration: { enabled: true, recordingProfile: 'masterclass' },
+      },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('legacy transcribe=true (no recordingProfile) maps to recordingProfile=hangout', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:p4'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: {
+        documentId: 'doc-prof-legacy',
+        findOrCreate: true,
+        recordingConfiguration: { enabled: true, transcribe: true },
+      },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    const sentBody = JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
+    expect(sentBody.recordingConfiguration.recordingProfile).toBe('hangout');
+    expect(sentBody.recordingConfiguration.transcribe).toBe(true);
+  });
+
   it('findOrCreate hit but no matching DDB row: creates a fresh DDB row pointing at the LVS-owned channel', async () => {
     mockFetch.mockResolvedValue(lvsSessionReused('arn:channel:9'));
     mockFindActiveByLobbyName.mockResolvedValue(null);

@@ -44,6 +44,10 @@ import {
   recordLvsParticipantReap,
   type LvsReapOutcome,
 } from '../observability/metrics';
+// Wave 3 / ADR-002 — recording profile validator. Reject unknown profile
+// strings at the API boundary with a 400 rather than letting them fall
+// through to LVS's resolveRecordingProfile silent-degrade-to-'none' path.
+import { isRecordingProfile } from '@connorhoehn/event-catalog';
 // Re-export breaker test helpers from the shared module for back-compat
 // with existing test imports — see src/lib/sfu-breaker.ts for the canonical
 // definitions (extracted for hub task #1001).
@@ -158,21 +162,44 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     // `room.settings.recordingEnabled`; DM/global calls default to enabled
     // to preserve the legacy "always record" behavior that powers Past
     // Calls. Pass through only if explicit; otherwise default.
-    const incomingRecordingConfig = (body.recordingConfiguration && typeof body.recordingConfiguration === 'object')
-      ? (body.recordingConfiguration as { enabled?: boolean; destination?: string; transcribe?: boolean })
-      : null;
+    //
+    // Wave 3 / ADR-002 — accept `recordingProfile` as the canonical
+    // recording-shape identifier. Defaults to `'hangout'` when absent
+    // (matches the prior implicit shape: per-peer compose + transcribe
+    // for video-session calls). Legacy `transcribe` boolean is still
+    // accepted on the way in for one release window; resolveRecordingProfile
+    // synthesizes the right profile on the LVS side when both are
+    // present.
+    const incomingRecordingConfig =
+      body.recordingConfiguration && typeof body.recordingConfiguration === 'object'
+        ? (body.recordingConfiguration as {
+            enabled?: boolean;
+            destination?: string;
+            recordingProfile?: string;
+            transcribe?: boolean;
+          })
+        : null;
+    const profileFromBody = (() => {
+      const raw = incomingRecordingConfig?.recordingProfile;
+      if (raw === undefined) return undefined;
+      if (isRecordingProfile(raw)) return raw;
+      throw new AppError(400, `invalid recordingProfile: '${String(raw)}'`);
+    })();
     const recordingConfiguration = incomingRecordingConfig
       ? {
           enabled: incomingRecordingConfig.enabled !== false,
           destination: incomingRecordingConfig.destination ?? 'local',
-          // Transcription opt-in. Defaults FALSE — the user (or hangout
-          // settings UI) must explicitly request transcription. LVS
-          // RecordingManager stamps this onto the recording and echoes it
-          // back on the recording.completed webhook, where lvsWebhooks.ts
-          // gates the transcription:job.queued publish.
+          // Canonical Wave-3 identifier. Falls back to legacy transcribe
+          // boolean → hangout/dm synthesis if FE hasn't been migrated yet.
+          recordingProfile:
+            profileFromBody ??
+            (incomingRecordingConfig.transcribe === true ? 'hangout' : undefined),
+          // Legacy field preserved for the one-release back-compat window.
+          // LVS RecordingManager resolves the profile, ignores this if
+          // recordingProfile is present.
           transcribe: incomingRecordingConfig.transcribe === true,
         }
-      : { enabled: true, destination: 'local', transcribe: false };
+      : { enabled: true, destination: 'local', recordingProfile: 'hangout', transcribe: false };
 
     // Forward the caller's Cognito Bearer so LVS validates the same
     // identity that hit us. Without a header we can't proxy — platform-api
