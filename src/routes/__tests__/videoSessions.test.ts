@@ -260,7 +260,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
   });
 
   // Wave 3 / ADR-002 — recordingProfile field flow
-  it('defaults to recordingProfile=hangout when body omits recordingConfiguration', async () => {
+  it('omits recordingProfile when body omits recordingConfiguration (legacy back-compat)', async () => {
     mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:p1'));
     await run(buildApp(), 'POST', '/api/video/sessions', {
       body: { documentId: 'doc-prof-default', findOrCreate: true },
@@ -268,7 +268,9 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       userId: 'alice',
     });
     const sentBody = JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
-    expect(sentBody.recordingConfiguration.recordingProfile).toBe('hangout');
+    // No recordingProfile in default path — LVS falls through to
+    // legacy-flag synthesis. New behavior is opt-in via FE.
+    expect(sentBody.recordingConfiguration).toEqual({ enabled: true, destination: 'local', transcribe: false });
   });
 
   it('accepts explicit recordingProfile in body and forwards it to LVS', async () => {

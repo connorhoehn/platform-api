@@ -190,7 +190,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
           enabled: incomingRecordingConfig.enabled !== false,
           destination: incomingRecordingConfig.destination ?? 'local',
           // Canonical Wave-3 identifier. Falls back to legacy transcribe
-          // boolean → hangout/dm synthesis if FE hasn't been migrated yet.
+          // boolean → 'hangout' synthesis if FE hasn't been migrated yet.
           recordingProfile:
             profileFromBody ??
             (incomingRecordingConfig.transcribe === true ? 'hangout' : undefined),
@@ -199,7 +199,12 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
           // recordingProfile is present.
           transcribe: incomingRecordingConfig.transcribe === true,
         }
-      : { enabled: true, destination: 'local', recordingProfile: 'hangout', transcribe: false };
+      : // Body absent → preserve legacy default exactly. NO recordingProfile
+        // field so LVS' resolveRecordingProfile falls through to legacy-flag
+        // synthesis (which maps {enabled:true, transcribe:false} → broadcast
+        // shape: composePerPeer=false, transcribe=false). New per-peer +
+        // transcribe behavior is opt-in via recordingProfile from the FE.
+        { enabled: true, destination: 'local', transcribe: false };
 
     // Forward the caller's Cognito Bearer so LVS validates the same
     // identity that hit us. Without a header we can't proxy — platform-api
