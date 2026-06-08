@@ -99,6 +99,26 @@ export interface CallRecording {
   composedUrl?: string;
   /** R2 — per-peer raw track files. Empty for single-producer calls. */
   tracks?: RecordingTrack[];
+  /**
+   * Transcription pipeline state. Sparse — only set when the user opted
+   * into transcription for this recording (recordingConfiguration.transcribe
+   * was true at start). Lifecycle:
+   *   undefined / 'pending' — outbox row published, worker hasn't picked up
+   *   'processing'          — worker has the message, faster-whisper running
+   *   'ready'               — transcript.json (and summary.md if present)
+   *                           written to blob storage; UI can fetch
+   *   'failed'              — exhausted DLQ retries
+   */
+  transcriptStatus?: 'pending' | 'processing' | 'ready' | 'failed';
+  /** Blob-storage key (S3/R2) for the merged transcript JSON. Sparse. */
+  transcriptKey?: string;
+  /** Blob-storage key for the LLM-generated markdown summary. Sparse — set
+   *  by the summary worker AFTER transcript is ready. */
+  summaryKey?: string;
+  /** ISO timestamp when the worker wrote the transcript. */
+  transcriptGeneratedAt?: string;
+  /** Last-error string when transcriptStatus === 'failed'. Truncated to 200 chars. */
+  transcriptError?: string;
 }
 
 const RETENTION_DAYS = Number(process.env.RECORDING_RETENTION_DAYS ?? 30);
@@ -425,6 +445,60 @@ export class CallRecordingRepository extends BaseRepository {
     }
 
     return { indexRowsDeleted, recordingsRedacted };
+  }
+
+  /**
+   * Flip transcriptStatus on a recording row. Used at three transition points:
+   *   1. lvsWebhooks  → 'pending'    (right after publishWithOutbox)
+   *   2. worker start → 'processing' (after MQ receive, before whisper run)
+   *   3. worker done  → 'ready'      (with transcriptKey, transcriptGeneratedAt)
+   *   4. DLQ          → 'failed'     (with transcriptError)
+   *
+   * Conditional on the row existing (attribute_exists(callId)) so a transcript
+   * update for a webhook-not-yet-persisted recording fails fast rather than
+   * silently creating a transcript-only ghost row.
+   */
+  async updateTranscriptStatus(
+    callId: string,
+    recordingId: string,
+    patch: {
+      status: 'pending' | 'processing' | 'ready' | 'failed';
+      transcriptKey?: string;
+      summaryKey?: string;
+      transcriptGeneratedAt?: string;
+      transcriptError?: string;
+    },
+  ): Promise<void> {
+    const sets: string[] = ['transcriptStatus = :s'];
+    const names: Record<string, string> = {};
+    const values: Record<string, unknown> = { ':s': patch.status };
+    if (patch.transcriptKey !== undefined) {
+      sets.push('transcriptKey = :k');
+      values[':k'] = patch.transcriptKey;
+    }
+    if (patch.summaryKey !== undefined) {
+      sets.push('summaryKey = :sk');
+      values[':sk'] = patch.summaryKey;
+    }
+    if (patch.transcriptGeneratedAt !== undefined) {
+      sets.push('transcriptGeneratedAt = :ga');
+      values[':ga'] = patch.transcriptGeneratedAt;
+    }
+    if (patch.transcriptError !== undefined) {
+      sets.push('transcriptError = :err');
+      // Truncate to 200 chars so a multi-MB stack trace can't bloat the row.
+      values[':err'] = String(patch.transcriptError).slice(0, 200);
+    }
+    await this.docClient.send(
+      new UpdateCommand({
+        TableName: CALL_RECORDINGS_TABLE,
+        Key: { callId, recordingId },
+        UpdateExpression: `SET ${sets.join(', ')}`,
+        ExpressionAttributeNames: Object.keys(names).length ? names : undefined,
+        ExpressionAttributeValues: values,
+        ConditionExpression: 'attribute_exists(callId)',
+      }),
+    );
   }
 }
 

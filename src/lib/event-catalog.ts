@@ -434,6 +434,88 @@ catalog.declare({
   tags: ['service:ingest', 'phase:54.6.3'],
 });
 
+// Hangout transcription pipeline — `transcription:job.queued` is the durable
+// handoff from platform-api's lvsWebhooks (recording.completed receipt) to the
+// transcription-worker container. Payload carries the recordingId + per-peer
+// mp4 tracks[] (each with participantId + url + startedAtMs); the worker
+// fetches each leg, demuxes audio via ffmpeg, runs faster-whisper, merges
+// segments by participant, writes transcript.json to blob storage, then
+// publishes `transcription:transcript.ready` to trigger summary generation.
+//
+// Long-running: per-recording processing on CPU takes minutes (3-5x real-time
+// for large-v3-turbo on 4-8 vCPU). visibility_timeout on the MQ side is set
+// to 3600s. dlqAfterAttempts=3 — a transcription that fails three times is
+// almost certainly a corrupt source file, not a transient infra issue.
+catalog.declare({
+  name: 'transcription:job.queued',
+  transport: 'durable',
+  producer: 'platform-api',
+  queue: 'transcription-jobs',
+  fifo: false,
+  retention: 7 * 24 * 60 * 60, // 7 days
+  dlqAfterAttempts: 3,
+  description: 'A hangout recording has completed with transcribe=true; the transcription-worker should process per-peer audio tracks into a merged transcript.',
+  schema: {
+    type: 'object',
+    properties: {
+      recordingId: { type: 'string' },
+      callId: { type: 'string' },
+      channelArn: { type: 'string' },
+      // tracks[] mirrors the shape RecordingManager writes: per-leg
+      // {legId, participantId, url, kind, startedAtMs, endedAtMs}. The
+      // worker uses startedAtMs as the merge anchor (clock-skew correction)
+      // and participantId for speaker attribution.
+      tracks: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            legId: { type: 'string' },
+            participantId: { type: 'string' },
+            userId: { type: ['string', 'null'] },
+            url: { type: 'string' },
+            kind: { type: 'string' },
+            startedAtMs: { type: 'number' },
+            endedAtMs: { type: 'number' },
+          },
+          required: ['legId', 'url', 'startedAtMs'],
+        },
+      },
+    },
+    required: ['recordingId', 'callId', 'tracks'],
+  },
+  tags: ['service:transcription'],
+});
+
+// `transcription:transcript.ready` — emitted by the worker after the
+// merged transcript JSON has been written. Triggers the summary worker
+// (platform-api consumer) to call createLLMClient + the COE-style markdown
+// prompt and write summary.md alongside the transcript. Routes through a
+// SEPARATE queue (transcription-summaries) from job.queued — different
+// consumers, must not compete for messages on the same queue.
+catalog.declare({
+  name: 'transcription:transcript.ready',
+  transport: 'durable',
+  producer: 'transcription-worker',
+  queue: 'transcription-summaries',
+  fifo: false,
+  retention: 7 * 24 * 60 * 60,
+  dlqAfterAttempts: 3,
+  description: 'A transcript.json has been written for a recording; the summary worker should generate summary.md.',
+  schema: {
+    type: 'object',
+    properties: {
+      recordingId: { type: 'string' },
+      callId: { type: 'string' },
+      transcriptKey: { type: 'string' },
+      durationMs: { type: 'number' },
+      speakerCount: { type: 'number' },
+    },
+    required: ['recordingId', 'transcriptKey'],
+  },
+  tags: ['service:transcription'],
+});
+
 // Phase 57b — `activity.recorded` is produced by websocket-gateway as
 // transport:'both' (declared in gateway-event-declarations.js). We declare
 // it locally so platform-api can `catalog.subscribe()` to the durable side

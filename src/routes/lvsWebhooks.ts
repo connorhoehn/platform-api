@@ -55,6 +55,7 @@ import {
   checkReplayWindow,
   WEBHOOK_TIMESTAMP_HEADER,
 } from '../lib/webhook-replay';
+import { catalog } from '../lib/event-catalog';
 
 export const lvsWebhooksRouter = Router();
 
@@ -503,6 +504,43 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       tracks: Array.isArray(detail.tracks) ? detail.tracks : undefined,
     });
     log.info({ callId, recordingId, arn, participants: participants.length }, '[lvs-webhook] recording persisted');
+
+    // Transcription pipeline trigger. LVS echoes the recording's
+    // `recordingConfiguration.transcribe` boolean back on the completed
+    // payload as `detail.transcribe`. When true, mark the row pending and
+    // publish the durable `transcription:job.queued` event so the
+    // transcription-worker container picks the job up from MQ.
+    //
+    // Best-effort: failures here log + metric but do NOT fail the webhook
+    // 204 — the worst case is "recording exists, transcript missing" which
+    // the user can re-trigger via the UI. We avoid wrapping the put +
+    // publish in an outbox TransactWrite because the put already does a
+    // multi-table fan-out (target + N participant rows) which
+    // publishWithOutbox's single-target model doesn't fit.
+    const wantTranscribe = detail.transcribe === true || detail.transcribe === 'true';
+    if (wantTranscribe) {
+      const persistedCallId = callId ?? `unknown-${arn}-${recordingId}`;
+      try {
+        await callRecordingRepo.updateTranscriptStatus(persistedCallId, recordingId, {
+          status: 'pending',
+        });
+        await catalog.publish('transcription:job.queued', {
+          recordingId,
+          callId: persistedCallId,
+          channelArn: arn,
+          tracks: Array.isArray(detail.tracks) ? detail.tracks : [],
+        });
+        log.info({ recordingId, callId: persistedCallId, trackCount: Array.isArray(detail.tracks) ? detail.tracks.length : 0 },
+          '[lvs-webhook] transcription job queued');
+      } catch (txErr: any) {
+        // Don't fail the webhook — transcription is a non-critical
+        // post-processing feature. Log with enough context that an
+        // operator can manually re-trigger from the UI.
+        log.warn({ err: txErr?.message ?? txErr, recordingId, callId: persistedCallId },
+          '[lvs-webhook] transcription enqueue failed (recording still persisted)');
+      }
+    }
+
     recordDelivery({
       timestamp: new Date().toISOString(),
       eventType,

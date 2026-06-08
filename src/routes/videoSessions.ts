@@ -159,14 +159,20 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     // to preserve the legacy "always record" behavior that powers Past
     // Calls. Pass through only if explicit; otherwise default.
     const incomingRecordingConfig = (body.recordingConfiguration && typeof body.recordingConfiguration === 'object')
-      ? (body.recordingConfiguration as { enabled?: boolean; destination?: string })
+      ? (body.recordingConfiguration as { enabled?: boolean; destination?: string; transcribe?: boolean })
       : null;
     const recordingConfiguration = incomingRecordingConfig
       ? {
           enabled: incomingRecordingConfig.enabled !== false,
           destination: incomingRecordingConfig.destination ?? 'local',
+          // Transcription opt-in. Defaults FALSE — the user (or hangout
+          // settings UI) must explicitly request transcription. LVS
+          // RecordingManager stamps this onto the recording and echoes it
+          // back on the recording.completed webhook, where lvsWebhooks.ts
+          // gates the transcription:job.queued publish.
+          transcribe: incomingRecordingConfig.transcribe === true,
         }
-      : { enabled: true, destination: 'local' };
+      : { enabled: true, destination: 'local', transcribe: false };
 
     // Forward the caller's Cognito Bearer so LVS validates the same
     // identity that hit us. Without a header we can't proxy — platform-api
