@@ -315,6 +315,134 @@ recordingsRouter.get(
   }),
 );
 
+// --------------------------------------------------------------------
+// GET /api/recordings/:recordingId/transcript — serve the JSON
+// transcript produced by the transcription-worker. 404s when
+// transcriptStatus !== 'ready'. 403 unless caller participated.
+// --------------------------------------------------------------------
+//
+// The transcript blob is stored by the worker at
+//   <arnSafe>/<recordingId>/transcript.json
+// alongside the recording's per-peer mp4 files. We proxy it through
+// platform-api rather than handing the FE a direct S3/file URL so that
+// future migrations (S3-presigned, CloudFront, auth-gated CDN) are
+// invisible to the client.
+//
+// For local-mode dev, the worker writes to the same hostPath LVS uses
+// (RECORDING_DIR). We resolve via the LVS segments-shaped HTTP path
+// because LVS already authenticates + serves files there — re-using
+// its file-resolution avoids re-implementing arnSafe + path traversal
+// guards on the platform-api side.
+recordingsRouter.get(
+  '/recordings/:recordingId/transcript',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const userId = (req as any).user?.userId ?? (req as any).user?.sub;
+    const { recordingId } = req.params;
+    const { items } = await callRecordingRepo.listByUser(userId, { limit: 100 });
+    const match = items.find((r) => r.recordingId === recordingId);
+    if (!match) throw new NotFoundError('recording not found or not authorized');
+    const detail = await callRecordingRepo.getRecording(match.callId, recordingId);
+    if (!detail) throw new NotFoundError('recording metadata missing');
+
+    const status = detail.transcriptStatus;
+    if (status === undefined) {
+      throw new NotFoundError('transcription not requested for this recording');
+    }
+    if (status !== 'ready') {
+      // Surface the in-flight status so the FE can show a spinner /
+      // failure banner without polling for the eventual transcript.
+      res.status(202).json({
+        status,
+        recordingId,
+        error: detail.transcriptError ?? null,
+        generatedAt: detail.transcriptGeneratedAt ?? null,
+      });
+      return;
+    }
+    if (!detail.transcriptKey) {
+      // Shouldn't happen — ready implies key present. Defensive 500.
+      throw new AppError(500, 'transcript ready but key missing');
+    }
+
+    // Fetch from LVS using the same segments URL pattern the
+    // composedUrl uses. The worker stored transcript.json relative
+    // to LVS_RECORDING_DIR, so the path encoding is the same as for
+    // recording mp4s. We could equivalently read the file off the
+    // shared volume, but LVS already implements path-traversal guards
+    // we'd otherwise duplicate.
+    //
+    // For S3 destination the transcriptKey is already an s3:// URI;
+    // in that case we'd need a different code path (signed URL or
+    // boto3 GetObject). MVP supports local mode only here — the
+    // worker writes the key shape uniformly for both backends, but
+    // the platform-api proxy only handles the local-served-by-LVS
+    // case below. Adding S3 follows the same pattern as the
+    // existing composedUrl handling in /playback-token.
+    const arnSafe = (detail.channelArn || '').replace(/[^A-Za-z0-9._-]/g, '_');
+    const lvsUrl = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(detail.channelArn)}/recordings/${encodeURIComponent(recordingId)}/segments/transcript.json`;
+    log.info({ recordingId, userId, transcriptKey: detail.transcriptKey, arnSafe }, '[recordings] transcript fetch');
+    try {
+      const upstream = await callSfu(lvsUrl, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${process.env.LVS_ADMIN_TOKEN ?? 'admin'}` },
+      });
+      if (!upstream.ok) {
+        if (upstream.status === 404) {
+          throw new NotFoundError('transcript file missing from blob storage');
+        }
+        throw new AppError(upstream.status, `lvs returned ${upstream.status}`);
+      }
+      const text = await upstream.text();
+      res.type('application/json').send(text);
+    } catch (e) {
+      if (e instanceof AppError) throw e;
+      throw mapSfuError(e);
+    }
+  }),
+);
+
+// --------------------------------------------------------------------
+// GET /api/recordings/:recordingId/summary — serve the LLM-generated
+// markdown meeting-notes summary. 404s when the recording has no
+// transcription opted in; 202 + status payload while in flight; the
+// raw markdown body when ready.
+// --------------------------------------------------------------------
+recordingsRouter.get(
+  '/recordings/:recordingId/summary',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const userId = (req as any).user?.userId ?? (req as any).user?.sub;
+    const { recordingId } = req.params;
+    const { items } = await callRecordingRepo.listByUser(userId, { limit: 100 });
+    const match = items.find((r) => r.recordingId === recordingId);
+    if (!match) throw new NotFoundError('recording not found or not authorized');
+    const detail = await callRecordingRepo.getRecording(match.callId, recordingId);
+    if (!detail) throw new NotFoundError('recording metadata missing');
+
+    const status = detail.transcriptStatus;
+    if (status === undefined) {
+      throw new NotFoundError('transcription not requested for this recording');
+    }
+    if (status !== 'ready') {
+      res.status(202).json({
+        status,
+        recordingId,
+        error: detail.transcriptError ?? null,
+      });
+      return;
+    }
+    if (!detail.summaryMarkdown) {
+      // Ready but no summary — happens for the "no audible legs"
+      // placeholder branch. Return 200 with the placeholder so the FE
+      // can render a "no transcript" badge instead of an empty panel.
+      res.type('text/markdown').send('_No summary available for this recording._');
+      return;
+    }
+    res.type('text/markdown').send(detail.summaryMarkdown);
+  }),
+);
+
 // DELETE /api/recordings/:recordingId — owner-only delete. Removes the
 // DDB row + participant fan-out rows. The underlying MP4 stays in
 // LVS storage until the GC sweep (separate retention window).

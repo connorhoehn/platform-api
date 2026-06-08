@@ -29,6 +29,7 @@ import { ensureOutboxTTL, ensureVideoSessionsTTL } from './lib/dynamo-setup';
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
+import { startTranscriptionSummaryConsumer } from './services/transcription-summary-consumer';
 import { createPipelineConfigRegistration } from './control-plane/pipeline-config-subscriber';
 import { createFileUploadEndpointRegistration } from './control-plane/file-upload-subscriber';
 import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
@@ -95,9 +96,16 @@ const server = app.listen(Number(port), () => {
   // recording.completed events flow into /hooks/lvs/recording → DDB.
   // Idempotent + non-fatal — failures log and the recording pipeline
   // simply won't persist until the next platform-api boot succeeds.
-  void import('./lib/lvs-webhook-bootstrap.js').then(({ bootstrapLvsWebhook }) =>
-    bootstrapLvsWebhook(),
-  ).catch((e: any) => log.warn({ err: e?.message ?? e }, 'lvs-webhook-bootstrap failed'));
+  void import('./lib/lvs-webhook-bootstrap.js').then(({ bootstrapLvsWebhook, startLvsWebhookReconciler }) => {
+    // One-shot bootstrap on boot.
+    void bootstrapLvsWebhook();
+    // Periodic reconciler — LVS forgets subscriptions on restart since they
+    // live in-memory only. Without this, a SFU bounce silently breaks the
+    // recordings pipeline until platform-api is also restarted, which is
+    // the most common root cause of "Past Calls is empty" reports in dev
+    // (and the most-likely cause in prod if LVS pods rotate independently).
+    startLvsWebhookReconciler();
+  }).catch((e: any) => log.warn({ err: e?.message ?? e }, 'lvs-webhook-bootstrap failed'));
 });
 
 // ---------------------------------------------------------------------------
@@ -155,6 +163,7 @@ const catalogRetry = new RetryManager({
 });
 
 let activityConsumer: { stop: () => Promise<void> } | null = null;
+let transcriptionSummaryConsumer: { stop: () => Promise<void> } | null = null;
 
 (async () => {
   try {
@@ -169,6 +178,19 @@ let activityConsumer: { stop: () => Promise<void> } | null = null;
     } catch (err: unknown) {
       const e = err as { message?: string };
       log.warn({ errMessage: e?.message }, 'activity-consumer failed to start (non-fatal)');
+    }
+    // Transcription summary consumer — listens for transcript.ready and
+    // runs the LLM-driven markdown summarization step. Non-fatal —
+    // platform-api stays up even if the consumer fails to subscribe
+    // (e.g. MQ briefly unreachable on boot). Recordings without a
+    // summary stay in 'processing' until a healthy consumer picks them
+    // up on redelivery.
+    try {
+      transcriptionSummaryConsumer = startTranscriptionSummaryConsumer();
+      log.info('transcription-summary-consumer started');
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      log.warn({ errMessage: e?.message }, 'transcription-summary-consumer failed to start (non-fatal)');
     }
   } catch (err: unknown) {
     const e = err as { message?: string };
@@ -416,6 +438,7 @@ sd.register('control-plane-registry', async () => {
 });
 sd.register('activity-consumer', async () => {
   if (activityConsumer) await activityConsumer.stop();
+  if (transcriptionSummaryConsumer) await transcriptionSummaryConsumer.stop();
 });
 sd.register('outbox-drainer', () => { drainer.stop(); });
 sd.register('ingest', async () => {

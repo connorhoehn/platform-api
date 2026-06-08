@@ -112,9 +112,15 @@ export interface CallRecording {
   transcriptStatus?: 'pending' | 'processing' | 'ready' | 'failed';
   /** Blob-storage key (S3/R2) for the merged transcript JSON. Sparse. */
   transcriptKey?: string;
-  /** Blob-storage key for the LLM-generated markdown summary. Sparse — set
-   *  by the summary worker AFTER transcript is ready. */
+  /** Blob-storage key for the LLM-generated markdown summary. Reserved for
+   *  the future when summaries grow past the inline DDB limit. */
   summaryKey?: string;
+  /** Inline markdown summary written by the summary consumer. Stored
+   *  directly in DDB because a typical 30-min meeting summary is <20 KB,
+   *  well under the 400 KB item cap. If summaries ever grow large we'd
+   *  switch to summaryKey + blob storage; both fields kept so the
+   *  migration is a write-shape change, not a type change. */
+  summaryMarkdown?: string;
   /** ISO timestamp when the worker wrote the transcript. */
   transcriptGeneratedAt?: string;
   /** Last-error string when transcriptStatus === 'failed'. Truncated to 200 chars. */
@@ -465,6 +471,7 @@ export class CallRecordingRepository extends BaseRepository {
       status: 'pending' | 'processing' | 'ready' | 'failed';
       transcriptKey?: string;
       summaryKey?: string;
+      summaryMarkdown?: string;
       transcriptGeneratedAt?: string;
       transcriptError?: string;
     },
@@ -479,6 +486,10 @@ export class CallRecordingRepository extends BaseRepository {
     if (patch.summaryKey !== undefined) {
       sets.push('summaryKey = :sk');
       values[':sk'] = patch.summaryKey;
+    }
+    if (patch.summaryMarkdown !== undefined) {
+      sets.push('summaryMarkdown = :sm');
+      values[':sm'] = patch.summaryMarkdown;
     }
     if (patch.transcriptGeneratedAt !== undefined) {
       sets.push('transcriptGeneratedAt = :ga');
