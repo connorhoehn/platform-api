@@ -183,12 +183,17 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
   it('returns playlistUrl + token on 200 from LVS (happy path)', async () => {
     mockListByUser.mockResolvedValue({ items: [matchItem] });
     mockGetRecording.mockResolvedValue(matchDetail);
-    mockGetSessionsByDocument.mockResolvedValue([
-      { channelArn: 'arn:1', streamKey: 'sk-1' },
-    ]);
     mockCallSfu.mockResolvedValue(lvsOk({ token: 'tok', expiresAt: '2026-05-30T01:00:00Z' }));
 
-    const res = await run('POST', '/api/recordings/r-1/playback-token');
+    const prevAdmin = process.env.VIDEO_ADMIN_TOKEN;
+    process.env.VIDEO_ADMIN_TOKEN = 'admin-secret';
+    let res;
+    try {
+      res = await run('POST', '/api/recordings/r-1/playback-token');
+    } finally {
+      if (prevAdmin === undefined) delete process.env.VIDEO_ADMIN_TOKEN;
+      else process.env.VIDEO_ADMIN_TOKEN = prevAdmin;
+    }
     expect(res.statusCode).toBe(200);
     const body = res.body as { playlistUrl: string; token: string; expiresAt: string };
     expect(body.token).toBe('tok');
@@ -196,10 +201,12 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
     expect(body.playlistUrl).toContain('https://public.video.test/api/channels/');
     expect(body.playlistUrl).toContain('token=tok');
 
-    // Verify streamKey was passed as Bearer auth (audit-relevant: LVS
-    // playback-tokens rejects admin bearer).
+    // Post-Wave-7 the DDB streamKey is always '' (LVS no longer returns
+    // one on POST /api/sessions), so this route uses VIDEO_ADMIN_TOKEN
+    // as the LVS bearer. LVS bearerAuth treats it as a role=admin
+    // wildcard and accepts it on /playback-tokens.
     const [, init] = mockCallSfu.mock.calls[0];
-    expect((init as RequestInit).headers).toMatchObject({ Authorization: 'Bearer sk-1' });
+    expect((init as RequestInit).headers).toMatchObject({ Authorization: 'Bearer admin-secret' });
   });
 
   it('returns empty token when LVS responds 400 (public channel, playback open)', async () => {

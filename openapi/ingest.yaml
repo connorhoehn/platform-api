@@ -1257,7 +1257,7 @@ components:
         mergedFields:
           type: object
           additionalProperties: true
-          description: Operator-supplied merge values, keyed by field name. Only meaningful when `resolution: merged`.
+          description: 'Operator-supplied merge values, keyed by field name. Only meaningful when `resolution: merged`.'
         auditNote:
           type: string
           description: Free-form note captured on the resulting `SyncConflict.auditNote`.

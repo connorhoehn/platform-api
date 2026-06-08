@@ -18,6 +18,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const yaml = require('js-yaml');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const ROUTE_DIR = path.join(PROJECT_ROOT, 'src/routes');
@@ -179,7 +180,48 @@ function readYamlPaths(yamlFile) {
   return out;
 }
 
+// Parse each yaml with js-yaml before the path-coverage pass. Catches
+// the class of typo where an unquoted `: ` inside a plain scalar
+// description (e.g. `Only meaningful when `resolution: merged`.`) is
+// interpreted as a mapping key — the regex-based reader silently
+// tolerated this and shipped broken YAML to every js-yaml consumer
+// (openapi-typescript, redoc, prettier yaml plugin, the frontend type
+// generator). See hub#1351.
+function parseAll() {
+  const failures = [];
+  for (const [name, prefix] of Object.entries(PREFIXES)) {
+    const yamlPath = path.join(OPENAPI_DIR, prefix.yaml);
+    if (!fs.existsSync(yamlPath)) continue;
+    try {
+      yaml.load(fs.readFileSync(yamlPath, 'utf8'), { filename: yamlPath });
+    } catch (e) {
+      const mark = e && e.mark;
+      failures.push({
+        name,
+        file: prefix.yaml,
+        message: e && e.reason ? e.reason : String(e),
+        line: mark ? mark.line + 1 : null,
+        column: mark ? mark.column + 1 : null,
+      });
+    }
+  }
+  return failures;
+}
+
 function lint(opts) {
+  const parseFailures = parseAll();
+  if (parseFailures.length > 0) {
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ parseFailures }, null, 2) + '\n');
+    } else {
+      for (const f of parseFailures) {
+        const loc = f.line !== null ? `:${f.line}:${f.column}` : '';
+        console.error(`[openapi-lint] ${f.name}: YAML parse failed — ${f.file}${loc} — ${f.message}`);
+      }
+    }
+    return 1;
+  }
+
   const report = {};
   let drift = 0;
   for (const [name, prefix] of Object.entries(PREFIXES)) {
@@ -311,4 +353,4 @@ if (emitIdx !== -1) {
 }
 process.exit(lint({ json: argv.includes('--json') }));
 
-module.exports = { enumerate, readYamlPaths, PREFIXES };
+module.exports = { enumerate, readYamlPaths, parseAll, PREFIXES };

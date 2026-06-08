@@ -20,6 +20,14 @@
  *                                 outbound signing).
  *   LVS_ADMIN_TOKEN            — Auth for /api/event-subscriptions (LVS
  *                                 admin route). Defaults to 'admin' (Tilt).
+ *   LVS_WEBHOOK_REBOOTSTRAP_MS — If >0, re-run the bootstrap on this
+ *                                 interval. Default 30000 (30s). LVS
+ *                                 keeps subscriptions in memory only —
+ *                                 if LVS restarts after platform-api,
+ *                                 our subscription is silently dropped
+ *                                 and `recording.completed` events never
+ *                                 land in DDB. Periodic re-bootstrap
+ *                                 self-heals that. Set to 0 to disable.
  */
 
 import log from './logger';
@@ -107,4 +115,31 @@ export async function bootstrapLvsWebhook(): Promise<void> {
       '[lvs-webhook-bootstrap] subscription POST threw',
     );
   }
+}
+
+/**
+ * Start a recurring re-bootstrap to self-heal after LVS restarts.
+ * LVS keeps `_globalSubs[]` in memory only, so a SFU bounce silently drops
+ * our subscription and `recording.completed` events stop reaching
+ * /hooks/lvs/recording. The list-then-POST is idempotent (matching subs
+ * are no-ops), so the only steady-state cost is one GET per tick.
+ *
+ * Returns a stop function for tests / graceful shutdown.
+ */
+export function startLvsWebhookReconciler(): () => void {
+  const raw = Number(process.env.LVS_WEBHOOK_REBOOTSTRAP_MS);
+  const intervalMs = Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
+  if (intervalMs === 0) {
+    log.info('[lvs-webhook-bootstrap] periodic reconciler disabled (LVS_WEBHOOK_REBOOTSTRAP_MS=0)');
+    return () => { /* noop */ };
+  }
+  const timer = setInterval(() => {
+    void bootstrapLvsWebhook().catch((e: unknown) =>
+      log.warn({ err: (e as Error)?.message ?? String(e) }, '[lvs-webhook-bootstrap] periodic re-bootstrap failed'),
+    );
+  }, intervalMs);
+  // Don't keep the event loop alive just for this timer.
+  if (typeof timer.unref === 'function') timer.unref();
+  log.info({ intervalMs }, '[lvs-webhook-bootstrap] periodic reconciler started');
+  return () => clearInterval(timer);
 }
