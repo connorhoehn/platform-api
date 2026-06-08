@@ -450,7 +450,7 @@ catalog.declare({
   name: 'transcription:job.queued',
   transport: 'durable',
   producer: 'platform-api',
-  queue: 'transcription-jobs',
+  queue: 'transcription-job-queued',
   fifo: false,
   retention: 7 * 24 * 60 * 60, // 7 days
   dlqAfterAttempts: 3,
@@ -491,13 +491,16 @@ catalog.declare({
 // merged transcript JSON has been written. Triggers the summary worker
 // (platform-api consumer) to call createLLMClient + the COE-style markdown
 // prompt and write summary.md alongside the transcript. Routes through a
-// SEPARATE queue (transcription-summaries) from job.queued — different
-// consumers, must not compete for messages on the same queue.
+// SEPARATE queue (transcription-transcript-ready) from job.queued —
+// different consumers, must not compete for messages on the same queue.
+// Queue names use the auto-derived form (colon/dot → dash) because the
+// durable transport routes by name-derived queue regardless of what the
+// `queue` declare field says.
 catalog.declare({
   name: 'transcription:transcript.ready',
   transport: 'durable',
   producer: 'transcription-worker',
-  queue: 'transcription-summaries',
+  queue: 'transcription-transcript-ready',
   fifo: false,
   retention: 7 * 24 * 60 * 60,
   dlqAfterAttempts: 3,
