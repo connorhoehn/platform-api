@@ -1,11 +1,14 @@
 // platform-api/src/pipeline/image/ImageGenerateStepHandler.ts
 //
 // Custom step handler for `node.data.type === 'image:generate'`.
-// Text-to-image via AWS Bedrock Titan Image Generator v2.
+// Text-to-image via AWS Bedrock (Amazon Nova Canvas).
 //
 // === Model ===
-// Default: `amazon.titan-image-generator-v2` (configurable via
-// `data.model` or `IMAGE_GENERATE_MODEL` env var).
+// Default: `amazon.nova-canvas-v1:0` (configurable via `data.model`
+// or `IMAGE_GENERATE_MODEL` env var). Nova Canvas shares the Titan
+// TEXT_IMAGE request/response schema, so older Titan model ids remain
+// usable via the overrides — but the operator's Bedrock account only
+// has Nova-family model access, matching variation/edit-prompt.
 //
 // === Output ===
 // numImages === 1 → single-image output + emit.
@@ -44,7 +47,7 @@ interface ImageGenerateNodeData {
   /** Prompt text; supports {{path}} interpolation via resolveTemplate. */
   prompt: string;
   /**
-   * Bedrock model ID. Default: `amazon.titan-image-generator-v2`.
+   * Bedrock model ID. Default: `amazon.nova-canvas-v1:0`.
    * Also overridable via IMAGE_GENERATE_MODEL env var (data wins).
    */
   model?: string;
@@ -69,7 +72,7 @@ export interface ImageGenerateStepHandlerOpts {
   bedrockClient?: BedrockRuntimeClient;
 }
 
-const DEFAULT_MODEL = 'amazon.titan-image-generator-v2';
+const DEFAULT_MODEL = 'amazon.nova-canvas-v1:0';
 const THROTTLING_NAMES = new Set(['ThrottlingException', 'TooManyRequestsException']);
 
 export function createImageGenerateStepHandler(
