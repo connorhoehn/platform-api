@@ -91,13 +91,15 @@ describe('image:generate dynamic dimensions', () => {
     const { client, last } = capturingGenClient();
     const handler = createImageGenerateStepHandler({ imageBlobStore: blob, imageGenClient: client });
 
+    // Real executor shape: a step's output is merged into context.steps[id]
+    // DIRECTLY (no `.output` nesting) — see VisionPipelineE2E.
     await handler.execute(
       node('image:generate', 'gen', {
         prompt: 'a landscape',
-        width: '{{steps.dims1.output.genWidth}}',
-        height: '{{steps.dims1.output.genHeight}}',
+        width: '{{steps.dims1.genWidth}}',
+        height: '{{steps.dims1.genHeight}}',
       }),
-      { steps: { dims1: { output: { genWidth: 1024, genHeight: 576 } } } },
+      { steps: { dims1: { genWidth: 1024, genHeight: 576 } } },
       makeHelpers(),
     );
 
@@ -121,7 +123,7 @@ describe('image:generate dynamic dimensions', () => {
     const { client, last } = capturingGenClient();
     const handler = createImageGenerateStepHandler({ imageBlobStore: blob, imageGenClient: client });
     await handler.execute(
-      node('image:generate', 'gen', { prompt: 'p', width: '{{steps.missing.output.genWidth}}' }),
+      node('image:generate', 'gen', { prompt: 'p', width: '{{steps.missing.genWidth}}' }),
       {},
       makeHelpers(),
     );

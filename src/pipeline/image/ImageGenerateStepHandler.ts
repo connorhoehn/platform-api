@@ -53,9 +53,12 @@ interface ImageGenerateNodeData {
   /**
    * Output width. A number, or a `{{path}}` template resolved against the
    * run context — e.g. bind to an upstream image:dimensions node with
-   * `{{steps.<dimsNodeId>.output.genWidth}}` to size off a real image
-   * instead of assuming 512. Resolved value is snapped to a valid
-   * generation size (multiple of 16, ≤1024). Default: 512.
+   * `{{steps.<dimsNodeId>.genWidth}}` to size off a real image instead of
+   * assuming 512. NOTE: a step's output is merged into context.steps[id]
+   * directly (NOT under `.output`), so the path is
+   * `steps.<id>.<field>` — see VisionPipelineE2E ($.steps.source.imageId).
+   * Resolved value is snapped to a valid generation size (multiple of 16,
+   * ≤1024). Default: 512.
    */
   width?: number | string;
   /** Output height. Same dynamic-binding + snapping rules as width. Default: 512. */

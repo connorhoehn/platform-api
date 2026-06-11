@@ -5,7 +5,10 @@
 // steps (notably image:generate) can size themselves off a real image
 // instead of assuming 512×512.
 //
-// Output (also merged into context.steps[nodeId].output):
+// Output — the executor merges a step's output into context.steps[nodeId]
+// DIRECTLY (not under `.output`), so downstream binds read
+// `{{steps.<thisNodeId>.genWidth}}` etc. (see VisionPipelineE2E:
+// $.steps.source.imageId). Fields:
 //   width        – source image width  (px, exact)
 //   height       – source image height (px, exact)
 //   aspectRatio  – width / height (4dp)
