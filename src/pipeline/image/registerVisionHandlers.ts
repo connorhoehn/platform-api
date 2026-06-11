@@ -23,6 +23,7 @@ import { createImageAdjustBwStepHandler } from './ImageAdjustBwStepHandler';
 import { createImageAdjustLayerStepHandler } from './ImageAdjustLayerStepHandler';
 import { createImageSaveStepHandler } from './ImageSaveStepHandler';
 import { createImageResizeStepHandler } from './ImageResizeStepHandler';
+import { createImageDimensionsStepHandler } from './ImageDimensionsStepHandler';
 import { createImageGeometricTransformStepHandler } from './ImageGeometricTransformStepHandler';
 import { createImageFormatConvertStepHandler } from './ImageFormatConvertStepHandler';
 import { createImageSharpenStepHandler } from './ImageSharpenStepHandler';
@@ -105,6 +106,7 @@ export function buildVisionStepHandlers(
   // Phase 4 Sharp transform handlers — resize, geometric transforms,
   // format conversion, sharpening, and watermarking.
   handlers.set('image:resize', createImageResizeStepHandler({ imageBlobStore }));
+  handlers.set('image:dimensions', createImageDimensionsStepHandler({ imageBlobStore }));
   handlers.set('image:transform', createImageGeometricTransformStepHandler({ imageBlobStore }));
   handlers.set('image:format-convert', createImageFormatConvertStepHandler({ imageBlobStore }));
   handlers.set('image:sharpen', createImageSharpenStepHandler({ imageBlobStore }));

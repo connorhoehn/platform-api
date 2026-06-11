@@ -36,6 +36,7 @@ import type { ImageBlobStore } from './ImageBlobStore';
 import type { ImageMeta } from './types';
 import { resolveTemplate } from './ImageSaveStepHandler';
 import { capFitImage } from './imageBlobCapFit';
+import { snapGenerationDims } from './dimensionSnap';
 import {
   ImageGenThrottlingError,
   type ImageGenClient,
@@ -49,14 +50,38 @@ interface ImageGenerateNodeData {
   prompt: string;
   /** Provider-specific model id (FLUX checkpoint / Bedrock modelId). Optional. */
   model?: string;
-  /** Output width in pixels. Default: 512. */
-  width?: number;
-  /** Output height in pixels. Default: 512. */
-  height?: number;
+  /**
+   * Output width. A number, or a `{{path}}` template resolved against the
+   * run context — e.g. bind to an upstream image:dimensions node with
+   * `{{steps.<dimsNodeId>.output.genWidth}}` to size off a real image
+   * instead of assuming 512. Resolved value is snapped to a valid
+   * generation size (multiple of 16, ≤1024). Default: 512.
+   */
+  width?: number | string;
+  /** Output height. Same dynamic-binding + snapping rules as width. Default: 512. */
+  height?: number | string;
   /** Optional random seed for reproducible generation. */
   seed?: number;
   /** Number of images to generate. Default: 1. */
   numImages?: number;
+}
+
+/**
+ * Resolve a width/height field that may be a number or a `{{path}}`
+ * template. Returns `fallback` when missing/unparseable.
+ */
+function resolveDim(
+  raw: number | string | undefined,
+  context: Record<string, unknown>,
+  fallback: number,
+): number {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw === 'string') {
+    const resolved = raw.includes('{{') ? resolveTemplate(raw, context) : raw;
+    const n = Number.parseInt(resolved.trim(), 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return fallback;
 }
 
 export interface ImageGenerateStepHandlerOpts {
@@ -87,8 +112,12 @@ export function createImageGenerateStepHandler(
       }
 
       const prompt = resolveTemplate(data.prompt, context);
-      const width = data.width ?? 512;
-      const height = data.height ?? 512;
+      // width/height may be numbers or {{path}} bindings (e.g. from an
+      // upstream image:dimensions node). Resolve, then snap to a valid
+      // generation size — diffusion models reject arbitrary dimensions.
+      const rawWidth = resolveDim(data.width, context, 512);
+      const rawHeight = resolveDim(data.height, context, 512);
+      const { width, height } = snapGenerationDims(rawWidth, rawHeight);
       const numImages = data.numImages ?? 1;
 
       // ── Generate via the selected provider ────────────────────────────────
