@@ -170,7 +170,12 @@ export function createImageGenerateStepHandler(
         const rawBytes = Buffer.from(b64, 'base64');
         let fitted: Awaited<ReturnType<typeof capFitImage>>;
         try {
-          fitted = await capFitImage(rawBytes, 'image:generate');
+          // Pass the store's declared capability so a volume-backed store
+          // skips aggressive downsizing while DDB-backed stores still cap.
+          fitted = await capFitImage(rawBytes, 'image:generate', {
+            maxDimension: opts.imageBlobStore.maxStoredEdge,
+            capBytes: opts.imageBlobStore.capBytes,
+          });
         } catch (err) {
           return {
             status: 'failed',

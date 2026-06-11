@@ -38,6 +38,30 @@ export const IMAGE_BLOB_SIZE_CAP_BYTES = 350 * 1024;
 
 export interface ImageBlobStore {
   /**
+   * Optional: largest image edge (in pixels) this store is willing to
+   * preserve. Step handlers use this to decide how aggressively to
+   * cap-fit before calling `put()`.
+   *
+   * - DdbImageBlobStore:    512 (DDB inline cap ≈ 350KB)
+   * - VolumeImageBlobStore: 2048 (full-res upscale)
+   * - InMemoryImageBlobStore: undefined (no cap, tests decide)
+   *
+   * When undefined, callers fall back to their own default.
+   */
+  readonly maxStoredEdge?: number;
+
+  /**
+   * Optional: maximum byte size this store accepts per image. Step
+   * handlers pass this as `capBytes` to `capFitImage()` so the
+   * compression target matches the store's limit.
+   *
+   * - DdbImageBlobStore:    350 * 1024
+   * - VolumeImageBlobStore: 25 * 1024 * 1024
+   * - InMemoryImageBlobStore: undefined
+   */
+  readonly capBytes?: number;
+
+  /**
    * Persist a body + metadata for the given imageId. Returns the same
    * imageId for symmetry with the rawtext store (caller already chose
    * the id, this is just confirmation).
@@ -91,6 +115,11 @@ interface ImageRow {
 }
 
 export class DdbImageBlobStore implements ImageBlobStore {
+  /** DDB inline cap limits stored edges to 512px. */
+  readonly maxStoredEdge = 512;
+  /** DDB inline cap — leaves headroom for metadata + ttl. */
+  readonly capBytes = IMAGE_BLOB_SIZE_CAP_BYTES;
+
   private readonly docClient: DynamoDBDocumentClient;
   private readonly ttlSeconds: number;
   private readonly now: () => number;

@@ -114,10 +114,14 @@ export function createImageUpscaleStepHandler(
       }
 
       // ── Cap-fit + store ────────────────────────────────────────────────
+      // Use the store's declared capability so a volume-backed store can
+      // keep the full 2048 upscale while a DDB-backed store still caps
+      // at its inline limit. data.maxEdge overrides both (operator pin).
       let fitted: Awaited<ReturnType<typeof capFitImage>>;
       try {
         fitted = await capFitImage(upscaledBytes, 'image:upscale', {
-          maxDimension: data.maxEdge ?? DEFAULT_STORE_MAX_EDGE,
+          maxDimension: data.maxEdge ?? opts.imageBlobStore.maxStoredEdge ?? DEFAULT_STORE_MAX_EDGE,
+          capBytes: opts.imageBlobStore.capBytes,
         });
       } catch (err) {
         return { status: 'failed', error: err instanceof Error ? err.message : String(err) };

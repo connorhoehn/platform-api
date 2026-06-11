@@ -16,21 +16,33 @@ import { VisionClient, type VisionClientLike } from './VisionClient';
 import { AnthropicVisionClient } from './AnthropicVisionClient';
 import { VisionResultRepository } from './VisionResultRepository';
 import { DdbImageBlobStore, type ImageBlobStore } from './ImageBlobStore';
+import { VolumeImageBlobStore } from './VolumeImageBlobStore';
 
 let _imageBlobStore: ImageBlobStore | null = null;
 let _visionResultRepo: VisionResultRepository | null = null;
 let _visionClient: VisionClientLike | null = null;
 
 /**
- * Singleton DdbImageBlobStore (`pipeline-images` DDB table). Operator
- * provisions the table — see docs/vision-PROVISIONING.md. When the
- * table is missing, put() throws and the HTTP route surfaces a 500;
- * get() soft-fails to null and the step's pipeline:image:vision:failed
- * event surfaces the cause.
+ * Singleton ImageBlobStore. Selection is env-gated:
+ *
+ *   IMAGE_BLOB_STORE=fs  OR  IMAGE_BLOB_DIR is set
+ *     → VolumeImageBlobStore — filesystem-backed, no size cap, supports
+ *       full 2048×2048 upscaled images. Base dir from IMAGE_BLOB_DIR
+ *       (default /var/lib/pipeline-images). Follows the LVS-recordings
+ *       hostPath precedent for local-dev + operator-managed volumes.
+ *
+ *   (default) → DdbImageBlobStore — DDB `pipeline-images` table. Body
+ *     capped at 350KB; max stored edge ~512px. No cloud SDK beyond the
+ *     local DDB substrate already used by every other pipeline table.
  */
 export function getImageBlobStore(): ImageBlobStore {
   if (!_imageBlobStore) {
-    _imageBlobStore = new DdbImageBlobStore();
+    const useFs =
+      process.env['IMAGE_BLOB_STORE'] === 'fs' ||
+      Boolean(process.env['IMAGE_BLOB_DIR']);
+    _imageBlobStore = useFs
+      ? new VolumeImageBlobStore()
+      : new DdbImageBlobStore();
   }
   return _imageBlobStore;
 }
