@@ -151,15 +151,41 @@ pipelineDefinitionsRouter.put(
       return;
     }
 
-    // Capture the BEFORE snapshot for the audit row (best-effort — read failure
-    // becomes a missing `before`, not a request failure).
-    let beforeSnap: Record<string, unknown> | undefined;
+    // Read the existing def once — reused for (a) the audit BEFORE snapshot,
+    // (b) the optimistic-lock check, and (c) authoritative version bumping.
+    // (best-effort — read failure becomes a missing `before`, not a failure).
+    let existing: Record<string, unknown> | null = null;
     try {
-      const existing = await definitionsRepo.get(userId, pipelineId);
-      beforeSnap = definitionSnapshot(existing);
+      existing = await definitionsRepo.get(userId, pipelineId);
     } catch {
-      beforeSnap = undefined;
+      existing = null;
     }
+    const beforeSnap = definitionSnapshot(existing);
+
+    const existingVersion =
+      existing && typeof existing.version === 'number' ? existing.version : 0;
+
+    // Optimistic lock: if the client declares the version it edited from
+    // (`expectedVersion`) and the stored version has moved on, reject so a
+    // concurrent writer isn't clobbered. Opt-in: clients that don't send
+    // expectedVersion get last-writer-wins (but still a monotonic version).
+    const expectedVersion = (def as { expectedVersion?: unknown }).expectedVersion;
+    if (typeof expectedVersion === 'number' && expectedVersion !== existingVersion) {
+      res.status(409).json({
+        error: 'version_conflict',
+        detail: 'pipeline was modified by another writer; reload before saving',
+        currentVersion: existingVersion,
+        expectedVersion,
+      });
+      return;
+    }
+
+    // The SERVER owns the version: monotonically bump from the stored value,
+    // ignoring whatever the client computed. Removes the client-driven
+    // double-increment / non-monotonic drift entirely. Also stamp updatedAt.
+    (def as Record<string, unknown>).version = existingVersion + 1;
+    (def as Record<string, unknown>).updatedAt = new Date().toISOString();
+    delete (def as { expectedVersion?: unknown }).expectedVersion;
 
     // Mint a webhook secret server-side the first time a webhook trigger
     // binding is saved so the secret never has to round-trip through the
