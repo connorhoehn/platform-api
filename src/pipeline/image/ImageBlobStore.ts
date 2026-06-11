@@ -115,8 +115,15 @@ interface ImageRow {
 }
 
 export class DdbImageBlobStore implements ImageBlobStore {
-  /** DDB inline cap limits stored edges to 512px. */
-  readonly maxStoredEdge = 512;
+  /**
+   * Max stored edge for DDB-backed images: 1024px. This is the historical
+   * upscale default (DEFAULT_STORE_MAX_EDGE) — the capBytes ceiling + the
+   * JPEG quality ladder in capFitImage keep a 1024px image under the DDB
+   * 350KB item cap. NOT 512: setting it to 512 silently halved DDB upscale
+   * output from its prior 1024 default. Generate is unaffected because its
+   * source is already 512 and capFitImage uses withoutEnlargement.
+   */
+  readonly maxStoredEdge = 1024;
   /** DDB inline cap — leaves headroom for metadata + ttl. */
   readonly capBytes = IMAGE_BLOB_SIZE_CAP_BYTES;
 

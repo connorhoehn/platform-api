@@ -154,6 +154,33 @@ describe('image:upscale store capability', () => {
     expect(Number(o.width)).toBeLessThanOrEqual(1024);
     expect(Number(o.height)).toBeLessThanOrEqual(1024);
   });
+
+  it('DDB-compatible store (maxStoredEdge=1024) → upscale stays at 1024, NOT regressed to 512', async () => {
+    // Regression guard: DdbImageBlobStore.maxStoredEdge must be 1024 (its
+    // historical upscale default), NOT 512. A value of 512 here would
+    // silently halve every DDB-backed upscale. This store stub mirrors
+    // DdbImageBlobStore's declared capability.
+    const inner = new InMemoryImageBlobStore();
+    const ddbLikeStore: typeof inner & { maxStoredEdge: number; capBytes: number } =
+      Object.assign(inner, { maxStoredEdge: 1024, capBytes: IMAGE_BLOB_SIZE_CAP_BYTES });
+    const sourceBytes = await makePng(512, 512);
+    await ddbLikeStore.put('src-ddb', sourceBytes, {
+      mimeType: 'image/png', sizeBytes: sourceBytes.byteLength,
+      width: 512, height: 512, uploadedAt: 'now',
+    });
+
+    const handler = createImageUpscaleStepHandler({
+      imageBlobStore: ddbLikeStore,
+      upscaleClient: makeUpscaleClient(),
+    });
+    const outcome = await handler.execute(upscaleNode(), { imageId: 'src-ddb' }, makeHelpers());
+
+    expect(outcome.status).toBe('completed');
+    const o = outcome.output as Record<string, unknown>;
+    // Must be the full 1024 (not silently halved to 512).
+    expect(Number(o.width)).toBeGreaterThan(512);
+    expect(Number(o.width)).toBeLessThanOrEqual(1024);
+  });
 });
 
 // ---------------------------------------------------------------------------
