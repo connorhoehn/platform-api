@@ -8,10 +8,15 @@
 // removes the listener on the normal-timeout success path.
 //
 // Two layers of assertion:
-// 1. Behavioral: 50 sleep() calls against the same signal must not leak.
+// 1. Behavioral: N sleep() calls against the same long-lived signal must
+//    leave the abort-listener count bounded — this is the load-bearing
+//    soak-test guard (LIVE-AUDIT C2). Uses the EventTarget listener probe
+//    (events.getEventListeners, available without flags on modern Node)
+//    to count residual 'abort' listeners after the loop.
 // 2. Source-level: the patched body must contain a removeEventListener
 //    on abort — protects against pin slip back to an unpatched build.
 
+import { getEventListeners } from 'node:events';
 import { DurableTransport } from '@connorhoehn/event-catalog';
 
 describe('event-catalog DurableTransport AbortSignal listener bound (hub#971)', () => {
@@ -26,22 +31,35 @@ describe('event-catalog DurableTransport AbortSignal listener bound (hub#971)', 
     expect(src).toMatch(/removeEventListener\(\s*['"]abort['"]/);
   });
 
-  it('50 sleep() calls against the same signal do not accumulate listeners', async () => {
+  it('N sleep() calls against the same signal keep abort-listener count bounded', async () => {
     const controller = new AbortController();
-    // Pre-set a low max so leaked listeners would emit the warning.
+    // Pre-set a low max so leaked listeners would emit MaxListenersExceeded.
     // Cast through unknown — Node's AbortSignal extends EventTarget at
     // runtime but TS DOM types don't surface setMaxListeners.
     (controller.signal as unknown as { setMaxListeners?: (n: number) => void })
       .setMaxListeners?.(5);
 
-    for (let i = 0; i < 50; i++) {
-      await transport.sleep(1, controller.signal);
+    // The LIVE-AUDIT C2 soak symptom was 1857+ accumulated abort listeners
+    // at ~1/sec poll cadence. Run an iteration count well past the default
+    // EventEmitter cap (10) so an unpatched build would both blow the cap
+    // and leave a listener count == iterations.
+    const ITERATIONS = 200;
+    for (let i = 0; i < ITERATIONS; i++) {
+      await transport.sleep(0, controller.signal);
     }
 
-    // Best-effort runtime probe — Node exposes listenerCount on EventTarget
-    // via getEventListeners-style internals only behind --expose-internals.
-    // Source-level assertion above is the load-bearing guard; this test
-    // just ensures the loop completes without throwing.
-    expect(true).toBe(true);
+    // Runtime probe: count residual 'abort' listeners on the long-lived
+    // signal. A correct (patched/upstream-fixed) sleep() removes its
+    // listener on the normal-timeout success path, so this must stay near
+    // zero regardless of how many iterations ran. The unpatched build
+    // would report ~ITERATIONS here.
+    const residual = getEventListeners(
+      controller.signal as unknown as NodeJS.EventEmitter,
+      'abort',
+    ).length;
+
+    // Bounded: allow a tiny slack for any in-flight timer races, but it
+    // must NOT scale with iteration count.
+    expect(residual).toBeLessThanOrEqual(2);
   });
 });
