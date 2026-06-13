@@ -19,6 +19,7 @@ import {
   PutCommand,
   UpdateCommand,
   DeleteCommand,
+  GetCommand,
   type DynamoDBDocumentClient,
 } from '@aws-sdk/lib-dynamodb';
 import type { LeaseStore } from 'distributed-core';
@@ -91,6 +92,26 @@ export function createDDBLeaseStore(opts: DDBLeaseStoreOptions): LeaseStore {
       } catch {
         // Best-effort release; lease auto-expires via TTL if delete fails.
       }
+    },
+
+    // Non-modifying lookup (DC 0.40.3 LeaseStore.read). Returns the current
+    // lease value for `key`, or `null` when the row is absent. Does NOT
+    // filter by `expiresAt` — callers decide whether an expired-but-unswept
+    // row counts as absent (hint) or as the authoritative owner (stale-write
+    // detection). A plain GetItem mirroring the keying used by the
+    // claim/renew/release sites above.
+    async read(key): Promise<{ owner: string; expiresAt: number } | null> {
+      const res = await docClient.send(
+        new GetCommand({
+          TableName: tableName,
+          Key: { [keyAttr]: key },
+        }),
+      );
+      const item = res.Item;
+      if (!item || typeof item.owner !== 'string' || typeof item.expiresAt !== 'number') {
+        return null;
+      }
+      return { owner: item.owner, expiresAt: item.expiresAt };
     },
   };
 }
