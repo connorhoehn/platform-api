@@ -2124,6 +2124,28 @@ components:
         - fork
         - join
         - approval
+        - mcp-tool
+        - 'image:vision-analyze'
+        - scatter
+        - 'image:crop'
+        - 'image:adjust-bw'
+        - 'image:adjust-layer'
+        - 'image:save'
+        - 'image:resize'
+        - 'image:transform'
+        - 'image:format-convert'
+        - 'image:sharpen'
+        - 'image:watermark'
+        - 'image:generate'
+        - 'image:variation'
+        - 'image:edit-prompt'
+        - 'image:upscale'
+        - 'image:dimensions'
+        - 'image:vision-classify'
+        - 'image:vision-describe'
+        - 'image:vision-tag'
+        - 'image:vision-extract-text'
+        - image-source
 
     TriggerType:
       type: string
@@ -2326,6 +2348,27 @@ components:
         - $ref: '#/components/schemas/ForkNodeData'
         - $ref: '#/components/schemas/JoinNodeData'
         - $ref: '#/components/schemas/ApprovalNodeData'
+        - $ref: '#/components/schemas/ImageVisionAnalyzeNodeData'
+        - $ref: '#/components/schemas/ScatterNodeData'
+        - $ref: '#/components/schemas/ImageCropNodeData'
+        - $ref: '#/components/schemas/ImageAdjustBwNodeData'
+        - $ref: '#/components/schemas/ImageAdjustLayerNodeData'
+        - $ref: '#/components/schemas/ImageSaveNodeData'
+        - $ref: '#/components/schemas/ImageResizeNodeData'
+        - $ref: '#/components/schemas/ImageTransformNodeData'
+        - $ref: '#/components/schemas/ImageFormatConvertNodeData'
+        - $ref: '#/components/schemas/ImageSharpenNodeData'
+        - $ref: '#/components/schemas/ImageWatermarkNodeData'
+        - $ref: '#/components/schemas/ImageGenerateNodeData'
+        - $ref: '#/components/schemas/ImageVariationNodeData'
+        - $ref: '#/components/schemas/ImageEditPromptNodeData'
+        - $ref: '#/components/schemas/ImageUpscaleNodeData'
+        - $ref: '#/components/schemas/ImageDimensionsNodeData'
+        - $ref: '#/components/schemas/ImageVisionClassifyNodeData'
+        - $ref: '#/components/schemas/ImageVisionDescribeNodeData'
+        - $ref: '#/components/schemas/ImageVisionTagNodeData'
+        - $ref: '#/components/schemas/ImageVisionExtractTextNodeData'
+        - $ref: '#/components/schemas/ImageSourceNodeData'
       discriminator:
         propertyName: type
         mapping:
@@ -2337,6 +2380,27 @@ components:
           fork: '#/components/schemas/ForkNodeData'
           join: '#/components/schemas/JoinNodeData'
           approval: '#/components/schemas/ApprovalNodeData'
+          'image:vision-analyze': '#/components/schemas/ImageVisionAnalyzeNodeData'
+          scatter: '#/components/schemas/ScatterNodeData'
+          'image:crop': '#/components/schemas/ImageCropNodeData'
+          'image:adjust-bw': '#/components/schemas/ImageAdjustBwNodeData'
+          'image:adjust-layer': '#/components/schemas/ImageAdjustLayerNodeData'
+          'image:save': '#/components/schemas/ImageSaveNodeData'
+          'image:resize': '#/components/schemas/ImageResizeNodeData'
+          'image:transform': '#/components/schemas/ImageTransformNodeData'
+          'image:format-convert': '#/components/schemas/ImageFormatConvertNodeData'
+          'image:sharpen': '#/components/schemas/ImageSharpenNodeData'
+          'image:watermark': '#/components/schemas/ImageWatermarkNodeData'
+          'image:generate': '#/components/schemas/ImageGenerateNodeData'
+          'image:variation': '#/components/schemas/ImageVariationNodeData'
+          'image:edit-prompt': '#/components/schemas/ImageEditPromptNodeData'
+          'image:upscale': '#/components/schemas/ImageUpscaleNodeData'
+          'image:dimensions': '#/components/schemas/ImageDimensionsNodeData'
+          'image:vision-classify': '#/components/schemas/ImageVisionClassifyNodeData'
+          'image:vision-describe': '#/components/schemas/ImageVisionDescribeNodeData'
+          'image:vision-tag': '#/components/schemas/ImageVisionTagNodeData'
+          'image:vision-extract-text': '#/components/schemas/ImageVisionExtractTextNodeData'
+          image-source: '#/components/schemas/ImageSourceNodeData'
 
     # -----------------------------------------------------------------
     # Graph
@@ -3177,3 +3241,633 @@ components:
           type: array
           items: { type: object, additionalProperties: true }
           description: Full trigger binding list (shape per the definition schema).
+
+    # -----------------------------------------------------------------
+    # Image / scatter node data + run-observability types.
+    # Projected 2026-08-16 from websocket-gateway/schemas/pipeline.schema.json
+    # (canonical: frontend/src/types/pipeline.ts) per TYPES_SYNC.md.
+    # -----------------------------------------------------------------
+
+    RetryPolicy:
+      type: object
+      required:
+        - maxAttempts
+        - backoffMs
+        - backoffMultiplier
+      properties:
+        maxAttempts:
+          type: integer
+          minimum: 1
+          maximum: 10
+        backoffMs:
+          type: integer
+          minimum: 100
+          maximum: 60000
+        backoffMultiplier:
+          type: number
+          minimum: 1
+          maximum: 5
+
+    ErrorCategory:
+      type: string
+      enum:
+        - NetworkError
+        - TimeoutError
+        - ValidationError
+        - LLMError
+        - RegistryConflict
+        - UnknownError
+
+    BBox:
+      description: Axis-aligned bounding box in pixel coordinates.
+      type: object
+      required:
+        - x
+        - 'y'
+        - width
+        - height
+      properties:
+        x:
+          type: number
+        'y':
+          type: number
+        width:
+          type: number
+        height:
+          type: number
+
+    AdjustLayer:
+      description: A single composable image adjustment layer, discriminated on `kind`.
+      oneOf:
+        - type: object
+          required:
+            - kind
+            - value
+          properties:
+            kind:
+              type: string
+              enum:
+                - brightness
+                - contrast
+                - saturation
+            value:
+              type: number
+        - type: object
+          required:
+            - kind
+            - degrees
+          properties:
+            kind:
+              const: hue
+            degrees:
+              type: number
+        - type: object
+          required:
+            - kind
+            - radiusPx
+          properties:
+            kind:
+              const: blur
+            radiusPx:
+              type: number
+
+    ResizeFit:
+      type: string
+      enum:
+        - cover
+        - contain
+        - fill
+        - inside
+        - outside
+
+    GeometricOpRotate:
+      type: object
+      required:
+        - op
+        - degrees
+      properties:
+        op:
+          const: rotate
+        degrees:
+          type: number
+        background:
+          type: string
+        trimAfter:
+          type: boolean
+
+    GeometricOpFlip:
+      type: object
+      required:
+        - op
+      properties:
+        op:
+          const: flip
+
+    GeometricOpFlop:
+      type: object
+      required:
+        - op
+      properties:
+        op:
+          const: flop
+
+    GeometricOp:
+      oneOf:
+        - $ref: '#/components/schemas/GeometricOpRotate'
+        - $ref: '#/components/schemas/GeometricOpFlip'
+        - $ref: '#/components/schemas/GeometricOpFlop'
+
+    ImageFormat:
+      type: string
+      enum:
+        - jpeg
+        - png
+        - webp
+        - avif
+
+    WatermarkGravity:
+      type: string
+      enum:
+        - northwest
+        - north
+        - northeast
+        - west
+        - center
+        - east
+        - southwest
+        - south
+        - southeast
+
+    ImageVisionAnalyzeNodeData:
+      type: object
+      required:
+        - type
+        - userPrompt
+        - imageRefPath
+      properties:
+        type:
+          const: image:vision-analyze
+        model:
+          type: string
+        systemPrompt:
+          type: string
+        userPrompt:
+          type: string
+        imageRefPath:
+          type: string
+        outputSchema:
+          type: object
+          additionalProperties: true
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+
+    ScatterNodeData:
+      type: object
+      required:
+        - type
+        - itemsPath
+      properties:
+        type:
+          const: scatter
+        itemsPath:
+          type: string
+        itemAlias:
+          type: string
+        maxConcurrency:
+          type: integer
+          minimum: 1
+
+    ImageCropNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image:crop
+        sourceImagePath:
+          type: string
+        bboxPath:
+          type: string
+        bbox:
+          $ref: '#/components/schemas/BBox'
+        materialize:
+          type: boolean
+
+    ImageAdjustBwNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image:adjust-bw
+        sourceImagePath:
+          type: string
+        algorithm:
+          type: string
+          enum:
+            - luminosity
+            - average
+            - desaturate
+        contrast:
+          type: number
+
+    ImageAdjustLayerNodeData:
+      type: object
+      required:
+        - type
+        - layers
+      properties:
+        type:
+          const: image:adjust-layer
+        sourceImagePath:
+          type: string
+        layers:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdjustLayer'
+
+    ImageSaveNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image:save
+        sourceImagePath:
+          type: string
+        filenameTemplate:
+          type: string
+
+    ImageResizeNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image:resize
+        sourceImagePath:
+          type: string
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+        fit:
+          $ref: '#/components/schemas/ResizeFit'
+        withoutEnlargement:
+          type: boolean
+        background:
+          type: string
+
+    ImageTransformNodeData:
+      type: object
+      required:
+        - type
+        - operations
+      properties:
+        type:
+          const: image:transform
+        sourceImagePath:
+          type: string
+        operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeometricOp'
+
+    ImageFormatConvertNodeData:
+      type: object
+      required:
+        - type
+        - format
+      properties:
+        type:
+          const: image:format-convert
+        sourceImagePath:
+          type: string
+        format:
+          $ref: '#/components/schemas/ImageFormat'
+        quality:
+          type: integer
+          minimum: 1
+          maximum: 100
+        lossless:
+          type: boolean
+        stripMetadata:
+          type: boolean
+
+    ImageSharpenNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image:sharpen
+        sourceImagePath:
+          type: string
+        sigma:
+          type: number
+        m1:
+          type: number
+        m2:
+          type: number
+
+    ImageWatermarkNodeData:
+      type: object
+      required:
+        - type
+        - overlayImageId
+      properties:
+        type:
+          const: image:watermark
+        sourceImagePath:
+          type: string
+        overlayImageId:
+          type: string
+        gravity:
+          $ref: '#/components/schemas/WatermarkGravity'
+        opacity:
+          type: number
+          minimum: 0
+          maximum: 1
+        offsetX:
+          type: number
+        offsetY:
+          type: number
+
+    ImageGenerateNodeData:
+      type: object
+      required:
+        - type
+        - prompt
+      properties:
+        type:
+          const: image:generate
+        prompt:
+          type: string
+        model:
+          type: string
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+        seed:
+          type: integer
+        numImages:
+          type: integer
+          minimum: 1
+
+    ImageVariationNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image:variation
+        sourceImagePath:
+          type: string
+        numVariations:
+          type: integer
+          minimum: 1
+        similarity:
+          type: number
+          minimum: 0
+          maximum: 1
+        model:
+          type: string
+
+    ImageEditPromptNodeData:
+      type: object
+      required:
+        - type
+        - prompt
+      properties:
+        type:
+          const: image:edit-prompt
+        sourceImagePath:
+          type: string
+        maskImagePath:
+          type: string
+        prompt:
+          type: string
+        model:
+          type: string
+
+    ImageUpscaleNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image:upscale
+        sourceImagePath:
+          type: string
+        prompt:
+          type: string
+        maxEdge:
+          type: integer
+          minimum: 1
+
+    ImageDimensionsNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image:dimensions
+        sourceImagePath:
+          type: string
+        maxEdge:
+          type: integer
+          minimum: 1
+
+    ImageVisionClassifyNodeData:
+      type: object
+      required:
+        - type
+        - imageRefPath
+        - labels
+      properties:
+        type:
+          const: image:vision-classify
+        model:
+          type: string
+        imageRefPath:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+          minItems: 2
+        systemPrompt:
+          type: string
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+
+    ImageVisionDescribeNodeData:
+      type: object
+      required:
+        - type
+        - imageRefPath
+        - userPrompt
+      properties:
+        type:
+          const: image:vision-describe
+        model:
+          type: string
+        imageRefPath:
+          type: string
+        userPrompt:
+          type: string
+        systemPrompt:
+          type: string
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+
+    ImageVisionTagNodeData:
+      type: object
+      required:
+        - type
+        - imageRefPath
+      properties:
+        type:
+          const: image:vision-tag
+        model:
+          type: string
+        imageRefPath:
+          type: string
+        candidateTags:
+          type: array
+          items:
+            type: string
+        maxTags:
+          type: integer
+          minimum: 1
+        systemPrompt:
+          type: string
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+
+    ImageVisionExtractTextNodeData:
+      type: object
+      required:
+        - type
+        - imageRefPath
+      properties:
+        type:
+          const: image:vision-extract-text
+        model:
+          type: string
+        imageRefPath:
+          type: string
+        systemPrompt:
+          type: string
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+
+    ImageSourceNodeData:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          const: image-source
+        imageId:
+          type: string
+        outputKey:
+          type: string
+
+    StepAttempt:
+      description: One entry in StepExecution.attempts — full per-attempt retry history (hub#1280).
+      type: object
+      required:
+        - attemptNumber
+        - startedAt
+        - idempotencyKey
+      properties:
+        attemptNumber:
+          type: integer
+          minimum: 1
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+        durationMs:
+          type: number
+          minimum: 0
+        input: {}
+        output: {}
+        error:
+          type: string
+        errorCategory:
+          $ref: '#/components/schemas/ErrorCategory'
+        retryAfterMs:
+          type: number
+          minimum: 0
+        idempotencyKey:
+          type: string
+          description: >-
+            `${runId}:${nodeId}:${attemptNumber}` (per-attempt) or `${runId}:${nodeId}` (per-step
+            idempotent).
+
+    PatchEntry:
+      description: hub#2226 — edit-and-continue patch applied while the run was paused at this step's breakpoint.
+      type: object
+      required:
+        - patchId
+        - appliedAt
+      properties:
+        patchId:
+          type: string
+        appliedAt:
+          type: string
+          format: date-time
+        appliedBy:
+          type: string
+        mode:
+          type: string
+          enum:
+            - merge
+            - jsonPatch
+        revertedAt:
+          type: string
+          format: date-time
+        unvalidated:
+          type: boolean
+
+    TokenUsageByModel:
+      type: object
+      required:
+        - tokensIn
+        - tokensOut
+      properties:
+        tokensIn:
+          type: integer
+          minimum: 0
+        tokensOut:
+          type: integer
+          minimum: 0
+
+    ResumeFromStepEntry:
+      description: A single resume-from-step entry on a PipelineRun (hub#2223).
+      type: object
+      required:
+        - fromNodeId
+        - at
+      properties:
+        fromNodeId:
+          type: string
+        originalFailedStepId:
+          type: string
+        at:
+          type: string
+          format: date-time
