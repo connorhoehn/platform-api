@@ -39,7 +39,12 @@ describe('buildVisionStepHandlers — Map structure', () => {
     // more image transform handlers for a total of 7; Phase 4 adds five
     // Sharp transform handlers for a total of 12; Phase 5 adds three
     // generative AI (Bedrock) handlers for a total of 15; Phase 6 adds four
-    // chained-vision handlers for a total of 19.
+    // chained-vision handlers for a total of 19. Two later additions bring
+    // it to 21: `image:dimensions` (9c7d89f) and `image:upscale` (1440f21).
+    //
+    // Verified against registerVisionHandlers.ts: 21 `handlers.set(...)`
+    // calls with 21 distinct keys — this is a genuine count, not a
+    // duplicate-registration bug that a bumped expectation would mask.
     expect(map.size).toBe(21);
     expect(map.has('image:vision-analyze')).toBe(true);
     expect(map.has('scatter')).toBe(true);
