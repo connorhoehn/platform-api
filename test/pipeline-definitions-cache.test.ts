@@ -9,6 +9,7 @@ jest.mock('../src/lib/logger', () => ({
 
 jest.mock('../src/observability/metrics', () => ({
     recordCacheAccess: jest.fn(),
+    recordPipelineDefinitionsRefresh: jest.fn(),
 }));
 
 jest.mock('../src/pipeline/definitions-repository', () => ({

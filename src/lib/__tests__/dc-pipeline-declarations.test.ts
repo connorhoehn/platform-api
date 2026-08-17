@@ -21,6 +21,9 @@ jest.mock('@connorhoehn/event-catalog', () => ({
     declare: jest.fn((decl: { name: string; transport: string; producer: string | string[]; description?: string; tags?: string[] }) => {
       declareCalls.push(decl);
     }),
+    declareAll: jest.fn((decls: Array<{ name: string; transport: string; producer: string | string[]; description?: string; tags?: string[] }>) => {
+      for (const d of decls) declareCalls.push(d);
+    }),
     publish: jest.fn().mockResolvedValue(undefined),
     getSignalTransport: jest.fn(),
   })),

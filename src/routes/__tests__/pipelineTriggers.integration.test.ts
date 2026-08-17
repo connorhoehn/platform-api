@@ -387,7 +387,9 @@ describe('Webhook trigger end-to-end with signature verification', () => {
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/sig-valid', {
       body: rawBody,
-      headers: { [SIGNATURE_HEADER]: sig },
+      // Signed traffic also passes the hub#1260 replay-window guard, which
+      // requires a fresh x-webhook-timestamp alongside the HMAC header.
+      headers: { [SIGNATURE_HEADER]: sig, 'x-webhook-timestamp': new Date().toISOString() },
     });
 
     expect(res.statusCode).toBe(202);

@@ -30,7 +30,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('buildVisionStepHandlers — Map structure', () => {
-  it('registers the nineteen vision-pipeline step kinds', () => {
+  it('registers the twenty-one vision-pipeline step kinds', () => {
     const ref: PipelineModuleRef = { current: null };
     const map = buildVisionStepHandlers({ moduleRef: ref });
 
@@ -40,7 +40,7 @@ describe('buildVisionStepHandlers — Map structure', () => {
     // Sharp transform handlers for a total of 12; Phase 5 adds three
     // generative AI (Bedrock) handlers for a total of 15; Phase 6 adds four
     // chained-vision handlers for a total of 19.
-    expect(map.size).toBe(19);
+    expect(map.size).toBe(21);
     expect(map.has('image:vision-analyze')).toBe(true);
     expect(map.has('scatter')).toBe(true);
     expect(map.has('image:crop')).toBe(true);
@@ -49,6 +49,8 @@ describe('buildVisionStepHandlers — Map structure', () => {
     expect(map.has('image:adjust-layer')).toBe(true);
     expect(map.has('image:save')).toBe(true);
     expect(map.has('image:resize')).toBe(true);
+    expect(map.has('image:dimensions')).toBe(true);
+    expect(map.has('image:upscale')).toBe(true);
     expect(map.has('image:transform')).toBe(true);
     expect(map.has('image:format-convert')).toBe(true);
     expect(map.has('image:sharpen')).toBe(true);

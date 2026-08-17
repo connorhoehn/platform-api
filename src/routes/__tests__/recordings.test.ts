@@ -199,7 +199,11 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
     expect(body.token).toBe('tok');
     expect(body.expiresAt).toBe('2026-05-30T01:00:00Z');
     expect(body.playlistUrl).toContain('https://public.video.test/api/channels/');
-    expect(body.playlistUrl).toContain('token=tok');
+    // Direct-MP4 playback (composed-url flow): playlistUrl points at the LVS
+    // segments route with no token query param — the token rides separately
+    // in body.token for private-channel callers.
+    expect(body.playlistUrl).toContain('/recordings/r-1/segments/');
+    expect((res.body as { composedUrl: string }).composedUrl).toBe(body.playlistUrl);
 
     // Post-Wave-7 the DDB streamKey is always '' (LVS no longer returns
     // one on POST /api/sessions), so this route uses VIDEO_ADMIN_TOKEN

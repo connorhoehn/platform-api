@@ -183,11 +183,13 @@ describe.each([withMemoryStore(), withDdbStore()])('VideoSessionStore contract â
     it('participant adds + removes persist across a simulated restart', async () => {
       const store = factory.makeStore();
       await store.createSession({ ...SAMPLE, participants: [] });
+      // participantId is the removal key since the per-tab dedup change
+      // (ddf3554) â€” removeParticipant() filters on it, not userId.
       await store.addParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
-        userId: 'u1', displayName: 'A', joinedAt: '2026-01-01T10:00Z',
+        userId: 'u1', participantId: 'p1', displayName: 'A', joinedAt: '2026-01-01T10:00Z',
       });
       await store.addParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
-        userId: 'u2', displayName: 'B', joinedAt: '2026-01-01T10:01Z',
+        userId: 'u2', participantId: 'p2', displayName: 'B', joinedAt: '2026-01-01T10:01Z',
       });
 
       // Simulate process restart â€” new store instance pointing at the same
@@ -198,7 +200,7 @@ describe.each([withMemoryStore(), withDdbStore()])('VideoSessionStore contract â
       expect(after!.participants.map(p => p.userId)).toEqual(['u1', 'u2']);
 
       const splice = await restarted.removeParticipant(
-        SAMPLE.documentId, SAMPLE.sessionId, 'u1',
+        SAMPLE.documentId, SAMPLE.sessionId, 'p1',
       );
       expect(splice).toEqual({ remaining: 1 });
 

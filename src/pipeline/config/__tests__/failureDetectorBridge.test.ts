@@ -23,6 +23,7 @@ jest.mock('distributed-core', () => ({
 }));
 
 import { setupFailureDetectorBridge } from '../failureDetectorBridge';
+import { DistributedLock } from 'distributed-core';
 import type { Cluster } from 'distributed-core';
 
 const MOCK_CLUSTER = {
@@ -30,7 +31,10 @@ const MOCK_CLUSTER = {
   failureDetector: { _id: 'fd' },
   clusterManager: { localNodeId: 'node-test' },
   router: { _id: 'router' },
-  lock: { _id: 'lock' },
+  // setupFailureDetectorBridge runtime-narrows cluster.lock with
+  // `instanceof DistributedLock` (non-instances are dropped from the bridge
+  // targets), so the mock must sit on the real prototype to be wired through.
+  lock: Object.assign(Object.create(DistributedLock.prototype), { _id: 'lock' }),
 } as unknown as Cluster;
 
 const origEnv = process.env;

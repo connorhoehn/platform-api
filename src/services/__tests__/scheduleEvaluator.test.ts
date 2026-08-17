@@ -16,6 +16,24 @@ import {
 } from '../scheduleEvaluator';
 import log from '../../lib/logger';
 
+// The real logger is a service-runtime autoEnrich Proxy whose `get` trap
+// returns a fresh wrapper function on every property read, which makes
+// `jest.spyOn(log, 'error')` structurally impossible (the spy can never be
+// observed through the trap). Mock the module with plain jest.fn()s instead.
+jest.mock('../../lib/logger', () => ({
+  __esModule: true,
+  default: {
+    trace: jest.fn(),
+    debug: jest.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    fatal: jest.fn(),
+    child: jest.fn(),
+  },
+  withContext: jest.fn(),
+}));
+
 function pipeline(over: Partial<PipelineForSchedule> = {}): PipelineForSchedule {
   return {
     id: 'p-1',
@@ -148,7 +166,7 @@ describe('ScheduleEvaluator.evaluateOnce', () => {
     });
     const ids = evaluator.evaluateOnce(new Date(2026, 3, 23, 10, 30));
     expect(ids).toEqual(['b']);
-    errSpy.mockRestore();
+    errSpy.mockClear();
   });
 });
 
@@ -189,7 +207,8 @@ describe('ScheduleEvaluator.triggerNow', () => {
   });
 
   test('swallows trigger errors without throwing', async () => {
-    const errSpy = jest.spyOn(log, 'error').mockImplementation(() => log);
+    const errSpy = log.error as jest.Mock;
+    errSpy.mockClear();
     const evaluator = createScheduleEvaluator({
       listPipelines: () => [pipeline({ id: 'y' })],
       trigger: async () => { throw new Error('manual trigger failed'); },
@@ -200,7 +219,7 @@ describe('ScheduleEvaluator.triggerNow', () => {
       expect.objectContaining({ pipelineId: 'y', err: expect.any(Error) }),
       '[scheduleEvaluator] manual trigger failed',
     );
-    errSpy.mockRestore();
+    errSpy.mockClear();
   });
 });
 
@@ -250,7 +269,8 @@ describe('ScheduleEvaluator.start / stop', () => {
 
   test('tick() errors inside the interval are caught by start()', async () => {
     jest.useFakeTimers();
-    const errSpy = jest.spyOn(log, 'error').mockImplementation(() => log);
+    const errSpy = log.error as jest.Mock;
+    errSpy.mockClear();
     let call = 0;
     const evaluator = createScheduleEvaluator({
       listPipelines: () => { if (call++ === 0) throw new Error('listPipelines exploded'); return []; },
@@ -269,14 +289,15 @@ describe('ScheduleEvaluator.start / stop', () => {
       expect.objectContaining({ err: expect.any(Error) }),
       '[scheduleEvaluator] tick error',
     );
-    errSpy.mockRestore();
+    errSpy.mockClear();
     jest.useRealTimers();
   });
 });
 
 describe('ScheduleEvaluator.tick — trigger error catch', () => {
   test('swallows trigger() rejection without crashing tick()', async () => {
-    const errSpy = jest.spyOn(log, 'error').mockImplementation(() => log);
+    const errSpy = log.error as jest.Mock;
+    errSpy.mockClear();
     const evaluator = createScheduleEvaluator({
       listPipelines: () => [pipeline({ id: 'fail-p' })],
       trigger: async () => { throw new Error('ddb gone'); },
@@ -287,7 +308,7 @@ describe('ScheduleEvaluator.tick — trigger error catch', () => {
       expect.objectContaining({ pipelineId: 'fail-p', err: expect.any(Error) }),
       '[scheduleEvaluator] trigger failed',
     );
-    errSpy.mockRestore();
+    errSpy.mockClear();
   });
 });
 

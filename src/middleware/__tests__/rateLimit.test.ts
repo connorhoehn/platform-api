@@ -482,12 +482,15 @@ describe('rate limiter — DC RateLimitStore.take() contract', () => {
 
     const first = await store.take('k', 1);
     expect(first.allowed).toBe(true);
-    expect(first.remaining).toBeCloseTo(1, 5);
+    // The bucket refills continuously in wall-clock time, so a few ms
+    // between take() calls adds a sliver of tokens — precision 2 keeps the
+    // contract meaningful without being flaky on contended machines.
+    expect(first.remaining).toBeCloseTo(1, 2);
     expect(first.retryAfterMs).toBe(0);
 
     const second = await store.take('k', 1);
     expect(second.allowed).toBe(true);
-    expect(second.remaining).toBeCloseTo(0, 5);
+    expect(second.remaining).toBeCloseTo(0, 2);
 
     const third = await store.take('k', 1);
     expect(third.allowed).toBe(false);

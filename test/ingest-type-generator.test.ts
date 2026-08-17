@@ -3,7 +3,7 @@
 // Tests for type-generator: buildStoredProposal, suggestTypeMatch (LLM path),
 // and generateTypeProposal (LLM path). Uses FixtureLLMClient from distributed-core.
 
-import { FixtureLLMClient } from 'distributed-core';
+import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import {
     buildStoredProposal,
     suggestTypeMatch,

@@ -12,12 +12,14 @@ import { computeEndedSessionTtl } from '../VideoSessionStore';
 
 const PARTICIPANT_A: VideoSessionParticipant = {
   userId: 'user-1',
+  participantId: 'tab-a',
   displayName: 'Alice',
   joinedAt: '2026-01-01T10:00:00Z',
 };
 
 const PARTICIPANT_B: VideoSessionParticipant = {
   userId: 'user-2',
+  participantId: 'tab-b',
   displayName: 'Bob',
   joinedAt: '2026-01-01T10:05:00Z',
 };
@@ -74,7 +76,7 @@ describe('MemoryVideoSessionStore.addParticipant / removeParticipant', () => {
     await store.createSession(
       makeSession({ participants: [PARTICIPANT_A, PARTICIPANT_B] }),
     );
-    const r = await store.removeParticipant('lobby-1', 'sess-1', 'user-1');
+    const r = await store.removeParticipant('lobby-1', 'sess-1', 'tab-a');
     expect(r).toEqual({ remaining: 1 });
     const got = await store.getSession('lobby-1', 'sess-1');
     expect(got!.participants.map(p => p.userId)).toEqual(['user-2']);

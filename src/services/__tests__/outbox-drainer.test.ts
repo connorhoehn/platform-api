@@ -31,6 +31,9 @@ jest.mock('../../lib/ddb-table-name', () => ({
 const mockPublishDurable = jest.fn();
 jest.mock('../../lib/event-catalog', () => ({
   publishDurable: (...args: unknown[]) => mockPublishDurable(...args),
+  // The drainer publishes via catalog.publish (72b5bd1) — route it to the
+  // same assertion mock.
+  catalog: { publish: (...args: unknown[]) => mockPublishDurable(...args) },
 }));
 
 jest.mock('../../lib/logger', () => ({

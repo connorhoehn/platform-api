@@ -166,6 +166,54 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }
 
+  /recordings/{recordingId}/transcript:
+    parameters:
+      - $ref: '#/components/parameters/RecordingIdPath'
+    get:
+      tags: [recordings]
+      summary: Serve the recording's transcript
+      description: |
+        Serves the transcription output for a recording. Resolves the file
+        via the LVS segments-shaped HTTP path so LVS's existing auth +
+        path-traversal guards apply. 404 when the recording has no
+        transcription opted in; 202 + status payload while transcription
+        is still in flight.
+      operationId: getRecordingTranscript
+      responses:
+        '200':
+          description: Transcript ready — body is the transcript content
+        '202':
+          description: Transcription still in flight — status payload
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /recordings/{recordingId}/summary:
+    parameters:
+      - $ref: '#/components/parameters/RecordingIdPath'
+    get:
+      tags: [recordings]
+      summary: Serve the LLM-generated meeting-notes summary
+      description: |
+        Serves the LLM-generated markdown meeting-notes summary for a
+        recording. 404 when the recording has no transcription opted in;
+        202 + status payload while generation is in flight; the raw
+        markdown body when ready.
+      operationId: getRecordingSummary
+      responses:
+        '200':
+          description: Summary ready — body is raw markdown
+          content:
+            text/markdown:
+              schema: { type: string }
+        '202':
+          description: Summary generation in flight — status payload
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /recordings/{recordingId}/share:
     parameters:
       - $ref: '#/components/parameters/RecordingIdPath'
@@ -723,6 +771,34 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+
+  /video/sessions/{sessionId}/refresh-token:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdPath'
+    post:
+      tags: [video-sessions]
+      summary: Rotate a participant's stage token mid-call
+      description: |
+        Thin proxy to LVS `POST /api/sessions/{arn}/refresh-token` —
+        rotates the caller's stage token without leaving the session.
+      operationId: refreshVideoSessionToken
+      responses:
+        '200':
+          description: OK — fresh stage token payload
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          description: SFU circuit breaker open
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '504':
+          description: Upstream LVS timeout
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
 
   /video/sessions/{sessionId}/recording:
     parameters:
