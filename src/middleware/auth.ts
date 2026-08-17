@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import jwksClient from 'jwks-rsa';
+import { readOrgClaim } from '../lib/org-claim';
 
 const region = process.env.COGNITO_REGION!;
 const userPoolId = process.env.COGNITO_USER_POOL_ID!;
@@ -38,7 +39,7 @@ export async function requireAuth(
       try {
         const decoded = jwt.decode(token) as jwt.JwtPayload | null;
         if (decoded && typeof decoded.sub === 'string' && decoded.sub.length > 0) {
-          req.user = { sub: decoded.sub, email: (decoded.email as string | undefined) ?? 'dev@local' };
+          req.user = { sub: decoded.sub, email: (decoded.email as string | undefined) ?? 'dev@local', orgId: readOrgClaim(decoded) };
           next();
           return;
         }
@@ -68,7 +69,7 @@ export async function requireAuth(
       algorithms: ['RS256'],
       issuer,
     }) as jwt.JwtPayload;
-    req.user = { sub: verified.sub!, email: verified.email as string | undefined };
+    req.user = { sub: verified.sub!, email: verified.email as string | undefined, orgId: readOrgClaim(verified) };
     next();
   } catch (err) {
     const message = err instanceof Error && err.name === 'TokenExpiredError'
@@ -94,7 +95,7 @@ export async function optionalAuth(
       try {
         const decoded = jwt.decode(token) as jwt.JwtPayload | null;
         if (decoded && typeof decoded.sub === 'string' && decoded.sub.length > 0) {
-          req.user = { sub: decoded.sub, email: (decoded.email as string | undefined) ?? 'dev@local' };
+          req.user = { sub: decoded.sub, email: (decoded.email as string | undefined) ?? 'dev@local', orgId: readOrgClaim(decoded) };
           next();
           return;
         }
@@ -121,7 +122,7 @@ export async function optionalAuth(
         algorithms: ['RS256'],
         issuer,
       }) as jwt.JwtPayload;
-      req.user = { sub: verified.sub!, email: verified.email as string | undefined };
+      req.user = { sub: verified.sub!, email: verified.email as string | undefined, orgId: readOrgClaim(verified) };
     }
   } catch {
     // Token invalid — proceed without user

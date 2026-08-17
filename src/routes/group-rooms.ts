@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { Router, Request, Response } from 'express';
 import { setCachedRoom } from '../lib/cache';
+import { orgChannel } from '../lib/org-channel';
 import { roomRepo, groupRepo } from '../repositories';
 import type { RoomItem } from '../repositories';
 import {
@@ -36,7 +37,8 @@ groupRoomsRouter.post('/', asyncHandler(async (req: Request, res: Response): Pro
   }
 
   const roomId = randomUUID();
-  const channelId = randomUUID();
+  // GAP B.2: org-prefixed channel name — the gateway's tenant gate keys on it.
+  const channelId = orgChannel(req.user?.orgId, randomUUID());
   const now = new Date().toISOString();
 
   const roomItem: RoomItem = {

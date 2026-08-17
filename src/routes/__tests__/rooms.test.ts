@@ -60,7 +60,7 @@ function mockRes(): MockRes {
   return r;
 }
 
-interface RunOpts { body?: unknown; userId?: string }
+interface RunOpts { body?: unknown; userId?: string; orgId?: string }
 
 async function run(
   app: express.Express,
@@ -83,7 +83,7 @@ async function run(
     headers: { 'content-type': 'application/json' },
     query,
     body: opts.body,
-    user: { sub: opts.userId ?? 'tester' },
+    user: { sub: opts.userId ?? 'tester', ...(opts.orgId ? { orgId: opts.orgId } : {}) },
     params: {},
     ip: '127.0.0.1',
   } as unknown as Request;
@@ -135,6 +135,28 @@ describe('POST /api/rooms — standalone room', () => {
     expect(body.roomId).toBeDefined();
     expect(mockCreateRoom).toHaveBeenCalledTimes(1);
     expect(mockAddMember).toHaveBeenCalledTimes(1);
+  });
+
+  // GAP B.2 — org-prefixed channel names. Rooms minted by an org-carrying
+  // token get `org:<orgId>:<uuid>` channelIds (the gateway's tenant gate keys
+  // on the prefix); org-less callers keep bare UUIDs (fail-open legacy path).
+  it('mints an org-prefixed channelId when the caller has an org claim', async () => {
+    const res = await run(buildApp(), 'POST', '/api/rooms', {
+      body: { name: 'Org Room' },
+      orgId: 'acme',
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.body as { channelId: string };
+    expect(body.channelId).toMatch(/^org:acme:[0-9a-f-]{36}$/);
+  });
+
+  it('mints a bare-UUID channelId for org-less callers', async () => {
+    const res = await run(buildApp(), 'POST', '/api/rooms', {
+      body: { name: 'Legacy Room' },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.body as { channelId: string };
+    expect(body.channelId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it('rejects missing name with 400', async () => {

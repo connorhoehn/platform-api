@@ -13,6 +13,7 @@ import {
   AppError,
 } from '../middleware/error-handler';
 import { tableName } from '../lib/ddb-table-name';
+import { orgChannel } from '../lib/org-channel';
 const REL_TABLE = tableName('social-relationships');
 
 export const roomsRouter = Router();
@@ -57,7 +58,8 @@ roomsRouter.post('/dm', asyncHandler(async (req: Request, res: Response): Promis
 
   // Deterministic DM roomId — sorted to ensure same key regardless of who initiates (ROOM-03)
   const dmRoomId = ['dm', ...[callerId, resolvedTarget].sort()].join('#');
-  const channelId = randomUUID();
+  // GAP B.2: org-prefixed channel name — the gateway's tenant gate keys on it.
+  const channelId = orgChannel(req.user?.orgId, randomUUID());
   const now = new Date().toISOString();
 
   // Write room item with ConditionExpression to prevent duplicate DM rooms (TOCTOU-safe)
@@ -117,7 +119,8 @@ roomsRouter.post('/', asyncHandler(async (req: Request, res: Response): Promise<
   }
 
   const roomId = randomUUID();
-  const channelId = randomUUID();
+  // GAP B.2: org-prefixed channel name — the gateway's tenant gate keys on it.
+  const channelId = orgChannel(req.user?.orgId, randomUUID());
   const now = new Date().toISOString();
 
   const roomItem: RoomItem = {
