@@ -7,8 +7,18 @@
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createMemoryStepHandler } from './MemoryStepHandler';
 import { getMemoryStore } from './memoryServices';
+import type { MemoryStore } from './MemoryStore';
 
 export interface BuildMemoryStepHandlersOpts {
+  /**
+   * Backing store. Injected so the AWS-backed implementation is a HOST choice
+   * rather than something the pipeline layer hardwires - the same reason the
+   * editor keeps vendor names out of its node panels. Defaults to the
+   * env-selected store from memoryServices (in-process unless
+   * PIPELINE_MEMORY_MODE=ddb).
+   */
+  store?: MemoryStore;
+
   /**
    * Mutable ref to the PipelineModule, patched after construction. Needed to
    * resolve a runId to its pipelineId for 'long-term' scope - the same
@@ -23,7 +33,7 @@ export function buildMemoryStepHandlers(
   const handlers = new Map<string, StepHandler>();
 
   const handler = createMemoryStepHandler({
-    store: getMemoryStore(),
+    store: opts.store ?? getMemoryStore(),
     pipelineIdLookup: (runId: string) => {
       const mod = opts.moduleRef.current;
       if (!mod || typeof mod.getRun !== 'function') return undefined;
