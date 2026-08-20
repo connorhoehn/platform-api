@@ -98,6 +98,7 @@ import {
 import { buildPipelineModuleConfig } from './config/pipelineModule';
 import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
 import { buildVisionStepHandlers } from './image/registerVisionHandlers';
+import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
@@ -697,6 +698,13 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     logger: bootstrapLog,
   });
   for (const [key, handler] of visionHandlers) {
+    customStepHandlers.set(key, handler);
+  }
+  // Memory node ('memory'). Same moduleRef again — 'long-term' scope resolves
+  // runId→pipelineId through it, and a run whose pipelineId cannot be resolved
+  // fails the step rather than silently degrading to session scope.
+  const memoryHandlers = buildMemoryStepHandlers({ moduleRef: judgeModuleRef });
+  for (const [key, handler] of memoryHandlers) {
     customStepHandlers.set(key, handler);
   }
 
