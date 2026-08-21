@@ -62,8 +62,17 @@ export async function bootstrapLvsWebhook(): Promise<void> {
   try {
     const listRes = await fetch(`${lvsUrl}/api/event-subscriptions`, { headers });
     if (listRes.ok) {
-      const body = (await listRes.json()) as { subscriptions?: ExistingSubscription[] };
-      const subs = Array.isArray(body?.subscriptions) ? body.subscriptions : [];
+      // LVS returns a BARE ARRAY from GET /api/event-subscriptions; the old
+      // { subscriptions: [...] } read always yielded [] so the dedup check
+      // never matched and every boot POSTed another duplicate (2,356 subs
+      // accumulated by 2026-08-21 — each recording event then fanned out
+      // into thousands of webhook deliveries and froze active calls).
+      const body = (await listRes.json()) as
+        | ExistingSubscription[]
+        | { subscriptions?: ExistingSubscription[] };
+      const subs = Array.isArray(body)
+        ? body
+        : Array.isArray(body?.subscriptions) ? body.subscriptions : [];
       const match = subs.find(
         (s) => s.url === receiverUrl && (s.filter === FILTER || s.filter === '*'),
       );
