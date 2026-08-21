@@ -25,7 +25,6 @@
 // =====================================================================
 
 import { google } from 'googleapis';
-import type { OAuth2Client } from 'google-auth-library';
 import type { drive_v3 } from 'googleapis';
 import { Readable } from 'stream';
 import type { SourceConfig } from '../types';
@@ -95,7 +94,11 @@ function classifyDriveError(err: unknown): {
  * decides whether a typed-doc edit can flow back at all.
  */
 export class GoogleDriveWriteBackDriver implements WriteBackDriver {
-  private buildAuth(config: SourceConfig): OAuth2Client {
+  // Return type deliberately INFERRED (googleapis' own OAuth2 class):
+  // 'google-auth-library' was a phantom dep (undeclared, hoist-resolved)
+  // whose type identity diverges from googleapis-common's nested copy;
+  // inference keeps the whole flow inside googleapis' own types.
+  private buildAuth(config: SourceConfig) {
     const auth = new google.auth.OAuth2(
       config.clientId as string,
       config.clientSecret as string,

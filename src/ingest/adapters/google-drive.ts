@@ -1,5 +1,4 @@
 import { google } from 'googleapis';
-import type { OAuth2Client } from 'google-auth-library';
 import type { drive_v3 } from 'googleapis';
 import type {
   SourceAdapter,
@@ -72,7 +71,10 @@ export class GoogleDriveAdapter implements SourceAdapter {
     supportsWebhook: false,
   };
 
-  private buildAuth(config: SourceConfig): OAuth2Client {
+  // Return type inferred (googleapis' own OAuth2): 'google-auth-library'
+  // was a phantom dependency — never declared, resolved only via hoisting —
+  // and its type identity diverges from googleapis-common's nested copy.
+  private buildAuth(config: SourceConfig) {
     const auth = new google.auth.OAuth2(
       config.clientId as string,
       config.clientSecret as string,
