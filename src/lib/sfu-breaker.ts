@@ -32,7 +32,13 @@ const BREAKER_TIMEOUT_MS = 10_000;
 const sfuBreaker = new CircuitBreaker({
   name: 'video-api',
   failureThreshold: 5,
-  successThreshold: 2,
+  // MUST be <= halfOpenMaxCalls with DC <= v0.42.x: the breaker only
+  // resets halfOpenCalls on a state TRANSITION, so successThreshold: 2 with
+  // halfOpenMaxCalls: 1 deadlocks in HALF_OPEN after the first successful
+  // probe — every later call is rejected ('half-open limit exceeded' →
+  // mapped 502) FOREVER, which is exactly the 'video service unreachable
+  // until pod restart' failure observed 2026-08-21. One good probe closes.
+  successThreshold: 1,
   resetTimeout: 30_000,
   timeout: BREAKER_TIMEOUT_MS,
   halfOpenMaxCalls: 1,
