@@ -1,6 +1,6 @@
 // lib/org-claim.ts
 //
-// MIRROR of websocket-gateway/src/utils/org-claim.ts (itself a mirror of
+// MIRROR of realtime-examples/src/utils/org-claim.ts (itself a mirror of
 // cell-router/src/shard-key.ts). These are SEPARATE npm packages, so they
 // cannot share a literal import without a workspace/publish change. Keep the
 // key list BYTE-IDENTICAL to both — enforced by
@@ -10,7 +10,7 @@
 // gate either blocks legitimate traffic or silently fails open — the list is
 // the load-bearing contract.
 
-/** Org/tenant claim names, in precedence order. MUST match websocket-gateway/src/utils/org-claim.ts. */
+/** Org/tenant claim names, in precedence order. MUST match realtime-examples/src/utils/org-claim.ts. */
 export const ORG_CLAIM_KEYS = ['custom:orgId', 'orgId', 'org_id', 'org', 'custom:org_id'] as const;
 
 /**

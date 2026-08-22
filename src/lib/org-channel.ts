@@ -3,7 +3,7 @@
 // GAP B.2 (cell architecture): org-prefixed channel names.
 //
 // platform-api owns channel NAMING; the gateway's authz gate
-// (websocket-gateway/src/middleware/authz-middleware.ts deriveChannelOrg)
+// (realtime-examples/src/middleware/authz-middleware.ts deriveChannelOrg)
 // already enforces the `org:<orgId>:<name>` shape: a user token carrying an
 // org claim may only touch channels whose name carries the SAME org.
 // Unprefixed channels fail OPEN at that gate (legacy compatibility), which is

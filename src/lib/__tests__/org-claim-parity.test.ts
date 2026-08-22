@@ -1,6 +1,6 @@
 // Drift guard (GAP B.2, mirrors the gateway's GAP B.1 guard):
 // platform-api's ORG_CLAIM_KEYS (src/lib/org-claim.ts) MUST stay
-// byte-identical to websocket-gateway/src/utils/org-claim.ts. They are
+// byte-identical to realtime-examples/src/utils/org-claim.ts. They are
 // separate npm packages so they can't share an import; if they drift,
 // platform-api mints a channel under one org while the gateway authorizes the
 // same token under another (or as org-less) → the tenant gate blocks
