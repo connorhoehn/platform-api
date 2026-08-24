@@ -93,6 +93,17 @@ export class ClaudeCodeLLMClient implements LLMClient {
 
         const child: ChildProcessByStdio<null, Readable, Readable> = spawn(CLAUDE_BIN, args, {
           stdio: ['ignore', 'pipe', 'pipe'],
+          // One-shot completions: extended thinking off by default
+          // (operator directive 2026-08-24 — LLM pipeline nodes are
+          // single-shot template fills; thinking multiplies latency and
+          // token spend for no benefit at this step type). Verified
+          // in-pod: MAX_THINKING_TOKENS=0 is honored by the CLI. Set
+          // PIPELINE_LLM_DISABLE_THINKING=false to restore thinking.
+          // Deliberately NOT applied to the agent client — agentic tool
+          // loops are where reasoning earns its cost.
+          env: process.env['PIPELINE_LLM_DISABLE_THINKING'] === 'false'
+            ? process.env
+            : { ...process.env, MAX_THINKING_TOKENS: '0' },
         });
 
         const abortReg = signal
