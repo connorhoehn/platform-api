@@ -249,7 +249,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     return { service, bus };
   }
 
-  it('handles pipeline:run:cancelled — sets status=canceled and persists', async () => {
+  it('handles pipeline:run:cancelled — sets status=cancelled and persists', async () => {
     const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const { service, bus } = makeService(repo);
     service.start();
@@ -262,7 +262,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     await bus.publish('pipeline:run:cancelled', { runId: 'rc1', at: 't1' });
 
     const lastItem = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
-    expect(lastItem.status).toBe('canceled');
+    expect(lastItem.status).toBe('cancelled');
     expect(lastItem.completedAt).toBe('t1');
   });
 
