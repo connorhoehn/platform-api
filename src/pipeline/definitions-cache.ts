@@ -16,9 +16,10 @@
 //      got re-touched, so scheduled pipelines went silently dark.
 //
 //   2. The public webhook router in `src/routes/pipelineWebhooks.ts`.
-//      `lookupPipelineIdByWebhookPath()` and `lookupWebhookSecret()` need
-//      to map the URL path back to a pipeline definition (which is owned
-//      by a specific user, but the URL itself is global). Same restart
+//      `lookupWebhookBinding()` needs to map the URL path back to a
+//      pipeline definition (which is owned by a specific user, but the URL
+//      itself is global, and the route is unauthenticated so it has no
+//      userId to read that definition with). Same restart
 //      blindness as above. Webhook receipt is a hot path — calling
 //      DynamoDB on every POST would add ~10ms of latency and burn read
 //      capacity on every signature check.
@@ -54,6 +55,29 @@ export interface PipelineDefinitionsCacheOptions {
 export interface WebhookIndexEntry {
   pipelineId: string;
   secret?: string;
+  /**
+   * The full stored definition that declared this binding.
+   *
+   * The webhook route is unauthenticated, so it has no `userId` with which
+   * to call `definitionsRepo.get(userId, pipelineId)` — but it MUST pass a
+   * definition to `bridge.trigger` (PipelineModule.createResource rejects
+   * the call without one). The cache is already holding every definition in
+   * memory to build this index, so carrying it here costs nothing and needs
+   * no owner lookup: the binding was authored by the definition's owner, so
+   * "the definition that claimed this path" is exactly the one the owner
+   * asked us to run.
+   */
+  definition: PipelineDefinition;
+  /**
+   * True when two or more stored definitions claim the same `webhookPath`.
+   *
+   * The index is a Map keyed by path and the Scan order that feeds it is not
+   * stable, so a collision would otherwise resolve to an arbitrary winner —
+   * meaning one user's webhook payload could be delivered into another
+   * user's pipeline (and the loser's webhook would silently stop firing).
+   * We refuse to pick a winner; the route fails the request closed.
+   */
+  ambiguous?: boolean;
 }
 
 /**
@@ -151,6 +175,7 @@ export class PipelineDefinitionsCache {
    */
   private rebuildWebhookIndex(defs: PipelineDefinition[]): void {
     const index = new Map<string, WebhookIndexEntry>();
+    const conflicts: string[] = [];
     for (const def of defs) {
       const d = def as {
         id?: string;
@@ -163,11 +188,28 @@ export class PipelineDefinitionsCache {
       const tb = d?.triggerBinding;
       if (!tb || tb.event !== 'webhook') continue;
       if (!tb.webhookPath || typeof d.id !== 'string') continue;
-      const entry: WebhookIndexEntry = { pipelineId: d.id };
+
+      // Collision: a second definition claims a path another one already
+      // took. Mark it and keep going — WHICH entry we retain is irrelevant
+      // because the route refuses ambiguous bindings outright.
+      const existing = index.get(tb.webhookPath);
+      if (existing) {
+        existing.ambiguous = true;
+        conflicts.push(tb.webhookPath);
+        continue;
+      }
+
+      const entry: WebhookIndexEntry = { pipelineId: d.id, definition: def };
       if (typeof tb.webhookSecret === 'string' && tb.webhookSecret.length > 0) {
         entry.secret = tb.webhookSecret;
       }
       index.set(tb.webhookPath, entry);
+    }
+    if (conflicts.length > 0) {
+      log.warn(
+        { webhookPaths: Array.from(new Set(conflicts)) },
+        'webhook path claimed by more than one pipeline definition; those paths will be refused',
+      );
     }
     this.webhookIndex = index;
   }

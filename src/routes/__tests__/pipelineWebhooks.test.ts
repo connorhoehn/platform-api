@@ -250,6 +250,48 @@ function buildApp(): express.Express {
   return app;
 }
 
+// ---------------------------------------------------------------------------
+// Webhook-binding seeding.
+//
+// The route resolves a webhook path ONLY through an owner-authored
+// `triggerBinding.webhookPath` on a stored definition — there is no fallback
+// to the raw URL segment. Every test that expects a run must therefore seed a
+// binding first. `seedBinding` writes straight into the definitions cache
+// (accumulating, so multiple bindings can coexist within one test); the
+// signature suite further down uses `seedViaPut` instead so it exercises the
+// real upsert path that mints secrets.
+// ---------------------------------------------------------------------------
+
+let seededDefs: Array<Record<string, unknown>> = [];
+
+function seedBinding(opts: {
+  webhookPath: string;
+  pipelineId?: string;
+  webhookSecret?: string;
+  nodes?: Array<{ id: string; type: string }>;
+}): Record<string, unknown> {
+  const def: Record<string, unknown> = {
+    id: opts.pipelineId ?? `pipe-${opts.webhookPath}`,
+    name: `def for ${opts.webhookPath}`,
+    version: 1,
+    status: 'published',
+    nodes: opts.nodes ?? [],
+    edges: [],
+    triggerBinding: {
+      event: 'webhook',
+      webhookPath: opts.webhookPath,
+      ...(opts.webhookSecret ? { webhookSecret: opts.webhookSecret } : {}),
+    },
+  };
+  seededDefs.push(def);
+  pipelineDefinitionsCache.__setSnapshotForTests(
+    seededDefs as unknown as Parameters<
+      typeof pipelineDefinitionsCache.__setSnapshotForTests
+    >[0],
+  );
+  return def;
+}
+
 // Reset logger + audit mocks between tests so per-test assertions don't
 // see leftover calls from earlier cases. The structured logger replaces
 // the old `console.log` noise — it's silenced by virtue of being a
@@ -261,6 +303,8 @@ beforeEach(() => {
   mockLog.debug.mockClear();
   mockedAuditRecord.mockClear();
   mockedAuditRecord.mockImplementation(() => Promise.resolve());
+  seededDefs = [];
+  pipelineDefinitionsCache.__setSnapshotForTests([]);
   // Install a stub bridge so the handler's new "must forward" path resolves
   // a runId. Individual tests that need to exercise the 503/null-bridge
   // branch override this with `setPipelineBridge(null)` directly.
@@ -281,6 +325,7 @@ describe('POST /hooks/pipeline/:path', () => {
     setPipelineBridge(
       makeStubBridge(async () => ({ runId: 'run-weekly-digest-1' })),
     );
+    seedBinding({ webhookPath: 'weekly-digest' });
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/weekly-digest', {
       body: { ping: 'pong' },
@@ -304,6 +349,7 @@ describe('POST /hooks/pipeline/:path', () => {
     // Wave-2 audit: external systems lying about success is worse than
     // failing loud. With no bridge wired, the route MUST surface 503.
     setPipelineBridge(null);
+    seedBinding({ webhookPath: 'no-bridge' });
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/no-bridge', {
       body: { hello: 'world' },
@@ -322,6 +368,7 @@ describe('POST /hooks/pipeline/:path', () => {
     );
     // The route logs the failure via the structured logger; the mocked
     // `log.error` jest.fn captures the call without writing to stdout.
+    seedBinding({ webhookPath: 'throws' });
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/throws', {
       body: { x: 1 },
@@ -343,6 +390,7 @@ describe('POST /hooks/pipeline/:path', () => {
       }),
     );
 
+    seedBinding({ webhookPath: 'forwarded' });
     const app = buildApp();
     // Pass body as a Buffer so the handler's `Buffer.isBuffer(req.body)`
     // branch runs (mirrors the signature tests — `express.raw` is bypassed
@@ -356,9 +404,9 @@ describe('POST /hooks/pipeline/:path', () => {
     expect(res.statusCode).toBe(202);
     expect(calls).toHaveLength(1);
     const args = calls[0];
-    // pipelineId falls back to the webhook path when no definition is
-    // bound (we didn't seed a pipeline def for this path).
-    expect(args.pipelineId).toBe('forwarded');
+    // pipelineId comes from the bound definition — never from the URL
+    // segment (an anonymous caller must not be able to name a pipeline).
+    expect(args.pipelineId).toBe('pipe-forwarded');
     expect(args.triggeredBy.userId).toBe('webhook:forwarded');
     const tp = args.triggerPayload as {
       webhookPath: string;
@@ -376,6 +424,7 @@ describe('POST /hooks/pipeline/:path', () => {
   test('accepts alphanumeric, underscore, hyphen', async () => {
     const app = buildApp();
     for (const path of ['abc', 'a_b', 'a-b', 'A1_b-2', 'x'.repeat(64)]) {
+      seedBinding({ webhookPath: path });
       const res = await run(app, 'POST', `/hooks/pipeline/${path}`, {
         body: {},
       });
@@ -433,6 +482,7 @@ describe('POST /hooks/pipeline/:path', () => {
   });
 
   test('route handler runs the header filter without crashing on mixed inputs', async () => {
+    seedBinding({ webhookPath: 'h1' });
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/h1', {
       body: { ok: true },
@@ -452,12 +502,120 @@ describe('POST /hooks/pipeline/:path', () => {
   });
 
   test('tolerates an empty body and still returns 202', async () => {
+    seedBinding({ webhookPath: 'empty' });
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/empty', {
       body: undefined,
     });
     expect(res.statusCode).toBe(202);
     expect((res.body as { accepted: boolean }).accepted).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GATE — argument-shape contract with the pipeline bridge.
+//
+// `bridge.trigger` hands its arguments straight to
+// `PipelineModule.createResource`, which THROWS when `definition` is absent:
+//
+//   createResource: metadata.applicationData.definition
+//   (PipelineDefinition) is required
+//
+// Every webhook-driven run 500'd in production for exactly that reason while
+// this suite stayed green, because the suite stubs the bridge and only ever
+// asserted the PAYLOAD. Asserting the argument shape is the only way a
+// stubbed suite can catch this class of bug — so that is what these tests do.
+//
+// The companion assertions cover the resolution rules that keep the fix from
+// widening access: a path nobody published resolves to nothing (404, no
+// trigger), and a path two owners both claim resolves to nothing (409, no
+// trigger) rather than to an arbitrary Scan winner.
+// ---------------------------------------------------------------------------
+
+describe('POST /hooks/pipeline/:path — bridge.trigger argument contract', () => {
+  test('bridge.trigger receives the bound definition', async () => {
+    const calls: Array<Parameters<NonNullable<PipelineBridge['trigger']>>[0]> =
+      [];
+    setPipelineBridge(
+      makeStubBridge(async (args) => {
+        calls.push(args);
+        return { runId: 'run-with-def' };
+      }),
+    );
+
+    const def = seedBinding({
+      webhookPath: 'needs-def',
+      pipelineId: 'pipe-needs-def',
+      nodes: [{ id: 'n1', type: 'transform' }],
+    });
+
+    const app = buildApp();
+    const res = await run(app, 'POST', '/hooks/pipeline/needs-def', {
+      body: Buffer.from(JSON.stringify({ hello: 'world' }), 'utf8'),
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect((res.body as { runId: string }).runId).toBe('run-with-def');
+    expect(calls).toHaveLength(1);
+
+    // The contract PipelineModule.createResource enforces.
+    const { definition } = calls[0];
+    expect(definition).toBeDefined();
+    expect(definition).toEqual(def);
+    // ...and it is the definition that claimed the path, not a stand-in
+    // synthesised from the URL.
+    expect((definition as { id: string }).id).toBe('pipe-needs-def');
+    expect((definition as { nodes: unknown[] }).nodes).toEqual([
+      { id: 'n1', type: 'transform' },
+    ]);
+    expect(calls[0].pipelineId).toBe('pipe-needs-def');
+  });
+
+  test('404 and no trigger when no definition is bound to the path', async () => {
+    const calls: unknown[] = [];
+    setPipelineBridge(
+      makeStubBridge(async (args) => {
+        calls.push(args);
+        return { runId: 'should-not-happen' };
+      }),
+    );
+
+    const app = buildApp();
+    const res = await run(app, 'POST', '/hooks/pipeline/nobody-published-me', {
+      body: Buffer.from('{}', 'utf8'),
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect((res.body as { title: string }).title).toBe('Unknown webhook path');
+    // The old `?? path` fallback let an anonymous caller name an arbitrary
+    // pipelineId via the URL. It must not reach the bridge at all.
+    expect(calls).toHaveLength(0);
+  });
+
+  test('409 and no trigger when two definitions claim the same path', async () => {
+    const calls: unknown[] = [];
+    setPipelineBridge(
+      makeStubBridge(async (args) => {
+        calls.push(args);
+        return { runId: 'should-not-happen' };
+      }),
+    );
+
+    // Two owners publish the same webhook path. The cache index is fed by an
+    // unordered Scan, so choosing a winner would non-deterministically deliver
+    // one owner's webhook payload into the other owner's pipeline.
+    seedBinding({ webhookPath: 'contested', pipelineId: 'owner-a-pipe' });
+    seedBinding({ webhookPath: 'contested', pipelineId: 'owner-b-pipe' });
+
+    const app = buildApp();
+    const res = await run(app, 'POST', '/hooks/pipeline/contested', {
+      body: Buffer.from('{}', 'utf8'),
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { title: string }).title).toBe('Ambiguous webhook path');
+    expect(calls).toHaveLength(0);
+    expect(mockLog.error).toHaveBeenCalled();
   });
 });
 
@@ -633,7 +791,11 @@ describe('POST /hooks/pipeline/:path — HMAC-SHA256 signature', () => {
   });
 
   test('no secret configured on def → 202 (legacy unsigned mode)', async () => {
-    // Note: no seedViaPut call — store has no def for this path.
+    // A binding IS required (an unbound path is a 404 now) — but this one
+    // carries no `webhookSecret`, so the route keeps the Phase-1 accept-
+    // unsigned behavior. Seeded straight into the cache because the real PUT
+    // handler mints a secret server-side whenever event === 'webhook'.
+    seedBinding({ webhookPath: 'unsigned-legacy' });
     const rawBody = Buffer.from(JSON.stringify({ hello: 'world' }), 'utf8');
 
     const app = buildApp();

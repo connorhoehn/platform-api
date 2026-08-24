@@ -7,6 +7,7 @@ import express from 'express';
 import http from 'http';
 import { AddressInfo } from 'net';
 import { renderPrometheusText } from '../observability/metrics';
+import { shouldParseJsonBody } from '../app';
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
@@ -142,5 +143,42 @@ describe('/internal/metrics endpoint', () => {
         expect(res.body).toContain('wsg_active_connections');
         expect(res.body).toContain('pipeline_triggers_total');
         expect(res.body).toContain('ingest_items_total');
+    });
+});
+
+// ─── global JSON parser scoping ────────────────────────────────────────────
+//
+// HMAC-verified webhook receivers mount their own `express.raw` and need the
+// exact signed bytes. body-parser sets `req._body` once ANY parser runs, so a
+// router-level raw parser no-ops if the global JSON parser got there first —
+// the handler then sees a parsed object, `Buffer.isBuffer(req.body)` false,
+// and computes its HMAC over zero bytes.
+//
+// /hooks/lvs was excluded; /hooks/pipeline was NOT, so every
+// `Content-Type: application/json` pipeline webhook silently lost its payload
+// and could never verify a signature (the live pod logged `bodySize: 0` for a
+// 15-byte POST). These assert the real exported predicate, not a copy.
+
+describe('shouldParseJsonBody', () => {
+    test('skips pipeline webhooks so the raw body survives for HMAC', () => {
+        expect(
+            shouldParseJsonBody('/hooks/pipeline/weekly-digest', 'application/json'),
+        ).toBe(false);
+    });
+
+    test('skips LVS webhooks', () => {
+        expect(shouldParseJsonBody('/hooks/lvs/recording', 'application/json')).toBe(false);
+    });
+
+    test('parses ordinary JSON API traffic', () => {
+        expect(shouldParseJsonBody('/api/pipelines/defs/p1', 'application/json')).toBe(true);
+        expect(
+            shouldParseJsonBody('/api/pipelines/defs/p1', 'application/json; charset=utf-8'),
+        ).toBe(true);
+    });
+
+    test('leaves non-JSON content types alone', () => {
+        expect(shouldParseJsonBody('/api/anything', 'text/plain')).toBe(false);
+        expect(shouldParseJsonBody('/api/anything', '')).toBe(false);
     });
 });

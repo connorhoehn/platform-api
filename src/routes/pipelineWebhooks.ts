@@ -16,12 +16,15 @@
 // fixtures keep working — Phase-5 will gate this on a global config flag.
 //
 // Raw-body gotcha: `express.json()` is mounted globally in `createApp()`
-// which would consume `req.body` before this route runs. To preserve the
-// exact bytes signed by the source we mount `express.raw({ type: '*/*' })`
-// at the router level — Express picks the first body parser that matches,
-// so the upstream `express.json()` never touches webhook traffic. After
-// signature verification we parse the raw buffer ourselves into the JSON
-// object that the existing log line / future Phase-4 forwarder expects.
+// and would consume `req.body` before this route runs. To preserve the exact
+// bytes signed by the source we mount `express.raw({ type: '*/*' })` at the
+// router level AND exclude `/hooks/pipeline` from the global parser (see
+// `shouldParseJsonBody` in app.ts). Both halves are required: body-parser
+// marks the request consumed via `req._body`, so the router-level raw parser
+// silently no-ops if the global JSON parser ran first — which is exactly what
+// happened until 2026-08, leaving every JSON webhook with an empty rawBody.
+// After signature verification we parse the raw buffer ourselves into the JSON
+// object that the existing log line / Phase-4 forwarder expects.
 
 import express, { Router, type Request, type Response } from 'express';
 import {
@@ -38,7 +41,10 @@ import {
   recordPipelineError,
 } from '../observability/metrics';
 import { auditRepo } from '../pipeline/audit-repository';
-import { pipelineDefinitionsCache } from '../pipeline/definitions-cache';
+import {
+  pipelineDefinitionsCache,
+  type WebhookIndexEntry,
+} from '../pipeline/definitions-cache';
 import { getPipelineBridge } from './pipelineTriggers';
 
 // Route-scoped structured logger. Every log line emitted by this file
@@ -79,52 +85,42 @@ export function pickSafeHeaders(
 }
 
 /**
- * Lookup the webhook secret (if any) configured for a given path across all
- * pipeline definitions. Returns the first match — paths are expected to be
- * unique per user / pipeline, but the route itself is global so we accept
- * the first hit. Returning `undefined` means "no secret configured" and the
- * route falls through to the Phase-1 "accept unsigned" behavior.
+ * Resolve the webhook binding — `{ pipelineId, secret?, definition }` — whose
+ * `triggerBinding.webhookPath` matches `path`. Returns `undefined` when no
+ * stored pipeline definition claims that path.
  *
- * Backed by `pipelineDefinitionsCache.getWebhookEntry()` — O(1) index built
- * on each cache refresh. Replaces the O(n) scan from earlier waves.
+ * This is the ONLY way this route learns what to run. It is deliberately not
+ * possible for a caller to name a pipeline: the URL path is matched against
+ * bindings that pipeline OWNERS authored in their own definitions, so an
+ * unauthenticated POST can only reach a pipeline whose owner explicitly
+ * published it at this path. (The previous `?? path` fallback — treating the
+ * raw URL segment as a pipelineId when nothing was bound — is gone; it let an
+ * anonymous caller name an arbitrary pipelineId. It never actually produced a
+ * run because the trigger below rejects a missing definition, but it is not a
+ * shape we want to keep now that definitions do flow through.)
  *
- * Exported so the test suite can stub it out without coupling tests to the
- * full pipeline-definition upsert flow.
- */
-export function lookupWebhookSecret(path: string): string | undefined {
-  return pipelineDefinitionsCache.getWebhookEntry(path)?.secret;
-}
-
-/**
- * Resolve the `pipelineId` whose `triggerBinding.webhookPath` matches `path`.
- * Returns `undefined` when no pipeline definition is bound to that path —
- * the caller is free to fall back to the path itself (e.g. for legacy
- * unsigned dev fixtures) so the bridge.trigger call still has SOMETHING to
- * key on. First match wins (paths are expected unique across the user
- * surface).
- *
- * Backed by `pipelineDefinitionsCache.getWebhookEntry()` — O(1) index built
- * on each cache refresh. Replaces the O(n) scan from earlier waves.
+ * Backed by `pipelineDefinitionsCache.getWebhookEntry()` — O(1) index rebuilt
+ * on each cache refresh, so this costs no I/O on the webhook hot path.
  *
  * Exported for tests so they can assert resolution without seeding the full
  * upsert flow.
  */
-export function lookupPipelineIdByWebhookPath(
+export function lookupWebhookBinding(
   path: string,
-): string | undefined {
-  return pipelineDefinitionsCache.getWebhookEntry(path)?.pipelineId;
+): WebhookIndexEntry | undefined {
+  return pipelineDefinitionsCache.getWebhookEntry(path);
 }
 
 // ---------------------------------------------------------------------------
 // Raw-body capture
 // ---------------------------------------------------------------------------
 //
-// `express.raw` short-circuits the upstream `express.json()` because Express
-// only invokes one body parser per request — the first one whose `type`
-// predicate matches. Mounting it at the router level scopes that override
-// to /hooks/pipeline only; the rest of the API still gets parsed JSON.
-// `type: '*/*'` accepts whatever Content-Type the caller sends so signed
-// non-JSON payloads (form-encoded, plain text, etc.) still verify.
+// Express invokes only ONE body parser per request — whichever runs first and
+// matches. The global `express.json()` runs before this one, so it must opt
+// out of `/hooks/pipeline` (it does; see `shouldParseJsonBody` in app.ts) for
+// this raw parser to see the stream at all. `type: '*/*'` accepts whatever
+// Content-Type the caller sends so signed non-JSON payloads (form-encoded,
+// plain text, etc.) still verify.
 const captureRawBody = express.raw({
   type: '*/*',
   limit: MAX_BODY_BYTES,
@@ -164,10 +160,41 @@ pipelineWebhooksRouter.post(
       ? req.body
       : Buffer.alloc(0);
 
-    // Signature verification — only when a secret is configured for the
-    // matched path. No secret = legacy "accept unsigned" behavior so Phase-1
-    // dev fixtures keep working.
-    const secret = lookupWebhookSecret(path);
+    // Resolve the owner-authored binding FIRST — before we touch the bridge
+    // or spend a HMAC. No binding means nothing is published at this path, so
+    // there is nothing to run and nothing to say beyond "not found".
+    const binding = lookupWebhookBinding(path);
+    if (!binding) {
+      log.warn({ webhookPath: path }, 'pipeline-webhook path is not bound to any pipeline');
+      return res.status(404).json({
+        type: 'about:blank',
+        title: 'Unknown webhook path',
+        status: 404,
+        detail: `No pipeline is bound to webhook path '${path}'.`,
+      });
+    }
+
+    // Two or more definitions claim this path. Picking one would hand this
+    // request's payload to a pipeline whose owner may not be the owner who
+    // published the path (the index is fed by an unordered Scan). Fail closed
+    // and make the operator disambiguate.
+    if (binding.ambiguous) {
+      log.error(
+        { webhookPath: path },
+        'pipeline-webhook path is claimed by more than one pipeline definition; refusing',
+      );
+      return res.status(409).json({
+        type: 'about:blank',
+        title: 'Ambiguous webhook path',
+        status: 409,
+        detail: `Webhook path '${path}' is claimed by more than one pipeline definition. Refusing to guess which one to run.`,
+      });
+    }
+
+    // Signature verification — only when a secret is configured on the
+    // matched binding. No secret = legacy "accept unsigned" behavior so
+    // Phase-1 dev fixtures keep working.
+    const secret = binding.secret;
     if (secret) {
       const headerRaw = req.headers[SIGNATURE_HEADER];
       const header = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
@@ -256,21 +283,29 @@ pipelineWebhooksRouter.post(
       });
     }
 
-    // Prefer the pipelineId bound to this webhook path; fall back to the
-    // path itself when no definition is registered (matches the "no secret
-    // configured" legacy unsigned mode and lets dev fixtures keep working).
-    const resolvedPipelineId =
-      lookupPipelineIdByWebhookPath(path) ?? path;
+    const resolvedPipelineId = binding.pipelineId;
 
     // The webhook route is unauthenticated by design — there's no Cognito
     // sub to attribute the run to. Synthesize a deterministic actor id so
     // downstream audit trails can distinguish webhook-driven runs from
     // user-driven ones (and from each other, by webhook path).
+    //
+    // Deliberately NOT the definition owner's userId: the run executes the
+    // owner's pipeline (that is what they published) but it must not be
+    // attributed to — or run as — the owner, or an anonymous POST would be
+    // indistinguishable from that person's own actions in the audit trail.
     const actorUserId = `webhook:${path}`;
 
     try {
+      // `definition` is REQUIRED by PipelineModule.createResource — without
+      // it the call throws "createResource: metadata.applicationData.
+      // definition (PipelineDefinition) is required" and every webhook run
+      // 500s. We take it from the binding (the same cache entry that
+      // resolved the pipelineId), so no per-user read and no widening: it is
+      // by construction the definition whose owner published this path.
       const out = await bridge.trigger({
         pipelineId: resolvedPipelineId,
+        definition: binding.definition,
         triggerPayload: payload,
         triggeredBy: { userId: actorUserId },
       });

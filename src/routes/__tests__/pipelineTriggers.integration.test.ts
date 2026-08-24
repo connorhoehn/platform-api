@@ -90,6 +90,31 @@ const mockLog = (globalThis as unknown as {
 
 const mockedAuditRecord = auditRepo.record as jest.Mock;
 
+/**
+ * Publish a webhook path straight into the definitions cache.
+ *
+ * The webhook route resolves a path ONLY through an owner-authored
+ * `triggerBinding.webhookPath`; unpublished paths 404 before the bridge is
+ * consulted. Tests that want to reach the bridge must seed a binding.
+ */
+function seedWebhookBinding(webhookPath: string, webhookSecret?: string): void {
+  pipelineDefinitionsCache.__setSnapshotForTests([
+    {
+      id: `pipe-${webhookPath}`,
+      name: `def for ${webhookPath}`,
+      version: 1,
+      status: 'published',
+      nodes: [],
+      edges: [],
+      triggerBinding: {
+        event: 'webhook',
+        webhookPath,
+        ...(webhookSecret ? { webhookSecret } : {}),
+      },
+    },
+  ]);
+}
+
 interface MockRes {
   statusCode: number;
   headers: Record<string, string | number | readonly string[]>;
@@ -259,6 +284,9 @@ describe('Pipeline bridge unavailable (bridge === null)', () => {
 
   test('webhook POST returns 503 when bridge is null', async () => {
     setPipelineBridge(null);
+    // A binding must exist — an unpublished path is a 404 before the route
+    // ever consults the bridge.
+    seedWebhookBinding('some-hook');
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/some-hook', { body: { x: 1 } });
     expect(res.statusCode).toBe(503);
@@ -316,6 +344,7 @@ describe('Audit write failures logged at warn', () => {
       getHistory: async () => [],
       resolveApproval: async () => {},
     });
+    seedWebhookBinding('audit-fail');
     const app = buildApp();
     const res = await run(app, 'POST', '/hooks/pipeline/audit-fail', {
       body: { test: true },

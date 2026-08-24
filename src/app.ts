@@ -14,6 +14,27 @@ import { renderPrometheusText } from './observability/metrics';
 import { createCapabilitiesRouter } from './routes/capabilities';
 import { definitionsRepo } from './pipeline/definitions-repository';
 
+/**
+ * Which requests the GLOBAL `express.json()` is allowed to consume.
+ *
+ * Every HMAC-verified webhook receiver mounts its own
+ * `express.raw({ type: '*\/*' })` and needs the exact bytes the sender signed.
+ * body-parser marks a request consumed (`req._body = true`) as soon as one
+ * parser handles it, so a router-level raw parser silently no-ops once the
+ * global JSON parser has run — the handler then sees a parsed object, an
+ * empty rawBody, and a HMAC computed over zero bytes.
+ *
+ * Exported (rather than inlined in the `express.json({ type })` option) so
+ * this rule is directly testable; the regression it guards against is
+ * invisible from the outside except as "signatures never verify and payloads
+ * arrive empty".
+ */
+export function shouldParseJsonBody(url: string, contentType: string): boolean {
+  if (url.startsWith('/hooks/lvs')) return false;
+  if (url.startsWith('/hooks/pipeline')) return false;
+  return contentType.includes('application/json');
+}
+
 export function createApp(): express.Application {
   const app = express();
 
@@ -35,18 +56,27 @@ export function createApp(): express.Application {
     next();
   });
 
-  // Global JSON parser — skipped for /hooks/lvs/* so the LVS webhook
-  // receiver can read the raw bytes for HMAC verification. Once the
-  // global parser consumes the stream, the route-level raw parser
+  // Global JSON parser — skipped for /hooks/lvs/* and /hooks/pipeline/* so
+  // those webhook receivers can read the raw bytes for HMAC verification.
+  // Once the global parser consumes the stream, the route-level raw parser
   // can't re-read it; req.body would arrive as a parsed Object and
   // the HMAC update() would crash with ERR_INVALID_ARG_TYPE.
+  //
+  // /hooks/pipeline was missing from this list: pipelineWebhooks.ts mounts
+  // `express.raw({ type: '*/*' })` at the router level and its header comment
+  // claims Express "picks the first body parser that matches", but body-parser
+  // marks the request consumed (`req._body`) so the router-level raw parser
+  // no-ops. Every `Content-Type: application/json` webhook therefore reached
+  // the handler with a parsed object, `Buffer.isBuffer(req.body)` false, and
+  // an EMPTY rawBody — so signed webhooks could never verify (HMAC over zero
+  // bytes) and unsigned ones forwarded `body: {}` into the pipeline. Silent
+  // payload loss; live pod logged `bodySize: 0` for a 15-byte POST.
   app.use(express.json({
-    type: (req) => {
-      const url = (req as any).url || '';
-      if (url.startsWith('/hooks/lvs')) return false;
-      const ct = req.headers['content-type'] || '';
-      return ct.includes('application/json');
-    },
+    type: (req) =>
+      shouldParseJsonBody(
+        (req as any).url || '',
+        String(req.headers['content-type'] || ''),
+      ),
   }));
   app.use(requestLogger);
   app.use(httpMetrics);

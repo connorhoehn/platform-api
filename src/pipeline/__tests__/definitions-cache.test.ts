@@ -188,6 +188,38 @@ describe('PipelineDefinitionsCache', () => {
       expect(entry).toBeDefined();
       expect(entry!.secret).toBeUndefined();
     });
+
+    // The unauthenticated webhook route has no userId with which to load a
+    // definition, so it can only run what the index carries. Dropping the
+    // definition here is what made every webhook-triggered run 500 on
+    // `createResource: metadata.applicationData.definition ... is required`.
+    it('carries the full definition that declared the binding', () => {
+      const def = makeWebhookDef('p1', '/hooks/p1');
+      cache.__setSnapshotForTests([def]);
+      const entry = cache.getWebhookEntry('/hooks/p1');
+      expect(entry!.definition).toBe(def);
+    });
+
+    // Scan order is unstable, so silently picking a winner would let one
+    // owner's webhook payload land in another owner's pipeline.
+    it('marks a path claimed by two definitions as ambiguous', () => {
+      cache.__setSnapshotForTests([
+        makeWebhookDef('owner-a-pipe', '/hooks/contested'),
+        makeWebhookDef('owner-b-pipe', '/hooks/contested'),
+      ]);
+      const entry = cache.getWebhookEntry('/hooks/contested');
+      expect(entry).toBeDefined();
+      expect(entry!.ambiguous).toBe(true);
+    });
+
+    it('leaves uncontested paths unambiguous', () => {
+      cache.__setSnapshotForTests([
+        makeWebhookDef('p1', '/hooks/p1'),
+        makeWebhookDef('p2', '/hooks/p2'),
+      ]);
+      expect(cache.getWebhookEntry('/hooks/p1')!.ambiguous).toBeUndefined();
+      expect(cache.getWebhookEntry('/hooks/p2')!.ambiguous).toBeUndefined();
+    });
   });
 
   describe('__setSnapshotForTests()', () => {
