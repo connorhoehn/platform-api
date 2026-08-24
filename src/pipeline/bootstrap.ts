@@ -99,6 +99,7 @@ import { buildPipelineModuleConfig } from './config/pipelineModule';
 import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
 import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
+import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
@@ -705,6 +706,17 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // fails the step rather than silently degrading to session scope.
   const memoryHandlers = buildMemoryStepHandlers({ moduleRef: judgeModuleRef });
   for (const [key, handler] of memoryHandlers) {
+    customStepHandlers.set(key, handler);
+  }
+  // Agentic node ('agent'): a real `claude -p` agent loop with tool use.
+  // No moduleRef needed — the trace goes out as step output, not to a
+  // side repository keyed by pipelineId. Registered via the custom-handler
+  // seam rather than a DC NodeType so it ships without a distributed-core
+  // dist/ rebuild + pipeline-runtime SHA repin; if DC later lands a
+  // first-class `agent` NodeType, built-in dispatch wins and this line is
+  // simply deleted.
+  const agentHandlers = buildAgentStepHandlers({ logger: bootstrapLog });
+  for (const [key, handler] of agentHandlers) {
     customStepHandlers.set(key, handler);
   }
 
