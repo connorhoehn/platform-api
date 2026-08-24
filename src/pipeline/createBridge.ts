@@ -165,6 +165,40 @@ function parseStoredError(stored: string): { message: string; nodeId: string; er
 // `message` and `stack` but no structured category. We add `errorCategory`
 // + `retryability` here so operators can triage failures (NetworkError vs
 // TimeoutError vs LLMError) without parsing stack traces.
+/**
+ * Map a persisted `PipelineRunItem` onto the wire snapshot.
+ *
+ * Exported because the run-DETAIL route needs the exact same mapping for its
+ * repository fallback: `bridge.getRun()` only ever sees runs the CURRENT
+ * process executed, so after a restart every earlier run 404'd from detail
+ * while still listing fine (the list path has always read the repository).
+ * Two mappings would drift, and this one already carries the legacy-status
+ * folding that keeps list and detail agreeing.
+ */
+export function runItemToSnapshot(item: PipelineRunItem): PipelineRunSnapshot {
+  return {
+    runId: item.runId,
+    pipelineId: item.pipelineId,
+    // Fold legacy spellings onto the canonical union. New writes are already
+    // canonical (runPersistence), but rows persisted before that fix still
+    // carry `succeeded`/`canceled`, and this endpoint must agree with the
+    // detail endpoint for every run — historical ones included.
+    status: normalizeRunStatus(item.status),
+    startedAt: item.startedAt,
+    completedAt: item.completedAt,
+    // Hub#1282: surface interruptedAt so the UI can render a "Resume" affordance.
+    ...(item.interruptedAt ? { interruptedAt: item.interruptedAt } : {}),
+    steps: summariesToStepExecutions(item.stepsSummary, item.runId),
+    error: item.error ? parseStoredError(item.error) : undefined,
+    triggeredBy: {
+      userId: item.triggeredBy === 'system' ? undefined : item.triggeredBy,
+      triggerType: item.triggerType ?? 'manual',
+      payload: {},
+    },
+    triggerType: item.triggerType,
+  };
+}
+
 function toRunSnapshot(run: unknown): PipelineRunSnapshot | null {
   if (!run || typeof run !== 'object') return null;
   const r = run as Record<string, unknown>;
@@ -427,28 +461,7 @@ export function createBridge(
         limit,
       });
 
-      // Convert PipelineRunItem to PipelineRunSnapshot
-      const runs: PipelineRunSnapshot[] = items.map((item) => ({
-        runId: item.runId,
-        pipelineId: item.pipelineId,
-        // Fold legacy spellings onto the canonical union. New writes are
-        // already canonical (runPersistence), but rows persisted before that
-        // fix still carry `succeeded`/`canceled`, and this endpoint must agree
-        // with the detail endpoint for every run — historical ones included.
-        status: normalizeRunStatus(item.status),
-        startedAt: item.startedAt,
-        completedAt: item.completedAt,
-        // Hub#1282: surface interruptedAt so the UI can render a "Resume" affordance.
-        ...(item.interruptedAt ? { interruptedAt: item.interruptedAt } : {}),
-        steps: summariesToStepExecutions(item.stepsSummary, item.runId),
-        error: item.error ? parseStoredError(item.error) : undefined,
-        triggeredBy: {
-          userId: item.triggeredBy === 'system' ? undefined : item.triggeredBy,
-          triggerType: item.triggerType ?? 'manual',
-          payload: {},
-        },
-        triggerType: item.triggerType,
-      }));
+      const runs: PipelineRunSnapshot[] = items.map(runItemToSnapshot);
 
       return { runs, nextCursor: undefined }; // Pagination via cursor NYI
     },

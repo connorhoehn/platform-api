@@ -19,6 +19,9 @@ import type { InlinePipelineDefinition } from '../pipeline/http/contracts';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { stubRunStore } from '../pipeline/stub-run-store';
+import { runItemToSnapshot } from '../pipeline/createBridge';
+import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
+import { getDynamoClient } from '../lib/ddb-client';
 
 export { classifyPipelineError, type ErrorCategory };
 export {
@@ -317,6 +320,12 @@ pipelineTriggersRouter.post(
 //
 // When the bridge exposes `listRuns()` we forward to it; otherwise we read
 // from the in-memory stubRunStore (filtered to the calling user).
+let runRepoSingleton: PipelineRunRepository | null = null;
+function getRunRepo(): PipelineRunRepository {
+  if (!runRepoSingleton) runRepoSingleton = new PipelineRunRepository(getDynamoClient());
+  return runRepoSingleton;
+}
+
 pipelineTriggersRouter.get(
   '/',
   asyncHandler<
@@ -416,6 +425,28 @@ pipelineTriggersRouter.get(
     }
 
     if (!snap) {
+      // `bridge.getRun()` only knows runs THIS process executed — it reads the
+      // in-memory PipelineModule. So every run predating the current pod 404'd
+      // here while listing perfectly, because the list path has always read
+      // the repository. Same store, same mapping, so the two endpoints agree.
+      let persisted = null;
+      try {
+        persisted = await getRunRepo().get(pipelineId, runId);
+      } catch (err) {
+        // The repository is a FALLBACK — the bridge has already said it does
+        // not know this run. If the repo is unreachable (or unwired, as in
+        // unit tests) we still cannot claim the run exists, so 404 remains
+        // the honest answer to "does this run exist"; the infra failure goes
+        // to the log rather than becoming a 500 that hides the real question.
+        reqLog.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'run-detail repository fallback failed',
+        );
+      }
+      if (persisted) {
+        res.json(runItemToSnapshot(persisted));
+        return;
+      }
       throw new NotFoundError('run not found');
     }
     res.json(snap);

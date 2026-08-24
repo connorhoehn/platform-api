@@ -17,6 +17,12 @@ import express, { type NextFunction, type Request, type Response } from 'express
 
 // Stub redis-client so the idempotency middleware doesn't try to dial Redis
 // in unit tests (saves ~30ms/test and keeps stderr clean).
+const mockRunRepoGet = jest.fn();
+jest.mock('../../repositories/PipelineRunRepository', () => ({
+  PipelineRunRepository: jest.fn().mockImplementation(() => ({ get: mockRunRepoGet })),
+}));
+jest.mock('../../lib/ddb-client', () => ({ getDynamoClient: () => ({}) }));
+
 jest.mock('../../lib/redis-client', () => ({
   getRedisClient: async () => null,
 }));
@@ -286,6 +292,51 @@ describe('GET /pipelines/:pipelineId/runs/:runId (snapshot)', () => {
     });
     const app = buildApp();
     const res = await run(app, 'GET', '/pipelines/p1/runs/missing');
+    expect(res.statusCode).toBe(404);
+  });
+
+  // The bridge only knows runs the CURRENT process executed (in-memory
+  // PipelineModule). Before the repository fallback, every run predating the
+  // running pod 404'd from detail while the list endpoint — which has always
+  // read the repository — returned it complete with steps. Reproduced live:
+  // a run created by the running pod resolved; one from before the last
+  // restart did not.
+  test('falls back to the repository for a run this process never executed', async () => {
+    mockRunRepoGet.mockResolvedValueOnce({
+      runId: 'old-run',
+      pipelineId: 'p1',
+      status: 'succeeded', // legacy spelling — must be folded on the way out
+      startedAt: '2026-08-24T00:00:00.000Z',
+      completedAt: '2026-08-24T00:00:01.000Z',
+      stepsSummary: {},
+      triggeredBy: 'user-1',
+      triggerType: 'manual',
+    });
+    setPipelineBridge({
+      getRun: async () => null,
+      getHistory: async () => [],
+      resolveApproval: async () => {},
+    });
+
+    const app = buildApp();
+    const res = await run(app, 'GET', '/pipelines/p1/runs/old-run');
+
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { runId: string; status: string };
+    expect(body.runId).toBe('old-run');
+    // Same mapping as the list endpoint, so the two agree on vocabulary.
+    expect(body.status).toBe('completed');
+  });
+
+  test('still 404s when neither the bridge nor the repository has the run', async () => {
+    mockRunRepoGet.mockResolvedValueOnce(null);
+    setPipelineBridge({
+      getRun: async () => null,
+      getHistory: async () => [],
+      resolveApproval: async () => {},
+    });
+    const app = buildApp();
+    const res = await run(app, 'GET', '/pipelines/p1/runs/nope');
     expect(res.statusCode).toBe(404);
   });
 
