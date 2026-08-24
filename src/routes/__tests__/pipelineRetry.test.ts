@@ -431,6 +431,30 @@ describe('POST /pipelines/:pipelineId/runs/:runId/retry/:nodeId', () => {
     });
   });
 
+  // GATE for the retry-from-node 500 (2026-08-23). Every live retry
+  // failed with `createResource: metadata.applicationData.definition
+  // (PipelineDefinition) is required` while this suite stayed green,
+  // because the assertions above check the payload and never checked
+  // that the route forwards the DEFINITION it already loaded.
+  //
+  // Asserting the argument shape is the whole point: a suite that stubs
+  // bridge.trigger can only catch this by inspecting what the route
+  // hands it. (A heavier variant that boots a real PipelineModule was
+  // tried and OOMs the jest worker — not worth the heap for the same
+  // signal.)
+  test('bridge.trigger receives the loaded definition — required by createResource', async () => {
+    mockRunRepoGet.mockResolvedValueOnce(baseRun);
+    mockDefRepoGet.mockResolvedValueOnce(baseDef);
+    (getPipelineBridge as jest.Mock).mockReturnValue(mockBridge);
+    mockBridge.trigger.mockResolvedValueOnce({ runId: 'def-run-1' });
+
+    await run(retryApp, 'POST', '/pipelines/p1/runs/r1/retry/node-B');
+
+    const [triggerArg] = mockBridge.trigger.mock.calls[0] as [{ definition?: unknown }];
+    expect(triggerArg.definition).toBeDefined();
+    expect(triggerArg.definition).toEqual(baseDef);
+  });
+
   test('body.inputs merged into triggerPayload', async () => {
     mockRunRepoGet.mockResolvedValueOnce(baseRun);
     mockDefRepoGet.mockResolvedValueOnce(baseDef);

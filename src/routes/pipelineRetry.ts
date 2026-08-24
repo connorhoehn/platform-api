@@ -182,8 +182,13 @@ pipelineRetryRouter.post(
     });
 
     try {
+      // `definition` is REQUIRED by PipelineModule.createResource (it throws
+      // "createResource: metadata.applicationData.definition (PipelineDefinition)
+      // is required" otherwise). We already loaded it above to validate nodeId,
+      // so forward it — same shape the sibling trigger route sends.
       const { runId: newRunId } = await bridge.trigger({
         pipelineId,
+        definition,
         triggerPayload: retryPayload,
         triggeredBy: { userId },
       });
