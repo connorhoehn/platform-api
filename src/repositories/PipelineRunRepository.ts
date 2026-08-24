@@ -64,6 +64,30 @@ export interface StepSummary {
   attempts?: StepAttempt[];
 }
 
+/**
+ * DC-25 durable resume: the latest executor checkpoint, persisted from
+ * `pipeline:run:checkpoint` events onto the run row so it survives pod
+ * replacement (the file WAL lives on the pod's ephemeral fs and does not).
+ *
+ * `steps` records are SLIMMED before persistence (no input/output/llm/agent
+ * payloads — outputs already live in `context.steps` and in `stepsSummary`),
+ * which keeps the row bounded. When even the slimmed checkpoint exceeds the
+ * size budget, the largest `context.steps` entries are replaced with
+ * `{truncated:true,size}` markers and listed in `droppedContextStepKeys`.
+ */
+export interface PersistedCheckpoint {
+  sequenceNumber: number;
+  at: string;
+  context: Record<string, unknown>;
+  currentStepIds: string[];
+  steps?: Record<string, unknown>;
+  joinStates?: Record<string, unknown[]>;
+  firedJoins?: string[];
+  completedStepCount?: number;
+  /** context.steps keys whose values were dropped by size compaction. */
+  droppedContextStepKeys?: string[];
+}
+
 export interface PipelineRunItem {
   pipelineId: string;
   runId: string;
@@ -87,6 +111,25 @@ export interface PipelineRunItem {
   estimatedCostUsd?: number;
   /** Epoch seconds — set by application for auto-expiry of old runs. */
   ttl?: number;
+  /**
+   * DC-25 durable resume: latest executor checkpoint (see PersistedCheckpoint).
+   * Written by RunPersistenceService from `pipeline:run:checkpoint` events.
+   * Its presence is what makes an `interrupted` run resumable at boot.
+   */
+  checkpoint?: PersistedCheckpoint;
+  /**
+   * The exact PipelineDefinition graph this run executes — captured from the
+   * FIRST checkpoint event (the executor includes it at sequenceNumber 1).
+   * Authoritative over the definitions repo for resume: the live definition
+   * may have been edited since the run started.
+   */
+  definitionSnapshot?: unknown;
+  /** ISO timestamp of the most recent boot-time resume of this run. */
+  resumedAt?: string;
+  /** Number of times this run has been resumed after an interruption. */
+  resumeCount?: number;
+  /** Node id that claimed the interrupted run for resume (double-resume guard). */
+  resumeClaimedBy?: string;
 }
 
 /**
@@ -234,6 +277,52 @@ export class PipelineRunRepository extends BaseRepository {
   /** Remove a run. */
   async delete(pipelineId: string, runId: string): Promise<void> {
     return this.deleteItem({ pipelineId, runId });
+  }
+
+  /**
+   * DC-25: idempotent claim of an `interrupted` run for boot-time resume.
+   *
+   * A conditional update — `status` must still be `interrupted` — so two
+   * processes racing to resume the same run cannot both win: the loser's
+   * write fails the condition and this returns `null`. The winner's row
+   * transitions to `running` with `resumeClaimedBy`/`resumedAt` stamped and
+   * `resumeCount` incremented (a second crash re-interrupts it and the next
+   * boot can claim it again).
+   *
+   * Returns the post-claim item on success, `null` when the claim was lost
+   * (already claimed, or the run reached a terminal state meanwhile).
+   */
+  async claimForResume(
+    pipelineId: string,
+    runId: string,
+    nodeId: string,
+    at: string = new Date().toISOString(),
+  ): Promise<PipelineRunItem | null> {
+    try {
+      const attributes = await this.updateItem({
+        Key: { pipelineId, runId },
+        UpdateExpression:
+          'SET #status = :running, resumeClaimedBy = :nodeId, resumedAt = :at, ' +
+          'resumeCount = if_not_exists(resumeCount, :zero) + :one',
+        ConditionExpression: '#status = :interrupted',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':running': 'running',
+          ':interrupted': 'interrupted',
+          ':nodeId': nodeId,
+          ':at': at,
+          ':zero': 0,
+          ':one': 1,
+        },
+        ReturnValues: 'ALL_NEW',
+      });
+      return (attributes as unknown as PipelineRunItem) ?? null;
+    } catch (err) {
+      if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      throw err;
+    }
   }
 
   /**

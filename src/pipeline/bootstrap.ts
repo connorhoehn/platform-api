@@ -109,6 +109,8 @@ import { buildRaftSigner } from './config/signer';
 import { RunPersistenceService, setRunPersistenceService } from './runPersistence';
 import { StuckRunDetector } from './StuckRunDetector';
 import { scanOrphanedRuns } from './scanOrphanedRuns';
+import { resumeInterruptedRuns } from './resumeInterruptedRuns';
+import { definitionsRepo } from './definitions-repository';
 import { runWalPreflight } from './WalPreflight';
 import { createShutdown } from './ShutdownOrchestrator';
 import log, { withContext } from '../lib/logger';
@@ -905,14 +907,50 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
         `Invalid PIPELINE_RESUME_WINDOW_MS="${resumeWindowEnv}" — falling back to default 4h window`,
       );
     }
+    // DC-25: after the orphan-scan marks dead-pod runs `interrupted`,
+    // resume the recoverable ones (checkpoint + definition present) on THIS
+    // process, under their original runIds. Behind PIPELINE_RESUME_ON_BOOT
+    // (default ON) so operators can fall back to scan-only marking.
+    const resumeOnBoot =
+      (process.env.PIPELINE_RESUME_ON_BOOT ?? 'true').trim().toLowerCase() !== 'false';
+    const pipelineRunRepository = opts.pipelineRunRepository;
+    const runPersistenceRef = runPersistence;
     void scanOrphanedRuns({
-      repository: opts.pipelineRunRepository,
+      repository: pipelineRunRepository,
       ...(Number.isFinite(resumeWindowMs) && (resumeWindowMs ?? 0) >= 0
         ? { resumeWindowMs: resumeWindowMs as number }
         : {}),
-    }).catch((err) => {
-      bootstrapLog.warn({ err: String(err) }, 'orphan-scan failed at bootstrap');
-    });
+    })
+      .then(async (scan) => {
+        if (!resumeOnBoot) {
+          if (scan.transitioned > 0) {
+            logger.info(
+              `resume-on-boot DISABLED (PIPELINE_RESUME_ON_BOOT=false) — ${scan.transitioned} interrupted run(s) left for manual resume`,
+            );
+          }
+          return;
+        }
+        const resumeResult = await resumeInterruptedRuns({
+          repository: pipelineRunRepository,
+          module,
+          runPersistence: runPersistenceRef,
+          definitionsRepo,
+          nodeId,
+          ...(Number.isFinite(resumeWindowMs) && (resumeWindowMs ?? 0) >= 0
+            ? { resumeWindowMs: resumeWindowMs as number }
+            : {}),
+        });
+        if (resumeResult.scanned > 0) {
+          logger.info(
+            `boot resume: ${resumeResult.resumed} resumed / ${resumeResult.scanned} interrupted ` +
+              `(noCheckpoint=${resumeResult.skippedNoCheckpoint}, noDefinition=${resumeResult.skippedNoDefinition}, ` +
+              `outsideWindow=${resumeResult.skippedOutsideWindow}, claimLost=${resumeResult.claimLost}, failed=${resumeResult.failed})`,
+          );
+        }
+      })
+      .catch((err) => {
+        bootstrapLog.warn({ err: String(err) }, 'orphan-scan/boot-resume failed at bootstrap');
+      });
   }
 
   // T9 (lib-expansion-3): construct the bus-event DLQ and assign into the

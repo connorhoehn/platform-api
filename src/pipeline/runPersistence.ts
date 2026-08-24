@@ -28,6 +28,7 @@ import { retryWithBackoff } from 'distributed-core';
 import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import {
   PipelineRunRepository,
+  type PersistedCheckpoint,
   type PipelineRunItem,
   type RunItemStatus,
   type StepAttempt,
@@ -48,6 +49,14 @@ export interface RunPersistenceOptions {
   ttlSeconds?: number;
   /** Maximum size of step output to persist (default: 100KB). */
   maxStepOutputBytes?: number;
+  /**
+   * DC-25: size budget for the persisted checkpoint blob (default: 100KB —
+   * same discipline as maxStepOutputBytes). Above it, the largest
+   * `context.steps` entries are replaced with `{truncated:true,size}`
+   * markers; if even that can't get under budget, the previous checkpoint
+   * is kept and the oversized one is dropped with an error log.
+   */
+  maxCheckpointBytes?: number;
 }
 
 /**
@@ -77,6 +86,15 @@ interface RunState {
   stepAttempts: Record<string, StepAttempt[]>;
   /** ISO timestamp of the most recent event observed for this run. */
   lastEventAt: string;
+  /** DC-25: latest (compacted) checkpoint — persisted onto the run row. */
+  checkpoint?: PersistedCheckpoint;
+  /** DC-25: definition snapshot captured from the first checkpoint event. */
+  definitionSnapshot?: unknown;
+  /** DC-25 resume bookkeeping — carried so full-row puts don't wipe the claim. */
+  interruptedAt?: string;
+  resumedAt?: string;
+  resumeCount?: number;
+  resumeClaimedBy?: string;
 }
 
 export class RunPersistenceService {
@@ -87,11 +105,14 @@ export class RunPersistenceService {
   private readonly runCache = new Map<string, RunState>();
   private subscriptionActive = false;
 
+  private readonly maxCheckpointBytes: number;
+
   constructor(options: RunPersistenceOptions) {
     this.eventBus = options.eventBus;
     this.repository = options.repository;
     this.ttlSeconds = options.ttlSeconds ?? 90 * 24 * 60 * 60; // 90 days
     this.maxStepOutputBytes = options.maxStepOutputBytes ?? 100 * 1024; // 100KB
+    this.maxCheckpointBytes = options.maxCheckpointBytes ?? 100 * 1024; // 100KB
   }
 
   /**
@@ -142,6 +163,16 @@ export class RunPersistenceService {
     this.eventBus.subscribe('pipeline:run:cancelled', async (event) => {
       await this.handleRunCancelled(event.payload).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:cancelled');
+      });
+    });
+
+    // DC-25: durable resume. Every checkpoint the executor emits is
+    // compacted and persisted onto the run row so an in-flight run's
+    // frontier survives pod replacement (the file WAL does not — it lives
+    // on the pod's ephemeral filesystem).
+    this.eventBus.subscribe('pipeline:run:checkpoint', async (event) => {
+      await this.handleCheckpoint(event.payload).catch((err) => {
+        log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:checkpoint');
       });
     });
 
@@ -382,6 +413,152 @@ export class RunPersistenceService {
       completedAt: at,
       attempts,
     };
+  }
+
+  /**
+   * DC-25: fold a `pipeline:run:checkpoint` event onto the run row.
+   *
+   * The raw payload duplicates step outputs twice (steps[].output and
+   * context.steps) and can carry LLM transcripts — persisting it wholesale
+   * would blow both the 100KB discipline and the 400KB DDB item ceiling.
+   * Compaction, in order:
+   *   1. Step records are ALWAYS slimmed to resume-critical fields
+   *      (status/timestamps/sourceHandle/approvals/error). Outputs are not
+   *      lost — they live in `context.steps` (execution truth) and in
+   *      `stepsSummary` (display truth, per-step-truncated already).
+   *   2. If the serialized checkpoint still exceeds `maxCheckpointBytes`,
+   *      the largest `context.steps` values are replaced with
+   *      `{truncated:true,size}` markers (largest-first) and recorded in
+   *      `droppedContextStepKeys` — a resumed run sees truncation markers
+   *      for those outputs rather than resurrecting megabytes.
+   *   3. If even that cannot fit, the checkpoint is dropped (previous one
+   *      kept) and an error is logged — stale-but-valid beats truncated-
+   *      wholesale, which is how oversized items got silently mangled
+   *      elsewhere in this codebase.
+   */
+  private async handleCheckpoint(event: {
+    runId: string;
+    context: Record<string, unknown>;
+    currentStepIds: string[];
+    sequenceNumber: number;
+    at: string;
+    steps?: Record<string, unknown>;
+    joinStates?: Record<string, unknown[]>;
+    firedJoins?: string[];
+    completedStepCount?: number;
+    definition?: unknown;
+  }): Promise<void> {
+    this.touchLastEvent(event.runId, event.at);
+    const state = this.runCache.get(event.runId);
+    if (!state) {
+      log.warn({ runId: event.runId }, 'run:checkpoint for unknown run');
+      return;
+    }
+
+    // Definition snapshot rides only the FIRST checkpoint — capture once.
+    if (event.definition && state.definitionSnapshot === undefined) {
+      state.definitionSnapshot = event.definition;
+    }
+
+    // (1) Slim the step records.
+    const slimSteps: Record<string, unknown> = {};
+    for (const [stepId, raw] of Object.entries(event.steps ?? {})) {
+      const s = (raw ?? {}) as Record<string, unknown>;
+      slimSteps[stepId] = {
+        nodeId: s.nodeId,
+        status: s.status,
+        ...(s.startedAt !== undefined ? { startedAt: s.startedAt } : {}),
+        ...(s.completedAt !== undefined ? { completedAt: s.completedAt } : {}),
+        ...(s.durationMs !== undefined ? { durationMs: s.durationMs } : {}),
+        ...(s.sourceHandle !== undefined ? { sourceHandle: s.sourceHandle } : {}),
+        ...(s.error !== undefined ? { error: s.error } : {}),
+        ...(s.approvals !== undefined ? { approvals: s.approvals } : {}),
+      };
+    }
+
+    const candidate: PersistedCheckpoint = {
+      sequenceNumber: event.sequenceNumber,
+      at: event.at,
+      context: JSON.parse(JSON.stringify(event.context)) as Record<string, unknown>,
+      currentStepIds: event.currentStepIds,
+      steps: slimSteps,
+      ...(event.joinStates !== undefined ? { joinStates: event.joinStates } : {}),
+      ...(event.firedJoins !== undefined ? { firedJoins: event.firedJoins } : {}),
+      ...(event.completedStepCount !== undefined
+        ? { completedStepCount: event.completedStepCount }
+        : {}),
+    };
+
+    // (2) Largest-first truncation of context.steps values.
+    let size = JSON.stringify(candidate).length;
+    if (size > this.maxCheckpointBytes) {
+      const ctxSteps = candidate.context.steps as Record<string, unknown> | undefined;
+      if (ctxSteps && typeof ctxSteps === 'object') {
+        const bySize = Object.entries(ctxSteps)
+          .map(([k, v]) => ({ k, bytes: JSON.stringify(v ?? null).length }))
+          .sort((a, b) => b.bytes - a.bytes);
+        const dropped: string[] = [];
+        for (const { k, bytes } of bySize) {
+          if (size <= this.maxCheckpointBytes) break;
+          ctxSteps[k] = { truncated: true, size: bytes };
+          dropped.push(k);
+          size = JSON.stringify(candidate).length;
+        }
+        if (dropped.length > 0) {
+          candidate.droppedContextStepKeys = dropped;
+          log.warn(
+            { runId: event.runId, sequenceNumber: event.sequenceNumber, dropped, size },
+            'checkpoint context.steps truncated to fit size budget',
+          );
+        }
+      }
+    }
+
+    // (3) Still oversized (huge non-steps context) — keep the previous one.
+    if (size > this.maxCheckpointBytes) {
+      log.error(
+        { runId: event.runId, sequenceNumber: event.sequenceNumber, size, budget: this.maxCheckpointBytes },
+        'checkpoint exceeds size budget even after compaction — keeping previous checkpoint',
+      );
+      return;
+    }
+
+    state.checkpoint = candidate;
+    await this.persistRun(state);
+  }
+
+  /**
+   * DC-25: rebuild the in-memory run cache for a run this process is about
+   * to RESUME (boot-time recovery). The resumed executor emits step events
+   * under the original runId; without a seeded cache entry those events
+   * would hit the 'unknown run' path and — worse — a later terminal event
+   * would synthesize a stub state that wipes the pre-crash stepsSummary.
+   * Seeding from the DDB row keeps pre-crash steps (original timestamps
+   * intact — the resume proof relies on this) and the resume bookkeeping
+   * fields, so subsequent full-row puts don't clobber the claim.
+   */
+  seedResumedRun(item: PipelineRunItem): void {
+    this.runCache.set(item.runId, {
+      pipelineId: item.pipelineId,
+      runId: item.runId,
+      status: 'running',
+      triggeredBy: item.triggeredBy,
+      triggerType: item.triggerType,
+      startedAt: item.startedAt,
+      steps: { ...(item.stepsSummary ?? {}) },
+      tokenUsage: { ...(item.tokenUsage ?? {}) },
+      estimatedCostUsd: item.estimatedCostUsd ?? 0,
+      stepModelMap: {},
+      stepInputMap: {},
+      stepAttempts: {},
+      lastEventAt: new Date().toISOString(),
+      checkpoint: item.checkpoint,
+      definitionSnapshot: item.definitionSnapshot,
+      interruptedAt: item.interruptedAt,
+      resumedAt: item.resumedAt,
+      resumeCount: item.resumeCount,
+      resumeClaimedBy: item.resumeClaimedBy,
+    });
   }
 
   /**
@@ -630,6 +807,14 @@ export class RunPersistenceService {
       estimatedCostUsd: state.estimatedCostUsd > 0 ? state.estimatedCostUsd : undefined,
       lastEventAt: state.lastEventAt,
       ttl,
+      // DC-25: full-row puts must carry the durable-resume fields, or a
+      // routine step/terminal persist would wipe the checkpoint + claim.
+      checkpoint: state.checkpoint,
+      definitionSnapshot: state.definitionSnapshot,
+      interruptedAt: state.interruptedAt,
+      resumedAt: state.resumedAt,
+      resumeCount: state.resumeCount,
+      resumeClaimedBy: state.resumeClaimedBy,
     };
 
     await this.putWithRetry(item, state);
