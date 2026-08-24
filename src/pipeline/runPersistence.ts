@@ -118,6 +118,15 @@ export class RunPersistenceService {
       });
     });
 
+    this.eventBus.subscribe('pipeline:step:failed', async (event) => {
+      await this.handleStepFailed(event.payload).catch((err) => {
+        log.warn(
+          { runId: event.payload.runId, stepId: event.payload.stepId, err: String(err) },
+          'failed to persist step:failed',
+        );
+      });
+    });
+
     this.eventBus.subscribe('pipeline:run:completed', async (event) => {
       await this.handleRunCompleted(event.payload).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:completed');
@@ -298,6 +307,84 @@ export class RunPersistenceService {
   }
 
   /**
+   * Record a FAILED step into the run's step summary. A failed step WAS
+   * executed — until this existed, stepsSummary contained only completed
+   * steps, so the retry route's "was this node executed in run X" guard
+   * 400'd on exactly the node the UI renders the "Retry from here" pill on
+   * (a failed one), and the feature could never work.
+   */
+  private async handleStepFailed(event: {
+    runId: string;
+    stepId: string;
+    error: string;
+    durationMs?: number;
+    at: string;
+  }): Promise<void> {
+    this.touchLastEvent(event.runId, event.at);
+    const state = this.runCache.get(event.runId);
+    if (!state) {
+      log.warn({ runId: event.runId }, 'step:failed for unknown run');
+      return;
+    }
+    this.recordFailedStep(state, event.stepId, event.error, event.at, event.durationMs);
+  }
+
+  /**
+   * Shared by handleStepFailed and the handleRunFailed backfill (the two
+   * events travel on independently-ordered channels, so either can arrive
+   * first — and older executors emit only run:failed).
+   */
+  private recordFailedStep(
+    state: RunState,
+    stepId: string,
+    error: string,
+    at: string,
+    durationMs?: number,
+  ): void {
+    // Same fork-branch key uniquing as handleStepCompleted.
+    let stepKey = stepId;
+    if (state.steps[stepKey]) {
+      let suffix = 2;
+      while (state.steps[`${stepId}:${suffix}`]) suffix++;
+      stepKey = `${stepId}:${suffix}`;
+    }
+
+    // Close out any in-flight attempt history (maxAttempts > 1 path), or
+    // synthesise a single failed attempt.
+    let attempts: StepAttempt[];
+    const accumulated = state.stepAttempts[stepId];
+    if (accumulated && accumulated.length > 0) {
+      const last = accumulated[accumulated.length - 1];
+      last.completedAt = at;
+      last.error = error;
+      if (last.durationMs === undefined && last.startedAt) {
+        last.durationMs = Date.parse(at) - Date.parse(last.startedAt);
+      }
+      attempts = accumulated;
+      delete state.stepAttempts[stepId];
+    } else {
+      attempts = [
+        {
+          attemptNumber: 1,
+          startedAt: at, // step:failed lacks startedAt; approximate
+          completedAt: at,
+          durationMs,
+          error,
+          idempotencyKey: `${state.runId}:${stepId}:1`,
+        },
+      ];
+    }
+
+    state.steps[stepKey] = {
+      status: 'failed',
+      error,
+      durationMs,
+      completedAt: at,
+      attempts,
+    };
+  }
+
+  /**
    * Pre-populate the cache from the trigger handler before the framework
    * fires `pipeline:run:started`. Some pipeline shapes reach a terminal
    * state without ever publishing `started` (e.g. validation failures
@@ -408,6 +495,13 @@ export class RunPersistenceService {
     const model = state.stepModelMap[failedNodeId];
     const modelSuffix = model ? ` (model: ${model})` : '';
     state.error = `${failedNodeId}: ${event.error.message}${modelSuffix}`;
+    // Backfill: step:failed and run:failed arrive on independently-ordered
+    // channels, and pre-durationMs executors may not emit step:failed at all
+    // for the terminal node. The failed step must exist in stepsSummary or
+    // "Retry from here" 400s on it.
+    if (failedNodeId && !state.steps[failedNodeId]) {
+      this.recordFailedStep(state, failedNodeId, event.error.message, event.at);
+    }
     await this.persistRun(state);
     this.runCache.delete(event.runId);
   }

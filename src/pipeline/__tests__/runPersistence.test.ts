@@ -535,8 +535,8 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     });
     service.start();
     service.start();
-    // subscribe should have been called exactly once per event type (9 events)
-    expect(bus.subscribe.mock.calls.length).toBe(9);
+    // subscribe should have been called exactly once per event type (10 events)
+    expect(bus.subscribe.mock.calls.length).toBe(10);
   });
 
   it('getStaleRunIds returns runs whose lastEventAt is before the cutoff', async () => {
@@ -877,5 +877,148 @@ describe('RunPersistenceService — DDB retry policy (P1 #7)', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FAILED steps are persisted into stepsSummary (2026-08 e2e bug 1)
+//
+// Until this landed, only pipeline:step:completed wrote step entries — a run
+// whose node FAILED persisted with the failed step absent, so the retry
+// route's "was this node executed" guard 400'd on exactly the node the UI
+// renders "Retry from here" on. A failed step IS executed; it must persist.
+// ---------------------------------------------------------------------------
+
+describe('RunPersistenceService persists FAILED steps into stepsSummary', () => {
+  type Subscriber<P> = (event: { payload: P }) => unknown | Promise<unknown>;
+
+  function makeMockBus() {
+    const subs = new Map<string, Subscriber<unknown>>();
+    return {
+      subscribe: jest.fn((event: string, fn: Subscriber<unknown>) => {
+        subs.set(event, fn);
+      }),
+      async publish<P>(event: string, payload: P): Promise<void> {
+        const fn = subs.get(event);
+        if (fn) await fn({ payload: payload as unknown });
+      },
+    };
+  }
+
+  function makeService() {
+    const repo = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+    return { repo, bus };
+  }
+
+  it('pipeline:step:failed lands in stepsSummary with status=failed, error, and a failed attempt', async () => {
+    const { repo, bus } = makeService();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rf1', pipelineId: 'pf1',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await bus.publish('pipeline:step:completed', {
+      runId: 'rf1', stepId: 'trigger-1', output: {}, durationMs: 10, at: 't1',
+    });
+    await bus.publish('pipeline:step:failed', {
+      runId: 'rf1', stepId: 'cond-1',
+      error: 'Condition expression is not supported: foo', durationMs: 42, at: 't2',
+    });
+    await bus.publish('pipeline:run:failed', {
+      runId: 'rf1',
+      error: { nodeId: 'cond-1', message: 'Condition expression is not supported: foo' },
+      at: 't2',
+    });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    // Both the completed AND the failed step are recorded.
+    expect(item.stepsSummary?.['trigger-1']?.status).toBe('completed');
+    const failed = item.stepsSummary?.['cond-1'];
+    expect(failed).toBeDefined();
+    expect(failed?.status).toBe('failed');
+    expect(failed?.error).toBe('Condition expression is not supported: foo');
+    expect(failed?.durationMs).toBe(42);
+    expect(failed?.attempts).toHaveLength(1);
+    expect(failed?.attempts?.[0]).toMatchObject({
+      attemptNumber: 1,
+      error: 'Condition expression is not supported: foo',
+      idempotencyKey: 'rf1:cond-1:1',
+    });
+  });
+
+  it('run:failed alone backfills the failed node (cross-topic race / older executors)', async () => {
+    const { repo, bus } = makeService();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rf2', pipelineId: 'pf2',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    // No step:failed at all — only the terminal run:failed.
+    await bus.publish('pipeline:run:failed', {
+      runId: 'rf2', error: { nodeId: 'node-X', message: 'boom' }, at: 't1',
+    });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(item.status).toBe('failed');
+    expect(item.stepsSummary?.['node-X']).toMatchObject({ status: 'failed', error: 'boom' });
+  });
+
+  it('run:failed does NOT duplicate a step already recorded by step:failed', async () => {
+    const { repo, bus } = makeService();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rf3', pipelineId: 'pf3',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await bus.publish('pipeline:step:failed', {
+      runId: 'rf3', stepId: 'node-Y', error: 'first', at: 't1',
+    });
+    await bus.publish('pipeline:run:failed', {
+      runId: 'rf3', error: { nodeId: 'node-Y', message: 'first' }, at: 't1',
+    });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(item.stepsSummary?.['node-Y']?.error).toBe('first');
+    expect(item.stepsSummary?.['node-Y:2']).toBeUndefined();
+  });
+
+  it('step:failed closes an in-flight attempt history from step:attempt:* events', async () => {
+    const { repo, bus } = makeService();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rf4', pipelineId: 'pf4',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await bus.publish('pipeline:step:attempt:started', {
+      runId: 'rf4', stepId: 'act-1', attemptNumber: 1, startedAt: '2026-01-01T00:00:00.000Z',
+    });
+    await bus.publish('pipeline:step:attempt:failed', {
+      runId: 'rf4', stepId: 'act-1', attemptNumber: 1,
+      error: 'fetch failed', nextBackoffMs: 1000, willRetry: true,
+    });
+    await bus.publish('pipeline:step:attempt:started', {
+      runId: 'rf4', stepId: 'act-1', attemptNumber: 2, startedAt: '2026-01-01T00:00:01.000Z',
+    });
+    await bus.publish('pipeline:step:failed', {
+      runId: 'rf4', stepId: 'act-1', error: 'fetch failed', durationMs: 2500,
+      at: '2026-01-01T00:00:02.500Z',
+    });
+    await bus.publish('pipeline:run:failed', {
+      runId: 'rf4', error: { nodeId: 'act-1', message: 'fetch failed' },
+      at: '2026-01-01T00:00:02.500Z',
+    });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    const step = item.stepsSummary?.['act-1'];
+    expect(step?.status).toBe('failed');
+    expect(step?.attempts).toHaveLength(2);
+    expect(step?.attempts?.[0]).toMatchObject({ attemptNumber: 1, error: 'fetch failed', retryAfterMs: 1000 });
+    expect(step?.attempts?.[1]).toMatchObject({ attemptNumber: 2, error: 'fetch failed' });
   });
 });
