@@ -25,6 +25,7 @@ import { idempotency } from '../middleware/idempotency';
 import { withContext } from '../lib/logger';
 import { recordPipelineTrigger, recordPipelineError } from '../observability/metrics';
 import { getPipelineBridge } from './pipelineTriggers';
+import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
 import { readAttempts } from '../repositories/PipelineRunRepository';
 import { DefinitionsRepository } from '../pipeline/definitions-repository';
@@ -100,9 +101,9 @@ pipelineRetryRouter.post(
       throw new NotFoundError(`Run ${runId} not found for pipeline ${pipelineId}`);
     }
 
-    // Validate run is in terminal state
-    const terminalStatuses = ['succeeded', 'failed', 'canceled'];
-    if (!terminalStatuses.includes(originalRun.status)) {
+    // Validate run is in terminal state. Shared predicate, so canonical
+    // spellings and the legacy aliases on pre-fix rows are both accepted.
+    if (!isTerminalRunStatus(originalRun.status)) {
       throw new ValidationError(
         `Cannot retry from run ${runId} with status '${originalRun.status}'. Only terminal runs can be retried.`,
       );

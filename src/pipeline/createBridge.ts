@@ -43,6 +43,7 @@ import type {
 import { wrap, InMemoryQueueInspector } from 'distributed-core/messaging-queue';
 // hub#2226 — see bridge-types.ts for why these aren't imported from
 // distributed-core (the v0.14.2 pin predates the type re-exports).
+import { normalizeRunStatus } from '@connorhoehn/pipeline-runtime';
 import type { ContextPatch, PatchResult } from './bridge-types';
 import type {
   BusEvent,
@@ -430,7 +431,11 @@ export function createBridge(
       const runs: PipelineRunSnapshot[] = items.map((item) => ({
         runId: item.runId,
         pipelineId: item.pipelineId,
-        status: item.status,
+        // Fold legacy spellings onto the canonical union. New writes are
+        // already canonical (runPersistence), but rows persisted before that
+        // fix still carry `succeeded`/`canceled`, and this endpoint must agree
+        // with the detail endpoint for every run — historical ones included.
+        status: normalizeRunStatus(item.status),
         startedAt: item.startedAt,
         completedAt: item.completedAt,
         // Hub#1282: surface interruptedAt so the UI can render a "Resume" affordance.

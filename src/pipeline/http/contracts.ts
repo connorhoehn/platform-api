@@ -19,6 +19,12 @@
 //   - .planning/HANDOFF-distributed-core-platform-api-absorption.md
 //     §"What 'module-shaped' actually means"
 
+// Type-only, zero runtime effect, and from the shared contract package rather
+// than a framework — so it holds the constraints above. On relocation into
+// distributed-core this becomes an import of DC's own `RunStatus`, which
+// `PipelineRunStatus` already mirrors one-for-one.
+import type { PipelineRunStatus } from '@connorhoehn/pipeline-runtime';
+
 // ---------------------------------------------------------------------------
 // Auth context — host-supplied per request.
 // ---------------------------------------------------------------------------
@@ -102,7 +108,12 @@ export interface PipelineRunsListQuery {
 export interface PipelineRunSummary {
   runId: string;
   pipelineId: string;
-  status: 'running' | 'succeeded' | 'failed' | 'canceled' | 'interrupted';
+  /**
+   * Canonical run status. `interrupted` is a platform-api-only lifecycle state
+   * (orphan scan) and is not part of the shared `PipelineRunStatus` union, so
+   * it is spelled out alongside it.
+   */
+  status: PipelineRunStatus | 'interrupted';
   startedAt: string;
   completedAt?: string;
   triggeredBy: {

@@ -10,14 +10,21 @@ import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
 
 /**
- * Platform-api run status — canonical `PipelineRunStatus` plus legacy aliases
- * and platform-api-specific lifecycle states:
- *   - `succeeded` — legacy alias for `completed` (used by runPersistence event handlers)
- *   - `canceled`  — legacy alias for `cancelled` (US-spelling; used in HTTP responses)
+ * Platform-api run status as it may be **read back** from the table.
+ *
+ * Canonical `PipelineRunStatus`, plus one platform-api-specific lifecycle
+ * state and the two legacy aliases that survive on historical rows:
  *   - `interrupted` — orphan-scan transition: `running` with no heartbeat after restart
- *   - `stuck`       — StuckRunDetector: no heartbeat within stuckThresholdMs
+ *   - `succeeded`   — legacy alias for `completed`, written before the vocabulary fix
+ *   - `canceled`    — legacy alias for `cancelled` (US spelling), same vintage
+ *
+ * The aliases are READ-ONLY. `runPersistence` writes canonical spellings, and
+ * every read boundary that serves this value to a client must fold it through
+ * `normalizeRunStatus` — otherwise the runs list and runs detail endpoints
+ * disagree for the same run, which is exactly the bug this shape once caused.
+ * Do not write `succeeded`/`canceled` from new code.
  */
-export type RunItemStatus = PipelineRunStatus | 'succeeded' | 'canceled' | 'interrupted' | 'stuck';
+export type RunItemStatus = PipelineRunStatus | 'interrupted' | 'succeeded' | 'canceled';
 
 export interface TokenUsageByModel {
   tokensIn: number;

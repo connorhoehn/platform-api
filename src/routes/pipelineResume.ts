@@ -13,7 +13,7 @@
 // Validations:
 //   - 404 when the run is unknown
 //   - 400 when the run is not in a resumable terminal state
-//     (default: only `failed`. `done`/`succeeded` allowed when
+//     (default: only `failed`. `completed` allowed when
 //     `allowCompleted=true` is passed in the body for diagnostic re-execution.)
 //   - 400 when `fromNodeId` is unknown to the original DAG
 //   - 503 when the bridge is not wired (no executor on this node)
@@ -29,6 +29,7 @@ import { idempotency } from '../middleware/idempotency';
 import { withContext } from '../lib/logger';
 import { recordPipelineTrigger, recordPipelineError } from '../observability/metrics';
 import { getPipelineBridge } from './pipelineTriggers';
+import { normalizeRunStatus } from '@connorhoehn/pipeline-runtime';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
 import { DefinitionsRepository } from '../pipeline/definitions-repository';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
@@ -64,7 +65,7 @@ function getDefRepo(): DefinitionsRepository {
 export const pipelineResumeRouter = Router({ mergeParams: true });
 
 interface ResumeFromStepRequestBody {
-  /** When true, allow resuming a `succeeded`/`done` run for diagnostic re-execution. */
+  /** When true, allow resuming a `completed` run for diagnostic re-execution. */
   allowCompleted?: boolean;
   /** Optional breakpoint list for the resumed dispatch loop. */
   breakpoints?: string[];
@@ -111,17 +112,18 @@ pipelineResumeRouter.post(
     }
 
     // 2. Validate the run is in a resumable terminal state. Only `failed`
-    //    by default; `succeeded`/`done` allowed for diagnostic re-execution
-    //    when `allowCompleted=true` is set.
+    //    by default; `completed` allowed for diagnostic re-execution when
+    //    `allowCompleted=true` is set.
+    //
+    //    Compared post-normalization so the legacy `succeeded`/`done`
+    //    spellings on pre-fix rows resolve to `completed` and stay resumable.
     const allowCompleted = body.allowCompleted === true;
-    const allowedStatuses = allowCompleted
-      ? ['failed', 'succeeded', 'done']
-      : ['failed'];
-    if (!allowedStatuses.includes(originalRun.status)) {
+    const allowedStatuses = allowCompleted ? ['failed', 'completed'] : ['failed'];
+    if (!allowedStatuses.includes(normalizeRunStatus(originalRun.status))) {
       throw new ValidationError(
         `Cannot resume run ${runId} with status '${originalRun.status}'. ` +
           `Expected one of: ${allowedStatuses.join(', ')}.` +
-          (allowCompleted ? '' : " Pass `allowCompleted: true` to resume a succeeded run."),
+          (allowCompleted ? '' : " Pass `allowCompleted: true` to resume a completed run."),
       );
     }
 

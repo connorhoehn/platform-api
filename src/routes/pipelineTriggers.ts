@@ -642,7 +642,7 @@ pipelineCancelRouter.post(
       });
       reqLog.info({ runId, action: 'cancel' }, 'pipeline cancelled');
 
-      res.json({ runId, status: 'canceled' });
+      res.json({ runId, status: 'cancelled' });
       return;
     }
 

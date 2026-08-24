@@ -382,7 +382,11 @@ export class RunPersistenceService {
       (await this.waitForCachedRun(event.runId)) ??
       this.synthesizeStateFromTerminal(event.runId, event.at);
 
-    state.status = 'succeeded';
+    // Canonical spelling (matches PipelineExecutor and the UI). This used to
+    // write the legacy `succeeded` alias, which made the runs *list* endpoint
+    // (backed by this table) disagree with the runs *detail* endpoint (backed
+    // by the live executor) for the same run.
+    state.status = 'completed';
     state.completedAt = event.at;
     await this.persistRun(state);
     this.runCache.delete(event.runId);
@@ -414,7 +418,9 @@ export class RunPersistenceService {
       (await this.waitForCachedRun(event.runId)) ??
       this.synthesizeStateFromTerminal(event.runId, event.at);
 
-    state.status = 'canceled';
+    // Canonical spelling — see handleRunCompleted. The US-spelled `canceled`
+    // was the same class of divergence.
+    state.status = 'cancelled';
     state.completedAt = event.at;
     await this.persistRun(state);
     this.runCache.delete(event.runId);

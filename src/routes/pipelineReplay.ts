@@ -24,6 +24,7 @@ import { idempotency } from '../middleware/idempotency';
 import { withContext } from '../lib/logger';
 import { recordPipelineTrigger, recordPipelineError } from '../observability/metrics';
 import { getPipelineBridge, type PipelineBridge } from './pipelineTriggers';
+import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
 import { DefinitionsRepository } from '../pipeline/definitions-repository';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
@@ -89,11 +90,12 @@ pipelineReplayRouter.post(
       throw new NotFoundError(`Run ${runId} not found for pipeline ${pipelineId}`);
     }
 
-    // Validate run is in terminal state (replay only makes sense for completed runs)
-    const terminalStatuses = ['succeeded', 'failed', 'canceled'];
-    if (!terminalStatuses.includes(originalRun.status)) {
+    // Validate run is in terminal state (replay only makes sense for finished
+    // runs). Uses the shared predicate rather than a literal array so both the
+    // canonical spellings and the legacy aliases still on old rows are accepted.
+    if (!isTerminalRunStatus(originalRun.status)) {
       throw new ValidationError(
-        `Cannot replay run ${runId} with status '${originalRun.status}'. Only completed runs (succeeded/failed/canceled) can be replayed.`,
+        `Cannot replay run ${runId} with status '${originalRun.status}'. Only terminal runs (completed/failed/cancelled) can be replayed.`,
       );
     }
 

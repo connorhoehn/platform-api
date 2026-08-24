@@ -43,8 +43,8 @@ describe('stubRunStore — put and get', () => {
 
   it('overwrites an existing record on re-put', () => {
     stubRunStore.put(record({ runId: 'r1', status: 'running' }));
-    stubRunStore.put(record({ runId: 'r1', status: 'succeeded' }));
-    expect(stubRunStore.get('r1')?.status).toBe('succeeded');
+    stubRunStore.put(record({ runId: 'r1', status: 'completed' }));
+    expect(stubRunStore.get('r1')?.status).toBe('completed');
   });
 });
 
@@ -140,7 +140,7 @@ describe('stubRunStore — listForPipeline', () => {
 describe('stubRunStore — listActive', () => {
   it('returns only runs with active statuses for the given user', () => {
     const activeStatuses = Array.from(ACTIVE_STATUSES);
-    const inactiveStatuses: StubRunStatus[] = ['succeeded', 'failed', 'canceled'];
+    const inactiveStatuses: StubRunStatus[] = ['completed', 'failed', 'cancelled'];
 
     for (const status of activeStatuses) {
       stubRunStore.put(record({ runId: `active-${status}`, userId: 'u1', status }));
@@ -158,7 +158,7 @@ describe('stubRunStore — listActive', () => {
   });
 
   it('returns empty array when no active runs for user', () => {
-    stubRunStore.put(record({ userId: 'u1', status: 'succeeded' }));
+    stubRunStore.put(record({ userId: 'u1', status: 'completed' }));
     expect(stubRunStore.listActive('u1')).toEqual([]);
   });
 });
@@ -168,10 +168,10 @@ describe('stubRunStore — listActive', () => {
 // ---------------------------------------------------------------------------
 
 describe('stubRunStore — cancel', () => {
-  it('transitions an active run to canceled', () => {
+  it('transitions an active run to cancelled', () => {
     stubRunStore.put(record({ runId: 'r1', userId: 'u1', status: 'running' }));
     const result = stubRunStore.cancel('r1', 'u1');
-    expect(result?.status).toBe('canceled');
+    expect(result?.status).toBe('cancelled');
   });
 
   it('stores the reason when provided', () => {
@@ -191,14 +191,14 @@ describe('stubRunStore — cancel', () => {
   });
 
   it('returns null when the run is already in a terminal status', () => {
-    stubRunStore.put(record({ runId: 'r1', userId: 'u1', status: 'succeeded' }));
+    stubRunStore.put(record({ runId: 'r1', userId: 'u1', status: 'completed' }));
     expect(stubRunStore.cancel('r1', 'u1')).toBeNull();
   });
 
   it('can cancel runs with all active statuses', () => {
     for (const status of ACTIVE_STATUSES) {
       stubRunStore.put(record({ runId: `r-${status}`, userId: 'u1', status }));
-      expect(stubRunStore.cancel(`r-${status}`, 'u1')?.status).toBe('canceled');
+      expect(stubRunStore.cancel(`r-${status}`, 'u1')?.status).toBe('cancelled');
     }
   });
 });

@@ -1,10 +1,17 @@
-export type StubRunStatus =
-  | 'pending'
-  | 'running'
-  | 'awaiting-approval'
-  | 'succeeded'
-  | 'failed'
-  | 'canceled';
+import type { PipelineRunStatus } from '@connorhoehn/pipeline-runtime';
+
+/**
+ * Statuses this in-memory fallback store can hold.
+ *
+ * Derived from the shared `PipelineRunStatus` rather than re-declared, so this
+ * store cannot drift from the canonical vocabulary again. It previously had
+ * its own spellings (`succeeded`, `canceled`, `awaiting-approval`) — a third
+ * dialect on top of the DynamoDB/executor split.
+ *
+ * `stuck` is excluded because nothing sets it on this path (StuckRunDetector
+ * writes through the repository, not here).
+ */
+export type StubRunStatus = Exclude<PipelineRunStatus, 'stuck'>;
 
 export interface StubRunRecord {
   runId: string;
@@ -31,10 +38,15 @@ function evictOldestIfNeeded(): void {
   }
 }
 
+/**
+ * Non-terminal statuses. Matches the frontend's active-run definition
+ * (`PipelineRunsContext`), which also counts a breakpoint-paused run as live.
+ */
 export const ACTIVE_STATUSES: ReadonlySet<StubRunStatus> = new Set([
   'pending',
   'running',
-  'awaiting-approval',
+  'awaiting_approval',
+  'paused_at_breakpoint',
 ]);
 
 export const stubRunStore = {
@@ -73,7 +85,7 @@ export const stubRunStore = {
     const r = runRecords.get(runId);
     if (!r || r.userId !== userId) return null;
     if (!ACTIVE_STATUSES.has(r.status)) return null;
-    r.status = 'canceled';
+    r.status = 'cancelled';
     r.updatedAt = new Date().toISOString();
     if (reason) r.reason = reason;
     return r;
