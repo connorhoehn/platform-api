@@ -695,7 +695,7 @@ describe('POST /pipelines/:runId/cancel', () => {
       expect(res.statusCode).toBe(200);
       expect(res.body).toMatchObject({
         runId,
-        status: 'canceled',
+        status: 'cancelled',
         reason: 'no longer needed',
       });
     } finally {
@@ -751,7 +751,7 @@ describe('POST /pipelines/:runId/cancel', () => {
 
   test('forwards to bridge.cancelRun when wired', async () => {
     const cancelRun = jest.fn(async () => {});
-    const getRun = jest.fn(async (runId: string) => ({ runId, status: 'canceled' }));
+    const getRun = jest.fn(async (runId: string) => ({ runId, status: 'cancelled' }));
     setPipelineBridge({
       getRun,
       getHistory: async () => [],
@@ -762,7 +762,7 @@ describe('POST /pipelines/:runId/cancel', () => {
     const res = await run(app, 'POST', '/pipelines/run-xyz/cancel', { body: {} });
     expect(res.statusCode).toBe(200);
     expect(cancelRun).toHaveBeenCalledWith('run-xyz', 'user-1');
-    expect(res.body).toMatchObject({ runId: 'run-xyz', status: 'canceled' });
+    expect(res.body).toMatchObject({ runId: 'run-xyz', status: 'cancelled' });
   });
 });
 
