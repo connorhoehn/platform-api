@@ -90,7 +90,14 @@ export function classifyPipelineError(message: string, stack?: string): ErrorCat
     combined.includes('required field') ||
     combined.includes('invalid') ||
     combined.includes('schema') ||
-    combined.includes('type mismatch')
+    combined.includes('type mismatch') ||
+    // Executor grammar rejections — e.g. `Condition expression is not
+    // supported: "1 === 1". Supported grammar: context.<path> === <literal>.`
+    // (distributed-core PipelineExecutor fails loudly instead of guessing).
+    // These are authoring defects, not mystery failures — they must never
+    // surface as "Unknown Error", and retrying can never fix them.
+    combined.includes('not supported') ||
+    combined.includes('unsupported')
   ) {
     return 'ValidationError';
   }

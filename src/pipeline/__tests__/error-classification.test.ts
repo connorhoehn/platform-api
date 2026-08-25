@@ -32,6 +32,21 @@ describe('classifyPipelineError()', () => {
     expect(classifyPipelineError('type mismatch in step output')).toBe('ValidationError');
   });
 
+  // Regression: the executor's deliberate grammar rejection surfaced in the
+  // FE error popover as "Unknown Error". A well-formed executor failure that
+  // names its own cause is the opposite of unknown — it is an authoring
+  // (validation) defect and retrying can never fix it.
+  it('classifies executor "not supported" step errors as ValidationError, never Unknown', () => {
+    const executorMsg =
+      'Condition expression is not supported: "1 === 1". ' +
+      'Supported grammar: context.<path> === <string|number|boolean literal>.';
+    expect(classifyPipelineError(executorMsg)).not.toBe('UnknownError');
+    expect(classifyPipelineError(executorMsg)).toBe('ValidationError');
+    expect(classifyRetryability('ValidationError', executorMsg)).toBe('terminal');
+    // Generic unsupported-operation step errors get the same treatment.
+    expect(classifyPipelineError('unsupported transform type: xslt')).toBe('ValidationError');
+  });
+
   it('returns RegistryConflict for lock/version-conflict messages', () => {
     expect(classifyPipelineError('registry conflict detected')).toBe('RegistryConflict');
     expect(classifyPipelineError('lock acquisition failed')).toBe('RegistryConflict');
