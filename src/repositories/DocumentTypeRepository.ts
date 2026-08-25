@@ -79,6 +79,14 @@ export interface DocumentTypeItem {
   description: string;
   icon: string;
   fields: DocumentTypeFieldItem[];
+  /**
+   * Opaque client payload — the frontend doc-editor's section-based
+   * `DocumentType` shape (renderer ids, pages, per-mode visibility). The
+   * server never interprets it; persisting it verbatim lets the wizard's
+   * schema round-trip without lossy field translation. Validated only for
+   * "is a plain object" + size at the route layer.
+   */
+  editorSchema?: Record<string, unknown>;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -124,7 +132,7 @@ export class DocumentTypeRepository extends BaseRepository {
 
   async update(
     typeId: string,
-    patch: Partial<Pick<DocumentTypeItem, 'name' | 'description' | 'icon' | 'fields'>>,
+    patch: Partial<Pick<DocumentTypeItem, 'name' | 'description' | 'icon' | 'fields' | 'editorSchema'>>,
     existingItem?: DocumentTypeItem,
   ): Promise<DocumentTypeItem> {
     const expressions: string[] = [];
@@ -148,6 +156,10 @@ export class DocumentTypeRepository extends BaseRepository {
       expressions.push('#fields = :fields');
       exprNames['#fields'] = 'fields';
       exprValues[':fields'] = patch.fields;
+    }
+    if (patch.editorSchema !== undefined) {
+      expressions.push('editorSchema = :editorSchema');
+      exprValues[':editorSchema'] = patch.editorSchema;
     }
 
     const now = new Date().toISOString();

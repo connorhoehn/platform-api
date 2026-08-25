@@ -192,6 +192,34 @@ function parseShowWhen(raw: unknown, fieldName: string): DocumentTypeFieldShowWh
   return { fieldId: r.fieldId, equals: r.equals };
 }
 
+// Opaque client payload cap — the doc-editor's section-based schema is a few
+// KB for realistic types; 64KB leaves generous headroom while keeping a
+// hostile payload out of the 400KB DDB item limit (fields + version history
+// share the same item).
+const EDITOR_SCHEMA_MAX_BYTES = 64 * 1024;
+
+/**
+ * `editorSchema` is deliberately opaque (the frontend owns its shape), but it
+ * must be a plain JSON object and bounded in size. Returns undefined when the
+ * caller sent nothing.
+ */
+function parseEditorSchema(raw: unknown): Record<string, unknown> | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ValidationError('editorSchema must be an object');
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(raw);
+  } catch {
+    throw new ValidationError('editorSchema must be JSON-serializable');
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > EDITOR_SCHEMA_MAX_BYTES) {
+    throw new ValidationError(`editorSchema exceeds ${EDITOR_SCHEMA_MAX_BYTES} bytes`);
+  }
+  return raw as Record<string, unknown>;
+}
+
 function parseFields(raw: unknown): DocumentTypeFieldItem[] {
   if (!Array.isArray(raw)) throw new ValidationError('fields must be an array');
   if (raw.length > 100) throw new ValidationError('fields cap is 100 per type');
@@ -221,6 +249,7 @@ documentTypesRouter.post('/', asyncHandler(async (req: Request, res: Response) =
     throw new ValidationError('name is required');
   }
   const fields = parseFields(body.fields ?? []);
+  const editorSchema = parseEditorSchema(body.editorSchema);
 
   const now = new Date().toISOString();
   const item: DocumentTypeItem = {
@@ -229,6 +258,7 @@ documentTypesRouter.post('/', asyncHandler(async (req: Request, res: Response) =
     description: typeof body.description === 'string' ? body.description : '',
     icon: typeof body.icon === 'string' ? body.icon : '📄',
     fields,
+    ...(editorSchema !== undefined ? { editorSchema } : {}),
     createdBy: req.user!.sub,
     createdAt: now,
     updatedAt: now,
@@ -261,7 +291,7 @@ documentTypesRouter.put('/:typeId', asyncHandler(async (req: Request, res: Respo
   const existing = await documentTypeRepo.get(params.typeId);
   if (!existing) throw new NotFoundError(`document type ${params.typeId} not found`);
 
-  const patch: Partial<Pick<DocumentTypeItem, 'name' | 'description' | 'icon' | 'fields'>> = {};
+  const patch: Partial<Pick<DocumentTypeItem, 'name' | 'description' | 'icon' | 'fields' | 'editorSchema'>> = {};
   if (typeof body.name === 'string') {
     if (body.name.trim().length === 0) throw new ValidationError('name cannot be empty');
     patch.name = body.name.trim();
@@ -269,6 +299,7 @@ documentTypesRouter.put('/:typeId', asyncHandler(async (req: Request, res: Respo
   if (typeof body.description === 'string') patch.description = body.description;
   if (typeof body.icon === 'string') patch.icon = body.icon;
   if (body.fields !== undefined) patch.fields = parseFields(body.fields);
+  if (body.editorSchema !== undefined) patch.editorSchema = parseEditorSchema(body.editorSchema);
 
   const updated = await documentTypeRepo.update(params.typeId, patch, existing);
   recordDocumentTypeUpdated();

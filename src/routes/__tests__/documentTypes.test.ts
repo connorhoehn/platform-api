@@ -235,6 +235,77 @@ describe('document-types CRUD', () => {
 });
 
 // ---------------------------------------------------------------------------
+// editorSchema — opaque client payload round-trip (frontend doc-editor's
+// section-based shape). The server persists it verbatim; only "plain object"
+// and a size cap are enforced.
+// ---------------------------------------------------------------------------
+
+describe('editorSchema round-trip', () => {
+  const schema = {
+    id: 'local-1111',
+    name: 'RFC',
+    description: '',
+    icon: '📄',
+    fields: [{ id: 'f1', name: 'Overview', sectionType: 'rich-text', required: false }],
+    pages: [{ id: 'p1', sectionIds: ['f1'] }],
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+
+  test('POST persists editorSchema verbatim and echoes it', async () => {
+    const res = await run(buildApp(), 'POST', '/api/document-types', {
+      body: { name: 'RFC', fields: [], editorSchema: schema },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.body as { typeId: string; editorSchema: typeof schema };
+    expect(body.editorSchema).toEqual(schema);
+    expect((typeStore[body.typeId] as { editorSchema: unknown }).editorSchema).toEqual(schema);
+  });
+
+  test('GET list includes editorSchema', async () => {
+    typeStore['t1'] = { typeId: 't1', name: 'A', fields: [], editorSchema: schema };
+    const res = await run(buildApp(), 'GET', '/api/document-types');
+    const body = res.body as { items: { editorSchema?: unknown }[] };
+    expect(body.items[0].editorSchema).toEqual(schema);
+  });
+
+  test('PUT replaces editorSchema', async () => {
+    typeStore['t1'] = { typeId: 't1', name: 'A', fields: [], editorSchema: schema };
+    const next = { ...schema, name: 'RFC v2' };
+    const res = await run(buildApp(), 'PUT', '/api/document-types/t1', {
+      body: { editorSchema: next },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { editorSchema: unknown }).editorSchema).toEqual(next);
+  });
+
+  test('POST rejects a non-object editorSchema', async () => {
+    for (const bad of ['a string', 42, ['array']]) {
+      const res = await run(buildApp(), 'POST', '/api/document-types', {
+        body: { name: 'Bad', fields: [], editorSchema: bad },
+      });
+      expect(res.statusCode).toBe(400);
+    }
+  });
+
+  test('POST rejects an oversized editorSchema (>64KB)', async () => {
+    const res = await run(buildApp(), 'POST', '/api/document-types', {
+      body: { name: 'Big', fields: [], editorSchema: { blob: 'x'.repeat(65 * 1024) } },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  test('POST without editorSchema stores no editorSchema attribute', async () => {
+    const res = await run(buildApp(), 'POST', '/api/document-types', {
+      body: { name: 'Plain', fields: [] },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.body as { typeId: string };
+    expect('editorSchema' in (typeStore[body.typeId] as object)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Typed Documents — schema-aware POST + reads
 // ---------------------------------------------------------------------------
 
