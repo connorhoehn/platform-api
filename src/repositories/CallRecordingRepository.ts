@@ -81,6 +81,16 @@ export interface CallRecording {
   segments: RecordingSegment[];
   destination: 'local' | 's3';
   participants: CallRecordingParticipant[];
+  /**
+   * True number of people in the recording, derived by the webhook from
+   * the recording's per-leg tracks[] ∪ the session roster. NOT always
+   * `participants.length`: `participants[]` only holds userId-bearing
+   * entries (roster + userId-tagged tracks), while LVS multi-leg tracks
+   * carry participantId only — those legs are real tiles in the composed
+   * video but can't be attributed to a userId. Absent on historical rows
+   * (pre-2026-08-24); readers fall back to `participants.length`.
+   */
+  participantCount?: number;
   startedBy?: string;
   orgId?: string;
   ttl: number; // epoch seconds
@@ -195,7 +205,10 @@ export class CallRecordingRepository extends BaseRepository {
                 // detail view needs the raw per-peer URLs).
                 composedUrl: rec.composedUrl,
                 // Denormalize participant count for the chip render.
-                participantCount: rec.participants?.length ?? 0,
+                // Prefer the leg-derived count from the webhook — the live
+                // roster (participants[]) undercounts because people who
+                // left before recording end were already removed from it.
+                participantCount: rec.participantCount ?? rec.participants?.length ?? 0,
                 ttl,
               },
             }),
@@ -377,9 +390,14 @@ export class CallRecordingRepository extends BaseRepository {
       lobbyName: i.lobbyName as string,
       thumbnailUrl: i.thumbnailUrl as string | undefined,
       composedUrl: (i as Record<string, unknown>).composedUrl as string | undefined,
-      participantCount: Array.isArray((i as Record<string, unknown>).participants)
-        ? ((i as Record<string, unknown>).participants as unknown[]).length
-        : undefined,
+      // Prefer the leg-derived scalar (see CallRecording.participantCount);
+      // participants.length is the legacy fallback and undercounts
+      // multi-leg recordings whose members left before the recording ended.
+      participantCount: typeof (i as Record<string, unknown>).participantCount === 'number'
+        ? ((i as Record<string, unknown>).participantCount as number)
+        : Array.isArray((i as Record<string, unknown>).participants)
+          ? ((i as Record<string, unknown>).participants as unknown[]).length
+          : undefined,
     }));
     const nextCursor = out.LastEvaluatedKey
       ? Buffer.from(JSON.stringify(out.LastEvaluatedKey), 'utf8').toString('base64')

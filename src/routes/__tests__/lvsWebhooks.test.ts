@@ -224,6 +224,82 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
     expect(arg.tracks).toHaveLength(2);
   });
 
+  // Screenshot bug (2026-08): a composed video visibly playing THREE tiles
+  // was captioned "1 participant". session.participants is a LIVE roster —
+  // people who left before recording end are already removed — so counting
+  // it at webhook time undercounts every real multi-leg recording. The
+  // per-leg tracks[] on recording.completed are the truth.
+  test('N legs → participantCount N even when the live roster shrank to 1', async () => {
+    findByChannelArnMock.mockResolvedValueOnce([
+      {
+        documentId: 'global-hangout',
+        sessionId: 'sess-gh-1',
+        channelArn: 'arn:gh',
+        startedAt: '2026-08-24T01:00:00.000Z',
+        startedBy: 'u-alice',
+        // Live roster at recording-completed: everyone but Alice already left.
+        participants: [{ userId: 'u-alice', participantId: 'p-alice' }],
+      },
+    ]);
+
+    const payload = {
+      type: 'recording.completed',
+      channelArn: 'arn:gh',
+      data: {
+        recordingId: 'r-gh',
+        segments: [],
+        totalSize: 0,
+        durationMs: 60_000,
+        destination: 'local',
+        composedUrl: 'https://lvs.test/composed/r-gh.mp4',
+        // Three legs. LVS multi-leg tracks carry participantId (no userId)
+        // except when the SFU could attribute one — mix both shapes.
+        tracks: [
+          { legId: 'leg-1', participantId: 'p-alice', key: 'k1', url: 'https://t/1.mp4', size: 1 },
+          { legId: 'leg-2', participantId: 'p-bob', userId: 'u-bob', key: 'k2', url: 'https://t/2.mp4', size: 2 },
+          { legId: 'leg-3', participantId: 'p-carol', key: 'k3', url: 'https://t/3.mp4', size: 3 },
+        ],
+      },
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+    const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
+    expect(res.status).toBe(204);
+
+    expect(putRecordingMock).toHaveBeenCalledTimes(1);
+    const arg = putRecordingMock.mock.calls[0]![0];
+    // The stored scalar reflects the legs, not the shrunken roster.
+    expect(arg.participantCount).toBe(3);
+    // Bob's userId-bearing track was unioned into participants[] so his
+    // fan-out row exists and the recording shows up in HIS list too.
+    const userIds = arg.participants.map((p: { userId: string }) => p.userId).sort();
+    expect(userIds).toEqual(['u-alice', 'u-bob']);
+  });
+
+  // Same-peer audio+video split tracks must not double-count.
+  test('split a/v tracks for the same peer count as one participant', async () => {
+    const payload = {
+      type: 'recording.completed',
+      channelArn: 'arn:av',
+      data: {
+        recordingId: 'r-av',
+        segments: [],
+        totalSize: 0,
+        durationMs: 1000,
+        destination: 'local',
+        tracks: [
+          { participantId: 'p1', kind: 'video', key: 'k1', url: 'https://t/1.mp4', size: 1 },
+          { participantId: 'p1', kind: 'audio', key: 'k2', url: 'https://t/2.mp4', size: 2 },
+          { participantId: 'p2', kind: 'av', key: 'k3', url: 'https://t/3.mp4', size: 3 },
+        ],
+      },
+    };
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+    const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
+    expect(res.status).toBe(204);
+    const arg = putRecordingMock.mock.calls[0]![0];
+    expect(arg.participantCount).toBe(2);
+  });
+
   // hub#1260 — replay-window guard, paired with HMAC.
   test('valid HMAC + missing x-webhook-timestamp → 401, repo NOT called', async () => {
     const payload = {

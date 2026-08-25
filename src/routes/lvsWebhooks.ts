@@ -467,6 +467,36 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
     }
   }
 
+  // Leg-truth reconciliation. `session.participants` is a LIVE roster —
+  // videoSessionRepo removes people the moment they leave, so by the time
+  // `recording.completed` fires (i.e. the call ended) most participants are
+  // already gone. That persisted `participants: 1` (or 0) for real
+  // multi-leg recordings and captioned a 3-tile composed video
+  // "1 participant". The per-leg `tracks[]` LVS ships on the completed
+  // event are the truth of who was actually recorded, so:
+  //   1. any track peer with a userId missing from the roster is unioned
+  //      into participants[] (also fixes fan-out: leave-early users get
+  //      their index row and can find the recording), and
+  //   2. participantCount is derived from the distinct track peers
+  //      (participantId-only legs — LVS multi-leg tracks carry no userId —
+  //      still count even though they can't fan out).
+  const rawTracks: Array<Record<string, unknown>> = Array.isArray(detail.tracks) ? detail.tracks : [];
+  const distinctTrackPeers = new Set<string>();
+  for (const t of rawTracks) {
+    const peerKey = t?.userId ?? t?.participantId ?? t?.legId;
+    if (peerKey != null && String(peerKey).length > 0) distinctTrackPeers.add(String(peerKey));
+  }
+  for (const t of rawTracks) {
+    const userId = typeof t?.userId === 'string' ? t.userId : undefined;
+    if (userId && !participants.some((p) => p.userId === userId)) {
+      participants.push({
+        userId,
+        participantId: typeof t?.participantId === 'string' ? t.participantId : undefined,
+      });
+    }
+  }
+  const participantCount = Math.max(participants.length, distinctTrackPeers.size);
+
   try {
     await callRecordingRepo.putRecording({
       callId: callId ?? `unknown-${arn}-${recordingId}`,
@@ -481,6 +511,10 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       segments: Array.isArray(detail.segments) ? detail.segments : [],
       destination: detail.destination === 's3' ? 's3' : 'local',
       participants,
+      // Derived from legs ∪ roster above — NOT participants.length, which
+      // undercounts whenever a leg lacks a userId (LVS multi-leg tracks
+      // carry participantId only).
+      participantCount,
       // VideoSessionRecord exposes the creator as `startedBy` (NOT
       // `createdBy` — that field doesn't exist on the record). Reading
       // the wrong field left `startedBy` undefined on every persisted
@@ -504,7 +538,10 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       composedUrl: typeof detail.composedUrl === 'string' ? detail.composedUrl : undefined,
       tracks: Array.isArray(detail.tracks) ? detail.tracks : undefined,
     });
-    log.info({ callId, recordingId, arn, participants: participants.length }, '[lvs-webhook] recording persisted');
+    log.info(
+      { callId, recordingId, arn, participants: participants.length, participantCount, trackPeers: distinctTrackPeers.size },
+      '[lvs-webhook] recording persisted',
+    );
 
     // Transcription pipeline trigger. Wave 3 / ADR-002 — read the
     // canonical `recordingProfile` first; resolveRecordingProfile expands

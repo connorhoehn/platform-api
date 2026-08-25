@@ -182,6 +182,42 @@ describe('CallRecordingRepository.putRecording — owner fan-out', () => {
     }
   });
 
+  // Screenshot bug (2026-08): the fan-out denorm counted participants[] —
+  // the live roster at webhook time — so a 3-leg composed recording whose
+  // members had already hung up rendered "1 participant". The webhook now
+  // derives an explicit leg-truth participantCount; the denorm must prefer
+  // it over participants.length.
+  test('explicit participantCount (leg truth) wins over participants.length on the fan-out row', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    await repo.putRecording({
+      callId: 'c4',
+      recordingId: 'r4',
+      channelArn: 'arn:gh',
+      lobbyName: 'global-hangout',
+      startedAt: '2026-08-24T02:00:00.000Z',
+      endedAt: '2026-08-24T02:05:00.000Z',
+      durationMs: 300_000,
+      totalBytes: 8192,
+      segments: [],
+      destination: 'local',
+      // Only one roster survivor, but three recorded legs.
+      participants: [{ userId: 'u-alice' }],
+      participantCount: 3,
+      startedBy: 'u-alice',
+    });
+
+    const fanouts = mockSend.mock.calls
+      .map((c) => c[0])
+      .filter(
+        (cmd) =>
+          cmd instanceof PutCommand &&
+          cmd.input.TableName === 'test-video-call-recording-participants' &&
+          cmd.input.Item!.recordingId === 'r4',
+      ) as PutCommand[];
+    expect(fanouts).toHaveLength(1);
+    expect(fanouts[0]!.input.Item!.participantCount).toBe(3);
+  });
+
   test('empty participants[] AND no startedBy → no fan-out rows written', async () => {
     const repo = new CallRecordingRepository(docClient);
 
