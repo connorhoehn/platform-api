@@ -66,6 +66,7 @@
 // routes the six bridge surfaces (getRun, getHistory, listActiveRuns,
 // getMetrics, getPendingApprovals, pipeline.run.reassigned) into WebSockets.
 
+import { sign as jwtSign } from 'jsonwebtoken';
 import { Cluster, IS_TEST_ENV } from 'distributed-core';
 import { PipelineModule } from 'distributed-core/applications/pipeline';
 import { InMemoryDeadLetterQueue, wrap } from 'distributed-core/messaging-queue';
@@ -722,6 +723,30 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     customStepHandlers.set(key, handler);
   }
 
+  // Wave A (2026-08-25): action-API wiring. When set, action nodes
+  // (post-comment / update-document / create-section-item / notify) make
+  // REAL HTTP calls back into platform-api's own routes instead of
+  // returning `{ok, simulated:true}` silently. Resolution:
+  //   PIPELINE_ACTION_API_BASE_URL set        → use it ('' disables)
+  //   unset, NODE_ENV=test                    → disabled (unit tests expect
+  //                                             simulated actions, and no
+  //                                             HTTP server is listening)
+  //   unset otherwise                         → self (http://127.0.0.1:$PORT)
+  const rawActionBase = process.env.PIPELINE_ACTION_API_BASE_URL;
+  const actionApiBaseUrl = rawActionBase !== undefined
+    ? (rawActionBase.trim() || undefined)
+    : (process.env.NODE_ENV === 'test'
+        ? undefined
+        : `http://127.0.0.1:${process.env.PORT ?? '3001'}`);
+  // The routes the executor targets sit behind requireAuth. In dev
+  // (SKIP_AUTH) an unsigned-but-decodable JWT is enough to attribute the
+  // write to the 'pipeline-bot' actor; in prod, operators supply a real
+  // token via PIPELINE_ACTION_API_TOKEN.
+  const actionApiToken = process.env.PIPELINE_ACTION_API_TOKEN
+    ?? (actionApiBaseUrl
+      ? jwtSign({ sub: 'pipeline-bot', email: 'pipeline-bot@platform' }, 'dev-local')
+      : undefined);
+
   const module = new PipelineModule(
     buildPipelineModuleConfig({
       nodeId,
@@ -733,6 +758,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       eventBusAutoCompactOptions: effectiveAutoCompactOptions,
       ...(eventBusMetricsEnabled ? { eventBusMetrics: metricsRegistry } : {}),
       ...(customStepHandlers.size > 0 ? { customStepHandlers } : {}),
+      ...(actionApiBaseUrl ? { actionApiBaseUrl } : {}),
+      ...(actionApiBaseUrl && actionApiToken
+        ? { actionApiHeaders: { Authorization: `Bearer ${actionApiToken}` } }
+        : {}),
     }),
   );
   // Wire the module ref now that construction is complete — judge handler

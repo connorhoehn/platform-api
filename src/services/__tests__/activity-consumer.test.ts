@@ -29,15 +29,22 @@ jest.mock('../../lib/event-catalog', () => ({
 
 const mockLogWarn = jest.fn();
 const mockLogError = jest.fn();
-jest.mock('../../lib/logger', () => ({
-  __esModule: true,
-  default: {
+jest.mock('../../lib/logger', () => {
+  const logger = {
     info: jest.fn(),
     warn: (...args: unknown[]) => mockLogWarn(...args),
     error: (...args: unknown[]) => mockLogError(...args),
     debug: jest.fn(),
-  },
-}));
+  };
+  return {
+    __esModule: true,
+    default: logger,
+    // Wave A: the consumer's import chain now reaches
+    // pipeline-event-dispatcher → definitions-cache, which builds a
+    // child logger at module load.
+    withContext: () => logger,
+  };
+});
 
 import { startActivityConsumer } from '../activity-consumer';
 import type { EventEnvelope } from '@connorhoehn/event-catalog';
@@ -97,6 +104,90 @@ describe('startActivityConsumer (Phase 57b)', () => {
     expect(cmd.input.Item.eventType).toBe('doc.created');
     expect(cmd.input.Item.displayName).toBe('Alice');
     expect(cmd.input.Item.detail).toBe('{"docId":"d-1"}');
+  });
+
+  // Wave A: activity events double as pipeline triggers.
+  it('dispatches to the pipeline dispatcher AFTER a successful persist', async () => {
+    let handler!: (env: EventEnvelope<ActivityPayload>) => Promise<void>;
+    const subscribe = jest.fn().mockImplementation((_name, h) => {
+      handler = h;
+      return { unsubscribe: async () => {} };
+    });
+    const dispatch = jest.fn().mockResolvedValue({ fired: [], failed: [] });
+    startActivityConsumer({ _catalog: { subscribe }, _dispatch: dispatch });
+
+    await handler(makeEnvelope({
+      eventType: 'doc.finalize',
+      detail: { documentId: 'doc-9', documentTitle: 'Q3 Retro' },
+      timestamp: '2026-08-25T00:00:00.000Z',
+      userId: 'u-7',
+      displayName: 'Alice',
+    }));
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith('doc.finalize', expect.objectContaining({
+      documentId: 'doc-9',
+      documentTitle: 'Q3 Retro',
+      userId: 'u-7',
+      displayName: 'Alice',
+    }));
+  });
+
+  it('does NOT dispatch when the DDB persist fails (redelivery would double-fire)', async () => {
+    let handler!: (env: EventEnvelope<ActivityPayload>) => Promise<void>;
+    const subscribe = jest.fn().mockImplementation((_name, h) => {
+      handler = h;
+      return { unsubscribe: async () => {} };
+    });
+    const dispatch = jest.fn().mockResolvedValue({ fired: [], failed: [] });
+    startActivityConsumer({ _catalog: { subscribe }, _dispatch: dispatch });
+    mockSend.mockRejectedValueOnce(new Error('ddb down'));
+
+    await expect(handler(makeEnvelope({
+      eventType: 'doc.finalize',
+      detail: {},
+      timestamp: '2026-08-25T00:00:00.000Z',
+      userId: 'u-7',
+    }))).rejects.toThrow('ddb down');
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('anonymous events still dispatch pipelines (no persist)', async () => {
+    let handler!: (env: EventEnvelope<ActivityPayload>) => Promise<void>;
+    const subscribe = jest.fn().mockImplementation((_name, h) => {
+      handler = h;
+      return { unsubscribe: async () => {} };
+    });
+    const dispatch = jest.fn().mockResolvedValue({ fired: [], failed: [] });
+    startActivityConsumer({ _catalog: { subscribe }, _dispatch: dispatch });
+
+    await handler(makeEnvelope({
+      eventType: 'doc.finalize',
+      detail: { documentId: 'doc-9' },
+      timestamp: '2026-08-25T00:00:00.000Z',
+      userId: null,
+    }));
+
+    expect(mockSend).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('a dispatcher throw never poisons the activity drain', async () => {
+    let handler!: (env: EventEnvelope<ActivityPayload>) => Promise<void>;
+    const subscribe = jest.fn().mockImplementation((_name, h) => {
+      handler = h;
+      return { unsubscribe: async () => {} };
+    });
+    const dispatch = jest.fn().mockRejectedValue(new Error('dispatcher bug'));
+    startActivityConsumer({ _catalog: { subscribe }, _dispatch: dispatch });
+
+    await expect(handler(makeEnvelope({
+      eventType: 'doc.finalize',
+      detail: {},
+      timestamp: '2026-08-25T00:00:00.000Z',
+      userId: 'u-7',
+    }))).resolves.toBeUndefined();
+    expect(mockSend).toHaveBeenCalledTimes(1);
   });
 
   it('is idempotent for re-delivery: same envelope id → same sort key', async () => {

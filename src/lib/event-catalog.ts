@@ -519,6 +519,36 @@ catalog.declare({
   tags: ['service:transcription'],
 });
 
+// Wave A (2026-08-25) — `transcription:summary.ready` closes the loop after
+// the summary consumer persists summaryMarkdown on the recording row.
+// Consumed by the summary-projector (single durable consumer), which
+// projects the summary's Action Items onto the call-bound document as
+// section items and then fan-ins matching pipelines through
+// `dispatchPlatformEvent`. Payload is deliberately light — the projector
+// re-reads summaryMarkdown from the recording row by (callId, recordingId).
+catalog.declare({
+  name: 'transcription:summary.ready',
+  transport: 'durable',
+  producer: 'platform-api',
+  queue: 'transcription-summary-ready',
+  fifo: false,
+  retention: 7 * 24 * 60 * 60,
+  dlqAfterAttempts: 3,
+  description: 'A meeting-summary markdown has been generated and persisted for a recording; projectors and summary-bound pipelines should run.',
+  schema: {
+    type: 'object',
+    properties: {
+      recordingId: { type: 'string' },
+      callId: { type: 'string' },
+      channelArn: { type: 'string' },
+      lobbyName: { type: 'string' },
+      summaryChars: { type: 'number' },
+    },
+    required: ['recordingId', 'callId'],
+  },
+  tags: ['service:transcription'],
+});
+
 // Phase 57b — `activity.recorded` is produced by websocket-gateway as
 // transport:'both' (declared in gateway-event-declarations.js). We declare
 // it locally so platform-api can `catalog.subscribe()` to the durable side

@@ -21,6 +21,7 @@
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { EventEnvelope, Subscription } from '@connorhoehn/event-catalog';
 import { catalog } from '../lib/event-catalog';
+import { dispatchPlatformEvent } from './pipeline-event-dispatcher';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import log from '../lib/logger';
@@ -42,9 +43,30 @@ interface ActivityPayload {
  * parameter (default: the module-singleton `catalog`).
  */
 export function startActivityConsumer(
-  opts: { _catalog?: { subscribe: typeof catalog.subscribe } } = {},
+  opts: {
+    _catalog?: { subscribe: typeof catalog.subscribe };
+    _dispatch?: typeof dispatchPlatformEvent;
+  } = {},
 ): { stop: () => Promise<void> } {
   const cat = opts._catalog ?? catalog;
+  const dispatchEvent = opts._dispatch ?? dispatchPlatformEvent;
+
+  // Wave A pipeline-trigger fan-in. dispatchPlatformEvent itself never
+  // throws, but guard anyway — a dispatcher bug must not poison the
+  // activity drain (a throw here would redeliver AND re-fire pipelines).
+  const dispatch = async (payload: ActivityPayload): Promise<void> => {
+    try {
+      await dispatchEvent(payload.eventType, {
+        ...(payload.detail ?? {}),
+        userId: payload.userId ?? undefined,
+        displayName: payload.displayName,
+        at: payload.timestamp,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.error({ err: message, eventType: payload.eventType }, '[activity-consumer] pipeline dispatch failed');
+    }
+  };
 
   const subscription: Subscription = cat.subscribe<ActivityPayload>(
     'activity.recorded',
@@ -53,8 +75,10 @@ export function startActivityConsumer(
 
       // Activity rows are keyed on userId; anonymous events have nowhere
       // to land. Drop them — they're already captured in Redis history
-      // and broadcast live to subscribers.
+      // and broadcast live to subscribers. They can still TRIGGER
+      // pipelines, though (Wave A) — dispatch before returning.
       if (!payload.userId) {
+        await dispatch(payload);
         return;
       }
 
@@ -78,6 +102,12 @@ export function startActivityConsumer(
         log.error({ err: message, eventType: payload.eventType }, '[activity-consumer] DDB write failed; will redeliver');
         throw err; // propagate so durable transport redelivers
       }
+
+      // Wave A: activity events double as pipeline triggers
+      // ('doc.finalize' → pipelines bound to 'document.finalize').
+      // AFTER the persist, so a DDB failure + redelivery can't fire the
+      // same pipeline twice; dispatchPlatformEvent never throws.
+      await dispatch(payload);
     },
   );
 

@@ -29,6 +29,7 @@
 
 import type { EventEnvelope, Subscription } from '@connorhoehn/event-catalog';
 import { catalog } from '../lib/event-catalog';
+import { dispatchPlatformEvent } from './pipeline-event-dispatcher';
 import { callRecordingRepo } from '../repositories';
 import { createLLMClient } from '../pipeline/createLLMClient';
 import { callSfu } from '../lib/sfu-breaker';
@@ -159,13 +160,65 @@ async function generateSummary(transcriptText: string): Promise<string> {
 }
 
 export interface StartSummaryConsumerOptions {
-  _catalog?: { subscribe: typeof catalog.subscribe };
+  _catalog?: {
+    subscribe: typeof catalog.subscribe;
+    publish?: typeof catalog.publish;
+  };
+  _dispatch?: typeof dispatchPlatformEvent;
 }
 
 export function startTranscriptionSummaryConsumer(
   opts: StartSummaryConsumerOptions = {},
 ): { stop: () => Promise<void> } {
   const cat = opts._catalog ?? catalog;
+  const dispatchEvent = opts._dispatch ?? dispatchPlatformEvent;
+
+  // Wave A: transcript-ready doubles as a pipeline trigger, and a
+  // successful summary emits `transcription:summary.ready` (consumed by
+  // the summary-projector, which projects action items onto the
+  // call-bound document and fires summary-bound pipelines). Neither may
+  // throw — a failure here must not redeliver the transcript message and
+  // regenerate the (expensive) LLM summary.
+  const afterReady = async (args: {
+    recordingId: string;
+    callId: string;
+    channelArn: string;
+    lobbyName: string;
+    transcriptKey: string;
+    summaryChars: number;
+    hasSegments: boolean;
+  }): Promise<void> => {
+    try {
+      await dispatchEvent('transcription:transcript.ready', {
+        recordingId: args.recordingId,
+        callId: args.callId,
+        channelArn: args.channelArn,
+        lobbyName: args.lobbyName,
+        transcriptKey: args.transcriptKey,
+      });
+    } catch (err) {
+      log.error(
+        { err: err instanceof Error ? err.message : String(err), recordingId: args.recordingId },
+        '[transcription-summary] transcript.ready pipeline dispatch failed',
+      );
+    }
+    if (!args.hasSegments) return;
+    try {
+      const publish = cat.publish?.bind(cat) ?? catalog.publish.bind(catalog);
+      await publish('transcription:summary.ready', {
+        recordingId: args.recordingId,
+        callId: args.callId,
+        channelArn: args.channelArn,
+        lobbyName: args.lobbyName,
+        summaryChars: args.summaryChars,
+      });
+    } catch (err) {
+      log.error(
+        { err: err instanceof Error ? err.message : String(err), recordingId: args.recordingId },
+        '[transcription-summary] summary.ready publish failed',
+      );
+    }
+  };
 
   const subscription: Subscription = cat.subscribe<TranscriptReadyPayload>(
     'transcription:transcript.ready',
@@ -203,6 +256,15 @@ export function startTranscriptionSummaryConsumer(
             transcriptGeneratedAt: new Date().toISOString(),
           });
           log.info({ recordingId }, '[transcription-summary] no segments — marked ready with placeholder');
+          await afterReady({
+            recordingId,
+            callId,
+            channelArn,
+            lobbyName: detail.lobbyName,
+            transcriptKey,
+            summaryChars: 0,
+            hasSegments: false,
+          });
           return;
         }
 
@@ -225,6 +287,16 @@ export function startTranscriptionSummaryConsumer(
           },
           '[transcription-summary] ready',
         );
+
+        await afterReady({
+          recordingId,
+          callId,
+          channelArn,
+          lobbyName: detail.lobbyName,
+          transcriptKey,
+          summaryChars: summary.length,
+          hasSegments: true,
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log.error(

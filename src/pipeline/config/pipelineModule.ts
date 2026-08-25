@@ -80,6 +80,16 @@ export interface PipelineModuleConstructorConfig {
   eventBusMetrics?: MetricsRegistry;
   /** T2 idempotency hook — see distributed-core `PipelineModuleConfig.onBeforeAction`. */
   onBeforeAction?: OnBeforeActionHook;
+  /**
+   * Wave A (2026-08-25): base URL for action-API calls. When set, action
+   * nodes (post-comment / update-document / create-section-item / notify)
+   * make REAL HTTP calls against this base; when unset they return
+   * `{ok, simulated:true}`. Points back at platform-api itself — the
+   * executor runs in-process here and the routes it targets are ours.
+   */
+  actionApiBaseUrl?: string;
+  /** Headers (service-auth bearer) attached to every action-API call. */
+  actionApiHeaders?: Record<string, string>;
 
   /**
    * DC-21: custom step-handler registry forwarded to every executor.
@@ -118,6 +128,10 @@ export interface BuildPipelineModuleConfigArgs {
   /** DC-21: custom step-handler registry — see PipelineModuleConstructorConfig. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   customStepHandlers?: Map<string, any>;
+  /** Wave A: see PipelineModuleConstructorConfig.actionApiBaseUrl. */
+  actionApiBaseUrl?: string;
+  /** Wave A: see PipelineModuleConstructorConfig.actionApiHeaders. */
+  actionApiHeaders?: Record<string, string>;
 }
 
 /**
@@ -184,6 +198,12 @@ export function buildPipelineModuleConfig(
   }
   if (args.customStepHandlers !== undefined) {
     config.customStepHandlers = args.customStepHandlers;
+  }
+  if (args.actionApiBaseUrl) {
+    config.actionApiBaseUrl = args.actionApiBaseUrl;
+  }
+  if (args.actionApiHeaders !== undefined) {
+    config.actionApiHeaders = args.actionApiHeaders;
   }
   return config;
 }

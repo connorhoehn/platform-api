@@ -10,7 +10,7 @@ import { createDDBSchedulerLeaderLock } from './services/scheduler-leader-lock';
 import { pipelineDefinitionsCache } from './pipeline/definitions-cache';
 import { startInvalidationSubscriber } from './pipeline/definitions-invalidator';
 import { wirePipelineBridge } from '@connorhoehn/pipeline-runtime';
-import { setPipelineBridge } from './pipeline/bridge-types';
+import { setPipelineBridge, getPipelineBridge } from './pipeline/bridge-types';
 import { bootstrapPipeline } from './pipeline/bootstrap';
 import { createBridge } from './pipeline/createBridge';
 import { PipelineRunRepository } from './repositories/PipelineRunRepository';
@@ -30,6 +30,7 @@ import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFa
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
 import { startTranscriptionSummaryConsumer } from './services/transcription-summary-consumer';
+import { startSummaryProjector } from './services/summary-projector';
 import { createPipelineConfigRegistration } from './control-plane/pipeline-config-subscriber';
 import { createFileUploadEndpointRegistration } from './control-plane/file-upload-subscriber';
 import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
@@ -164,6 +165,7 @@ const catalogRetry = new RetryManager({
 
 let activityConsumer: { stop: () => Promise<void> } | null = null;
 let transcriptionSummaryConsumer: { stop: () => Promise<void> } | null = null;
+let summaryProjector: { stop: () => Promise<void> } | null = null;
 
 (async () => {
   try {
@@ -191,6 +193,16 @@ let transcriptionSummaryConsumer: { stop: () => Promise<void> } | null = null;
     } catch (err: unknown) {
       const e = err as { message?: string };
       log.warn({ errMessage: e?.message }, 'transcription-summary-consumer failed to start (non-fatal)');
+    }
+    // Wave A — summary-projector: single durable consumer of
+    // `transcription:summary.ready`. Projects Action Items onto the
+    // call-bound document and fires summary-bound pipelines.
+    try {
+      summaryProjector = startSummaryProjector();
+      log.info('summary-projector started');
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      log.warn({ errMessage: e?.message }, 'summary-projector failed to start (non-fatal)');
     }
   } catch (err: unknown) {
     const e = err as { message?: string };
@@ -403,8 +415,38 @@ const scheduler = createScheduleEvaluator({
     return out;
   },
   trigger: async (pipelineId, payload) => {
-    // Phase 1: log only. Phase 4 will create a pipeline run via ResourceRouter.
-    log.info({ pipelineId, payload }, 'scheduler firing');
+    // Wave A (2026-08-25): actually create a run. This was the "one line
+    // short" stub — cron matching, leader election and the definitions
+    // cache all existed, but the fire was log-only.
+    const bridge = getPipelineBridge();
+    if (!bridge?.trigger) {
+      log.warn({ pipelineId }, 'scheduler fired but pipeline bridge unavailable — skipping');
+      return;
+    }
+    // `definition` is REQUIRED by PipelineModule.createResource (same
+    // contract as the webhook route) — resolve it from the cache entry
+    // that produced this fire.
+    const definition = pipelineDefinitionsCache
+      .all()
+      .find((d) => (d as { id?: unknown }).id === pipelineId);
+    if (!definition) {
+      log.warn({ pipelineId }, 'scheduler fired but definition missing from cache — skipping');
+      return;
+    }
+    try {
+      const out = await bridge.trigger({
+        pipelineId,
+        definition,
+        triggerPayload: { triggerType: 'schedule', ...payload },
+        triggeredBy: { userId: `schedule:${pipelineId}` },
+      });
+      log.info({ pipelineId, runId: out.runId }, 'scheduler fired pipeline run');
+    } catch (err: unknown) {
+      log.error(
+        { pipelineId, errMessage: err instanceof Error ? err.message : String(err) },
+        'scheduler bridge.trigger failed',
+      );
+    }
   },
   // Phase 54.6.1 — multi-replica safe leader election. Without this, every
   // replica's tick would fire every matching cron pipeline once per minute,
@@ -439,6 +481,7 @@ sd.register('control-plane-registry', async () => {
 sd.register('activity-consumer', async () => {
   if (activityConsumer) await activityConsumer.stop();
   if (transcriptionSummaryConsumer) await transcriptionSummaryConsumer.stop();
+  if (summaryProjector) await summaryProjector.stop();
 });
 sd.register('outbox-drainer', () => { drainer.stop(); });
 sd.register('ingest', async () => {
