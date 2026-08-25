@@ -573,6 +573,36 @@ catalog.declare({
   tags: ['service:activity', 'phase:57'],
 });
 
+// `call:reaction.recorded` — produced by websocket-gateway when a user
+// fires an in-call emoji reaction. Declared locally so platform-api can
+// `catalog.subscribe()` to the durable side and drain into the
+// call-reactions DDB table (playback + transcript injection).
+catalog.declare({
+  name: 'call:reaction.recorded',
+  transport: 'durable',
+  producer: 'websocket-gateway',
+  queue: 'call-reaction-recorded',
+  fifo: false,
+  retention: 7 * 24 * 60 * 60,
+  dlqAfterAttempts: 3,
+  description: 'An in-call emoji reaction fired by a participant; drained by platform-api into the call-reactions table for playback and transcript injection.',
+  schema: {
+    type: 'object',
+    properties: {
+      reactionId: { type: 'string' },
+      channel: { type: 'string' },
+      lobbyName: { type: 'string' },
+      userId: { type: ['string', 'null'] },
+      displayName: { type: 'string' },
+      emoji: { type: 'string' },
+      effect: { type: 'string' },
+      at: { type: 'string' },
+    },
+    required: ['reactionId', 'channel', 'lobbyName', 'emoji', 'at'],
+  },
+  tags: ['service:call'],
+});
+
 // ---------------------------------------------------------------------------
 // platform-api Raft state-machine signal events (wave2-pa-1 / wave9-d / wave20-c)
 //

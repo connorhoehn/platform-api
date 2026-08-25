@@ -31,6 +31,7 @@ import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
 import { startTranscriptionSummaryConsumer } from './services/transcription-summary-consumer';
 import { startSummaryProjector } from './services/summary-projector';
+import { startCallReactionConsumer } from './services/call-reaction-consumer';
 import { createPipelineConfigRegistration } from './control-plane/pipeline-config-subscriber';
 import { createFileUploadEndpointRegistration } from './control-plane/file-upload-subscriber';
 import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
@@ -166,6 +167,7 @@ const catalogRetry = new RetryManager({
 let activityConsumer: { stop: () => Promise<void> } | null = null;
 let transcriptionSummaryConsumer: { stop: () => Promise<void> } | null = null;
 let summaryProjector: { stop: () => Promise<void> } | null = null;
+let callReactionConsumer: { stop: () => Promise<void> } | null = null;
 
 (async () => {
   try {
@@ -203,6 +205,16 @@ let summaryProjector: { stop: () => Promise<void> } | null = null;
     } catch (err: unknown) {
       const e = err as { message?: string };
       log.warn({ errMessage: e?.message }, 'summary-projector failed to start (non-fatal)');
+    }
+    // In-call emoji reactions — durable drain of `call:reaction.recorded`
+    // into the call-reactions table (playback + transcript injection).
+    // Non-fatal like the other consumers.
+    try {
+      callReactionConsumer = startCallReactionConsumer();
+      log.info('call-reaction-consumer started');
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      log.warn({ errMessage: e?.message }, 'call-reaction-consumer failed to start (non-fatal)');
     }
   } catch (err: unknown) {
     const e = err as { message?: string };
@@ -482,6 +494,7 @@ sd.register('activity-consumer', async () => {
   if (activityConsumer) await activityConsumer.stop();
   if (transcriptionSummaryConsumer) await transcriptionSummaryConsumer.stop();
   if (summaryProjector) await summaryProjector.stop();
+  if (callReactionConsumer) await callReactionConsumer.stop();
 });
 sd.register('outbox-drainer', () => { drainer.stop(); });
 sd.register('ingest', async () => {

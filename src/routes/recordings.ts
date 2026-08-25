@@ -22,7 +22,8 @@ import { Router, Request, Response } from 'express';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
-import { callRecordingRepo } from '../repositories';
+import { callRecordingRepo, callReactionRepo } from '../repositories';
+import { mergeReactionsIntoTranscript } from '../lib/transcript-reactions';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { VIDEO_API_URL, VIDEO_PUBLIC_URL } from '../lib/video-auth';
@@ -394,6 +395,33 @@ recordingsRouter.get(
         throw new AppError(upstream.status, `lvs returned ${upstream.status}`);
       }
       const text = await upstream.text();
+
+      // Inject in-call emoji reactions as synthetic transcript segments
+      // ("Connor reacted with 👍") for the recording's time window.
+      // Best-effort: a reactions outage or a non-JSON transcript body
+      // must not fail transcript serving — fall through to the raw text.
+      try {
+        const doc = JSON.parse(text) as { segments?: Array<{ startMs: number; endMs: number; speakerId: string; speakerLabel: string; text: string }> };
+        if (doc && Array.isArray(doc.segments)) {
+          const reactions = await callReactionRepo.listByLobby(
+            detail.lobbyName,
+            detail.startedAt,
+            detail.endedAt,
+          );
+          const merged = mergeReactionsIntoTranscript(
+            doc as { segments: Array<{ startMs: number; endMs: number; speakerId: string; speakerLabel: string; text: string }> },
+            reactions,
+            detail.startedAt,
+          );
+          res.json(merged);
+          return;
+        }
+      } catch (mergeErr) {
+        log.warn(
+          { err: mergeErr instanceof Error ? mergeErr.message : String(mergeErr), recordingId },
+          '[recordings] reaction merge failed — serving unmerged transcript',
+        );
+      }
       res.type('application/json').send(text);
     } catch (e) {
       if (e instanceof AppError) throw e;

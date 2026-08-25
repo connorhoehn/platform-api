@@ -30,7 +30,8 @@
 import type { EventEnvelope, Subscription } from '@connorhoehn/event-catalog';
 import { catalog } from '../lib/event-catalog';
 import { dispatchPlatformEvent } from './pipeline-event-dispatcher';
-import { callRecordingRepo } from '../repositories';
+import { callRecordingRepo, callReactionRepo } from '../repositories';
+import { mergeReactionsIntoTranscript } from '../lib/transcript-reactions';
 import { createLLMClient } from '../pipeline/createLLMClient';
 import { callSfu } from '../lib/sfu-breaker';
 import { VIDEO_API_URL } from '../lib/video-auth';
@@ -268,7 +269,32 @@ export function startTranscriptionSummaryConsumer(
           return;
         }
 
-        const promptText = formatTranscriptForPrompt(doc);
+        // Inject in-call emoji reactions into the transcript so the LLM
+        // summary sees lines like "[03:12] Connor: reacted with 👍".
+        // Soft-fail: a reactions outage must not fail (and redeliver +
+        // re-bill) the summary — proceed with the unmerged doc.
+        let docForPrompt: TranscriptDoc = doc;
+        try {
+          const reactions = await callReactionRepo.listByLobby(
+            detail.lobbyName,
+            detail.startedAt,
+            detail.endedAt,
+          );
+          if (reactions.length > 0) {
+            docForPrompt = mergeReactionsIntoTranscript(doc, reactions, detail.startedAt) as TranscriptDoc;
+          }
+        } catch (reactionErr) {
+          log.warn(
+            {
+              err: reactionErr instanceof Error ? reactionErr.message : String(reactionErr),
+              recordingId,
+              lobbyName: detail.lobbyName,
+            },
+            '[transcription-summary] reactions fetch failed — summarizing without reactions',
+          );
+        }
+
+        const promptText = formatTranscriptForPrompt(docForPrompt);
         const summary = await generateSummary(promptText);
 
         await callRecordingRepo.updateTranscriptStatus(callId, recordingId, {

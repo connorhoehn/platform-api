@@ -15,6 +15,7 @@ import { ApprovalRepository } from './ApprovalRepository';
 import { PipelineRunRepository } from './PipelineRunRepository';
 import { PipelineDLQRepository } from './PipelineDLQRepository';
 import { CallRecordingRepository } from './CallRecordingRepository';
+import { CallReactionRepository } from './CallReactionRepository';
 import { HangoutRoomRepository } from './HangoutRoomRepository';
 import { HangoutRoomMemberRepository } from './HangoutRoomMemberRepository';
 
@@ -36,6 +37,7 @@ export const approvalRepo = new ApprovalRepository(docClient);
 export const pipelineRunRepo = new PipelineRunRepository(docClient);
 export const pipelineDLQRepo = new PipelineDLQRepository(docClient);
 export const callRecordingRepo = new CallRecordingRepository(docClient);
+export const callReactionRepo = new CallReactionRepository(docClient);
 export const hangoutRoomRepo = new HangoutRoomRepository(docClient);
 export const hangoutRoomMemberRepo = new HangoutRoomMemberRepository(docClient);
 
@@ -99,6 +101,12 @@ export {
   CALL_RECORDINGS_TABLE,
   CALL_RECORDING_PARTICIPANTS_TABLE,
 } from './CallRecordingRepository';
+export {
+  CallReactionRepository,
+  CallReaction,
+  CallReactionInput,
+  CALL_REACTIONS_TABLE,
+} from './CallReactionRepository';
 export {
   HangoutRoomRepository,
   HangoutRoom,

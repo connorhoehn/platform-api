@@ -30,7 +30,7 @@ import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { requireAuth, optionalAuth } from '../middleware/auth';
 import { VIDEO_API_URL } from '../lib/video-auth';
-import { videoSessionRepo } from '../repositories';
+import { videoSessionRepo, callReactionRepo } from '../repositories';
 import { VideoSessionRecord } from '../repositories/VideoSessionRepository';
 import {
   asyncHandler,
@@ -734,6 +734,25 @@ videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async 
 // deployment reality); disable falls back to scanning the channel's taps
 // for one pointing at OUR sink URL, so a restarted platform-api can still
 // turn captions off. Idempotent in both directions.
+
+// --- in-call emoji reactions (playback) ------------------------------------
+//
+// GET /api/video/reactions?lobbyName=<name>&from=<iso>&to=<iso>
+//
+// Serves the reactions drained from the durable `call:reaction.recorded`
+// event by call-reaction-consumer. `from`/`to` are optional ISO bounds
+// (typically a recording's startedAt/endedAt) — omitted, the full
+// retention window for the lobby is returned. Ascending by `at`.
+videoSessionsRouter.get('/reactions', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const lobbyName = typeof req.query.lobbyName === 'string' ? req.query.lobbyName : undefined;
+  if (!lobbyName) {
+    throw new ValidationError('lobbyName query parameter is required');
+  }
+  const from = typeof req.query.from === 'string' && req.query.from.length > 0 ? req.query.from : undefined;
+  const to = typeof req.query.to === 'string' && req.query.to.length > 0 ? req.query.to : undefined;
+  const reactions = await callReactionRepo.listByLobby(lobbyName, from, to);
+  res.json({ reactions });
+}));
 
 const CAPTIONS_SINK_URL =
   process.env.LIVE_CAPTIONS_SINK_URL || 'http://localhost:3915/pcm';

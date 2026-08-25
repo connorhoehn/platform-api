@@ -836,6 +836,84 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }
 
+  /video/reactions:
+    get:
+      tags: [video-sessions]
+      summary: In-call emoji reactions for a lobby
+      description: |
+        Reactions drained from the durable `call:reaction.recorded` event
+        into the `call-reactions` table. `from`/`to` are optional ISO-8601
+        bounds (typically a recording's startedAt/endedAt window). Results
+        are ascending by `at`, capped at 500.
+      operationId: listCallReactions
+      parameters:
+        - in: query
+          name: lobbyName
+          required: true
+          schema: { type: string }
+          description: Lobby identifier the reactions were fired in.
+        - in: query
+          name: from
+          required: false
+          schema: { type: string, format: date-time }
+          description: Inclusive lower bound (ISO-8601).
+        - in: query
+          name: to
+          required: false
+          schema: { type: string, format: date-time }
+          description: Inclusive upper bound (ISO-8601).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reactions]
+                properties:
+                  reactions:
+                    type: array
+                    items: { $ref: '#/components/schemas/CallReaction' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /video/captions:
+    post:
+      tags: [video-sessions]
+      summary: Toggle live whisper captions for a channel
+      description: |
+        enabled=true creates a per-participant webhook-pcm tap on the LVS
+        channel pointed at the live-captions ASR sidecar; enabled=false
+        deletes it. Idempotent in both directions.
+      operationId: toggleLiveCaptions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channelArn, enabled]
+              properties:
+                channelArn: { type: string }
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [enabled]
+                properties:
+                  enabled: { type: boolean }
+                  tapId: { type: string }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -892,6 +970,28 @@ components:
           schema: { $ref: '#/components/schemas/ErrorBody' }
 
   schemas:
+    CallReaction:
+      type: object
+      description: |
+        One in-call emoji reaction, drained from `call:reaction.recorded`
+        (producer websocket-gateway) into the call-reactions table.
+      required: [reactionId, channel, lobbyName, emoji, at, sk]
+      properties:
+        reactionId: { type: string }
+        channel: { type: string }
+        lobbyName: { type: string }
+        userId: { type: [string, 'null'] }
+        displayName: { type: string }
+        emoji: { type: string }
+        effect: { type: string }
+        at: { type: string, format: date-time }
+        sk:
+          type: string
+          description: Composite sort key `${at}#${reactionId}`.
+        ttl:
+          type: integer
+          description: Epoch-seconds row TTL (90 days).
+
     ErrorBody:
       type: object
       required: [error]
