@@ -716,3 +716,81 @@ videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async 
     throw new AppError(500, 'Failed to fetch video session');
   }
 }));
+
+// ---------------------------------------------------------------------------
+// Live captions toggle (2026-08-25 wave)
+// ---------------------------------------------------------------------------
+//
+// POST /api/video/captions { channelArn, enabled }
+//
+// enabled=true  → create ONE per-participant webhook-pcm tap on the LVS
+//                 channel, pointed at the live-captions ASR sidecar. The
+//                 sidecar publishes caption lines to Redis; the gateway's
+//                 caption-relay fans them onto the `captions:<arn>` WS
+//                 channel that clients subscribe to.
+// enabled=false → delete that tap.
+//
+// Tap ids are tracked in-process per channelArn (single-node dev is the
+// deployment reality); disable falls back to scanning the channel's taps
+// for one pointing at OUR sink URL, so a restarted platform-api can still
+// turn captions off. Idempotent in both directions.
+
+const CAPTIONS_SINK_URL =
+  process.env.LIVE_CAPTIONS_SINK_URL || 'http://localhost:3915/pcm';
+const captionTapsByArn = new Map<string, string>();
+
+videoSessionsRouter.post('/captions', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const { channelArn, enabled } = (req.body ?? {}) as { channelArn?: string; enabled?: boolean };
+  if (!channelArn || typeof enabled !== 'boolean') {
+    throw new AppError(400, 'channelArn and enabled are required');
+  }
+  const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
+  const tapsUrl = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(channelArn)}/taps`;
+  const authHeaders = { Authorization: `Bearer ${adminToken}` };
+
+  if (enabled) {
+    const existing = captionTapsByArn.get(channelArn);
+    if (existing) {
+      res.json({ enabled: true, tapId: existing });
+      return;
+    }
+    const createRes = await fetch(tapsUrl, {
+      method: 'POST',
+      headers: { ...authHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        destination: {
+          type: 'webhook-pcm',
+          url: CAPTIONS_SINK_URL,
+          perParticipant: true,
+          chunkMs: 200,
+        },
+      }),
+    });
+    if (!createRes.ok) {
+      const text = await createRes.text().catch(() => '');
+      throw new AppError(502, `LVS tap create failed (${createRes.status}): ${text.slice(0, 200)}`);
+    }
+    const body = (await createRes.json()) as { tapId?: string; id?: string };
+    const tapId = body.tapId ?? body.id ?? '';
+    if (tapId) captionTapsByArn.set(channelArn, tapId);
+    res.json({ enabled: true, tapId });
+    return;
+  }
+
+  // Disable: tracked id first, then scan for our sink URL.
+  let tapId = captionTapsByArn.get(channelArn) ?? null;
+  if (!tapId) {
+    const listRes = await fetch(tapsUrl, { headers: authHeaders });
+    if (listRes.ok) {
+      const body = (await listRes.json()) as { taps?: Array<{ tapId?: string; id?: string; destination?: { url?: string } }> };
+      const mine = (body.taps ?? []).find((t) => t.destination?.url === CAPTIONS_SINK_URL);
+      tapId = mine?.tapId ?? mine?.id ?? null;
+    }
+  }
+  if (tapId) {
+    await fetch(`${tapsUrl}/${encodeURIComponent(tapId)}`, { method: 'DELETE', headers: authHeaders })
+      .catch(() => undefined); // 404 = already gone
+  }
+  captionTapsByArn.delete(channelArn);
+  res.json({ enabled: false });
+}));
