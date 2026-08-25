@@ -555,10 +555,20 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
     // publish in an outbox TransactWrite because the put already does a
     // multi-table fan-out (target + N participant rows) which
     // publishWithOutbox's single-target model doesn't fit.
+    const webhookSaysTranscribe = detail.transcribe === true || detail.transcribe === 'true';
     const resolvedProfile = resolveRecordingProfile({
       recordingProfile: typeof detail.recordingProfile === 'string' ? detail.recordingProfile : undefined,
-      transcribe: detail.transcribe === true || detail.transcribe === 'true',
+      transcribe: webhookSaysTranscribe,
       composePerPeer: detail.composePerPeer === true || detail.composePerPeer === 'true',
+      // LVS's denormalized `transcribe` reflects ITS resolved config —
+      // including per-channel overrides (e.g. dm-profile transcribe
+      // opt-in via LVS_DM_TRANSCRIBE). Re-resolving from the bare
+      // profile id here used to DROP that override (profile id wins
+      // over legacy flags in resolveRecordingProfile), silently turning
+      // transcription back off for dm recordings. Passing it as an
+      // override keeps profiles whose `overridable` list excludes
+      // `transcribe` unaffected.
+      overrides: webhookSaysTranscribe ? { transcribe: true } : undefined,
     });
     const wantTranscribe = resolvedProfile.transcribe === true;
     if (wantTranscribe) {
