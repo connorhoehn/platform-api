@@ -95,6 +95,17 @@ export class PipelineDefinitionsCache {
   private readonly loader: () => Promise<PipelineDefinition[]>;
   /** Promise of the currently-in-flight refresh, if any. Coalesces concurrent calls. */
   private inFlight: Promise<void> | null = null;
+  /**
+   * Wave A fix: a refresh() call that lands while another refresh is
+   * mid-Scan must NOT be silently coalesced away — the in-flight Scan's
+   * snapshot predates the write that prompted the new call, so the write
+   * would stay invisible until the next timer tick (observed live: a
+   * publish poked refresh while a delete-poked refresh was in flight; the
+   * event dispatcher then missed the freshly published pipeline for up to
+   * 60s). Instead we mark the in-flight refresh dirty and chain one
+   * follow-up refresh after it settles.
+   */
+  private dirty = false;
   /** Set true once the first refresh has completed (success or failure). */
   private primed = false;
 
@@ -140,7 +151,23 @@ export class PipelineDefinitionsCache {
    * doesn't trigger a Scan storm under burst-write workloads.
    */
   refresh(): Promise<void> {
-    if (this.inFlight) return this.inFlight;
+    if (this.inFlight) {
+      // Coalesce onto the in-flight Scan, but remember that state may have
+      // changed after it started — one follow-up refresh runs when it
+      // settles (see `dirty` field note). Callers still resolve when the
+      // CURRENT refresh finishes; the follow-up is best-effort.
+      if (!this.dirty) {
+        this.dirty = true;
+        void this.inFlight
+          .catch(() => {})
+          .then(() => {
+            this.dirty = false;
+            return this.refresh();
+          })
+          .catch(() => {});
+      }
+      return this.inFlight;
+    }
     this.inFlight = (async () => {
       try {
         const next = await this.loader();

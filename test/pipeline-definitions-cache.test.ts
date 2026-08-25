@@ -93,15 +93,51 @@ describe('PipelineDefinitionsCache — start/stop', () => {
 // ─── refresh() coalescing ─────────────────────────────────────────────────
 
 describe('PipelineDefinitionsCache — refresh() coalescing', () => {
-    test('concurrent refresh() calls share the same in-flight promise', async () => {
+    test('concurrent refresh() calls share the same in-flight promise, then run ONE follow-up', async () => {
         const loader = makeLoader([]);
         const cache = new PipelineDefinitionsCache({ loader });
-        // Fire two refreshes without awaiting between them
+        // Fire three refreshes without awaiting between them.
         const p1 = cache.refresh();
         const p2 = cache.refresh();
-        await Promise.all([p1, p2]);
-        // Only one loader call should have been made
-        expect(loader).toHaveBeenCalledTimes(1);
+        const p3 = cache.refresh();
+        await Promise.all([p1, p2, p3]);
+        // Wave A contract change: callers coalesce onto one in-flight Scan
+        // (so a burst can't storm DDB), but a call that lands mid-flight
+        // marks the cache dirty and exactly ONE follow-up load runs after —
+        // the in-flight Scan's snapshot predates whatever write prompted
+        // the late caller. Silently swallowing it left a freshly published
+        // pipeline invisible to the event dispatcher until the 60s timer.
+        await new Promise((r) => setTimeout(r, 10));
+        expect(loader).toHaveBeenCalledTimes(2);
+        cache.stop();
+    });
+
+    test('a write during an in-flight refresh becomes visible via the follow-up', async () => {
+        const oldDef = makeDef({ id: 'p-old' });
+        const newDef = makeDef({ id: 'p-new' });
+        let store: PipelineDefinition[] = [oldDef];
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>((r) => { releaseFirst = r; });
+        let calls = 0;
+        const loader = jest.fn(async () => {
+            calls++;
+            // First Scan snapshots BEFORE the write and hangs until released.
+            const snapshot = [...store];
+            if (calls === 1) await firstGate;
+            return snapshot;
+        });
+        const cache = new PipelineDefinitionsCache({ loader });
+
+        const first = cache.refresh();          // Scan starts, snapshots [p-old]
+        store = [oldDef, newDef];               // the "publish" lands mid-Scan
+        const second = cache.refresh();         // poked by the publish route
+        releaseFirst();
+        await Promise.all([first, second]);
+        // Let the chained follow-up refresh settle.
+        await new Promise((r) => setTimeout(r, 10));
+
+        expect(loader).toHaveBeenCalledTimes(2);
+        expect(cache.all().map((d) => (d as { id?: string }).id)).toContain('p-new');
         cache.stop();
     });
 
