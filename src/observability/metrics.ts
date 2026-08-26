@@ -305,68 +305,6 @@ export function recordLvsParticipantReap(outcome: LvsReapOutcome): void {
 }
 
 // ---------------------------------------------------------------------------
-// Ingest Subsystem Metrics (Task #2136)
-// ---------------------------------------------------------------------------
-//
-// Observability for the ingest subsystem: source syncs, item processing,
-// queue depth, mapping confidence distribution, and dead-letter queue.
-// Provides operators visibility into ingestion pipeline health and performance.
-
-/**
- * Total ingest items processed, labeled by status (queued, mapping, materializing,
- * triggering, done, failed). Pre-registered with status='_init' so the metric
- * appears at zero before the first item is processed.
- */
-registry.counter('ingest_items_total', { ...BASE_LABELS, status: '_init' }, 'Ingest items processed, labeled by status.');
-
-/**
- * Sync duration histogram tracks time from sync.started to sync.completed.
- * Helps identify slow source adapters or large sync batches.
- */
-registry.histogram('ingest_sync_duration_seconds', BASE_LABELS, 1000, 'Ingest sync duration in seconds, from start to completion.');
-
-/**
- * Current queue depth gauge (items in 'queued' status waiting for processing).
- * Updated on item enqueue (+1) and dequeue (-1).
- */
-const ingestQueueDepthGauge = registry.gauge('ingest_queue_depth', BASE_LABELS, 'Ingest items currently queued for processing.');
-
-/**
- * Mapping confidence histogram tracks the confidence score (0.0-1.0) of
- * rule-based and LLM-based type mappings. Helps identify weak mappings that
- * may benefit from rule tuning or human review.
- */
-registry.histogram('ingest_mapping_confidence', BASE_LABELS, 1000, 'Ingest mapping confidence score (0.0-1.0).');
-
-/**
- * Dead-letter queue depth gauge (items in 'failed' status after exhausting retries).
- * High DLQ depth indicates persistent mapping or materialization failures.
- */
-const ingestDlqDepthGauge = registry.gauge('ingest_dlq_depth', BASE_LABELS, 'Ingest items in dead-letter queue (failed after retries).');
-
-export function recordIngestItem(status: string): void {
-  registry.counter('ingest_items_total', { ...BASE_LABELS, status }).inc();
-}
-
-export function recordIngestSyncDuration(durationSeconds: number): void {
-  registry.histogram('ingest_sync_duration_seconds', BASE_LABELS, 1000).observe(durationSeconds);
-}
-
-export function recordIngestQueueDepthDelta(delta: number): void {
-  if (delta > 0) ingestQueueDepthGauge.inc(delta);
-  else if (delta < 0) ingestQueueDepthGauge.dec(-delta);
-}
-
-export function recordIngestMappingConfidence(confidence: number): void {
-  registry.histogram('ingest_mapping_confidence', BASE_LABELS, 1000).observe(confidence);
-}
-
-export function recordIngestDlqDepthDelta(delta: number): void {
-  if (delta > 0) ingestDlqDepthGauge.inc(delta);
-  else if (delta < 0) ingestDlqDepthGauge.dec(-delta);
-}
-
-// ---------------------------------------------------------------------------
 // Outbox Drainer Metrics (hub#1002)
 // ---------------------------------------------------------------------------
 //
@@ -528,55 +466,6 @@ export function recordSchedulerLeaderSkipped(): void {
 
 export function recordSchedulerLeaderError(): void {
   schedulerLeaderErrorsTotal.inc();
-}
-
-// ---------------------------------------------------------------------------
-// Ingest-engine leader-lock metrics (hub#1150)
-// ---------------------------------------------------------------------------
-//
-// Mirror of the scheduler_leader_* shape, but for the IngestEngine schedule
-// timer (src/ingest/engine.ts). The engine wraps DC's LeasedKVLock (long-
-// lived heartbeat lease) so it gets one extra observable event over the
-// per-tick scheduler lock: `onLeaseLost`, fired when a heartbeat renewal
-// fails after a successful claim. Without these counters a sick DDB or a
-// flapping network silently degrades ingest-sync firing to single-replica
-// behavior, with no log.warn at all (the engine's tickSchedule did not even
-// try/catch the start() call before this metric pass).
-const ingestLeaderAcquiredTotal = registry.counter(
-  'ingest_leader_acquired_total',
-  BASE_LABELS,
-  'IngestEngine tick attempts that won the DDB lease and ran evaluateSchedules.',
-);
-const ingestLeaderSkippedTotal = registry.counter(
-  'ingest_leader_skipped_total',
-  BASE_LABELS,
-  'IngestEngine tick attempts that yielded (another replica holds the lease).',
-);
-const ingestLeaderErrorsTotal = registry.counter(
-  'ingest_leader_errors_total',
-  BASE_LABELS,
-  'IngestEngine tick attempts where the lease store threw on start() (treated as non-leader).',
-);
-const ingestLeaderLeaseLostTotal = registry.counter(
-  'ingest_leader_lease_lost_total',
-  BASE_LABELS,
-  'IngestEngine leases lost mid-lifetime when LeasedKVLock heartbeat-renewal failed.',
-);
-
-export function recordIngestLeaderAcquired(): void {
-  ingestLeaderAcquiredTotal.inc();
-}
-
-export function recordIngestLeaderSkipped(): void {
-  ingestLeaderSkippedTotal.inc();
-}
-
-export function recordIngestLeaderError(): void {
-  ingestLeaderErrorsTotal.inc();
-}
-
-export function recordIngestLeaderLeaseLost(): void {
-  ingestLeaderLeaseLostTotal.inc();
 }
 
 // Renders the registry snapshot as Prometheus 0.0.4 text format.

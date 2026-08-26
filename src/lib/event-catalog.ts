@@ -246,41 +246,6 @@ catalog.declare({
   },
 });
 
-// `ingest:progress` is an envelope event carrying 10 distinct sub-shapes
-// discriminated by `payload.type`. The actual sub-type union is
-// IngestEvent in src/ingest/types.ts — keep this list in sync.
-// Phase P3.2 — exercises event-catalog Phase E3.6 discriminator validation.
-export const INGEST_PROGRESS_DISCRIMINATOR_VALUES = [
-  'sync.started',
-  'sync.file.fetched',
-  'item.status',
-  'item.mapped',
-  'item.materialized',
-  'item.pipeline.spawned',
-  'item.failed',
-  'item.review.triggered',
-  'sync.completed',
-  'source.status',
-] as const;
-
-catalog.declare({
-  name: 'ingest:progress',
-  transport: 'signal',
-  producer: 'platform-api',
-  description: 'Ingest pipeline progress event — envelope carrying 10 sub-shapes discriminated by payload.type.',
-  schema: {
-    type: 'object',
-    properties: {
-      type: { type: 'string', enum: [...INGEST_PROGRESS_DISCRIMINATOR_VALUES] },
-    },
-    required: ['type'],
-  },
-  discriminator: {
-    field: 'type',
-    values: [...INGEST_PROGRESS_DISCRIMINATOR_VALUES],
-  },
-});
-
 // ---------------------------------------------------------------------------
 // Durable event declarations (message-queue, at-least-once)
 // ---------------------------------------------------------------------------
@@ -454,40 +419,6 @@ catalog.declare({
     },
     required: ['runId'],
   },
-});
-
-// Phase 54.6.3 — `ingest:item.queued` is the durable handoff between the
-// ingest sync stage (file discovery) and the ingest processing stage
-// (mapping → materialization → pipeline trigger). The previous in-process
-// partition queue could only fan out within a single replica; the durable
-// queue lets any platform-api replica pick the item up. FIFO with
-// `partitionKey: sourceId` preserves per-source ordering through the queue.
-//
-// Tags are embedded in the payload so the consumer doesn't need an in-memory
-// tag cache from the producer replica.
-catalog.declare({
-  name: 'ingest:item.queued',
-  transport: 'durable',
-  producer: 'platform-api',
-  queue: 'ingest-items',
-  fifo: true,
-  partitionKey: (payload: unknown) => {
-    const p = payload as { sourceId?: string };
-    return p.sourceId ?? 'unknown';
-  },
-  retention: 7 * 24 * 60 * 60, // 7 days
-  dlqAfterAttempts: 3,
-  description: 'A newly synced ingest item is ready to be processed (mapped, materialized, pipeline-triggered). Replaces the in-memory partition queue.',
-  schema: {
-    type: 'object',
-    properties: {
-      ingestId: { type: 'string' },
-      sourceId: { type: 'string' },
-      tags: { type: 'array', items: { type: 'string' } },
-    },
-    required: ['ingestId', 'sourceId'],
-  },
-  tags: ['service:ingest', 'phase:54.6.3'],
 });
 
 // Hangout transcription pipeline — `transcription:job.queued` is the durable
@@ -749,7 +680,7 @@ export async function disconnectCatalog(): Promise<void> {
  * Compared to the prior direct-Redis bypass, the library hop adds:
  *   - Schema validation against the declared event (throws on bad
  *     payload); warns when the event is undeclared and continues.
- *   - Discriminator validation (used by `ingest:progress` sub-types).
+ *   - Discriminator validation for events declaring a discriminator.
  *   - Centralized envelope construction (the gateway's
  *     `channel_message` shape) + target-nodes lookup against the
  *     `websocket:channel:{channelId}:nodes` Redis set.

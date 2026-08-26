@@ -30,7 +30,6 @@ describe('deriveRouteGroup', () => {
     ['/api/rooms/abc-room/members', 'api_rooms'],
     ['/api/document-types/dt-1', 'api_document_types'],
     ['/api/typed-documents/bulk-import', 'api_typed_documents'],
-    ['/api/ingest/sources', 'api_ingest'],
     ['/api/capabilities', 'api_capabilities'],
     ['/api/something-new', 'api_other'],
     ['/openapi/pipelines.yaml', 'other'],

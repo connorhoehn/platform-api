@@ -142,7 +142,6 @@ describe('/internal/metrics endpoint', () => {
         const res = await rawRequest(server, 'GET', '/internal/metrics');
         expect(res.body).toContain('wsg_active_connections');
         expect(res.body).toContain('pipeline_triggers_total');
-        expect(res.body).toContain('ingest_items_total');
     });
 });
 

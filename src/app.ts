@@ -8,8 +8,6 @@ import { pipelineReadRateLimit } from './middleware/rateLimit';
 import healthRouter from './routes/health';
 import apiRouter from './routes/index';
 import { pipelineWebhooksRouter } from './routes/pipelineWebhooks';
-import { ingestWebhooksRouter } from './ingest/routes/ingestWebhooks';
-import { confluenceWebhookRouter } from './ingest/routes/ingestConfluenceWebhook';
 import { renderPrometheusText } from './observability/metrics';
 import { createCapabilitiesRouter } from './routes/capabilities';
 import { definitionsRepo } from './pipeline/definitions-repository';
@@ -99,16 +97,6 @@ export function createApp(): express.Application {
   // fire pipelines. Mounted BEFORE requireAuth because webhook callers don't
   // carry a Cognito JWT. See routes/pipelineWebhooks.ts.
   app.use('/hooks/pipeline', pipelineWebhooksRouter);
-
-  // Ingest webhooks — public endpoint for external sources to push change
-  // notifications. Mounted BEFORE requireAuth so external systems (S3, Drive,
-  // etc.) can call without a JWT. See ingest/routes/ingestWebhooks.ts.
-  app.use('/api/ingest/webhooks', ingestWebhooksRouter);
-
-  // Confluence webhook — Atlassian "page updated" callbacks land here and
-  // are normalized into the standard IngestEvent shape. Mount path matches
-  // the connector spec: /api/ingest/webhook/confluence/:sourceId.
-  app.use('/api/ingest/webhook/confluence', confluenceWebhookRouter);
 
   // LVS recording webhook — receives `recording.started` / `recording.completed`
   // from live-video-streaming, persists CallRecording rows. HMAC-protected via

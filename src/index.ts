@@ -19,10 +19,6 @@ import { docClient } from './lib/aws-clients';
 import log from './lib/logger';
 import { assertRequiredInProd } from 'distributed-core';
 import { createShutdownManager, drainHttpServer } from '@connorhoehn/service-runtime';
-import { CatalogIngestEventBus } from './ingest/catalog-event-bus';
-import { IngestEngine } from './ingest/engine';
-import { setIngestEngine } from './ingest/engine-singleton';
-import { createIngestTransport } from './ingest/transport';
 import { RetryManager } from 'distributed-core/transport';
 import { connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
 import { ensureOutboxTTL, ensureVideoSessionsTTL } from './lib/dynamo-setup';
@@ -286,59 +282,6 @@ void pipelineWiring.ready.then((bridge) => {
 });
 
 // ---------------------------------------------------------------------------
-// Ingest engine bootstrap — wires IngestEngine with catalog-backed event bus
-// so progress events flow to the gateway via event-catalog's signal transport
-// (Redis pub/sub under the hood). Non-fatal: routes return 503 if engine
-// isn't available.
-//
-// Wave2-PA-2: the producer/consumer handoff is now transport-pluggable via
-// `PLATFORM_API_INGEST_TRANSPORT` (default `memory`, optional `mq`). See
-// src/ingest/transport.ts for the rationale + restart-safety trade-offs.
-// ---------------------------------------------------------------------------
-
-let ingestShutdown: (() => Promise<void>) | null = null;
-
-(async () => {
-  try {
-    const { ingestSourceRepo, ingestItemRepo, syncCursorRepo } = await import('./ingest/repositories/index.js');
-    const { typedDocumentRepo } = await import('./repositories/index.js');
-
-    const eventBus = new CatalogIngestEventBus();
-    const transport = createIngestTransport();
-
-    const engine = new IngestEngine({
-      sourceRepository: ingestSourceRepo,
-      itemRepository: ingestItemRepo,
-      cursorRepository: syncCursorRepo,
-      documentRepository: typedDocumentRepo,
-      eventBus,
-      enqueueItem: transport.enqueueItem,
-    });
-
-    await engine.start();
-    setIngestEngine(engine);
-
-    const consumer = transport.startConsumer(engine);
-
-    ingestShutdown = async () => {
-      await consumer.stop();
-      await engine.stop();
-    };
-
-    log.info(
-      { transport: transport.mode },
-      'IngestEngine bootstrapped',
-    );
-  } catch (err: unknown) {
-    const e = err as { message?: string };
-    log.error(
-      { errMessage: e?.message },
-      'IngestEngine bootstrap FAILED — ingest routes will return 503',
-    );
-  }
-})();
-
-// ---------------------------------------------------------------------------
 // Pipeline definitions cache — Scan-backed, refreshed every 60s.
 //
 // Replaces the old write-through in-memory mirror. The schedule evaluator
@@ -497,9 +440,6 @@ sd.register('activity-consumer', async () => {
   if (callReactionConsumer) await callReactionConsumer.stop();
 });
 sd.register('outbox-drainer', () => { drainer.stop(); });
-sd.register('ingest', async () => {
-  if (ingestShutdown) await ingestShutdown();
-});
 sd.register('pipeline', async () => {
   if (pipelineShutdown) await pipelineShutdown();
 });

@@ -1,6 +1,6 @@
 # platform-api
 
-Application platform API — manages users, documents, pipelines, ingest/ETL, social features, and video sessions. Extracted from websocket-gateway/social-api into a standalone Express TypeScript service (port 3001).
+Application platform API — manages users, documents, pipelines, social features, and video sessions. Extracted from websocket-gateway/social-api into a standalone Express TypeScript service (port 3001).
 
 ## Architecture
 
@@ -62,7 +62,6 @@ npm run dev
 | `DDB_TABLE_PREFIX` | Table name prefix for shared DDB | (none) |
 | `PIPELINE_RUN_PERSISTENCE_ENABLED` | Persist pipeline runs to DDB | `true` |
 | `PIPELINE_DLQ_PERSISTENCE_ENABLED` | Persist DLQ entries to DDB | `true` |
-| `PLATFORM_API_INGEST_TRANSPORT` | Ingest item handoff transport: `memory` (in-process FIFO per sourceId; lost on restart) or `mq` (durable via message-queue; survives restart, multi-replica safe). See `src/ingest/transport.ts`. | `memory` |
 
 ## Service Domains
 
@@ -71,9 +70,6 @@ Typed document CRUD, sections, section items, reviews, approvals, comments, impo
 
 ### Pipelines
 Distributed pipeline orchestration via `distributed-core` PipelineModule. Supports triggers, scheduling (cron), approvals, breakpoints, replay, retry, resume, DLQ, LLM streaming, cost tracking, and audit logging. Multiple LLM backends (Anthropic direct, Bedrock, Claude Code).
-
-### Ingest / ETL
-Source-adapter framework for ingesting content from external systems (Google Drive, Confluence, Jira, S3). Includes mapping rules, type generation, materialization, dead-letter queue, conflict resolution, audit trail, and webhook receivers for push-based sync.
 
 ### Social
 Rooms, posts, comments, likes, reactions, activity feeds, groups, group membership, profiles. Real-time updates broadcast to websocket-gateway via Redis.
@@ -86,7 +82,6 @@ Composes live-video-streaming primitives (channels + participant tokens) into ap
 | Channel Pattern | Publisher | Description |
 |----------------|-----------|-------------|
 | `dcore:topic:pipeline.events.*` | Pipeline module | Pipeline lifecycle (run started, step complete, failed, etc.) |
-| `ingest:events` | Ingest engine | Ingest progress (item fetched, mapped, materialized, failed) |
 | `social:post`, `social:comment`, `social:like`, `social:member_joined`, `social:member_left` | Social routes | Social activity events |
 | `doc:comment_added`, `doc:comment_resolved`, `doc:comment_deleted` | Document routes | Document collaboration events |
 | `websocket:route:{channelId}` | BroadcastService | Targeted delivery to gateway nodes with subscribed clients |
@@ -102,8 +97,6 @@ All authenticated routes require a valid Cognito JWT (or `SKIP_AUTH=true` for lo
 | GET | `/health` | Health check |
 | GET | `/internal/metrics` | Prometheus metrics |
 | POST | `/hooks/pipeline/:webhookId` | External webhook pipeline triggers |
-| POST | `/api/ingest/webhooks` | External ingest push notifications |
-| POST | `/api/ingest/webhook/confluence/:sourceId` | Confluence page-updated callbacks |
 
 ### Documents (`/api/documents`)
 
@@ -143,21 +136,6 @@ All authenticated routes require a valid Cognito JWT (or `SKIP_AUTH=true` for lo
 | GET | `/api/pipelines/:id/cost` | Per-pipeline cost aggregation |
 | POST | `/api/pipelines/:runId/cancel` | Cancel a run |
 | POST | `/api/pipelines/:runId/approvals` | Approve/reject gate |
-
-### Ingest (`/api/ingest`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| * | `/api/ingest/sources` | Ingest source CRUD |
-| GET | `/api/ingest/sources/:id/metrics` | Per-source SLO metrics |
-| * | `/api/ingest/items` | Ingested item tracking |
-| * | `/api/ingest/mapping` | Mapping rule management |
-| * | `/api/ingest/mapping/proposals` | DocType proposals |
-| * | `/api/ingest/templates` | Pipeline templates |
-| * | `/api/ingest/dlq` | Ingest dead-letter queue |
-| GET | `/api/ingest/audit` | Ingest audit log |
-| * | `/api/sync/conflicts` | Write-back conflict queue |
-| POST | `/api/ingest/dev/seed` | Dev-only seed data |
 
 ### Social (`/api`)
 

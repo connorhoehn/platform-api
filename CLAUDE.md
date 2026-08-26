@@ -11,13 +11,12 @@ docs and commit history are historical breadcrumbs, not live tickets.
 Current state and open work live in this repo (constitution/roadmap/CHANGELOG).
 
 Application platform API service. Manages users, content, documents,
-pipelines, ingest/ETL, social features, and live video sessions. Sits
+pipelines, social features, and live video sessions. Sits
 behind identity-server for authentication.
 
 **Read `.agent/CONSTITUTION.md` first** — agent's north star and
 backlog priorities. Read `ROADMAP.md` for Phase P1–P7 progression
-(M1 event-catalog adoption, M2 ingest durable-backbone flip, M4
-pipeline-worker extraction).
+(M1 event-catalog adoption, M4 pipeline-worker extraction).
 
 ## Architecture
 
@@ -45,7 +44,6 @@ pipeline-worker extraction).
 | Channel | Data |
 |---------|------|
 | `dcore:topic:pipeline.events.*` | Pipeline lifecycle events |
-| `ingest:events` | Ingest progress events |
 
 ## Dependencies
 

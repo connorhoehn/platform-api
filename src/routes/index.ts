@@ -56,16 +56,6 @@ import { pipelinePreviewVisionRouter } from './pipeline-preview-vision';
 import { documentTypesRouter } from './documentTypes';
 import { typedDocumentsRouter } from './typedDocuments';
 import { approvalsRouter } from './approvals';
-import { ingestSourcesRouter } from '../ingest/routes/ingestSources';
-import { ingestItemsRouter } from '../ingest/routes/ingestItems';
-import { ingestMappingRouter } from '../ingest/routes/ingestMapping';
-import { ingestTemplatesRouter } from '../ingest/routes/ingestTemplates';
-import { ingestDevSeedRouter } from '../ingest/routes/ingestDevSeed';
-import { ingestDLQRouter } from '../ingest/routes/ingestDLQ';
-import { ingestSourceMetricsRouter } from '../ingest/routes/ingestSourceMetrics';
-import { ingestConflictsRouter } from '../ingest/routes/ingestConflicts';
-import { ingestProposalsRouter } from '../ingest/routes/ingestProposals';
-import { ingestAuditRouter } from '../ingest/routes/ingestAudit';
 
 // Module-shaped pipeline router (Phase A of the distributed-core absorption
 // — see .planning/HANDOFF-distributed-core-platform-api-absorption.md). Lives
@@ -286,25 +276,5 @@ router.use('/typed-documents', typedDocumentsRouter);
 // Phase 51 / hub#62 — append-only approval log mirrored from the
 // decisions renderer into the approval-workflows DDB table.
 router.use('/approvals', approvalsRouter);
-
-// Ingest subsystem — source management, item tracking, mapping preview, templates.
-router.use('/ingest/sources', ingestSourcesRouter);
-router.use('/ingest/items', ingestItemsRouter);
-router.use('/ingest/mapping', ingestMappingRouter);
-router.use('/ingest/templates', ingestTemplatesRouter);
-// Dev-only — gated to non-prod inside the handler. AGENTIC_ETL_VISION slice J.
-router.use('/ingest/dev', ingestDevSeedRouter);
-// Dead-letter queue inspection + replay. AGENTIC_ETL_VISION slice I.
-router.use('/ingest/dlq', ingestDLQRouter);
-// Per-source SLO panel data — latency / error rate / queue depth.
-// Mounted as a nested router so the :id param threads through.
-router.use('/ingest/sources/:id/metrics', ingestSourceMetricsRouter);
-// Write-back conflict queue. Stub-only until slice F lands; persists
-// resolutions in-memory so the Resolved tab is exercisable.
-router.use('/sync/conflicts', ingestConflictsRouter);
-// DocType proposal queue (Phase 2 / Vision §B Tier 3).
-router.use('/ingest/mapping/proposals', ingestProposalsRouter);
-// Audit log read endpoint — slice 2/3 of hub#2190 (hub#2214).
-router.use('/ingest/audit', ingestAuditRouter);
 
 export default router;

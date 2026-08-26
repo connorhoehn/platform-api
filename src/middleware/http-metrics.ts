@@ -44,7 +44,6 @@ export function deriveRouteGroup(url: string): string {
   if (path.startsWith('/api/rooms')) return 'api_rooms';
   if (path.startsWith('/api/document-types')) return 'api_document_types';
   if (path.startsWith('/api/typed-documents')) return 'api_typed_documents';
-  if (path.startsWith('/api/ingest')) return 'api_ingest';
   if (path.startsWith('/api/capabilities')) return 'api_capabilities';
   if (path.startsWith('/api/')) return 'api_other';
   return 'other';

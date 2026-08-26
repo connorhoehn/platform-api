@@ -17,7 +17,7 @@ Current state and open work live in this repo (constitution/roadmap/CHANGELOG).
 ## Mission
 
 The application platform API — HTTP CRUD over the durable model (users, content,
-documents, typed documents, pipelines, ingest/ETL, social, video sessions).
+documents, typed documents, pipelines, social, video sessions).
 Owns the outbox path for durable event publishing; embeds the
 `distributed-core` PipelineModule for in-process pipeline execution today.
 
@@ -59,12 +59,6 @@ are explicitly slated for extraction at scale:
   a process with HTTP routes (200ms p99 budget). Extract to a separate
   deployable when M4's trigger fires (HTTP p99 incidents observed under
   pipeline load, OR multi-node executor required for crash isolation).
-
-- **Ingest engine source-of-truth → message-queue** (M2 milestone). Today
-  `src/ingest/bootstrap.ts` uses an in-process `InMemoryBatchedQueue`; items
-  arriving moments before a crash are lost. Flip the source-of-truth to
-  message-queue (POST to `/api/v1/queues/ingest-items/messages`); the
-  in-process queue stays as a batching buffer. Crash-isolation win.
 
 These are described in `ROADMAP.md`. Do not pre-build for them.
 
@@ -135,17 +129,12 @@ criteria" below.
    hand-rolls the `{type:'channel_message', channel, message, ...}` envelope;
    gateway parses it. Replace with import from `@connorhoehn/event-catalog`
    once that ship.
-3. **Discriminator declaration for `ingest:progress`** (depends on event-catalog
-   Phase E3.6). Today the envelope carries 10 sub-types via `payload.type`
-   (`src/ingest/types.ts:253-262`); the registry sees one schema. Declare
-   `discriminator: { field: 'type', values: [...] }` to enable per-sub-type
-   validation.
-4. **Reconcile `pipeline.run.completed` dual-source.** Today distributed-core's
+3. **Reconcile `pipeline.run.completed` dual-source.** Today distributed-core's
    `PipelineExecutor` emits the event AND `src/pipeline/bootstrap.ts:745`
    re-publishes it durably with a different payload. Pick one canonical
    source; the other becomes a consumer. Coordinate with distributed-core
    agent if the executor side needs to change.
-5. **`platform-api/.agent/CONSTITUTION.md` first review at 5 done events.**
+4. **`platform-api/.agent/CONSTITUTION.md` first review at 5 done events.**
    Re-read this file + last 5 done summaries; propose edits via handoff if
    the document drifts from reality.
 
@@ -188,8 +177,6 @@ A self-driven task is **not** worth claiming if it:
 **Good user-impact statements:**
 - "Schedule pipelines can now run with 2 replicas of platform-api without
   duplicate firings — the leader election handles failover transparently."
-- "Ingest events from a partial-crash scenario survive because message-queue
-  is the source of truth, not the in-process buffer."
 
 **Bad user-impact statements (REJECTED):**
 - "Adopts T1 envelope shared type." (Names the type, not the capability.)
@@ -198,7 +185,7 @@ A self-driven task is **not** worth claiming if it:
 ## Affected consumers
 
 - **websocket-gateway** — subscribes to platform-api's Redis pub/sub channels
-  (`websocket:route:{channelId}`, `dcore:topic:pipeline.events.*`, `ingest:events`,
+  (`websocket:route:{channelId}`, `dcore:topic:pipeline.events.*`,
   `social:*`, `doc:*`). Any envelope-shape change requires a coordinated
   bump.
 - **frontend SPA (inside websocket-gateway repo)** — consumes ~180 HTTP

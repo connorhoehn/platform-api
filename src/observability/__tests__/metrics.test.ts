@@ -19,11 +19,6 @@ import {
   getQueueMetrics,
   incrementBusDeadLetter,
   ALLOWED_QUEUE_NAMES,
-  recordIngestDlqDepthDelta,
-  recordIngestItem,
-  recordIngestMappingConfidence,
-  recordIngestQueueDepthDelta,
-  recordIngestSyncDuration,
   recordLLMTokens,
   recordMessage,
   recordOutboxLeaseAcquired,
@@ -46,10 +41,6 @@ import {
   recordSchedulerLeaderAcquired,
   recordSchedulerLeaderError,
   recordSchedulerLeaderSkipped,
-  recordIngestLeaderAcquired,
-  recordIngestLeaderSkipped,
-  recordIngestLeaderError,
-  recordIngestLeaderLeaseLost,
   recordTypedDocumentBulkImported,
   recordTypedDocumentCreated,
   recordTypedDocumentValidationError,
@@ -448,86 +439,6 @@ describe('recordAuditWriteLatency', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Ingest subsystem metrics
-// ---------------------------------------------------------------------------
-
-describe('recordIngestItem', () => {
-  it('increments ingest_items_total with the given status label', () => {
-    recordIngestItem('done');
-    const { metrics } = getRegistry().getSnapshot();
-    expect(counterValue(metrics, 'ingest_items_total', { status: 'done' })).toBe(1);
-  });
-
-  it('different statuses produce independent counters', () => {
-    recordIngestItem('done');
-    recordIngestItem('failed');
-    recordIngestItem('failed');
-    const { metrics } = getRegistry().getSnapshot();
-    expect(counterValue(metrics, 'ingest_items_total', { status: 'done' })).toBe(1);
-    expect(counterValue(metrics, 'ingest_items_total', { status: 'failed' })).toBe(2);
-  });
-});
-
-describe('recordIngestSyncDuration', () => {
-  it('records observation in ingest_sync_duration_seconds', () => {
-    recordIngestSyncDuration(2.5);
-    const { metrics } = getRegistry().getSnapshot();
-    const m = metrics.find((s) => s.name === 'ingest_sync_duration_seconds');
-    expect(m).toBeDefined();
-    const snap = m!.value as { count: number; sum: number };
-    expect(snap.count).toBe(1);
-    expect(snap.sum).toBeCloseTo(2.5);
-  });
-});
-
-describe('recordIngestQueueDepthDelta', () => {
-  it('+delta increments ingest_queue_depth', () => {
-    recordIngestQueueDepthDelta(3);
-    expect(gaugeValue(getRegistry().getSnapshot().metrics, 'ingest_queue_depth')).toBe(3);
-  });
-
-  it('-delta decrements ingest_queue_depth', () => {
-    recordIngestQueueDepthDelta(3);
-    recordIngestQueueDepthDelta(-1);
-    expect(gaugeValue(getRegistry().getSnapshot().metrics, 'ingest_queue_depth')).toBe(2);
-  });
-
-  it('0 delta is a no-op', () => {
-    recordIngestQueueDepthDelta(0);
-    expect(gaugeValue(getRegistry().getSnapshot().metrics, 'ingest_queue_depth')).toBe(0);
-  });
-});
-
-describe('recordIngestMappingConfidence', () => {
-  it('records confidence observation in ingest_mapping_confidence', () => {
-    recordIngestMappingConfidence(0.85);
-    const { metrics } = getRegistry().getSnapshot();
-    const m = metrics.find((s) => s.name === 'ingest_mapping_confidence');
-    expect(m).toBeDefined();
-    const snap = m!.value as { count: number; sum: number };
-    expect(snap.count).toBe(1);
-    expect(snap.sum).toBeCloseTo(0.85);
-  });
-});
-
-describe('recordIngestDlqDepthDelta', () => {
-  it('+delta increments ingest_dlq_depth', () => {
-    recordIngestDlqDepthDelta(2);
-    expect(gaugeValue(getRegistry().getSnapshot().metrics, 'ingest_dlq_depth')).toBe(2);
-  });
-
-  it('-delta decrements ingest_dlq_depth', () => {
-    recordIngestDlqDepthDelta(2);
-    recordIngestDlqDepthDelta(-2);
-    expect(gaugeValue(getRegistry().getSnapshot().metrics, 'ingest_dlq_depth')).toBe(0);
-  });
-
-  it('0 delta is a no-op', () => {
-    recordIngestDlqDepthDelta(0);
-    expect(gaugeValue(getRegistry().getSnapshot().metrics, 'ingest_dlq_depth')).toBe(0);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // renderPrometheusText
@@ -540,7 +451,6 @@ describe('renderPrometheusText', () => {
     expect(text.length).toBeGreaterThan(0);
     expect(text).toContain('wsg_active_connections');
     expect(text).toContain('pipeline_triggers_total');
-    expect(text).toContain('ingest_items_total');
   });
 });
 
@@ -636,53 +546,6 @@ describe('scheduler leader-lock metrics', () => {
     expect(text).toContain('scheduler_leader_acquired_total');
     expect(text).toContain('scheduler_leader_skipped_total');
     expect(text).toContain('scheduler_leader_errors_total');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Ingest-engine leader-lock metrics (hub#1150)
-// ---------------------------------------------------------------------------
-
-describe('ingest-engine leader-lock metrics', () => {
-  it('recordIngestLeaderAcquired increments ingest_leader_acquired_total', () => {
-    recordIngestLeaderAcquired();
-    recordIngestLeaderAcquired();
-    expect(
-      counterValue(getRegistry().getSnapshot().metrics, 'ingest_leader_acquired_total'),
-    ).toBe(2);
-  });
-
-  it('recordIngestLeaderSkipped increments ingest_leader_skipped_total', () => {
-    recordIngestLeaderSkipped();
-    expect(
-      counterValue(getRegistry().getSnapshot().metrics, 'ingest_leader_skipped_total'),
-    ).toBe(1);
-  });
-
-  it('recordIngestLeaderError increments ingest_leader_errors_total', () => {
-    recordIngestLeaderError();
-    expect(
-      counterValue(getRegistry().getSnapshot().metrics, 'ingest_leader_errors_total'),
-    ).toBe(1);
-  });
-
-  it('recordIngestLeaderLeaseLost increments ingest_leader_lease_lost_total', () => {
-    recordIngestLeaderLeaseLost();
-    expect(
-      counterValue(getRegistry().getSnapshot().metrics, 'ingest_leader_lease_lost_total'),
-    ).toBe(1);
-  });
-
-  it('renderPrometheusText includes all 4 ingest_leader_* series', () => {
-    recordIngestLeaderAcquired();
-    recordIngestLeaderSkipped();
-    recordIngestLeaderError();
-    recordIngestLeaderLeaseLost();
-    const text = renderPrometheusText();
-    expect(text).toContain('ingest_leader_acquired_total');
-    expect(text).toContain('ingest_leader_skipped_total');
-    expect(text).toContain('ingest_leader_errors_total');
-    expect(text).toContain('ingest_leader_lease_lost_total');
   });
 });
 

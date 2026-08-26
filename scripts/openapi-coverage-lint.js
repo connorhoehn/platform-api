@@ -86,23 +86,6 @@ const PREFIXES = {
       { file: 'hangoutRooms.ts', routers: { hangoutRoomsRouter: '/rooms' } },
     ],
   },
-  ingest: {
-    yaml: 'ingest.yaml',
-    // Ingest router files live under src/ingest/routes/, not src/routes/.
-    routeDir: path.join(__dirname, '..', 'src/ingest/routes'),
-    files: [
-      { file: 'ingestSources.ts', routers: { ingestSourcesRouter: '/ingest/sources' } },
-      { file: 'ingestItems.ts', routers: { ingestItemsRouter: '/ingest/items' } },
-      { file: 'ingestMapping.ts', routers: { ingestMappingRouter: '/ingest/mapping' } },
-      { file: 'ingestTemplates.ts', routers: { ingestTemplatesRouter: '/ingest/templates' } },
-      { file: 'ingestDevSeed.ts', routers: { ingestDevSeedRouter: '/ingest/dev' } },
-      { file: 'ingestDLQ.ts', routers: { ingestDLQRouter: '/ingest/dlq' } },
-      { file: 'ingestSourceMetrics.ts', routers: { ingestSourceMetricsRouter: '/ingest/sources/{id}/metrics' } },
-      { file: 'ingestConflicts.ts', routers: { ingestConflictsRouter: '/sync/conflicts' } },
-      { file: 'ingestProposals.ts', routers: { ingestProposalsRouter: '/ingest/mapping/proposals' } },
-      { file: 'ingestAudit.ts', routers: { ingestAuditRouter: '/ingest/audit' } },
-    ],
-  },
 };
 
 const ROUTE_RE = /\b(\w+Router)\.(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`]/gm;

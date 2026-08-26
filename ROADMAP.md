@@ -7,7 +7,7 @@
 ## Charter (one paragraph)
 
 The application platform API. Owns HTTP CRUD over all business state
-(documents, typed documents, pipelines, ingest/ETL, social, video sessions)
+(documents, typed documents, pipelines, social, video sessions)
 backed by DynamoDB. Owns the **outbox path** — durable events are written
 atomically alongside state mutations and drained to `message-queue` for
 at-least-once delivery. Embeds the `distributed-core` PipelineModule for
@@ -24,7 +24,6 @@ Two of today's responsibilities are extraction candidates at scale:
 | Today | Future | Milestone | Trigger |
 |---|---|---|---|
 | Embeds pipeline executor (Raft SM, in-process Cluster) | `pipeline-worker` (separate deployable) | M4 | HTTP p99 incidents under pipeline load, OR multi-node executor for crash isolation |
-| In-process `InMemoryBatchedQueue` is ingest source-of-truth | `message-queue` is source-of-truth, in-process queue is just a batching buffer | M2 | Crash-isolation requirement OR multi-replica platform-api needed |
 
 **Do not pre-build these splits.** Wait for trigger.
 
@@ -39,8 +38,6 @@ What's working:
   conditional lease — already multi-node safe.
 - ✅ Distributed-core PipelineModule embedded for pipeline execution
   (`src/pipeline/bootstrap.ts`).
-- ✅ Ingest engine with adapter framework (Google Drive, Confluence, Jira, S3),
-  mapping pipeline, materialization (`src/ingest/`).
 - ✅ Video session composition over live-video-streaming primitives.
 - ✅ Cognito JWT auth with SKIP_AUTH bypass for local dev (`src/middleware/auth.ts`).
 - ✅ Schedule evaluator for cron-triggered pipelines.
@@ -53,9 +50,6 @@ What's not:
 - ⚠ Schedule evaluator (`src/services/scheduleEvaluator.ts:158`) is a
   process-singleton `setInterval`; 2 replicas would fire each cron pipeline
   twice. **The single biggest blocker to running platform-api 2-replica.**
-- ⚠ Ingest engine (`src/ingest/engine.ts:75-103`) is a process-singleton
-  with per-source partition workers; multiple engines don't coordinate
-  partition assignments. Items in the in-process queue at crash time are lost.
 - ⚠ `publishSignal()` in `src/lib/event-catalog.ts:430` bypasses the event-
   catalog library and writes directly to Redis — schemas aren't validated on
   the WS-bound path.
@@ -69,7 +63,7 @@ What's not:
   polls DDB every 60s; webhook lookup is per-replica. Newly-created pipelines
   take up to 60s to propagate across replicas.
 - ⚠ OpenAPI spec at `openapi/pipelines.yaml` covers only pipelines (not
-  documents, social, ingest, video). Incomplete.
+  documents, social, video). Incomplete.
 
 ## Roadmap
 
@@ -120,10 +114,6 @@ Depends on event-catalog Phases E2.1 (envelope shared type), E3 (transport:
 - [ ] **P3.1 — Import shared `channel_message` envelope.** Replace inline
   construction at `src/lib/event-catalog.ts:443` with import from
   `@connorhoehn/event-catalog`. Add unit test that round-trips through Redis.
-- [ ] **P3.2 — Declare ingest sub-types via discriminator.** Today
-  `ingest:progress` carries 10 sub-shapes via `payload.type`. Declare
-  `discriminator: { field: 'type', values: ['sync.started', 'item.failed', ...] }`.
-  Wires into event-catalog Phase E3.6 validation.
 - [ ] **P3.3 — Reconcile `pipeline.run.completed`.** Coordinate with
   distributed-core agent: either the PipelineExecutor stops dual-emitting
   AND platform-api stays the durable producer, OR they get a shared
@@ -142,36 +132,6 @@ Depends on event-catalog Phases E2.1 (envelope shared type), E3 (transport:
   full set of platform-api-declared events.
 - Strict-mode compat checking is on in prod for ≥1 week with zero violations.
 - `grep -r 'channel_message' src/` finds only imports.
-
-### Phase P4 — M2 assist: ingest source-of-truth flips to message-queue (3 weeks)
-
-**Goal:** Ingest survives a partial crash. Items in-flight at crash time
-are not lost.
-
-Depends on message-queue Phase 2 (cluster stable) and event-catalog Phase E3
-(`queue` field on declaration).
-
-- [ ] **P4.1 — Declare `ingest.item.queued` and `ingest.item.materialized`
-  as durable events.** Per-queue config: FIFO, retention 7 days, DLQ after
-  3 attempts.
-- [ ] **P4.2 — Producer side: replace direct `engine.enqueue(item)` with
-  durable publish.** Sources write to message-queue; the in-process engine
-  reads from the queue instead of the in-process buffer.
-- [ ] **P4.3 — In-process queue becomes a batching buffer only.** Items
-  drained from message-queue land in the in-process queue for batching,
-  but DDB-write completion acks the message-queue receipt. Crash before
-  ack → message-queue re-delivers.
-- [ ] **P4.4 — Migration: ingest a backlog from in-process to message-queue.**
-  At deploy time, drain the in-process queue first, then start consuming
-  from message-queue. One-shot script.
-- [ ] **P4.5 — Integration test for partial-crash scenario.** Send 100
-  items; kill platform-api mid-batch; verify all 100 are processed after
-  restart with no duplicates.
-
-**Success criteria:**
-- Killing platform-api with 50 items in-flight loses zero items.
-- Replaying via message-queue's redrive endpoint reprocesses any items
-  that hit DLQ.
 
 ### Phase P5 — Video session events become durable (2 weeks)
 
@@ -239,7 +199,7 @@ LVS agent — **coordinate via handoff**).
 
 **Goal:** Generate documentation + SDK-friendly spec for the full HTTP surface.
 
-- [ ] **P7.1 — Extend `openapi/` to cover documents, social, ingest, video
+- [ ] **P7.1 — Extend `openapi/` to cover documents, social, video
   domains.** Today only pipelines.yaml exists.
 - [ ] **P7.2 — Auto-generate from route declarations.** Use a route-decoration
   pattern (express-openapi-validator or similar) so spec doesn't drift from
