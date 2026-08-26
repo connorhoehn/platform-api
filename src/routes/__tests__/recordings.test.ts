@@ -255,3 +255,85 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
     expect(mockCallSfu).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// The detail response is the only place `tracks[]` is served, and LVS stamps
+// each track with the recorder pod's absolute path — in local dev, literally
+// `file:///Users/<developer>/Projects/...`. Unusable by a browser, and a
+// filesystem-layout leak to every authenticated caller.
+//
+// Same response also re-derives people, so rows written before the webhook
+// fix don't keep rendering rejoin counts on the detail card.
+// ---------------------------------------------------------------------------
+describe('GET /api/recordings/:recordingId — what leaves the process', () => {
+  /** Trimmed from the real row 2026-08-26T02-35-09-652Z-546cf1e9. */
+  const leakyDetail = {
+    recordingId: 'r-1',
+    callId: 'c-1',
+    channelArn: 'arn:local:ivs:channel/fe74b6a1',
+    lobbyName: 'dm:dev-bob:dev-hank',
+    startedAt: '2026-08-26T02:35:09.768Z',
+    endedAt: '2026-08-26T02:35:28.215Z',
+    durationMs: 8_318,
+    sessionDurationMs: 18_447,
+    startedBy: 'dev-hank',
+    participants: [
+      { userId: 'dev-bob', displayName: 'Bob Martinez', joinedAt: '2026-08-26T02:34:49.825Z' },
+      { userId: 'dev-bob', displayName: 'Bob Martinez', joinedAt: '2026-08-26T02:35:10.000Z' },
+    ],
+    tracks: [
+      {
+        legId: 'leg-001',
+        participantId: 'a937dfa9-aeb8-5366-a90b-6d5599ba1239',
+        file: '/Users/connorhoehn/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
+        key: 'arn_local_ivs_channel_fe74b6a1/2026-08-26T02-35-09-652Z-546cf1e9/peer_leg-001.mp4',
+        url: 'file:///Users/connorhoehn/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
+        size: 796,
+        kind: 'av',
+      },
+    ],
+  };
+
+  it('no file:// URI and no developer home directory anywhere in the response', async () => {
+    mockListByUser.mockResolvedValue({ items: [{ recordingId: 'r-1', callId: 'c-1' }] });
+    mockGetRecording.mockResolvedValue(leakyDetail);
+
+    const res = await run('GET', '/api/recordings/r-1');
+    expect(res.statusCode).toBe(200);
+
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain('file://');
+    expect(serialized).not.toContain('/Users/');
+    expect(serialized).not.toContain('.tilt-lvs-recordings');
+  });
+
+  it('tracks[] carry the same proxied /segments/ URL shape as the composed file', async () => {
+    mockListByUser.mockResolvedValue({ items: [{ recordingId: 'r-1', callId: 'c-1' }] });
+    mockGetRecording.mockResolvedValue(leakyDetail);
+
+    const res = await run('GET', '/api/recordings/r-1');
+    const track = (res.body as { tracks: Array<Record<string, unknown>> }).tracks[0]!;
+    expect(track.url).toBe(
+      'https://public.video.test/api/channels/'
+      + encodeURIComponent('arn:local:ivs:channel/fe74b6a1')
+      + '/recordings/r-1/segments/peer_leg-001.mp4',
+    );
+    expect(track).not.toHaveProperty('file');
+    // Everything else the downloads list needs survives.
+    expect(track.legId).toBe('leg-001');
+    expect(track.size).toBe(796);
+  });
+
+  it('participants are deduped and include the initiator', async () => {
+    mockListByUser.mockResolvedValue({ items: [{ recordingId: 'r-1', callId: 'c-1' }] });
+    mockGetRecording.mockResolvedValue(leakyDetail);
+
+    const res = await run('GET', '/api/recordings/r-1');
+    const body = res.body as {
+      participants: Array<{ userId: string }>;
+      participantCount: number;
+    };
+    expect(body.participants.map((p) => p.userId).sort()).toEqual(['dev-bob', 'dev-hank']);
+    expect(body.participantCount).toBe(2);
+  });
+});

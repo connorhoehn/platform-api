@@ -10,7 +10,12 @@
 // the RoomAdminPage "View recordings" link. v1 is a Scan + FilterExpression
 // since lobbyName has no GSI yet; we cap at 100 rows per page.
 
-import { DynamoDBDocumentClient, PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  DynamoDBDocumentClient,
+  PutCommand,
+  ScanCommand,
+  DeleteCommand,
+} from '@aws-sdk/lib-dynamodb';
 import { CallRecordingRepository } from '../CallRecordingRepository';
 
 jest.mock('../../lib/ddb-table-name', () => ({
@@ -311,6 +316,15 @@ describe('CallRecordingRepository.listByLobbyName', () => {
       channelArn: 'arn:x',
       lobbyName: 'room:lounge',
       thumbnailUrl: 'http://thumb/1.png',
+      // Shape grew: the row now also carries the raw session lifetime and
+      // the re-derived people list. Both are `undefined` for this fixture
+      // (no tracks, no roster) — asserted explicitly rather than relaxed to
+      // toMatchObject, so an accidental `participantCount: 0` or a leaked
+      // extra field still fails here.
+      composedUrl: undefined,
+      sessionDurationMs: undefined,
+      participantCount: undefined,
+      participants: undefined,
     });
     expect(out.cursor).toBeDefined();
     const decoded = JSON.parse(Buffer.from(out.cursor!, 'base64').toString('utf8'));
@@ -363,5 +377,203 @@ describe('CallRecordingRepository.listByLobbyName', () => {
       .map((c) => c[0])
       .find((cmd) => cmd instanceof ScanCommand) as ScanCommand | undefined;
     expect(scan?.input.ExclusiveStartKey).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FINDING 2 — the person who STARTS a call never got their own recording.
+//
+// The fan-out set used to be "participants[], or startedBy ONLY IF
+// participants[] is empty". That reads like a sensible fallback and is in
+// fact the bug: `participants[]` is the SFU's LIVE roster at
+// recording-complete time, so on a real DM the caller has already hung up
+// and only the callee is in it — non-empty, so the startedBy fallback never
+// fired, so the caller got no index row and the recording was permanently
+// invisible to them in GET /api/recordings.
+//
+// Measured on live data 2026-08-25: 37 of 200 recordings (18%) had no
+// fan-out row for their own startedBy. ALL 37 had a non-empty
+// participants[].
+// ---------------------------------------------------------------------------
+describe('CallRecordingRepository.putRecording — initiator fan-out (FINDING 2)', () => {
+  /** The real 22s hank→bob DM: good media, roster held the callee only. */
+  const hankRingsBob = {
+    callId: 'call-dm-1',
+    recordingId: '2026-08-26T02-23-24-593Z-0d14eca7',
+    channelArn: 'arn:local:ivs:channel/abc',
+    lobbyName: 'dm:dev-bob:dev-hank',
+    sessionId: 'sess-dm-1',
+    startedAt: '2026-08-26T02:23:24.679Z',
+    endedAt: '2026-08-26T02:23:42.558Z',
+    durationMs: 21_800,
+    totalBytes: 4096,
+    segments: [],
+    destination: 'local' as const,
+    // NON-EMPTY, and missing the caller. This is the shape the old
+    // empty-only fallback could not see.
+    participants: [{ userId: 'dev-bob', displayName: 'Bob Martinez' }],
+    startedBy: 'dev-hank',
+  };
+
+  function fanoutRows(): PutCommand[] {
+    return mockSend.mock.calls
+      .map((c) => c[0])
+      .filter(
+        (cmd) =>
+          cmd instanceof PutCommand &&
+          cmd.input.TableName === 'test-video-call-recording-participants',
+      ) as PutCommand[];
+  }
+
+  test('non-empty participants[] WITHOUT startedBy still fans out to the initiator', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    await repo.putRecording(hankRingsBob);
+
+    const userIds = fanoutRows().map((p) => p.input.Item!.userId).sort();
+    expect(userIds).toEqual(['dev-bob', 'dev-hank']);
+  });
+
+  test('the initiator row is a complete row, not a stub', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    await repo.putRecording(hankRingsBob);
+
+    const hank = fanoutRows().find((p) => p.input.Item!.userId === 'dev-hank');
+    expect(hank).toBeDefined();
+    const item = hank!.input.Item!;
+    expect(item.recordingId).toBe(hankRingsBob.recordingId);
+    expect(item.callId).toBe('call-dm-1');
+    expect(item.lobbyName).toBe('dm:dev-bob:dev-hank');
+    expect(item.startedAtRecordingId).toBe(
+      `${hankRingsBob.startedAt}#${hankRingsBob.recordingId}`,
+    );
+  });
+
+  test('startedBy already in participants[] does NOT produce a duplicate row', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    await repo.putRecording({
+      ...hankRingsBob,
+      participants: [
+        { userId: 'dev-bob' },
+        { userId: 'dev-hank' },
+      ],
+    });
+    expect(fanoutRows()).toHaveLength(2);
+  });
+
+  test('delete removes the initiator row it wrote — no stranded index row', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    // getRecording → the stored row; the deletes that follow are what we assert on.
+    mockSend.mockResolvedValueOnce({ Item: hankRingsBob });
+
+    await repo.deleteRecording('call-dm-1', hankRingsBob.recordingId);
+
+    const deletedUserIds = mockSend.mock.calls
+      .map((c) => c[0])
+      .filter(
+        (cmd) =>
+          cmd instanceof DeleteCommand &&
+          cmd.input.TableName === 'test-video-call-recording-participants',
+      )
+      .map((cmd) => (cmd as DeleteCommand).input.Key!.userId)
+      .sort();
+    expect(deletedUserIds).toEqual(['dev-bob', 'dev-hank']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FINDING 1 — durationMs on the read path.
+//
+// The webhook now stores media duration, but 200 rows already exist holding
+// the session lifetime. The backfill rewrites them; this guard means a row
+// the backfill missed (or one written by a pod that hasn't rolled) still
+// can't re-surface the lie.
+// ---------------------------------------------------------------------------
+describe('CallRecordingRepository — duration normalization on read (FINDING 1)', () => {
+  test('a legacy row (no sessionDurationMs) is re-derived from its tracks', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({
+      Item: {
+        callId: 'c1',
+        recordingId: 'r1',
+        durationMs: 18_736, // session lifetime — the lie
+        tracks: [
+          { legId: 'leg-001', startedAtMs: 3, endedAtMs: 8_671, durationMs: 8_668 },
+          { legId: 'leg-002', startedAtMs: 21, endedAtMs: 8_640, durationMs: 8_619 },
+        ],
+      },
+    });
+
+    const rec = await repo.getRecording('c1', 'r1');
+    expect(rec!.durationMs).toBe(8_668);
+    // The raw number is preserved, not discarded.
+    expect(rec!.sessionDurationMs).toBe(18_736);
+  });
+
+  test('an already-corrected row is passed through untouched', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({
+      Item: {
+        callId: 'c1',
+        recordingId: 'r1',
+        durationMs: 8_668,
+        sessionDurationMs: 18_736,
+        tracks: [{ startedAtMs: 3, endedAtMs: 8_671 }],
+      },
+    });
+
+    const rec = await repo.getRecording('c1', 'r1');
+    expect(rec!.durationMs).toBe(8_668);
+    expect(rec!.sessionDurationMs).toBe(18_736);
+  });
+
+  test('a row with no tracks keeps its stored duration (nothing better to say)', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({
+      Item: { callId: 'c1', recordingId: 'r1', durationMs: 60_000, tracks: [] },
+    });
+
+    const rec = await repo.getRecording('c1', 'r1');
+    expect(rec!.durationMs).toBe(60_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FINDING 3 — the lobby-scoped list re-derives people from the primary row.
+// ---------------------------------------------------------------------------
+describe('CallRecordingRepository.listByLobbyName — people, not sessions (FINDING 3)', () => {
+  test('a stored participantCount of 7 for a 2-person DM is corrected on read', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        {
+          callId: 'c1',
+          recordingId: 'r1',
+          startedAt: '2026-08-24T22:07:23.349Z',
+          endedAt: '2026-08-24T22:07:45.000Z',
+          durationMs: 21_000,
+          sessionDurationMs: 21_000,
+          channelArn: 'arn:x',
+          lobbyName: 'dm:dev-bob:dev-hank',
+          startedBy: 'dev-hank',
+          participantCount: 7,
+          participants: [
+            { userId: 'dev-hank', displayName: 'Hank Hill', joinedAt: '2026-08-24T22:07:20.000Z' },
+            { userId: 'dev-bob', displayName: 'Bob Martinez', joinedAt: '2026-08-24T22:07:21.000Z' },
+            { userId: 'dev-hank', joinedAt: '2026-08-24T22:07:22.000Z' },
+            { userId: 'dev-bob', joinedAt: '2026-08-24T22:07:22.500Z' },
+            { userId: 'dev-hank', joinedAt: '2026-08-24T22:07:23.000Z' },
+            { userId: 'dev-bob', joinedAt: '2026-08-24T22:07:23.100Z' },
+            { userId: 'dev-hank', joinedAt: '2026-08-24T22:07:23.200Z' },
+          ],
+          tracks: [{ legId: 'leg-001' }, { legId: 'leg-002' }],
+        },
+      ],
+    });
+
+    const { items } = await repo.listByLobbyName('dm:dev-bob:dev-hank');
+    expect(items[0]!.participantCount).toBe(2);
+    expect(items[0]!.participants!.map((p) => p.displayName).sort()).toEqual([
+      'Bob Martinez', 'Hank Hill',
+    ]);
   });
 });

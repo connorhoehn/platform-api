@@ -56,6 +56,11 @@ import {
   WEBHOOK_TIMESTAMP_HEADER,
 } from '../lib/webhook-replay';
 import { catalog } from '../lib/event-catalog';
+import {
+  deriveMediaDurationMs,
+  reconcileParticipants,
+  type TruthTrack,
+} from '../lib/recording-truth';
 import { resolveRecordingProfile } from '@connorhoehn/event-catalog';
 
 export const lvsWebhooksRouter = Router();
@@ -467,35 +472,45 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
     }
   }
 
-  // Leg-truth reconciliation. `session.participants` is a LIVE roster —
-  // videoSessionRepo removes people the moment they leave, so by the time
-  // `recording.completed` fires (i.e. the call ended) most participants are
-  // already gone. That persisted `participants: 1` (or 0) for real
-  // multi-leg recordings and captioned a 3-tile composed video
-  // "1 participant". The per-leg `tracks[]` LVS ships on the completed
-  // event are the truth of who was actually recorded, so:
-  //   1. any track peer with a userId missing from the roster is unioned
-  //      into participants[] (also fixes fan-out: leave-early users get
-  //      their index row and can find the recording), and
-  //   2. participantCount is derived from the distinct track peers
-  //      (participantId-only legs — LVS multi-leg tracks carry no userId —
-  //      still count even though they can't fan out).
-  const rawTracks: Array<Record<string, unknown>> = Array.isArray(detail.tracks) ? detail.tracks : [];
-  const distinctTrackPeers = new Set<string>();
-  for (const t of rawTracks) {
-    const peerKey = t?.userId ?? t?.participantId ?? t?.legId;
-    if (peerKey != null && String(peerKey).length > 0) distinctTrackPeers.add(String(peerKey));
-  }
-  for (const t of rawTracks) {
-    const userId = typeof t?.userId === 'string' ? t.userId : undefined;
-    if (userId && !participants.some((p) => p.userId === userId)) {
-      participants.push({
-        userId,
-        participantId: typeof t?.participantId === 'string' ? t.participantId : undefined,
-      });
-    }
-  }
-  const participantCount = Math.max(participants.length, distinctTrackPeers.size);
+  // Leg-truth reconciliation — see lib/recording-truth.ts for the full
+  // rationale and the measurements. In short, neither of the two numbers
+  // LVS hands us means what the UI rendered it as:
+  //
+  //   `session.participants` is the CHANNEL's lifetime roster: appended to
+  //   on every join, never deduped, never scoped to one recording, and
+  //   snapshotted after the initiator usually already hung up. Rendering
+  //   its length gave a 2-person DM "7 👥" and dropped the caller entirely.
+  //
+  //   `detail.durationMs` is the SFU channel-session lifetime, which
+  //   includes the ring, the lobby wait and teardown. Rendering it as
+  //   "Duration" overstated every single recording on disk.
+  //
+  // Both corrections are pure functions of the payload we already have,
+  // and both run again on read so a row that predates this code (or one
+  // written by a pod that hasn't rolled) still renders honestly.
+  const rawTracks: TruthTrack[] = Array.isArray(detail.tracks) ? detail.tracks : [];
+  const sessionDurationMs = Number(detail.durationMs ?? 0);
+  const startedAt = detail.startedAt ?? new Date(Date.now() - sessionDurationMs).toISOString();
+  const endedAt = detail.endedAt ?? new Date().toISOString();
+  // VideoSessionRecord exposes the creator as `startedBy` (NOT `createdBy`
+  // — that field doesn't exist on the record). Resolved BEFORE
+  // reconciliation now, because the initiator has to be unioned into
+  // participants[]: they were in their own call even when the live roster
+  // no longer says so.
+  const startedBy: string | undefined = session?.startedBy ?? participants[0]?.userId;
+  const reconciled = reconcileParticipants({
+    participants,
+    tracks: rawTracks,
+    startedBy,
+    startedAt,
+    endedAt,
+  });
+  participants = reconciled.participants;
+  const participantCount = reconciled.participantCount;
+  const mediaDurationMs = deriveMediaDurationMs({
+    tracks: rawTracks,
+    sessionDurationMs,
+  });
 
   try {
     await callRecordingRepo.putRecording({
@@ -504,27 +519,23 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       channelArn: arn,
       lobbyName,
       sessionId: session?.sessionId,
-      startedAt: detail.startedAt ?? new Date(Date.now() - (detail.durationMs ?? 0)).toISOString(),
-      endedAt: detail.endedAt ?? new Date().toISOString(),
-      durationMs: Number(detail.durationMs ?? 0),
+      startedAt,
+      endedAt,
+      // Media length — what a viewer means by "Duration", and what the
+      // player's own timeline shows. The raw session lifetime is kept
+      // alongside it rather than discarded.
+      durationMs: mediaDurationMs,
+      sessionDurationMs,
       totalBytes: Number(detail.totalSize ?? detail.totalBytes ?? 0),
       segments: Array.isArray(detail.segments) ? detail.segments : [],
       destination: detail.destination === 's3' ? 's3' : 'local',
       participants,
-      // Derived from legs ∪ roster above — NOT participants.length, which
-      // undercounts whenever a leg lacks a userId (LVS multi-leg tracks
-      // carry participantId only).
+      // Distinct PEOPLE (deduped by userId, scoped to this recording,
+      // floored at the recorded-leg count so participantId-only legs still
+      // count) — never `participants.length` on the raw roster, which is a
+      // join count.
       participantCount,
-      // VideoSessionRecord exposes the creator as `startedBy` (NOT
-      // `createdBy` — that field doesn't exist on the record). Reading
-      // the wrong field left `startedBy` undefined on every persisted
-      // recording, which (a) silently broke owner-only delete (delete
-      // route fails-closed on `!detail.startedBy`) and (b) made the
-      // recording invisible to the owner when participants[] was empty
-      // (because the fan-out only writes rows for participants).
-      // Fall through to participants[0]?.userId for legacy rows that
-      // somehow lack startedBy.
-      startedBy: session?.startedBy ?? participants[0]?.userId,
+      startedBy,
       // W8 — thumbnail surfaced by LVS RecordingManager. May be a
       // file:// URL in dev (hostPath) or a backend-specific URL in
       // prod (S3 signed / CloudFront / etc.). Null when ffmpeg
@@ -539,7 +550,19 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
       tracks: Array.isArray(detail.tracks) ? detail.tracks : undefined,
     });
     log.info(
-      { callId, recordingId, arn, participants: participants.length, participantCount, trackPeers: distinctTrackPeers.size },
+      {
+        callId,
+        recordingId,
+        arn,
+        participants: participants.length,
+        participantCount,
+        startedBy,
+        legs: rawTracks.length,
+        // Both durations logged so a "the UI says 18s but the file is 8s"
+        // report can be triaged from the log line alone.
+        mediaDurationMs,
+        sessionDurationMs,
+      },
       '[lvs-webhook] recording persisted',
     );
 

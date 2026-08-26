@@ -418,3 +418,215 @@ describe('lvsWebhooks — no-secret gate (hub#1006)', () => {
     expect(putRecordingMock).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The webhook is where all three lies were born, so it gets end-to-end
+// coverage of what it now persists. Payloads are trimmed from real
+// `recording.completed` deliveries captured on 2026-08-25.
+// ---------------------------------------------------------------------------
+describe('lvsWebhooks — what the persisted row is allowed to claim', () => {
+  let server: http.Server;
+
+  beforeAll(async () => {
+    const app = express();
+    app.use('/hooks/lvs', lvsWebhooksRouter);
+    server = http.createServer(app);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  beforeEach(() => {
+    putRecordingMock.mockClear();
+    getSessionMock.mockClear();
+    findByChannelArnMock.mockClear();
+    findByChannelArnMock.mockResolvedValue([]);
+  });
+
+  async function deliver(payload: unknown) {
+    const body = Buffer.from(JSON.stringify(payload), 'utf-8');
+    const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
+    expect(res.status).toBe(204);
+    expect(putRecordingMock).toHaveBeenCalledTimes(1);
+    return putRecordingMock.mock.calls[0]![0];
+  }
+
+  // FINDING 1 -------------------------------------------------------------
+  test('durationMs is the MEDIA length, not the channel-session lifetime', async () => {
+    // The real hank↔bob DM: 18,736ms of session, 8,668ms of media. The UI
+    // rendered "18s" over a player whose own timeline read 0:08.
+    const arg = await deliver({
+      type: 'recording.completed',
+      channelArn: 'arn:dur',
+      data: {
+        recordingId: 'r-dur',
+        segments: [],
+        totalSize: 0,
+        durationMs: 18_736,
+        destination: 'local',
+        tracks: [
+          { legId: 'leg-001', participantId: 'p-1', startedAtMs: 3, endedAtMs: 8_671, durationMs: 8_668 },
+          { legId: 'leg-002', participantId: 'p-2', startedAtMs: 21, endedAtMs: 8_640, durationMs: 8_619 },
+        ],
+      },
+    });
+
+    expect(arg.durationMs).toBe(8_668);
+    // The raw number is kept, not thrown away — it's real, it just isn't
+    // what "Duration" means to a viewer.
+    expect(arg.sessionDurationMs).toBe(18_736);
+  });
+
+  test('the worst measured overstatement (23.3s claimed / 0.5s of media) is gone', async () => {
+    const arg = await deliver({
+      type: 'recording.completed',
+      channelArn: 'arn:worst',
+      data: {
+        recordingId: 'r-worst',
+        segments: [],
+        totalSize: 0,
+        durationMs: 23_278,
+        destination: 'local',
+        tracks: [{ legId: 'leg-001', startedAtMs: 4, endedAtMs: 512, durationMs: 508 }],
+      },
+    });
+
+    expect(arg.durationMs).toBe(508);
+    expect(arg.durationMs / 23_278).toBeLessThan(0.1);
+  });
+
+  // FINDING 2 -------------------------------------------------------------
+  test('the caller is in participants[] even when the live roster dropped them', async () => {
+    // The roster is snapshotted at recording-COMPLETE time, by which point
+    // hank (who placed the call) has hung up. The row used to name only bob
+    // — so hank never got a fan-out row and never saw his own recording.
+    findByChannelArnMock.mockResolvedValueOnce([
+      {
+        documentId: 'dm:dev-bob:dev-hank',
+        sessionId: 'sess-1',
+        channelArn: 'arn:caller',
+        startedBy: 'dev-hank',
+        participants: [
+          {
+            userId: 'dev-bob',
+            displayName: 'Bob Martinez',
+            participantId: 'dev-bob-mt9h',
+            joinedAt: '2026-08-26T02:22:42.704Z',
+          },
+        ],
+      },
+    ]);
+
+    const arg = await deliver({
+      type: 'recording.completed',
+      channelArn: 'arn:caller',
+      data: {
+        recordingId: 'r-caller',
+        segments: [],
+        totalSize: 0,
+        durationMs: 21_800,
+        destination: 'local',
+        startedAt: '2026-08-26T02:23:24.679Z',
+        endedAt: '2026-08-26T02:23:42.558Z',
+        tracks: [{ legId: 'leg-001', participantId: 'p-1', startedAtMs: 3, endedAtMs: 21_000 }],
+      },
+    });
+
+    expect(arg.startedBy).toBe('dev-hank');
+    expect(arg.participants.map((p: { userId: string }) => p.userId).sort()).toEqual([
+      'dev-bob', 'dev-hank',
+    ]);
+    // …and therefore the DM reads as the 2-person call it was, not "1 👥".
+    expect(arg.participantCount).toBe(2);
+  });
+
+  // FINDING 3 -------------------------------------------------------------
+  test('a rejoin-inflated roster collapses to distinct people', async () => {
+    // The lobby roster appends one entry per join. Four hank sessions and
+    // three bob sessions in one 2-person DM rendered "7 👥".
+    findByChannelArnMock.mockResolvedValueOnce([
+      {
+        documentId: 'dm:dev-bob:dev-hank',
+        sessionId: 'sess-2',
+        channelArn: 'arn:rejoin',
+        startedBy: 'dev-hank',
+        participants: [
+          { userId: 'dev-hank', displayName: 'Hank Hill', joinedAt: '2026-08-24T22:07:20.000Z' },
+          { userId: 'dev-bob', displayName: 'Bob Martinez', joinedAt: '2026-08-24T22:07:20.500Z' },
+          { userId: 'dev-hank', joinedAt: '2026-08-24T22:07:21.000Z' },
+          { userId: 'dev-bob', joinedAt: '2026-08-24T22:07:21.500Z' },
+          { userId: 'dev-hank', joinedAt: '2026-08-24T22:07:22.000Z' },
+          { userId: 'dev-bob', joinedAt: '2026-08-24T22:07:22.500Z' },
+          { userId: 'dev-hank', joinedAt: '2026-08-24T22:07:23.000Z' },
+        ],
+      },
+    ]);
+
+    const arg = await deliver({
+      type: 'recording.completed',
+      channelArn: 'arn:rejoin',
+      data: {
+        recordingId: 'r-rejoin',
+        segments: [],
+        totalSize: 0,
+        durationMs: 22_000,
+        destination: 'local',
+        startedAt: '2026-08-24T22:07:23.349Z',
+        endedAt: '2026-08-24T22:07:45.000Z',
+        tracks: [
+          { legId: 'leg-001', participantId: 'p-1', startedAtMs: 3, endedAtMs: 21_000 },
+          { legId: 'leg-002', participantId: 'p-2', startedAtMs: 8, endedAtMs: 21_100 },
+        ],
+      },
+    });
+
+    expect(arg.participantCount).toBe(2);
+    expect(arg.participants).toHaveLength(2);
+    // Display names survive the dedup — they're what the UI renders.
+    expect(
+      arg.participants.map((p: { displayName?: string }) => p.displayName).sort(),
+    ).toEqual(['Bob Martinez', 'Hank Hill']);
+  });
+
+  test("a roster carried over from an earlier call in the same lobby is scoped out", async () => {
+    findByChannelArnMock.mockResolvedValueOnce([
+      {
+        documentId: 'room:standup',
+        sessionId: 'sess-3',
+        channelArn: 'arn:stale',
+        startedBy: 'dev-hank',
+        participants: [
+          { userId: 'dev-hank', joinedAt: '2026-08-23T21:26:30.000Z' },
+          { userId: 'dev-bob', joinedAt: '2026-08-23T21:26:31.000Z' },
+          // 46 minutes older than this recording's own startedAt.
+          { userId: 'dev-alice', joinedAt: '2026-08-23T20:40:47.142Z' },
+        ],
+      },
+    ]);
+
+    const arg = await deliver({
+      type: 'recording.completed',
+      channelArn: 'arn:stale',
+      data: {
+        recordingId: 'r-stale',
+        segments: [],
+        totalSize: 0,
+        durationMs: 30_000,
+        destination: 'local',
+        startedAt: '2026-08-23T21:26:40.268Z',
+        endedAt: '2026-08-23T21:27:10.000Z',
+        tracks: [
+          { legId: 'leg-001', participantId: 'p-1', startedAtMs: 3, endedAtMs: 28_000 },
+          { legId: 'leg-002', participantId: 'p-2', startedAtMs: 9, endedAtMs: 28_100 },
+        ],
+      },
+    });
+
+    expect(arg.participants.map((p: { userId: string }) => p.userId).sort()).toEqual([
+      'dev-bob', 'dev-hank',
+    ]);
+    expect(arg.participantCount).toBe(2);
+  });
+});

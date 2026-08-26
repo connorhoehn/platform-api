@@ -34,6 +34,11 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
+import {
+  deriveMediaDurationMs,
+  reconcileParticipants,
+  type TruthTrack,
+} from '../lib/recording-truth';
 
 export const CALL_RECORDINGS_TABLE = tableName('video-call-recordings');
 export const CALL_RECORDING_PARTICIPANTS_TABLE = tableName(
@@ -76,7 +81,23 @@ export interface CallRecording {
   sessionId?: string;
   startedAt: string; // ISO
   endedAt: string; // ISO
+  /**
+   * Length of the RECORDED MEDIA. Derived from the track timeline by
+   * `deriveMediaDurationMs` — NOT the SFU channel-session lifetime, which
+   * is what LVS puts on the wire and what this field used to hold. See
+   * `sessionDurationMs` for that number and `lib/recording-truth.ts` for
+   * the measurement that motivated the split.
+   */
   durationMs: number;
+  /**
+   * The SFU channel-session lifetime (ring + lobby wait + media +
+   * teardown). Kept because it is genuinely useful for call analytics and
+   * because throwing away the raw webhook number would make the change
+   * irreversible — but it is NOT what "Duration" means to a viewer, so it
+   * is never the field the UI renders. Absent on rows written before
+   * 2026-08-25.
+   */
+  sessionDurationMs?: number;
   totalBytes: number;
   segments: RecordingSegment[];
   destination: 'local' | 's3';
@@ -137,7 +158,78 @@ export interface CallRecording {
   transcriptError?: string;
 }
 
+/**
+ * Shape returned by both list endpoints. Shared so the user-scoped list
+ * (fan-out index) and the lobby-scoped list (primary-table scan) can't
+ * drift into rendering different fields for the same card.
+ */
+export interface RecordingListRow {
+  callId: string;
+  recordingId: string;
+  startedAt: string;
+  endedAt: string;
+  /** Media length — see CallRecording.durationMs. */
+  durationMs: number;
+  sessionDurationMs?: number;
+  channelArn: string;
+  lobbyName: string;
+  thumbnailUrl?: string;
+  composedUrl?: string;
+  /** Distinct people, not sessions. */
+  participantCount?: number;
+  /** userId + displayName, so the list can render names, not raw ids. */
+  participants?: Array<{ userId: string; displayName?: string }>;
+}
+
 const RETENTION_DAYS = Number(process.env.RECORDING_RETENTION_DAYS ?? 30);
+
+/** Identities denormalized onto each fan-out row, for list-view labels. */
+const FANOUT_PARTICIPANT_CAP = 12;
+
+/**
+ * The set of userIds that must be able to find this recording:
+ * `participants[] ∪ {startedBy}`. Unconditional union — see the
+ * putRecording docblock for why the old "only when participants is empty"
+ * fallback lost the caller on 18% of real recordings.
+ *
+ * Shared by putRecording and deleteRecording so the write set and the
+ * delete set are the same set by construction.
+ */
+export function fanoutSetFor(rec: {
+  participants?: Array<{ userId?: string }> | null;
+  startedBy?: string;
+}): Set<string> {
+  const ids = new Set<string>();
+  for (const p of rec.participants ?? []) {
+    if (p?.userId) ids.add(p.userId);
+  }
+  if (rec.startedBy) ids.add(rec.startedBy);
+  return ids;
+}
+
+/**
+ * Read-path safety net for `durationMs`.
+ *
+ * Rows written before 2026-08-25 hold the SFU session lifetime in
+ * `durationMs` — every one of them overstates its own media (measured:
+ * 98/98 by >1s, median +10.2s). The backfill script rewrites them, but a
+ * derive-on-read guard means a row that the backfill missed — or one
+ * written by an LVS pod still on the old payload shape — cannot re-surface
+ * the lie. Rows already carrying `sessionDurationMs` were written by the
+ * corrected path and are passed through untouched.
+ */
+function normalizeDuration<T extends { durationMs?: number; sessionDurationMs?: number; tracks?: unknown }>(
+  rec: T,
+): T {
+  if (rec.sessionDurationMs !== undefined) return rec;
+  const tracks = Array.isArray(rec.tracks) ? (rec.tracks as TruthTrack[]) : undefined;
+  if (!tracks || tracks.length === 0) return rec;
+  return {
+    ...rec,
+    durationMs: deriveMediaDurationMs({ tracks, sessionDurationMs: rec.durationMs }),
+    sessionDurationMs: rec.durationMs,
+  };
+}
 
 export class CallRecordingRepository extends BaseRepository {
   private participantsTable: string;
@@ -152,30 +244,26 @@ export class CallRecordingRepository extends BaseRepository {
    * into the reverse-index table. Idempotent — re-running the same
    * webhook payload overwrites both tables without duplicate entries.
    *
-   * Visibility guarantee: even when `participants[]` is empty (the
-   * session never had a /join, e.g. recording started but caller dropped
-   * before the SFU minted a participant token), we still write a single
-   * fan-out row keyed by `startedBy` so the recording owner sees their
-   * own recording in `GET /api/recordings`. Without this, the row was
-   * stranded in the primary table and undiscoverable by user-scoped
-   * queries — the most common cause of "Past Calls is empty" in dev.
+   * Visibility guarantee: the fan-out set is ALWAYS `participants[] ∪
+   * {startedBy}`. The union with `startedBy` is unconditional and that is
+   * the whole point — the previous code only fell back to `startedBy` when
+   * `participants[]` was *empty*, which quietly lost exactly the case that
+   * matters most: `participants[]` is the SFU's LIVE roster at
+   * recording-complete time, and the person who PLACED the call has
+   * usually already hung up by then. So a non-empty roster containing only
+   * the callee looked like a complete answer, `startedBy` was skipped, and
+   * the caller never got an index row. Measured on live data 2026-08-25:
+   * 37 of 200 recordings (18%) had no fan-out row for their own
+   * `startedBy` — permanently invisible in `GET /api/recordings` to the
+   * one person who made the call. Every one of those had a non-empty
+   * `participants[]`, so the old empty-only fallback could never fire.
    */
   async putRecording(rec: Omit<CallRecording, 'ttl'>): Promise<void> {
     const ttl = Math.floor(Date.now() / 1000) + RETENTION_DAYS * 86400;
     const full: CallRecording = { ...rec, ttl };
     await this.putItem(full as unknown as Record<string, unknown>);
 
-    // Build the de-duplicated set of userIds that should see this recording.
-    // Participants are the canonical set; if absent, fall back to `startedBy`
-    // so the owner can still find their recording. Dedup so multiple tabs
-    // (same userId, different participantId) collapse to one fan-out row.
-    const fanoutUserIds = new Set<string>();
-    for (const p of rec.participants) {
-      if (p.userId) fanoutUserIds.add(p.userId);
-    }
-    if (fanoutUserIds.size === 0 && rec.startedBy) {
-      fanoutUserIds.add(rec.startedBy);
-    }
+    const fanoutUserIds = fanoutSetFor(rec);
 
     // Fan out participant index rows. Promise.all is fine — DDB
     // PutItem is independent per row, and we want one round-trip-batch
@@ -195,7 +283,12 @@ export class CallRecordingRepository extends BaseRepository {
                 lobbyName: rec.lobbyName,
                 startedAt: rec.startedAt,
                 endedAt: rec.endedAt,
+                // Media length, not session lifetime. The fan-out row has
+                // no tracks[] of its own, so this value cannot be re-derived
+                // on read — it is the reason the backfill script has to
+                // touch BOTH tables (scripts/backfill-recording-truth.ts).
                 durationMs: rec.durationMs,
+                sessionDurationMs: rec.sessionDurationMs,
                 // W8 — denormalize so list view doesn't need a join
                 // back to the primary table for thumbnail rendering.
                 thumbnailUrl: rec.thumbnailUrl,
@@ -204,11 +297,20 @@ export class CallRecordingRepository extends BaseRepository {
                 // join. tracks[] stays on the primary record (only the
                 // detail view needs the raw per-peer URLs).
                 composedUrl: rec.composedUrl,
-                // Denormalize participant count for the chip render.
-                // Prefer the leg-derived count from the webhook — the live
-                // roster (participants[]) undercounts because people who
-                // left before recording end were already removed from it.
+                // Denormalize the reconciled PEOPLE count for the chip
+                // render. `participants[]` has already been deduped by
+                // userId and scoped to this recording by the webhook, so
+                // the `.length` fallback is now a people count too — it
+                // used to be a join count (one entry per rejoin), which is
+                // how a 2-person DM rendered "7 👥".
                 participantCount: rec.participantCount ?? rec.participants?.length ?? 0,
+                // Denormalize identities so the list view can render
+                // "DM · Bob Martinez & Hank Hill" instead of splitting raw
+                // userIds out of the lobby string. Capped so a large room
+                // can't push the index row toward the 400KB item limit.
+                participants: (rec.participants ?? [])
+                  .slice(0, FANOUT_PARTICIPANT_CAP)
+                  .map((p) => ({ userId: p.userId, displayName: p.displayName })),
                 ttl,
               },
             }),
@@ -219,7 +321,8 @@ export class CallRecordingRepository extends BaseRepository {
   }
 
   async getRecording(callId: string, recordingId: string): Promise<CallRecording | null> {
-    return this.getItem<CallRecording>({ callId, recordingId });
+    const rec = await this.getItem<CallRecording>({ callId, recordingId });
+    return rec ? normalizeDuration(rec) : null;
   }
 
   /**
@@ -235,17 +338,11 @@ export class CallRecordingRepository extends BaseRepository {
   async deleteRecording(callId: string, recordingId: string): Promise<void> {
     const rec = await this.getRecording(callId, recordingId);
     if (rec) {
-      // Mirror putRecording's fan-out set: participants ∪ startedBy
-      // (when participants[] is empty). Without including startedBy
-      // here, owner-only recordings would leave a stranded fan-out row
-      // that keeps showing up in GET /api/recordings even after delete.
-      const fanoutUserIds = new Set<string>();
-      for (const p of rec.participants ?? []) {
-        if (p.userId) fanoutUserIds.add(p.userId);
-      }
-      if (fanoutUserIds.size === 0 && rec.startedBy) {
-        fanoutUserIds.add(rec.startedBy);
-      }
+      // Mirror putRecording's fan-out set EXACTLY — same helper, so the
+      // two can't drift. Any row putRecording wrote, this deletes; a
+      // narrower set here would strand an index row that keeps surfacing
+      // in GET /api/recordings after the recording is gone.
+      const fanoutUserIds = fanoutSetFor(rec);
       if (fanoutUserIds.size > 0) {
         await Promise.all(
           Array.from(fanoutUserIds).map((userId) =>
@@ -278,7 +375,7 @@ export class CallRecordingRepository extends BaseRepository {
         ExpressionAttributeValues: { ':c': callId },
       }),
     );
-    return (out.Items ?? []) as CallRecording[];
+    return ((out.Items ?? []) as CallRecording[]).map(normalizeDuration);
   }
 
   /**
@@ -290,7 +387,7 @@ export class CallRecordingRepository extends BaseRepository {
   async listByUser(
     userId: string,
     opts?: { limit?: number; cursor?: string },
-  ): Promise<{ items: Array<{ callId: string; recordingId: string; startedAt: string; endedAt: string; durationMs: number; channelArn: string; lobbyName: string; thumbnailUrl?: string; composedUrl?: string; participantCount?: number; }>; cursor?: string }> {
+  ): Promise<{ items: RecordingListRow[]; cursor?: string }> {
     const out = await this.docClient.send(
       new QueryCommand({
         TableName: this.participantsTable,
@@ -313,12 +410,22 @@ export class CallRecordingRepository extends BaseRepository {
       recordingId: i.recordingId as string,
       startedAt: i.startedAt as string,
       endedAt: i.endedAt as string,
+      // Media length. The fan-out row has no tracks[], so this cannot be
+      // re-derived here — it is whatever the writer stored, which is why
+      // scripts/backfill-recording-truth.ts had to rewrite this table.
       durationMs: i.durationMs as number,
+      sessionDurationMs: i.sessionDurationMs as number | undefined,
       channelArn: i.channelArn as string,
       lobbyName: i.lobbyName as string,
       thumbnailUrl: i.thumbnailUrl as string | undefined,
       composedUrl: i.composedUrl as string | undefined,
       participantCount: i.participantCount as number | undefined,
+      // Denormalized identities (userId + displayName). Absent on rows
+      // written before 2026-08-25; the FE falls back to the lobby-derived
+      // ids for those.
+      participants: Array.isArray(i.participants)
+        ? (i.participants as CallRecordingParticipant[])
+        : undefined,
     }));
     const cursor = out.LastEvaluatedKey
       ? (out.LastEvaluatedKey.startedAtRecordingId as string)
@@ -346,21 +453,7 @@ export class CallRecordingRepository extends BaseRepository {
     lobbyName: string,
     limit = 50,
     cursor?: string,
-  ): Promise<{
-    items: Array<{
-      callId: string;
-      recordingId: string;
-      startedAt: string;
-      endedAt: string;
-      durationMs: number;
-      channelArn: string;
-      lobbyName: string;
-      thumbnailUrl?: string;
-      composedUrl?: string;
-      participantCount?: number;
-    }>;
-    cursor?: string;
-  }> {
+  ): Promise<{ items: RecordingListRow[]; cursor?: string }> {
     const cappedLimit = Math.max(1, Math.min(100, limit));
     let exclusiveStartKey: Record<string, unknown> | undefined;
     if (cursor) {
@@ -380,25 +473,44 @@ export class CallRecordingRepository extends BaseRepository {
         ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
       }),
     );
-    const items = (out.Items ?? []).map((i) => ({
-      callId: i.callId as string,
-      recordingId: i.recordingId as string,
-      startedAt: i.startedAt as string,
-      endedAt: i.endedAt as string,
-      durationMs: i.durationMs as number,
-      channelArn: i.channelArn as string,
-      lobbyName: i.lobbyName as string,
-      thumbnailUrl: i.thumbnailUrl as string | undefined,
-      composedUrl: (i as Record<string, unknown>).composedUrl as string | undefined,
-      // Prefer the leg-derived scalar (see CallRecording.participantCount);
-      // participants.length is the legacy fallback and undercounts
-      // multi-leg recordings whose members left before the recording ended.
-      participantCount: typeof (i as Record<string, unknown>).participantCount === 'number'
-        ? ((i as Record<string, unknown>).participantCount as number)
-        : Array.isArray((i as Record<string, unknown>).participants)
-          ? ((i as Record<string, unknown>).participants as unknown[]).length
+    // This one scans the PRIMARY table, so unlike listByUser it has the
+    // full row — tracks[] and the raw roster — and can re-derive the truth
+    // on read rather than trusting whatever the writer of the day stored.
+    const items: RecordingListRow[] = (out.Items ?? []).map((raw) => {
+      const i = normalizeDuration(raw as unknown as CallRecording);
+      const people = reconcileParticipants({
+        participants: i.participants,
+        tracks: i.tracks,
+        startedBy: i.startedBy,
+        startedAt: i.startedAt,
+        endedAt: i.endedAt,
+      });
+      return {
+        callId: i.callId,
+        recordingId: i.recordingId,
+        startedAt: i.startedAt,
+        endedAt: i.endedAt,
+        durationMs: i.durationMs,
+        sessionDurationMs: i.sessionDurationMs,
+        channelArn: i.channelArn,
+        lobbyName: i.lobbyName,
+        thumbnailUrl: i.thumbnailUrl,
+        composedUrl: i.composedUrl,
+        // Distinct PEOPLE. Deliberately re-derived instead of reading the
+        // stored scalar: legacy rows stored `participants.length`, which
+        // counted rejoins (the "2, 3, 4, 5, 6, 7 👥 over one evening" bug).
+        // `undefined` rather than 0 when we know nothing — the FE renders
+        // no chip for undefined, and "0 people were in this call" would be
+        // its own small lie.
+        participantCount: people.participantCount || undefined,
+        participants: people.participants.length
+          ? people.participants.map((p) => ({
+              userId: p.userId,
+              displayName: p.displayName,
+            }))
           : undefined,
-    }));
+      };
+    });
     const nextCursor = out.LastEvaluatedKey
       ? Buffer.from(JSON.stringify(out.LastEvaluatedKey), 'utf8').toString('base64')
       : undefined;

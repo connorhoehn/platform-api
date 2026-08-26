@@ -22,7 +22,8 @@ import { Router, Request, Response } from 'express';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
-import { callRecordingRepo, callReactionRepo } from '../repositories';
+import { callRecordingRepo, callReactionRepo, type CallRecording } from '../repositories';
+import { publicizeTracks, reconcileParticipants } from '../lib/recording-truth';
 import { mergeReactionsIntoTranscript } from '../lib/transcript-reactions';
 import { docClient } from '../lib/aws-clients';
 import { tenantOf } from '../lib/tenant';
@@ -95,9 +96,47 @@ recordingsRouter.get(
     if (!detail) {
       throw new NotFoundError('recording metadata missing');
     }
-    res.json(detail);
+    res.json(publicRecordingView(detail));
   }),
 );
+
+/**
+ * Everything the detail response must scrub or re-derive before it leaves
+ * the process.
+ *
+ * `tracks[].url` / `.file` arrive from LVS as absolute recorder-pod paths —
+ * in local dev, literally
+ * `file:///Users/<developer>/Projects/realtime-examples/...`. A browser
+ * cannot open those, and shipping them leaks a filesystem layout (a
+ * developer's home directory today, a pod's mount path in production) to
+ * every authenticated caller. `publicizeTracks` rewrites each track onto
+ * the same proxied `/segments/:filename` URL the composed file already
+ * uses and drops the raw `file` field.
+ *
+ * `participants` / `participantCount` are re-derived rather than served as
+ * stored, so rows written before the webhook fix still render deduped,
+ * initiator-inclusive people counts. Duration is already normalized by the
+ * repository read path.
+ */
+function publicRecordingView(detail: CallRecording): Record<string, unknown> {
+  const people = reconcileParticipants({
+    participants: detail.participants,
+    tracks: detail.tracks,
+    startedBy: detail.startedBy,
+    startedAt: detail.startedAt,
+    endedAt: detail.endedAt,
+  });
+  return {
+    ...detail,
+    participants: people.participants,
+    participantCount: people.participantCount,
+    tracks: publicizeTracks(detail.tracks, {
+      channelArn: detail.channelArn,
+      recordingId: detail.recordingId,
+      publicBaseUrl: VIDEO_PUBLIC_URL,
+    }),
+  };
+}
 
 // --------------------------------------------------------------------
 // POST /api/recordings/:recordingId/playback-token

@@ -121,6 +121,7 @@ export {
   CallRecordingRepository,
   CallRecording,
   CallRecordingParticipant,
+  RecordingListRow,
   RecordingSegment,
   CALL_RECORDINGS_TABLE,
   CALL_RECORDING_PARTICIPANTS_TABLE,
