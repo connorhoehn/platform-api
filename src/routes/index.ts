@@ -12,8 +12,10 @@ import { postLikesRouter, commentLikesRouter } from './likes';
 import { reactionsRouter } from './reactions';
 import { activityRouter } from './activity';
 import { documentCommentsRouter } from './documentComments';
+import { voiceCaptureRouter } from './voiceCapture';
 import { sectionReviewsRouter, documentReviewsRouter, myReviewsRouter } from './sectionReviews';
 import { sectionItemsRouter, myItemsRouter } from './sectionItems';
+import { workItemsRouter } from './workItems';
 import { documentLifecycleRouter, lifecycleSchemaRouter } from './documentLifecycle';
 import {
   documentReviewRequestsRouter,
@@ -101,7 +103,16 @@ router.use('/documents/:documentId/reviews', documentReviewsRouter);
 router.use('/reviews', myReviewsRouter);
 router.use('/documents/:documentId/sections/:sectionId/items', sectionItemsRouter);
 router.use('/items', myItemsRouter);
+// Work items: the utterance -> proposal -> acceptance lane. Addressed by itemId
+// alone (not documentId/sectionId/itemId) because re-attaching an item moves it
+// between sections and a URL that encoded the section would break on every move.
+// Must precede the '/documents/:documentId' mount below, which would otherwise
+// swallow '/work-items' as a sub-path of the import/export router.
+router.use('/documents/:documentId/work-items', workItemsRouter);
 router.use('/documents/:documentId', documentImportExportRouter);
+// Ambient voice capture — authenticated PCM proxy in front of the
+// live-captions sidecar. See routes/voiceCapture.ts.
+router.use('/voice-capture', voiceCaptureRouter);
 router.use('/video', videoSessionsRouter);
 // Recordings — mounted at /api directly so paths are
 // /api/recordings, /api/recordings/:id, /api/recordings/:id/playback-token.
