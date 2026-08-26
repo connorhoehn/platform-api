@@ -21,8 +21,11 @@ import { catalog } from '../lib/event-catalog';
 import { callReactionRepo } from '../repositories';
 import type { CallReactionInput } from '../repositories';
 import log from '../lib/logger';
+import { tenantOf } from '../lib/tenant';
 
 interface CallReactionPayload {
+  /** Owning tenant, stamped by the producer. Absent today — see tenant.ts. */
+  orgId?: string;
   reactionId: string;
   channel: string;
   lobbyName: string;
@@ -53,6 +56,11 @@ export function startCallReactionConsumer(
       const payload = envelope.payload;
 
       const row: CallReactionInput = {
+        // A durable consumer has no request context, so the tenant has to
+        // travel IN the event. Until the producer stamps `orgId`, org-less
+        // rows land in the reserved TENANTLESS namespace — isolated from
+        // every real org rather than pooled into a shared default.
+        tenant: tenantOf(payload.orgId),
         reactionId: payload.reactionId,
         channel: payload.channel,
         lobbyName: payload.lobbyName,

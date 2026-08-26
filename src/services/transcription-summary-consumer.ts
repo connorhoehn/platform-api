@@ -36,6 +36,7 @@ import { createLLMClient } from '../pipeline/createLLMClient';
 import { callSfu } from '../lib/sfu-breaker';
 import { VIDEO_API_URL } from '../lib/video-auth';
 import log from '../lib/logger';
+import { tenantOf } from '../lib/tenant';
 
 interface TranscriptReadyPayload {
   recordingId: string;
@@ -276,6 +277,7 @@ export function startTranscriptionSummaryConsumer(
         let docForPrompt: TranscriptDoc = doc;
         try {
           const reactions = await callReactionRepo.listByLobby(
+            tenantOf(detail.orgId),
             detail.lobbyName,
             detail.startedAt,
             detail.endedAt,

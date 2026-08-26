@@ -25,6 +25,7 @@ import { requireAuth } from '../middleware/auth';
 import { callRecordingRepo, callReactionRepo } from '../repositories';
 import { mergeReactionsIntoTranscript } from '../lib/transcript-reactions';
 import { docClient } from '../lib/aws-clients';
+import { tenantOf } from '../lib/tenant';
 import { tableName } from '../lib/ddb-table-name';
 import { VIDEO_API_URL, VIDEO_PUBLIC_URL } from '../lib/video-auth';
 import { callSfu, mapSfuError } from '../lib/sfu-breaker';
@@ -404,6 +405,7 @@ recordingsRouter.get(
         const doc = JSON.parse(text) as { segments?: Array<{ startMs: number; endMs: number; speakerId: string; speakerLabel: string; text: string }> };
         if (doc && Array.isArray(doc.segments)) {
           const reactions = await callReactionRepo.listByLobby(
+            tenantOf(req.user?.orgId),
             detail.lobbyName,
             detail.startedAt,
             detail.endedAt,

@@ -94,6 +94,12 @@ describe('startCallReactionConsumer', () => {
 
     expect(mockPutReaction).toHaveBeenCalledTimes(1);
     expect(mockPutReaction).toHaveBeenCalledWith({
+      // A durable consumer has no request context, so the tenant rides the
+      // event. The producer does not stamp orgId yet, so these land in the
+      // reserved org-less namespace — isolated from every real org, NOT
+      // pooled into a shared default (that pooling is the leak the tenant
+      // convention exists to prevent).
+      tenant: '~',
       reactionId: 'rx-1',
       channel: 'reactions:room:lounge',
       lobbyName: 'room:lounge',

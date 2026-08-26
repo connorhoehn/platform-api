@@ -48,6 +48,7 @@ import {
 // strings at the API boundary with a 400 rather than letting them fall
 // through to LVS's resolveRecordingProfile silent-degrade-to-'none' path.
 import { isRecordingProfile } from '@connorhoehn/event-catalog';
+import { tenantOf } from '../lib/tenant';
 // Re-export breaker test helpers from the shared module for back-compat
 // with existing test imports — see src/lib/sfu-breaker.ts for the canonical
 // definitions (extracted for hub task #1001).
@@ -750,7 +751,7 @@ videoSessionsRouter.get('/reactions', requireAuth, asyncHandler(async (req: Requ
   }
   const from = typeof req.query.from === 'string' && req.query.from.length > 0 ? req.query.from : undefined;
   const to = typeof req.query.to === 'string' && req.query.to.length > 0 ? req.query.to : undefined;
-  const reactions = await callReactionRepo.listByLobby(lobbyName, from, to);
+  const reactions = await callReactionRepo.listByLobby(tenantOf(req.user?.orgId), lobbyName, from, to);
   res.json({ reactions });
 }));
 

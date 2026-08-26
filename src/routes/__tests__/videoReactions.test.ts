@@ -113,7 +113,10 @@ describe('GET /api/video/reactions', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ reactions: rows });
+    // Tenant is the FIRST argument now — reads are scoped by partition key,
+    // so a caller cannot reach another tenant's reactions.
     expect(mockListByLobby).toHaveBeenCalledWith(
+      '~',
       'room:lounge',
       '2026-08-25T10:00:00.000Z',
       '2026-08-25T10:30:00.000Z',
@@ -127,7 +130,7 @@ describe('GET /api/video/reactions', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ reactions: [] });
-    expect(mockListByLobby).toHaveBeenCalledWith('room:lounge', undefined, undefined);
+    expect(mockListByLobby).toHaveBeenCalledWith('~', 'room:lounge', undefined, undefined);
   });
 
   it('400s when lobbyName is missing', async () => {
