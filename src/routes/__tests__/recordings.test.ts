@@ -18,6 +18,9 @@ import express, {
 
 const mockListByUser = jest.fn();
 const mockGetRecording = jest.fn();
+const mockFindByRecordingId = jest.fn();
+const mockHasParticipantRow = jest.fn();
+const mockUpdateComposeState = jest.fn();
 const mockGetSessionsByDocument = jest.fn();
 const mockDocClientSend = jest.fn();
 const mockCallSfu = jest.fn();
@@ -30,17 +33,37 @@ jest.mock('../../middleware/auth', () => ({
   },
 }));
 
-jest.mock('../../repositories', () => ({
-  callRecordingRepo: {
-    listByUser: (...args: unknown[]) => mockListByUser(...args),
-    getRecording: (...args: unknown[]) => mockGetRecording(...args),
-    listByLobbyName: jest.fn(),
-    deleteRecording: jest.fn(),
-  },
-  videoSessionRepo: {
-    getSessionsByDocument: (...args: unknown[]) => mockGetSessionsByDocument(...args),
-  },
-}));
+jest.mock('../../repositories', () => {
+  // `describeMedia` is a pure function over a row — mocking it would mean
+  // the tests below assert against a fake notion of what is playable, which
+  // is the one thing they exist to check. Take the real one.
+  const { describeMedia } = jest.requireActual('../../repositories/CallRecordingRepository');
+  return {
+    describeMedia,
+    callRecordingRepo: {
+      listByUser: (...args: unknown[]) => mockListByUser(...args),
+      getRecording: (...args: unknown[]) => mockGetRecording(...args),
+      findByRecordingId: (...args: unknown[]) => mockFindByRecordingId(...args),
+      hasParticipantRow: (...args: unknown[]) => mockHasParticipantRow(...args),
+      updateComposeState: (...args: unknown[]) => mockUpdateComposeState(...args),
+      // The real implementation, so a route that reaches for the point
+      // lookup exercises the same two calls production would make.
+      async resolveForUser(userId: string, recordingId: string) {
+        const detail = await mockFindByRecordingId(recordingId);
+        if (!detail) return null;
+        const isParticipant = await mockHasParticipantRow(
+          userId, detail.startedAt, recordingId,
+        );
+        return { detail, isParticipant };
+      },
+      listByLobbyName: jest.fn(),
+      deleteRecording: jest.fn(),
+    },
+    videoSessionRepo: {
+      getSessionsByDocument: (...args: unknown[]) => mockGetSessionsByDocument(...args),
+    },
+  };
+});
 
 jest.mock('../../lib/aws-clients', () => ({
   docClient: { send: (...args: unknown[]) => mockDocClientSend(...args) },
@@ -140,12 +163,30 @@ function lvsFail(status: number) {
 
 // --- tests ------------------------------------------------------------------
 
+/**
+ * Point the route at one recording, with the caller in it (or not).
+ *
+ * Mirrors the two point-reads `resolveForUser` performs: the GSI query for
+ * the recording, and the fan-out point-get for membership. Note there is no
+ * page size anywhere in this helper — that is the fix.
+ */
+function givenRecording(detail: Record<string, unknown>, isParticipant = true): void {
+  mockFindByRecordingId.mockImplementation(async (id: string) =>
+    id === detail.recordingId ? detail : null);
+  mockHasParticipantRow.mockResolvedValue(isParticipant);
+}
+
 beforeEach(() => {
   mockListByUser.mockReset();
   mockGetRecording.mockReset();
+  mockFindByRecordingId.mockReset().mockResolvedValue(null);
+  mockHasParticipantRow.mockReset().mockResolvedValue(false);
+  mockUpdateComposeState.mockReset().mockResolvedValue(undefined);
   mockGetSessionsByDocument.mockReset();
   mockDocClientSend.mockReset();
-  mockCallSfu.mockReset();
+  // Default: LVS is not answering. Every route must still produce a
+  // coherent answer from the stored row rather than a guessed URL.
+  mockCallSfu.mockReset().mockResolvedValue(lvsFail(503));
   mockMapSfuError.mockReset().mockImplementation((e) => {
     if (e?.name === 'BreakerOpenError') return new AppError(503, 'breaker open');
     if (e?.name === 'TimeoutError') return new AppError(504, 'timeout');
@@ -154,23 +195,58 @@ beforeEach(() => {
 });
 
 describe('GET /api/recordings/:recordingId', () => {
+  const base = {
+    recordingId: 'r-1',
+    callId: 'c-1',
+    channelArn: 'arn:1',
+    startedAt: '2026-08-26T00:00:00Z',
+    endedAt: '2026-08-26T00:01:00Z',
+    composeStatus: 'skipped',
+  };
+
   it('returns the recording when the caller participated', async () => {
-    mockListByUser.mockResolvedValue({ items: [{ recordingId: 'r-1', callId: 'c-1' }] });
-    mockGetRecording.mockResolvedValue({ recordingId: 'r-1', callId: 'c-1', startedAt: 't0', endedAt: 't1' });
+    givenRecording(base);
     const res = await run('GET', '/api/recordings/r-1');
     expect(res.statusCode).toBe(200);
     expect((res.body as { recordingId: string }).recordingId).toBe('r-1');
   });
 
-  it('404 when caller did not participate (recording not in user index)', async () => {
-    mockListByUser.mockResolvedValue({ items: [] });
+  it('404 when the caller has no participant row', async () => {
+    givenRecording(base, false);
+    const res = await run('GET', '/api/recordings/r-1');
+    // 404 and not 403 — see the recording:read policy. Confirming that a
+    // recording with this id exists is itself the disclosure.
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('404 when no such recording exists', async () => {
     const res = await run('GET', '/api/recordings/r-x');
     expect(res.statusCode).toBe(404);
+  });
+
+  // -------------------------------------------------------------------
+  // THE DEEP-LINK REGRESSION GUARD.
+  //
+  // The bug was not "the wrong row came back" — it was that the lookup
+  // only ever looked at a PAGE of the caller's recordings, so a recording
+  // past their 100th 404'd while sitting in the table. Asserting on the
+  // returned row cannot catch that; asserting that no bounded list is
+  // consulted at all can. If someone reintroduces `listByUser({limit})`
+  // here, this fails.
+  // -------------------------------------------------------------------
+  it('resolves by id alone and never consults a bounded list of the user\'s recordings', async () => {
+    givenRecording(base);
+    const res = await run('GET', '/api/recordings/r-1');
+    expect(res.statusCode).toBe(200);
+    expect(mockListByUser).not.toHaveBeenCalled();
+    expect(mockFindByRecordingId).toHaveBeenCalledWith('r-1');
+    // Membership is a point-get on the exact fan-out key, which is only
+    // constructible once startedAt is known from the primary row.
+    expect(mockHasParticipantRow).toHaveBeenCalledWith('u-1', base.startedAt, 'r-1');
   });
 });
 
 describe('POST /api/recordings/:recordingId/playback-token', () => {
-  const matchItem = { recordingId: 'r-1', callId: 'c-1', channelArn: 'arn:1' };
   const matchDetail = {
     recordingId: 'r-1',
     callId: 'c-1',
@@ -178,11 +254,14 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
     lobbyName: 'doc-1',
     startedAt: '2026-05-30T00:00:00Z',
     endedAt: '2026-05-30T00:30:00Z',
+    // Settled compose with a real file — so `resolveMedia` short-circuits
+    // and the only LVS call these cases make is the token mint.
+    composeStatus: 'ok',
+    composedSegment: { key: 'arn_1/r-1/composed.mp4' },
   };
 
   it('returns playlistUrl + token on 200 from LVS (happy path)', async () => {
-    mockListByUser.mockResolvedValue({ items: [matchItem] });
-    mockGetRecording.mockResolvedValue(matchDetail);
+    givenRecording(matchDetail);
     mockCallSfu.mockResolvedValue(lvsOk({ token: 'tok', expiresAt: '2026-05-30T01:00:00Z' }));
 
     const prevAdmin = process.env.VIDEO_ADMIN_TOKEN;
@@ -214,8 +293,7 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
   });
 
   it('returns empty token when LVS responds 400 (public channel, playback open)', async () => {
-    mockListByUser.mockResolvedValue({ items: [matchItem] });
-    mockGetRecording.mockResolvedValue(matchDetail);
+    givenRecording(matchDetail);
     mockGetSessionsByDocument.mockResolvedValue([]);
     mockCallSfu.mockResolvedValue(lvsFail(400));
 
@@ -227,8 +305,7 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
   });
 
   it('503 when the SFU breaker is open (BreakerOpenError → mapSfuError)', async () => {
-    mockListByUser.mockResolvedValue({ items: [matchItem] });
-    mockGetRecording.mockResolvedValue(matchDetail);
+    givenRecording(matchDetail);
     mockGetSessionsByDocument.mockResolvedValue([{ channelArn: 'arn:1', streamKey: 'sk-1' }]);
     const breakerOpen = new Error('breaker');
     breakerOpen.name = 'BreakerOpenError';
@@ -239,8 +316,7 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
   });
 
   it('502 when LVS returns non-400 4xx/5xx (AppError thrown inside try)', async () => {
-    mockListByUser.mockResolvedValue({ items: [matchItem] });
-    mockGetRecording.mockResolvedValue(matchDetail);
+    givenRecording(matchDetail);
     mockGetSessionsByDocument.mockResolvedValue([{ channelArn: 'arn:1', streamKey: 'sk-1' }]);
     mockCallSfu.mockResolvedValue(lvsFail(500));
 
@@ -249,10 +325,148 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
   });
 
   it('404 when caller did not participate', async () => {
-    mockListByUser.mockResolvedValue({ items: [] });
-    const res = await run('POST', '/api/recordings/r-x/playback-token');
+    givenRecording(matchDetail, false);
+    const res = await run('POST', '/api/recordings/r-1/playback-token');
     expect(res.statusCode).toBe(404);
     expect(mockCallSfu).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Playback error." was one message covering three unrelated situations,
+// because the route ended its file-picking chain with `?? 'composed.mp4'`
+// and let the browser 404 discover the truth. Only 11 of 941 recordings
+// actually have composed media; 220 are still queued and 125 were skipped.
+// These are the three cases, kept apart.
+// ---------------------------------------------------------------------------
+describe('media state — the thing "Playback error." was hiding', () => {
+  const row = (over: Record<string, unknown>) => ({
+    recordingId: 'r-1',
+    callId: 'c-1',
+    channelArn: 'arn:1',
+    lobbyName: 'dm:a:b',
+    startedAt: '2026-08-26T00:00:00Z',
+    endedAt: '2026-08-26T00:01:00Z',
+    ...over,
+  });
+
+  it('compose still queued → processing, no URL, and no token minted', async () => {
+    givenRecording(row({ composeStatus: 'queued', tracks: [{ key: 'x/peer_leg-001.mp4' }, { key: 'x/peer_leg-002.mp4' }] }));
+    const res = await run('POST', '/api/recordings/r-1/playback-token');
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { mediaState: string; composeStatus: string; composedUrl: string | null };
+    expect(body.mediaState).toBe('processing');
+    expect(body.composeStatus).toBe('queued');
+    expect(body.composedUrl).toBeNull();
+    // The route still asks LVS what compose is doing — that is the only way
+    // it can know — but there is nothing to sign, so nothing is signed.
+    const urls = mockCallSfu.mock.calls.map((c) => c[0] as string);
+    expect(urls.some((u) => u.includes('playback-tokens'))).toBe(false);
+  });
+
+  it('compose skipped with no media at all → unavailable, no URL', async () => {
+    givenRecording(row({ composeStatus: 'skipped', segments: [], tracks: [] }));
+    const res = await run('POST', '/api/recordings/r-1/playback-token');
+    const body = res.body as { mediaState: string; composeStatus: string; composedUrl: string | null };
+    expect(body.mediaState).toBe('unavailable');
+    expect(body.composeStatus).toBe('skipped');
+    expect(body.composedUrl).toBeNull();
+  });
+
+  // A solo call is `skipped` (there is no grid to build from one leg) and
+  // has an EMPTY segments[] — but its single per-peer leg is real, servable
+  // media. Writing skipped off as "nothing to play" would bury all 125 of
+  // them behind a shrug.
+  it('a skipped SOLO recording still plays, from its one per-peer leg', async () => {
+    givenRecording(row({
+      composeStatus: 'skipped',
+      segments: [],
+      tracks: [{ key: 'arn_1/r-1/peer_leg-001.mp4', size: 796 }],
+    }));
+    mockCallSfu.mockResolvedValue(lvsOk({ token: 'tok', expiresAt: 'later' }));
+    const res = await run('POST', '/api/recordings/r-1/playback-token');
+    const body = res.body as { mediaState: string; composedUrl: string };
+    expect(body.mediaState).toBe('playable');
+    expect(body.composedUrl).toContain('/segments/peer_leg-001.mp4');
+  });
+
+  it('reads live compose status from LVS when the row has none, and caches a settled answer', async () => {
+    givenRecording(row({ tracks: [{ key: 'a/peer_leg-001.mp4' }, { key: 'a/peer_leg-002.mp4' }] }));
+    mockCallSfu.mockImplementation(async (url: string) => {
+      if (url.endsWith('/recordings')) {
+        return lvsOk({ recordings: [{ recordingId: 'r-1', composeStatus: 'ok', composedSegment: { key: 'a/composed.mp4' } }] });
+      }
+      return lvsOk({ token: 'tok', expiresAt: 'later' });
+    });
+    const res = await run('POST', '/api/recordings/r-1/playback-token');
+    const body = res.body as { mediaState: string; composeStatus: string; composedUrl: string };
+    expect(body.composeStatus).toBe('ok');
+    expect(body.mediaState).toBe('playable');
+    expect(body.composedUrl).toContain('/segments/composed.mp4');
+    // Cached, so the next read does not re-ask LVS about a job that is done.
+    expect(mockUpdateComposeState).toHaveBeenCalledWith('c-1', 'r-1', expect.objectContaining({ composeStatus: 'ok' }));
+  });
+
+  it('an unreachable LVS reports what the row knows, never a guessed URL', async () => {
+    givenRecording(row({ tracks: [{ key: 'a/peer_leg-001.mp4' }, { key: 'a/peer_leg-002.mp4' }] }));
+    mockCallSfu.mockRejectedValue(new Error('ECONNREFUSED'));
+    const res = await run('POST', '/api/recordings/r-1/playback-token');
+    const body = res.body as { mediaState: string; composedUrl: string | null };
+    // Two legs and no composed file we've been told about: compose is
+    // presumed still queued, which is honest, and there is nothing to play.
+    expect(body.mediaState).toBe('processing');
+    expect(body.composedUrl).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The transcript 202 used to carry no way of knowing whether to ask again,
+// so the client asked forever — six identical requests were observed for
+// one recording whose transcript does not exist.
+// ---------------------------------------------------------------------------
+describe('GET /api/recordings/:recordingId/transcript — bounded polling', () => {
+  const transcriptRow = (over: Record<string, unknown>) => ({
+    recordingId: 'r-1',
+    callId: 'c-1',
+    channelArn: 'arn:1',
+    lobbyName: 'dm:a:b',
+    startedAt: new Date(Date.now() - 120_000).toISOString(),
+    endedAt: new Date(Date.now() - 60_000).toISOString(),
+    composeStatus: 'skipped',
+    ...over,
+  });
+
+  it('in flight → 202 with terminal:false and a retry delay', async () => {
+    givenRecording(transcriptRow({ transcriptStatus: 'processing' }));
+    const res = await run('GET', '/api/recordings/r-1/transcript');
+    expect(res.statusCode).toBe(202);
+    const body = res.body as { status: string; terminal: boolean; retryAfterMs: number };
+    expect(body.status).toBe('processing');
+    expect(body.terminal).toBe(false);
+    expect(body.retryAfterMs).toBeGreaterThanOrEqual(5_000);
+  });
+
+  it('failed → terminal, with no retry delay to act on', async () => {
+    givenRecording(transcriptRow({ transcriptStatus: 'failed', transcriptError: 'whisper OOM' }));
+    const res = await run('GET', '/api/recordings/r-1/transcript');
+    const body = res.body as { terminal: boolean; retryAfterMs: number | null; error: string };
+    expect(body.terminal).toBe(true);
+    expect(body.retryAfterMs).toBeNull();
+    expect(body.error).toBe('whisper OOM');
+  });
+
+  it('pending long past the stall deadline → stalled and terminal', async () => {
+    givenRecording(transcriptRow({
+      transcriptStatus: 'pending',
+      endedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    }));
+    const res = await run('GET', '/api/recordings/r-1/transcript');
+    const body = res.body as { status: string; terminal: boolean; retryAfterMs: number | null };
+    // 'stalled', not 'failed' — nothing ever picked the job up, which is a
+    // different thing to go look at than a worker that ran and gave up.
+    expect(body.status).toBe('stalled');
+    expect(body.terminal).toBe(true);
+    expect(body.retryAfterMs).toBeNull();
   });
 });
 
@@ -292,11 +506,20 @@ describe('GET /api/recordings/:recordingId — what leaves the process', () => {
         kind: 'av',
       },
     ],
+    // The field the original scrub missed. Measured live 2026-08-26: a
+    // response with a perfectly clean `tracks[]` sitting next to
+    // `composedSegment.url: file:///Users/<developer>/…`. Scrubbing one
+    // field and not its neighbour is how a fix looks finished while the
+    // leak is still on the wire.
+    composedSegment: {
+      key: 'arn_local_ivs_channel_fe74b6a1/2026-08-26T02-35-09-652Z-546cf1e9/composed.mp4',
+      url: 'file:///Users/connorhoehn/Projects/realtime-examples/.tilt-lvs-recordings/x/composed.mp4',
+      size: 41_000,
+    },
   };
 
   it('no file:// URI and no developer home directory anywhere in the response', async () => {
-    mockListByUser.mockResolvedValue({ items: [{ recordingId: 'r-1', callId: 'c-1' }] });
-    mockGetRecording.mockResolvedValue(leakyDetail);
+    givenRecording(leakyDetail);
 
     const res = await run('GET', '/api/recordings/r-1');
     expect(res.statusCode).toBe(200);
@@ -307,9 +530,17 @@ describe('GET /api/recordings/:recordingId — what leaves the process', () => {
     expect(serialized).not.toContain('.tilt-lvs-recordings');
   });
 
+  it('keeps composedSegment useful without its recorder-pod path', async () => {
+    givenRecording(leakyDetail);
+    const res = await run('GET', '/api/recordings/r-1');
+    const seg = (res.body as { composedSegment: Record<string, unknown> }).composedSegment;
+    expect(seg.size).toBe(41_000);
+    expect(seg.key).toContain('composed.mp4');
+    expect(seg).not.toHaveProperty('url');
+  });
+
   it('tracks[] carry the same proxied /segments/ URL shape as the composed file', async () => {
-    mockListByUser.mockResolvedValue({ items: [{ recordingId: 'r-1', callId: 'c-1' }] });
-    mockGetRecording.mockResolvedValue(leakyDetail);
+    givenRecording(leakyDetail);
 
     const res = await run('GET', '/api/recordings/r-1');
     const track = (res.body as { tracks: Array<Record<string, unknown>> }).tracks[0]!;
@@ -325,8 +556,7 @@ describe('GET /api/recordings/:recordingId — what leaves the process', () => {
   });
 
   it('participants are deduped and include the initiator', async () => {
-    mockListByUser.mockResolvedValue({ items: [{ recordingId: 'r-1', callId: 'c-1' }] });
-    mockGetRecording.mockResolvedValue(leakyDetail);
+    givenRecording(leakyDetail);
 
     const res = await run('GET', '/api/recordings/r-1');
     const body = res.body as {

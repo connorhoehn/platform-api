@@ -123,8 +123,13 @@ export {
   CallRecordingParticipant,
   RecordingListRow,
   RecordingSegment,
+  ComposeStatus,
+  RecordingMediaState,
+  describeMedia,
+  deriveComposeStatus,
   CALL_RECORDINGS_TABLE,
   CALL_RECORDING_PARTICIPANTS_TABLE,
+  RECORDING_ID_INDEX,
 } from './CallRecordingRepository';
 export {
   CallReactionRepository,

@@ -142,3 +142,46 @@ describe('recording:listByLobby — the hole this closed', () => {
     expect((await listByLobby(hank, '')).allow).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// `recording:read` exists because the lookup behind it got wider.
+//
+// It used to be `listByUser(caller, { limit: 100 }).find(...)` — the
+// caller's own index served as both the lookup and, by accident, the access
+// check. Replacing that with a by-id point-query (so a recording past the
+// caller's 100th stops 404ing) removed the accident, so the check had to
+// become deliberate. These are the properties it must hold.
+// ---------------------------------------------------------------------------
+describe('recording:read', () => {
+  const read = (principal: ReturnType<typeof principalOf>, attrs?: Record<string, unknown>) =>
+    authorize({
+      principal,
+      action: 'recording:read',
+      resource: { type: 'recording', id: 'rec-abc', ...(attrs ? { attrs } : {}) },
+    });
+
+  it('allows a participant', async () => {
+    expect((await read(hank, { isParticipant: true })).allow).toBe(true);
+  });
+
+  it('refuses a non-participant with 404, not 403', async () => {
+    const d = await read(hank, { isParticipant: false });
+    expect(d.allow).toBe(false);
+    // Recordings are made of DMs between named people. A 403 would confirm
+    // the recording exists, which is the same disclosure listByLobby
+    // refuses above.
+    expect(d.allow === false && d.status).toBe(404);
+  });
+
+  it('DENIES when membership was never established — never falls open', async () => {
+    // A failed or skipped fan-out lookup arrives as a missing attr. Anything
+    // other than an explicit `true` has to refuse.
+    expect((await read(hank)).allow).toBe(false);
+    expect((await read(hank, { isParticipant: 'true' })).allow).toBe(false);
+    expect((await read(hank, { isParticipant: undefined })).allow).toBe(false);
+  });
+
+  it('is registered, so it is not silently default-denied', async () => {
+    expect(registeredActions()).toContain('recording:read');
+  });
+});

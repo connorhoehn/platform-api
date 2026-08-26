@@ -16,7 +16,11 @@ import {
   ScanCommand,
   DeleteCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { CallRecordingRepository } from '../CallRecordingRepository';
+import {
+  CallRecordingRepository,
+  describeMedia,
+  deriveComposeStatus,
+} from '../CallRecordingRepository';
 
 jest.mock('../../lib/ddb-table-name', () => ({
   tableName: (name: string) => `test-${name}`,
@@ -575,5 +579,163 @@ describe('CallRecordingRepository.listByLobbyName — people, not sessions (FIND
     expect(items[0]!.participants!.map((p) => p.displayName).sort()).toEqual([
       'Bob Martinez', 'Hank Hill',
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The id-only lookup. Six routes used to do this by listing the caller's
+// first 100 fan-out rows and scanning them in memory, which meant a user
+// with 101 recordings got a hard 404 on a recording sitting in the table.
+// ---------------------------------------------------------------------------
+describe('CallRecordingRepository — point-lookup by recordingId', () => {
+  test('findByRecordingId queries the GSI, not the table, and not a scan', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({
+      Items: [{ callId: 'c-9', recordingId: 'r-9', startedAt: 't0', durationMs: 1000 }],
+    });
+
+    const rec = await repo.findByRecordingId('r-9');
+    expect(rec?.callId).toBe('c-9');
+
+    const input = mockSend.mock.calls[0][0].input;
+    expect(input.IndexName).toBe('recordingId-index');
+    expect(input.KeyConditionExpression).toBe('recordingId = :r');
+    expect(input.ExpressionAttributeValues).toEqual({ ':r': 'r-9' });
+    // No FilterExpression, no Limit-then-scan-in-memory. If this ever grows
+    // one, the 404-on-an-existing-recording bug is back.
+    expect(input.FilterExpression).toBeUndefined();
+  });
+
+  test('findByRecordingId returns null when the id matches nothing', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({ Items: [] });
+    expect(await repo.findByRecordingId('nope')).toBeNull();
+  });
+
+  test('resolveForUser point-gets the fan-out row on the exact key', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend
+      .mockResolvedValueOnce({ Items: [{ callId: 'c-9', recordingId: 'r-9', startedAt: '2026-08-26T00:00:00Z' }] })
+      .mockResolvedValueOnce({ Item: { userId: 'u-1' } });
+
+    const out = await repo.resolveForUser('u-1', 'r-9');
+    expect(out?.isParticipant).toBe(true);
+
+    const getInput = mockSend.mock.calls[1][0].input;
+    expect(getInput.TableName).toBe('test-video-call-recording-participants');
+    // `${startedAt}#${recordingId}` — the SK that was unreachable before,
+    // because startedAt was unknown until the primary row was in hand.
+    expect(getInput.Key).toEqual({
+      userId: 'u-1',
+      startedAtRecordingId: '2026-08-26T00:00:00Z#r-9',
+    });
+  });
+
+  test('resolveForUser reports a non-participant rather than hiding the row', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend
+      .mockResolvedValueOnce({ Items: [{ callId: 'c-9', recordingId: 'r-9', startedAt: 't0' }] })
+      .mockResolvedValueOnce({}); // no fan-out row
+
+    const out = await repo.resolveForUser('stranger', 'r-9');
+    // The repository states the fact; the policy decides what to answer.
+    expect(out?.isParticipant).toBe(false);
+  });
+
+  test('resolveForUser returns null when the recording does not exist', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({ Items: [] });
+    expect(await repo.resolveForUser('u-1', 'ghost')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The three states "Playback error." was collapsing.
+// ---------------------------------------------------------------------------
+describe('describeMedia', () => {
+  test('a composed grid is playable', () => {
+    const m = describeMedia({ composeStatus: 'ok', composedSegment: { key: 'a/b/composed.mp4' } });
+    expect(m).toEqual({ composeStatus: 'ok', mediaState: 'playable', playbackFilename: 'composed.mp4' });
+  });
+
+  test('compose queued with no file yet is PROCESSING, not an error', () => {
+    const m = describeMedia({ composeStatus: 'queued', tracks: [{ key: 'x/peer_leg-001.mp4' }, { key: 'x/peer_leg-002.mp4' }] });
+    expect(m.mediaState).toBe('processing');
+    // Deliberately no filename: serving one leg of a two-person call as
+    // "the recording" shows one person and calls it a conversation.
+    expect(m.playbackFilename).toBeNull();
+  });
+
+  test('a legacy skipped SOLO call plays from its single leg', () => {
+    // 125 rows looked exactly like this before LVS started composing solo
+    // calls: composeStatus skipped, segments[] empty, one genuine per-peer
+    // file. New recordings compose instead, but these rows are still here.
+    const m = describeMedia({ composeStatus: 'skipped', segments: [], tracks: [{ key: 'x/peer_leg-001.mp4' }] });
+    expect(m.mediaState).toBe('playable');
+    expect(m.playbackFilename).toBe('peer_leg-001.mp4');
+  });
+
+  // 306 recordings on disk are 28-byte moov-less stubs from a historical
+  // truncated-mux bug. They have names and sizes and serve a 200, so
+  // everything short of the decoder believes them.
+  test('a 28-byte stub is not media, and we say so before the browser finds out', () => {
+    const m = describeMedia({
+      composeStatus: 'ok',
+      composedSegment: { key: 'x/composed.mp4', size: 28 },
+    });
+    expect(m.mediaState).toBe('unavailable');
+    expect(m.playbackFilename).toBeNull();
+  });
+
+  test('skips past a stub to a live file rather than giving up at the first name', () => {
+    const m = describeMedia({
+      composeStatus: 'skipped',
+      tracks: [{ key: 'x/peer_leg-001.mp4', size: 28 }, { key: 'x/peer_leg-002.mp4', size: 41_000 }],
+    });
+    expect(m.playbackFilename).toBe('peer_leg-002.mp4');
+  });
+
+  test('an unknown size is not an empty size', () => {
+    // Most rows carry no size at all. "We don't know" must not be read as
+    // "it's empty", or every one of them goes dark.
+    const m = describeMedia({ composeStatus: 'ok', composedSegment: { key: 'x/composed.mp4' } });
+    expect(m.mediaState).toBe('playable');
+  });
+
+  test('degraded is a composed, playable recording — not a failure', () => {
+    // The label came from grading output length against wall-clock while
+    // the windowed pipeline deliberately drops dead air, so any call where
+    // someone left early was marked down. The file exists and plays.
+    const m = describeMedia({ composeStatus: 'degraded', composedSegment: { key: 'x/composed.mp4', size: 900_000 } });
+    expect(m.mediaState).toBe('playable');
+  });
+
+  test('skipped with nothing on the row at all is UNAVAILABLE, permanently', () => {
+    const m = describeMedia({ composeStatus: 'skipped', segments: [], tracks: [] });
+    expect(m.mediaState).toBe('unavailable');
+    expect(m.playbackFilename).toBeNull();
+  });
+
+  test('never names a file it has not been told about', () => {
+    // The bug in one line: the old chain ended `?? 'composed.mp4'`, so
+    // "we have no idea" came out as a confident URL that 404'd.
+    expect(describeMedia({}).playbackFilename).toBeNull();
+    expect(describeMedia({ composeStatus: 'failed' }).playbackFilename).toBeNull();
+  });
+
+  test('derives a status for rows LVS never stamped one on', () => {
+    // No row this service persists has ever carried composeStatus — the
+    // webhook fires before compose runs and never fires again.
+    expect(deriveComposeStatus({ tracks: [{ key: 'a.mp4' }, { key: 'b.mp4' }] })).toBe('queued');
+    // ONE leg is enough — LVS composes a solo call onto a 1x1 canvas now.
+    // The old two-leg threshold is what stranded 125 recordings on
+    // 'skipped' forever.
+    expect(deriveComposeStatus({ tracks: [{ key: 'a.mp4' }] })).toBe('queued');
+    expect(deriveComposeStatus({ tracks: [] })).toBe('skipped');
+    expect(deriveComposeStatus({ composedSegment: { key: 'composed.mp4' } })).toBe('ok');
+    // Never invents 'failed' — "compose failed" and "compose hasn't run"
+    // are not distinguishable from row contents, and guessing between them
+    // is how the UI started lying.
+    expect(deriveComposeStatus({})).not.toBe('failed');
   });
 });

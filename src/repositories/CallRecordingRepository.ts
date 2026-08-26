@@ -45,6 +45,27 @@ export const CALL_RECORDING_PARTICIPANTS_TABLE = tableName(
   'video-call-recording-participants',
 );
 
+/**
+ * GSI that makes `recordingId` a point-lookup key.
+ *
+ * The primary table is keyed PK `callId` + SK `recordingId`, so a URL that
+ * carries only a `recordingId` — which is every recording URL in the app,
+ * and every share link — could not point-get. Six routes worked around
+ * that by listing the caller's first 100 fan-out rows and scanning them in
+ * memory, which means a user with 101 recordings got a 404 on a recording
+ * that demonstrably exists. That is not a rare edge: the fan-out table
+ * writes one row per participant per recording, so a chatty account passes
+ * 100 in weeks.
+ *
+ * Paging that scan would have removed the 404 without removing the shape
+ * that produced it — the next route to be written would reach for the same
+ * bounded list. A `recordingId` index removes the shape: there is no
+ * "how many did we look at" question left to get wrong.
+ *
+ * Projection is ALL so the detail routes need no follow-up GetItem.
+ */
+export const RECORDING_ID_INDEX = 'recordingId-index';
+
 export interface RecordingSegment {
   key: string;
   url: string;
@@ -65,6 +86,42 @@ export interface RecordingTrack {
   /** 'video' | 'audio' — when ffmpeg recorded a/v together this stays unset. */
   kind?: 'video' | 'audio' | 'av';
 }
+
+/**
+ * LVS's compose-job vocabulary, reproduced exactly (see
+ * live-video-streaming/src/recording/RecordingManager.js — `composeStatus`
+ * is validated there against this same set).
+ */
+export type ComposeStatus =
+  | 'queued'
+  | 'running'
+  | 'ok'
+  | 'degraded'
+  | 'failed'
+  | 'skipped';
+
+/**
+ * What the viewer can actually be told about this recording's media, and
+ * the ONLY thing the playback surface is allowed to branch on.
+ *
+ * Three genuinely different situations were collapsed into one bare
+ * "Playback error." because the API handed the player a fabricated
+ * `composed.mp4` URL in every case and let the `<video>` element discover
+ * the truth by 404ing:
+ *
+ *   'playable'   — a file exists and we know its name.
+ *   'processing' — compose is queued or running. Nothing to play YET. This
+ *                  is not an error and must never be rendered as one.
+ *   'unavailable'— compose was skipped or failed and no per-leg media is
+ *                  servable either. There will never be anything to play.
+ *                  Also not an error — the recording is intact, it just
+ *                  has no video, and saying so is the whole job.
+ *
+ * A real playback failure — the file is named, we handed over its URL, and
+ * the browser still could not play it — is the fourth case, and it is the
+ * only one the player itself gets to report.
+ */
+export type RecordingMediaState = 'playable' | 'processing' | 'unavailable';
 
 export interface CallRecordingParticipant {
   userId: string;
@@ -130,6 +187,45 @@ export interface CallRecording {
   composedUrl?: string;
   /** R2 — per-peer raw track files. Empty for single-producer calls. */
   tracks?: RecordingTrack[];
+  /**
+   * The LVS compose job's own word for what happened to this recording's
+   * media. Carried verbatim from the `recording.completed` webhook — this
+   * service deliberately does not invent a parallel vocabulary, because the
+   * two would drift and then nobody could tell which one was lying.
+   *
+   *   'queued'   — eligible for compose; the background ffmpeg job has not
+   *                finished. The webhook fires BEFORE compose completes, so
+   *                this is the status most rows are born with.
+   *   'running'  — ffmpeg is working.
+   *   'ok'       — composed.mp4 exists.
+   *   'degraded' — composed.mp4 ALSO exists and plays. This is not a broken
+   *                state: the grade came from comparing output length to
+   *                wall-clock, while the windowed pipeline deliberately
+   *                drops dead air, so every call where somebody left early
+   *                was marked down. Legacy rows keep the label. Do not
+   *                render it as a failure.
+   *   'failed'   — compose ran and produced nothing usable.
+   *   'skipped'  — compose never ran because there were no legs at all.
+   *                It used to also mean "only one leg, so no grid to
+   *                build"; LVS composes a solo leg now, so that reading is
+   *                historical.
+   *
+   * Absent on rows written before this field existed and on rows from an
+   * LVS build that does not send it — `deriveComposeStatus` fills that gap
+   * from the media that IS on the row, so readers never have to branch on
+   * `undefined`.
+   */
+  composeStatus?: ComposeStatus;
+  /**
+   * The composed grid file, once LVS has actually produced it. Never
+   * present off the `recording.completed` webhook — compose has not run at
+   * that point — so this is written back by the read path after it
+   * reconciles live status from LVS. It was already being read here via an
+   * inline cast in routes/recordings.ts; declared so the two can't disagree.
+   */
+  composedSegment?: { key?: string; url?: string; size?: number };
+  /** ISO timestamp of the last live compose-status reconciliation. */
+  composeCheckedAt?: string;
   /**
    * Transcription pipeline state. Sparse — only set when the user opted
    * into transcription for this recording (recordingConfiguration.transcribe
@@ -231,6 +327,145 @@ function normalizeDuration<T extends { durationMs?: number; sessionDurationMs?: 
   };
 }
 
+/** Basename of a stored object key/url, or null when unrecoverable. */
+function basenameOf(candidate: string | undefined | null): string | null {
+  if (typeof candidate !== 'string' || candidate.length === 0) return null;
+  const name = candidate.split(/[\\/]/).pop();
+  if (!name || !name.includes('.')) return null;
+  return name;
+}
+
+/** The composed grid file's name, from whichever field carries it. */
+function composedFilenameOf(rec: ComposableRecording): string | null {
+  const seg = rec.composedSegment;
+  if (isDeadFile(seg?.size)) return null;
+  return basenameOf(seg?.key ?? seg?.url ?? rec.composedUrl);
+}
+
+/** First entry that is both named and not a stub. */
+function firstLiveFilename(
+  files: Array<{ key?: string; url?: string; size?: number }> | undefined,
+): string | null {
+  for (const f of files ?? []) {
+    if (isDeadFile(f?.size)) continue;
+    const name = basenameOf(f?.key ?? f?.url);
+    if (name) return name;
+  }
+  return null;
+}
+
+/** Whatever this recording holds that a player could be pointed at. */
+export interface ComposableRecording {
+  composeStatus?: ComposeStatus;
+  composedUrl?: string;
+  composedSegment?: { key?: string; url?: string; size?: number };
+  segments?: Array<{ key?: string; url?: string; size?: number }>;
+  tracks?: Array<{ key?: string; url?: string; size?: number }>;
+}
+
+/**
+ * Below this, a file cannot be a playable MP4 — it is a stub.
+ *
+ * 306 recordings on disk are 28-byte files: an `ftyp` box and nothing
+ * after it, left by a historical truncated-mux bug. They have a name, a
+ * size, and a URL that returns 200, so everything upstream of the decoder
+ * thinks they are fine; the browser opens one, finds no `moov` atom, and
+ * fires an error the player can only describe as "Playback error."
+ *
+ * A real MP4 with a moov atom does not fit in 64 bytes, so anything at or
+ * under that is dead with certainty rather than by guess. The threshold is
+ * deliberately far below the smallest real file we have on record (796
+ * bytes) — the point is to catch stubs, not to adjudicate marginal files.
+ * When `size` is absent we say nothing, because "unknown" is not "empty".
+ */
+const MIN_PLAYABLE_BYTES = 64;
+
+/** A file we can be sure holds no decodable video. */
+function isDeadFile(size: number | undefined): boolean {
+  return typeof size === 'number' && size <= MIN_PLAYABLE_BYTES;
+}
+
+/**
+ * The compose status of a row that never got one.
+ *
+ * LVS fires `recording.completed` BEFORE the background compose job runs and
+ * never fires a second webhook, so no row this service persists has ever
+ * carried a compose status — and `composedUrl` off that webhook is always
+ * undefined too (verified in RecordingManager: nothing assigns
+ * `record.composedUrl`). Live status therefore has to be read back from LVS.
+ * When that read is unavailable, this reconstructs the status from the media
+ * that IS on the row, using the same rule LVS uses to pick it:
+ *
+ *   one or more per-peer legs → there is something to compose → 'queued'
+ *   none                      → nothing to compose → 'skipped'
+ *
+ * The threshold is ONE leg, not two. LVS used to require two — a solo call
+ * had no grid to build, so 125 recordings sat permanently 'skipped' — and as
+ * of LVS 92d2e74 a single leg composes onto a 1×1 canvas instead. Both
+ * 'queued' and 'skipped' are now zero in live data; this rule is for legacy
+ * rows and for when LVS cannot be reached.
+ *
+ * Deliberately conservative: it never claims 'ok' for a file it has not been
+ * told exists, and never claims 'failed', because "compose failed" and
+ * "compose has not run yet" are not distinguishable from row contents alone
+ * and guessing between them is how the UI started lying in the first place.
+ */
+export function deriveComposeStatus(rec: ComposableRecording): ComposeStatus {
+  if (rec.composeStatus) return rec.composeStatus;
+  if (composedFilenameOf(rec)) return 'ok';
+  return (rec.tracks?.length ?? 0) >= 1 ? 'queued' : 'skipped';
+}
+
+/**
+ * What we can honestly tell the viewer, and the exact file to serve.
+ *
+ * The route this replaces ended with `?? 'composed.mp4'` — when it had no
+ * idea what to play it named a file it had no reason to think existed, the
+ * browser 404'd, and the player said "Playback error." That fallback is the
+ * bug: it converts "we don't know" into "you broke it".
+ *
+ * Playback target order — composed grid, then a raw segment, then a per-peer
+ * leg. Every step skips stub files, so a name that leads to 28 bytes is not
+ * treated as a name; 306 recordings on disk are exactly that, and each one
+ * used to reach the player as a working URL and come back "Playback error."
+ * Telling someone up front that a file holds nothing is a different message
+ * from letting their browser find out.
+ *
+ * The per-peer fallback is conditional. A leg is real, watchable media, and
+ * for a legacy solo recording it is the whole recording — write those off
+ * and 125 perfectly good videos vanish for no reason. But a multi-party
+ * call whose compose is still `queued` also has legs sitting in `tracks[]`,
+ * and serving the first would present one person's camera as the recording
+ * of a conversation. Smaller than "Playback error.", still a lie, and it
+ * would go permanent wherever compose never lands. So the fallback applies
+ * only once compose has stopped: while it is still coming, the honest
+ * answer is that it is still coming.
+ */
+export function describeMedia(rec: ComposableRecording): {
+  composeStatus: ComposeStatus;
+  mediaState: RecordingMediaState;
+  /** Filename to serve from the LVS segments route; null when nothing to serve. */
+  playbackFilename: string | null;
+} {
+  const composeStatus = deriveComposeStatus(rec);
+  const stillComing = composeStatus === 'queued' || composeStatus === 'running';
+  const playbackFilename =
+    composedFilenameOf(rec)
+    ?? firstLiveFilename(rec.segments)
+    ?? (stillComing ? null : firstLiveFilename(rec.tracks));
+
+  if (playbackFilename) {
+    return { composeStatus, mediaState: 'playable', playbackFilename };
+  }
+  // Nothing to serve. Whether that is temporary or permanent is exactly the
+  // distinction the old code threw away.
+  return {
+    composeStatus,
+    mediaState: stillComing ? 'processing' : 'unavailable',
+    playbackFilename: null,
+  };
+}
+
 export class CallRecordingRepository extends BaseRepository {
   private participantsTable: string;
 
@@ -323,6 +558,124 @@ export class CallRecordingRepository extends BaseRepository {
   async getRecording(callId: string, recordingId: string): Promise<CallRecording | null> {
     const rec = await this.getItem<CallRecording>({ callId, recordingId });
     return rec ? normalizeDuration(rec) : null;
+  }
+
+  /**
+   * Point-get a recording from its id alone, via the `recordingId` GSI.
+   *
+   * This is the lookup the primary key cannot do (PK `callId` + SK
+   * `recordingId`) and the reason every id-only route used to scan.
+   * `recordingId` is a uuid, so the query is a single-item read; if a
+   * duplicate ever appeared we take the first and log, rather than
+   * pretending the ambiguity away.
+   */
+  async findByRecordingId(recordingId: string): Promise<CallRecording | null> {
+    const out = await this.docClient.send(
+      new QueryCommand({
+        TableName: CALL_RECORDINGS_TABLE,
+        IndexName: RECORDING_ID_INDEX,
+        KeyConditionExpression: 'recordingId = :r',
+        ExpressionAttributeValues: { ':r': recordingId },
+        Limit: 1,
+      }),
+    );
+    const item = (out.Items ?? [])[0] as CallRecording | undefined;
+    return item ? normalizeDuration(item) : null;
+  }
+
+  /**
+   * Does this user have a fan-out row for this recording — i.e. did they
+   * participate (or start it), and have they not since untagged themselves?
+   *
+   * A point-get, because by the time we call this we have `startedAt` off
+   * the primary row and can build the exact SK. That is the whole trick:
+   * the fan-out index was always the authorization source of truth, but
+   * without `startedAt` its key was unreachable, so the routes approximated
+   * it by listing a page and scanning — and the approximation went wrong
+   * the moment a user had more recordings than the page held.
+   *
+   * Keeping the fan-out row as the answer (rather than re-deriving it from
+   * `participants[] ∪ {startedBy}` on the primary row) preserves the GDPR
+   * untag path in `deleteByUserId`: that deletes the index row, and a user
+   * who has untagged themselves must stay untagged.
+   */
+  async hasParticipantRow(
+    userId: string,
+    startedAt: string,
+    recordingId: string,
+  ): Promise<boolean> {
+    const out = await this.docClient.send(
+      new GetCommand({
+        TableName: this.participantsTable,
+        Key: { userId, startedAtRecordingId: `${startedAt}#${recordingId}` },
+        ProjectionExpression: 'userId',
+      }),
+    );
+    return Boolean(out.Item);
+  }
+
+  /**
+   * The whole id-only lookup, in two point-reads.
+   *
+   * Returns `null` when no such recording exists, and
+   * `{ detail, isParticipant: false }` when it exists but this user was not
+   * in it — the caller decides how to answer, and for recordings that
+   * answer is 404 either way (see routes/recordings.ts).
+   *
+   * Replaces `listByUser(userId, { limit: 100 })` + `Array.find` in six
+   * routes. The old form 404'd on recordings that exist whenever the caller
+   * had more than 100 fan-out rows; this form has no page to fall off.
+   */
+  async resolveForUser(
+    userId: string,
+    recordingId: string,
+  ): Promise<{ detail: CallRecording; isParticipant: boolean } | null> {
+    const detail = await this.findByRecordingId(recordingId);
+    if (!detail) return null;
+    const isParticipant = await this.hasParticipantRow(
+      userId,
+      detail.startedAt,
+      recordingId,
+    );
+    return { detail, isParticipant };
+  }
+
+  /**
+   * Write back a compose status reconciled from LVS.
+   *
+   * LVS fires no webhook when the background compose job finishes, so the
+   * only way this service ever learns is by asking — and asking on every
+   * read forever, for a value that stops changing once it reaches a
+   * terminal state, would be silly. Caching it here means the LVS round
+   * trip stops as soon as compose settles.
+   *
+   * Best-effort by construction: a failed write just means we ask again
+   * next time. Conditional on the row existing so a reconciliation for a
+   * deleted recording can't resurrect it as a status-only ghost.
+   */
+  async updateComposeState(
+    callId: string,
+    recordingId: string,
+    patch: { composeStatus: ComposeStatus; composedSegment?: { key?: string; url?: string; size?: number } },
+  ): Promise<void> {
+    const sets = ['composeStatus = :cs', 'composeCheckedAt = :ca'];
+    const values: Record<string, unknown> = {
+      ':cs': patch.composeStatus,
+      ':ca': new Date().toISOString(),
+    };
+    if (patch.composedSegment) {
+      sets.push('composedSegment = :seg');
+      values[':seg'] = patch.composedSegment;
+    }
+    await this.docClient.send(
+      new UpdateCommand({
+        TableName: CALL_RECORDINGS_TABLE,
+        Key: { callId, recordingId },
+        UpdateExpression: `SET ${sets.join(', ')}`,
+        ExpressionAttributeValues: values,
+        ConditionExpression: 'attribute_exists(callId)',
+      }),
+    );
   }
 
   /**
@@ -654,7 +1007,14 @@ export class CallRecordingRepository extends BaseRepository {
  *     --key-schema \
  *       AttributeName=callId,KeyType=HASH \
  *       AttributeName=recordingId,KeyType=RANGE \
+ *     --global-secondary-indexes \
+ *       'IndexName=recordingId-index,KeySchema=[{AttributeName=recordingId,KeyType=HASH}],Projection={ProjectionType=ALL}' \
  *     --billing-mode PAY_PER_REQUEST
+ *
+ *   # The GSI is what lets a URL carrying only a recordingId point-get.
+ *   # Without it findByRecordingId throws ValidationException — which is
+ *   # the intended failure: a loud misconfiguration beats a silent fallback
+ *   # to the bounded scan this index exists to delete.
  *
  *   aws dynamodb create-table \
  *     --table-name ${DDB_TABLE_PREFIX}video-call-recording-participants \

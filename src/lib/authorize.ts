@@ -186,6 +186,34 @@ registerPolicy('recording:listByLobby', (req) => {
     : deny('not a member of this room');
 });
 
+/**
+ * `recording:read` — may this principal see this one recording?
+ *
+ * Registered because the lookup behind it got WIDER. It used to be
+ * `listByUser(caller, { limit: 100 }).find(...)`, where the caller's own
+ * fan-out index was both the lookup and, incidentally, the access check —
+ * you could only find what was already yours. That incidental coupling is
+ * gone: the route now point-queries the recording by id first (via the
+ * `recordingId` GSI, so a recording past the caller's 100th no longer
+ * 404s), and asks about membership separately. Membership therefore has to
+ * be an explicit decision, and this is where it lives.
+ *
+ * The caller passes `isParticipant` — the existence of the caller's row in
+ * the participant fan-out table. Anything other than an explicit `true`
+ * denies, so a lookup that failed or was never performed cannot fall open.
+ *
+ * 404, not 403: the id is a uuid, so a caller asking about a recording they
+ * were not in either guessed it or was given it. Answering 403 confirms
+ * that a recording with that id exists — and since recordings are made of
+ * DMs between named people, that is the same disclosure
+ * `recording:listByLobby` refuses above. Same reasoning, same status.
+ */
+registerPolicy('recording:read', (req) => {
+  return req.resource.attrs?.isParticipant === true
+    ? ALLOW
+    : deny('recording not found', 404);
+});
+
 /** Build a Principal from an authenticated request's user. */
 export function principalOf(
   user: { sub?: string; orgId?: string } | undefined,
