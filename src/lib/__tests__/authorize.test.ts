@@ -1,0 +1,144 @@
+// The policy decision point.
+//
+// The two properties that matter here are the ones that make this SAFER than
+// the scattered inline checks it replaces: default-deny for unknown actions,
+// and framework-enforced tenant isolation that a policy cannot forget.
+
+import {
+  ALLOW,
+  authorize,
+  deny,
+  dmLobbyParticipants,
+  principalOf,
+  registerPolicy,
+  registeredActions,
+  requireAuthorized,
+  AuthorizationError,
+} from '../authorize';
+import { TENANTLESS, tenantOf } from '../tenant';
+
+const acme = tenantOf('acme');
+const globex = tenantOf('globex');
+const hank = principalOf({ sub: 'dev-hank' }, acme);
+
+describe('authorize — framework guarantees', () => {
+  it('DEFAULT DENIES an action with no registered policy', () => {
+    // A typo'd or not-yet-written action must never fail open. This is the
+    // failure mode the whole module exists to make impossible.
+    return authorize({
+      principal: hank,
+      action: 'totally:invented',
+      resource: { type: 'thing' },
+    }).then((d) => {
+      expect(d.allow).toBe(false);
+      expect(d.allow === false && d.reason).toMatch(/no policy registered/);
+    });
+  });
+
+  it('denies cross-tenant BEFORE any policy runs — the policy cannot forget it', async () => {
+    let policyRan = false;
+    registerPolicy('test:crosstenant', () => {
+      policyRan = true;
+      return ALLOW; // a permissive policy that would have allowed it
+    });
+
+    const d = await authorize({
+      principal: hank, // tenant acme
+      action: 'test:crosstenant',
+      resource: { type: 'thing', id: 'x', tenant: globex },
+    });
+
+    expect(d.allow).toBe(false);
+    expect(policyRan).toBe(false);
+    // 404, not 403: "that exists, in another tenant" is itself a disclosure.
+    expect(d.allow === false && d.status).toBe(404);
+  });
+
+  it('allows same-tenant through to the policy', async () => {
+    registerPolicy('test:sametenant', () => ALLOW);
+    const d = await authorize({
+      principal: hank,
+      action: 'test:sametenant',
+      resource: { type: 'thing', tenant: acme },
+    });
+    expect(d.allow).toBe(true);
+  });
+
+  it('denies an unauthenticated principal', async () => {
+    registerPolicy('test:open', () => ALLOW);
+    const d = await authorize({
+      principal: principalOf(undefined, TENANTLESS),
+      action: 'test:open',
+      resource: { type: 'thing' },
+    });
+    expect(d.allow).toBe(false);
+  });
+
+  it('requireAuthorized throws with the decision status', async () => {
+    registerPolicy('test:nope', () => deny('because', 404));
+    await expect(
+      requireAuthorized({ principal: hank, action: 'test:nope', resource: { type: 'x' } }),
+    ).rejects.toThrow(AuthorizationError);
+    await requireAuthorized({
+      principal: hank,
+      action: 'test:nope',
+      resource: { type: 'x' },
+    }).catch((e: AuthorizationError) => {
+      expect(e.status).toBe(404);
+    });
+  });
+
+  it('exposes the registered actions so the rule set is auditable', () => {
+    expect(registeredActions()).toContain('recording:listByLobby');
+  });
+});
+
+describe('dmLobbyParticipants', () => {
+  it('reads both participants out of a dm lobby name', () => {
+    expect(dmLobbyParticipants('dm:dev-bob:dev-hank')).toEqual(['dev-bob', 'dev-hank']);
+  });
+  it('returns null for lobbies that do not encode membership', () => {
+    expect(dmLobbyParticipants('room:lounge')).toBeNull();
+    expect(dmLobbyParticipants('global-hangout')).toBeNull();
+    expect(dmLobbyParticipants('dm:onlyone')).toBeNull();
+  });
+});
+
+describe('recording:listByLobby — the hole this closed', () => {
+  const listByLobby = (principal: ReturnType<typeof principalOf>, id: string, attrs?: Record<string, unknown>) =>
+    authorize({ principal, action: 'recording:listByLobby', resource: { type: 'lobby', id, ...(attrs ? { attrs } : {}) } });
+
+  it('lets a DM participant list their own conversation', async () => {
+    expect((await listByLobby(hank, 'dm:dev-bob:dev-hank')).allow).toBe(true);
+  });
+
+  it("REFUSES a stranger listing someone else's private DM", async () => {
+    // This is the exact request that used to succeed: any authenticated
+    // user could list any lobby, and the route's own comment leaned on the
+    // UI hiding the link.
+    const dave = principalOf({ sub: 'dev-dave' }, acme);
+    const d = await listByLobby(dave, 'dm:dev-bob:dev-hank');
+    expect(d.allow).toBe(false);
+    // 404 — confirming that DM exists would itself leak.
+    expect(d.allow === false && d.status).toBe(404);
+  });
+
+  it('allows a room member and refuses a non-member', async () => {
+    const members = { memberIds: ['dev-hank', 'dev-carol'] };
+    expect((await listByLobby(hank, 'room:lounge', members)).allow).toBe(true);
+    const dave = principalOf({ sub: 'dev-dave' }, acme);
+    expect((await listByLobby(dave, 'room:lounge', members)).allow).toBe(false);
+  });
+
+  it('DENIES when membership could not be established — never falls open', async () => {
+    // A room lookup that failed (deleted room, DDB blip) must not become
+    // "allow"; that is how a lookup failure turns into a data leak.
+    const d = await listByLobby(hank, 'room:lounge');
+    expect(d.allow).toBe(false);
+    expect(d.allow === false && d.reason).toMatch(/could not be established/);
+  });
+
+  it('refuses an empty lobby name', async () => {
+    expect((await listByLobby(hank, '')).allow).toBe(false);
+  });
+});

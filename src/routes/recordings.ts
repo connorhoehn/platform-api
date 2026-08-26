@@ -22,11 +22,12 @@ import { Router, Request, Response } from 'express';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
-import { callRecordingRepo, callReactionRepo, type CallRecording } from '../repositories';
+import { callRecordingRepo, callReactionRepo, hangoutRoomRepo, hangoutRoomMemberRepo, type CallRecording } from '../repositories';
 import { publicizeTracks, reconcileParticipants } from '../lib/recording-truth';
 import { mergeReactionsIntoTranscript } from '../lib/transcript-reactions';
 import { docClient } from '../lib/aws-clients';
 import { tenantOf } from '../lib/tenant';
+import { principalOf, requireAuthorized } from '../lib/authorize';
 import { tableName } from '../lib/ddb-table-name';
 import { VIDEO_API_URL, VIDEO_PUBLIC_URL } from '../lib/video-auth';
 import { callSfu, mapSfuError } from '../lib/sfu-breaker';
@@ -56,12 +57,33 @@ recordingsRouter.get(
     const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
     const lobbyName = typeof req.query.lobbyName === 'string' ? req.query.lobbyName : undefined;
 
-    // W6 — room-scoped filter for RoomAdminPage. Auth is still required (any
-    // authenticated user can list a room's recordings — the RoomAdminPage UI
-    // gates the "View recordings" link to owners/admins, so cross-room
-    // discovery is unlikely in practice). If we later want strict per-room
-    // ACLs, add a membership check here against hangoutRoomRepo.
+    // W6 — room-scoped filter for RoomAdminPage.
+    //
+    // This used to be open: ANY authenticated user could list ANY lobby's
+    // recordings, including a private DM between two other people, and the
+    // comment here leaned on the RoomAdminPage UI hiding the link. Hiding a
+    // link is not access control — the endpoint was one curl away.
+    //
+    // Now it goes through the policy decision point (lib/authorize.ts). DM
+    // membership is decidable from the lobby name; room membership needs the
+    // member list, which we look up and hand to the policy. A lookup failure
+    // yields no memberIds, and the policy denies — it never falls open.
     if (lobbyName) {
+      const tenant = tenantOf(req.user?.orgId);
+      let memberIds: string[] | undefined;
+      if (lobbyName.startsWith('room:')) {
+        const slug = lobbyName.slice('room:'.length);
+        const room = await hangoutRoomRepo.getRoomBySlug(req.user?.orgId ?? '', slug).catch(() => null);
+        if (room) {
+          const members = await hangoutRoomMemberRepo.listMembers(room.roomId).catch(() => []);
+          memberIds = members.map((m: { userId: string }) => m.userId);
+        }
+      }
+      await requireAuthorized({
+        principal: principalOf(req.user, tenant),
+        action: 'recording:listByLobby',
+        resource: { type: 'lobby', id: lobbyName, ...(memberIds ? { attrs: { memberIds } } : {}) },
+      });
       const { items, cursor: next } = await callRecordingRepo.listByLobbyName(lobbyName, limit, cursor);
       res.json({ items, cursor: next ?? null });
       return;
