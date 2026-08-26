@@ -190,6 +190,62 @@ catalog.declare({
   },
 });
 
+catalog.declare({
+  name: 'doc:lifecycle_changed',
+  transport: 'signal',
+  producer: 'platform-api',
+  description:
+    'A document moved between review-lifecycle states (draft / in_review / changes_requested / approved)',
+  schema: {
+    type: 'object',
+    properties: {
+      documentId: { type: 'string' },
+      from: { type: 'string' },
+      to: { type: 'string' },
+      action: { type: 'string' },
+      actor: { type: 'string' },
+      at: { type: 'string' },
+      reason: { type: 'string' },
+      version: { type: 'number' },
+    },
+    required: ['documentId', 'from', 'to', 'action', 'actor', 'at'],
+  },
+});
+
+catalog.declare({
+  name: 'doc:review_requested',
+  transport: 'signal',
+  producer: 'platform-api',
+  description: 'A named review request was created or re-issued on a document or section',
+  schema: {
+    type: 'object',
+    properties: {
+      documentId: { type: 'string' },
+      sectionId: { type: 'string' },
+      request: { type: 'object' },
+    },
+    required: ['documentId', 'request'],
+  },
+});
+
+catalog.declare({
+  name: 'doc:review_request_updated',
+  transport: 'signal',
+  producer: 'platform-api',
+  description: 'A named review request changed state (approved / changes_requested / withdrawn) or due date',
+  schema: {
+    type: 'object',
+    properties: {
+      documentId: { type: 'string' },
+      sectionId: { type: 'string' },
+      requestKey: { type: 'string' },
+      state: { type: 'string' },
+      request: { type: 'object' },
+    },
+    required: ['documentId', 'requestKey', 'request'],
+  },
+});
+
 // `ingest:progress` is an envelope event carrying 10 distinct sub-shapes
 // discriminated by `payload.type`. The actual sub-type union is
 // IngestEvent in src/ingest/types.ts — keep this list in sync.

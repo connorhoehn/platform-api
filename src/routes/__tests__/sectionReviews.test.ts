@@ -10,6 +10,7 @@ const mockGetForSection = jest.fn();
 const mockGetForDocument = jest.fn();
 const mockGetUserReviews = jest.fn();
 const mockGetProfile = jest.fn();
+const mockGetRequestsForReviewer = jest.fn();
 const mockEmit = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('../../middleware/auth', () => ({
@@ -24,6 +25,9 @@ jest.mock('../../repositories', () => ({
     getUserReviews: mockGetUserReviews,
   },
   profileRepo: { getProfile: mockGetProfile },
+  documentReviewRequestRepo: {
+    getRequestsForReviewer: mockGetRequestsForReviewer,
+  },
 }));
 
 jest.mock('../../lib/event-catalog', () => ({
@@ -130,6 +134,7 @@ beforeEach(() => {
   mockGetForDocument.mockReset();
   mockGetUserReviews.mockReset();
   mockGetProfile.mockReset();
+  mockGetRequestsForReviewer.mockReset().mockResolvedValue([]);
   mockEmit.mockReset().mockResolvedValue(undefined);
 });
 
@@ -213,11 +218,85 @@ describe('GET /api/documents/:documentId/reviews', () => {
 });
 
 describe('GET /api/reviews/mine', () => {
+  // `reviews` is the pre-existing key. These first two assertions are the
+  // backward-compatibility contract — they must not change shape.
   it('returns 200 with user reviews', async () => {
     mockGetUserReviews.mockResolvedValue([{ reviewId: 'r-1' }]);
     const res = await run(buildApp(), 'GET', '/api/reviews/mine');
     expect(res.statusCode).toBe(200);
     expect((res.body as { reviews: unknown[] }).reviews).toHaveLength(1);
     expect(mockGetUserReviews).toHaveBeenCalledWith('tester');
+  });
+
+  it('keeps `reviews` untouched when the caller has review requests too', async () => {
+    mockGetUserReviews.mockResolvedValue([{ reviewId: 'r-1', status: 'approved' }]);
+    mockGetRequestsForReviewer.mockResolvedValue([
+      { documentId: 'doc-1', requestKey: '_doc:tester', state: 'pending', required: true },
+    ]);
+    const res = await run(buildApp(), 'GET', '/api/reviews/mine');
+    expect((res.body as { reviews: unknown[] }).reviews).toEqual([
+      { reviewId: 'r-1', status: 'approved' },
+    ]);
+  });
+
+  it('returns the named review requests addressed to the caller', async () => {
+    mockGetUserReviews.mockResolvedValue([]);
+    mockGetRequestsForReviewer.mockResolvedValue([
+      {
+        documentId: 'doc-1', requestKey: '_doc:tester', reviewerId: 'tester',
+        state: 'pending', required: true, dueDate: '2030-01-01T00:00:00.000Z',
+      },
+    ]);
+    const res = await run(buildApp(), 'GET', '/api/reviews/mine');
+    const body = res.body as { requests: Array<{ documentId: string }> };
+    expect(body.requests).toHaveLength(1);
+    expect(body.requests[0]!.documentId).toBe('doc-1');
+    expect(mockGetRequestsForReviewer).toHaveBeenCalledWith('tester', undefined);
+  });
+
+  it('sorts requests by due date, undated last', async () => {
+    mockGetUserReviews.mockResolvedValue([]);
+    mockGetRequestsForReviewer.mockResolvedValue([
+      { documentId: 'no-due', requestKey: 'a', state: 'pending' },
+      { documentId: 'late', requestKey: 'b', state: 'pending', dueDate: '2030-06-01T00:00:00.000Z' },
+      { documentId: 'soon', requestKey: 'c', state: 'pending', dueDate: '2030-01-01T00:00:00.000Z' },
+    ]);
+    const res = await run(buildApp(), 'GET', '/api/reviews/mine');
+    const ids = (res.body as { requests: Array<{ documentId: string }> }).requests
+      .map((r) => r.documentId);
+    expect(ids).toEqual(['soon', 'late', 'no-due']);
+  });
+
+  it('passes the state filter through to the repository', async () => {
+    mockGetUserReviews.mockResolvedValue([]);
+    await run(buildApp(), 'GET', '/api/reviews/mine?state=pending');
+    expect(mockGetRequestsForReviewer).toHaveBeenCalledWith('tester', 'pending');
+  });
+
+  it('filters to overdue requests when asked', async () => {
+    mockGetUserReviews.mockResolvedValue([]);
+    mockGetRequestsForReviewer.mockResolvedValue([
+      { documentId: 'overdue', requestKey: 'a', state: 'pending', dueDate: '2000-01-01T00:00:00.000Z' },
+      { documentId: 'fine', requestKey: 'b', state: 'pending', dueDate: '2100-01-01T00:00:00.000Z' },
+      // Already answered — never overdue, however old the due date.
+      { documentId: 'answered', requestKey: 'c', state: 'approved', dueDate: '2000-01-01T00:00:00.000Z' },
+    ]);
+    const res = await run(buildApp(), 'GET', '/api/reviews/mine?overdue=true');
+    const ids = (res.body as { requests: Array<{ documentId: string }> }).requests
+      .map((r) => r.documentId);
+    expect(ids).toEqual(['overdue']);
+  });
+
+  it('summarizes pending / overdue / total counts', async () => {
+    mockGetUserReviews.mockResolvedValue([]);
+    mockGetRequestsForReviewer.mockResolvedValue([
+      { documentId: 'a', requestKey: 'a', state: 'pending', dueDate: '2000-01-01T00:00:00.000Z' },
+      { documentId: 'b', requestKey: 'b', state: 'pending' },
+      { documentId: 'c', requestKey: 'c', state: 'approved' },
+    ]);
+    const res = await run(buildApp(), 'GET', '/api/reviews/mine');
+    expect((res.body as { summary: unknown }).summary).toEqual({
+      pending: 2, overdue: 1, total: 3,
+    });
   });
 });

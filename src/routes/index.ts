@@ -14,6 +14,11 @@ import { activityRouter } from './activity';
 import { documentCommentsRouter } from './documentComments';
 import { sectionReviewsRouter, documentReviewsRouter, myReviewsRouter } from './sectionReviews';
 import { sectionItemsRouter, myItemsRouter } from './sectionItems';
+import { documentLifecycleRouter, lifecycleSchemaRouter } from './documentLifecycle';
+import {
+  documentReviewRequestsRouter,
+  sectionReviewRequestsRouter,
+} from './documentReviewRequests';
 import { documentImportExportRouter } from './documentImportExport';
 import { videoSessionsRouter } from './videoSessions';
 import { recordingsRouter } from './recordings';
@@ -95,6 +100,12 @@ router.use('/rooms/:roomId/posts/:postId/comments/:commentId/likes', commentLike
 router.use('/rooms/:roomId/posts/:postId', reactionsRouter);
 router.use('/activity', activityRouter);
 router.use('/documents', documentCommentsRouter);
+// Static segment BEFORE any `:documentId` mount — Express resolves mounts in
+// registration order, so `/documents/:documentId` would otherwise swallow it.
+router.use('/documents/lifecycle-schema', lifecycleSchemaRouter);
+router.use('/documents/:documentId/lifecycle', documentLifecycleRouter);
+router.use('/documents/:documentId/review-requests', documentReviewRequestsRouter);
+router.use('/documents/:documentId/sections/:sectionId/review-requests', sectionReviewRequestsRouter);
 router.use('/documents/:documentId/sections/:sectionId/reviews', sectionReviewsRouter);
 router.use('/documents/:documentId/reviews', documentReviewsRouter);
 router.use('/reviews', myReviewsRouter);

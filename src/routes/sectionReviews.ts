@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth';
-import { sectionReviewRepo, profileRepo } from '../repositories';
+import { sectionReviewRepo, profileRepo, documentReviewRequestRepo } from '../repositories';
+import { isOverdue } from '../repositories/DocumentReviewRequestRepository';
 import { publishSignal } from '../lib/event-catalog';
 import {
   asyncHandler,
@@ -67,9 +68,44 @@ documentReviewsRouter.get('/', asyncHandler(async (req: Request, res: Response):
   res.status(200).json({ reviews });
 }));
 
-// GET /api/reviews/mine
+// GET /api/reviews/mine[?state=pending][&overdue=true]
+//
+// The reviewer's inbox. Historically this returned only `reviews` — the
+// section reviews the caller has already SUBMITTED — which is why it had no
+// frontend consumers: it answered "what did I say" rather than "what is
+// waiting on me". It now also returns `requests`: the named review requests
+// ADDRESSED to the caller, with due dates.
+//
+// `reviews` keeps its exact previous shape and semantics so any existing
+// consumer is unaffected; `requests` and `summary` are additive. `state` and
+// `overdue` filter `requests` only.
 myReviewsRouter.get('/mine', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const userId = req.user!.sub;
-  const reviews = await sectionReviewRepo.getUserReviews(userId);
-  res.status(200).json({ reviews });
+  const state = req.query['state'] as string | undefined;
+  const overdueOnly = req.query['overdue'] === 'true';
+
+  const [reviews, allRequests] = await Promise.all([
+    sectionReviewRepo.getUserReviews(userId),
+    documentReviewRequestRepo.getRequestsForReviewer(userId, state),
+  ]);
+
+  const now = new Date();
+  const requests = (overdueOnly ? allRequests.filter((r) => isOverdue(r, now)) : allRequests)
+    // Soonest due first; requests with no due date sort last.
+    .slice()
+    .sort((a, b) => {
+      const av = a.dueDate ? Date.parse(a.dueDate) : Number.POSITIVE_INFINITY;
+      const bv = b.dueDate ? Date.parse(b.dueDate) : Number.POSITIVE_INFINITY;
+      return av - bv;
+    });
+
+  res.status(200).json({
+    reviews,
+    requests,
+    summary: {
+      pending: allRequests.filter((r) => r.state === 'pending').length,
+      overdue: allRequests.filter((r) => isOverdue(r, now)).length,
+      total: allRequests.length,
+    },
+  });
 }));

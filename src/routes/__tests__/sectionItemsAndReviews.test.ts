@@ -178,6 +178,12 @@ jest.mock('../../repositories', () => ({
       return { userId, displayName: `User ${userId}` };
     }),
   },
+  // GET /api/reviews/mine now also returns the named review requests
+  // addressed to the caller. This suite only asserts the legacy `reviews`
+  // half, so an empty request list is enough.
+  documentReviewRequestRepo: {
+    getRequestsForReviewer: jest.fn(async () => []),
+  },
 }));
 
 import { sectionItemsRouter, myItemsRouter } from '../sectionItems';

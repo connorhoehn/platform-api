@@ -6,6 +6,8 @@ import { SectionItemRepository } from './SectionItemRepository';
 import { DocumentSectionRepository } from './DocumentSectionRepository';
 import { DocumentCommentRepository } from './DocumentCommentRepository';
 import { SectionReviewRepository } from './SectionReviewRepository';
+import { DocumentLifecycleRepository } from './DocumentLifecycleRepository';
+import { DocumentReviewRequestRepository } from './DocumentReviewRequestRepository';
 import { VideoSessionRepository } from './VideoSessionRepository';
 import { createVideoSessionStore } from './videoSessionStoreFactory';
 import type { VideoSessionStore } from './VideoSessionStore';
@@ -27,6 +29,8 @@ export const sectionItemRepo = new SectionItemRepository(docClient);
 export const documentSectionRepo = new DocumentSectionRepository(docClient);
 export const documentCommentRepo = new DocumentCommentRepository(docClient);
 export const sectionReviewRepo = new SectionReviewRepository(docClient);
+export const documentLifecycleRepo = new DocumentLifecycleRepository(docClient);
+export const documentReviewRequestRepo = new DocumentReviewRequestRepository(docClient);
 // videoSessionRepo is typed as the VideoSessionStore interface so callers
 // don't bind to the DDB implementation. The factory honours the
 // VIDEO_SESSIONS_STORE env flag — see videoSessionStoreFactory.ts.
@@ -49,6 +53,26 @@ export { SectionItemRepository, SectionItemFields, CreateSectionItemInput } from
 export { DocumentSectionRepository, DocumentSectionFields, CreateDocumentSectionInput } from './DocumentSectionRepository';
 export { DocumentCommentRepository, DocumentComment } from './DocumentCommentRepository';
 export { SectionReviewRepository, SectionReview } from './SectionReviewRepository';
+export {
+  DocumentLifecycleRepository,
+  DocumentLifecycleItem,
+  LifecycleHistoryEntry,
+  LifecycleConcurrencyError,
+  HISTORY_LIMIT,
+} from './DocumentLifecycleRepository';
+export {
+  DocumentReviewRequestRepository,
+  DocumentReviewRequest,
+  CreateReviewRequestInput,
+  ReviewRequestState,
+  REVIEW_REQUEST_STATES,
+  REVIEWER_RESPONSE_STATES,
+  DOC_SCOPE,
+  WITHDRAWN_RETENTION_DAYS,
+  buildRequestKey,
+  isReviewOutstanding,
+  isOverdue,
+} from './DocumentReviewRequestRepository';
 export { VideoSessionRepository } from './VideoSessionRepository';
 export {
   VideoSessionStore,
