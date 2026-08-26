@@ -757,6 +757,53 @@ export interface PendingApprovalRowWithContext extends PendingApprovalRow {
    * `output.response` (LLM steps) and other free-form output values.
    */
   runSteps?: Record<string, { output?: unknown }>;
+  /**
+   * Human-readable name of the pipeline this approval belongs to. Read from
+   * the run's `pipelineDefinitionSnapshot` (authoritative — the live
+   * definition may have been renamed or edited since the run started), with
+   * the definitions repo as a fallback.
+   */
+  pipelineName?: string;
+  /** Label of the approval NODE, so the queue doesn't show a bare uuid. */
+  stepName?: string;
+  /** Who triggered the run awaiting this decision. */
+  requestedBy?: string;
+  /** How the run was triggered (`manual`, `schedule`, `webhook`, …). */
+  triggerType?: string;
+  /**
+   * The output of every step feeding directly INTO this approval node — the
+   * thing the approver is actually being asked to judge. Ordered as the
+   * definition's edges are. Empty when the approval sits directly on the
+   * trigger.
+   */
+  upstream?: readonly {
+    stepId: string;
+    /** Node label, or a humanised node type when unlabelled. */
+    name: string;
+    /** Node type (`llm`, `action`, `transform`, `trigger`, …). */
+    type: string;
+    status?: string;
+    output?: unknown;
+  }[];
+}
+
+/** Fallback display name for a node with no authored label. */
+function humaniseNodeType(type: string): string {
+  return type
+    .split(/[:_-]/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function nodeDisplayName(node: { id: string; type?: string; data?: unknown }): string {
+  const data = (node.data ?? {}) as Record<string, unknown>;
+  const label = data.label;
+  if (typeof label === 'string' && label.trim()) return label.trim();
+  const name = data.name;
+  if (typeof name === 'string' && name.trim()) return name.trim();
+  const type = typeof data.type === 'string' ? data.type : node.type;
+  return type ? humaniseNodeType(type) : node.id;
 }
 
 export const pipelinePendingApprovalsRouter = Router();
@@ -824,10 +871,30 @@ pipelinePendingApprovalsRouter.get(
   ),
 );
 
+/** What one `getRun` yields for the queue-enrichment pass. */
+interface ApprovalRunSnapshotView {
+  context?: Record<string, unknown>;
+  steps?: Record<string, { output?: unknown; status?: string }>;
+  pipelineName?: string;
+  requestedBy?: string;
+  triggerType?: string;
+  nodesById: Map<string, { id: string; type?: string; data?: unknown }>;
+  /** target nodeId → source nodeIds feeding it. */
+  incomingByTarget: Map<string, string[]>;
+}
+
 /**
- * Best-effort hydration of `runContext` + `runSteps` onto each pending-approval
- * row. Failures per-row are swallowed (logged at warn) — the approval queue
- * itself must keep rendering even if one run snapshot is unavailable.
+ * Best-effort hydration of the fields an approver needs to actually DECIDE:
+ * the pipeline's name, the approval step's name, who asked, and the output of
+ * the upstream steps feeding the gate — plus the pre-existing `runContext` /
+ * `runSteps` the approval card already consumed.
+ *
+ * Before this, the queue rendered nothing but raw uuids ("Pipeline 4d8bb9fe /
+ * run #535ef2 / Step f85c44e2…") and the card's own empty state admitted that
+ * "upstream steps haven't produced reviewable output yet".
+ *
+ * Failures per-row are swallowed (logged at warn) — the approval queue itself
+ * must keep rendering even if one run snapshot is unavailable.
  */
 async function enrichWithRunContext(
   rows: PendingApprovalRow[],
@@ -837,30 +904,57 @@ async function enrichWithRunContext(
   if (rows.length === 0) return [];
   // Multiple approval rows on the same run share one snapshot fetch.
   const runIds = Array.from(new Set(rows.map((r) => r.runId)));
-  const snapshots = new Map<
-    string,
-    { context?: Record<string, unknown>; steps?: Record<string, { output?: unknown }> }
-  >();
+  const snapshots = new Map<string, ApprovalRunSnapshotView>();
   await Promise.all(
     runIds.map(async (runId) => {
       try {
         const snap = await Promise.resolve(bridge.getRun(runId));
         if (!snap) return;
-        // Project steps → { output } only; the FE doesn't read other fields
-        // on this surface and we'd rather not ship unbounded approval+llm
-        // metadata over the wire on the queue endpoint.
-        const stepsProjection: Record<string, { output?: unknown }> = {};
-        const rawSteps = (snap as { steps?: Record<string, { output?: unknown }> }).steps;
+        // Project steps → { output, status } only; we'd rather not ship
+        // unbounded approval+llm metadata over the wire on the queue endpoint.
+        const stepsProjection: Record<string, { output?: unknown; status?: string }> = {};
+        const rawSteps = (snap as {
+          steps?: Record<string, { output?: unknown; status?: string }>;
+        }).steps;
         if (rawSteps && typeof rawSteps === 'object') {
           for (const [stepId, step] of Object.entries(rawSteps)) {
             if (step && typeof step === 'object' && 'output' in step) {
-              stepsProjection[stepId] = { output: step.output };
+              stepsProjection[stepId] = { output: step.output, status: step.status };
             }
           }
         }
+
+        // The definition SNAPSHOT is authoritative: the live definition may
+        // have been renamed or rewired since this run started.
+        const definition = (snap as {
+          pipelineDefinitionSnapshot?: {
+            name?: string;
+            nodes?: { id: string; type?: string; data?: unknown }[];
+            edges?: { source: string; target: string }[];
+          };
+        }).pipelineDefinitionSnapshot;
+
+        const nodesById = new Map<string, { id: string; type?: string; data?: unknown }>();
+        for (const node of definition?.nodes ?? []) nodesById.set(node.id, node);
+        const incomingByTarget = new Map<string, string[]>();
+        for (const edge of definition?.edges ?? []) {
+          const list = incomingByTarget.get(edge.target) ?? [];
+          list.push(edge.source);
+          incomingByTarget.set(edge.target, list);
+        }
+
+        const triggeredBy = (snap as {
+          triggeredBy?: { userId?: string; triggerType?: string };
+        }).triggeredBy;
+
         snapshots.set(runId, {
           context: (snap as { context?: Record<string, unknown> }).context,
           steps: stepsProjection,
+          ...(definition?.name ? { pipelineName: definition.name } : {}),
+          ...(triggeredBy?.userId ? { requestedBy: triggeredBy.userId } : {}),
+          ...(triggeredBy?.triggerType ? { triggerType: triggeredBy.triggerType } : {}),
+          nodesById,
+          incomingByTarget,
         });
       } catch (err) {
         reqLog.warn(
@@ -873,10 +967,30 @@ async function enrichWithRunContext(
   return rows.map((row) => {
     const snap = snapshots.get(row.runId);
     if (!snap) return row;
+
+    const approvalNode = snap.nodesById.get(row.stepId);
+    const upstream = (snap.incomingByTarget.get(row.stepId) ?? []).map((sourceId) => {
+      const node = snap.nodesById.get(sourceId);
+      const step = snap.steps?.[sourceId];
+      const data = (node?.data ?? {}) as Record<string, unknown>;
+      return {
+        stepId: sourceId,
+        name: node ? nodeDisplayName(node) : sourceId,
+        type: (typeof data.type === 'string' ? data.type : node?.type) ?? 'unknown',
+        ...(step?.status !== undefined ? { status: step.status } : {}),
+        ...(step && 'output' in step ? { output: step.output } : {}),
+      };
+    });
+
     return {
       ...row,
       ...(snap.context ? { runContext: snap.context } : {}),
       ...(snap.steps ? { runSteps: snap.steps } : {}),
+      ...(snap.pipelineName ? { pipelineName: snap.pipelineName } : {}),
+      ...(approvalNode ? { stepName: nodeDisplayName(approvalNode) } : {}),
+      ...(snap.requestedBy ? { requestedBy: snap.requestedBy } : {}),
+      ...(snap.triggerType ? { triggerType: snap.triggerType } : {}),
+      ...(upstream.length > 0 ? { upstream } : {}),
     };
   });
 }

@@ -105,6 +105,12 @@ export interface PipelineRunItem {
   lastEventAt?: string;
   stepsSummary?: Record<string, StepSummary>;
   error?: string;
+  /**
+   * Set when `status === 'rejected'` — who rejected the run's approval gate,
+   * when, and why. Persisted so the runs LIST can explain a rejection without
+   * a second lookup into the (possibly evicted) live executor.
+   */
+  rejection?: { stepId: string; userId: string; comment?: string; at: string };
   /** Per-model token usage accumulated from pipeline:llm:response events. */
   tokenUsage?: Record<string, TokenUsageByModel>;
   /** Estimated total cost in USD based on the pricing table. */

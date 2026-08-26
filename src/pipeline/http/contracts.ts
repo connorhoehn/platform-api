@@ -174,6 +174,25 @@ export interface PipelinePendingApproval {
   requiredCount?: number;
   /** Approvals already recorded against the step. */
   recordedCount?: number;
+  /** Human-readable pipeline name (from the run's definition snapshot). */
+  pipelineName?: string;
+  /** Label of the approval node — so the queue isn't a wall of uuids. */
+  stepName?: string;
+  /** Who triggered the run awaiting this decision. */
+  requestedBy?: string;
+  /** How the run was triggered (`manual`, `schedule`, `webhook`, …). */
+  triggerType?: string;
+  /**
+   * Output of the steps feeding directly into this approval node — what the
+   * approver is actually being asked to judge.
+   */
+  upstream?: readonly {
+    stepId: string;
+    name: string;
+    type: string;
+    status?: string;
+    output?: unknown;
+  }[];
 }
 
 export interface PipelinePendingApprovalsResponse {

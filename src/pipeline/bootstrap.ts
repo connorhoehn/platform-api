@@ -882,6 +882,11 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       runId: data.runId as string,
       durationMs: data.durationMs as number | undefined,
       completedAt: data.at as string || new Date().toISOString(),
+      // A run whose approval gate was rejected arrives on this event too —
+      // carry the terminal status and the decision so subscribers don't have
+      // to treat every `run.completed` as a success.
+      ...(data.status !== undefined ? { status: data.status } : {}),
+      ...(data.rejection !== undefined ? { rejection: data.rejection } : {}),
     }).catch((err: unknown) => {
       log.error({ event: 'pipeline.run.completed', err: err instanceof Error ? err.message : String(err) }, 'durable publish failed');
     });

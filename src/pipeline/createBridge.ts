@@ -190,6 +190,10 @@ export function runItemToSnapshot(item: PipelineRunItem): PipelineRunSnapshot {
     ...(item.interruptedAt ? { interruptedAt: item.interruptedAt } : {}),
     steps: summariesToStepExecutions(item.stepsSummary, item.runId),
     error: item.error ? parseStoredError(item.error) : undefined,
+    // Approval rejection detail — who rejected, when, and why. Carried on the
+    // LIST shape too, so the Runs table can name the rejector without opening
+    // the run (and without a live executor, which historical runs don't have).
+    ...(item.rejection ? { rejection: item.rejection } : {}),
     triggeredBy: {
       userId: item.triggeredBy === 'system' ? undefined : item.triggeredBy,
       triggerType: item.triggerType ?? 'manual',

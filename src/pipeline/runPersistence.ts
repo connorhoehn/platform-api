@@ -25,7 +25,7 @@
 
 import type { EventBus } from 'distributed-core';
 import { retryWithBackoff } from 'distributed-core';
-import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
+import type { PipelineEventMap, RunRejection } from 'distributed-core/applications/pipeline';
 import {
   PipelineRunRepository,
   type PersistedCheckpoint,
@@ -74,6 +74,8 @@ interface RunState {
   completedAt?: string;
   steps: Record<string, StepSummary>;
   error?: string;
+  /** Set when an approval gate on this run was rejected (drives `status: 'rejected'`). */
+  rejection?: RunRejection;
   /** Per-model token usage accumulated across LLM steps. */
   tokenUsage: Record<string, TokenUsageByModel>;
   /** Estimated total cost in USD. */
@@ -640,7 +642,13 @@ export class RunPersistenceService {
     };
   }
 
-  private async handleRunCompleted(event: { runId: string; durationMs: number; at: string }): Promise<void> {
+  private async handleRunCompleted(event: {
+    runId: string;
+    durationMs: number;
+    at: string;
+    status?: 'completed' | 'rejected';
+    rejection?: RunRejection;
+  }): Promise<void> {
     this.touchLastEvent(event.runId, event.at);
     const state =
       (await this.waitForCachedRun(event.runId)) ??
@@ -650,7 +658,13 @@ export class RunPersistenceService {
     // write the legacy `succeeded` alias, which made the runs *list* endpoint
     // (backed by this table) disagree with the runs *detail* endpoint (backed
     // by the live executor) for the same run.
-    state.status = 'completed';
+    //
+    // A run whose approval gate was REJECTED also arrives on this event — the
+    // traversal finished without throwing — but must not be listed as a
+    // success. The executor tells us which it was via `status`; older
+    // executors omit the field, which still means `completed`.
+    state.status = event.status === 'rejected' ? 'rejected' : 'completed';
+    if (event.rejection) state.rejection = event.rejection;
     state.completedAt = event.at;
     await this.persistRun(state);
     this.runCache.delete(event.runId);
@@ -803,6 +817,7 @@ export class RunPersistenceService {
       completedAt: state.completedAt,
       stepsSummary: state.steps,
       error: state.error,
+      rejection: state.rejection,
       tokenUsage: Object.keys(state.tokenUsage).length > 0 ? state.tokenUsage : undefined,
       estimatedCostUsd: state.estimatedCostUsd > 0 ? state.estimatedCostUsd : undefined,
       lastEventAt: state.lastEventAt,
