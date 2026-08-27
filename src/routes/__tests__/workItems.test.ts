@@ -414,6 +414,26 @@ describe('POST /work-items/:itemId/propose', () => {
     expect(last.proposalError).toContain('sections.other.title');
   });
 
+  // Observed for real: the pod's `claude` CLI credentials had expired, so every
+  // draft came back "claude exited 1: (no stderr)" and the route rethrew it as a
+  // bare 500 logged as "unhandled error". Nothing in this service was broken —
+  // and a person clicking "Draft a change" was shown a generic failure they
+  // would reasonably read as a problem with the sentence they had just spoken.
+  it('reports an unreachable model as an upstream outage, not as a server bug', async () => {
+    mockFindByItemId.mockResolvedValue(item);
+    const { ProposalProviderError } = jest.requireActual('../../lib/proposalDrafter');
+    mockDraftProposal.mockRejectedValue(
+      new ProposalProviderError('the claude-code provider could not be reached: Not logged in'),
+    );
+    const res = await run(buildApp(), 'post', '/documents/doc-1/work-items/ITEM1/propose', { body: { snapshot } });
+    expect(res.statusCode).toBe(502);
+    expect((res.body as { detail: string }).detail).toContain('Not logged in');
+    const last = mockUpdateItemFields.mock.calls.at(-1)![3];
+    expect(last.proposalStatus).toBe('failed');
+    // The reason has to reach the row, or the card has nothing to show.
+    expect(last.proposalError).toContain('Not logged in');
+  });
+
   it('treats "not an edit request" as a normal outcome, not a failure', async () => {
     mockFindByItemId.mockResolvedValue(item);
     mockDraftProposal.mockResolvedValue(null);

@@ -43,7 +43,12 @@ import {
   type AppliedReceipt,
   type CapturedContext,
 } from '../types/workItem';
-import { draftProposal, ProposalDraftError, type DocumentSnapshot } from '../lib/proposalDrafter';
+import {
+  draftProposal,
+  ProposalDraftError,
+  ProposalProviderError,
+  type DocumentSnapshot,
+} from '../lib/proposalDrafter';
 import log from '../lib/logger';
 
 export const workItemsRouter = Router({ mergeParams: true });
@@ -274,6 +279,15 @@ workItemsRouter.post(
         proposalError: message.slice(0, 500),
       });
       log.warn({ event: 'workitem.proposal.failed', documentId, itemId, err: message }, 'draft failed');
+      if (err instanceof ProposalProviderError) {
+        // 502, not 500: nothing in this service is broken. Something upstream
+        // of it is, and the person clicking "Draft a change" needs to be told
+        // that rather than shown a generic failure they will read as a bug in
+        // their own remark. Seen for real when the pod's CLI credentials
+        // expired — every draft returned a bare 500 with "unhandled error".
+        res.status(502).json({ error: 'the drafting model is unavailable', detail: message });
+        return;
+      }
       if (err instanceof ProposalDraftError) {
         res.status(422).json({ error: 'proposal could not be drafted', detail: message });
         return;

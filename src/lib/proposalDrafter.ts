@@ -19,9 +19,13 @@
 //    the one it was given — a model that tries to redirect the edit fails
 //    closed, loudly, rather than quietly filing it somewhere plausible.
 //
-// 3. NO BLACK-BOX LIBRARIES. This shells out to `claude -p` through the same
-//    ClaudeCodeLLMClient the judge and agent steps use. No SDK, no framework, no
-//    hidden retry loop.
+// 3. NO BLACK-BOX LIBRARIES. This goes through the same LLM client factory the
+//    judge and agent steps use — in this deployment `PIPELINE_LLM_PROVIDER` is
+//    `claude-code`, which shells out to `claude -p`. No SDK, no framework, no
+//    hidden retry loop. It asks the FACTORY rather than naming a client,
+//    because hard-coding one silently ignores the provider the deployment was
+//    configured with, and the resulting failure ("claude exited 1") looks like
+//    a code bug rather than a misconfiguration.
 //
 // Deliberately NOT built on the pipeline engine: every node there has a 50ms
 // sleep floor, its approval gate parks a live `resolve` callback in an
@@ -31,7 +35,7 @@
 // -> create work item) and this is the interactive one.
 
 import { randomUUID } from 'node:crypto';
-import { ClaudeCodeLLMClient } from '../pipeline/ClaudeCodeLLMClient';
+import { createLLMClient } from '../pipeline/createLLMClient';
 import type { LLMClient } from '../pipeline/LLMClient';
 import type { Proposal, FieldChange, ProseEdit } from '../types/workItem';
 import log from './logger';
@@ -60,7 +64,21 @@ export interface DraftProposalInput {
   signal?: AbortSignal;
 }
 
+/** The model replied, but with something we refuse to turn into an edit. */
 export class ProposalDraftError extends Error {}
+
+/**
+ * We never got a reply at all — the provider was unreachable, unauthenticated,
+ * or exited non-zero.
+ *
+ * Separate from `ProposalDraftError` because the two need different words in
+ * front of a person. "The model tried to edit a different section" is about the
+ * remark; "claude exited 1: Not logged in" is about the deployment, and dressing
+ * the second up as the first sends someone off re-phrasing a sentence that was
+ * never the problem. Observed for real: the pod's CLI credentials had expired
+ * and every draft came back as a bare 500.
+ */
+export class ProposalProviderError extends Error {}
 
 const DEFAULT_MODEL = process.env['WORK_ITEM_PROPOSAL_MODEL'] ?? 'sonnet';
 
@@ -247,17 +265,26 @@ export function validate(
  */
 export async function draftProposal(
   input: DraftProposalInput,
-  client: LLMClient = new ClaudeCodeLLMClient(),
+  client: LLMClient = createLLMClient(),
 ): Promise<Proposal | null> {
   const proposalId = randomUUID();
   const model = input.model ?? DEFAULT_MODEL;
 
   let response = '';
-  const stream = client.stream(model, SYSTEM_PROMPT, buildUserPrompt(input), {
-    ...(input.signal ? { signal: input.signal } : {}),
-  });
-  for await (const chunk of stream) {
-    if (chunk.done) response = chunk.response;
+  try {
+    const stream = client.stream(model, SYSTEM_PROMPT, buildUserPrompt(input), {
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
+    for await (const chunk of stream) {
+      if (chunk.done) response = chunk.response;
+    }
+  } catch (err) {
+    if ((err as Error)?.name === 'AbortError') throw err;
+    throw new ProposalProviderError(
+      `the ${client.provider} provider could not be reached: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
   }
 
   const parsed = extractJson(response);
