@@ -6,8 +6,25 @@
 
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import type { PipelineRunStatus, PipelineStepStatus } from '@connorhoehn/pipeline-runtime';
+import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
+
+/**
+ * How long a FINISHED run stays queryable, in days.
+ *
+ * Runs accumulated without bound until 2026-08: the `ttl` field below was
+ * declared but never written, and `pipeline-runs` was never registered with
+ * `ensureTableTTL`. Either gap alone is enough to keep every row forever, so
+ * both had to be closed — a ttl value on a table with TTL disabled expires
+ * nothing, and an enabled table expires nothing if no row carries a ttl.
+ */
+const DEFAULT_RUN_RETENTION_DAYS = 30;
+
+function runRetentionDays(): number {
+  const raw = Number(process.env['PIPELINE_RUN_RETENTION_DAYS']);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_RUN_RETENTION_DAYS;
+}
 
 /**
  * Platform-api run status as it may be **read back** from the table.
@@ -225,9 +242,25 @@ export class PipelineRunRepository extends BaseRepository {
     super(tableName('pipeline-runs'), docClient);
   }
 
-  /** Upsert a pipeline run. */
+  /**
+   * Upsert a pipeline run, stamping an expiry once the run is FINISHED.
+   *
+   * Only terminal runs get a ttl. A `pending`, `running` or — critically —
+   * `interrupted` run must never expire: `resumeInterruptedRuns` reads exactly
+   * those rows at boot, so expiring one would silently destroy work that was
+   * going to be resumed. `isTerminalRunStatus` is the shared predicate rather
+   * than a local list, so this cannot drift from the canonical vocabulary the
+   * way the `succeeded`/`canceled` aliases once did (it folds those in).
+   *
+   * An explicit ttl already on the item wins, so a caller can pin a specific
+   * expiry without fighting this default.
+   */
   async put(item: PipelineRunItem): Promise<void> {
-    return this.putItem(item as unknown as Record<string, unknown>);
+    const stamped =
+      item.ttl === undefined && isTerminalRunStatus(item.status)
+        ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
+        : item;
+    return this.putItem(stamped as unknown as Record<string, unknown>);
   }
 
   /** Fetch a single run by composite key. */

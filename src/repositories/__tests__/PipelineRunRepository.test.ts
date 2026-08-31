@@ -49,6 +49,65 @@ describe('PipelineRunRepository — put', () => {
     expect(cmd.input.TableName).toBe('test-pipeline-runs');
     expect(cmd.input.Item).toMatchObject({ pipelineId: 'pipeline-1', runId: 'run-1' });
   });
+
+  // Runs used to accumulate forever: this ttl was declared but never written,
+  // and pipeline-runs was never registered with ensureTableTTL. Both halves
+  // are needed, so both are pinned — this one, and dynamo-setup's.
+  it('stamps a ttl on a finished run so it eventually expires', async () => {
+    mockSend.mockResolvedValue({});
+    const repo = new PipelineRunRepository(mockDocClient);
+    const before = Math.floor(Date.now() / 1000);
+    await repo.put(runItem({ status: 'completed' }));
+
+    const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as { ttl?: number };
+    expect(item.ttl).toBeGreaterThanOrEqual(before + 29 * 86_400);
+    expect(item.ttl).toBeLessThanOrEqual(before + 31 * 86_400);
+  });
+
+  it('accepts the legacy `succeeded` spelling as terminal', async () => {
+    mockSend.mockResolvedValue({});
+    const repo = new PipelineRunRepository(mockDocClient);
+    await repo.put(runItem({ status: 'succeeded' }));
+    const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as { ttl?: number };
+    expect(item.ttl).toBeDefined();
+  });
+
+  // The one that would hurt: resumeInterruptedRuns reads exactly these rows at
+  // boot, so expiring one destroys work that was going to be resumed.
+  it.each(['pending', 'running', 'interrupted'] as const)(
+    'never expires a %s run',
+    async (status) => {
+      mockSend.mockResolvedValue({});
+      const repo = new PipelineRunRepository(mockDocClient);
+      await repo.put(runItem({ status }));
+      const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as { ttl?: number };
+      expect(item.ttl).toBeUndefined();
+    },
+  );
+
+  it('leaves an explicitly supplied ttl alone', async () => {
+    mockSend.mockResolvedValue({});
+    const repo = new PipelineRunRepository(mockDocClient);
+    await repo.put(runItem({ status: 'completed', ttl: 42 }));
+    const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as { ttl?: number };
+    expect(item.ttl).toBe(42);
+  });
+
+  it('honours PIPELINE_RUN_RETENTION_DAYS', async () => {
+    const prev = process.env['PIPELINE_RUN_RETENTION_DAYS'];
+    process.env['PIPELINE_RUN_RETENTION_DAYS'] = '2';
+    try {
+      mockSend.mockResolvedValue({});
+      const repo = new PipelineRunRepository(mockDocClient);
+      const before = Math.floor(Date.now() / 1000);
+      await repo.put(runItem({ status: 'failed' }));
+      const item = (mockSend.mock.calls[0][0] as PutCommand).input.Item as { ttl?: number };
+      expect(item.ttl).toBeLessThanOrEqual(before + 3 * 86_400);
+    } finally {
+      if (prev === undefined) delete process.env['PIPELINE_RUN_RETENTION_DAYS'];
+      else process.env['PIPELINE_RUN_RETENTION_DAYS'] = prev;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

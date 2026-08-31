@@ -8,6 +8,7 @@ import log from './logger';
 
 const OUTBOX_TABLE = tableName('social-outbox');
 const VIDEO_SESSIONS_TABLE = tableName('document-video-sessions');
+const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
 
 /**
  * Idempotent: enable the DDB native TTL on a table if it isn't already.
@@ -45,4 +46,21 @@ export async function ensureOutboxTTL(): Promise<void> {
  */
 export async function ensureVideoSessionsTTL(): Promise<void> {
   await ensureTableTTL(VIDEO_SESSIONS_TABLE);
+}
+
+/**
+ * Enable TTL on the pipeline-runs table.
+ *
+ * Runs grew without bound because BOTH halves of expiry were missing: this
+ * table was never registered here, and `PipelineRunRepository` never wrote the
+ * `ttl` attribute it declared. Each gap independently defeats the other, so
+ * fixing one alone changes nothing — which is why the rows stacked up
+ * unnoticed for so long.
+ *
+ * Only FINISHED runs carry a ttl (see PipelineRunRepository.put), so enabling
+ * TTL here cannot expire a run that is still pending, running, or interrupted
+ * and awaiting resume.
+ */
+export async function ensurePipelineRunsTTL(): Promise<void> {
+  await ensureTableTTL(PIPELINE_RUNS_TABLE);
 }

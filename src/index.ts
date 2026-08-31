@@ -21,7 +21,7 @@ import { assertRequiredInProd } from 'distributed-core';
 import { createShutdownManager, drainHttpServer } from '@connorhoehn/service-runtime';
 import { RetryManager } from 'distributed-core/transport';
 import { connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
-import { ensureOutboxTTL, ensureVideoSessionsTTL } from './lib/dynamo-setup';
+import { ensureOutboxTTL, ensureVideoSessionsTTL, ensurePipelineRunsTTL } from './lib/dynamo-setup';
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
@@ -150,6 +150,21 @@ if (videoStoreMode === 'ddb') {
     },
   );
 }
+
+// Pipeline runs. Same reasoning as the outbox above, and the one that actually
+// bit: ~1500 fixture runs accumulated because neither half of expiry existed.
+// Only terminal runs carry a ttl, so this never expires a run that is still
+// pending, running, or interrupted and waiting to be resumed at boot.
+void assertRequiredInProd(
+  {
+    name: 'ddb-pipeline-runs-ttl',
+    ping: () => ensurePipelineRunsTTL(),
+  },
+  {
+    requiredEnvVar: 'DDB_TTL_REQUIRED',
+    logger: log,
+  },
+);
 
 const catalogRetry = new RetryManager({
   maxRetries: 2,
