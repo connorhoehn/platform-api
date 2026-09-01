@@ -292,9 +292,20 @@ describe('GATE: runPersistence writes canonical spellings', () => {
       'utf8',
     ) as string;
 
-    expect(src).not.toMatch(/state\.status\s*=\s*'succeeded'/);
-    expect(src).not.toMatch(/state\.status\s*=\s*'canceled'/);
-    expect(src).toMatch(/state\.status\s*=\s*'completed'/);
-    expect(src).toMatch(/state\.status\s*=\s*'cancelled'/);
+    // The right-hand side is matched loosely (`[^;\n]*`) because a status
+    // assignment is not always a bare literal: `handleRunCompleted` became a
+    // ternary when `rejected` landed in pipeline-runtime v1.2.0
+    //   state.status = event.status === 'rejected' ? 'rejected' : 'completed';
+    // and a literal-only regex silently stopped matching the very line it
+    // exists to guard. What this gate actually asserts is which SPELLINGS may
+    // appear on the write side, so match the spelling, not the syntax.
+    expect(src).not.toMatch(/state\.status\s*=\s*[^;\n]*'succeeded'/);
+    expect(src).not.toMatch(/state\.status\s*=\s*[^;\n]*'canceled'/);
+    expect(src).toMatch(/state\.status\s*=\s*[^;\n]*'completed'/);
+    expect(src).toMatch(/state\.status\s*=\s*[^;\n]*'cancelled'/);
+    // `rejected` is terminal and distinct from `completed` — it must be a
+    // spelling the writer can actually produce, or the read side folds a
+    // status nothing ever persists.
+    expect(src).toMatch(/state\.status\s*=\s*[^;\n]*'rejected'/);
   });
 });
