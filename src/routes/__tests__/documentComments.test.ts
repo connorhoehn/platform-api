@@ -159,11 +159,84 @@ describe('POST /api/documents/:documentId/comments', () => {
     );
   });
 
-  it('rejects missing sectionId with 400', async () => {
+  it('rejects a comment that says nothing about WHERE it points', async () => {
+    // No section, no anchor, no parent: there is no answer to "what is this
+    // comment about?", so there is nowhere to render it.
     const res = await run(buildApp(), 'POST', BASE, {
       body: { text: 'No section' },
     });
     expect(res.statusCode).toBe(400);
+  });
+
+  // -------------------------------------------------------------------------
+  // Anchors — a canvas document has no sections, so the position IS the anchor
+  // -------------------------------------------------------------------------
+
+  /** Shaped like the real thing: base64 of an encoded Y.js relative position. */
+  const ANCHOR = {
+    v: 1,
+    key: 'body',
+    start: 'AQIDBAU=',
+    end: 'BQQDAgE=',
+    quote: 'the cache expired for every key at once',
+  };
+
+  it('accepts an anchored comment with NO sectionId', async () => {
+    mockCreateComment.mockResolvedValue({ commentId: 'c-3', anchor: ANCHOR });
+
+    const res = await run(buildApp(), 'POST', BASE, {
+      body: { text: 'Was this the thundering herd?', anchor: ANCHOR },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateComment).toHaveBeenCalledWith(expect.objectContaining({ anchor: ANCHOR }));
+    // The absence is the point: a synthetic section id would be a position the
+    // gutter would then try, and fail, to measure against.
+    expect(mockCreateComment.mock.calls[0][0]).not.toHaveProperty('sectionId');
+  });
+
+  it('stores no anchor when none is sent — the pre-anchor comment still works', async () => {
+    mockCreateComment.mockResolvedValue({ commentId: 'c-4' });
+
+    const res = await run(buildApp(), 'POST', BASE, {
+      body: { sectionId: 's-1', text: 'Looks good' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateComment.mock.calls[0][0]).not.toHaveProperty('anchor');
+  });
+
+  it('accepts a reply with neither section nor anchor — the thread positions it', async () => {
+    mockCreateComment.mockResolvedValue({ commentId: 'c-5' });
+
+    const res = await run(buildApp(), 'POST', BASE, {
+      body: { text: 'Agreed', parentCommentId: 'c-3' },
+    });
+    expect(res.statusCode).toBe(201);
+  });
+
+  it.each([
+    ['a missing version', { ...ANCHOR, v: undefined }],
+    ['a zero version', { ...ANCHOR, v: 0 }],
+    ['a missing root key', { ...ANCHOR, key: '' }],
+    ['a missing start', { ...ANCHOR, start: '' }],
+    ['a missing end', { ...ANCHOR, end: undefined }],
+    ['a non-string quote', { ...ANCHOR, quote: 42 }],
+    ['an oversized position', { ...ANCHOR, start: 'A'.repeat(2049) }],
+    ['an array', []],
+  ])('rejects an anchor with %s', async (_label, anchor) => {
+    const res = await run(buildApp(), 'POST', BASE, {
+      body: { text: 'Bad anchor', anchor },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('truncates an oversized quote rather than refusing the comment', async () => {
+    mockCreateComment.mockResolvedValue({ commentId: 'c-6' });
+
+    await run(buildApp(), 'POST', BASE, {
+      body: { text: 'Long selection', anchor: { ...ANCHOR, quote: 'x'.repeat(900) } },
+    });
+    const sent = mockCreateComment.mock.calls[0][0] as { anchor: { quote: string } };
+    expect(sent.anchor.quote).toHaveLength(500);
   });
 
   it('rejects missing text with 400', async () => {

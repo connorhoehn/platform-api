@@ -31,14 +31,35 @@ export interface DocumentExportData {
   items: SectionItemFields[];
 }
 
-function groupBySection<T extends { sectionId: string }>(entries: T[]): Map<string, T[]> {
+/**
+ * `sectionId` is optional because a canvas comment has none — it points at a
+ * span of prose instead. Those entries are skipped here rather than filed
+ * under an empty-string key, and picked up by `withoutSection` so they reach
+ * the export by their own route. Bucketing them under `''` would have hidden
+ * them behind a section that does not exist.
+ */
+function groupBySection<T extends { sectionId?: string }>(entries: T[]): Map<string, T[]> {
   const map = new Map<string, T[]>();
   for (const entry of entries) {
+    if (!entry.sectionId) continue;
     const list = map.get(entry.sectionId) ?? [];
     list.push(entry);
     map.set(entry.sectionId, list);
   }
   return map;
+}
+
+/**
+ * The entries no section claims — comments on a canvas page, which is one
+ * document rather than a list of sections.
+ *
+ * They have to be exported somewhere. Walking `sections` and emitting only
+ * what each one owns silently drops every anchored comment, and an export that
+ * quietly omits the discussion is worse than one that has no comments at all:
+ * it looks complete.
+ */
+function withoutSection<T extends { sectionId?: string }>(entries: T[]): T[] {
+  return entries.filter((entry) => !entry.sectionId);
 }
 
 /**
@@ -49,6 +70,7 @@ export function buildJsonExport(data: DocumentExportData) {
   const { meta, sections, comments, reviews, items } = data;
 
   const commentsBySection = groupBySection(comments);
+  const pageComments = withoutSection(comments);
   const itemsBySection = groupBySection(items);
   const reviewsBySection = groupBySection(reviews);
 
@@ -100,6 +122,27 @@ export function buildJsonExport(data: DocumentExportData) {
           ...(r.comment ? { comment: r.comment } : {}),
         })),
       })),
+      // Comments that belong to the page rather than to a section: a canvas
+      // document has no sections, so its threads hang here, each carrying the
+      // text it was anchored to. Omitted entirely when there are none, so a
+      // sectioned document's export is byte-identical to what it was before.
+      ...(pageComments.length > 0
+        ? {
+            pageComments: pageComments.map((c) => ({
+              id: c.commentId,
+              text: c.text,
+              userId: c.userId,
+              displayName: c.displayName,
+              timestamp: c.timestamp,
+              ...(c.parentCommentId ? { parentCommentId: c.parentCommentId } : {}),
+              ...(c.resolved !== undefined ? { resolved: c.resolved } : {}),
+              // The quote, not the encoded position: a reader of the export
+              // has no Y.Doc to resolve an anchor against, so the only useful
+              // thing to say is what the comment was about.
+              ...(c.anchor?.quote ? { quote: c.anchor.quote } : {}),
+            })),
+          }
+        : {}),
     },
   };
 }
@@ -171,6 +214,28 @@ export function buildMarkdownExport(data: DocumentExportData): string {
       }
       lines.push('');
     }
+  }
+
+  // The page's own threads. A canvas document has no sections, so the loop
+  // above emits nothing for it and this is the only place its discussion
+  // appears — hence the quote on each thread, which is the export reader's
+  // only way to know which sentence was being argued about.
+  const pageComments = withoutSection(comments);
+  const pageTopLevel = pageComments.filter((c) => !c.parentCommentId);
+  if (pageTopLevel.length > 0) {
+    lines.push('## Comments');
+    lines.push('');
+    for (const comment of pageTopLevel) {
+      const date = comment.timestamp.split('T')[0];
+      const quote = comment.anchor?.quote;
+      if (quote) lines.push(`> On "${quote}":`);
+      lines.push(`> **${comment.displayName}** (${date}): ${comment.text}`);
+      for (const reply of pageComments.filter((c) => c.parentCommentId === comment.commentId)) {
+        const replyDate = reply.timestamp.split('T')[0];
+        lines.push(`>   > **${reply.displayName}** (${replyDate}): ${reply.text}`);
+      }
+    }
+    lines.push('');
   }
 
   return lines.join('\n');
