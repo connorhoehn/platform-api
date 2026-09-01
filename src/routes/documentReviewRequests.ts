@@ -35,6 +35,10 @@ import {
 } from '../services/documentLifecycleService';
 import { publishSignal } from '../lib/event-catalog';
 import {
+  isTerminalStatus,
+  LifecycleConflictError,
+} from '../lib/document-lifecycle';
+import {
   asyncHandler,
   ValidationError,
   ForbiddenError,
@@ -96,6 +100,19 @@ async function createRequest(
   if (!rolesFor(ctx, userId).includes('owner')) {
     throw new ForbiddenError(
       'Only the document owner may request reviews',
+    );
+  }
+
+  // A terminal document cannot change state, so a review request against one
+  // could never be acted on: the reviewer's verdict has nowhere to go and the
+  // request would sit outstanding forever. Refusing here rather than accepting
+  // a request that is dead on arrival — the owner is told the document is
+  // closed instead of quietly appointing someone to a job that does not exist.
+  if (isTerminalStatus(ctx.status)) {
+    throw new LifecycleConflictError(
+      `Document ${documentId} is ${ctx.status}, a terminal state. Reviews ` +
+        `cannot be requested on it because no verdict could change anything.`,
+      'illegal_transition',
     );
   }
 

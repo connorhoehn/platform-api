@@ -373,10 +373,12 @@ describe('GET /api/documents/:documentId/lifecycle', () => {
     expect(body.lifecycle.legacyStatus).toBe('final');
   });
 
-  it('gives the owner reopen as an available action on an approved doc', async () => {
+  it('gives the owner reopen AND finalize on an approved doc', async () => {
     await seedOwnedDocument('approved');
     const res = await call('GET', `/api/documents/${DOC}/lifecycle`, { as: 'alice' });
-    expect((res.body as { availableActions: string[] }).availableActions).toEqual(['reopen']);
+    expect(
+      (res.body as { availableActions: string[] }).availableActions.sort(),
+    ).toEqual(['finalize', 'reopen']);
   });
 
   it('gives a bystander NO available actions on an approved doc', async () => {
@@ -403,8 +405,12 @@ describe('GET /api/documents/lifecycle-schema', () => {
       statuses: string[]; actions: string[];
       transitions: unknown[]; legacyStatusAliases: Record<string, string>;
     };
-    expect(body.statuses).toEqual(['draft', 'in_review', 'changes_requested', 'approved']);
-    expect(body.transitions).toHaveLength(7);
+    expect(body.statuses).toEqual([
+      'draft', 'in_review', 'changes_requested', 'approved', 'finalized',
+    ]);
+    expect(body.transitions).toHaveLength(8);
+    // Still 'approved'. The legacy string is NOT promoted to the new terminal
+    // state — see the legacy block in lib/__tests__/document-lifecycle.test.ts.
     expect(body.legacyStatusAliases['final']).toBe('approved');
   });
 });
@@ -675,10 +681,23 @@ describe('illegal transitions return 409 with a reason', () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it('rejects the old "finalize" verb with 400', async () => {
+  // This test used to read "rejects the old 'finalize' verb with 400", which
+  // is no longer true and is the point of the change: finalize is a real
+  // transition now. What it must NOT be is available from `draft` — the whole
+  // guarantee is that the terminal state is only reachable via review.
+  it('rejects finalize from draft with 409, not 400', async () => {
     await seedOwnedDocument('draft');
     const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
       as: 'alice', body: { action: 'finalize' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { code: string }).code).toBe('illegal_transition');
+  });
+
+  it('rejects a genuinely unknown verb with 400', async () => {
+    await seedOwnedDocument('draft');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'publish' },
     });
     expect(res.statusCode).toBe(400);
   });
@@ -994,7 +1013,7 @@ describe('error bodies carry a distinct machine-readable code', () => {
   it('400 unknown_action', async () => {
     await seedOwnedDocument('draft');
     const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
-      as: 'alice', body: { action: 'finalize' },
+      as: 'alice', body: { action: 'publish' },
     });
     expect(res.statusCode).toBe(400);
     expect((res.body as { code: string }).code).toBe('unknown_action');
@@ -1066,5 +1085,152 @@ describe('GET /lifecycle does not leak the audit trail to anonymous callers', ()
     expect(body.lifecycle.ownerId).toBe('alice');
     expect(body.lifecycle.lastReason).toBe('needs a rollback plan');
     expect(body.outstandingReviews).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// finalize — the terminal transition, end to end through the route
+// ---------------------------------------------------------------------------
+
+describe('POST finalize — the allow path', () => {
+  it('the owner finalizes an approved document with no outstanding reviews', async () => {
+    await seedOwnedDocument('approved');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'finalize' },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.body as {
+      from: string; to: string; action: string;
+      lifecycle: { status: string }; availableActions: string[];
+    };
+    expect(body.from).toBe('approved');
+    expect(body.to).toBe('finalized');
+    expect(body.action).toBe('finalize');
+    expect(body.lifecycle.status).toBe('finalized');
+    // The response itself says there is nothing left to do — the client does
+    // not have to know the table to render a closed document.
+    expect(body.availableActions).toEqual([]);
+  });
+
+  it('persists the terminal status, so a fresh read agrees', async () => {
+    await seedOwnedDocument('approved');
+    await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'finalize' },
+    });
+    const res = await call('GET', `/api/documents/${DOC}/lifecycle`, { as: 'alice' });
+    const body = res.body as {
+      lifecycle: { status: string; lastAction: string };
+      availableActions: string[];
+    };
+    expect(body.lifecycle.status).toBe('finalized');
+    expect(body.lifecycle.lastAction).toBe('finalize');
+    expect(body.availableActions).toEqual([]);
+  });
+
+  it('records who closed it and why, permanently', async () => {
+    await seedOwnedDocument('approved');
+    await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'finalize', reason: 'shipped in v4' },
+    });
+    const res = await call('GET', `/api/documents/${DOC}/lifecycle`, { as: 'alice' });
+    const body = res.body as {
+      lifecycle: {
+        lastReason: string;
+        history: { from: string; to: string; action: string; actor: string }[];
+      };
+    };
+    expect(body.lifecycle.lastReason).toBe('shipped in v4');
+    const last = body.lifecycle.history.at(-1)!;
+    expect(last).toMatchObject({
+      from: 'approved', to: 'finalized', action: 'finalize', actor: 'alice',
+    });
+  });
+});
+
+describe('POST finalize — the deny paths, all enforced by the server', () => {
+  it('a designated reviewer is refused with 403', async () => {
+    await seedOwnedDocument('approved');
+    await seedReviewRequest('bob', { state: 'approved' });
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'bob', body: { action: 'finalize' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect((res.body as { code: string }).code).toBe('not_authorized');
+  });
+
+  it('a bystander is refused with 403', async () => {
+    await seedOwnedDocument('approved');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'mallory', body: { action: 'finalize' },
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('an unauthenticated caller is refused with 401', async () => {
+    await seedOwnedDocument('approved');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: undefined, body: { action: 'finalize' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('the OWNER is refused with 409 while a review is outstanding', async () => {
+    await seedOwnedDocument('approved');
+    await seedReviewRequest('bob'); // pending
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'finalize' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { code: string }).code).toBe('reviews_outstanding');
+    expect((res.body as { error: string }).error).toMatch(/bob/);
+  });
+
+  it.each(['draft', 'in_review', 'changes_requested'])(
+    'the owner cannot finalize from %s — approved is the only entrance',
+    async (status) => {
+      await seedOwnedDocument(status);
+      const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+        as: 'alice', body: { action: 'finalize' },
+      });
+      expect(res.statusCode).toBe(409);
+      expect((res.body as { code: string }).code).toBe('illegal_transition');
+    },
+  );
+});
+
+describe('a finalized document is closed to everyone', () => {
+  beforeEach(async () => {
+    await seedOwnedDocument('finalized');
+  });
+
+  it.each(['reopen', 'revise', 'withdraw', 'submit_for_review', 'approve', 'finalize'])(
+    'refuses %s from the owner with 409',
+    async (action) => {
+      const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+        as: 'alice', body: { action },
+      });
+      expect(res.statusCode).toBe(409);
+      expect((res.body as { code: string }).code).toBe('illegal_transition');
+    },
+  );
+
+  it('refuses reopen from a designated reviewer too', async () => {
+    await seedReviewRequest('bob');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'bob', body: { action: 'reopen' },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it('says it is permanent, not a missing permission', async () => {
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'reopen' },
+    });
+    expect((res.body as { error: string }).error).toMatch(/terminal state/i);
+  });
+
+  it('offers no actions to the owner', async () => {
+    const res = await call('GET', `/api/documents/${DOC}/lifecycle`, { as: 'alice' });
+    expect((res.body as { availableActions: string[] }).availableActions).toEqual([]);
   });
 });

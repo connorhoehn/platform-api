@@ -16,6 +16,8 @@ import {
   actionsFrom,
   availableActions,
   isKnownAction,
+  isTerminalStatus,
+  assertTerminalStatesHaveNoExit,
   TRANSITIONS,
   DOCUMENT_STATUSES,
   LIFECYCLE_ACTIONS,
@@ -42,6 +44,9 @@ const LEGAL_PAIRS: ReadonlyArray<[DocumentStatus, DocumentStatus]> = [
   ['changes_requested', 'draft'],
   ['changes_requested', 'in_review'],
   ['approved', 'draft'],
+  ['approved', 'finalized'],
+  // Nothing leaves 'finalized'. Its absence from this list is what every
+  // `finalized -> *` case in the exhaustive pair sweep below asserts against.
 ];
 
 /** (from, action) → who may drive it. Everything absent is illegal. */
@@ -58,6 +63,7 @@ const LEGAL_MOVES: ReadonlyArray<{
   { from: 'changes_requested', action: 'revise', to: 'draft', roles: ['owner'] },
   { from: 'changes_requested', action: 'submit_for_review', to: 'in_review', roles: ['owner'] },
   { from: 'approved', action: 'reopen', to: 'draft', roles: ['owner'] },
+  { from: 'approved', action: 'finalize', to: 'finalized', roles: ['owner'] },
 ];
 
 const ALL_ROLES: ActorRole[] = ['owner', 'reviewer'];
@@ -95,16 +101,156 @@ describe('transition table integrity', () => {
     expect(toApproved[0]!.allowedRoles).toEqual(['reviewer']);
   });
 
-  it('exactly one rule leaves approved, and it is owner-only', () => {
+  it('every rule leaving approved is owner-only', () => {
     // This is the "anyone can unlock a finalized doc" bug, encoded as a test.
+    // There are two exits now (reopen and finalize) and BOTH are owner-only,
+    // which is the property that actually mattered — the original single-rule
+    // count was a proxy for it.
     const fromApproved = TRANSITIONS.filter((r) => r.from === 'approved');
-    expect(fromApproved).toHaveLength(1);
-    expect(fromApproved[0]!.action).toBe('reopen');
-    expect(fromApproved[0]!.allowedRoles).toEqual(['owner']);
+    expect(fromApproved.map((r) => r.action).sort()).toEqual(['finalize', 'reopen']);
+    for (const rule of fromApproved) {
+      expect(rule.allowedRoles).toEqual(['owner']);
+    }
   });
 
   it('no rule is a self-transition', () => {
     expect(TRANSITIONS.filter((r) => r.from === r.to)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The terminal state
+// ---------------------------------------------------------------------------
+
+describe('finalized is terminal', () => {
+  it('no rule leaves it, for any action', () => {
+    expect(TRANSITIONS.filter((r) => r.from === 'finalized')).toHaveLength(0);
+    expect(actionsFrom('finalized')).toEqual([]);
+  });
+
+  it('offers no action to any combination of roles', () => {
+    const roleSets: ActorRole[][] = [[], ['owner'], ['reviewer'], ['owner', 'reviewer']];
+    for (const roles of roleSets) {
+      expect(availableActions('finalized', roles)).toEqual([]);
+    }
+  });
+
+  it('refuses every action in the vocabulary, even from an all-roles actor', () => {
+    for (const action of LIFECYCLE_ACTIONS) {
+      expect(() =>
+        transition('finalized', action, { roles: ALL_ROLES, outstandingReviews: [] }),
+      ).toThrow(ConflictError);
+    }
+  });
+
+  it('explains that it is permanent rather than a missing permission', () => {
+    // The wording is load-bearing: a bare "no actions are legal" reads as
+    // something the caller might fix by asking someone.
+    expect(() => transition('finalized', 'reopen', { roles: ALL_ROLES })).toThrow(
+      /terminal state.*for any user/s,
+    );
+    expect(() => transition('finalized', 'reopen', { roles: ALL_ROLES })).toThrow(
+      /not a permission you are missing/,
+    );
+  });
+
+  it('is reported as terminal, and the other states are not', () => {
+    expect(isTerminalStatus('finalized')).toBe(true);
+    for (const s of DOCUMENT_STATUSES.filter((x) => x !== 'finalized')) {
+      expect(isTerminalStatus(s)).toBe(false);
+    }
+  });
+
+  it('locks the document, like approved but permanently', () => {
+    expect(isLocked('finalized')).toBe(true);
+    expect(isLocked('approved')).toBe(true);
+    // The lock says nothing about reversibility; only isTerminalStatus does.
+    expect(isTerminalStatus('approved')).toBe(false);
+  });
+
+  it('the runtime guard agrees with the table', () => {
+    expect(() => assertTerminalStatesHaveNoExit()).not.toThrow();
+  });
+});
+
+describe('reaching finalized takes two different actors', () => {
+  // The point of the owner/reviewer split on approve vs finalize: no single
+  // role can drive a document from draft to a state nobody can undo.
+  it('an owner alone cannot approve, so cannot reach finalized alone', () => {
+    expect(() =>
+      transition('in_review', 'approve', { roles: ['owner'], outstandingReviews: [] }),
+    ).toThrow(ForbiddenError);
+  });
+
+  it('a reviewer alone cannot finalize an approved document', () => {
+    expect(() =>
+      transition('approved', 'finalize', { roles: ['reviewer'], outstandingReviews: [] }),
+    ).toThrow(ForbiddenError);
+  });
+
+  it('a bystander certainly cannot', () => {
+    expect(() =>
+      transition('approved', 'finalize', { roles: [], outstandingReviews: [] }),
+    ).toThrow(ForbiddenError);
+  });
+
+  it('the owner can, once a reviewer has approved', () => {
+    const result = transition('approved', 'finalize', {
+      roles: ['owner'],
+      outstandingReviews: [],
+    });
+    expect(result.to).toBe('finalized');
+    expect(result.action).toBe('finalize');
+  });
+});
+
+describe('finalize is gated on outstanding reviews', () => {
+  const pending: OutstandingReview[] = [
+    { requestKey: 'r-1', reviewerId: 'grace', state: 'pending' },
+  ];
+
+  it('refuses with 409 while a review request is outstanding', () => {
+    // The deliberate change from the old warn-not-block behaviour: with no
+    // unlock, finalizing over a pending request makes it permanently
+    // unanswerable, so the override is not offered at all.
+    expect(() =>
+      transition('approved', 'finalize', {
+        roles: ['owner'],
+        outstandingReviews: pending,
+      }),
+    ).toThrow(ConflictError);
+  });
+
+  it('names the blocking reviewer', () => {
+    expect(() =>
+      transition('approved', 'finalize', {
+        roles: ['owner'],
+        outstandingReviews: pending,
+      }),
+    ).toThrow(/grace/);
+  });
+
+  it('the rule carries requiresAllReviews, so the gate is not incidental', () => {
+    const rule = findRule('approved', 'finalize')!;
+    expect(rule.requiresAllReviews).toBe(true);
+  });
+
+  it('reopen is NOT gated on reviews — only the one-way door is', () => {
+    expect(() =>
+      transition('approved', 'reopen', {
+        roles: ['owner'],
+        outstandingReviews: pending,
+      }),
+    ).not.toThrow();
+  });
+
+  it('forbidden still beats outstanding-reviews', () => {
+    expect(() =>
+      transition('approved', 'finalize', {
+        roles: ['reviewer'],
+        outstandingReviews: pending,
+      }),
+    ).toThrow(ForbiddenError);
   });
 });
 
@@ -114,9 +260,9 @@ describe('isLegalTransition — every (from, to) pair', () => {
     for (const to of DOCUMENT_STATUSES) pairs.push([from, to]);
   }
 
-  it('covers all 16 pairs (4 states squared)', () => {
-    expect(pairs).toHaveLength(16);
-    expect(LEGAL_PAIR_KEYS.size).toBe(7);
+  it('covers all 25 pairs (5 states squared)', () => {
+    expect(pairs).toHaveLength(25);
+    expect(LEGAL_PAIR_KEYS.size).toBe(8);
   });
 
   it.each(pairs)('%s -> %s', (from, to) => {
@@ -130,8 +276,8 @@ describe('transition() — every (from, action) pair', () => {
     for (const action of LIFECYCLE_ACTIONS) combos.push([from, action]);
   }
 
-  it('covers all 24 combinations (4 states x 6 actions)', () => {
-    expect(combos).toHaveLength(24);
+  it('covers all 35 combinations (5 states x 7 actions)', () => {
+    expect(combos).toHaveLength(35);
   });
 
   it.each(combos)(
@@ -164,19 +310,36 @@ describe('transition() — every (from, action) pair', () => {
     ).toThrow(/Cannot 'approve' a document in state 'draft'.*submit_for_review/s);
   });
 
+  // 'finalize' used to be this file's example of an unknown action. It is a
+  // real action now, so the example moved — and the pair below pins the new
+  // fact directly, because "finalize is in the vocabulary" is exactly the
+  // thing a careless revert would undo while leaving every other test green.
   it('rejects an action outside the vocabulary with a 400, not a 409', () => {
-    expect(() => transition('draft', 'finalize', { roles: ALL_ROLES })).toThrow(
+    expect(() => transition('draft', 'publish', { roles: ALL_ROLES })).toThrow(
       ValidationError,
     );
-    expect(() => transition('draft', 'finalize', { roles: ALL_ROLES })).toThrow(
+    expect(() => transition('draft', 'publish', { roles: ALL_ROLES })).toThrow(
       /Unknown lifecycle action/,
     );
   });
 
   it('isKnownAction gates the vocabulary', () => {
     for (const a of LIFECYCLE_ACTIONS) expect(isKnownAction(a)).toBe(true);
-    expect(isKnownAction('finalize')).toBe(false);
+    expect(isKnownAction('publish')).toBe(false);
     expect(isKnownAction('')).toBe(false);
+  });
+
+  it('finalize IS part of the vocabulary', () => {
+    expect(isKnownAction('finalize')).toBe(true);
+    expect(LIFECYCLE_ACTIONS).toContain('finalize');
+  });
+
+  it('a finalize attempt from a non-approved state is a 409, not a 400', () => {
+    // The distinction matters: 400 would say "no such action", which would
+    // send the caller looking for a typo instead of at the document's state.
+    expect(() => transition('draft', 'finalize', { roles: ALL_ROLES })).toThrow(
+      ConflictError,
+    );
   });
 });
 
@@ -359,9 +522,50 @@ describe('legacy `final` status', () => {
   it('locks the document', () => {
     expect(isLocked('final')).toBe(true);
     expect(isLocked('approved')).toBe(true);
+    expect(isLocked('finalized')).toBe(true);
     expect(isLocked('draft')).toBe(false);
     expect(isLocked('in_review')).toBe(false);
     expect(isLocked('changes_requested')).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // The one that would be easy to get wrong
+  // -------------------------------------------------------------------------
+
+  it('does NOT normalize to the new terminal state, despite the spelling', () => {
+    // 'final' (legacy stored value) and 'finalized' (terminal state) differ by
+    // three characters and mean opposite things about reversibility. Mapping
+    // the old string onto the new state would silently make an existing set of
+    // documents permanently unreopenable on the strength of a value written
+    // when nothing on the server meant anything by it.
+    expect(normalizeStatus('final')).toBe('approved');
+    expect(normalizeStatus('final')).not.toBe('finalized');
+  });
+
+  it('leaves a legacy document reopenable', () => {
+    expect(isTerminalStatus('final')).toBe(false);
+    expect(actionsFrom(normalizeStatus('final'))).toContain('reopen');
+    expect(() => transition('final', 'reopen', { roles: ['owner'] })).not.toThrow();
+  });
+
+  it('a legacy document can still be finalized, but only through the real rule', () => {
+    // It is `approved`, so `finalize` is legal from it — for the owner, with
+    // no outstanding reviews. That is the migration path: not inherited,
+    // transitioned.
+    const result = transition('final', 'finalize', {
+      roles: ['owner'],
+      outstandingReviews: [],
+    });
+    expect(result.from).toBe('approved');
+    expect(result.to).toBe('finalized');
+    // Still flagged, so the write path rewrites the stored 'final' as it goes.
+    expect(result.migratedLegacyStatus).toBe(true);
+  });
+
+  it('and a non-owner still cannot', () => {
+    expect(() =>
+      transition('final', 'finalize', { roles: ['reviewer'], outstandingReviews: [] }),
+    ).toThrow(ForbiddenError);
   });
 });
 
@@ -391,7 +595,8 @@ describe('introspection helpers (drive frontend button state)', () => {
     expect(actionsFrom('changes_requested').sort()).toEqual(
       ['revise', 'submit_for_review'].sort(),
     );
-    expect(actionsFrom('approved').sort()).toEqual(['reopen']);
+    expect(actionsFrom('approved').sort()).toEqual(['finalize', 'reopen']);
+    expect(actionsFrom('finalized')).toEqual([]);
   });
 
   it('availableActions filters by the actor roles', () => {
@@ -401,7 +606,9 @@ describe('introspection helpers (drive frontend button state)', () => {
     );
     expect(availableActions('in_review', []).length).toBe(0);
     expect(availableActions('approved', ['reviewer']).length).toBe(0);
-    expect(availableActions('approved', ['owner'])).toEqual(['reopen']);
+    expect(availableActions('approved', ['owner']).sort()).toEqual(['finalize', 'reopen']);
+    // Terminal: empty for everyone, which is what the FE renders as "closed".
+    expect(availableActions('finalized', ['owner'])).toEqual([]);
   });
 
   it('findRule returns undefined for illegal moves', () => {
