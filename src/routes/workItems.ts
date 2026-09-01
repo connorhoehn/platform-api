@@ -26,7 +26,7 @@
 
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth';
-import { sectionItemRepo } from '../repositories';
+import { sectionItemRepo, changeVerdictRepo, toVerdict } from '../repositories';
 import type { SectionItemFields } from '../repositories/SectionItemRepository';
 import { publishSignal } from '../lib/event-catalog';
 import {
@@ -49,6 +49,20 @@ import {
   ProposalProviderError,
   type DocumentSnapshot,
 } from '../lib/proposalDrafter';
+import {
+  buildVerdictContext,
+  computeChangeRevision,
+  judgeChange,
+  describeError,
+  VerdictParseError,
+  VerdictProviderError,
+  VerdictTimeoutError,
+  type PeerChange,
+} from '../lib/changeVerdict';
+import type {
+  ChangeVerdictResponse,
+  VerdictFailure,
+} from '../types/changeVerdict';
 import log from '../lib/logger';
 
 export const workItemsRouter = Router({ mergeParams: true });
@@ -392,6 +406,250 @@ workItemsRouter.post(
     });
     publish(documentId, 'workitem:rejected', { sectionId: item.sectionId, itemId });
     res.status(200).json({ item: updated });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Verdicts — pass / concern / fail on a proposed change
+//
+// ADVICE, NEVER A GATE. Nothing below applies, accepts, or rejects anything. A
+// `pass` moves no status and unblocks no button; the accept path is
+// `POST .../applied` above, it is driven by a person, and it demands a receipt
+// proving the edit landed. An agent's opinion is not an approval, and the
+// moment it becomes one this stops being useful and starts being a liability.
+// ---------------------------------------------------------------------------
+
+/**
+ * The other changes awaiting a decision on this document.
+ *
+ * Two pending changes that contradict each other are invisible to any reviewer
+ * that only ever sees one of them, so they go into the prompt. Bounded by the
+ * document's own item count, which is tens, not thousands.
+ */
+function peersOf(all: SectionItemFields[], selfItemId: string): PeerChange[] {
+  return all
+    .filter((i) => i.itemId !== selfItemId && i.proposal && i.proposalStatus === 'ready')
+    .map((i) => ({
+      itemId: i.itemId,
+      ...(i.text ? { summary: i.text.slice(0, 240) } : {}),
+      proposal: i.proposal!,
+    }));
+}
+
+/** Shape a FAILED state. Never a verdict — see types/changeVerdict.ts. */
+function failure(
+  reason: VerdictFailure['reason'],
+  error: string,
+  detail: string,
+  currentRevision: string,
+): VerdictFailure {
+  return { state: 'failed', reason, error, detail, currentRevision };
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/documents/:documentId/work-items/verdicts
+// ---------------------------------------------------------------------------
+
+/**
+ * Cache-only verdicts for every pending change in the document, keyed by item
+ * id. Calls no model, so it is safe to hit on every render of the queue; a
+ * change with no cached verdict simply is not in the map.
+ *
+ * Static segment — registered before `/:itemId/...` for the usual Express
+ * reason, though the two cannot actually collide at one segment vs two.
+ */
+workItemsRouter.get(
+  '/verdicts',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const { documentId } = req.params;
+    const userId = req.user!.sub;
+    const items = (await sectionItemRepo.getItemsForDocument(documentId)).filter(
+      (i) => i.proposal && visibleTo(i, userId),
+    );
+
+    const entries = await Promise.all(
+      items.slice(0, 100).map(async (item) => {
+        const currentRevision = computeChangeRevision(item.proposal!);
+        const rows = await changeVerdictRepo.listForChange(documentId, item.itemId);
+        const exact = rows.find((r) => r.forRevision === currentRevision);
+        const stale = rows.find((r) => r.forRevision !== currentRevision);
+        const body: ChangeVerdictResponse = {
+          verdict: exact ? toVerdict(exact) : null,
+          cached: Boolean(exact),
+          currentRevision,
+          ...(stale && !exact ? { stale: toVerdict(stale) } : {}),
+        };
+        return [item.itemId, body] as const;
+      }),
+    );
+
+    res.status(200).json({ verdicts: Object.fromEntries(entries) });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// GET /api/documents/:documentId/work-items/:itemId/verdict
+// ---------------------------------------------------------------------------
+
+/** One change's cached verdict. Never calls the model. */
+workItemsRouter.get(
+  '/:itemId/verdict',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const { documentId, itemId } = req.params;
+    const item = await loadOr404(documentId, itemId);
+    if (!item.proposal) throw new ValidationError('this work item has no proposed change to judge');
+
+    const currentRevision = computeChangeRevision(item.proposal);
+    const rows = await changeVerdictRepo.listForChange(documentId, itemId);
+    const exact = rows.find((r) => r.forRevision === currentRevision);
+    const stale = rows.find((r) => r.forRevision !== currentRevision);
+
+    const body: ChangeVerdictResponse = {
+      verdict: exact ? toVerdict(exact) : null,
+      cached: Boolean(exact),
+      currentRevision,
+      ...(stale && !exact ? { stale: toVerdict(stale) } : {}),
+    };
+    res.status(200).json(body);
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/documents/:documentId/work-items/:itemId/verdict
+// ---------------------------------------------------------------------------
+
+/**
+ * Produce the verdict, or serve the cached one.
+ *
+ * `snapshot` is required for the same reason it is required for drafting: there
+ * is no server-side Y.Doc, so the browser is the only process that can show us
+ * the document. A verdict computed from the change alone would be a style
+ * opinion — it could not answer "does this contradict what the document already
+ * says", which is the only question worth asking here.
+ *
+ * The cache key is (change id, hash of the change's content). A verdict is
+ * therefore addressable only by the exact text it judged: edit the change and
+ * the old verdict is not stale, it is unreachable. `?refresh=1` re-asks anyway.
+ */
+workItemsRouter.post(
+  '/:itemId/verdict',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const { documentId, itemId } = req.params;
+    const { snapshot, model, refresh } = req.body as {
+      snapshot?: DocumentSnapshot;
+      model?: string;
+      refresh?: boolean;
+    };
+
+    if (!snapshot || !Array.isArray(snapshot.sections) || typeof snapshot.meta !== 'object') {
+      throw new ValidationError(
+        'snapshot { meta, sections[] } is required — the server has no Y.Doc to read, ' +
+          'and a verdict without the surrounding document is a style opinion',
+      );
+    }
+
+    const item = await loadOr404(documentId, itemId);
+    if (!item.proposal) throw new ValidationError('this work item has no proposed change to judge');
+
+    const proposal = item.proposal;
+    const currentRevision = computeChangeRevision(proposal);
+    const all = await sectionItemRepo.getItemsForDocument(documentId);
+    const context = buildVerdictContext({
+      proposal,
+      snapshot,
+      ...(item.utterance ? { utterance: item.utterance } : {}),
+      peers: peersOf(all, itemId),
+    });
+
+    if (refresh !== true) {
+      const cached = await changeVerdictRepo.get(documentId, itemId, currentRevision);
+      // Both halves must match. Same change AND same document around it — a row
+      // whose context digest has moved was reasoned from a document that no
+      // longer exists, and "does this contradict the document" cannot be
+      // answered from the wrong one.
+      if (cached && cached.contextDigest === context.digest) {
+        const body: ChangeVerdictResponse = {
+          verdict: toVerdict(cached),
+          cached: true,
+          currentRevision,
+        };
+        res.status(200).json(body);
+        return;
+      }
+    }
+
+    try {
+      const result = await judgeChange({
+        proposal,
+        snapshot,
+        forRevision: currentRevision,
+        context,
+        ...(model ? { model } : {}),
+      });
+
+      await changeVerdictRepo.put({
+        documentId,
+        itemId,
+        forRevision: currentRevision,
+        verdict: result.verdict.verdict,
+        headline: result.verdict.headline,
+        ...(result.verdict.reasoning ? { reasoning: result.verdict.reasoning } : {}),
+        producedAt: result.verdict.producedAt,
+        contextDigest: context.digest,
+        model: result.model,
+      });
+
+      log.info(
+        {
+          event: 'workitem.verdict.produced',
+          documentId,
+          itemId,
+          verdict: result.verdict.verdict,
+          forRevision: currentRevision,
+          elapsedMs: result.elapsedMs,
+          peers: peersOf(all, itemId).length,
+        },
+        'change verdict produced',
+      );
+
+      const body: ChangeVerdictResponse = {
+        verdict: result.verdict,
+        cached: false,
+        currentRevision,
+      };
+      res.status(200).json(body);
+    } catch (err) {
+      // Nothing is cached on any of these paths, and none of them invents a
+      // verdict. A synthesised `pass` here would be indistinguishable from a
+      // real one and would be skimmed past exactly like a real one.
+      const detail = describeError(err);
+      log.warn(
+        { event: 'workitem.verdict.failed', documentId, itemId, forRevision: currentRevision, err: detail },
+        'change verdict failed',
+      );
+      if (err instanceof VerdictTimeoutError) {
+        res
+          .status(504)
+          .json(failure('timed_out', 'the reviewing model did not answer in time', detail, currentRevision));
+        return;
+      }
+      if (err instanceof VerdictProviderError) {
+        res
+          .status(502)
+          .json(failure('provider_unavailable', 'the reviewing model is unavailable', detail, currentRevision));
+        return;
+      }
+      if (err instanceof VerdictParseError) {
+        res
+          .status(502)
+          .json(failure('unusable_reply', 'the reviewing model gave an unusable answer', detail, currentRevision));
+        return;
+      }
+      throw err;
+    }
   }),
 );
 

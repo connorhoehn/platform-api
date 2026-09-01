@@ -20,6 +20,7 @@ import { CallRecordingRepository } from './CallRecordingRepository';
 import { CallReactionRepository } from './CallReactionRepository';
 import { HangoutRoomRepository } from './HangoutRoomRepository';
 import { HangoutRoomMemberRepository } from './HangoutRoomMemberRepository';
+import { ChangeVerdictRepository } from './ChangeVerdictRepository';
 
 // Singleton instances — share the same docClient across all repositories
 export const profileRepo = new ProfileRepository(docClient);
@@ -44,6 +45,7 @@ export const callRecordingRepo = new CallRecordingRepository(docClient);
 export const callReactionRepo = new CallReactionRepository(docClient);
 export const hangoutRoomRepo = new HangoutRoomRepository(docClient);
 export const hangoutRoomMemberRepo = new HangoutRoomMemberRepository(docClient);
+export const changeVerdictRepo = new ChangeVerdictRepository(docClient);
 
 export { BaseRepository } from './BaseRepository';
 export { ProfileRepository, ProfileItem } from './ProfileRepository';
@@ -162,3 +164,10 @@ export {
   ListRoomsForUserResult,
   HANGOUT_ROOM_MEMBERS_TABLE,
 } from './HangoutRoomMemberRepository';
+export {
+  ChangeVerdictRepository,
+  ChangeVerdictRow,
+  CHANGE_VERDICTS_TABLE,
+  changeKey,
+  toVerdict,
+} from './ChangeVerdictRepository';
