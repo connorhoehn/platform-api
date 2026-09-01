@@ -172,8 +172,15 @@ const fakeRequestRepo = {
   },
 };
 
+/**
+ * When set, the creator lookup THROWS instead of returning a row — the case
+ * that used to be swallowed into `null` and thereby into an ownership grant.
+ */
+let typedDocLookupError: Error | null = null;
+
 const fakeTypedDocumentRepo = {
   async get(documentId: string): Promise<{ createdBy: string } | null> {
+    if (typedDocLookupError) throw typedDocLookupError;
     return typedDocs.get(documentId) ?? null;
   },
 };
@@ -342,6 +349,7 @@ beforeEach(() => {
   lifecycleRows.clear();
   requestRows.clear();
   typedDocs.clear();
+  typedDocLookupError = null;
   mockEmit.mockClear();
   currentUser = 'alice';
 });
@@ -694,16 +702,369 @@ describe('ownership resolution', () => {
     expect(denied.statusCode).toBe(403);
   });
 
-  it('trust-on-first-use: the first caller claims a document with no owner anywhere', async () => {
+  it('the creator CAN act, and the materialized row records the creator as owner', async () => {
+    typedDocs.set(DOC, { createdBy: 'alice' });
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'submit_for_review' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(lifecycleRows.get(DOC)!['ownerId']).toBe('alice');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The vulnerability this lane closes.
+// ---------------------------------------------------------------------------
+
+describe('a null owner does NOT grant ownership (no trust-on-first-use)', () => {
+  it('the first caller on an ownerless document is refused, not made owner', async () => {
     const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
       as: 'mallory', body: { action: 'submit_for_review' },
     });
-    expect(res.statusCode).toBe(200);
-    expect(lifecycleRows.get(DOC)!['ownerId']).toBe('mallory');
-    // ...and the claim sticks: alice is now a bystander.
-    const after = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
-      as: 'alice', body: { action: 'withdraw' },
+    expect(res.statusCode).toBe(403);
+    expect((res.body as { code: string }).code).toBe('owner_not_established');
+    // The decisive assertion: no row was written, so nothing was claimed.
+    expect(lifecycleRows.has(DOC)).toBe(false);
+  });
+
+  it('an ownerless document offers NOBODY any available action', async () => {
+    const res = await call('GET', `/api/documents/${DOC}/lifecycle`, { as: 'mallory' });
+    expect((res.body as { availableActions: string[] }).availableActions).toEqual([]);
+  });
+
+  it('an ownerless approved document cannot be reopened by anyone', async () => {
+    lifecycleRows.set(DOC, {
+      documentId: DOC, status: 'approved', ownerId: '',
+      createdAt: '', updatedAt: '', updatedBy: '', version: 1, history: [],
     });
-    expect(after.statusCode).toBe(403);
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'mallory', body: { action: 'reopen' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(lifecycleRows.get(DOC)!['status']).toBe('approved');
+  });
+
+  it('a designated reviewer is unaffected — reviewer rights never came from ownership', async () => {
+    // No lifecycle row owner and no creator, but bob has a review request.
+    lifecycleRows.set(DOC, {
+      documentId: DOC, status: 'in_review', ownerId: '',
+      createdAt: '', updatedAt: '', updatedBy: '', version: 1, history: [],
+    });
+    await seedReviewRequest('bob', { state: 'approved' });
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'bob', body: { action: 'approve' },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+});
+
+describe('a FAILED creator lookup fails closed', () => {
+  it('does not grant ownership — 503, not a silent grant', async () => {
+    typedDocLookupError = new Error('ddb unavailable');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'mallory', body: { action: 'submit_for_review' },
+    });
+    expect(res.statusCode).toBe(503);
+    expect((res.body as { code: string }).code).toBe('owner_lookup_unavailable');
+    expect(lifecycleRows.has(DOC)).toBe(false);
+  });
+
+  it('is distinguished from "definitely no owner" by its code', async () => {
+    const absent = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'mallory', body: { action: 'submit_for_review' },
+    });
+    typedDocLookupError = new Error('ddb unavailable');
+    const unavailable = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'mallory', body: { action: 'submit_for_review' },
+    });
+    expect((absent.body as { code: string }).code).toBe('owner_not_established');
+    expect((unavailable.body as { code: string }).code).toBe('owner_lookup_unavailable');
+    expect(absent.statusCode).not.toBe(unavailable.statusCode);
+  });
+
+  it('cannot be used to steal a document that already has a recorded owner', async () => {
+    await seedOwnedDocument('draft');
+    typedDocLookupError = new Error('ddb unavailable');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'mallory', body: { action: 'submit_for_review' },
+    });
+    // The recorded ownerId short-circuits the creator lookup entirely.
+    expect(res.statusCode).toBe(403);
+    expect((res.body as { code: string }).code).toBe('not_authorized');
+  });
+
+  it('the legitimate owner still cannot be locked out once ownership is recorded', async () => {
+    await seedOwnedDocument('draft');
+    typedDocLookupError = new Error('ddb unavailable');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'submit_for_review' },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('refuses an ownership CLAIM rather than granting it', async () => {
+    typedDocLookupError = new Error('ddb unavailable');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, {
+      as: 'mallory', body: {},
+    });
+    expect(res.statusCode).toBe(503);
+    expect((res.body as { code: string }).code).toBe('owner_lookup_unavailable');
+    expect(lifecycleRows.has(DOC)).toBe(false);
+  });
+});
+
+describe('POST /lifecycle/ownership — explicit, recorded first claim', () => {
+  it('claims an ownerless document and records the owner', async () => {
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, {
+      as: 'alice', body: {},
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { claimed: boolean }).claimed).toBe(true);
+    expect(lifecycleRows.get(DOC)!['ownerId']).toBe('alice');
+  });
+
+  it('unblocks the owner-only transitions that were refused before the claim', async () => {
+    const before = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'submit_for_review' },
+    });
+    expect(before.statusCode).toBe(403);
+
+    await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, { as: 'alice', body: {} });
+
+    const after = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'submit_for_review' },
+    });
+    expect(after.statusCode).toBe(200);
+  });
+
+  it('is idempotent for the owner and does not re-claim', async () => {
+    await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, { as: 'alice', body: {} });
+    const again = await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, {
+      as: 'alice', body: {},
+    });
+    expect(again.statusCode).toBe(200);
+    expect((again.body as { claimed: boolean }).claimed).toBe(false);
+    expect(lifecycleRows.get(DOC)!['ownerId']).toBe('alice');
+  });
+
+  it('a second user cannot take over an already-claimed document (409)', async () => {
+    await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, { as: 'alice', body: {} });
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, {
+      as: 'mallory', body: {},
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { code: string }).code).toBe('owner_already_established');
+    expect(lifecycleRows.get(DOC)!['ownerId']).toBe('alice');
+  });
+
+  it('cannot override a document whose creator is known (409)', async () => {
+    typedDocs.set(DOC, { createdBy: 'alice' });
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, {
+      as: 'mallory', body: {},
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { code: string }).code).toBe('owner_already_established');
+  });
+
+  it('requires authentication (401)', async () => {
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, {
+      as: undefined, body: {},
+    });
+    expect(res.statusCode).toBe(401);
+    expect(lifecycleRows.has(DOC)).toBe(false);
+  });
+
+  it('preserves the existing status when claiming a non-draft document', async () => {
+    lifecycleRows.set(DOC, {
+      documentId: DOC, status: 'approved', ownerId: '',
+      createdAt: '', updatedAt: '', updatedBy: '', version: 3, history: [],
+    });
+    // A row exists, so `initialize` loses; the claim must not silently succeed
+    // against an existing row it did not write.
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/ownership`, {
+      as: 'mallory', body: {},
+    });
+    expect(res.statusCode).toBe(409);
+    expect(lifecycleRows.get(DOC)!['status']).toBe('approved');
+  });
+});
+
+describe('error bodies carry a distinct machine-readable code', () => {
+  it('409 illegal_transition', async () => {
+    await seedOwnedDocument('draft');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'reopen' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { code: string }).code).toBe('illegal_transition');
+  });
+
+  it('409 reviews_outstanding — same status, different code', async () => {
+    await seedOwnedDocument('in_review');
+    await seedReviewRequest('bob', { state: 'approved' });
+    await seedReviewRequest('carol', { state: 'pending' });
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'bob', body: { action: 'approve' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { code: string }).code).toBe('reviews_outstanding');
+  });
+
+  it('409 concurrent_modification — a lost compare-and-swap', async () => {
+    await seedOwnedDocument('draft');
+    // Move the row out from under the decision, exactly as a racing writer
+    // would; the repository's CAS then fails.
+    const spy = jest
+      .spyOn(fakeLifecycleRepo, 'applyTransition')
+      .mockImplementationOnce(async () => {
+        const { LifecycleConcurrencyError } = jest.requireActual<
+          typeof import('../../repositories/DocumentLifecycleRepository')
+        >('../../repositories/DocumentLifecycleRepository');
+        throw new LifecycleConcurrencyError();
+      });
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'submit_for_review' },
+    });
+    spy.mockRestore();
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { code: string }).code).toBe('concurrent_modification');
+  });
+
+  it('the three 409s are mutually distinguishable without reading the prose', async () => {
+    const codes = new Set<string>();
+
+    await seedOwnedDocument('draft');
+    codes.add(
+      ((await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+        as: 'alice', body: { action: 'reopen' },
+      })).body as { code: string }).code,
+    );
+
+    lifecycleRows.clear();
+    requestRows.clear();
+    await seedOwnedDocument('in_review');
+    await seedReviewRequest('bob', { state: 'pending' });
+    codes.add(
+      ((await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+        as: 'bob', body: { action: 'approve' },
+      })).body as { code: string }).code,
+    );
+
+    lifecycleRows.clear();
+    requestRows.clear();
+    await seedOwnedDocument('draft');
+    const spy = jest
+      .spyOn(fakeLifecycleRepo, 'applyTransition')
+      .mockImplementationOnce(async () => {
+        const { LifecycleConcurrencyError } = jest.requireActual<
+          typeof import('../../repositories/DocumentLifecycleRepository')
+        >('../../repositories/DocumentLifecycleRepository');
+        throw new LifecycleConcurrencyError();
+      });
+    codes.add(
+      ((await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+        as: 'alice', body: { action: 'submit_for_review' },
+      })).body as { code: string }).code,
+    );
+    spy.mockRestore();
+
+    expect(codes).toEqual(
+      new Set(['illegal_transition', 'reviews_outstanding', 'concurrent_modification']),
+    );
+  });
+
+  it('403 not_authorized', async () => {
+    await seedOwnedDocument('approved');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'mallory', body: { action: 'reopen' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect((res.body as { code: string }).code).toBe('not_authorized');
+  });
+
+  it('400 action_required when no action is supplied', async () => {
+    await seedOwnedDocument('draft');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: {},
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.body as { code: string }).code).toBe('action_required');
+  });
+
+  it('400 unknown_action', async () => {
+    await seedOwnedDocument('draft');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'finalize' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.body as { code: string }).code).toBe('unknown_action');
+  });
+
+  it('keeps the human-readable `error` string alongside the code', async () => {
+    await seedOwnedDocument('approved');
+    const res = await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'mallory', body: { action: 'reopen' },
+    });
+    const body = res.body as { error: string; code: string };
+    expect(body.error).toMatch(/Only the document owner/);
+    expect(body.code).toBe('not_authorized');
+  });
+});
+
+describe('GET /lifecycle does not leak the audit trail to anonymous callers', () => {
+  beforeEach(async () => {
+    await seedOwnedDocument('in_review');
+    await seedReviewRequest('bob');
+    lifecycleRows.set(DOC, {
+      ...lifecycleRows.get(DOC)!,
+      updatedBy: 'alice',
+      lastAction: 'submit_for_review',
+      lastReason: 'needs a rollback plan',
+      history: [
+        {
+          from: 'draft', to: 'in_review', action: 'submit_for_review',
+          actor: 'alice', at: '2026-01-01T00:00:00.000Z',
+          reason: 'needs a rollback plan',
+        },
+      ],
+    });
+  });
+
+  it('withholds history, actor ids, reasons and the reviewer roster', async () => {
+    const res = await call('GET', `/api/documents/${DOC}/lifecycle`, { as: undefined });
+    expect(res.statusCode).toBe(200);
+    const body = res.body as {
+      lifecycle: Record<string, unknown>;
+      outstandingReviews: unknown[];
+      availableActions: string[];
+    };
+    expect(body.lifecycle['history']).toBeUndefined();
+    expect(body.lifecycle['ownerId']).toBeUndefined();
+    expect(body.lifecycle['updatedBy']).toBeUndefined();
+    expect(body.lifecycle['lastReason']).toBeUndefined();
+    expect(body.outstandingReviews).toEqual([]);
+    expect(body.availableActions).toEqual([]);
+    // No user id survives anywhere in the serialized response.
+    expect(JSON.stringify(body)).not.toMatch(/alice|bob|rollback/);
+  });
+
+  it('still tells an anonymous reader the status, so the badge keeps working', async () => {
+    const res = await call('GET', `/api/documents/${DOC}/lifecycle`, { as: undefined });
+    const body = res.body as { lifecycle: { status: string; version: number; implicit: boolean } };
+    expect(body.lifecycle.status).toBe('in_review');
+    expect(body.lifecycle.version).toBe(1);
+    expect(body.lifecycle.implicit).toBe(false);
+  });
+
+  it('an authenticated caller still gets the full view', async () => {
+    const res = await call('GET', `/api/documents/${DOC}/lifecycle`, { as: 'alice' });
+    const body = res.body as {
+      lifecycle: { history: unknown[]; ownerId: string; lastReason?: string };
+      outstandingReviews: unknown[];
+    };
+    expect(body.lifecycle.history).toHaveLength(1);
+    expect(body.lifecycle.ownerId).toBe('alice');
+    expect(body.lifecycle.lastReason).toBe('needs a rollback plan');
+    expect(body.outstandingReviews).toHaveLength(1);
   });
 });

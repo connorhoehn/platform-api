@@ -478,7 +478,7 @@ describe('sectionReviews — document-level + user-level queries', () => {
       body: { status: 'approved' }, userId: 'u1',
     });
     await run(app, 'POST', '/api/documents/doc-20/sections/s2/reviews', {
-      body: { status: 'rejected' }, userId: 'u2',
+      body: { status: 'changes_requested' }, userId: 'u2',
     });
     // Review in a different document (should not appear)
     await run(app, 'POST', '/api/documents/doc-other/sections/s1/reviews', {
@@ -497,7 +497,7 @@ describe('sectionReviews — document-level + user-level queries', () => {
       body: { status: 'approved' }, userId: 'alice',
     });
     await run(app, 'POST', '/api/documents/d2/sections/s2/reviews', {
-      body: { status: 'rejected' }, userId: 'bob',
+      body: { status: 'changes_requested' }, userId: 'bob',
     });
     await run(app, 'POST', '/api/documents/d3/sections/s3/reviews', {
       body: { status: 'changes_requested' }, userId: 'alice',

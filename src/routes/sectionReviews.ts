@@ -12,14 +12,67 @@ import log from '../lib/logger';
 export const sectionReviewsRouter = Router({ mergeParams: true });
 export const myReviewsRouter = Router();
 
+/**
+ * A reviewer's verdict on ONE SECTION. Deliberately NOT the document-lifecycle
+ * vocabulary in `../lib/document-lifecycle` (`draft`/`in_review`/`approved`/…)
+ * nor the review-REQUEST states in `DocumentReviewRequestRepository`
+ * (`pending`/`approved`/`changes_requested`/`withdrawn`): those describe where
+ * a whole document or a named request has got to, this describes what one
+ * person said about one section. `approved` and `changes_requested` happen to
+ * spell the same in all three — they are still separate vocabularies, and a
+ * status is only valid here if it is in THIS list.
+ *
+ * This is the write boundary. It is not a claim about what is already stored:
+ * the reads below (and `SectionReview.status`, still a plain `string`) return
+ * historical rows verbatim, including statuses this list would now reject.
+ */
+export const SECTION_REVIEW_STATUSES = [
+  'reviewed',
+  'approved',
+  'changes_requested',
+] as const;
+
+export type SectionReviewStatus = (typeof SECTION_REVIEW_STATUSES)[number];
+
+/** Same cap document comments use (`documentComments.ts`). */
+const MAX_COMMENT_LENGTH = 10000;
+
+/** Keep a rejected value out of the log/response at unbounded length. */
+function describe(value: unknown): string {
+  const raw = typeof value === 'string' ? value : JSON.stringify(value) ?? String(value);
+  return raw.length > 80 ? `${raw.slice(0, 80)}…` : raw;
+}
+
 // POST /api/documents/:documentId/sections/:sectionId/reviews
 sectionReviewsRouter.post('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { documentId, sectionId } = req.params;
   const userId = req.user!.sub;
-  const { status, comment } = req.body as { status?: string; comment?: string };
+  const { status, comment } = req.body as { status?: unknown; comment?: unknown };
 
   if (!status) {
     throw new ValidationError('status is required');
+  }
+
+  if (
+    typeof status !== 'string'
+    || !(SECTION_REVIEW_STATUSES as readonly string[]).includes(status)
+  ) {
+    throw new ValidationError(
+      `status must be one of: ${SECTION_REVIEW_STATUSES.join(', ')} (got: ${describe(status)})`,
+    );
+  }
+
+  let validComment: string | undefined;
+  if (comment !== undefined) {
+    if (typeof comment !== 'string') {
+      throw new ValidationError('comment must be a string');
+    }
+    if (comment.length > MAX_COMMENT_LENGTH) {
+      throw new ValidationError(
+        `comment must be ${MAX_COMMENT_LENGTH} characters or fewer (got: ${comment.length})`,
+      );
+    }
+    validComment = comment;
   }
 
   // Look up display name from profile
@@ -36,7 +89,7 @@ sectionReviewsRouter.post('/', requireAuth, asyncHandler(async (req: Request, re
     displayName,
     status,
     timestamp: new Date().toISOString(),
-    ...(comment !== undefined && { comment }),
+    ...(validComment !== undefined && { comment: validComment }),
   });
 
   publishSignal(`doc:${documentId}`, 'doc:section_updated', {

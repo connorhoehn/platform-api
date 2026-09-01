@@ -26,7 +26,88 @@
  * table naturally rather than needing a migration job.
  */
 
-import { ConflictError, ForbiddenError, ValidationError } from '../middleware/error-handler';
+import { AppError, ConflictError, ForbiddenError, ValidationError } from '../middleware/error-handler';
+
+// ---------------------------------------------------------------------------
+// Machine-readable failure codes
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a lifecycle call failed, as a stable token.
+ *
+ * The HTTP status alone is not enough: 409 is returned for three genuinely
+ * different situations (illegal move, reviews outstanding, lost compare-and-
+ * swap) and a client that needs to tell them apart was previously forced to
+ * regex the human-readable `error` prose — which silently breaks the moment
+ * anyone rewords a message. Responses now carry `code` alongside `error`;
+ * `error` stays exactly as it was, for humans.
+ *
+ *   action_required         400 — no action was supplied at all.
+ *   unknown_action          400 — action is not in the vocabulary.
+ *   illegal_transition      409 — real action, not legal from the current state.
+ *   reviews_outstanding     409 — legal move, but required reviews are pending.
+ *   concurrent_modification 409 — the compare-and-swap lost; re-read and retry.
+ *   lifecycle_unavailable   409 — the row could not be created or read back.
+ *   not_authorized          403 — legal move, wrong actor.
+ *   owner_not_established   403 — nobody owns this document yet (see the
+ *                                 ownership notes in documentLifecycleService).
+ *   owner_already_established
+ *                           409 — an ownership claim raced or arrived late.
+ *   owner_lookup_unavailable
+ *                           503 — the owner could not be determined. This is
+ *                                 NOT "there is no owner"; it fails closed.
+ */
+export type LifecycleErrorCode =
+  | 'action_required'
+  | 'unknown_action'
+  | 'illegal_transition'
+  | 'reviews_outstanding'
+  | 'concurrent_modification'
+  | 'lifecycle_unavailable'
+  | 'not_authorized'
+  | 'owner_not_established'
+  | 'owner_already_established'
+  | 'owner_lookup_unavailable';
+
+/** Mixin marker: any error carrying a `LifecycleErrorCode`. */
+export interface CodedError {
+  readonly code: LifecycleErrorCode;
+}
+
+export class LifecycleValidationError extends ValidationError implements CodedError {
+  constructor(message: string, public readonly code: LifecycleErrorCode) {
+    super(message);
+  }
+}
+
+export class LifecycleConflictError extends ConflictError implements CodedError {
+  constructor(message: string, public readonly code: LifecycleErrorCode) {
+    super(message);
+  }
+}
+
+export class LifecycleForbiddenError extends ForbiddenError implements CodedError {
+  constructor(message: string, public readonly code: LifecycleErrorCode) {
+    super(message);
+  }
+}
+
+/**
+ * 503 — the server could not determine the answer. Distinct from a 403: the
+ * caller may well be authorized, we simply could not verify it, so the correct
+ * client behaviour is to retry rather than to give up.
+ */
+export class LifecycleUnavailableError extends AppError implements CodedError {
+  constructor(message: string, public readonly code: LifecycleErrorCode = 'owner_lookup_unavailable') {
+    super(503, message);
+  }
+}
+
+/** The code on a lifecycle error, or undefined for anything else. */
+export function lifecycleErrorCode(err: unknown): LifecycleErrorCode | undefined {
+  const code = (err as Partial<CodedError> | null | undefined)?.code;
+  return typeof code === 'string' ? (code as LifecycleErrorCode) : undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Vocabulary
@@ -249,11 +330,12 @@ export interface TransitionResult {
  * Decide a single lifecycle transition.
  *
  * Throws, in this order, so the failure the caller sees is the most specific
- * one available:
- *   - ValidationError (400) — the action is not part of the vocabulary.
- *   - ConflictError   (409) — the action is real but illegal from `from`.
- *   - ForbiddenError  (403) — legal move, wrong actor.
- *   - ConflictError   (409) — legal move, right actor, reviews outstanding.
+ * one available. Each carries a `code` (see `LifecycleErrorCode`) so a client
+ * can branch without string-matching the message:
+ *   - 400 unknown_action      — the action is not part of the vocabulary.
+ *   - 409 illegal_transition  — the action is real but illegal from `from`.
+ *   - 403 not_authorized      — legal move, wrong actor.
+ *   - 409 reviews_outstanding — legal move, right actor, reviews outstanding.
  *
  * Illegal-before-forbidden matters: "reopen an approved document" is a LEGAL
  * transition, so a random caller attempting it falls through to the
@@ -265,8 +347,9 @@ export function transition(
   ctx: TransitionContext,
 ): TransitionResult {
   if (!isKnownAction(action)) {
-    throw new ValidationError(
+    throw new LifecycleValidationError(
       `Unknown lifecycle action '${action}'. Expected one of: ${LIFECYCLE_ACTIONS.join(', ')}`,
+      'unknown_action',
     );
   }
 
@@ -278,16 +361,18 @@ export function transition(
     const suffix = legal.length
       ? `Legal actions from '${from}': ${legal.join(', ')}.`
       : `No actions are legal from '${from}'.`;
-    throw new ConflictError(
+    throw new LifecycleConflictError(
       `Cannot '${action}' a document in state '${from}'. ${suffix}`,
+      'illegal_transition',
     );
   }
 
   const permitted = rule.allowedRoles.some((role) => ctx.roles.includes(role));
   if (!permitted) {
-    throw new ForbiddenError(
+    throw new LifecycleForbiddenError(
       `Only the document ${rule.allowedRoles.join(' or ')} may '${action}' ` +
         `(${from} → ${rule.to}).`,
+      'not_authorized',
     );
   }
 
@@ -295,9 +380,10 @@ export function transition(
     const outstanding = ctx.outstandingReviews ?? [];
     if (outstanding.length > 0) {
       const names = outstanding.map((r) => r.reviewerId).join(', ');
-      throw new ConflictError(
+      throw new LifecycleConflictError(
         `Cannot '${action}': ${outstanding.length} required review request` +
           `${outstanding.length === 1 ? '' : 's'} still outstanding (${names}).`,
+        'reviews_outstanding',
       );
     }
   }
