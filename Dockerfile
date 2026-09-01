@@ -36,7 +36,15 @@ WORKDIR /app
 # pre-build for the same reason. SSH agent forwarding is required for
 # the private repo pins (--ssh default at the host).
 COPY platform-api/package.json ./
-RUN --mount=type=ssh npm install --ignore-scripts
+# --legacy-peer-deps matches the project's resolution mode, the same as the
+# gateway Dockerfile. Without it this image is the ONLY place that resolves
+# peers strictly, so it fails on conflicts every local `npm install` accepts —
+# a build break that cannot be reproduced outside Docker.
+#
+# The live one: @connorhoehn/pipeline-runtime declares its peer on
+# distributed-core as an EXACT SHA, so any DC bump anywhere makes this install
+# unsatisfiable even though the code is fine.
+RUN --mount=type=ssh npm install --legacy-peer-deps --ignore-scripts
 COPY platform-api/tsconfig.json platform-api/tsconfig.build.json ./
 COPY platform-api/src/ ./src/
 RUN npx tsc --project tsconfig.build.json; test -f dist/index.js
@@ -57,7 +65,7 @@ RUN addgroup -g 1001 -S nodejs && adduser -S platformapi -u 1001 -G nodejs
 WORKDIR /app
 COPY platform-api/package.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
 # See build-stage comment for why the lockfile isn't copied.
-RUN --mount=type=ssh npm install --omit=dev --ignore-scripts && npm cache clean --force
+RUN --mount=type=ssh npm install --omit=dev --legacy-peer-deps --ignore-scripts && npm cache clean --force
 COPY --from=build /app/dist ./dist/
 COPY platform-api/src/ ./src/
 RUN chown -R platformapi:nodejs /app
