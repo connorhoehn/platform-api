@@ -79,18 +79,46 @@ recordingsRouter.get(
     if (lobbyName) {
       const tenant = tenantOf(req.user?.orgId);
       let memberIds: string[] | undefined;
+      // Carried alongside membership: an org-visible room has no member rows,
+      // because nobody has to join what is already open to them. Without this
+      // the policy saw an empty member list and denied everyone, including the
+      // room's creator.
+      let visibility: string | undefined;
       if (lobbyName.startsWith('room:')) {
         const slug = lobbyName.slice('room:'.length);
-        const room = await hangoutRoomRepo.getRoomBySlug(req.user?.orgId ?? '', slug).catch(() => null);
+        // The SAME org resolution the rooms routes use to create and list
+        // rooms. This read `orgId ?? ''`, and in local dev (SKIP_AUTH, tokens
+        // with no org claim) hangoutRooms.ts falls back to 'default-org' —
+        // so every room was WRITTEN under 'default-org' and looked up here
+        // under '', the lookup missed, membership could not be established,
+        // and the policy denied every request for a room's recordings. The
+        // two routes disagreeing about the caller's org is the bug; this
+        // makes them agree.
+        //
+        // Deliberately scoped to the room LOOKUP. The principal's tenant
+        // below still comes from the real claim: substituting the placement
+        // fallback there would fold every org-less token into one tenant,
+        // which lib/org-claim.ts warns about at length.
+        const lookupOrgId = req.user?.orgId
+          ?? (process.env.SKIP_AUTH === 'true' ? 'default-org' : '');
+        const room = await hangoutRoomRepo.getRoomBySlug(lookupOrgId, slug).catch(() => null);
         if (room) {
+          visibility = (room as { visibility?: string }).visibility;
           const members = await hangoutRoomMemberRepo.listMembers(room.roomId).catch(() => []);
           memberIds = members.map((m: { userId: string }) => m.userId);
         }
       }
+      const attrs: Record<string, unknown> = {};
+      if (memberIds) attrs.memberIds = memberIds;
+      if (visibility) attrs.visibility = visibility;
       await requireAuthorized({
         principal: principalOf(req.user, tenant),
         action: 'recording:listByLobby',
-        resource: { type: 'lobby', id: lobbyName, ...(memberIds ? { attrs: { memberIds } } : {}) },
+        resource: {
+          type: 'lobby',
+          id: lobbyName,
+          ...(Object.keys(attrs).length > 0 ? { attrs } : {}),
+        },
       });
       const { items, cursor: next } = await callRecordingRepo.listByLobbyName(lobbyName, limit, cursor);
       res.json({ items, cursor: next ?? null });

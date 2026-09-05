@@ -175,6 +175,15 @@ registerPolicy('recording:listByLobby', (req) => {
       : deny('not a participant in this conversation', 404);
   }
 
+  // An ORG-VISIBLE room is readable by the org — that is what the field
+  // means. Membership alone denied everyone here, including the room's own
+  // creator: an org room has no member ROWS (nobody has to join what is
+  // already open to them), so `memberIds` came back empty and matched nobody.
+  // The route resolves the room by the caller's own orgId, so a room that was
+  // found at all is one the caller shares an org with; this grants exactly
+  // what `visibility: 'org'` already declares and nothing wider.
+  if (req.resource.attrs?.visibility === 'org') return ALLOW;
+
   // Non-DM lobbies (rooms, ad-hoc hangouts): the caller supplies the member
   // list. Absent means "could not establish membership" → deny, never allow.
   const memberIds = req.resource.attrs?.memberIds;

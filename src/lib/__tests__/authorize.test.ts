@@ -108,6 +108,34 @@ describe('recording:listByLobby — the hole this closed', () => {
   const listByLobby = (principal: ReturnType<typeof principalOf>, id: string, attrs?: Record<string, unknown>) =>
     authorize({ principal, action: 'recording:listByLobby', resource: { type: 'lobby', id, ...(attrs ? { attrs } : {}) } });
 
+  // An org-visible room is readable by the org — that is what the field
+  // means. Membership alone denied EVERYONE here, including the room's own
+  // creator: an org room has no member rows, because nobody has to join what
+  // is already open to them, so the member list came back empty and matched
+  // nobody. Observed live: every recording in an org room was unreachable.
+  it('allows an org-visible room even with no members', async () => {
+    const grace = principalOf({ sub: 'dev-grace' }, acme);
+    expect((await listByLobby(grace, 'room:asdf', { visibility: 'org', memberIds: [] })).allow).toBe(true);
+  });
+
+  it('allows an org-visible room when membership could not be established', async () => {
+    const grace = principalOf({ sub: 'dev-grace' }, acme);
+    expect((await listByLobby(grace, 'room:asdf', { visibility: 'org' })).allow).toBe(true);
+  });
+
+  // Visibility widens nothing for a room that did not declare it.
+  it('still requires membership for a room that is not org-visible', async () => {
+    const grace = principalOf({ sub: 'dev-grace' }, acme);
+    expect((await listByLobby(grace, 'room:secret', { visibility: 'private', memberIds: ['dev-bob'] })).allow).toBe(false);
+    expect((await listByLobby(grace, 'room:secret', { memberIds: ['dev-bob'] })).allow).toBe(false);
+  });
+
+  // A DM is private no matter what a caller claims about visibility.
+  it('does not let a visibility claim open somebody else DM', async () => {
+    const grace = principalOf({ sub: 'dev-grace' }, acme);
+    expect((await listByLobby(grace, 'dm:dev-bob:dev-hank', { visibility: 'org' })).allow).toBe(false);
+  });
+
   it('lets a DM participant list their own conversation', async () => {
     expect((await listByLobby(hank, 'dm:dev-bob:dev-hank')).allow).toBe(true);
   });
