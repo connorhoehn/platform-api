@@ -348,6 +348,77 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       expect(res.statusCode).toBe(404);
     });
 
+    // The roster cannot answer "is this watchable": a room call joins TWICE
+    // (room bridge + call widget) and hangs up ONCE, so every call leaves a
+    // participant behind and the count never reaches zero. Measured on a real
+    // room: three participants from three calls that were all hung up. So the
+    // SFU is asked instead — it holds the producer objects.
+    const streamState = (state: 'LIVE' | 'OFFLINE') => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ stream: { state } }),
+      text: async () => JSON.stringify({ stream: { state } }),
+    });
+
+    it('404s when the SFU says nothing is being broadcast, roster be damned', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce({
+        sessionId: 'sess-leaked', channelArn: 'arn:channel:leaked',
+        startedAt: '2026-09-01T00:00:00.000Z', startedBy: 'hank',
+        // Three leaked participants — exactly the state the bug produces.
+        participants: [
+          { participantId: 'p1', userId: 'hank' },
+          { participantId: 'p2', userId: 'hank' },
+          { participantId: 'p3', userId: 'hank' },
+        ],
+      });
+      mockFetch.mockResolvedValue(streamState('OFFLINE'));
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Aleaked', {
+        headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it('200s when the SFU says LIVE, even with an empty roster', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce({
+        sessionId: 'sess-live', channelArn: 'arn:channel:live',
+        startedAt: null, startedBy: null, participants: [],
+      });
+      mockFetch.mockResolvedValue(streamState('LIVE'));
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Alive', {
+        headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.body.channelArn).toBe('arn:channel:live');
+    });
+
+    // "Could not ask" is not "nothing is on". Telling a viewer a running
+    // broadcast does not exist is the worse failure, so an unreachable SFU
+    // falls back to the (too generous) roster rather than to silence.
+    it('falls back to the roster when the SFU cannot be reached', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce({
+        sessionId: 'sess-unknown', channelArn: 'arn:channel:unknown',
+        startedAt: null, startedBy: null,
+        participants: [{ participantId: 'p1', userId: 'hank' }],
+      });
+      mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Aunknown', {
+        headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+      });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it('404s when the SFU is unreachable AND the roster is empty', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce({
+        sessionId: 'sess-none', channelArn: 'arn:channel:none',
+        startedAt: null, startedBy: null, participants: [],
+      });
+      mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Anone', {
+        headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
     it('decodes the lobby name out of the path', async () => {
       mockFindActiveByLobbyName.mockResolvedValueOnce({
         sessionId: 's', channelArn: 'a', startedAt: null, startedBy: null,

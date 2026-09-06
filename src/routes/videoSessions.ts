@@ -734,6 +734,45 @@ videoSessionsRouter.get('/sessions/:sessionId/recording', requireAuth, asyncHand
 //
 // Deliberately NOT a proxy to LVS: the repository already holds the mapping,
 // and a viewer should not need LVS reachable to be told there is nothing on.
+/**
+ * Is anyone actually publishing to this channel right now?
+ *
+ * `true` / `false` are answers. `null` means LVS could not be asked, which is
+ * NOT the same as "nothing is on" and must not be treated as one.
+ *
+ * LVS derives `state` by walking its live mediasoup participants and checking
+ * each producer object is open — so it is the one view of liveness nobody has
+ * to remember to decrement. Every counter in this system leaks: our own
+ * `participants[]` accumulates an entry per join, and LVS's own
+ * `sessionStore` participant set is only ever decremented by the /end route
+ * it is supposed to outlive.
+ */
+async function isChannelPublishing(channelArn: string): Promise<boolean | null> {
+  if (!channelArn) return null;
+  const url = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(channelArn)}/stream`;
+  const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
+  try {
+    const upstream = await fetch(url, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!upstream.ok) return null;
+    const body = (await upstream.json()) as {
+      stream?: { state?: unknown };
+      state?: unknown;
+    };
+    const state = body.stream?.state ?? body.state;
+    if (state === 'LIVE') return true;
+    if (state === 'OFFLINE') return false;
+    return null;
+  } catch {
+    // Unreachable, slow, or unparseable. Refusing to answer is better than
+    // inventing one: a viewer told "nothing is on" because a probe timed out
+    // has been lied to just as surely as one shown a dead stream.
+    return null;
+  }
+}
+
 videoSessionsRouter.get(
   '/sessions/by-lobby/:lobbyName',
   requireAuth,
@@ -746,17 +785,28 @@ videoSessionsRouter.get(
       if (!session) throw new NotFoundError('No live session for this lobby');
 
       // `status: 'active'` is a LIFECYCLE flag, not evidence that anything is
-      // being broadcast. It flips to 'ended' when the last participant leaves
-      // through the leave route — so a session whose participants closed their
-      // tabs, crashed, or were a headless test that never said goodbye stays
-      // 'active' forever.
+      // being broadcast. It flips to 'ended' only when the last participant
+      // leaves through the leave route, and participants leak: a room call
+      // joins TWICE (once through the room bridge, once through the call
+      // widget) and hangs up ONCE, so every call nets an extra participant and
+      // the ref-count never reaches zero. Measured on a real room: three
+      // participants left behind by three calls that were all hung up.
       //
-      // Answering "yes, watchable" for one of those is how a room that had a
-      // call once ended up permanently offering a Watch button that opened a
-      // black rectangle labelled LIVE. Nobody is publishing, so there is
-      // nothing to watch, and 404 is the same honest answer as before anyone
-      // started.
-      if ((session.participants ?? []).length === 0) {
+      // So the roster cannot answer "is this watchable" — ask the SFU, which
+      // knows because it holds the producer objects. It also self-heals: a
+      // client that vanishes has its transport reaped within ~20-65s and the
+      // channel goes OFFLINE on its own, with nobody having to say goodbye.
+      const publishing = await isChannelPublishing(session.channelArn);
+      if (publishing === false) {
+        throw new NotFoundError('Nothing is being broadcast to this lobby');
+      }
+
+      // `null` is "LVS could not be asked", not "nothing is on". Falling back
+      // to the roster keeps a reachable-LVS outage from hiding a live stream —
+      // the leak makes this answer too generous, which is the failure worth
+      // having when the alternative is telling a viewer a running broadcast
+      // does not exist.
+      if (publishing === null && (session.participants ?? []).length === 0) {
         throw new NotFoundError('No live session for this lobby');
       }
 
