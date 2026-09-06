@@ -286,6 +286,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       mockFindActiveByLobbyName.mockResolvedValueOnce({
         sessionId: 'sess-watch', channelArn: 'arn:channel:watch',
         startedAt: '2026-09-06T00:00:00.000Z', startedBy: 'hank',
+        participants: [{ participantId: 'p1', userId: 'hank' }],
       });
       const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Aasdf', {
         headers: { authorization: 'Bearer user-jwt' },
@@ -316,9 +317,41 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       expect(res.statusCode).toBe(404);
     });
 
+    // `status: 'active'` is a lifecycle flag, not evidence of a broadcast. It
+    // only flips to 'ended' when the last participant LEAVES through the leave
+    // route, so a session whose people closed their tabs, crashed, or were a
+    // headless test that never said goodbye stays 'active' forever. Reporting
+    // one of those as watchable is how a room that once had a call ended up
+    // permanently offering a Watch button onto a black rectangle marked LIVE.
+    it('404s on a leaked session that nobody is publishing to', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce({
+        sessionId: 'sess-leaked', channelArn: 'arn:channel:leaked',
+        startedAt: '2026-09-01T00:00:00.000Z', startedBy: 'hank',
+        participants: [],
+      });
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Afresh-probe-room', {
+        headers: { authorization: 'Bearer user-jwt' },
+        userId: 'alice',
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it('404s when the record predates participant tracking entirely', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce({
+        sessionId: 'sess-old', channelArn: 'arn:channel:old',
+        startedAt: null, startedBy: null,
+      });
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Aold', {
+        headers: { authorization: 'Bearer user-jwt' },
+        userId: 'alice',
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
     it('decodes the lobby name out of the path', async () => {
       mockFindActiveByLobbyName.mockResolvedValueOnce({
         sessionId: 's', channelArn: 'a', startedAt: null, startedBy: null,
+        participants: [{ participantId: 'p1', userId: 'hank' }],
       });
       const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/dm%3Aalice%3Abob', {
         headers: { authorization: 'Bearer user-jwt' },

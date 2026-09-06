@@ -745,6 +745,21 @@ videoSessionsRouter.get(
       const session = await videoSessionRepo.findActiveByLobbyName(lobbyName);
       if (!session) throw new NotFoundError('No live session for this lobby');
 
+      // `status: 'active'` is a LIFECYCLE flag, not evidence that anything is
+      // being broadcast. It flips to 'ended' when the last participant leaves
+      // through the leave route — so a session whose participants closed their
+      // tabs, crashed, or were a headless test that never said goodbye stays
+      // 'active' forever.
+      //
+      // Answering "yes, watchable" for one of those is how a room that had a
+      // call once ended up permanently offering a Watch button that opened a
+      // black rectangle labelled LIVE. Nobody is publishing, so there is
+      // nothing to watch, and 404 is the same honest answer as before anyone
+      // started.
+      if ((session.participants ?? []).length === 0) {
+        throw new NotFoundError('No live session for this lobby');
+      }
+
       // Only what a viewer needs. Participant lists and tokens stay out: this
       // route is reachable by anyone who can see the room, and watching is a
       // weaker right than joining.
