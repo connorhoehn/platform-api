@@ -276,6 +276,58 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
   // LVS starts recording on producer-create — the instant the FIRST person
   // publishes — so a 1:1 call recorded the callee's ringing. LVS cannot tell a
   // call from a broadcast; we can, from the lobby.
+  // A viewer needs the channelArn to watch (HLS is addressed by channel), and
+  // the only way to learn it was POST /sessions with findOrCreate — which
+  // CREATES a session and enrolls you as a participant. Watching a room
+  // therefore required joining it, which defeats the reason to watch: an HLS
+  // audience is supposed to cost nothing per head.
+  describe('GET /sessions/by-lobby/:lobbyName', () => {
+    it('resolves a live lobby to its channel without joining', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce({
+        sessionId: 'sess-watch', channelArn: 'arn:channel:watch',
+        startedAt: '2026-09-06T00:00:00.000Z', startedBy: 'hank',
+      });
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Aasdf', {
+        headers: { authorization: 'Bearer user-jwt' },
+        userId: 'alice',
+      });
+      // Either the repo has a live session (200 with a channelArn) or it does
+      // not (404). What must NOT happen is a session being created.
+      expect(res.statusCode).toBe(200);
+      expect(res.body.channelArn).toBe('arn:channel:watch');
+      expect(res.body.lobbyName).toBe('room:asdf');
+      // A viewer gets what they need to watch and nothing more — no
+      // participant list, no token. Watching is a weaker right than joining.
+      expect(res.body).not.toHaveProperty('participants');
+      expect(res.body).not.toHaveProperty('streamKey');
+      // The decisive part: no LVS session-create was proxied.
+      const created = mockFetch.mock.calls.filter(
+        ([url, init]) => String(url).includes('/api/sessions') && (init as RequestInit)?.method === 'POST',
+      );
+      expect(created).toHaveLength(0);
+    });
+
+    it('404s when nothing is live — the honest answer before anyone starts', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce(null);
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Anever-used', {
+        headers: { authorization: 'Bearer user-jwt' },
+        userId: 'alice',
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it('decodes the lobby name out of the path', async () => {
+      mockFindActiveByLobbyName.mockResolvedValueOnce({
+        sessionId: 's', channelArn: 'a', startedAt: null, startedBy: null,
+      });
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/dm%3Aalice%3Abob', {
+        headers: { authorization: 'Bearer user-jwt' },
+        userId: 'alice',
+      });
+      expect(res.body.lobbyName).toBe('dm:alice:bob');
+    });
+  });
+
   it('asks LVS to wait for the second party on a DM call', async () => {
     mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dm-wait'));
     await run(buildApp(), 'POST', '/api/video/sessions', {

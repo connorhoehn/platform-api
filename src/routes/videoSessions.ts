@@ -712,6 +712,52 @@ videoSessionsRouter.get('/sessions/:sessionId/recording', requireAuth, asyncHand
 
 // GET /api/video/sessions/:sessionId — get a single session record
 // Requires lobbyName (or documentId) as a query param since it's the partition key.
+// ---------------------------------------------------------------------------
+// GET /api/video/sessions/by-lobby/:lobbyName — resolve a lobby to its live
+// channel WITHOUT joining it.
+// ---------------------------------------------------------------------------
+//
+// A viewer needs the channelArn to watch: near-realtime HLS playback is
+// addressed by channel. Until now the only way to learn it was POST /sessions
+// with findOrCreate, which CREATES a session and enrolls you as a
+// participant — the exact thing a viewer must not do. So watching a room
+// required first joining it, which defeats the point of watching: the reason
+// to use HLS is that an audience costs nothing per head.
+//
+// Read-only and non-mutating. Returns 404 when no session is live, which is
+// the honest answer to "can I watch this" before anyone has started.
+//
+// Deliberately NOT a proxy to LVS: the repository already holds the mapping,
+// and a viewer should not need LVS reachable to be told there is nothing on.
+videoSessionsRouter.get(
+  '/sessions/by-lobby/:lobbyName',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    try {
+      const lobbyName = decodeURIComponent(req.params.lobbyName ?? '');
+      if (!lobbyName) throw new ValidationError('lobbyName is required');
+
+      const session = await videoSessionRepo.findActiveByLobbyName(lobbyName);
+      if (!session) throw new NotFoundError('No live session for this lobby');
+
+      // Only what a viewer needs. Participant lists and tokens stay out: this
+      // route is reachable by anyone who can see the room, and watching is a
+      // weaker right than joining.
+      res.status(200).json({
+        lobbyName,
+        sessionId: session.sessionId,
+        channelArn: session.channelArn,
+        startedAt: session.startedAt ?? null,
+        startedBy: session.startedBy ?? null,
+      });
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      log.error({ err }, '[videoSessions] GET /sessions/by-lobby error');
+      throw new AppError(500, 'Failed to resolve lobby');
+    }
+  }),
+);
+
 videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {
     const { sessionId } = req.params;
