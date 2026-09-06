@@ -219,7 +219,12 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     // second" is unambiguous. A room or a broadcast can legitimately hold one
     // person who is worth recording, and LVS' default of 1 keeps them working
     // exactly as before.
-    const recordingConfigurationForLobby = lobbyName.startsWith('dm:')
+    // `dmg:` too — a big group chat is addressed by a HASH rather than by its
+    // members, but it is the same product concept and rings exactly the same
+    // way before anyone answers. Matching only `dm:` meant the large groups
+    // kept recording their own ringing.
+    const isConversationCall = lobbyName.startsWith('dm:') || lobbyName.startsWith('dmg:');
+    const recordingConfigurationForLobby = isConversationCall
       ? { ...recordingConfiguration, startWhenParticipants: 2 }
       : recordingConfiguration;
 

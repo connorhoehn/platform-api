@@ -341,6 +341,20 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
 
   // A room or a broadcast can legitimately hold one person worth recording,
   // so they keep LVS' default of 1.
+  // A big group chat is addressed by a hash rather than by its members, but it
+  // rings exactly the same way. Matching only `dm:` left the large groups
+  // recording their own ringing.
+  it('waits for the second party on a hashed group call too', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dmg-wait'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'dmg:9f2c1a4b55de7788aa11bb22', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    const sentBody = JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
+    expect(sentBody.recordingConfiguration.startWhenParticipants).toBe(2);
+  });
+
   it('does not impose a participant threshold on rooms', async () => {
     mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:room-nowait'));
     await run(buildApp(), 'POST', '/api/video/sessions', {
