@@ -273,6 +273,49 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
     expect(sentBody.recordingConfiguration).toEqual({ enabled: true, destination: 'local', transcribe: false });
   });
 
+  // LVS starts recording on producer-create — the instant the FIRST person
+  // publishes — so a 1:1 call recorded the callee's ringing. LVS cannot tell a
+  // call from a broadcast; we can, from the lobby.
+  it('asks LVS to wait for the second party on a DM call', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dm-wait'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'dm:alice:bob', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    const sentBody = JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
+    expect(sentBody.recordingConfiguration.startWhenParticipants).toBe(2);
+  });
+
+  // A room or a broadcast can legitimately hold one person worth recording,
+  // so they keep LVS' default of 1.
+  it('does not impose a participant threshold on rooms', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:room-nowait'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'room:design', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    const sentBody = JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
+    expect(sentBody.recordingConfiguration.startWhenParticipants).toBeUndefined();
+  });
+
+  it('keeps the threshold alongside an explicit recordingConfiguration', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dm-explicit'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: {
+        lobbyName: 'dm:alice:bob',
+        findOrCreate: true,
+        recordingConfiguration: { enabled: true, recordingProfile: 'dm' },
+      },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+    const sentBody = JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
+    expect(sentBody.recordingConfiguration.startWhenParticipants).toBe(2);
+    expect(sentBody.recordingConfiguration.recordingProfile).toBe('dm');
+  });
+
   it('accepts explicit recordingProfile in body and forwards it to LVS', async () => {
     mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:p2'));
     await run(buildApp(), 'POST', '/api/video/sessions', {

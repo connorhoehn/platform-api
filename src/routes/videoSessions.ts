@@ -207,6 +207,22 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
         // transcribe behavior is opt-in via recordingProfile from the FE.
         { enabled: true, destination: 'local', transcribe: false };
 
+    // A 1:1 call must not start recording while the callee is still ringing.
+    //
+    // LVS starts recording on producer-create — the instant the FIRST person
+    // publishes — which for a broadcast is exactly right and for a DM meant
+    // every recording opened with the caller alone in dead air, with the
+    // ringback bleeding back through the mic. LVS cannot tell a call from a
+    // stream; we can, from the lobby.
+    //
+    // `dm:` only, deliberately. A DM has exactly two parties, so "wait for the
+    // second" is unambiguous. A room or a broadcast can legitimately hold one
+    // person who is worth recording, and LVS' default of 1 keeps them working
+    // exactly as before.
+    const recordingConfigurationForLobby = lobbyName.startsWith('dm:')
+      ? { ...recordingConfiguration, startWhenParticipants: 2 }
+      : recordingConfiguration;
+
     // Forward the caller's Cognito Bearer so LVS validates the same
     // identity that hit us. Without a header we can't proxy — platform-api
     // requireAuth ensures one is present.
@@ -224,7 +240,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
           lobbyName,
           findOrCreate,
           creatorId: userId,
-          recordingConfiguration,
+          recordingConfiguration: recordingConfigurationForLobby,
           metadata: body.metadata,
         }),
       });
