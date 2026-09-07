@@ -104,6 +104,15 @@ export interface VideoSessionStore {
    * (root cause of the 2026-05-23 "Past Calls hides DMs" bug).
    */
   findByChannelArn(channelArn: string): Promise<VideoSessionRecord[]>;
+  /**
+   * Every lobby still marked active, newest row per lobby.
+   *
+   * CANDIDATES, not an answer. `status: 'active'` leaks — a room call joins
+   * twice and hangs up once — so the caller must ask the SFU whether each
+   * channel is actually publishing before showing anything to a user. See
+   * `GET /api/video/sessions/live`, the only caller.
+   */
+  listActiveCandidates(limit?: number): Promise<VideoSessionRecord[]>;
 }
 
 /**

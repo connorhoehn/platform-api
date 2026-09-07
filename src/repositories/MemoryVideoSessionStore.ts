@@ -138,6 +138,20 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
     return out.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
   }
 
+  /** Parity with the DDB impl — see VideoSessionStore.listActiveCandidates. */
+  async listActiveCandidates(limit = 60): Promise<VideoSessionRecord[]> {
+    const active = [...this.sessions.values()]
+      .filter((s) => s.status === 'active' && !!s.documentId)
+      .sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+    const newestPerLobby = new Map<string, VideoSessionRecord>();
+    for (const item of active) {
+      if (newestPerLobby.has(item.documentId)) continue;
+      newestPerLobby.set(item.documentId, item);
+      if (newestPerLobby.size >= limit) break;
+    }
+    return [...newestPerLobby.values()];
+  }
+
   /** Test helper — clear all state. Not part of the public interface. */
   __clearForTests(): void {
     this.sessions.clear();

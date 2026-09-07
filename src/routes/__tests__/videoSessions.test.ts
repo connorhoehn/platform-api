@@ -18,6 +18,7 @@ const mockGetSession = jest.fn();
 const mockFindActiveByLobbyName = jest.fn().mockResolvedValue(null);
 const mockRemoveParticipant = jest.fn();
 const mockRemoveParticipantByUserId = jest.fn();
+const mockListActiveCandidates = jest.fn().mockResolvedValue([]);
 
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
@@ -38,6 +39,7 @@ jest.mock('../../repositories', () => ({
     findActiveByLobbyName: (...args: unknown[]) => mockFindActiveByLobbyName(...args),
     removeParticipant: (...args: unknown[]) => mockRemoveParticipant(...args),
     removeParticipantByUserId: (...args: unknown[]) => mockRemoveParticipantByUserId(...args),
+    listActiveCandidates: (...args: unknown[]) => mockListActiveCandidates(...args),
   },
 }));
 
@@ -47,6 +49,7 @@ const mockFetch = jest.fn();
 import {
   videoSessionsRouter,
   __resetSfuBreakerForTests,
+  __resetLiveLobbyCacheForTests,
   __configureSfuBreakerForTests,
   reapLvsParticipant,
 } from '../videoSessions';
@@ -151,6 +154,8 @@ beforeEach(() => {
   mockGetSessionsByDocument.mockReset();
   mockGetSession.mockReset();
   mockFetch.mockReset();
+  mockListActiveCandidates.mockReset().mockResolvedValue([]);
+  __resetLiveLobbyCacheForTests();
   jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'error').mockImplementation(() => {});
   // Reset breaker to CLOSED + restore default thresholds between cases so
@@ -281,6 +286,86 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
   // CREATES a session and enrolls you as a participant. Watching a room
   // therefore required joining it, which defeats the reason to watch: an HLS
   // audience is supposed to cost nothing per head.
+  describe('GET /sessions/live', () => {
+    // The whole reason this route probes instead of returning the rows: a
+    // conversation list badges every row it is given, so an unprobed list
+    // marks every room that has ever hosted a call as live, permanently.
+    it('drops a leaked active session that nobody is publishing to', async () => {
+      mockListActiveCandidates.mockResolvedValueOnce([
+        { documentId: 'room:live', channelArn: 'arn:channel:live', startedAt: '2026-09-07T00:00:00.000Z', startedBy: 'bob' },
+        { documentId: 'room:leaked', channelArn: 'arn:channel:leaked', startedAt: '2026-09-01T00:00:00.000Z', startedBy: 'hank' },
+      ]);
+      // Probes run in registration order within a batch.
+      mockFetch.mockImplementation((url: unknown) =>
+        Promise.resolve(
+          String(url).includes('arn%3Achannel%3Alive')
+            ? apiOk({ stream: { state: 'LIVE' } })
+            : apiOk({ stream: { state: 'OFFLINE' } }),
+        ),
+      );
+
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/live', {
+        headers: { authorization: 'Bearer user-jwt' },
+        userId: 'alice',
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.body as { lobbies: { lobbyName: string }[] };
+      expect(body.lobbies.map((l) => l.lobbyName)).toEqual(['room:live']);
+    });
+
+    // Unlike by-lobby, which falls back to the roster so an SFU outage cannot
+    // hide a running broadcast from someone asking about one specific room.
+    // A badge is a passive claim about rooms nobody asked about, and a stale
+    // LIVE on a dead room is a worse lie than a missing badge on a live one.
+    it('drops candidates the SFU could not be asked about', async () => {
+      mockListActiveCandidates.mockResolvedValueOnce([
+        { documentId: 'room:unknown', channelArn: 'arn:channel:unknown', startedAt: null, startedBy: null },
+      ]);
+      mockFetch.mockResolvedValue(apiFail(500));
+
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/live', {
+        headers: { authorization: 'Bearer user-jwt' },
+        userId: 'alice',
+      });
+      expect(res.statusCode).toBe(200);
+      expect((res.body as { lobbies: unknown[] }).lobbies).toEqual([]);
+    });
+
+    // The caller is a conversation list drawing badges: it has to render
+    // whether or not this could be answered.
+    it('answers an empty list rather than an error when the store fails', async () => {
+      mockListActiveCandidates.mockRejectedValueOnce(new Error('ddb down'));
+      const res = await run(buildApp(), 'GET', '/api/video/sessions/live', {
+        headers: { authorization: 'Bearer user-jwt' },
+        userId: 'alice',
+      });
+      expect(res.statusCode).toBe(200);
+      expect((res.body as { lobbies: unknown[]; degraded?: boolean }).lobbies).toEqual([]);
+      expect((res.body as { degraded?: boolean }).degraded).toBe(true);
+    });
+
+    // N clients polling a badge must not become N x M requests at the SFU.
+    it('serves a second caller from cache without re-probing', async () => {
+      mockListActiveCandidates.mockResolvedValue([
+        { documentId: 'room:live', channelArn: 'arn:channel:live', startedAt: null, startedBy: null },
+      ]);
+      mockFetch.mockResolvedValue(apiOk({ stream: { state: 'LIVE' } }));
+
+      const app = buildApp();
+      await run(app, 'GET', '/api/video/sessions/live', {
+        headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+      });
+      const probesAfterFirst = mockFetch.mock.calls.length;
+
+      const second = await run(app, 'GET', '/api/video/sessions/live', {
+        headers: { authorization: 'Bearer user-jwt' }, userId: 'bob',
+      });
+      expect((second.body as { cached?: boolean }).cached).toBe(true);
+      expect(mockFetch.mock.calls.length).toBe(probesAfterFirst);
+    });
+  });
+
   describe('GET /sessions/by-lobby/:lobbyName', () => {
     it('resolves a live lobby to its channel without joining', async () => {
       mockFindActiveByLobbyName.mockResolvedValueOnce({

@@ -117,6 +117,48 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
   }
 
   /**
+   * Every session still marked active, newest-first per lobby.
+   *
+   * Answers "which conversations might have something on right now" in ONE
+   * ask, so a conversation list can badge every row instead of resolving each
+   * lobby separately.
+   *
+   * `status: 'active'` is a LIFECYCLE flag and it leaks — a room call joins
+   * twice and hangs up once, so the ref-count rarely reaches zero and rows
+   * stay 'active' long after everyone has gone. This method therefore returns
+   * CANDIDATES, never an answer: the caller must ask the SFU whether each
+   * channel is actually publishing. Treating this list as truth is how every
+   * room that ever had a call ends up advertising a live stream.
+   *
+   * A Scan, like `findByChannelArn` — the table is TTL-bounded
+   * (VIDEO_SESSION_TTL_DAYS, default 7d) so it stays cheap, and `limit` caps
+   * the work regardless.
+   */
+  async listActiveCandidates(limit = 60): Promise<VideoSessionRecord[]> {
+    const { ScanCommand } = await import('@aws-sdk/lib-dynamodb');
+    const out = await this.docClient.send(
+      new ScanCommand({
+        TableName: VIDEO_SESSIONS_TABLE,
+        FilterExpression: '#s = :active',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: { ':active': 'active' },
+      }),
+    );
+    const items = (out.Items ?? []) as VideoSessionRecord[];
+    items.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+    // One per lobby: a lobby with several 'active' rows has been through the
+    // leak more than once, and only the newest could possibly be publishing.
+    const newestPerLobby = new Map<string, VideoSessionRecord>();
+    for (const item of items) {
+      const lobby = item.documentId;
+      if (!lobby || newestPerLobby.has(lobby)) continue;
+      newestPerLobby.set(lobby, item);
+      if (newestPerLobby.size >= limit) break;
+    }
+    return [...newestPerLobby.values()];
+  }
+
+  /**
    * Find the newest active session for a given lobby name (a/k/a documentId —
    * lobbyName is just a more honest field name now that this powers global /
    * 1:1 / room lobbies in addition to document-scoped calls). Returns null

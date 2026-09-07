@@ -836,6 +836,118 @@ videoSessionsRouter.get(
   }),
 );
 
+// ---------------------------------------------------------------------------
+// GET /api/video/sessions/live — every lobby that is actually publishing.
+// ---------------------------------------------------------------------------
+//
+// The list counterpart to `by-lobby`. A conversation list wants to badge every
+// row, and asking per row is a request per conversation; this answers for all
+// of them at once.
+//
+// WHY THIS CANNOT JUST RETURN THE 'active' ROWS
+//
+// `status: 'active'` leaks — see `listActiveCandidates`. Returning it raw
+// would mark every room that has ever hosted a call as live, permanently,
+// which is worse than the missing badge this route exists to fix. So each
+// candidate is probed against the SFU, exactly as `by-lobby` does, and only
+// the ones publishing come back.
+//
+// The probes are bounded and cached: LVS is asked at most PROBE_CONCURRENCY at
+// a time, and the whole answer is held for CACHE_TTL_MS so that N clients
+// polling this do not become N x M requests at the SFU.
+//
+// Registered BEFORE `/sessions/:sessionId` — Express matches in registration
+// order, and `live` is a perfectly good session id as far as that route knows.
+
+/** How many channels to ask LVS about at once. */
+const PROBE_CONCURRENCY = 6;
+/** How long one computed answer serves every caller. */
+const CACHE_TTL_MS = 5_000;
+
+interface LiveLobby {
+  lobbyName: string;
+  channelArn: string;
+  startedAt: string | null;
+  startedBy: string | null;
+}
+
+let liveCache: { at: number; value: LiveLobby[] } | null = null;
+/** In-flight de-duplication: a burst of callers shares one computation. */
+let liveInFlight: Promise<LiveLobby[]> | null = null;
+
+async function computeLiveLobbies(): Promise<LiveLobby[]> {
+  const candidates = (await videoSessionRepo.listActiveCandidates()).filter(
+    (s) => !!s.channelArn && !!s.documentId,
+  );
+
+  const out: LiveLobby[] = [];
+  for (let i = 0; i < candidates.length; i += PROBE_CONCURRENCY) {
+    const slice = candidates.slice(i, i + PROBE_CONCURRENCY);
+    const verdicts = await Promise.all(
+      slice.map((session) => isChannelPublishing(session.channelArn)),
+    );
+    slice.forEach((session, n) => {
+      const publishing = verdicts[n];
+      // `null` is "LVS could not be asked", not "nothing is on". Unlike
+      // by-lobby — which falls back to the roster so an SFU outage cannot hide
+      // a running broadcast from someone asking about one specific room — this
+      // route drops the unknowns. A badge is a passive claim about rooms
+      // nobody asked about, and a stale "LIVE" on a dead room is a worse lie
+      // than a missing badge on a live one.
+      if (publishing !== true) return;
+      out.push({
+        lobbyName: session.documentId,
+        channelArn: session.channelArn,
+        startedAt: session.startedAt ?? null,
+        startedBy: session.startedBy ?? null,
+      });
+    });
+  }
+  return out;
+}
+
+/**
+ * Clears the cached answer. Tests only — without it one case's live list
+ * serves the next one, and a 5s TTL is longer than a suite takes to run.
+ */
+export function __resetLiveLobbyCacheForTests(): void {
+  liveCache = null;
+  liveInFlight = null;
+}
+
+videoSessionsRouter.get(
+  '/sessions/live',
+  requireAuth,
+  asyncHandler(async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const now = Date.now();
+      if (liveCache && now - liveCache.at < CACHE_TTL_MS) {
+        res.status(200).json({ lobbies: liveCache.value, cached: true });
+        return;
+      }
+      if (!liveInFlight) {
+        liveInFlight = computeLiveLobbies()
+          .then((value) => {
+            liveCache = { at: Date.now(), value };
+            return value;
+          })
+          .finally(() => {
+            liveInFlight = null;
+          });
+      }
+      const lobbies = await liveInFlight;
+      res.status(200).json({ lobbies, cached: false });
+    } catch (err) {
+      log.error({ err }, '[videoSessions] GET /sessions/live error');
+      // An empty list, not a 500. The caller is a conversation list drawing
+      // badges; it must render whether or not this could be answered, and
+      // "nothing is on" is the safe reading — the same one every other
+      // liveness path here takes when it cannot ask.
+      res.status(200).json({ lobbies: [], degraded: true });
+    }
+  }),
+);
+
 videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {
     const { sessionId } = req.params;
