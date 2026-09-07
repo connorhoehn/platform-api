@@ -601,9 +601,21 @@ const TRANSCRIPT_STALL_MS = Number(process.env.TRANSCRIPT_STALL_MS ?? 20 * 60 * 
  *
  * A stalled job reports `status: 'stalled'`, which is a real distinction
  * from 'failed': 'failed' means the worker ran and could not produce a
- * transcript, 'stalled' means nothing ever picked the job up. Both are
- * terminal, and conflating them would lose the one detail that tells an
- * operator which system to go look at.
+ * transcript, 'stalled' means the job has sat un-progressed past the
+ * deadline. Both are terminal, and conflating them would lose the one
+ * detail that tells an operator which system to go look at.
+ *
+ * What 'stalled' does NOT distinguish — and cannot, from this row — is a
+ * job nothing ever picked up from one the message queue redrove three
+ * times and dropped into the DLQ. Neither outcome writes anything back
+ * here: the transcription worker is a separate container that only ever
+ * reports success (via `transcription:transcript.ready`), and the DLQ this
+ * service persists is the pipeline one, keyed by messageId with no
+ * recordingId to join on. So the row shows 'pending' with no error and no
+ * attempt count in both cases. That ambiguity is stated rather than
+ * papered over with a made-up status; resolving it needs a signal that
+ * does not exist yet (a worker-side 'processing' write, or a DLQ lookup
+ * keyed by recording), not a new value in this enum.
  */
 function writeTranscriptProgress(
   res: Response,
@@ -611,7 +623,22 @@ function writeTranscriptProgress(
   detail: CallRecording,
 ): void {
   const status = detail.transcriptStatus;
-  const waitedMs = Date.now() - new Date(detail.endedAt).getTime();
+  // Measure from when the job last moved, not from when the CALL ended.
+  //
+  // Those are the same instant for a fresh recording, which is exactly why
+  // `endedAt` survived here as long as it did. They are nothing like the
+  // same instant for a replayed or re-triggered one: a job enqueued thirty
+  // seconds ago against a month-old recording reported
+  // `waitedMs: 32106080` and was declared stalled before any worker could
+  // possibly have looked at it.
+  //
+  // `transcriptStatusAt` is stamped by every `updateTranscriptStatus`
+  // write, so it means "when we last saw this job move" — which is the
+  // question the stall deadline is actually asking. Rows written before
+  // that field existed fall back to `endedAt` and behave as they did.
+  const clockedFrom = detail.transcriptStatusAt ?? detail.endedAt;
+  const clockedFromMs = new Date(clockedFrom).getTime();
+  const waitedMs = Date.now() - clockedFromMs;
   const stalled =
     (status === 'pending' || status === 'processing')
     && Number.isFinite(waitedMs)
@@ -631,8 +658,18 @@ function writeTranscriptProgress(
     terminal,
     retryAfterMs,
     waitedMs: Number.isFinite(waitedMs) ? waitedMs : null,
+    // Which clock produced `waitedMs`. Without it a client reading a
+    // seven-figure wait cannot tell a genuinely old job from the bug this
+    // field was added alongside.
+    waitedFrom: Number.isFinite(clockedFromMs) ? new Date(clockedFromMs).toISOString() : null,
     error: detail.transcriptError ?? null,
     generatedAt: detail.transcriptGeneratedAt ?? null,
+    // The summary is a separate job over the transcript. It cannot be
+    // further along than the transcript is, so while this endpoint is
+    // answering 202 the summary is at best pending — reported anyway so
+    // one shape carries both axes wherever a client looks.
+    summaryStatus: detail.summaryStatus ?? null,
+    summaryError: detail.summaryError ?? null,
   });
 }
 
@@ -679,6 +716,15 @@ recordingsRouter.get(
       // Shouldn't happen — ready implies key present. Defensive 500.
       throw new AppError(500, 'transcript ready but key missing');
     }
+
+    // A ready transcript can sit next to a failed summary — they are two
+    // jobs now, not one status. A client that fetches only the transcript
+    // learns the other half here instead of having to guess from an empty
+    // summary panel.
+    res.setHeader(
+      'X-Summary-Status',
+      detail.summaryStatus ?? (detail.summaryMarkdown ? 'ready' : 'none'),
+    );
 
     // Fetch from LVS using the same segments URL pattern the
     // composedUrl uses. The worker stored transcript.json relative
@@ -769,6 +815,35 @@ recordingsRouter.get(
       writeTranscriptProgress(res, recordingId, detail);
       return;
     }
+
+    // Every response past this point carries the summary's own state in a
+    // header, because the body is markdown and has nowhere to put it. A
+    // client that has never heard of the header ignores it and renders the
+    // body, which is why the failure case below answers 200 with an
+    // explanation rather than a status code the old client turns into
+    // `null` and an empty panel.
+    res.setHeader(
+      'X-Summary-Status',
+      detail.summaryStatus ?? (detail.summaryMarkdown ? 'ready' : 'none'),
+    );
+
+    if (detail.summaryStatus === 'failed') {
+      // The transcript is ready — this route only gets here when it is —
+      // and only the summarisation over it failed. These used to be one
+      // status, so an LLM outage reported the TRANSCRIPTION as failed and
+      // the readable transcript went unmentioned. Say which half broke,
+      // and point at the half that works.
+      const detailText = detail.summaryError ? `: ${detail.summaryError}` : '.';
+      res
+        .type('text/markdown')
+        .send(
+          `_Summary generation failed${detailText}_\n\n`
+          + '_The transcript itself is complete and unaffected — open the '
+          + 'Transcript tab to read it._',
+        );
+      return;
+    }
+
     if (!detail.summaryMarkdown) {
       // Ready but no summary — happens for the "no audible legs"
       // placeholder branch. Return 200 with the placeholder so the FE

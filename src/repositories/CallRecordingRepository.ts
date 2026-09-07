@@ -237,6 +237,41 @@ export interface CallRecording {
    *   'failed'              — exhausted DLQ retries
    */
   transcriptStatus?: 'pending' | 'processing' | 'ready' | 'failed';
+  /**
+   * ISO timestamp of the last `transcriptStatus` write — i.e. when we last
+   * observed forward progress on this job.
+   *
+   * The stall check used to measure from `endedAt`, which is the wrong
+   * clock: it answers "how long since the call finished", not "how long has
+   * this job been waiting". They coincide for a fresh recording, which is
+   * why the bug survived, and diverge completely for a re-triggered or
+   * replayed one — a job enqueued thirty seconds ago against a recording
+   * from a month back reported `waitedMs: 32106080` and was declared
+   * stalled on the spot.
+   *
+   * Sparse: rows written before this field existed have none, and the read
+   * path falls back to `endedAt` for them.
+   */
+  transcriptStatusAt?: string;
+  /**
+   * Summarisation state, which is NOT transcription state.
+   *
+   * The summary is a second, LLM-backed job over a transcript that already
+   * exists. It has its own ways to fail — missing credentials, a rate
+   * limit, an empty completion — none of which say anything about whether
+   * the transcript is readable. Folding the two together meant one failed
+   * `createLLMClient()` call marked `transcriptStatus: 'failed'` on a row
+   * that had a perfectly good `transcriptKey` stamped by the same write,
+   * and the UI reported the transcription as failed for a transcript that
+   * served 200 the moment the status was flipped by hand.
+   *
+   * Sparse for the same reason as the transcript fields, and additionally
+   * absent on every row written before this split; readers treat a missing
+   * value as "no summary attempt recorded".
+   */
+  summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed';
+  /** Last-error string when `summaryStatus === 'failed'`. Truncated to 200 chars. */
+  summaryError?: string;
   /** Blob-storage key (S3/R2) for the merged transcript JSON. Sparse. */
   transcriptKey?: string;
   /** Blob-storage key for the LLM-generated markdown summary. Reserved for
@@ -946,6 +981,18 @@ export class CallRecordingRepository extends BaseRepository {
    * Conditional on the row existing (attribute_exists(callId)) so a transcript
    * update for a webhook-not-yet-persisted recording fails fast rather than
    * silently creating a transcript-only ghost row.
+   *
+   * Every call also stamps `transcriptStatusAt`. That timestamp is what the
+   * stall check measures from — see the field's own comment for why
+   * `endedAt` was the wrong clock — and stamping it here rather than at the
+   * four call sites means no future transition can forget to.
+   *
+   * `summaryStatus` / `summaryError` ride along on the same write because
+   * the summary consumer settles both halves in one place, but they are an
+   * independent axis: a failed summary must not move `transcriptStatus`.
+   * Passing `null` for either error field REMOVEs it, so a redelivery that
+   * finally succeeds does not leave the previous attempt's error string
+   * sitting next to a 'ready' status.
    */
   async updateTranscriptStatus(
     callId: string,
@@ -956,12 +1003,30 @@ export class CallRecordingRepository extends BaseRepository {
       summaryKey?: string;
       summaryMarkdown?: string;
       transcriptGeneratedAt?: string;
-      transcriptError?: string;
+      transcriptError?: string | null;
+      summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed';
+      summaryError?: string | null;
+      /** Override for the status clock. Tests only; production uses now. */
+      statusAt?: string;
     },
   ): Promise<void> {
-    const sets: string[] = ['transcriptStatus = :s'];
+    const sets: string[] = ['transcriptStatus = :s', 'transcriptStatusAt = :sat'];
+    const removes: string[] = [];
     const names: Record<string, string> = {};
-    const values: Record<string, unknown> = { ':s': patch.status };
+    const values: Record<string, unknown> = {
+      ':s': patch.status,
+      ':sat': patch.statusAt ?? new Date().toISOString(),
+    };
+    if (patch.summaryStatus !== undefined) {
+      sets.push('summaryStatus = :ss');
+      values[':ss'] = patch.summaryStatus;
+    }
+    if (patch.summaryError === null) {
+      removes.push('summaryError');
+    } else if (patch.summaryError !== undefined) {
+      sets.push('summaryError = :serr');
+      values[':serr'] = String(patch.summaryError).slice(0, 200);
+    }
     if (patch.transcriptKey !== undefined) {
       sets.push('transcriptKey = :k');
       values[':k'] = patch.transcriptKey;
@@ -978,16 +1043,21 @@ export class CallRecordingRepository extends BaseRepository {
       sets.push('transcriptGeneratedAt = :ga');
       values[':ga'] = patch.transcriptGeneratedAt;
     }
-    if (patch.transcriptError !== undefined) {
+    if (patch.transcriptError === null) {
+      removes.push('transcriptError');
+    } else if (patch.transcriptError !== undefined) {
       sets.push('transcriptError = :err');
       // Truncate to 200 chars so a multi-MB stack trace can't bloat the row.
       values[':err'] = String(patch.transcriptError).slice(0, 200);
     }
+    const updateExpression = removes.length
+      ? `SET ${sets.join(', ')} REMOVE ${removes.join(', ')}`
+      : `SET ${sets.join(', ')}`;
     await this.docClient.send(
       new UpdateCommand({
         TableName: CALL_RECORDINGS_TABLE,
         Key: { callId, recordingId },
-        UpdateExpression: `SET ${sets.join(', ')}`,
+        UpdateExpression: updateExpression,
         ExpressionAttributeNames: Object.keys(names).length ? names : undefined,
         ExpressionAttributeValues: values,
         ConditionExpression: 'attribute_exists(callId)',

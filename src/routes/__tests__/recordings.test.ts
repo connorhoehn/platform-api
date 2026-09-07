@@ -102,11 +102,16 @@ interface MockRes {
   body: unknown;
   ended: boolean;
   finished: Promise<void>;
+  /** Lower-cased header name → value, as express would send them. */
+  headers: Record<string, string>;
+  contentType: string | null;
   status(c: number): MockRes;
   json(b: unknown): MockRes;
   send(b?: unknown): MockRes;
-  setHeader(): MockRes;
-  getHeader(): unknown;
+  /** `res.type(...)` — the /summary route ends every path through it. */
+  type(t: string): MockRes;
+  setHeader(name: string, value: unknown): MockRes;
+  getHeader(name: string): unknown;
   end(...args: unknown[]): MockRes;
 }
 
@@ -115,11 +120,17 @@ function mockRes(): MockRes {
   const finished = new Promise<void>((r) => { resolve = r; });
   const r: MockRes = {
     statusCode: 200, body: undefined, ended: false, finished,
+    // Headers used to be dropped on the floor here, which was fine while
+    // nothing but the body carried meaning. `X-Summary-Status` is the one
+    // place the summary's own state can live on a markdown response, so it
+    // has to survive to be asserted on.
+    headers: {}, contentType: null,
     status(c) { this.statusCode = c; return this; },
     json(b) { this.body = b; this.ended = true; resolve(); return this; },
     send(b) { this.body = b; this.ended = true; resolve(); return this; },
-    setHeader() { return this; },
-    getHeader() { return undefined; },
+    type(t) { this.contentType = t; return this; },
+    setHeader(name, value) { this.headers[String(name).toLowerCase()] = String(value); return this; },
+    getHeader(name) { return this.headers[String(name).toLowerCase()]; },
     end() { this.ended = true; resolve(); return this; },
   };
   return r;
@@ -462,11 +473,174 @@ describe('GET /api/recordings/:recordingId/transcript — bounded polling', () =
     }));
     const res = await run('GET', '/api/recordings/r-1/transcript');
     const body = res.body as { status: string; terminal: boolean; retryAfterMs: number | null };
-    // 'stalled', not 'failed' — nothing ever picked the job up, which is a
-    // different thing to go look at than a worker that ran and gave up.
+    // 'stalled', not 'failed' — the job sat un-progressed past the
+    // deadline, which is a different thing to go look at than a worker
+    // that ran and gave up. This row has no `transcriptStatusAt`, so the
+    // clock falls back to `endedAt` exactly as it did before that field
+    // existed — the legacy path, still working.
     expect(body.status).toBe('stalled');
     expect(body.terminal).toBe(true);
     expect(body.retryAfterMs).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The stall clock used to start at `endedAt` — when the CALL finished, not
+// when the JOB was queued. Identical instants for a fresh recording, which
+// is why it survived; wildly apart for a replayed or re-triggered one. A job
+// enqueued thirty seconds earlier against an older recording reported
+// `waitedMs: 32106080` and was declared stalled before a worker could
+// plausibly have looked at it.
+// ---------------------------------------------------------------------------
+describe('GET /api/recordings/:recordingId/transcript — the stall clock', () => {
+  const threeHoursAgo = () => new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+
+  const requeuedRow = (over: Record<string, unknown> = {}) => ({
+    recordingId: 'r-1',
+    callId: 'c-1',
+    channelArn: 'arn:1',
+    lobbyName: 'dm:a:b',
+    composeStatus: 'skipped',
+    startedAt: threeHoursAgo(),
+    // The call is old…
+    endedAt: threeHoursAgo(),
+    // …and the job was queued thirty seconds ago.
+    transcriptStatus: 'pending',
+    transcriptStatusAt: new Date(Date.now() - 30_000).toISOString(),
+    ...over,
+  });
+
+  it('a job queued seconds ago on an old recording is not stalled', async () => {
+    givenRecording(requeuedRow());
+    const res = await run('GET', '/api/recordings/r-1/transcript');
+    const body = res.body as {
+      status: string; terminal: boolean; waitedMs: number; retryAfterMs: number | null;
+    };
+    expect(body.status).toBe('pending');
+    expect(body.terminal).toBe(false);
+    // Seconds, not the three hours since the call ended.
+    expect(body.waitedMs).toBeLessThan(60_000);
+    expect(body.retryAfterMs).toBeGreaterThanOrEqual(5_000);
+  });
+
+  it('reports which clock it used, so a large wait can be read', async () => {
+    const row = requeuedRow();
+    givenRecording(row);
+    const res = await run('GET', '/api/recordings/r-1/transcript');
+    const body = res.body as { waitedFrom: string };
+    expect(body.waitedFrom).toBe(row.transcriptStatusAt);
+    expect(body.waitedFrom).not.toBe(row.endedAt);
+  });
+
+  it('still stalls when the job itself has sat past the deadline', async () => {
+    givenRecording(requeuedRow({
+      // Queued three hours ago and never moved. Same verdict as before —
+      // the fix narrows what counts as waiting, it does not remove the
+      // deadline.
+      transcriptStatusAt: threeHoursAgo(),
+    }));
+    const res = await run('GET', '/api/recordings/r-1/transcript');
+    const body = res.body as { status: string; terminal: boolean; retryAfterMs: number | null };
+    expect(body.status).toBe('stalled');
+    expect(body.terminal).toBe(true);
+    expect(body.retryAfterMs).toBeNull();
+  });
+
+  it('a worker that picked the job up restarts the clock', async () => {
+    givenRecording(requeuedRow({
+      transcriptStatus: 'processing',
+      transcriptStatusAt: new Date(Date.now() - 10_000).toISOString(),
+    }));
+    const res = await run('GET', '/api/recordings/r-1/transcript');
+    const body = res.body as { status: string; terminal: boolean };
+    expect(body.status).toBe('processing');
+    expect(body.terminal).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transcript state and summary state are two axes, not one.
+//
+// The summary is an LLM call over a transcript that already exists. When it
+// failed, the consumer wrote `transcriptStatus: 'failed'` — on a row whose
+// `transcriptKey` it had stamped moments earlier — and the UI reported the
+// transcription as failed for a transcript that served 200 the instant the
+// status was flipped by hand.
+// ---------------------------------------------------------------------------
+describe('a failed summary does not hide a ready transcript', () => {
+  const readyRow = (over: Record<string, unknown> = {}) => ({
+    recordingId: 'r-1',
+    callId: 'c-1',
+    channelArn: 'arn:1',
+    lobbyName: 'dm:a:b',
+    composeStatus: 'skipped',
+    startedAt: new Date(Date.now() - 120_000).toISOString(),
+    endedAt: new Date(Date.now() - 60_000).toISOString(),
+    transcriptStatus: 'ready',
+    transcriptKey: 'arn_1/r-1/transcript.json',
+    transcriptGeneratedAt: new Date().toISOString(),
+    ...over,
+  });
+
+  const transcriptDoc = {
+    recordingId: 'r-1',
+    segments: [{ startMs: 0, endMs: 1_000, speakerId: 's1', speakerLabel: 'Bob', text: 'hi' }],
+  };
+
+  it('GET /transcript serves the transcript with the summary failed', async () => {
+    givenRecording(readyRow({ summaryStatus: 'failed', summaryError: 'no ANTHROPIC_API_KEY' }));
+    mockCallSfu.mockResolvedValue({
+      ok: true, status: 200, text: async () => JSON.stringify(transcriptDoc),
+    } as unknown as globalThis.Response);
+
+    const res = await run('GET', '/api/recordings/r-1/transcript');
+    // 200 with the transcript — not a 202 claiming the transcription
+    // failed, which is what the row used to say.
+    expect(res.statusCode).toBe(200);
+    expect(String(res.body)).toContain('"speakerLabel":"Bob"');
+    // …and the other axis travels with it, so a client fetching only the
+    // transcript still learns the summary is gone.
+    expect(res.headers['x-summary-status']).toBe('failed');
+  });
+
+  it('GET /summary explains the failure and points at the transcript', async () => {
+    givenRecording(readyRow({ summaryStatus: 'failed', summaryError: 'no ANTHROPIC_API_KEY' }));
+    const res = await run('GET', '/api/recordings/r-1/summary');
+    // 200, not 202 or 404: an old client turns both of those into `null`
+    // and renders an empty panel with no explanation anywhere.
+    expect(res.statusCode).toBe(200);
+    expect(res.contentType).toBe('text/markdown');
+    expect(res.headers['x-summary-status']).toBe('failed');
+    const body = String(res.body);
+    expect(body).toContain('Summary generation failed');
+    expect(body).toContain('no ANTHROPIC_API_KEY');
+    expect(body).toContain('transcript itself is complete');
+  });
+
+  it('a ready summary is unchanged, and says so in the header', async () => {
+    givenRecording(readyRow({ summaryStatus: 'ready', summaryMarkdown: '## Summary\nWe shipped it.' }));
+    const res = await run('GET', '/api/recordings/r-1/summary');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('## Summary\nWe shipped it.');
+    expect(res.headers['x-summary-status']).toBe('ready');
+  });
+
+  it('a row from before the split still serves its summary', async () => {
+    // No `summaryStatus` at all — every row written before this existed.
+    givenRecording(readyRow({ summaryMarkdown: '## Summary\nLegacy row.' }));
+    const res = await run('GET', '/api/recordings/r-1/summary');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('## Summary\nLegacy row.');
+    expect(res.headers['x-summary-status']).toBe('ready');
+  });
+
+  it('the detail response carries both axes', async () => {
+    givenRecording(readyRow({ summaryStatus: 'failed', summaryError: 'rate limited' }));
+    const res = await run('GET', '/api/recordings/r-1');
+    const body = res.body as Record<string, unknown>;
+    expect(body.transcriptStatus).toBe('ready');
+    expect(body.summaryStatus).toBe('failed');
+    expect(body.summaryError).toBe('rate limited');
   });
 });
 

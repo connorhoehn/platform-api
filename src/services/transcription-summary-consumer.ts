@@ -15,6 +15,7 @@
  *      system prompt + speaker-tagged transcript user prompt.
  *   7. Persist:
  *        transcriptStatus → 'ready'
+ *        summaryStatus    → 'ready'
  *        transcriptKey    → from payload
  *        summaryMarkdown  → LLM response (inline in DDB; <400 KB cap)
  *        transcriptGeneratedAt → ISO now
@@ -23,8 +24,24 @@
  *
  * Failure policy: re-throws so the durable transport sees the failure
  * and redelivers. After 3 attempts the MQ redrive policy moves the
- * message to DLQ; we mark status='failed' before the throw so the
+ * message to DLQ; we mark a failure on the row before the throw so the
  * FE knows to render an error chip instead of an indefinite spinner.
+ *
+ * WHICH failure, though, is the part this used to get wrong. Step 6 is an
+ * LLM call over a transcript that steps 1-5 have already proven exists —
+ * we are holding its key and its parsed segments. When that call failed
+ * (no credentials, a rate limit, an empty completion) the catch below
+ * wrote `transcriptStatus: 'failed'` on a row whose `transcriptKey` had
+ * been stamped by the very same handler, and the UI reported the
+ * TRANSCRIPTION as failed. Observed live: a recording transcribed in 1.4s,
+ * a summary call that failed for want of credentials, and a transcript
+ * that served 200 the instant the status was flipped by hand.
+ *
+ * So the two are settled on two axes now. Anything up to and including the
+ * transcript fetch is a transcript failure. Everything after it — the
+ * summarisation and its persistence — is a summary failure, and leaves
+ * `transcriptStatus: 'ready'` with the key in place, because that is what
+ * is true.
  */
 
 import type { EventEnvelope, Subscription } from '@connorhoehn/event-catalog';
@@ -240,13 +257,45 @@ export function startTranscriptionSummaryConsumer(
       }
       const channelArn = detail.channelArn;
 
+      // ----------------------------------------------------------------
+      // Phase 1 — the transcript. A failure here means there is genuinely
+      // no transcript to read, so it is a transcript failure.
+      // ----------------------------------------------------------------
+      let doc: TranscriptDoc;
       try {
         await callRecordingRepo.updateTranscriptStatus(callId, recordingId, {
           status: 'processing',
           transcriptKey,
+          // The summary hasn't been attempted yet. Saying so beats leaving
+          // the field absent, which a reader can't tell from "this row
+          // predates the split".
+          summaryStatus: 'pending',
         });
 
-        const doc = await fetchTranscript(channelArn, recordingId);
+        doc = await fetchTranscript(channelArn, recordingId);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.error(
+          { err: message, recordingId, callId },
+          '[transcription-summary] transcript unavailable; will redeliver',
+        );
+        try {
+          await callRecordingRepo.updateTranscriptStatus(callId, recordingId, {
+            status: 'failed',
+            transcriptError: message,
+          });
+        } catch {
+          // Swallow secondary failure — the throw below is the
+          // load-bearing signal to MQ.
+        }
+        throw err;
+      }
+
+      // ----------------------------------------------------------------
+      // Phase 2 — the summary over a transcript we now know exists.
+      // Nothing below may move `transcriptStatus` off 'ready'.
+      // ----------------------------------------------------------------
+      try {
         if (!doc.segments || doc.segments.length === 0) {
           // No-audible-legs case from the worker. Mark ready with an
           // empty summary rather than failing — the FE renders a
@@ -254,8 +303,11 @@ export function startTranscriptionSummaryConsumer(
           await callRecordingRepo.updateTranscriptStatus(callId, recordingId, {
             status: 'ready',
             transcriptKey,
+            summaryStatus: 'ready',
             summaryMarkdown: '_No audible speech was captured in this recording._',
             transcriptGeneratedAt: new Date().toISOString(),
+            transcriptError: null,
+            summaryError: null,
           });
           log.info({ recordingId }, '[transcription-summary] no segments — marked ready with placeholder');
           await afterReady({
@@ -302,8 +354,13 @@ export function startTranscriptionSummaryConsumer(
         await callRecordingRepo.updateTranscriptStatus(callId, recordingId, {
           status: 'ready',
           transcriptKey,
+          summaryStatus: 'ready',
           summaryMarkdown: summary,
           transcriptGeneratedAt: new Date().toISOString(),
+          // A redelivery that finally succeeds must not leave the previous
+          // attempt's error string sitting next to a 'ready' status.
+          transcriptError: null,
+          summaryError: null,
         });
 
         log.info(
@@ -329,21 +386,35 @@ export function startTranscriptionSummaryConsumer(
         const message = err instanceof Error ? err.message : String(err);
         log.error(
           { err: message, recordingId, callId },
-          '[transcription-summary] failed; will redeliver',
+          '[transcription-summary] summary failed; transcript stays ready; will redeliver',
         );
         // Mark failed only after redelivery budget exhausted — but the
         // catalog envelope doesn't expose dlq-imminent reliably. For
         // MVP, flip to failed every time and let success overwrite it
         // on a redelivery that does succeed.
+        //
+        // `status: 'ready'` is not optimism. We are in this branch only
+        // because `fetchTranscript` returned a document, so the transcript
+        // exists, its key is the one we were handed, and the endpoint that
+        // serves it will answer 200. Writing 'failed' here — which is what
+        // this did — hid a working transcript behind an LLM outage.
         try {
           await callRecordingRepo.updateTranscriptStatus(callId, recordingId, {
-            status: 'failed',
-            transcriptError: message,
+            status: 'ready',
+            transcriptKey,
+            transcriptGeneratedAt: new Date().toISOString(),
+            summaryStatus: 'failed',
+            summaryError: message,
           });
         } catch {
           // Swallow secondary failure — the throw below is the
           // load-bearing signal to MQ.
         }
+        // Deliberately no `afterReady` on this path. Dispatching
+        // transcript.ready here would re-fire the pipeline trigger on
+        // every redelivery; a redelivery that succeeds still fires it
+        // exactly once, which is the behaviour every other failure mode
+        // already has.
         throw err;
       }
     },
