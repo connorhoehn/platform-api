@@ -781,8 +781,19 @@ videoSessionsRouter.get(
       const lobbyName = decodeURIComponent(req.params.lobbyName ?? '');
       if (!lobbyName) throw new ValidationError('lobbyName is required');
 
+      // "Nothing is live" is the ORDINARY answer here — most conversations,
+      // most of the time — so it is a 200 with a plain no, not an error. As a
+      // 404 it was correct on the wire and wrong in practice: the browser
+      // paints every 404 red, so simply opening a conversation without a
+      // stream printed console errors that read like a broken build, and the
+      // one caller already had to carry a comment explaining that its own
+      // error path was not an error.
+      const notLive = (): void => {
+        res.status(200).json({ lobbyName, live: false, channelArn: null });
+      };
+
       const session = await videoSessionRepo.findActiveByLobbyName(lobbyName);
-      if (!session) throw new NotFoundError('No live session for this lobby');
+      if (!session) return notLive();
 
       // `status: 'active'` is a LIFECYCLE flag, not evidence that anything is
       // being broadcast. It flips to 'ended' only when the last participant
@@ -797,24 +808,21 @@ videoSessionsRouter.get(
       // client that vanishes has its transport reaped within ~20-65s and the
       // channel goes OFFLINE on its own, with nobody having to say goodbye.
       const publishing = await isChannelPublishing(session.channelArn);
-      if (publishing === false) {
-        throw new NotFoundError('Nothing is being broadcast to this lobby');
-      }
+      if (publishing === false) return notLive();
 
       // `null` is "LVS could not be asked", not "nothing is on". Falling back
       // to the roster keeps a reachable-LVS outage from hiding a live stream —
       // the leak makes this answer too generous, which is the failure worth
       // having when the alternative is telling a viewer a running broadcast
       // does not exist.
-      if (publishing === null && (session.participants ?? []).length === 0) {
-        throw new NotFoundError('No live session for this lobby');
-      }
+      if (publishing === null && (session.participants ?? []).length === 0) return notLive();
 
       // Only what a viewer needs. Participant lists and tokens stay out: this
       // route is reachable by anyone who can see the room, and watching is a
       // weaker right than joining.
       res.status(200).json({
         lobbyName,
+        live: true,
         sessionId: session.sessionId,
         channelArn: session.channelArn,
         startedAt: session.startedAt ?? null,

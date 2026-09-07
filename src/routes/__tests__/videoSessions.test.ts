@@ -292,9 +292,10 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         headers: { authorization: 'Bearer user-jwt' },
         userId: 'alice',
       });
-      // Either the repo has a live session (200 with a channelArn) or it does
-      // not (404). What must NOT happen is a session being created.
+      // Whether or not anything is live, the answer is a 200 — what must NOT
+      // happen is a session being created.
       expect(res.statusCode).toBe(200);
+      expect(res.body.live).toBe(true);
       expect(res.body.channelArn).toBe('arn:channel:watch');
       expect(res.body.lobbyName).toBe('room:asdf');
       // A viewer gets what they need to watch and nothing more — no
@@ -308,13 +309,17 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       expect(created).toHaveLength(0);
     });
 
-    it('404s when nothing is live — the honest answer before anyone starts', async () => {
+    // Not an error: most conversations have no stream most of the time. As a
+    // 404 this painted a red console error every time someone opened a chat.
+    it('answers a plain no when nothing is live', async () => {
       mockFindActiveByLobbyName.mockResolvedValueOnce(null);
       const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Anever-used', {
         headers: { authorization: 'Bearer user-jwt' },
         userId: 'alice',
       });
-      expect(res.statusCode).toBe(404);
+      expect(res.statusCode).toBe(200);
+      expect(res.body.live).toBe(false);
+      expect(res.body.channelArn).toBeNull();
     });
 
     // `status: 'active'` is a lifecycle flag, not evidence of a broadcast. It
@@ -323,7 +328,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
     // headless test that never said goodbye stays 'active' forever. Reporting
     // one of those as watchable is how a room that once had a call ended up
     // permanently offering a Watch button onto a black rectangle marked LIVE.
-    it('404s on a leaked session that nobody is publishing to', async () => {
+    it('reports not-live for a leaked session that nobody is publishing to', async () => {
       mockFindActiveByLobbyName.mockResolvedValueOnce({
         sessionId: 'sess-leaked', channelArn: 'arn:channel:leaked',
         startedAt: '2026-09-01T00:00:00.000Z', startedBy: 'hank',
@@ -333,10 +338,11 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         headers: { authorization: 'Bearer user-jwt' },
         userId: 'alice',
       });
-      expect(res.statusCode).toBe(404);
+      expect(res.statusCode).toBe(200);
+      expect(res.body.live).toBe(false);
     });
 
-    it('404s when the record predates participant tracking entirely', async () => {
+    it('reports not-live when the record predates participant tracking entirely', async () => {
       mockFindActiveByLobbyName.mockResolvedValueOnce({
         sessionId: 'sess-old', channelArn: 'arn:channel:old',
         startedAt: null, startedBy: null,
@@ -345,7 +351,8 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         headers: { authorization: 'Bearer user-jwt' },
         userId: 'alice',
       });
-      expect(res.statusCode).toBe(404);
+      expect(res.statusCode).toBe(200);
+      expect(res.body.live).toBe(false);
     });
 
     // The roster cannot answer "is this watchable": a room call joins TWICE
@@ -375,7 +382,8 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Aleaked', {
         headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
       });
-      expect(res.statusCode).toBe(404);
+      expect(res.statusCode).toBe(200);
+      expect(res.body.live).toBe(false);
     });
 
     it('200s when the SFU says LIVE, even with an empty roster', async () => {
@@ -407,7 +415,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       expect(res.statusCode).toBe(200);
     });
 
-    it('404s when the SFU is unreachable AND the roster is empty', async () => {
+    it('reports not-live when the SFU is unreachable AND the roster is empty', async () => {
       mockFindActiveByLobbyName.mockResolvedValueOnce({
         sessionId: 'sess-none', channelArn: 'arn:channel:none',
         startedAt: null, startedBy: null, participants: [],
@@ -416,7 +424,8 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Anone', {
         headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
       });
-      expect(res.statusCode).toBe(404);
+      expect(res.statusCode).toBe(200);
+      expect(res.body.live).toBe(false);
     });
 
     it('decodes the lobby name out of the path', async () => {
