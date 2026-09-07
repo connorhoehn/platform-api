@@ -2118,6 +2118,7 @@ components:
       enum:
         - trigger
         - llm
+        - agent
         - transform
         - condition
         - action
@@ -2338,10 +2339,101 @@ components:
         message:
           type: string
 
+    AgentNodeData:
+      description: >-
+        Agentic step (agent-step contract v1) — a bounded multi-turn agent
+        loop with tool use, as opposed to `llm`, which is a single completion.
+      type: object
+      required: [type, prompt]
+      properties:
+        type:
+          type: string
+          const: agent
+        prompt:
+          type: string
+          description: The task. Supports the same `{{ context.x }}` interpolation as `llm`.
+        systemPrompt:
+          type: string
+        model:
+          type: string
+          description: Friendly alias ('sonnet' | 'opus' | 'haiku') or explicit model id.
+        allowedTools:
+          type: array
+          items:
+            type: string
+          description: >-
+            DEFAULT-DENY: absent or empty means the agent runs with NO tools
+            and is equivalent to a plain `llm` step. Never widen implicitly.
+        maxTurns:
+          type: integer
+          minimum: 1
+          description: Hard ceiling on agent turns. Defaults to 8.
+        timeoutMs:
+          type: integer
+          minimum: 0
+          description: Wall-clock ceiling for the whole step. Defaults to 120000.
+
+    AgentToolCall:
+      description: One tool invocation inside an agent loop, as persisted on the step output.
+      type: object
+      required: [name, ok, startedAt]
+      properties:
+        name:
+          type: string
+        input: {}
+        output: {}
+        ok:
+          type: boolean
+        startedAt: { type: string, format: date-time }
+        endedAt:
+          type: string
+          format: date-time
+          description: Absent while the call is still in flight.
+        error:
+          type: string
+          description: Present when `ok` is false.
+
+    AgentStopReason:
+      type: string
+      enum: [complete, max_turns, timeout, error, cancelled]
+
+    AgentStepOutput:
+      description: >-
+        `step.output` shape for an `agent` node; also persisted on
+        `StepExecution.agent`, which is written on FAILED steps too (timeout /
+        max_turns / error) where `output` is not.
+      type: object
+      required: [text, turns, toolCalls, model, tokensIn, tokensOut, stopReason, toolless]
+      properties:
+        text:
+          type: string
+          description: Final assistant text.
+        turns:
+          type: integer
+          minimum: 0
+        toolCalls:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentToolCall'
+        model:
+          type: string
+        tokensIn:
+          type: integer
+          minimum: 0
+        tokensOut:
+          type: integer
+          minimum: 0
+        stopReason:
+          $ref: '#/components/schemas/AgentStopReason'
+        toolless:
+          type: boolean
+          description: True when the step ran with no tools allowed (see `allowedTools`).
+
     NodeData:
       oneOf:
         - $ref: '#/components/schemas/TriggerNodeData'
         - $ref: '#/components/schemas/LLMNodeData'
+        - $ref: '#/components/schemas/AgentNodeData'
         - $ref: '#/components/schemas/TransformNodeData'
         - $ref: '#/components/schemas/ConditionNodeData'
         - $ref: '#/components/schemas/ActionNodeData'
@@ -2374,6 +2466,7 @@ components:
         mapping:
           trigger: '#/components/schemas/TriggerNodeData'
           llm: '#/components/schemas/LLMNodeData'
+          agent: '#/components/schemas/AgentNodeData'
           transform: '#/components/schemas/TransformNodeData'
           condition: '#/components/schemas/ConditionNodeData'
           action: '#/components/schemas/ActionNodeData'
@@ -2533,7 +2626,9 @@ components:
         - pending
         - running
         - awaiting_approval
+        - paused_at_breakpoint
         - completed
+        - rejected
         - failed
         - cancelled
 
@@ -2595,6 +2690,13 @@ components:
           type: string
         llm:
           $ref: '#/components/schemas/StepExecutionLLM'
+        agent:
+          allOf:
+            - $ref: '#/components/schemas/AgentStepOutput'
+          description: >-
+            Agent-specific result, populated by `agent` steps. Present on
+            FAILED steps too — read `stopReason` here to find out how the
+            loop ended.
         approvals:
           type: array
           items:
@@ -2611,6 +2713,28 @@ components:
         payload:
           type: object
           additionalProperties: true
+
+    RunRejection:
+      description: >-
+        Why a run ended in `status: rejected` — which approval gate was
+        rejected, by whom, when and why. Present iff `status` is `rejected`.
+      type: object
+      required: [stepId, userId, at]
+      properties:
+        stepId:
+          type: string
+          description: Node id of the approval gate that was rejected.
+        userId:
+          type: string
+          description: >-
+            Who rejected. `system:timeout` for a `timeoutAction: reject`
+            expiry.
+        comment:
+          type: string
+          description: Free-text reason supplied with the decision, when present.
+        at:
+          type: string
+          format: date-time
 
     PipelineRunError:
       type: object
@@ -2674,6 +2798,12 @@ components:
           additionalProperties: true
         error:
           $ref: '#/components/schemas/PipelineRunError'
+        rejection:
+          allOf:
+            - $ref: '#/components/schemas/RunRejection'
+          description: >-
+            Present iff `status` is `rejected`. Lets the Runs list explain a
+            rejection without opening the run.
 
     # -----------------------------------------------------------------
     # Validation (pure client-side result, included for SDK completeness)
