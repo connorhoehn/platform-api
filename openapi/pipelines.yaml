@@ -2622,6 +2622,13 @@ components:
     # -----------------------------------------------------------------
     RunStatus:
       type: string
+      description: |
+        Run lifecycle vocabulary. Mirrors distributed-core's `RunStatus`.
+        `stuck` is NON-terminal: `StuckRunDetector` emits `pipeline:run:stuck`
+        when a `running` / `awaiting_approval` run stops heartbeating past the
+        threshold, but the run is still open and may still reach `completed`,
+        `failed` or `cancelled`. The operator escape hatch is force-fail,
+        which moves the run to the platform-api-only `interrupted` state.
       enum:
         - pending
         - running
@@ -2631,6 +2638,7 @@ components:
         - rejected
         - failed
         - cancelled
+        - stuck
 
     StepStatus:
       type: string
