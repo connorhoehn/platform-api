@@ -24,12 +24,24 @@ process.env.LVS_WEBHOOK_SECRET = 'test-secret';
 const putRecordingMock = jest.fn().mockResolvedValue(undefined);
 const getSessionMock = jest.fn().mockResolvedValue(null);
 const findByChannelArnMock = jest.fn().mockResolvedValue([]);
+// The transcription branch touches two more collaborators: the transcript
+// status write and the catalog publish. Both are mocked so the enqueue
+// tests below can make either one throw on demand.
+const updateTranscriptStatusMock = jest.fn().mockResolvedValue(undefined);
 jest.mock('../../repositories', () => ({
-  callRecordingRepo: { putRecording: putRecordingMock },
+  callRecordingRepo: {
+    putRecording: putRecordingMock,
+    updateTranscriptStatus: updateTranscriptStatusMock,
+  },
   videoSessionRepo: {
     getSession: getSessionMock,
     findByChannelArn: findByChannelArnMock,
   },
+}));
+
+const catalogPublishMock = jest.fn().mockResolvedValue(undefined);
+jest.mock('../../lib/event-catalog', () => ({
+  catalog: { publish: (...args: unknown[]) => catalogPublishMock(...args) },
 }));
 
 // Stub redis-client to return null — webhook then proceeds with
@@ -628,5 +640,160 @@ describe('lvsWebhooks — what the persisted row is allowed to claim', () => {
       'dev-bob', 'dev-hank',
     ]);
     expect(arg.participantCount).toBe(2);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// The transcription enqueue, and what the row is left claiming when it fails.
+//
+// `pending` is written BEFORE the publish so a worker that picks the job up
+// immediately can move the row to 'processing' without racing a late status
+// write. The cost is that a publish which throws leaves a row saying
+// 'pending' for a job that is on no queue — and the only thing that ever
+// noticed was the transcript endpoint's stall timer, roughly twenty minutes
+// later, which then had to guess at the reason. The route knows the reason
+// at the moment it happens; these tests hold it to saying so.
+// ---------------------------------------------------------------------------
+describe('lvsWebhooks — a transcription enqueue that fails says so on the row', () => {
+  let server: http.Server;
+
+  beforeAll(async () => {
+    const app = express();
+    app.use('/hooks/lvs', lvsWebhooksRouter);
+    server = http.createServer(app);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  beforeEach(() => {
+    putRecordingMock.mockClear();
+    getSessionMock.mockClear();
+    findByChannelArnMock.mockClear();
+    findByChannelArnMock.mockResolvedValue([]);
+    updateTranscriptStatusMock.mockClear();
+    updateTranscriptStatusMock.mockResolvedValue(undefined);
+    catalogPublishMock.mockClear();
+    catalogPublishMock.mockResolvedValue(undefined);
+  });
+
+  /** A `recording.completed` delivery that opts into transcription. */
+  async function deliverTranscribable(recordingId: string) {
+    const body = Buffer.from(
+      JSON.stringify({
+        type: 'recording.completed',
+        channelArn: 'arn:tx',
+        data: {
+          recordingId,
+          callId: 'call-tx',
+          segments: [],
+          totalSize: 0,
+          durationMs: 10_000,
+          destination: 'local',
+          transcribe: true,
+          tracks: [
+            { legId: 'leg-001', participantId: 'p-1', kind: 'audio', startedAtMs: 3, endedAtMs: 9_000 },
+          ],
+        },
+      }),
+      'utf-8',
+    );
+    const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
+    return res;
+  }
+
+  test('the happy path writes pending, then publishes, and leaves it pending', async () => {
+    const res = await deliverTranscribable('r-tx-ok');
+    expect(res.status).toBe(204);
+
+    expect(catalogPublishMock).toHaveBeenCalledTimes(1);
+    expect(catalogPublishMock.mock.calls[0]![0]).toBe('transcription:job.queued');
+    // Exactly one status write: 'pending'. Nothing corrects a publish that
+    // did not fail.
+    expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(1);
+    expect(updateTranscriptStatusMock.mock.calls[0]![2]).toEqual({ status: 'pending' });
+  });
+
+  test('a publish that throws marks the row failed with the reason, not pending', async () => {
+    catalogPublishMock.mockRejectedValueOnce(new Error('ECONNREFUSED 127.0.0.1:3004'));
+
+    // Still 204 — transcription is post-processing, and the recording itself
+    // persisted fine. The webhook has never failed for this and must not start.
+    const res = await deliverTranscribable('r-tx-fail');
+    expect(res.status).toBe(204);
+    expect(putRecordingMock).toHaveBeenCalledTimes(1);
+
+    expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(2);
+    expect(updateTranscriptStatusMock.mock.calls[0]![2]).toEqual({ status: 'pending' });
+
+    const corrective = updateTranscriptStatusMock.mock.calls[1]![2];
+    expect(corrective.status).toBe('failed');
+    // The reason travels with it. Without this the FE's only signal is the
+    // stall timer, which cannot tell "the queue was down" from "the worker
+    // is not running" — two different things to go and fix.
+    expect(corrective.transcriptError).toContain('enqueue failed');
+    expect(corrective.transcriptError).toContain('ECONNREFUSED');
+  });
+
+  test('the corrective write addresses the same row as the pending write', async () => {
+    catalogPublishMock.mockRejectedValueOnce(new Error('boom'));
+    await deliverTranscribable('r-tx-key');
+
+    const [pendingCallId, pendingRecordingId] = updateTranscriptStatusMock.mock.calls[0]!;
+    const [failedCallId, failedRecordingId] = updateTranscriptStatusMock.mock.calls[1]!;
+    expect(failedCallId).toBe(pendingCallId);
+    expect(failedRecordingId).toBe(pendingRecordingId);
+    expect(failedRecordingId).toBe('r-tx-key');
+  });
+
+  test('when the PENDING write is what failed, no corrective write is attempted', async () => {
+    // The row does not exist, so updateTranscriptStatus fails its
+    // attribute_exists(callId) condition. A second write would fail
+    // identically — and there is no row to correct in any case.
+    updateTranscriptStatusMock.mockRejectedValueOnce(
+      new Error('ConditionalCheckFailedException'),
+    );
+
+    const res = await deliverTranscribable('r-tx-norow');
+    expect(res.status).toBe(204);
+    expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(1);
+    // And nothing was published — the failure happened before the publish.
+    expect(catalogPublishMock).not.toHaveBeenCalled();
+  });
+
+  test('a corrective write that itself fails does not fail the webhook', async () => {
+    catalogPublishMock.mockRejectedValueOnce(new Error('publish down'));
+    updateTranscriptStatusMock
+      .mockResolvedValueOnce(undefined)                       // pending — ok
+      .mockRejectedValueOnce(new Error('ddb down'));          // failed — also down
+
+    const res = await deliverTranscribable('r-tx-double');
+    expect(res.status).toBe(204);
+    expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('a recording that did not opt into transcription touches neither collaborator', async () => {
+    const body = Buffer.from(
+      JSON.stringify({
+        type: 'recording.completed',
+        channelArn: 'arn:notx',
+        data: {
+          recordingId: 'r-no-tx',
+          segments: [],
+          totalSize: 0,
+          durationMs: 5_000,
+          destination: 'local',
+          tracks: [{ legId: 'leg-001', participantId: 'p-1', startedAtMs: 3, endedAtMs: 4_900 }],
+        },
+      }),
+      'utf-8',
+    );
+    const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
+    expect(res.status).toBe(204);
+    expect(updateTranscriptStatusMock).not.toHaveBeenCalled();
+    expect(catalogPublishMock).not.toHaveBeenCalled();
   });
 });

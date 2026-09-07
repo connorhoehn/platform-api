@@ -596,10 +596,25 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
     const wantTranscribe = resolvedProfile.transcribe === true;
     if (wantTranscribe) {
       const persistedCallId = callId ?? `unknown-${arn}-${recordingId}`;
+      // `pending` is written BEFORE the publish on purpose: once the job is
+      // on the queue a worker may pick it up and move the row to
+      // 'processing' at any moment, and a status write sequenced after the
+      // publish would race that and stamp the row back to 'pending'.
+      //
+      // The cost of that ordering is that a failed publish leaves a row
+      // claiming 'pending' for a job that is not on any queue — which the
+      // transcript endpoint can only discover by waiting out
+      // TRANSCRIPT_STALL_MS (~20 minutes) and then guessing 'stalled'. We
+      // know better than that, here and now: the publish threw. So on the
+      // failure path we correct the row to 'failed' with the reason,
+      // turning a twenty-minute timeout into an immediate, specific answer
+      // in the UI.
+      let pendingWritten = false;
       try {
         await callRecordingRepo.updateTranscriptStatus(persistedCallId, recordingId, {
           status: 'pending',
         });
+        pendingWritten = true;
         await catalog.publish('transcription:job.queued', {
           recordingId,
           callId: persistedCallId,
@@ -612,8 +627,27 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
         // Don't fail the webhook — transcription is a non-critical
         // post-processing feature. Log with enough context that an
         // operator can manually re-trigger from the UI.
-        log.warn({ err: txErr?.message ?? txErr, recordingId, callId: persistedCallId },
+        const reason = typeof txErr?.message === 'string' ? txErr.message : String(txErr);
+        log.warn({ err: reason, recordingId, callId: persistedCallId, pendingWritten },
           '[lvs-webhook] transcription enqueue failed (recording still persisted)');
+        // Only worth attempting when the `pending` write itself succeeded.
+        // If THAT is what threw (a missing row fails the
+        // attribute_exists(callId) condition) the corrective write would
+        // fail identically, and there is no row to correct anyway.
+        if (pendingWritten) {
+          try {
+            await callRecordingRepo.updateTranscriptStatus(persistedCallId, recordingId, {
+              status: 'failed',
+              transcriptError: `enqueue failed: ${reason}`,
+            });
+          } catch (markErr: any) {
+            // Now the row really is stuck on 'pending' and the stall timer
+            // is the only backstop left. Say so, rather than leaving a
+            // silent gap between the two writes.
+            log.warn({ err: markErr?.message ?? markErr, recordingId, callId: persistedCallId },
+              '[lvs-webhook] could not mark transcript failed — row left pending, stall timer is the only backstop');
+          }
+        }
       }
     }
 
