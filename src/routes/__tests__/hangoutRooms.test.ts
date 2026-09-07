@@ -380,3 +380,98 @@ describe('GET /api/rooms?state=archived', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// POST /api/rooms/:slug/join — the room bridge, and the double-join it causes
+// ---------------------------------------------------------------------------
+//
+// Entering a room joins the video session TWICE: once here, and again when the
+// call widget calls useVideoCall.startCall against the same lobby (the client
+// deliberately drops the token this route returns — see
+// HangoutDomainProvider.joinRoomBySlug). Leaving hangs up ONCE. That net +1
+// participant per call is why room sessions never reach a zero ref-count.
+//
+// videoSessions' /join now collapses repeat joins from one client. When the
+// client identifies its tab, that `clientId` has to reach BOTH joins or they
+// look like two different tabs and the leak comes straight back.
+
+describe('POST /api/rooms/:slug/join — clientId reaches the video join', () => {
+  const realFetch = globalThis.fetch;
+  let calls: Array<{ url: string; body: Record<string, unknown> }>;
+
+  beforeEach(() => {
+    calls = [];
+    (globalThis as unknown as { fetch: unknown }).fetch = jest.fn(
+      async (url: string, init: RequestInit) => {
+        const body = init?.body ? JSON.parse(init.body as string) : {};
+        calls.push({ url: String(url), body });
+        const payload = String(url).includes('/join')
+          ? { token: 'jwt', participantId: 'alice-bridge' }
+          : { sessionId: 'vs-1' };
+        return {
+          status: 200,
+          text: async () => JSON.stringify(payload),
+        } as unknown as globalThis.Response;
+      },
+    );
+    mockGetRoomBySlug.mockResolvedValue(makeRoom());
+  });
+
+  afterEach(() => {
+    (globalThis as unknown as { fetch: unknown }).fetch = realFetch;
+  });
+
+  it('forwards the caller clientId to /api/video/sessions/:id/join', async () => {
+    const res = await run(buildApp(), 'POST', '/api/rooms/team-standup/join', {
+      body: { clientId: 'tab-7' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const videoJoin = calls.find((c) => c.url.includes('/api/video/sessions/vs-1/join'));
+    expect(videoJoin).toBeDefined();
+    expect(videoJoin!.body).toMatchObject({ lobbyName: 'room:team-standup', clientId: 'tab-7' });
+  });
+
+  it('omits clientId entirely when the caller does not send one', async () => {
+    // Older clients: /join then collapses on userId instead, which still
+    // catches the bridge + widget pair.
+    await run(buildApp(), 'POST', '/api/rooms/team-standup/join', { body: {} });
+
+    const videoJoin = calls.find((c) => c.url.includes('/api/video/sessions/vs-1/join'));
+    expect(videoJoin!.body).not.toHaveProperty('clientId');
+  });
+});
+
+describe('POST /api/rooms/:slug/leave — clientId reaches the video end', () => {
+  const realFetch = globalThis.fetch;
+  let calls: Array<{ url: string; body: Record<string, unknown> }>;
+
+  beforeEach(() => {
+    calls = [];
+    (globalThis as unknown as { fetch: unknown }).fetch = jest.fn(
+      async (url: string, init: RequestInit) => {
+        calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body as string) : {} });
+        return { status: 200, text: async () => JSON.stringify({ ended: true }) } as unknown as globalThis.Response;
+      },
+    );
+    mockGetRoomBySlug.mockResolvedValue(makeRoom());
+  });
+
+  afterEach(() => {
+    (globalThis as unknown as { fetch: unknown }).fetch = realFetch;
+  });
+
+  it('forwards participantId and clientId to the video /end', async () => {
+    const res = await run(buildApp(), 'POST', '/api/rooms/team-standup/leave', {
+      body: { sessionId: 'vs-1', participantId: 'alice-widget', clientId: 'tab-7' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(calls[0].url).toContain('/api/video/sessions/vs-1/end');
+    expect(calls[0].body).toMatchObject({
+      lobbyName: 'room:team-standup',
+      participantId: 'alice-widget',
+      clientId: 'tab-7',
+    });
+  });
+});

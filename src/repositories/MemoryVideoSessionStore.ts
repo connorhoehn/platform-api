@@ -18,6 +18,7 @@ import {
   VideoSessionParticipant,
   VideoSessionStore,
   computeEndedSessionTtl,
+  participantSupersedes,
 } from './VideoSessionStore';
 
 /**
@@ -76,6 +77,25 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
     // DDB's list_append doesn't dedupe; we match that behaviour. Callers
     // are responsible for idempotency (the route layer does this today).
     rec.participants = [...(rec.participants ?? []), { ...participant }];
+  }
+
+  /** See VideoSessionStore.addOrReplaceParticipant. */
+  async addOrReplaceParticipant(
+    documentId: string,
+    sessionId: string,
+    participant: VideoSessionParticipant,
+  ): Promise<{ displaced: VideoSessionParticipant[]; remaining: number } | null> {
+    const key = makeKey(documentId, sessionId);
+    const rec = this.sessions.get(key);
+    if (!rec) return null;
+    const current = rec.participants ?? [];
+    const displaced = current.filter((p) => participantSupersedes(p, participant));
+    const kept = current.filter((p) => !participantSupersedes(p, participant));
+    rec.participants = [...kept, { ...participant }];
+    return {
+      displaced: displaced.map((p) => ({ ...p })),
+      remaining: rec.participants.length,
+    };
   }
 
   async removeParticipant(
@@ -139,10 +159,14 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
   }
 
   /** Parity with the DDB impl — see VideoSessionStore.listActiveCandidates. */
-  async listActiveCandidates(limit = 60): Promise<VideoSessionRecord[]> {
+  async listActiveCandidates(
+    limit = 60,
+    opts: { perLobby?: boolean } = {},
+  ): Promise<VideoSessionRecord[]> {
     const active = [...this.sessions.values()]
       .filter((s) => s.status === 'active' && !!s.documentId)
       .sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+    if (opts.perLobby === false) return active.slice(0, limit);
     const newestPerLobby = new Map<string, VideoSessionRecord>();
     for (const item of active) {
       if (newestPerLobby.has(item.documentId)) continue;

@@ -17,6 +17,7 @@ import {
   VideoSessionParticipant,
   VideoSessionStore,
   computeEndedSessionTtl,
+  participantSupersedes,
 } from './VideoSessionStore';
 
 export type {
@@ -70,6 +71,32 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
         ':empty': [],
       },
     });
+  }
+
+  /**
+   * See VideoSessionStore.addOrReplaceParticipant.
+   *
+   * Read-modify-write rather than `list_append`, because appending is
+   * exactly the behaviour that leaks: a client that joins twice (a room
+   * does) appends twice, and the second entry's participantId is a fresh
+   * upstream-minted string that no /end will ever name.
+   */
+  async addOrReplaceParticipant(
+    documentId: string,
+    sessionId: string,
+    participant: VideoSessionParticipant,
+  ): Promise<{ displaced: VideoSessionParticipant[]; remaining: number } | null> {
+    const session = await this.getSession(documentId, sessionId);
+    if (!session) return null;
+    const current = session.participants ?? [];
+    const displaced = current.filter((p) => participantSupersedes(p, participant));
+    const next = [...current.filter((p) => !participantSupersedes(p, participant)), participant];
+    await this.updateItem({
+      Key: { documentId, sessionId },
+      UpdateExpression: 'SET participants = :participants',
+      ExpressionAttributeValues: { ':participants': next },
+    });
+    return { displaced, remaining: next.length };
   }
 
   async getSession(
@@ -134,7 +161,11 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
    * (VIDEO_SESSION_TTL_DAYS, default 7d) so it stays cheap, and `limit` caps
    * the work regardless.
    */
-  async listActiveCandidates(limit = 60): Promise<VideoSessionRecord[]> {
+  async listActiveCandidates(
+    limit = 60,
+    opts: { perLobby?: boolean } = {},
+  ): Promise<VideoSessionRecord[]> {
+    const perLobby = opts.perLobby !== false;
     const { ScanCommand } = await import('@aws-sdk/lib-dynamodb');
     const out = await this.docClient.send(
       new ScanCommand({
@@ -146,6 +177,7 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
     );
     const items = (out.Items ?? []) as VideoSessionRecord[];
     items.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+    if (!perLobby) return items.filter((i) => !!i.documentId).slice(0, limit);
     // One per lobby: a lobby with several 'active' rows has been through the
     // leak more than once, and only the newest could possibly be publishing.
     const newestPerLobby = new Map<string, VideoSessionRecord>();

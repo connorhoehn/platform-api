@@ -556,6 +556,23 @@ hangoutRoomsRouter.post(
 
     const lobbyName = `room:${slug}`;
 
+    // Per-tab key, forwarded to the video join so this bridge and the call
+    // widget that follows it are recognised as the SAME client.
+    //
+    // Entering a room joins the video session TWICE: once here, and again
+    // when HangoutOverlay calls useVideoCall.startCall against the same
+    // lobby (the client deliberately drops the token this route returns —
+    // see HangoutDomainProvider.joinRoomBySlug). Leaving hangs up once. That
+    // net +1 participant per call is why sessions never end. videoSessions'
+    // /join now collapses repeat joins from one client, and when the client
+    // sends a `clientId` it must reach BOTH joins or they look like two
+    // different tabs and the leak comes straight back. With no clientId the
+    // collapse falls back to userId, which covers today's clients.
+    const clientId =
+      typeof (req.body as { clientId?: unknown } | undefined)?.clientId === 'string'
+        ? ((req.body as { clientId: string }).clientId)
+        : undefined;
+
     // Step 1 — find-or-create the live VideoSession. Pass the room's
     // recording setting EXPLICITLY (both on + off) so videoSessions.ts
     // honors per-room intent. Default-on behavior in videoSessions only
@@ -585,7 +602,7 @@ hangoutRoomsRouter.post(
     // Step 2 — mint a participant token.
     const join = await callSelf(req, `/api/video/sessions/${encodeURIComponent(sessionId)}/join`, {
       method: 'POST',
-      body: { lobbyName },
+      body: { lobbyName, ...(clientId ? { clientId } : {}) },
     });
     if (join.status >= 400) {
       throw new AppError(join.status, `Failed to join video session: ${JSON.stringify(join.body)}`);
@@ -617,7 +634,11 @@ hangoutRoomsRouter.post(
     const orgId = resolveOrgId(req);
     const userId = getUserId(req);
     const { slug } = req.params;
-    const body = (req.body ?? {}) as { sessionId?: string; participantId?: string };
+    const body = (req.body ?? {}) as {
+      sessionId?: string;
+      participantId?: string;
+      clientId?: string;
+    };
 
     if (!body.sessionId) throw new ValidationError('sessionId is required');
 
@@ -630,6 +651,9 @@ hangoutRoomsRouter.post(
       body: {
         lobbyName,
         ...(body.participantId ? { participantId: body.participantId } : {}),
+        // Second chance at naming the right entry when the caller lost its
+        // participantId — see the /end route's clientId fallback.
+        ...(body.clientId ? { clientId: body.clientId } : {}),
       },
     });
 

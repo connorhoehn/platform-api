@@ -83,6 +83,21 @@ function makeFakeDocClient(): {
       }
       return {};
     }
+    if (name === 'ScanCommand') {
+      // listActiveCandidates + findByChannelArn both Scan with a
+      // FilterExpression. Enough fidelity to exercise the filter the repo
+      // actually emits.
+      const vals = (input.ExpressionAttributeValues ?? {}) as Record<string, unknown>;
+      const filter = (input.FilterExpression ?? '') as string;
+      const items: FakeRow[] = [];
+      for (const row of table.values()) {
+        if (row.ttl !== undefined && row.ttl * 1000 <= Date.now()) continue;
+        if (filter.includes('#s = :active') && row.status !== vals[':active']) continue;
+        if (filter.includes('channelArn = :arn') && row.channelArn !== vals[':arn']) continue;
+        items.push({ ...row });
+      }
+      return { Items: items };
+    }
     if (name === 'QueryCommand') {
       const vals = (input.ExpressionAttributeValues ?? {}) as Record<string, unknown>;
       const docId = vals[':docId'] as string;
@@ -151,7 +166,7 @@ const SAMPLE: VideoSessionRecord = {
   startedAt: '2026-01-01T10:00:00Z',
   startedBy: 'user-1',
   participants: [
-    { userId: 'user-1', displayName: 'Alice', joinedAt: '2026-01-01T10:00:00Z' },
+    { userId: 'user-1', participantId: 'user-1-a', displayName: 'Alice', joinedAt: '2026-01-01T10:00:00Z' },
   ],
 };
 
@@ -221,6 +236,117 @@ describe.each([withMemoryStore(), withDdbStore()])('VideoSessionStore contract �
       expect(got!.status).toBe('ended');
       expect(got!.endedAt).toBe(endedAt);
       expect(got!.ttl).toBeGreaterThan(Math.floor(Date.parse(endedAt) / 1000));
+    });
+
+    // ---- join/leave symmetry + double-join idempotence -------------------
+    //
+    // The leak these guard: LVS mints participantId as
+    // `${userId}-${Date.now().toString(36)}`, fresh on EVERY join, so a
+    // dedupe keyed on it can never fire and a client that joins twice
+    // appends twice. Nothing removes the extra, so the ref-count never
+    // reaches zero and the row stays 'active' forever.
+
+    it('join then leave nets to zero — the row its join created is the row it removes', async () => {
+      const store = factory.makeStore();
+      await store.createSession({ ...SAMPLE, participants: [] });
+
+      const added = await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
+        userId: 'u1', participantId: 'u1-aaa', displayName: 'A', joinedAt: '2026-01-01T10:00Z',
+      });
+      expect(added).toEqual({ displaced: [], remaining: 1 });
+
+      const left = await store.removeParticipant(SAMPLE.documentId, SAMPLE.sessionId, 'u1-aaa');
+      expect(left).toEqual({ remaining: 0 });
+    });
+
+    it('a second join by the same client REPLACES the first instead of stacking', async () => {
+      const store = factory.makeStore();
+      await store.createSession({ ...SAMPLE, participants: [] });
+
+      // Entering a room does exactly this: the room bridge joins, then the
+      // call widget joins the same lobby as the same user. Two upstream
+      // participantIds, one human, one hang-up.
+      await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
+        userId: 'u1', participantId: 'u1-bridge', displayName: 'A', joinedAt: '2026-01-01T10:00Z',
+      });
+      const second = await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
+        userId: 'u1', participantId: 'u1-widget', displayName: 'A', joinedAt: '2026-01-01T10:00Z',
+      });
+
+      expect(second!.remaining).toBe(1);
+      // The displaced entry is handed back so the caller can release it in
+      // LVS too — its own participant set is what /end counts.
+      expect(second!.displaced.map((p) => p.participantId)).toEqual(['u1-bridge']);
+
+      const after = await store.getSession(SAMPLE.documentId, SAMPLE.sessionId);
+      expect(after!.participants.map((p) => p.participantId)).toEqual(['u1-widget']);
+
+      // And the single hang-up the client actually sends empties the roster.
+      const left = await store.removeParticipant(SAMPLE.documentId, SAMPLE.sessionId, 'u1-widget');
+      expect(left).toEqual({ remaining: 0 });
+    });
+
+    it('two clients that identify themselves keep separate ref-count slots', async () => {
+      const store = factory.makeStore();
+      await store.createSession({ ...SAMPLE, participants: [] });
+
+      await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
+        userId: 'u1', participantId: 'u1-t1', clientId: 'tab-1', displayName: 'A', joinedAt: '2026-01-01T10:00Z',
+      });
+      const t2 = await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
+        userId: 'u1', participantId: 'u1-t2', clientId: 'tab-2', displayName: 'A', joinedAt: '2026-01-01T10:01Z',
+      });
+
+      // Same user, two tabs — nothing displaced, two slots.
+      expect(t2!.displaced).toEqual([]);
+      expect(t2!.remaining).toBe(2);
+
+      // Tab 1 rejoining (a reconnect) replaces only its own slot.
+      const t1again = await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
+        userId: 'u1', participantId: 'u1-t1b', clientId: 'tab-1', displayName: 'A', joinedAt: '2026-01-01T10:02Z',
+      });
+      expect(t1again!.displaced.map((p) => p.participantId)).toEqual(['u1-t1']);
+      expect(t1again!.remaining).toBe(2);
+
+      // Tab 2 leaving does NOT end the session out from under tab 1.
+      const left = await store.removeParticipant(SAMPLE.documentId, SAMPLE.sessionId, 'u1-t2');
+      expect(left).toEqual({ remaining: 1 });
+    });
+
+    it('different users are never collapsed into one another', async () => {
+      const store = factory.makeStore();
+      await store.createSession({ ...SAMPLE, participants: [] });
+      await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
+        userId: 'u1', participantId: 'u1-a', displayName: 'A', joinedAt: '2026-01-01T10:00Z',
+      });
+      const second = await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, {
+        userId: 'u2', participantId: 'u2-a', displayName: 'B', joinedAt: '2026-01-01T10:01Z',
+      });
+      expect(second).toEqual({ displaced: [], remaining: 2 });
+    });
+
+    it('returns null for a session that does not exist', async () => {
+      const store = factory.makeStore();
+      expect(
+        await store.addOrReplaceParticipant('nope', 'nope', {
+          userId: 'u1', participantId: 'p', displayName: 'A', joinedAt: '2026-01-01T10:00Z',
+        }),
+      ).toBeNull();
+    });
+
+    // The reaper needs EVERY active row, not the newest per lobby: rows
+    // behind the newest are invisible to every read path, so collapsing them
+    // away is how one room ends up holding four 'active' rows forever.
+    it('listActiveCandidates collapses per lobby by default and does not with perLobby:false', async () => {
+      const store = factory.makeStore();
+      await store.createSession({ ...SAMPLE, sessionId: 'old-1', startedAt: '2026-01-01T09:00:00Z' });
+      await store.createSession({ ...SAMPLE, sessionId: 'new-1', startedAt: '2026-01-01T11:00:00Z' });
+
+      const collapsed = await store.listActiveCandidates();
+      expect(collapsed.map((s) => s.sessionId)).toEqual(['new-1']);
+
+      const all = await store.listActiveCandidates(60, { perLobby: false });
+      expect(all.map((s) => s.sessionId)).toEqual(['new-1', 'old-1']);
     });
 
     it('findActiveByLobbyName skips ended sessions', async () => {

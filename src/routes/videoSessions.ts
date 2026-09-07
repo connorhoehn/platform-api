@@ -143,6 +143,60 @@ export async function reapLvsParticipant(args: {
   return 'error';
 }
 
+/**
+ * Release a participant that platform-api has decided is gone, in BOTH of the
+ * places LVS counts it.
+ *
+ * There are two independent registries on the LVS side and they are decremented
+ * by different routes:
+ *
+ *   - `sessionStore` — the participant SET that produces `participantsRemaining`
+ *     on POST /api/sessions/:arn/end. This is the number our /end route reads to
+ *     decide whether the session is over, and the ONLY thing that decrements it
+ *     is that same /end route. Nothing reaps it.
+ *   - mediasoup `RoomManager` — the live transports. DELETE
+ *     /api/channels/:arn/participants/:pid evicts these (see
+ *     `reapLvsParticipant`) and does NOT touch `sessionStore`
+ *     (live-video-streaming src/api/channels/index.js:1083).
+ *
+ * So a reap alone leaves the ref-count above zero forever. Both calls are
+ * needed, and both are best-effort: the worst case is the SFU's own reaper
+ * sweeps the transports and this session waits for `reapStaleSessions`.
+ *
+ * Only safe to call AFTER the replacement participant has been registered
+ * upstream — LVS hard-ends the channel when a soft-end takes the count to zero.
+ */
+async function releaseLvsParticipant(args: {
+  channelArn: string;
+  participantId: string;
+  sessionId: string;
+  authHeader?: string;
+}): Promise<void> {
+  if (args.authHeader) {
+    try {
+      await callSfu(
+        `${VIDEO_API_URL}/api/sessions/${encodeURIComponent(args.channelArn)}/end`,
+        {
+          method: 'POST',
+          headers: { Authorization: args.authHeader, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ participantId: args.participantId }),
+        },
+      );
+    } catch (endErr) {
+      log.warn(
+        { err: endErr, sessionId: args.sessionId, participantId: args.participantId },
+        '[videoSessions] LVS sessionStore release failed (non-fatal)',
+      );
+    }
+  }
+  const outcome = await reapLvsParticipant({
+    channelArn: args.channelArn,
+    participantId: args.participantId,
+    sessionId: args.sessionId,
+  });
+  recordLvsParticipantReap(outcome);
+}
+
 // POST /api/video/sessions — find-or-create a session for a lobby
 //
 // Thin proxy → LVS POST /api/sessions { lobbyName, findOrCreate, creatorId,
@@ -312,6 +366,26 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     try {
       await videoSessionRepo.createSession(record);
       log.info({ sessionId, lobbyName, channelArn, reused }, '[videoSessions] DDB row written');
+
+      // Close out this lobby's PREVIOUS active rows, which are now provably
+      // stale: LVS has just named the channel that is current, so any row
+      // still marked active on a different channel belongs to a call that is
+      // over. This is the second way a lobby accumulates active rows — the
+      // reuse branch above only returns early when the arns MATCH, so every
+      // call that starts a fresh channel used to leave its predecessor behind.
+      //
+      // Same-arn rows are deliberately left alone: two clients racing to
+      // create the same lobby converge on one channel and both rows are real.
+      const previous = await videoSessionRepo.getSessionsByDocument(lobbyName);
+      for (const stale of previous) {
+        if (stale.status !== 'active') continue;
+        if (stale.sessionId === sessionId || stale.channelArn === channelArn) continue;
+        await videoSessionRepo.endSession(lobbyName, stale.sessionId, now);
+        log.info(
+          { sessionId: stale.sessionId, lobbyName, supersededBy: sessionId },
+          '[videoSessions] ended superseded session row',
+        );
+      }
     } catch (dbErr) {
       // Log but don't fail — LVS already has the canonical session.
       log.error({ err: dbErr }, '[videoSessions] Failed to persist local record');
@@ -355,6 +429,11 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
     const lobbyName = resolveLobbyName(body);
     const displayName = typeof body.displayName === 'string' ? body.displayName : undefined;
     const role = typeof body.role === 'string' ? body.role : 'publisher';
+    // Stable per-TAB key. Optional: when absent, joins collapse on userId
+    // instead (see `participantSupersedes`). Threading one through from the
+    // client is what keeps two tabs of one user ref-counting separately.
+    const clientId =
+      typeof body.clientId === 'string' && body.clientId.length > 0 ? body.clientId : undefined;
 
     if (!lobbyName) {
       throw new ValidationError('lobbyName (or documentId) is required in request body');
@@ -403,22 +482,57 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
       participantId: string; role: string; displayName?: string;
     };
 
-    // Mirror to DDB for past-calls history. Best-effort, idempotent.
+    // Mirror to DDB for past-calls history, IDEMPOTENTLY.
+    //
+    // The old check here was `participants.some(p => p.participantId === id)`,
+    // which could never match: LVS mints participantId as
+    // `${userId}-${Date.now().toString(36)}` on every join, so the id we are
+    // testing for is one we have never seen before by construction. Every
+    // repeat join therefore appended — and a room entry joins TWICE (the room
+    // bridge in hangoutRooms.ts, then the call widget) while hanging up once,
+    // so each call left one participant behind and the ref-count never reached
+    // zero. Four rows stuck 'active' on one room is what that looks like.
+    //
+    // `addOrReplaceParticipant` collapses on the client key instead, and hands
+    // back whatever it displaced so we can release it upstream too — LVS's own
+    // participant set is the number our /end route trusts.
     const participantId = tokenData.participantId;
-    const already = (session.participants ?? []).some(p => p.participantId === participantId);
-    if (!already) {
-      const now = new Date().toISOString();
-      try {
-        await videoSessionRepo.addParticipant(lobbyName, sessionId, {
-          userId,
-          participantId,
-          displayName: displayName || userId,
-          joinedAt: now,
-        });
-        log.info({ userId, participantId, sessionId }, '[videoSessions] Added participant to DDB');
-      } catch (dbErr) {
-        log.error({ err: dbErr }, '[videoSessions] Failed to add participant to local record');
-      }
+    const participant = {
+      userId,
+      participantId,
+      ...(clientId ? { clientId } : {}),
+      displayName: displayName || userId,
+      joinedAt: new Date().toISOString(),
+    };
+    let displaced: Array<{ participantId: string }> = [];
+    try {
+      const result = await videoSessionRepo.addOrReplaceParticipant(
+        lobbyName,
+        sessionId,
+        participant,
+      );
+      displaced = result?.displaced ?? [];
+      log.info(
+        { userId, participantId, clientId, sessionId, displaced: displaced.length, remaining: result?.remaining },
+        '[videoSessions] Added participant to DDB',
+      );
+    } catch (dbErr) {
+      log.error({ err: dbErr }, '[videoSessions] Failed to add participant to local record');
+    }
+
+    // Superseded entries are stale registrations for THIS client — a second
+    // join from the same tab. Release them in LVS as well, or its
+    // `participantsRemaining` stays above zero and /end never hard-ends.
+    // Safe here and only here: the replacement is already registered upstream,
+    // so this cannot take the count to zero and tear down a live channel.
+    for (const stale of displaced) {
+      if (!stale.participantId || stale.participantId === participantId) continue;
+      await releaseLvsParticipant({
+        channelArn: session.channelArn,
+        participantId: stale.participantId,
+        sessionId,
+        authHeader,
+      });
     }
 
     res.status(200).json({ token: tokenData.token, participantId, userId });
@@ -461,7 +575,20 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
       throw new NotFoundError('Session not found');
     }
 
-    const participantId = typeof body.participantId === 'string' ? body.participantId : undefined;
+    const clientId =
+      typeof body.clientId === 'string' && body.clientId.length > 0 ? body.clientId : undefined;
+    // participantId is the intended key and the FE sends it on both the
+    // click-to-hang-up and the sendBeacon paths. `clientId` is the second
+    // chance: if the beacon lost it (an unload race where the join hadn't
+    // resolved yet), the per-tab key still names exactly one entry, whereas
+    // the userId fallback below wipes every tab this user has open.
+    const participantId =
+      (typeof body.participantId === 'string' && body.participantId.length > 0
+        ? body.participantId
+        : undefined)
+      ?? (clientId
+        ? (session.participants ?? []).find((p) => p.clientId === clientId)?.participantId
+        : undefined);
     const userId =
       req.user?.sub
       ?? (typeof body.userId === 'string' ? body.userId : undefined);
@@ -808,7 +935,16 @@ videoSessionsRouter.get(
       // client that vanishes has its transport reaped within ~20-65s and the
       // channel goes OFFLINE on its own, with nobody having to say goodbye.
       const publishing = await isChannelPublishing(session.channelArn);
-      if (publishing === false) return notLive();
+      if (publishing === false) {
+        // A definite "nothing is on" from the authority. Take the chance to
+        // close the row out — otherwise this same dead session is re-probed
+        // on every poll, forever, and stays 'active' in the table where the
+        // next reader has to disbelieve it all over again. Grace-window
+        // guarded so a call that is still ringing is never ended, and
+        // fire-and-forget so the viewer's answer is not held up by a write.
+        if (isPastGrace(session)) void endStaleSession(session);
+        return notLive();
+      }
 
       // `null` is "LVS could not be asked", not "nothing is on". Falling back
       // to the roster keeps a reachable-LVS outage from hiding a live stream —
@@ -875,35 +1011,143 @@ let liveCache: { at: number; value: LiveLobby[] } | null = null;
 /** In-flight de-duplication: a burst of callers shares one computation. */
 let liveInFlight: Promise<LiveLobby[]> | null = null;
 
-async function computeLiveLobbies(): Promise<LiveLobby[]> {
-  const candidates = (await videoSessionRepo.listActiveCandidates()).filter(
+// ---------------------------------------------------------------------------
+// Stale-session reaper — sessions must end even when nobody says goodbye.
+// ---------------------------------------------------------------------------
+//
+// A hang-up is the happy path, and the happy path is not the only one: a tab
+// crashes, a laptop lid closes, a headless test process is killed. None of
+// those send /end, and `status: 'active'` has no other way to become 'ended'
+// — `createSession` writes no TTL either, so the row is immortal.
+//
+// LVS is the authority and it self-heals: it walks its live mediasoup
+// producers to answer `state`, and a vanished client's transports are reaped
+// on ICE/DTLS timeout in ~20-65s, after which the channel reports OFFLINE
+// with nobody having had to say anything. `isChannelPublishing` already asks
+// exactly that question.
+//
+// LAZY-ON-READ, not a timer. Three reasons: (1) the probe, the concurrency
+// limiter and the answer cache all already exist here, on the one route whose
+// job is to decide which lobbies are live — a sweep would be a second copy of
+// the same logic; (2) platform-api runs multiple replicas and an interval
+// would have every replica scanning the table on its own clock, needing a
+// lock to not stampede; (3) `/sessions/live` is polled by the conversation
+// list, so in practice the whole active set is examined whenever anyone has
+// the app open, which is precisely when a stale 'LIVE' badge would be seen.
+// The cost is that a table nobody looks at is not tidied, which nobody minds.
+//
+// GRACE WINDOW. A freshly created session is legitimately OFFLINE: the DM is
+// still ringing, or the publisher has not finished its WHIP handshake. Ending
+// those would be a far worse bug than the leak. So only rows older than
+// VIDEO_SESSION_STALE_MS (default 120s — comfortably past LVS's 20-65s reap)
+// are eligible, and `null` (LVS could not be asked) never ends anything.
+
+function staleAfterMs(): number {
+  const raw = process.env.VIDEO_SESSION_STALE_MS;
+  const n = raw ? Number.parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 120_000;
+}
+
+/** Is this row old enough that "not publishing" means "over" rather than "not started yet"? */
+function isPastGrace(session: { startedAt?: string }, now = Date.now()): boolean {
+  const started = Date.parse(session.startedAt ?? '');
+  if (Number.isNaN(started)) return true; // no usable timestamp → not new
+  return now - started >= staleAfterMs();
+}
+
+/**
+ * End one session whose channel LVS says is not publishing. Best-effort and
+ * idempotent — `endSession` is a plain conditional-free update, so a race
+ * between two replicas both deciding this is harmless.
+ */
+async function endStaleSession(session: VideoSessionRecord): Promise<void> {
+  try {
+    await videoSessionRepo.endSession(
+      session.documentId,
+      session.sessionId,
+      new Date().toISOString(),
+    );
+    log.info(
+      { sessionId: session.sessionId, lobbyName: session.documentId, channelArn: session.channelArn },
+      '[videoSessions] reaped stale session (channel not publishing)',
+    );
+  } catch (err) {
+    log.warn({ err, sessionId: session.sessionId }, '[videoSessions] stale-session reap failed');
+  }
+}
+
+/**
+ * ONE pass over every active row: probe it, end it if it is dead, keep it if
+ * it is live. Both callers want the same probe, so they share it — asking LVS
+ * twice about the same channel would double the SFU load for no new
+ * information.
+ *
+ * Every row, not just the newest per lobby. Rows BEHIND the newest are
+ * invisible to `by-lobby` and to the badge list, so a reaper that skipped them
+ * would leave them 'active' forever with nothing able to notice. That is
+ * exactly how one room accumulates four active rows for one call.
+ *
+ * Returns the live lobbies (newest row per lobby, since only one call is
+ * current per lobby) and the sessionIds it ended.
+ */
+async function sweepActiveSessions(
+  limit = 120,
+): Promise<{ live: LiveLobby[]; ended: string[] }> {
+  const rows = (await videoSessionRepo.listActiveCandidates(limit, { perLobby: false })).filter(
     (s) => !!s.channelArn && !!s.documentId,
   );
 
-  const out: LiveLobby[] = [];
-  for (let i = 0; i < candidates.length; i += PROBE_CONCURRENCY) {
-    const slice = candidates.slice(i, i + PROBE_CONCURRENCY);
-    const verdicts = await Promise.all(
-      slice.map((session) => isChannelPublishing(session.channelArn)),
-    );
-    slice.forEach((session, n) => {
+  const live: LiveLobby[] = [];
+  const ended: string[] = [];
+  const seenLobbies = new Set<string>();
+
+  for (let i = 0; i < rows.length; i += PROBE_CONCURRENCY) {
+    const slice = rows.slice(i, i + PROBE_CONCURRENCY);
+    const verdicts = await Promise.all(slice.map((s) => isChannelPublishing(s.channelArn)));
+    for (let n = 0; n < slice.length; n += 1) {
+      const session = slice[n];
       const publishing = verdicts[n];
-      // `null` is "LVS could not be asked", not "nothing is on". Unlike
-      // by-lobby — which falls back to the roster so an SFU outage cannot hide
-      // a running broadcast from someone asking about one specific room — this
-      // route drops the unknowns. A badge is a passive claim about rooms
-      // nobody asked about, and a stale "LIVE" on a dead room is a worse lie
-      // than a missing badge on a live one.
-      if (publishing !== true) return;
-      out.push({
-        lobbyName: session.documentId,
-        channelArn: session.channelArn,
-        startedAt: session.startedAt ?? null,
-        startedBy: session.startedBy ?? null,
-      });
-    });
+
+      if (publishing === true) {
+        // Rows arrive newest-first, so the first one seen for a lobby is the
+        // current call; anything behind it is a leftover.
+        if (!seenLobbies.has(session.documentId)) {
+          seenLobbies.add(session.documentId);
+          live.push({
+            lobbyName: session.documentId,
+            channelArn: session.channelArn,
+            startedAt: session.startedAt ?? null,
+            startedBy: session.startedBy ?? null,
+          });
+        }
+        continue;
+      }
+
+      // `null` is "LVS could not be asked", not "nothing is on" — it neither
+      // ends a session nor earns a badge. Ending a call because a probe timed
+      // out would hang up on people who are still talking; badging on a guess
+      // would mark a dead room live, which is the worse lie of the two since
+      // nobody asked about that room.
+      if (publishing === false && isPastGrace(session)) {
+        await endStaleSession(session);
+        ended.push(session.sessionId);
+      }
+    }
   }
-  return out;
+  return { live, ended };
+}
+
+/**
+ * Reap dead sessions without caring about the badge list. Exported so the
+ * behaviour is directly testable and so an operator can trigger a sweep by
+ * hand; `GET /api/video/sessions/live` runs the same pass on every miss.
+ */
+export async function reapStaleSessions(limit = 120): Promise<string[]> {
+  return (await sweepActiveSessions(limit)).ended;
+}
+
+async function computeLiveLobbies(): Promise<LiveLobby[]> {
+  return (await sweepActiveSessions()).live;
 }
 
 /**

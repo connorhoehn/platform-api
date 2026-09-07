@@ -8,6 +8,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 
 const mockCreateSession = jest.fn();
 const mockAddParticipant = jest.fn();
+const mockAddOrReplaceParticipant = jest.fn();
 const mockEndSession = jest.fn();
 const mockGetSessionsByDocument = jest.fn();
 const mockGetSession = jest.fn();
@@ -33,6 +34,7 @@ jest.mock('../../repositories', () => ({
   videoSessionRepo: {
     createSession: (...args: unknown[]) => mockCreateSession(...args),
     addParticipant: (...args: unknown[]) => mockAddParticipant(...args),
+    addOrReplaceParticipant: (...args: unknown[]) => mockAddOrReplaceParticipant(...args),
     endSession: (...args: unknown[]) => mockEndSession(...args),
     getSessionsByDocument: (...args: unknown[]) => mockGetSessionsByDocument(...args),
     getSession: (...args: unknown[]) => mockGetSession(...args),
@@ -52,6 +54,7 @@ import {
   __resetLiveLobbyCacheForTests,
   __configureSfuBreakerForTests,
   reapLvsParticipant,
+  reapStaleSessions,
 } from '../videoSessions';
 import { errorHandler } from '../../middleware/error-handler';
 
@@ -150,8 +153,12 @@ function makeTimeoutError(): Error {
 beforeEach(() => {
   mockCreateSession.mockReset().mockResolvedValue(undefined);
   mockAddParticipant.mockReset().mockResolvedValue(undefined);
+  mockAddOrReplaceParticipant.mockReset().mockResolvedValue({ displaced: [], remaining: 1 });
+  mockRemoveParticipant.mockReset();
+  mockRemoveParticipantByUserId.mockReset();
+  mockFindActiveByLobbyName.mockReset().mockResolvedValue(null);
   mockEndSession.mockReset().mockResolvedValue(undefined);
-  mockGetSessionsByDocument.mockReset();
+  mockGetSessionsByDocument.mockReset().mockResolvedValue([]);
   mockGetSession.mockReset();
   mockFetch.mockReset();
   mockListActiveCandidates.mockReset().mockResolvedValue([]);
@@ -712,7 +719,7 @@ describe('POST /api/video/sessions/:sessionId/join (thin proxy → LVS)', () => 
     expect((res.body as { token: string }).token).toBe('lvs.jwt.token');
     expect((res.body as { participantId: string }).participantId).toBe('p-1');
     expect((res.body as { userId: string }).userId).toBe('tester');
-    expect(mockAddParticipant).toHaveBeenCalledWith('doc-1', 'vs-1', expect.objectContaining({ userId: 'tester' }));
+    expect(mockAddOrReplaceParticipant).toHaveBeenCalledWith('doc-1', 'vs-1', expect.objectContaining({ userId: 'tester', participantId: 'p-1' }));
   });
 
   it('forwards to LVS /api/sessions/:arn/join with userId, displayName, role', async () => {
@@ -778,7 +785,7 @@ describe('POST /api/video/sessions/:sessionId/join (thin proxy → LVS)', () => 
   it('still returns 200 when addParticipant throws (non-fatal DB failure)', async () => {
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockResolvedValue(lvsJoinOk());
-    mockAddParticipant.mockRejectedValue(new Error('DDB write failed'));
+    mockAddOrReplaceParticipant.mockRejectedValue(new Error('DDB write failed'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
       body: { documentId: 'doc-1', displayName: 'Bob' },
       headers: { authorization: 'Bearer user-jwt' },
@@ -1188,6 +1195,282 @@ describe('POST /api/video/sessions/:sessionId/end — LVS authoritative path', (
     });
 
     expect(res.statusCode).toBe(503);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The participant leak — sessions that never end
+// ---------------------------------------------------------------------------
+//
+// Measured on a real room: FOUR rows left `status: 'active'` in
+// document-video-sessions for one room after the call had been hung up.
+// Two mechanisms, and both are here:
+//
+//   1. A room entry joins the video session TWICE (the room bridge in
+//      hangoutRooms.ts, then the call widget) and hangs up ONCE. The old
+//      dedupe could not catch it, because it tested the participantId — which
+//      LVS mints fresh on every join as `${userId}-${Date.now()}`, so the id
+//      being tested for is by construction one we have never seen.
+//   2. Nobody says goodbye at all: a crash, a closed lid, a killed headless
+//      test. `status` has no other way to become 'ended' and the row carries
+//      no TTL until it does, so it is immortal.
+
+describe('POST /api/video/sessions — superseded lobby rows are closed out', () => {
+  it('ends the previous active row when the lobby moves to a new channel', async () => {
+    // The reuse branch only returns early when the arns MATCH. A second call
+    // in the same lobby on a fresh channel therefore used to write a new
+    // 'active' row beside the old one, forever.
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:new'));
+    mockFindActiveByLobbyName.mockResolvedValue(null);
+    mockGetSessionsByDocument.mockResolvedValue([
+      { documentId: 'room:standup', sessionId: 'vs-old', channelArn: 'arn:channel:old', status: 'active' },
+    ]);
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'room:standup' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(mockEndSession).toHaveBeenCalledWith('room:standup', 'vs-old', expect.any(String));
+  });
+
+  it('leaves a same-channel row alone — two clients racing to create one lobby', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:same'));
+    mockFindActiveByLobbyName.mockResolvedValue(null);
+    mockGetSessionsByDocument.mockResolvedValue([
+      { documentId: 'room:standup', sessionId: 'vs-peer', channelArn: 'arn:channel:same', status: 'active' },
+    ]);
+
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'room:standup' },
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+
+    expect(mockEndSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/video/sessions/:sessionId/join — double-join idempotence', () => {
+  const session = {
+    documentId: 'room:standup', sessionId: 'vs-1', channelArn: 'arn:ch:1',
+    streamKey: '', status: 'active',
+    participants: [{ userId: 'alice', participantId: 'alice-bridge', displayName: 'Alice', joinedAt: '2026-09-07T00:00:00Z' }],
+  };
+
+  function lvsJoinOk(participantId: string) {
+    return apiOk({ token: 'jwt', participantId, role: 'publisher', displayName: 'Alice' });
+  }
+
+  it('collapses the second join and releases the first participant in LVS', async () => {
+    mockGetSession.mockResolvedValue(session);
+    // The widget's join mints a DIFFERENT id for the same human.
+    mockAddOrReplaceParticipant.mockResolvedValue({
+      displaced: [{ userId: 'alice', participantId: 'alice-bridge' }],
+      remaining: 1,
+    });
+    mockFetch
+      .mockResolvedValueOnce(lvsJoinOk('alice-widget'))  // LVS /join
+      .mockResolvedValue(apiOk({}));                     // release calls
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { lobbyName: 'room:standup', displayName: 'Alice' },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+
+    expect(res.statusCode).toBe(200);
+    // One participant survives, and it is the one whose id the client holds
+    // and will send back on hang-up.
+    expect((res.body as { participantId: string }).participantId).toBe('alice-widget');
+
+    const urls = mockFetch.mock.calls.map((c) => String(c[0]));
+    // The displaced participant is released in BOTH of LVS's registries:
+    // its sessionStore (POST /api/sessions/:arn/end — the count /end reads)
+    // and its live transports (DELETE .../participants/:pid). A reap alone
+    // would leave participantsRemaining above zero forever.
+    expect(urls.some((u) => u.includes('/end'))).toBe(true);
+    expect(urls.some((u) => u.includes('/participants/alice-bridge'))).toBe(true);
+    // Never the surviving one.
+    expect(urls.some((u) => u.includes('/participants/alice-widget'))).toBe(false);
+  });
+
+  it('threads the per-tab clientId into the stored participant', async () => {
+    mockGetSession.mockResolvedValue(session);
+    mockAddOrReplaceParticipant.mockResolvedValue({ displaced: [], remaining: 1 });
+    mockFetch.mockResolvedValue(lvsJoinOk('alice-widget'));
+
+    await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { lobbyName: 'room:standup', clientId: 'tab-7' },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+
+    expect(mockAddOrReplaceParticipant).toHaveBeenCalledWith(
+      'room:standup', 'vs-1',
+      expect.objectContaining({ clientId: 'tab-7', participantId: 'alice-widget' }),
+    );
+  });
+
+  it('a first join displaces nothing and touches no release path', async () => {
+    mockGetSession.mockResolvedValue({ ...session, participants: [] });
+    mockAddOrReplaceParticipant.mockResolvedValue({ displaced: [], remaining: 1 });
+    mockFetch.mockResolvedValue(lvsJoinOk('alice-1'));
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { lobbyName: 'room:standup' },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+
+    expect(res.statusCode).toBe(200);
+    // Exactly one upstream call: the join itself.
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('POST /api/video/sessions/:sessionId/end — join/leave symmetry', () => {
+  it('the participantId a join handed out is the one a leave removes', async () => {
+    mockGetSession.mockResolvedValue({
+      documentId: 'room:standup', sessionId: 'vs-1', channelArn: 'arn:lvs:1', status: 'active',
+      participants: [{ userId: 'alice', participantId: 'alice-widget' }],
+    });
+    mockFetch
+      .mockResolvedValueOnce(apiOk({}))                                   // reap
+      .mockResolvedValueOnce(apiOk({ participantsRemaining: 0, endedAt: '2026-09-07T01:00:00Z' }));
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { lobbyName: 'room:standup', participantId: 'alice-widget' },
+      headers: { authorization: 'Bearer user-jwt' },
+      userId: 'alice',
+    });
+
+    expect((res.body as { ended: boolean }).ended).toBe(true);
+    expect(mockEndSession).toHaveBeenCalledWith('room:standup', 'vs-1', '2026-09-07T01:00:00Z');
+  });
+
+  it('a beacon that lost its participantId still names one entry via clientId', async () => {
+    // The userId fallback below this one wipes EVERY tab the user has open;
+    // the per-tab key resolves to exactly the row this tab created.
+    mockGetSession.mockResolvedValue({
+      documentId: 'room:standup', sessionId: 'vs-1', channelArn: 'arn:lvs:1', status: 'active',
+      participants: [
+        { userId: 'alice', participantId: 'alice-t1', clientId: 'tab-1' },
+        { userId: 'alice', participantId: 'alice-t2', clientId: 'tab-2' },
+      ],
+    });
+    mockRemoveParticipant.mockResolvedValueOnce({ remaining: 1 });
+    mockFetch.mockResolvedValue(apiOk({}));
+
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+      body: { lobbyName: 'room:standup', clientId: 'tab-2' },
+      // No auth header — sendBeacon.
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(mockRemoveParticipant).toHaveBeenCalledWith('room:standup', 'vs-1', 'alice-t2');
+    expect(mockRemoveParticipantByUserId).not.toHaveBeenCalled();
+  });
+});
+
+describe('stale-session reaper — sessions end even when nobody says goodbye', () => {
+  const ONE_HOUR_AGO = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const JUST_NOW = new Date().toISOString();
+
+  it('ends an active session whose channel the SFU says is not publishing', async () => {
+    mockListActiveCandidates.mockResolvedValue([
+      { documentId: 'room:ghost', sessionId: 'vs-ghost', channelArn: 'arn:ch:ghost', startedAt: ONE_HOUR_AGO },
+    ]);
+    mockFetch.mockResolvedValue(apiOk({ stream: { state: 'OFFLINE' } }));
+
+    const ended = await reapStaleSessions();
+
+    expect(ended).toEqual(['vs-ghost']);
+    expect(mockEndSession).toHaveBeenCalledWith('room:ghost', 'vs-ghost', expect.any(String));
+  });
+
+  it('reaps EVERY leaked row for a lobby, not just the newest', async () => {
+    // The bug as measured: one room, four rows, all still 'active'. Only the
+    // newest is reachable through any read path, so a per-lobby collapse
+    // would strand the other three forever.
+    mockListActiveCandidates.mockImplementation(
+      async (_limit?: number, opts?: { perLobby?: boolean }) =>
+        opts?.perLobby === false
+          ? [1, 2, 3, 4].map((n) => ({
+              documentId: 'room:standup', sessionId: `vs-${n}`,
+              channelArn: `arn:ch:${n}`, startedAt: ONE_HOUR_AGO,
+            }))
+          : [],
+    );
+    mockFetch.mockResolvedValue(apiOk({ stream: { state: 'OFFLINE' } }));
+
+    const ended = await reapStaleSessions();
+
+    expect(ended).toEqual(['vs-1', 'vs-2', 'vs-3', 'vs-4']);
+    expect(mockEndSession).toHaveBeenCalledTimes(4);
+  });
+
+  it('spares a session that is still publishing', async () => {
+    mockListActiveCandidates.mockResolvedValue([
+      { documentId: 'room:live', sessionId: 'vs-live', channelArn: 'arn:ch:live', startedAt: ONE_HOUR_AGO },
+    ]);
+    mockFetch.mockResolvedValue(apiOk({ stream: { state: 'LIVE' } }));
+
+    expect(await reapStaleSessions()).toEqual([]);
+    expect(mockEndSession).not.toHaveBeenCalled();
+  });
+
+  it('spares a session too young to judge — a DM that is still ringing is OFFLINE', async () => {
+    mockListActiveCandidates.mockResolvedValue([
+      { documentId: 'dm:a:b', sessionId: 'vs-ringing', channelArn: 'arn:ch:ring', startedAt: JUST_NOW },
+    ]);
+    mockFetch.mockResolvedValue(apiOk({ stream: { state: 'OFFLINE' } }));
+
+    expect(await reapStaleSessions()).toEqual([]);
+    expect(mockEndSession).not.toHaveBeenCalled();
+  });
+
+  it('never ends a session on a probe it could not make', async () => {
+    // `null` is "LVS could not be asked", not "nothing is on". Hanging up on
+    // people who are still talking because a probe timed out is far worse
+    // than leaving a row to the next sweep.
+    mockListActiveCandidates.mockResolvedValue([
+      { documentId: 'room:unknown', sessionId: 'vs-unknown', channelArn: 'arn:ch:u', startedAt: ONE_HOUR_AGO },
+    ]);
+    mockFetch.mockRejectedValue(new Error('SFU unreachable'));
+
+    expect(await reapStaleSessions()).toEqual([]);
+    expect(mockEndSession).not.toHaveBeenCalled();
+  });
+
+  it('GET /sessions/live runs the sweep, so a poll of the badge list tidies the table', async () => {
+    mockListActiveCandidates.mockResolvedValue([
+      { documentId: 'room:ghost', sessionId: 'vs-ghost', channelArn: 'arn:ch:ghost', startedAt: ONE_HOUR_AGO },
+    ]);
+    mockFetch.mockResolvedValue(apiOk({ stream: { state: 'OFFLINE' } }));
+
+    const res = await run(buildApp(), 'GET', '/api/video/sessions/live', {
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+
+    expect((res.body as { lobbies: unknown[] }).lobbies).toEqual([]);
+    expect(mockEndSession).toHaveBeenCalledWith('room:ghost', 'vs-ghost', expect.any(String));
+  });
+
+  it('GET /sessions/by-lobby closes out the dead row it just disbelieved', async () => {
+    mockFindActiveByLobbyName.mockResolvedValueOnce({
+      documentId: 'room:ghost', sessionId: 'vs-ghost', channelArn: 'arn:ch:ghost',
+      startedAt: ONE_HOUR_AGO, participants: [{ participantId: 'leaked' }],
+    });
+    mockFetch.mockResolvedValue(apiOk({ stream: { state: 'OFFLINE' } }));
+
+    const res = await run(buildApp(), 'GET', '/api/video/sessions/by-lobby/room%3Aghost', {
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+
+    expect((res.body as { live: boolean }).live).toBe(false);
+    await new Promise((r) => setTimeout(r, 0));  // the write is fire-and-forget
+    expect(mockEndSession).toHaveBeenCalledWith('room:ghost', 'vs-ghost', expect.any(String));
   });
 });
 

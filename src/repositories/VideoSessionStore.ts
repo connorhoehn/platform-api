@@ -36,8 +36,60 @@ export interface VideoSessionParticipant {
    * participant slot and the session ends with the second tab orphaned.
    */
   participantId: string;
+  /**
+   * Stable per-TAB key supplied by the client (see `clientId` in the join
+   * body). Optional — older clients don't send one.
+   *
+   * WHY THIS EXISTS. `participantId` cannot be the idempotency key for a
+   * join, because it is minted UPSTREAM: LVS builds it as
+   * `${userId}-${Date.now().toString(36)}` (live-video-streaming
+   * src/api/sessions/index.js:276), so it is different on every single
+   * join. The old dedupe check — "is this participantId already in the
+   * list?" — could therefore never fire, and any client that joined twice
+   * (a room does: once through the room bridge, once through the call
+   * widget) appended a second entry that nothing ever removed.
+   *
+   * `clientId` is the one identifier that survives a re-join from the same
+   * tab, so it is what `addOrReplaceParticipant` collapses on. When it is
+   * absent we fall back to collapsing on `userId`, which is right for the
+   * double-join and slightly lossy for a user with two untagged tabs —
+   * see `participantSupersedes`.
+   */
+  clientId?: string;
   displayName: string;
   joinedAt: string;
+}
+
+/**
+ * Does `incoming` represent the same client as `existing`, such that adding
+ * `incoming` should REPLACE `existing` rather than append beside it?
+ *
+ * The rule, in order:
+ *   1. Both carry a `clientId` → same tab iff the ids match. Two tabs of one
+ *      user each keep their own ref-count slot, which is the whole point of
+ *      the per-tab key.
+ *   2. `incoming` carries a `clientId` and `existing` does not → NOT the
+ *      same client. An untagged entry is never displaced by a tagged one;
+ *      otherwise a client mid-upgrade would evict a peer's slot.
+ *   3. Neither carries one → collapse on `userId`. This is the case that
+ *      fixes the room double-join with no client change: the room bridge
+ *      and the call widget both join untagged as the same user, so the
+ *      second join supersedes the first instead of leaking it.
+ *
+ * Rule 3 is deliberately lossy for one user in two untagged tabs — they get
+ * one participant slot, holding the NEWEST participantId. That is strictly
+ * better than the leak it replaces: removal is still by exact
+ * participantId, so an older tab leaving cannot evict a newer one, and the
+ * authoritative /end path defers to LVS's own count anyway. Tabs that send
+ * a `clientId` are exact.
+ */
+export function participantSupersedes(
+  existing: VideoSessionParticipant,
+  incoming: VideoSessionParticipant,
+): boolean {
+  if (incoming.clientId) return existing.clientId === incoming.clientId;
+  if (existing.clientId) return false;
+  return existing.userId === incoming.userId;
 }
 
 export interface VideoSessionRecord {
@@ -77,6 +129,21 @@ export interface VideoSessionStore {
     sessionId: string,
     participant: VideoSessionParticipant,
   ): Promise<void>;
+  /**
+   * Idempotent join. Appends `participant`, first removing every existing
+   * entry that `participantSupersedes` says is the same client. Returns the
+   * displaced entries so the caller can release them upstream (LVS keeps its
+   * OWN participant set, and it is only ever decremented by the /end route —
+   * a displaced entry left there keeps `participantsRemaining` above zero
+   * forever, which is how the session never ends).
+   *
+   * Returns null when the session row does not exist.
+   */
+  addOrReplaceParticipant(
+    documentId: string,
+    sessionId: string,
+    participant: VideoSessionParticipant,
+  ): Promise<{ displaced: VideoSessionParticipant[]; remaining: number } | null>;
   /** Remove a participant by per-tab participantId (the SFU-issued id). */
   removeParticipant(
     documentId: string,
@@ -107,12 +174,20 @@ export interface VideoSessionStore {
   /**
    * Every lobby still marked active, newest row per lobby.
    *
-   * CANDIDATES, not an answer. `status: 'active'` leaks — a room call joins
-   * twice and hangs up once — so the caller must ask the SFU whether each
-   * channel is actually publishing before showing anything to a user. See
-   * `GET /api/video/sessions/live`, the only caller.
+   * CANDIDATES, not an answer. `status: 'active'` is a lifecycle flag, and a
+   * client that crashes or closes its laptop never says goodbye — so the
+   * caller must ask the SFU whether each channel is actually publishing
+   * before showing anything to a user. See `GET /api/video/sessions/live`.
+   *
+   * `opts.perLobby` (default true) keeps only the newest row per lobby, which
+   * is what a badge wants. The stale-session reaper passes `false`: rows
+   * BEHIND the newest are invisible to every read path, so collapsing would
+   * leave them 'active' forever with nothing able to see them.
    */
-  listActiveCandidates(limit?: number): Promise<VideoSessionRecord[]>;
+  listActiveCandidates(
+    limit?: number,
+    opts?: { perLobby?: boolean },
+  ): Promise<VideoSessionRecord[]>;
 }
 
 /**
