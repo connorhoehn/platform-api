@@ -953,12 +953,29 @@ videoSessionsRouter.get(
       // does not exist.
       if (publishing === null && (session.participants ?? []).length === 0) return notLive();
 
+      // …but say WHICH of the two answers this is. The fallback above trusts a
+      // roster the comment two paragraphs up calls unreliable — "every call
+      // nets an extra participant and the ref-count never reaches zero" — so
+      // while LVS is unreachable, every room that has ever hosted a call
+      // answers `live: true`. Observed 2026-09-07: LVS had been up five hours
+      // with a closed Redis client and was 500ing every request, and a room
+      // with nothing running showed a "Live now" banner whose Watch button
+      // opened a black stage.
+      //
+      // A caller cannot tell that apart from a verified broadcast unless we
+      // tell it, so `verified` says whether the SFU actually confirmed this.
+      // Present and true is the ordinary case; false means "the roster says
+      // so and the authority could not be reached", which a UI should offer
+      // more cautiously than a broadcast it can promise.
+      const verified = publishing === true;
+
       // Only what a viewer needs. Participant lists and tokens stay out: this
       // route is reachable by anyone who can see the room, and watching is a
       // weaker right than joining.
       res.status(200).json({
         lobbyName,
         live: true,
+        verified,
         sessionId: session.sessionId,
         channelArn: session.channelArn,
         startedAt: session.startedAt ?? null,
