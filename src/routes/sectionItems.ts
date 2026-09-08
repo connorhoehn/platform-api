@@ -15,6 +15,27 @@ import log from '../lib/logger';
 export const sectionItemsRouter = Router({ mergeParams: true });
 export const myItemsRouter = Router();
 
+/**
+ * A caller-supplied `itemId`, validated — or null when none was supplied.
+ *
+ * Only ever ONE path segment: it is the range key of the row and it goes into
+ * URLs, so a slash or a newline in it produces an item that can be created and
+ * then never addressed again.
+ */
+function callerItemId(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'string') throw new ValidationError('itemId must be a string');
+  const id = raw.trim();
+  if (id === '') throw new ValidationError('itemId must not be empty');
+  if (id.length > 128) throw new ValidationError('itemId must be at most 128 characters');
+  if (!/^[A-Za-z0-9_.:-]+$/.test(id)) {
+    throw new ValidationError(
+      'itemId may contain only letters, digits and _ . : - (it is a URL path segment)',
+    );
+  }
+  return id;
+}
+
 // POST /api/documents/:documentId/sections/:sectionId/items
 sectionItemsRouter.post('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { documentId, sectionId } = req.params;
@@ -29,9 +50,40 @@ sectionItemsRouter.post('/', requireAuth, asyncHandler(async (req: Request, res:
 
   // Allow empty text — items are created inline and the user types text after
 
+  // ---------------------------------------------------------------------
+  // A caller-chosen id, and why this create has to be IDEMPOTENT
+  // ---------------------------------------------------------------------
+  //
+  // A mirrored HITL callout is keyed on the callout's own `id` so that the row
+  // an inbox answers and the block in the document body are the same callout.
+  // That identity is minted in the document, not here — so the writer supplies
+  // it.
+  //
+  // Which makes a second POST for the same id not an error but the NORMAL
+  // case: the projection is made by whichever clients have the page open (see
+  // `onCalloutChanged` in ui-components), so opening a document with a callout
+  // in it POSTs the same row from every tab. `createItem` is a plain `PutItem`
+  // and would happily overwrite — and overwriting is the one outcome that must
+  // never happen here, because a row rewritten with a fresh `status: open`
+  // would UN-ANSWER a callout somebody had already answered and hand a
+  // finished question back to an agent that had moved on.
+  //
+  // So: an id that already exists returns the row that is there, untouched,
+  // with 200 rather than 201. The status code is the only way a caller can
+  // tell it created something, and no caller here needs to.
+  const itemId = callerItemId((req.body as { itemId?: unknown }).itemId);
+  if (itemId) {
+    const existing = await sectionItemRepo.getOne(documentId, sectionId, itemId);
+    if (existing) {
+      res.status(200).json({ item: existing });
+      return;
+    }
+  }
+
   const item = await sectionItemRepo.createItem({
     documentId,
     sectionId,
+    ...(itemId ? { itemId } : {}),
     text: (text ?? '').trim(),
     // `assignee` is the label that renders; `assigneeId` is the identity that
     // GET /api/items/mine is keyed on. A writer that supplies only the label

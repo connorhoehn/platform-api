@@ -12,6 +12,7 @@ const mockUpdateItemFields = jest.fn();
 const mockDeleteItemById = jest.fn();
 const mockAckItem = jest.fn();
 const mockGetItemsAssignedTo = jest.fn();
+const mockGetOne = jest.fn();
 const mockEmit = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('../../middleware/auth', () => ({
@@ -29,6 +30,7 @@ jest.mock('../../repositories', () => ({
     deleteItemById: mockDeleteItemById,
     ackItem: mockAckItem,
     getItemsAssignedTo: mockGetItemsAssignedTo,
+    getOne: mockGetOne,
   },
 }));
 
@@ -181,6 +183,73 @@ describe('POST /documents/:documentId/sections/:sectionId/items', () => {
 
     expect(res.statusCode).toBe(201);
     expect(mockCreateItem).toHaveBeenCalledWith(expect.objectContaining({ text: '' }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A caller-chosen itemId — the join between a document callout and its row
+// ---------------------------------------------------------------------------
+//
+// The overwrite case is the one that matters: the mirror row for a `macro:hitl`
+// callout is re-POSTed by every client that has the page open, so a create that
+// clobbered would keep handing an answered question back to the agent.
+
+describe('POST .../items with a caller-supplied itemId', () => {
+  const app = buildApp();
+
+  test('creates the row under the id the caller chose', async () => {
+    mockGetOne.mockResolvedValueOnce(null);
+    mockCreateItem.mockResolvedValueOnce({ ...sampleItem, itemId: 'hitl-01J8Z' });
+
+    const res = await run(app, 'POST', '/documents/doc-1/sections/_macro/items', {
+      body: { itemId: 'hitl-01J8Z', text: 'Ship now?', assigneeId: 'dev-bob', category: 'hitl' },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateItem).toHaveBeenCalledWith(
+      expect.objectContaining({ itemId: 'hitl-01J8Z', assigneeId: 'dev-bob', category: 'hitl' }),
+    );
+  });
+
+  test('a second POST returns the existing row and writes NOTHING', async () => {
+    const answered = {
+      ...sampleItem,
+      itemId: 'hitl-01J8Z',
+      status: 'done',
+      notes: 'ship it',
+      ackedBy: 'dev-bob',
+    };
+    mockGetOne.mockResolvedValueOnce(answered);
+
+    const res = await run(app, 'POST', '/documents/doc-1/sections/_macro/items', {
+      body: { itemId: 'hitl-01J8Z', text: 'Ship now?', assigneeId: 'dev-bob', category: 'hitl' },
+    });
+
+    // 200, not 201: nothing was created. And the ANSWER survived — a create
+    // that overwrote here would un-answer the callout.
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { item: unknown }).item).toEqual(answered);
+    expect(mockCreateItem).not.toHaveBeenCalled();
+  });
+
+  test('refuses an id that could not be addressed again', async () => {
+    for (const itemId of ['', '   ', 'a/b', 'a b', 'x'.repeat(129), 42]) {
+      mockGetOne.mockResolvedValue(null);
+      const res = await run(app, 'POST', '/documents/doc-1/sections/_macro/items', {
+        body: { itemId },
+      });
+      expect(res.statusCode).toBe(400);
+    }
+    expect(mockCreateItem).not.toHaveBeenCalled();
+  });
+
+  test('an omitted itemId still mints one, and never looks a row up', async () => {
+    mockCreateItem.mockResolvedValueOnce(sampleItem);
+    const res = await run(app, 'POST', '/documents/doc-1/sections/sec-1/items', {
+      body: { text: 'Buy groceries' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(mockGetOne).not.toHaveBeenCalled();
   });
 });
 
