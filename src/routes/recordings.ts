@@ -549,7 +549,20 @@ recordingsRouter.post(
           token = '';
           expiresAt = '';
         } else {
-          throw new AppError(502, `LVS playback-token mint failed: ${lvsRes.status}`);
+          // Carry LVS's own words. Without them a 403 here reads as an
+          // authorization bug in this route, when the actual cause is
+          // config: LVS's admin wildcard (bearerAuth.js) is gated on
+          // ADMIN_TOKEN being set, and when it is unset the literal
+          // 'admin' fallback below falls through to RS256 verification
+          // and 403s with `{"error":"invalid credentials"}`. The same
+          // unset var makes GET /api/channels 500 with "server
+          // misconfigured: ADMIN_TOKEN unset" — the honest signal that
+          // this 403 was hiding. Cost a full diagnosis pass 2026-09-08.
+          const detailText = await lvsRes.text().catch(() => '');
+          throw new AppError(
+            502,
+            `LVS playback-token mint failed: ${lvsRes.status}${detailText ? ` — ${detailText.slice(0, 200)}` : ''}`,
+          );
         }
       } else {
         const body = (await lvsRes.json()) as { token: string; expiresAt: string };
