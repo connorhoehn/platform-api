@@ -62,7 +62,7 @@ jest.mock('../../lib/ddb-table-name', () => ({
 }));
 
 // NOTE: import AFTER the mocks above so jest swaps the deps.
-import { lvsWebhooksRouter } from '../lvsWebhooks';
+import { lvsWebhooksRouter, startedAtFromRecordingId } from '../lvsWebhooks';
 
 // ---------------------------------------------------------------------------
 // Raw http helper (avoids adding supertest dep)
@@ -795,5 +795,36 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
     expect(res.status).toBe(204);
     expect(updateTranscriptStatusMock).not.toHaveBeenCalled();
     expect(catalogPublishMock).not.toHaveBeenCalled();
+  });
+});
+
+
+// --------------------------------------------------------------------
+// `startedAt` is half the fan-out sort key, so it has to be a function of
+// the EVENT, not of when the event happened to be handled. It used to be
+// `Date.now() - durationMs`, which made every redelivery of one recording
+// write a new key — eight fan-out rows for seven recordings in live data,
+// and one call rendered twice in the list.
+// --------------------------------------------------------------------
+describe('startedAtFromRecordingId', () => {
+  test('recovers the exact instant LVS minted the id at', () => {
+    // The real id from the duplicated row.
+    expect(startedAtFromRecordingId('2026-09-07T10-30-33-757Z-4b2365cf')).toBe(
+      '2026-09-07T10:30:33.757Z',
+    );
+  });
+
+  test('is stable — the same id always yields the same timestamp', () => {
+    const id = '2026-09-08T05-45-08-896Z-e28b6e78';
+    expect(startedAtFromRecordingId(id)).toBe(startedAtFromRecordingId(id));
+    expect(startedAtFromRecordingId(id)).toBe('2026-09-08T05:45:08.896Z');
+  });
+
+  test('returns null rather than inventing a date for an unrecognised id', () => {
+    // An LVS build with a different id scheme must fall through to the
+    // clock, not get a date parsed out of a random string.
+    expect(startedAtFromRecordingId('rec_01HXYZ')).toBeNull();
+    expect(startedAtFromRecordingId('')).toBeNull();
+    expect(startedAtFromRecordingId('2026-13-45T99-99-99-999Z-x')).toBeNull();
   });
 });

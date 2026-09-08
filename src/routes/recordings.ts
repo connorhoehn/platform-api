@@ -121,14 +121,123 @@ recordingsRouter.get(
         },
       });
       const { items, cursor: next } = await callRecordingRepo.listByLobbyName(lobbyName, limit, cursor);
-      res.json({ items, cursor: next ?? null });
+      res.json({ items: await settleComposeForList(items), cursor: next ?? null });
       return;
     }
 
     const { items, cursor: next } = await callRecordingRepo.listByUser(userId, { limit, cursor });
-    res.json({ items, cursor: next ?? null });
+    res.json({ items: await settleComposeForList(items), cursor: next ?? null });
   }),
 );
+
+/**
+ * Give every row in a list page a compose status that is actually TRUE.
+ *
+ * The stored status is not enough on its own, and the stored-status-only
+ * version of this would have shipped a badge that lies. Measured against
+ * live LVS on 2026-09-08: of seven recordings, four carried NO
+ * `composeStatus` in DDB at all — and `deriveComposeStatus` calls all four
+ * `queued`, because a row with legs and no composed file is indistinguishable
+ * from one whose ffmpeg job has not started. LVS's own answer for those four
+ * was two `ok` and two `failed`. So the derived value was wrong in both
+ * directions: two working recordings would have shown "still assembling"
+ * forever, and two dead ones would have too.
+ *
+ * The reason the stored value is empty is structural, and it is the same one
+ * `resolveMedia` documents for the detail route: LVS fires
+ * `recording.completed` BEFORE the background compose job runs and never
+ * fires a second webhook. Nothing pushes the answer; somebody has to pull it.
+ * Until now only the detail route pulled, so a recording's status was
+ * populated only if a user had already opened it — and the list is exactly
+ * where you look BEFORE opening one.
+ *
+ * Cost control, in three parts:
+ *   - Only unsettled rows are asked about. `ok`/`degraded`/`failed`/`skipped`
+ *     never change, and `resolveMedia` caches them onto the row, so a given
+ *     recording is fetched once in its life and never again.
+ *   - Requests are grouped by `channelArn`, because LVS's endpoint returns a
+ *     whole channel's recordings in one call. A room with 40 recordings on
+ *     one channel costs one request, not 40.
+ *   - Capped at MAX_CHANNELS distinct channels per page. Past that the
+ *     remaining rows keep their derived status, which reads as "processing" —
+ *     the same honest not-yet the detail route falls back to when LVS is
+ *     unreachable.
+ *
+ * Never throws. A list that renders without badges is a small loss; a list
+ * that 500s because the SFU is down is a large one.
+ */
+const MAX_RECONCILE_CHANNELS = 8;
+
+async function settleComposeForList<
+  T extends { callId: string; recordingId: string; channelArn: string; composeStatus?: ComposeStatus },
+>(items: T[]): Promise<T[]> {
+  const unsettled = items.filter(
+    (r) => !r.composeStatus || !SETTLED_COMPOSE.has(r.composeStatus),
+  );
+  if (unsettled.length === 0) return items;
+
+  const byChannel = new Map<string, T[]>();
+  for (const r of unsettled) {
+    if (!r.channelArn) continue;
+    const bucket = byChannel.get(r.channelArn);
+    if (bucket) bucket.push(r);
+    else byChannel.set(r.channelArn, [r]);
+  }
+
+  const resolved = new Map<string, ComposeStatus>();
+  const channels = Array.from(byChannel.entries()).slice(0, MAX_RECONCILE_CHANNELS);
+  await Promise.all(
+    channels.map(async ([arn, rows]) => {
+      try {
+        const res = await callSfu(
+          `${VIDEO_API_URL}/api/channels/${encodeURIComponent(arn)}/recordings`,
+          { method: 'GET', headers: { Authorization: `Bearer ${process.env.VIDEO_ADMIN_TOKEN || 'admin'}` } },
+        );
+        if (!res.ok) return;
+        const body = (await res.json()) as
+          | { recordings?: Array<Record<string, unknown>> }
+          | Array<Record<string, unknown>>;
+        const live = Array.isArray(body) ? body : (body.recordings ?? []);
+        const liveById = new Map(live.map((r) => [r?.recordingId as string, r]));
+        for (const row of rows) {
+          const hit = liveById.get(row.recordingId);
+          if (!hit) continue;
+          const described = describeMedia({
+            composeStatus: hit.composeStatus as ComposeStatus | undefined,
+            composedSegment: hit.composedSegment as { key?: string; url?: string; size?: number } | undefined,
+            segments: hit.segments as Array<{ key?: string; url?: string; size?: number }> | undefined,
+            tracks: hit.tracks as Array<{ key?: string; url?: string; size?: number }> | undefined,
+          });
+          resolved.set(row.recordingId, described.composeStatus);
+          // Same write-back the detail route does, and the reason this whole
+          // function converges to zero LVS traffic instead of asking forever.
+          if (SETTLED_COMPOSE.has(described.composeStatus)) {
+            const seg = hit.composedSegment as { key?: string; url?: string; size?: number } | undefined;
+            void callRecordingRepo
+              .updateComposeState(row.callId, row.recordingId, {
+                composeStatus: described.composeStatus,
+                // `key` + `size` only — LVS's `composedSegment.url` is the
+                // recorder's absolute filesystem path.
+                composedSegment: seg ? { key: seg.key ?? seg.url, size: seg.size } : undefined,
+              })
+              .catch(() => { /* best-effort cache */ });
+          }
+        }
+      } catch (e) {
+        log.warn(
+          { err: e instanceof Error ? e.message : String(e), arn },
+          '[recordings] list compose reconcile failed — rows keep their stored status',
+        );
+      }
+    }),
+  );
+
+  if (resolved.size === 0) return items;
+  return items.map((r) => {
+    const status = resolved.get(r.recordingId);
+    return status ? { ...r, composeStatus: status } : r;
+  });
+}
 
 /**
  * Resolve a recording from its id alone, and prove the caller was in it.

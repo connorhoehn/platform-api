@@ -20,6 +20,7 @@ import {
   CallRecordingRepository,
   describeMedia,
   deriveComposeStatus,
+  dedupeByRecordingId,
 } from '../CallRecordingRepository';
 
 jest.mock('../../lib/ddb-table-name', () => ({
@@ -329,6 +330,14 @@ describe('CallRecordingRepository.listByLobbyName', () => {
       sessionDurationMs: undefined,
       participantCount: undefined,
       participants: undefined,
+      // Compose state now rides along on every list row — it is the only
+      // field that says whether a row can be opened, and its absence was
+      // what left the FE treating every recording as playable. `skipped`
+      // for this fixture because it has neither tracks nor a composed
+      // file, which is `deriveComposeStatus`'s answer for "nothing to
+      // compose" rather than a claim that a job ran and gave up.
+      composeStatus: 'skipped',
+      transcriptStatus: undefined,
     });
     expect(out.cursor).toBeDefined();
     const decoded = JSON.parse(Buffer.from(out.cursor!, 'base64').toString('utf8'));
@@ -737,5 +746,102 @@ describe('describeMedia', () => {
     // are not distinguishable from row contents, and guessing between them
     // is how the UI started lying.
     expect(deriveComposeStatus({})).not.toBe('failed');
+  });
+});
+
+
+// --------------------------------------------------------------------
+// The duplicate-row defect: one recording, two list rows.
+//
+// The fan-out index's sort key is `${startedAt}#${recordingId}`, and
+// `startedAt` is DATA. The primary table overwrites itself on a re-put
+// because its key is (callId, recordingId); the fan-out table does not,
+// because a changed timestamp is a changed key. Live data carried eight
+// fan-out rows for seven recordings — `2026-09-07T10-30-33-757Z-4b2365cf`
+// twice, 30ms apart, identical in every other attribute.
+// --------------------------------------------------------------------
+describe('CallRecordingRepository.putRecording — stale fan-out eviction', () => {
+  const rec = (startedAt: string) => ({
+    callId: 'c1',
+    recordingId: 'r1',
+    channelArn: 'arn:x',
+    lobbyName: 'room:x',
+    startedAt,
+    endedAt: '2026-05-23T00:01:00.000Z',
+    durationMs: 60_000,
+    totalBytes: 1024,
+    segments: [],
+    destination: 'local' as const,
+    participants: [{ userId: 'u-hank' }],
+    startedBy: 'u-hank',
+  });
+
+  const deletesAtParticipants = () =>
+    mockSend.mock.calls
+      .map((c) => c[0])
+      .filter(
+        (cmd) =>
+          cmd instanceof DeleteCommand &&
+          cmd.input.TableName === 'test-video-call-recording-participants',
+      ) as DeleteCommand[];
+
+  test('re-putting a recording under a NEW startedAt deletes the row it left at the old one', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    // The GetItem that reads the existing primary row resolves to the
+    // previously-written recording, 30ms earlier — the live shape exactly.
+    mockSend.mockResolvedValueOnce({
+      Item: { ...rec('2026-05-23T00:00:00.757Z'), ttl: 1 },
+    });
+
+    await repo.putRecording(rec('2026-05-23T00:00:00.787Z'));
+
+    const deletes = deletesAtParticipants();
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0].input.Key).toEqual({
+      userId: 'u-hank',
+      // The OLD key, not the new one. Without this the row stays forever
+      // and `GET /api/recordings` returns the same call twice.
+      startedAtRecordingId: '2026-05-23T00:00:00.757Z#r1',
+    });
+  });
+
+  test('re-putting at the SAME startedAt deletes nothing — the put overwrites itself', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({
+      Item: { ...rec('2026-05-23T00:00:00.757Z'), ttl: 1 },
+    });
+
+    await repo.putRecording(rec('2026-05-23T00:00:00.757Z'));
+
+    expect(deletesAtParticipants()).toHaveLength(0);
+  });
+
+  test('a first-time write deletes nothing', async () => {
+    const repo = new CallRecordingRepository(docClient);
+    mockSend.mockResolvedValueOnce({}); // no existing primary row
+
+    await repo.putRecording(rec('2026-05-23T00:00:00.757Z'));
+
+    expect(deletesAtParticipants()).toHaveLength(0);
+  });
+});
+
+describe('dedupeByRecordingId', () => {
+  test('collapses two rows for one recording, keeping the first', () => {
+    const rows = [
+      { recordingId: 'r1', startedAt: '2026-09-07T10:30:33.787Z' },
+      { recordingId: 'r1', startedAt: '2026-09-07T10:30:33.757Z' },
+      { recordingId: 'r2', startedAt: '2026-09-07T10:03:09.650Z' },
+    ];
+    // Newest-first in, so the first occurrence is the latest write.
+    expect(dedupeByRecordingId(rows)).toEqual([
+      { recordingId: 'r1', startedAt: '2026-09-07T10:30:33.787Z' },
+      { recordingId: 'r2', startedAt: '2026-09-07T10:03:09.650Z' },
+    ]);
+  });
+
+  test('leaves a already-distinct list untouched, in order', () => {
+    const rows = [{ recordingId: 'a' }, { recordingId: 'b' }, { recordingId: 'c' }];
+    expect(dedupeByRecordingId(rows)).toEqual(rows);
   });
 });

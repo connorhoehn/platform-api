@@ -31,6 +31,7 @@ import {
   ScanCommand,
   DeleteCommand,
   UpdateCommand,
+  BatchGetCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
@@ -310,6 +311,30 @@ export interface RecordingListRow {
   participantCount?: number;
   /** userId + displayName, so the list can render names, not raw ids. */
   participants?: Array<{ userId: string; displayName?: string }>;
+  /**
+   * Where this recording's media got to — the ONE field that says whether
+   * a row can be opened.
+   *
+   * It was missing from both lists, and the cost was two dead features and
+   * one active lie. ui-components' RecordingRow already renders a
+   * Processing / Failed badge off `status`, and it could never fire because
+   * nothing ever reached it. Worse, the app's `isRecordingPlayable` treats
+   * an ABSENT status as playable — deliberately, so legacy rows still open
+   * — so an absent field did not mean "unknown", it meant "yes": every row
+   * in the in-channel strip was presented as playable, including the ones
+   * whose compose had failed and that had nothing behind them at all.
+   *
+   * Always populated now, `deriveComposeStatus`-filled for rows that never
+   * carried one, so the FE's legacy-tolerant branch stops being the branch
+   * every row takes.
+   */
+  composeStatus?: ComposeStatus;
+  /**
+   * Transcription pipeline state, when there is one. Sparse by nature —
+   * only recordings that opted into transcription have it — so `undefined`
+   * here means "no transcript was ever asked for", NOT "still waiting".
+   */
+  transcriptStatus?: 'pending' | 'processing' | 'ready' | 'failed';
 }
 
 const RETENTION_DAYS = Number(process.env.RECORDING_RETENTION_DAYS ?? 30);
@@ -360,6 +385,34 @@ function normalizeDuration<T extends { durationMs?: number; sessionDurationMs?: 
     durationMs: deriveMediaDurationMs({ tracks, sessionDurationMs: rec.durationMs }),
     sessionDurationMs: rec.durationMs,
   };
+}
+
+/**
+ * One row per recording, newest write wins.
+ *
+ * The fan-out index's sort key is `${startedAt}#${recordingId}`, so a
+ * recording whose `startedAt` ever changed has TWO rows and a user sees the
+ * same call listed twice. The writer no longer strands old keys and LVS now
+ * sends a stable `startedAt`, but rows written before either fix are still
+ * sitting in the table, and a list that shows one call twice is a bug the
+ * user sees no matter which layer produced it.
+ *
+ * Rows arrive newest-first (ScanIndexForward: false), so the FIRST
+ * occurrence of a recordingId is the one written against the latest
+ * `startedAt` — keep it and drop the rest. Order is otherwise preserved.
+ *
+ * The dropped row is a duplicate by construction: the two differ only in
+ * the timestamp that keyed them apart, so nothing is lost by collapsing them.
+ */
+export function dedupeByRecordingId<T extends { recordingId: string }>(rows: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const r of rows) {
+    if (seen.has(r.recordingId)) continue;
+    seen.add(r.recordingId);
+    out.push(r);
+  }
+  return out;
 }
 
 /** Basename of a stored object key/url, or null when unrecoverable. */
@@ -511,8 +564,15 @@ export class CallRecordingRepository extends BaseRepository {
 
   /**
    * Persist a completed recording + fan out one row per participant
-   * into the reverse-index table. Idempotent — re-running the same
-   * webhook payload overwrites both tables without duplicate entries.
+   * into the reverse-index table.
+   *
+   * Idempotent in the payload — re-running the same webhook overwrites both
+   * tables rather than adding to them. That sentence used to be here without
+   * the qualifier, and it was not true: the fan-out sort key embeds
+   * `startedAt`, the webhook did not carry one, and the receiver synthesized
+   * it from its own clock, so two deliveries of one event wrote two rows.
+   * `startedAt` now comes off the wire (or off the recordingId), and the
+   * eviction below cleans up after any writer that still changes it.
    *
    * Visibility guarantee: the fan-out set is ALWAYS `participants[] ∪
    * {startedBy}`. The union with `startedBy` is unconditional and that is
@@ -531,6 +591,51 @@ export class CallRecordingRepository extends BaseRepository {
   async putRecording(rec: Omit<CallRecording, 'ttl'>): Promise<void> {
     const ttl = Math.floor(Date.now() / 1000) + RETENTION_DAYS * 86400;
     const full: CallRecording = { ...rec, ttl };
+
+    // Evict fan-out rows this recording left at a PREVIOUS `startedAt`.
+    //
+    // The primary table is keyed (callId, recordingId), so re-putting a
+    // recording overwrites itself — which is what made the "idempotent"
+    // claim above look true. The fan-out table is keyed
+    // (userId, `${startedAt}#${recordingId}`), and `startedAt` is DATA, not
+    // identity. Change it by a millisecond and the same recording writes a
+    // second row that nothing ever deletes, and `GET /api/recordings`
+    // returns the same call twice.
+    //
+    // That is not hypothetical: recordingId
+    // 2026-09-07T10-30-33-757Z-4b2365cf carried two rows 30ms apart,
+    // identical in every other attribute. The upstream cause (a synthesized
+    // `startedAt`) is fixed at the webhook and in LVS, but a write path that
+    // silently strands its own old key is worth closing regardless — a
+    // backfill, a replay, or a clock correction would all reopen it.
+    //
+    // One GetItem, and only on an actual change.
+    const prev = await this.getItem<CallRecording>({
+      callId: rec.callId,
+      recordingId: rec.recordingId,
+    }).catch(() => null);
+    if (prev && prev.startedAt && prev.startedAt !== rec.startedAt) {
+      // Union of both fan-out sets: the roster can shift between writes,
+      // and a stranded row under the OLD key is exactly what we're here to
+      // remove, whichever set it came from.
+      const stale = new Set([...fanoutSetFor(prev), ...fanoutSetFor(rec)]);
+      await Promise.all(
+        Array.from(stale).map((userId) =>
+          this.docClient
+            .send(
+              new DeleteCommand({
+                TableName: this.participantsTable,
+                Key: {
+                  userId,
+                  startedAtRecordingId: `${prev.startedAt}#${rec.recordingId}`,
+                },
+              }),
+            )
+            .catch(() => { /* best-effort — listByUser dedupes as well */ }),
+        ),
+      );
+    }
+
     await this.putItem(full as unknown as Record<string, unknown>);
 
     const fanoutUserIds = fanoutSetFor(rec);
@@ -793,7 +898,7 @@ export class CallRecordingRepository extends BaseRepository {
           : {}),
       }),
     );
-    const items = (out.Items ?? []).map((i) => ({
+    const rows = (out.Items ?? []).map((i) => ({
       callId: i.callId as string,
       recordingId: i.recordingId as string,
       startedAt: i.startedAt as string,
@@ -815,10 +920,75 @@ export class CallRecordingRepository extends BaseRepository {
         ? (i.participants as CallRecordingParticipant[])
         : undefined,
     }));
+    // Two guards the fan-out index cannot provide on its own, in one pass.
+    const items = await this.hydrateComposeState(dedupeByRecordingId(rows));
     const cursor = out.LastEvaluatedKey
       ? (out.LastEvaluatedKey.startedAtRecordingId as string)
       : undefined;
     return { items, cursor };
+  }
+
+  /**
+   * Fill in `composeStatus` / `transcriptStatus` for fan-out rows.
+   *
+   * The fan-out table cannot carry them. Not "does not" — cannot: both are
+   * MUTABLE. `updateComposeState` and `updateTranscriptStatus` write the
+   * primary table only, and a denormalized copy on the index row would be
+   * frozen at webhook time, which is before compose has even started. A
+   * stale "queued" badge on a recording that finished an hour ago is a
+   * different wrong answer, not a better one.
+   *
+   * So we join — one BatchGetItem over the page (≤100 keys, well inside the
+   * limit, one round trip) projecting only what `deriveComposeStatus` needs.
+   * Rows the join misses keep `composeStatus: undefined`, which the FE reads
+   * as "legacy, let it open" — the same tolerance as before this existed.
+   */
+  private async hydrateComposeState(
+    rows: RecordingListRow[],
+  ): Promise<RecordingListRow[]> {
+    if (rows.length === 0) return rows;
+    // BatchGetItem caps at 100 keys per table per call; a page is ≤100 by
+    // construction (listByUser's Limit) but chunk anyway so a future caller
+    // raising the limit doesn't get a ValidationException instead of a list.
+    const chunks: RecordingListRow[][] = [];
+    for (let i = 0; i < rows.length; i += 100) chunks.push(rows.slice(i, i + 100));
+
+    const byId = new Map<string, ComposableRecording & { transcriptStatus?: CallRecording['transcriptStatus'] }>();
+    for (const chunk of chunks) {
+      try {
+        const res = await this.docClient.send(
+          new BatchGetCommand({
+            RequestItems: {
+              [CALL_RECORDINGS_TABLE]: {
+                Keys: chunk.map((r) => ({ callId: r.callId, recordingId: r.recordingId })),
+                // `segments`/`tracks` are reserved-word-free; composeStatus and
+                // the rest are plain attribute names. Projected narrowly so a
+                // 50-row page doesn't drag 50 full track manifests across.
+                ProjectionExpression:
+                  'recordingId, composeStatus, composedUrl, composedSegment, segments, tracks, transcriptStatus',
+              },
+            },
+          }),
+        );
+        for (const raw of res.Responses?.[CALL_RECORDINGS_TABLE] ?? []) {
+          byId.set(raw.recordingId as string, raw as never);
+        }
+      } catch {
+        // A failed join costs badges, not the list. Falling through with
+        // `undefined` is the pre-existing behaviour, so this degrades to
+        // exactly what shipped before rather than to an error page.
+      }
+    }
+
+    return rows.map((r) => {
+      const primary = byId.get(r.recordingId);
+      if (!primary) return r;
+      return {
+        ...r,
+        composeStatus: deriveComposeStatus(primary),
+        transcriptStatus: primary.transcriptStatus,
+      };
+    });
   }
 
   /**
@@ -884,6 +1054,11 @@ export class CallRecordingRepository extends BaseRepository {
         lobbyName: i.lobbyName,
         thumbnailUrl: i.thumbnailUrl,
         composedUrl: i.composedUrl,
+        // This scan has the full primary row, so the compose state needs no
+        // join — it is right here, and omitting it was what left the FE's
+        // "is this playable" question permanently unanswerable.
+        composeStatus: deriveComposeStatus(i),
+        transcriptStatus: i.transcriptStatus,
         // Distinct PEOPLE. Deliberately re-derived instead of reading the
         // stored scalar: legacy rows stored `participants.length`, which
         // counted rejoins (the "2, 3, 4, 5, 6, 7 👥 over one evening" bug).

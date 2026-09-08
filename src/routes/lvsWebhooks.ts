@@ -95,6 +95,27 @@ export function getRecentDeliveries(): LvsDeliveryRecord[] {
   return deliveries.slice();
 }
 
+/**
+ * Recover a recording's true start instant from its own id.
+ *
+ * LVS mints `recordingId` at recording START as the ISO timestamp with
+ * every `:` and `.` swapped for `-`, plus a random suffix — e.g.
+ * `2026-09-07T10-30-33-757Z-4b2365cf` is `2026-09-07T10:30:33.757Z`. The
+ * instant is right there, exact, and it is the SAME string on every
+ * redelivery of the event, which is the property the fan-out sort key
+ * needs and the wall clock does not have.
+ *
+ * Returns null on anything that doesn't match, so an LVS build with a
+ * different id scheme falls through to the clock rather than inventing a
+ * date out of a random string.
+ */
+export function startedAtFromRecordingId(recordingId: string): string | null {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/.exec(recordingId ?? '');
+  if (!m) return null;
+  const iso = `${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`;
+  return Number.isNaN(Date.parse(iso)) ? null : iso;
+}
+
 // Capture raw body for HMAC. The router-scoped raw parser leaves
 // req.body as a Buffer; we JSON.parse it after signature verification.
 lvsWebhooksRouter.use(
@@ -490,8 +511,36 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
   // written by a pod that hasn't rolled) still renders honestly.
   const rawTracks: TruthTrack[] = Array.isArray(detail.tracks) ? detail.tracks : [];
   const sessionDurationMs = Number(detail.durationMs ?? 0);
-  const startedAt = detail.startedAt ?? new Date(Date.now() - sessionDurationMs).toISOString();
-  const endedAt = detail.endedAt ?? new Date().toISOString();
+  // `startedAt` is not a display field — it is HALF THE SORT KEY of the
+  // fan-out index (`${startedAt}#${recordingId}`), so whatever we compute
+  // here decides whether a redelivered webhook overwrites its own row or
+  // opens a second one.
+  //
+  // It used to be `new Date(Date.now() - sessionDurationMs)`, i.e. the
+  // handling clock, which is a different value on every delivery. That is
+  // the duplicate-row bug: recordingId 2026-09-07T10-30-33-757Z-4b2365cf
+  // holds two fan-out rows differing only in 30ms of `startedAt`, with
+  // identical durationMs, participants and callId. Eight rows, seven
+  // recordings, and the list showed one call twice.
+  //
+  // Three sources, in decreasing order of truth:
+  //   1. `detail.startedAt` — LVS now sends it (RecordingManager's
+  //      recording.completed emit). Same event, same value, always.
+  //   2. The recordingId, which LVS mints as
+  //      `<ISO with : and . replaced by ->-<rand>` at recording start —
+  //      the exact same instant, recoverable losslessly. Covers LVS pods
+  //      that predate (1).
+  //   3. The handling clock, as before. Reached only when neither of the
+  //      above parses, and no longer the normal path.
+  const startedAt: string =
+    detail.startedAt
+    ?? startedAtFromRecordingId(recordingId)
+    ?? new Date(Date.now() - sessionDurationMs).toISOString();
+  // Derived from `startedAt` rather than the wall clock for the same
+  // reason: two deliveries of one event must agree.
+  const endedAt: string =
+    detail.endedAt
+    ?? new Date(Date.parse(startedAt) + sessionDurationMs).toISOString();
   // VideoSessionRecord exposes the creator as `startedBy` (NOT `createdBy`
   // — that field doesn't exist on the record). Resolved BEFORE
   // reconciliation now, because the initiator has to be unioned into
