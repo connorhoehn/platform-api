@@ -159,12 +159,19 @@ export async function projectSummary(
       skipped++;
       continue;
     }
-    const assignee = byDisplayName.get(item.owner.trim().toLowerCase()) ?? item.owner;
+    // Resolved → a real userId; unresolved → the raw speaker label. `assignee`
+    // keeps whichever it was (unchanged), and `assigneeId` is written ONLY when
+    // we actually resolved an identity — it is the key GET /api/items/mine is
+    // now keyed on, and a speaker label in it would be a lie the index cannot
+    // detect.
+    const resolvedId = byDisplayName.get(item.owner.trim().toLowerCase());
+    const assignee = resolvedId ?? item.owner;
     await deps.items.createItem({
       documentId,
       sectionId,
       text: item.action,
       assignee,
+      ...(resolvedId ? { assigneeId: resolvedId } : {}),
       category: 'action-item',
       ...(item.deadline ? { dueDate: item.deadline } : {}),
     });

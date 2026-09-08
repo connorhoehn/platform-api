@@ -711,9 +711,17 @@ paths:
       tags: [section-items]
       summary: List items assigned to the caller (optionally filtered by status)
       description: |
-        Cross-document rollup — uses the `assignee-status-index` GSI to
-        find every item assigned to the caller. Without `status`, returns
-        items in any state.
+        Cross-document rollup, keyed on the caller's auth subject.
+
+        Reads the `assigneeId-status-index` GSI (identity), and also the
+        legacy `assignee-status-index` for the SAME id — never for a name —
+        because voice work items and the summary projector wrote a real
+        userId into `assignee` before the label/identity split. Rows whose
+        `assignee` holds only a display name are not returned; they have
+        never been findable and there is no server-side name→identity
+        directory that could resolve them.
+
+        Without `status`, returns items in any state.
       operationId: listMyItems
       parameters:
         - in: query
@@ -1470,7 +1478,18 @@ components:
           description: 'Defaults to "open" at create; typical values: open, in_progress, done.'
         assignee:
           type: string
-          description: Cognito sub of the assigned user.
+          description: |
+            HUMAN LABEL for the assigned user ("Alice Chen") — what the
+            assignee badge renders. NOT an identity: this field used to be
+            documented as a Cognito sub while the app wrote a display name
+            into it, which is why /items/mine returned nothing for everyone.
+        assigneeId:
+          type: string
+          description: |
+            Identity of the assigned user (auth subject / Cognito sub).
+            The only field /items/mine is keyed on. Absent on rows written
+            before the label/identity split, and on rows assigned by name
+            alone — such a row is not findable by assignee, by design.
         priority: { type: string }
         dueDate: { type: string }
         category: { type: string }

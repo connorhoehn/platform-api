@@ -2,8 +2,8 @@
 //
 // Tests for SectionItemRepository: createItem (sectionKey composite, ULID id,
 // status default, optional fields), getItemsForSection (limit), updateItemFields
-// (dynamic SET aliases, empty guard), deleteItemById, getItemsByAssignee
-// (with/without status), getItemsForDocument, ackItem.
+// (dynamic SET aliases, empty guard, null-means-REMOVE), deleteItemById,
+// getItemsAssignedTo (with/without status), getItemsForDocument, ackItem.
 
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { SectionItemRepository } from '../SectionItemRepository';
@@ -85,6 +85,27 @@ describe('SectionItemRepository.createItem', () => {
     expect(result.priority).toBe('high');
     expect(result.notes).toBe('Very important');
   });
+
+  it('stores the label and the identity as two separate fields', async () => {
+    const repo = new SectionItemRepository(docClient);
+    const result = await repo.createItem({
+      ...BASE_INPUT,
+      assignee: 'Alice Chen',
+      assigneeId: 'dev-alice',
+    });
+    expect(result.assignee).toBe('Alice Chen');
+    expect(result.assigneeId).toBe('dev-alice');
+  });
+
+  it('omits an empty assigneeId rather than writing "" into a GSI key', async () => {
+    const repo = new SectionItemRepository(docClient);
+    const result = await repo.createItem({ ...BASE_INPUT, assignee: 'Alice Chen', assigneeId: '' });
+    expect(result.assignee).toBe('Alice Chen');
+    expect(result).not.toHaveProperty('assigneeId');
+
+    const written = mockSend.mock.calls[0][0].input.Item;
+    expect(written).not.toHaveProperty('assigneeId');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -163,6 +184,51 @@ describe('SectionItemRepository.updateItemFields', () => {
     const cmd = mockSend.mock.calls[0][0];
     expect(cmd.input.Key).toEqual({ sectionKey: 'doc-5:sec-9', itemId: 'item-x' });
   });
+
+  // Both assignee fields are GSI hash keys, and DynamoDB refuses an empty
+  // string in one. Unassigning therefore has to REMOVE the attributes; writing
+  // '' would have failed the whole update.
+  it('REMOVEs an attribute passed as null instead of setting it', async () => {
+    mockSend.mockResolvedValue({ Attributes: {} });
+    const repo = new SectionItemRepository(docClient);
+    await repo.updateItemFields('doc-1', 'sec-1', 'item-1', {
+      assignee: null,
+      assigneeId: null,
+    });
+
+    const cmd = mockSend.mock.calls[0][0];
+    expect(cmd.input.UpdateExpression).toContain('REMOVE #assignee');
+    expect(cmd.input.UpdateExpression).toContain('#assigneeId');
+    expect(cmd.input.ExpressionAttributeValues[':assignee']).toBeUndefined();
+    expect(cmd.input.ExpressionAttributeValues[':assigneeId']).toBeUndefined();
+  });
+
+  it('mixes SET and REMOVE in one expression', async () => {
+    mockSend.mockResolvedValue({ Attributes: {} });
+    const repo = new SectionItemRepository(docClient);
+    await repo.updateItemFields('doc-1', 'sec-1', 'item-1', {
+      text: 'still mine',
+      assigneeId: null,
+    });
+
+    const cmd = mockSend.mock.calls[0][0];
+    expect(cmd.input.UpdateExpression).toMatch(/^SET .*REMOVE #assigneeId$/);
+    expect(cmd.input.ExpressionAttributeValues[':text']).toBe('still mine');
+  });
+
+  it('writes both assignee fields when a person is picked', async () => {
+    mockSend.mockResolvedValue({ Attributes: {} });
+    const repo = new SectionItemRepository(docClient);
+    await repo.updateItemFields('doc-1', 'sec-1', 'item-1', {
+      assignee: 'Alice Chen',
+      assigneeId: 'dev-alice',
+    });
+
+    const cmd = mockSend.mock.calls[0][0];
+    expect(cmd.input.ExpressionAttributeValues[':assignee']).toBe('Alice Chen');
+    expect(cmd.input.ExpressionAttributeValues[':assigneeId']).toBe('dev-alice');
+    expect(cmd.input.UpdateExpression).not.toContain('REMOVE');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -180,31 +246,89 @@ describe('SectionItemRepository.deleteItemById', () => {
 });
 
 // ---------------------------------------------------------------------------
-// getItemsByAssignee
+// getItemsAssignedTo
+//
+// The one query behind GET /api/items/mine. It is keyed on the IDENTITY
+// (`assigneeId`), and it also reads the legacy label index for the SAME id —
+// never for a display name. See the method's own comment for why both.
 // ---------------------------------------------------------------------------
 
-describe('SectionItemRepository.getItemsByAssignee', () => {
+/** The index each captured QueryCommand was issued against. */
+const indexesQueried = (): string[] =>
+  mockSend.mock.calls.map((c: unknown[]) => (c[0] as { input: { IndexName: string } }).input.IndexName);
+
+/** The captured QueryCommand input for one index. */
+const queryOn = (index: string) =>
+  (mockSend.mock.calls.find(
+    (c: unknown[]) => (c[0] as { input: { IndexName: string } }).input.IndexName === index,
+  )?.[0] as { input: Record<string, never> }).input as unknown as {
+    IndexName: string;
+    KeyConditionExpression: string;
+    ExpressionAttributeNames: Record<string, string>;
+    ExpressionAttributeValues: Record<string, string>;
+  };
+
+describe('SectionItemRepository.getItemsAssignedTo', () => {
   beforeEach(() => {
     mockSend.mockResolvedValue({ Items: [] });
   });
 
-  it('queries assignee-status-index with only assignee when no status', async () => {
+  it('queries the assigneeId index — not the display-name index — for the caller', async () => {
     const repo = new SectionItemRepository(docClient);
-    await repo.getItemsByAssignee('user-5');
+    await repo.getItemsAssignedTo('dev-alice');
 
-    const cmd = mockSend.mock.calls[0][0];
-    expect(cmd.input.IndexName).toBe('assignee-status-index');
-    expect(cmd.input.ExpressionAttributeValues[':a']).toBe('user-5');
-    expect(cmd.input.ExpressionAttributeValues[':s']).toBeUndefined();
+    const byId = queryOn('assigneeId-status-index');
+    expect(byId.ExpressionAttributeNames['#k']).toBe('assigneeId');
+    expect(byId.ExpressionAttributeValues[':a']).toBe('dev-alice');
+    expect(byId.ExpressionAttributeValues[':s']).toBeUndefined();
   });
 
-  it('adds status condition when status is provided', async () => {
+  it('also reads the legacy assignee index for the SAME id, so pre-split rows survive', async () => {
     const repo = new SectionItemRepository(docClient);
-    await repo.getItemsByAssignee('user-5', 'open');
+    await repo.getItemsAssignedTo('dev-alice');
 
-    const cmd = mockSend.mock.calls[0][0];
-    expect(cmd.input.ExpressionAttributeValues[':s']).toBe('open');
-    expect(cmd.input.KeyConditionExpression).toContain('#status');
+    expect(indexesQueried().sort()).toEqual([
+      'assignee-status-index',
+      'assigneeId-status-index',
+    ]);
+    const legacy = queryOn('assignee-status-index');
+    expect(legacy.ExpressionAttributeNames['#k']).toBe('assignee');
+    // The id, never a name. Asking the label index for a display name is the
+    // bug this whole split exists to remove.
+    expect(legacy.ExpressionAttributeValues[':a']).toBe('dev-alice');
+  });
+
+  it('adds the status condition to both index queries when status is provided', async () => {
+    const repo = new SectionItemRepository(docClient);
+    await repo.getItemsAssignedTo('dev-alice', 'open');
+
+    for (const index of ['assigneeId-status-index', 'assignee-status-index']) {
+      const q = queryOn(index);
+      expect(q.ExpressionAttributeValues[':s']).toBe('open');
+      expect(q.KeyConditionExpression).toContain('#status');
+    }
+  });
+
+  it('never scans, and never returns the same row twice when both indexes hold it', async () => {
+    const row = {
+      sectionKey: 'doc-1:sec-1',
+      itemId: 'item-1',
+      assignee: 'dev-alice',
+      assigneeId: 'dev-alice',
+    };
+    mockSend.mockResolvedValue({ Items: [row] });
+
+    const repo = new SectionItemRepository(docClient);
+    const items = await repo.getItemsAssignedTo('dev-alice');
+
+    expect(items).toHaveLength(1);
+    expect(indexesQueried().every((i) => typeof i === 'string' && i.length > 0)).toBe(true);
+  });
+
+  it('returns nothing without asking DynamoDB when there is no caller id', async () => {
+    const repo = new SectionItemRepository(docClient);
+    expect(await repo.getItemsAssignedTo('')).toEqual([]);
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });
 

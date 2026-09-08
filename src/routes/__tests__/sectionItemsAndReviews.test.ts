@@ -94,6 +94,7 @@ jest.mock('../../repositories', () => ({
         sectionId: input.sectionId as string,
         text: (input.text as string) ?? '',
         ...(input.assignee !== undefined && { assignee: input.assignee }),
+        ...(input.assigneeId ? { assigneeId: input.assigneeId } : {}),
         ...(input.priority !== undefined && { priority: input.priority }),
         ...(input.dueDate !== undefined && { dueDate: input.dueDate }),
         ...(input.category !== undefined && { category: input.category }),
@@ -136,9 +137,12 @@ jest.mock('../../repositories', () => ({
       itemStore[itemId] = merged as ItemRecord;
       return merged;
     }),
-    getItemsByAssignee: jest.fn(async (assignee: string, status?: string) => {
+    // Mirrors the real repository: keyed on the IDENTITY, with the legacy
+    // label field consulted for the SAME id (never for a display name) so
+    // pre-split rows — voice work items, projected action items — survive.
+    getItemsAssignedTo: jest.fn(async (userId: string, status?: string) => {
       return Object.values(itemStore).filter((i) => {
-        if (i.assignee !== assignee) return false;
+        if (i.assigneeId !== userId && i.assignee !== userId) return false;
         if (status && i.status !== status) return false;
         return true;
       });
@@ -416,6 +420,54 @@ describe('sectionItems — /items/mine cross-document query', () => {
     const body = res.body as { items: { text: string }[] };
     expect(body.items).toHaveLength(1);
     expect(body.items[0].text).toBe('Open');
+  });
+
+  // The bug, stated as a test: the app assigned "Alice Chen" and this endpoint
+  // asked for `dev-alice`. Nothing ever matched, for anyone, ever.
+  test('an item assigned by DISPLAY NAME plus id is found by the id', async () => {
+    const app = buildApp();
+    await run(app, 'POST', '/api/documents/d1/sections/s1/items', {
+      body: { text: 'Ship the thing', assignee: 'Alice Chen', assigneeId: 'dev-alice' },
+    });
+
+    const res = await run(app, 'GET', '/api/items/mine', { userId: 'dev-alice' });
+    const body = res.body as { items: { text: string; assignee: string }[] };
+    expect(body.items).toHaveLength(1);
+    // And the badge still has a human to render.
+    expect(body.items[0].assignee).toBe('Alice Chen');
+  });
+
+  test('an item assigned by display name ALONE is not findable, and does not leak to the named user', async () => {
+    const app = buildApp();
+    await run(app, 'POST', '/api/documents/d1/sections/s1/items', {
+      body: { text: 'Orphan', assignee: 'Alice Chen' },
+    });
+
+    // Unfindable, and deliberately so: there is no server-side name→identity
+    // directory, so the row cannot be resolved without guessing.
+    const byId = await run(app, 'GET', '/api/items/mine', { userId: 'dev-alice' });
+    expect((byId.body as { items: unknown[] }).items).toHaveLength(0);
+  });
+
+  test('a pre-split row whose assignee IS a userId still answers the query', async () => {
+    const app = buildApp();
+    // What workItems and the summary projector have always written.
+    await run(app, 'POST', '/api/documents/d1/sections/s1/items', {
+      body: { text: 'Raised from a call', assignee: 'dev-alice' },
+    });
+
+    const res = await run(app, 'GET', '/api/items/mine', { userId: 'dev-alice' });
+    expect((res.body as { items: unknown[] }).items).toHaveLength(1);
+  });
+
+  test('a row carrying both fields is returned once, not twice', async () => {
+    const app = buildApp();
+    await run(app, 'POST', '/api/documents/d1/sections/s1/items', {
+      body: { text: 'Self-assigned', assignee: 'dev-alice', assigneeId: 'dev-alice' },
+    });
+
+    const res = await run(app, 'GET', '/api/items/mine', { userId: 'dev-alice' });
+    expect((res.body as { items: unknown[] }).items).toHaveLength(1);
   });
 });
 

@@ -11,7 +11,7 @@ const mockGetItemsForSection = jest.fn();
 const mockUpdateItemFields = jest.fn();
 const mockDeleteItemById = jest.fn();
 const mockAckItem = jest.fn();
-const mockGetItemsByAssignee = jest.fn();
+const mockGetItemsAssignedTo = jest.fn();
 const mockEmit = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('../../middleware/auth', () => ({
@@ -28,7 +28,7 @@ jest.mock('../../repositories', () => ({
     updateItemFields: mockUpdateItemFields,
     deleteItemById: mockDeleteItemById,
     ackItem: mockAckItem,
-    getItemsByAssignee: mockGetItemsByAssignee,
+    getItemsAssignedTo: mockGetItemsAssignedTo,
   },
 }));
 
@@ -280,20 +280,95 @@ describe('GET /items/mine', () => {
   const app = buildApp();
 
   test('200 + items assigned to the caller', async () => {
-    mockGetItemsByAssignee.mockResolvedValueOnce([sampleItem]);
+    mockGetItemsAssignedTo.mockResolvedValueOnce([sampleItem]);
 
     const res = await run(app, 'GET', '/items/mine', { userId: 'user-1' });
 
     expect(res.statusCode).toBe(200);
     expect((res.body as { items: unknown[] }).items).toHaveLength(1);
-    expect(mockGetItemsByAssignee).toHaveBeenCalledWith('user-1', undefined);
+    expect(mockGetItemsAssignedTo).toHaveBeenCalledWith('user-1', undefined);
   });
 
   test('passes status query param through', async () => {
-    mockGetItemsByAssignee.mockResolvedValueOnce([]);
+    mockGetItemsAssignedTo.mockResolvedValueOnce([]);
 
     await run(app, 'GET', '/items/mine?status=done', { userId: 'user-1' });
 
-    expect(mockGetItemsByAssignee).toHaveBeenCalledWith('user-1', 'done');
+    expect(mockGetItemsAssignedTo).toHaveBeenCalledWith('user-1', 'done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The label/identity split
+//
+// The bug: the app assigned by display name and this endpoint asked for a
+// Cognito sub, so nothing assigned was ever findable. The fix is two fields,
+// and these tests pin the halves that made it wrong.
+// ---------------------------------------------------------------------------
+
+describe('assignee label vs assignee identity', () => {
+  const app = buildApp();
+
+  test('POST stores the label and the identity as separate fields', async () => {
+    mockCreateItem.mockResolvedValueOnce({ ...sampleItem, assignee: 'Alice Chen', assigneeId: 'dev-alice' });
+
+    const res = await run(app, 'POST', '/documents/doc-1/sections/sec-1/items', {
+      userId: 'user-1',
+      body: { text: 'Ship it', assignee: 'Alice Chen', assigneeId: 'dev-alice' },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateItem).toHaveBeenCalledWith(
+      expect.objectContaining({ assignee: 'Alice Chen', assigneeId: 'dev-alice' }),
+    );
+  });
+
+  test('PATCH carries the identity alongside the label', async () => {
+    mockUpdateItemFields.mockResolvedValueOnce({ ...sampleItem, assignee: 'Bob Martinez', assigneeId: 'dev-bob' });
+
+    await run(app, 'PATCH', '/documents/doc-1/sections/sec-1/items/item-1', {
+      userId: 'user-1',
+      body: { assignee: 'Bob Martinez', assigneeId: 'dev-bob' },
+    });
+
+    expect(mockUpdateItemFields).toHaveBeenCalledWith(
+      'doc-1',
+      'sec-1',
+      'item-1',
+      expect.objectContaining({ assignee: 'Bob Martinez', assigneeId: 'dev-bob' }),
+    );
+  });
+
+  test('unassigning REMOVEs both fields instead of being a silent no-op', async () => {
+    mockUpdateItemFields.mockResolvedValueOnce({ ...sampleItem });
+
+    const res = await run(app, 'PATCH', '/documents/doc-1/sections/sec-1/items/item-1', {
+      userId: 'user-1',
+      body: { assignee: '', assigneeId: '' },
+    });
+
+    // Empty strings used to fail a truthiness test and vanish, leaving the row
+    // assigned to whoever had it. They are now REMOVE instructions — and they
+    // must not reach DynamoDB as '' either, since both are GSI hash keys.
+    expect(res.statusCode).toBe(200);
+    expect(mockUpdateItemFields).toHaveBeenCalledWith(
+      'doc-1',
+      'sec-1',
+      'item-1',
+      expect.objectContaining({ assignee: null, assigneeId: null }),
+    );
+  });
+
+  test('a cleared assignee reaches peers as an empty string, never as null', async () => {
+    mockUpdateItemFields.mockResolvedValueOnce({ ...sampleItem });
+    mockEmit.mockClear();
+
+    await run(app, 'PATCH', '/documents/doc-1/sections/sec-1/items/item-1', {
+      userId: 'user-1',
+      body: { assignee: '' },
+    });
+
+    const payload = mockEmit.mock.calls[0][2] as { updates: Record<string, unknown> };
+    expect(payload.updates.assignee).toBe('');
   });
 });

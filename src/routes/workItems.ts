@@ -129,6 +129,7 @@ workItemsRouter.post(
       context?: CapturedContext;
       candidates?: AttachCandidate[];
       assignee?: string;
+      assigneeId?: string;
       priority?: string;
     };
 
@@ -175,6 +176,15 @@ workItemsRouter.post(
       // this the item is invisible to `GET /api/items/mine` and the queue has no
       // reader.
       assignee: body.assignee ?? userId,
+      // The queue is keyed on the IDENTITY, not the label. A caller that names
+      // somebody else must say who that is; when nobody is named, the speaker
+      // is both label and identity, so the default self-assignment stays
+      // findable exactly as it was.
+      ...(body.assigneeId
+        ? { assigneeId: body.assigneeId }
+        : body.assignee
+          ? {}
+          : { assigneeId: userId }),
       ...(body.priority ? { priority: body.priority } : {}),
       proposalStatus: 'none',
     });
