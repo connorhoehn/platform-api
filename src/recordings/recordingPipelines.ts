@@ -27,6 +27,7 @@ import type { CallRecording, ComposeStatus } from '../repositories/CallRecording
 import { deriveMediaDurationMs, reconcileParticipants, type TruthTrack } from '../lib/recording-truth';
 import { mergeReactionsIntoTranscript } from '../lib/transcript-reactions';
 import { callSfu } from '../lib/sfu-breaker';
+import { getRedisClient } from '../lib/redis-client';
 import { VIDEO_API_URL } from '../lib/video-auth';
 import { tableName } from '../lib/ddb-table-name';
 import { ddbClient } from '../lib/aws-clients';
@@ -172,7 +173,6 @@ function resolveHandler(): StepHandler {
       if (!arn || !recordingId) return fail('arn and recordingId are required');
       let session: any = null;
       try {
-        const { getRedisClient } = await import('../lib/redis-client.js');
         const redis = await getRedisClient();
         const raw = redis ? await redis.get(`video:arn-index:${arn}`) : null;
         if (raw) {
