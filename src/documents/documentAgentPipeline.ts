@@ -127,21 +127,56 @@ export function createDocumentReadHandler(): StepHandler {
   };
 }
 
-/** Step 3: join as the agent, show up in presence, apply the planned operations, leave. */
+/** Node options the shared apply step honours. */
+export interface DocumentApplyNodeData {
+  /**
+   * Where the operations live in the run context — a dotted path (e.g.
+   * `transcriptOps`, `steps.plan.text`). The value may be an ops array or the
+   * model's JSON text. Default: the planning agent's text, then `context.text`.
+   */
+  opsFrom?: string;
+  /** Who the edit is attributed to in presence. Default: Haiku. */
+  agent?: { userId: string; displayName: string; color?: string };
+  /** When the run has no document, complete (nothing to write) instead of failing. */
+  optional?: boolean;
+}
+
+function readPath(obj: unknown, path: string): unknown {
+  return path.split('.').reduce<unknown>((cur, key) => (cur && typeof cur === 'object' ? (cur as Record<string, unknown>)[key] : undefined), obj);
+}
+
+/** The operations a run wants applied: from `opsFrom`, else the planning agent's answer. */
+export function opsFromContext(context: Record<string, unknown>, data: DocumentApplyNodeData): { ops: ReturnType<typeof parseOps>; source: string; raw: string } {
+  const candidates: Array<[string, unknown]> = data.opsFrom
+    ? [[data.opsFrom, readPath(context, data.opsFrom)]]
+    : [['steps.plan.text', readPath(context, 'steps.plan.text')], ['text', context.text]];
+  for (const [source, value] of candidates) {
+    if (Array.isArray(value)) return { ops: parseOps(JSON.stringify(value)), source, raw: '' };
+    if (typeof value === 'string' && value.trim()) return { ops: parseOps(value), source, raw: value };
+  }
+  return { ops: [], source: candidates[0]![0], raw: '' };
+}
+
+/**
+ * Step 3, and THE write path into a document for every pipeline: join as the
+ * agent, show up in presence, apply the operations, leave. The /doc edit, the
+ * transform and the call transcript all land through this one step.
+ */
 export function createDocumentApplyHandler(): StepHandler {
   return {
     kind: DOCUMENT_APPLY_KIND,
-    async execute(_node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
+    async execute(node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
+      const data = ((node as { data?: DocumentApplyNodeData }).data ?? {}) as DocumentApplyNodeData;
       const documentId = documentIdOf(context);
-      if (!documentId) return { status: 'failed', error: 'documentId missing from the run context' };
-      const steps = (context.steps ?? {}) as Record<string, unknown>;
-      const plan = steps.plan as { text?: unknown } | undefined;
-      const planText = typeof plan?.text === 'string' ? plan.text : typeof context.text === 'string' ? context.text : '';
-      const ops = parseOps(planText);
-      if (ops.length === 0) {
-        return { status: 'completed', output: { applied: 0, skipped: 0, reason: 'the model proposed no operations', planText: planText.slice(0, 500) } };
+      if (!documentId) {
+        if (data.optional) return { status: 'completed', output: { applied: 0, skipped: 'no document on this run' } };
+        return { status: 'failed', error: 'documentId missing from the run context' };
       }
-      const agent = new AgentCollaborator({ documentId, identity: HAIKU_AGENT });
+      const { ops, raw: planText } = opsFromContext(context, data);
+      if (ops.length === 0) {
+        return { status: 'completed', output: { applied: 0, skipped: 0, reason: data.opsFrom ? 'nothing to write' : 'the model proposed no operations', planText: planText.slice(0, 500) } };
+      }
+      const agent = new AgentCollaborator({ documentId, identity: data.agent ? { ...HAIKU_AGENT, ...data.agent } : HAIKU_AGENT });
       try {
         await agent.join();
         agent.announce();

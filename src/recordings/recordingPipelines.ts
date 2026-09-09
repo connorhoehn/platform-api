@@ -34,13 +34,25 @@ import { ddbClient } from '../lib/aws-clients';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { postChatMessage, PIPELINE_IDENTITY } from '../gateway/GatewayServiceClient';
-import { AgentCollaborator } from '../documents/AgentCollaborator';
-import { applyOps } from '../documents/documentAgentOps';
+import { DOCUMENT_APPLY_KIND } from '../documents/documentAgentPipeline';
 import { resolveRecordingProfile } from '@connorhoehn/event-catalog';
 import log from '../lib/logger';
 
 export const RECORDING_FINALIZE_PIPELINE_ID = 'recording-finalize';
 export const CALL_TRANSCRIPTION_PIPELINE_ID = 'call-transcription';
+
+/** Presence identity the transcript is written under. */
+export const TRANSCRIPT_AGENT = { userId: PIPELINE_IDENTITY.userId, displayName: 'Transcript', color: '#0ea5e9' };
+
+/** The document operations a transcript becomes: a heading, then one paragraph per segment. */
+export function transcriptOps(segments: Array<{ text: string }>): Array<Record<string, unknown>> {
+  const spoken = segments.filter((s) => s.text && s.text.trim());
+  if (spoken.length === 0) return [];
+  return [
+    { op: 'appendBlock', kind: 'heading', level: 2, text: 'Call transcript' },
+    ...spoken.map((s) => ({ op: 'appendBlock', kind: 'paragraph', text: s.text.trim() })),
+  ];
+}
 
 export const KINDS = {
   resolve: 'recording:resolve',
@@ -103,9 +115,12 @@ export function buildCallTranscriptionDefinition(): Record<string, unknown> {
       { id: 'transcribe', type: KINDS.transcribe, position: pos(200), data: { type: KINDS.transcribe, label: 'Transcribe the audio', retryPolicy: { maxAttempts: 3, backoffMs: 3000, backoffMultiplier: 2, retryUnknown: true } } },
       { id: 'merge-reactions', type: KINDS.mergeReactions, position: pos(400), data: { type: KINDS.mergeReactions, label: 'Merge reactions' } },
       { id: 'store', type: KINDS.store, position: pos(600), data: { type: KINDS.store, label: 'Store the transcript' } },
-      { id: 'publish', type: KINDS.publish, position: pos(800), data: { type: KINDS.publish, label: 'Publish to the conversation' } },
+      // The one shared write path into a document — the same step kind /doc and
+      // Transform use. Optional: a room call has no document to write into.
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(800), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the transcript into the call document', opsFrom: 'transcriptOps', optional: true, agent: TRANSCRIPT_AGENT } },
+      { id: 'publish', type: KINDS.publish, position: pos(1000), data: { type: KINDS.publish, label: 'Publish to the conversation' } },
     ],
-    edges: [edge('trigger', 'transcribe'), edge('transcribe', 'merge-reactions'), edge('merge-reactions', 'store'), edge('store', 'publish')],
+    edges: [edge('trigger', 'transcribe'), edge('transcribe', 'merge-reactions'), edge('merge-reactions', 'store'), edge('store', 'apply'), edge('apply', 'publish')],
   };
 }
 
@@ -367,7 +382,8 @@ function storeHandler(): StepHandler {
       const json = JSON.stringify(transcript);
       if (json.length > 350 * 1024) return fail(`transcript too large to store inline (${json.length} bytes)`);
       await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', transcriptKey: 'inline', transcriptJson: json } as never);
-      return ok({ stored: 'inline', bytes: json.length, segments: transcript.segments.length });
+      // `transcriptOps` is what the shared document:apply step writes next.
+      return ok({ stored: 'inline', bytes: json.length, segments: transcript.segments.length, transcriptOps: transcriptOps(transcript.segments) });
     },
   };
 }
@@ -384,26 +400,10 @@ function publishHandler(): StepHandler {
         command: 'transcript', instruction: words ? `${words} words — “${preview}${preview.length >= 160 ? '…' : ''}”` : 'No speech was found in the recording',
         extra: { recordingId: ctx.recordingId, callId: ctx.callId },
       });
-      // A call started from a document gets its transcript appended there, by
-      // the same collaborator that applies every other document side effect.
-      let appended = 0;
-      const documentId = str(ctx.documentId);
-      if (documentId && transcript.segments.length > 0) {
-        const agent = new AgentCollaborator({ documentId, identity: { userId: PIPELINE_IDENTITY.userId, displayName: 'Transcript', color: '#0ea5e9' } });
-        try {
-          await agent.join(); agent.announce();
-          const r = applyOps(agent.doc, [
-            { op: 'appendBlock', kind: 'heading', level: 2, text: 'Call transcript' },
-            ...transcript.segments.map((s) => ({ op: 'appendBlock' as const, kind: 'paragraph' as const, text: s.text })),
-          ], 'agent');
-          appended = r.applied;
-          void agent.leave(2000).catch(() => undefined);
-        } catch (e) {
-          await agent.leave(0).catch(() => undefined);
-          log.warn({ err: e instanceof Error ? e.message : String(e), documentId }, '[transcription] could not append the transcript to the document');
-        }
-      }
-      return ok({ posted, appended, words });
+      // The transcript reached the call's document (when there is one) in the
+      // document:apply step before this one — the same write path /doc uses.
+      const applied = ((ctx.steps as Record<string, { applied?: number }> | undefined)?.apply?.applied) ?? 0;
+      return ok({ posted, appended: applied, words });
     },
   };
 }
