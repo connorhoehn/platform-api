@@ -41,10 +41,10 @@ export function buildDocumentAgentEditDefinition(model = process.env.DOCUMENT_AG
     status: 'published',
     publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual' } },
-      { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND } },
-      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', prompt: DOCUMENT_EDIT_PROMPT, model, allowedTools: [], maxTurns: 1 } },
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/doc command' } },
+      { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the document' } },
+      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the edit (Haiku)', prompt: DOCUMENT_EDIT_PROMPT, model, allowedTools: [], maxTurns: 1 } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Apply as a collaborator' } },
     ],
     edges: [
       { id: 'e1', source: 'trigger', sourceHandle: 'out', target: 'read', targetHandle: 'in' },

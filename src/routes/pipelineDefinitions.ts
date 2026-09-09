@@ -34,6 +34,7 @@ import { Router, type Request, type Response } from 'express';
 import { asyncHandler } from '../middleware/error-handler';
 import { generateWebhookSecret } from 'distributed-core';
 import { definitionsRepo } from '../pipeline/definitions-repository';
+import { getSystemPipeline, listSystemPipelines } from '../pipeline/systemPipelines';
 import { pipelineDefinitionsCache } from '../pipeline/definitions-cache';
 import { publishInvalidate } from '../pipeline/definitions-invalidator';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
@@ -100,7 +101,8 @@ pipelineDefinitionsRouter.get(
     const userId = req.user!.sub;
     try {
       const items = await definitionsRepo.list(userId);
-      res.json({ pipelines: items });
+      // Platform-owned pipelines ride along, read-only, so their runs have a home.
+      res.json({ pipelines: [...items, ...listSystemPipelines()] });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       log.error({ err: message, action: 'def.list' }, 'failed to list definitions');
@@ -116,7 +118,7 @@ pipelineDefinitionsRouter.get(
     const userId = req.user!.sub;
     const pipelineId = req.params.pipelineId;
     try {
-      const def = await definitionsRepo.get(userId, pipelineId);
+      const def = (await definitionsRepo.get(userId, pipelineId)) ?? getSystemPipeline(pipelineId);
       if (!def) {
         res.status(404).json({ error: 'not_found' });
         return;
