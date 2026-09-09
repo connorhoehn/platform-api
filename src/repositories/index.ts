@@ -22,6 +22,7 @@ import { HangoutRoomRepository } from './HangoutRoomRepository';
 import { HangoutRoomMemberRepository } from './HangoutRoomMemberRepository';
 import { ChangeVerdictRepository } from './ChangeVerdictRepository';
 import { CallLogRepository } from './CallLogRepository';
+import { VoicemailRepository } from './VoicemailRepository';
 
 // Singleton instances — share the same docClient across all repositories
 export const profileRepo = new ProfileRepository(docClient);
@@ -173,3 +174,4 @@ export {
   toVerdict,
 } from './ChangeVerdictRepository';
 export const callLogRepo = new CallLogRepository(docClient);
+export const voicemailRepo = new VoicemailRepository(docClient);

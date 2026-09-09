@@ -27,7 +27,7 @@ export const CALL_LOG_TABLE = tableName('call-log');
 
 export type CallOutcome = 'ringing' | 'answered' | 'missed' | 'declined' | 'cancelled';
 export type CallDirection = 'incoming' | 'outgoing';
-export type CallEventAction = 'invite' | 'accepted' | 'declined' | 'cancelled' | 'ended' | 'missed';
+export type CallEventAction = 'invite' | 'accepted' | 'declined' | 'cancelled' | 'ended' | 'missed' | 'voicemail';
 
 export interface CallEvent {
   callId: string;
@@ -45,6 +45,9 @@ export interface CallEvent {
   at?: string;
   /** Who is reporting — decides which row `accepted`/`declined` name. */
   reporterId?: string;
+  /** `voicemail` only: the message left after this call went unanswered. */
+  voicemailId?: string;
+  voicemailDurationMs?: number;
 }
 
 export interface CallLogRow {
@@ -64,6 +67,9 @@ export interface CallLogRow {
   sessionId?: string;
   /** Set when the person has looked at their missed calls since this one. */
   seenAt?: string;
+  /** A message the caller left when nobody picked up. Bytes live in VoicemailRepository. */
+  voicemailId?: string;
+  voicemailDurationMs?: number;
   updatedAt: string;
 }
 
@@ -143,6 +149,14 @@ export function applyCallEvent(row: CallLogRow | null, event: CallEvent, userId:
       // A call that ended while still ringing was never picked up.
       if (next.outcome === 'ringing') next.outcome = 'missed';
       break;
+    case 'voicemail':
+      // Leaving a message is what you do INSTEAD of being answered, so a row
+      // still ringing is missed; an answered row keeps its answer (a message
+      // left after a dropped call is still a message).
+      if (next.outcome === 'ringing') next.outcome = 'missed';
+      if (event.voicemailId) next.voicemailId = event.voicemailId;
+      if (typeof event.voicemailDurationMs === 'number') next.voicemailDurationMs = event.voicemailDurationMs;
+      break;
     case 'invite':
     default:
       break;
@@ -154,11 +168,12 @@ export function applyCallEvent(row: CallLogRow | null, event: CallEvent, userId:
   return next;
 }
 
-export type CallLogFilter = 'all' | 'missed' | 'incoming' | 'outgoing';
+export type CallLogFilter = 'all' | 'missed' | 'incoming' | 'outgoing' | 'voicemail';
 
 export function matchesFilter(row: CallLogRow, filter: CallLogFilter): boolean {
   switch (filter) {
     case 'missed': return row.direction === 'incoming' && row.outcome === 'missed';
+    case 'voicemail': return row.direction === 'incoming' && !!row.voicemailId;
     case 'incoming': return row.direction === 'incoming';
     case 'outgoing': return row.direction === 'outgoing';
     default: return true;
@@ -231,14 +246,18 @@ export class CallLogRepository extends BaseRepository {
     return rows.slice(0, limit);
   }
 
-  /** Missed incoming calls the person has not looked at. */
+  /** What the badge counts: missed incoming calls and voicemails not yet looked at. */
+  private async unseenRows(userId: string): Promise<CallLogRow[]> {
+    const rows = await this.listForUser(userId, 'all', 500);
+    return rows.filter((r) => !r.seenAt && (matchesFilter(r, 'missed') || matchesFilter(r, 'voicemail')));
+  }
+
   async unseenMissed(userId: string): Promise<number> {
-    const rows = await this.listForUser(userId, 'missed', 500);
-    return rows.filter((r) => !r.seenAt).length;
+    return (await this.unseenRows(userId)).length;
   }
 
   async markSeen(userId: string): Promise<number> {
-    const rows = (await this.listForUser(userId, 'missed', 500)).filter((r) => !r.seenAt);
+    const rows = await this.unseenRows(userId);
     const now = new Date().toISOString();
     for (const r of rows) {
       await this.docClient.send(new UpdateCommand({

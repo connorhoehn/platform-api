@@ -71,3 +71,24 @@ describe('a reused callId after a declined or cancelled attempt', () => {
     expect(row).toMatchObject({ outcome: 'answered', startedAt: T0, answeredAt: T1 });
   });
 });
+
+describe('voicemail on the call log', () => {
+  it('a message left on an unanswered ring marks the row missed and carries the id', () => {
+    const row = run([base({}), base({ action: 'voicemail', at: T2, voicemailId: 'vm-1', voicemailDurationMs: 12_000 })], 'bob');
+    expect(row.outcome).toBe('missed');
+    expect(row.voicemailId).toBe('vm-1');
+    expect(row.voicemailDurationMs).toBe(12_000);
+    expect(matchesFilter(row, 'voicemail')).toBe(true);
+    expect(matchesFilter(row, 'missed')).toBe(true);
+  });
+
+  it('a message left after a decline keeps the decline; the caller\'s own row is never "voicemail"', () => {
+    const events = [base({}), base({ action: 'declined', at: T1 }), base({ action: 'voicemail', at: T2, voicemailId: 'vm-2', voicemailDurationMs: 5_000 })];
+    const bob = run(events, 'bob');
+    expect(bob.outcome).toBe('declined');
+    expect(matchesFilter(bob, 'voicemail')).toBe(true);
+    const ana = run(events, 'ana');
+    expect(ana.voicemailId).toBe('vm-2');
+    expect(matchesFilter(ana, 'voicemail')).toBe(false);
+  });
+});
