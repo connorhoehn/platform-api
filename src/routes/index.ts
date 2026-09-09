@@ -16,6 +16,7 @@ import { voiceCaptureRouter } from './voiceCapture';
 import { sectionReviewsRouter, documentReviewsRouter, myReviewsRouter } from './sectionReviews';
 import { sectionItemsRouter, myItemsRouter } from './sectionItems';
 import { documentTransformRouter } from './documentTransform';
+import { callLogRouter } from './callLog';
 import { workItemsRouter } from './workItems';
 import { documentLifecycleRouter, lifecycleSchemaRouter } from './documentLifecycle';
 import {
@@ -79,6 +80,7 @@ const router = Router();
 
 // Before the `/documents/:documentId/...` routers, so `transform` is never read as an id.
 router.use('/documents', documentTransformRouter);
+router.use('/calls', callLogRouter);
 router.use('/profiles', profilesRouter);
 router.use('/social', socialRouter);
 router.use('/groups', groupsRouter);

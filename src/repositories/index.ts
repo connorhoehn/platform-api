@@ -21,6 +21,7 @@ import { CallReactionRepository } from './CallReactionRepository';
 import { HangoutRoomRepository } from './HangoutRoomRepository';
 import { HangoutRoomMemberRepository } from './HangoutRoomMemberRepository';
 import { ChangeVerdictRepository } from './ChangeVerdictRepository';
+import { CallLogRepository } from './CallLogRepository';
 
 // Singleton instances — share the same docClient across all repositories
 export const profileRepo = new ProfileRepository(docClient);
@@ -171,3 +172,4 @@ export {
   changeKey,
   toVerdict,
 } from './ChangeVerdictRepository';
+export const callLogRepo = new CallLogRepository(docClient);
