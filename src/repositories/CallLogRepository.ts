@@ -93,7 +93,20 @@ export function applyCallEvent(row: CallLogRow | null, event: CallEvent, userId:
     startedAt: at,
     updatedAt: now,
   };
-  const next: CallLogRow = { ...base, updatedAt: now };
+  let next: CallLogRow = { ...base, updatedAt: now };
+  // The DM call button reuses a callId across attempts (measured: hang up, ring
+  // again, same id). An invite that arrives AFTER the previous attempt ended is
+  // a new call, not a late report of the old one — otherwise the old
+  // `cancelled` outranks the new ring forever and a genuinely missed call reads
+  // as cancelled. Start the row over; the id is the only thing carried.
+  if (event.action === 'invite' && row?.endedAt && at > row.endedAt) {
+    next = {
+      userId, callId: event.callId, direction: row.direction, callerId: event.callerId,
+      ...(event.callerName ?? row.callerName ? { callerName: event.callerName ?? row.callerName } : {}),
+      targetUserIds: event.targetUserIds.length ? event.targetUserIds : row.targetUserIds,
+      lobbyName: event.lobbyName, audioOnly: Boolean(event.audioOnly), outcome: 'ringing', startedAt: at, updatedAt: now,
+    };
+  }
   if (event.callerName && !next.callerName) next.callerName = event.callerName;
   if (event.sessionId && !next.sessionId) next.sessionId = event.sessionId;
   // A late `invite` report must not move the start forward.

@@ -45,3 +45,15 @@ describe('the call log reducer', () => {
     expect(matchesFilter(missedOut, 'outgoing')).toBe(true);
   });
 });
+
+describe('a reused callId', () => {
+  it('starts a new attempt when an invite arrives after the previous one ended', () => {
+    const T3 = '2026-09-09T10:05:00.000Z', T4 = '2026-09-09T10:06:00.000Z';
+    const row = run([
+      base({}), base({ action: 'ended', at: T1 }), base({ action: 'cancelled', at: T1 }),
+      base({ at: T3 }), base({ action: 'missed', at: T4 }),
+    ], 'bob');
+    expect(row).toMatchObject({ outcome: 'missed', startedAt: T3 });
+    expect(row.endedAt).toBeUndefined();
+  });
+});
