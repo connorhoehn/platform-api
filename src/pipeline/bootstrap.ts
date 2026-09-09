@@ -115,6 +115,9 @@ import { StuckRunDetector } from './StuckRunDetector';
 import { scanOrphanedRuns } from './scanOrphanedRuns';
 import { resumeInterruptedRuns } from './resumeInterruptedRuns';
 import { definitionsRepo } from './definitions-repository';
+import { attachFailedRunDeadLetters, isRunRetrigger, retriggerFromDeadLetter, type RunRetriggerPayload } from './failedRunDeadLetters';
+import { getSystemPipeline } from './systemPipelines';
+import { getPipelineBridge } from '../routes/pipelineTriggers';
 import { runWalPreflight } from './WalPreflight';
 import { createShutdown } from './ShutdownOrchestrator';
 import {
@@ -1044,11 +1047,30 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       redriveSink: {
         enqueue: async (env) => {
           const evt = env.body;
+          // A failed RUN is redriven by running it again, not by re-publishing
+          // its failure. See failedRunDeadLetters.ts.
+          if (isRunRetrigger(evt)) {
+            await retriggerFromDeadLetter(evt.payload as unknown as RunRetriggerPayload, {
+              resolveDefinition: async (pipelineId, userId) =>
+                getSystemPipeline(pipelineId)
+                ?? ((userId ? await definitionsRepo.get(userId, pipelineId) : null) as Record<string, unknown> | null),
+              trigger: async (input) => {
+                const bridge = getPipelineBridge();
+                if (!bridge?.trigger) throw new Error('pipeline engine is not available');
+                const out = await Promise.resolve(bridge.trigger(input as never));
+                return { runId: (out as { runId: string }).runId };
+              },
+            });
+            return;
+          }
           await eventBus.publish(evt.type as never, evt.payload as never);
         },
       },
     });
     dlqRef.current = dlq;
+    // Every run that ends `failed` becomes a dead letter of its own — the
+    // operator's one list of things to look at and redrive.
+    attachFailedRunDeadLetters({ eventBus: eventBus as never, dlq });
   }
 
   // --- hub#2224 Wave 2: executor audit subscriber + sweeper ---
