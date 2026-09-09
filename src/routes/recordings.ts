@@ -19,6 +19,7 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { startSystemRun, buildCallTranscriptionDefinition, CALL_TRANSCRIPTION_PIPELINE_ID, documentIdForLobby } from '../recordings/recordingPipelines';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
@@ -48,6 +49,21 @@ import {
 import log from '../lib/logger';
 
 export const recordingsRouter = Router();
+
+// POST /api/recordings/:recordingId/transcribe — (re)run transcription as a
+// pipeline for a recording that has a composed file. The finalize pipeline
+// does this on its own; this is the operator's and the UI's "try again".
+recordingsRouter.post('/recordings/:recordingId/transcribe', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const recordingId = String(req.params.recordingId);
+  const rec = await callRecordingRepo.findByRecordingId(recordingId);
+  if (!rec) throw new NotFoundError('recording not found');
+  await callRecordingRepo.updateTranscriptStatus(rec.callId, rec.recordingId, { status: 'pending', transcriptError: null });
+  const runId = await startSystemRun(CALL_TRANSCRIPTION_PIPELINE_ID, buildCallTranscriptionDefinition(), {
+    recordingId: rec.recordingId, callId: rec.callId, arn: rec.channelArn, lobbyName: rec.lobbyName, composedKey: rec.composedSegment?.key ?? null,
+    startedAt: rec.startedAt, documentId: documentIdForLobby(rec.lobbyName), requestedBy: req.user!.sub,
+  }, req.user!.sub);
+  res.status(202).json({ runId, pipelineId: CALL_TRANSCRIPTION_PIPELINE_ID, recordingId: rec.recordingId });
+}));
 
 // --------------------------------------------------------------------
 // GET /api/recordings — list by authed user, optionally filtered by
@@ -862,6 +878,12 @@ recordingsRouter.get(
     // the platform-api proxy only handles the local-served-by-LVS
     // case below. Adding S3 follows the same pattern as the
     // existing composedUrl handling in /playback-token.
+    // The in-process transcription pipeline stores the transcript on the row.
+    if (detail.transcriptKey === 'inline' && detail.transcriptJson) {
+      const doc = JSON.parse(detail.transcriptJson) as { segments?: Array<{ startMs: number; endMs: number; speakerId: string; speakerLabel: string; text: string }> };
+      res.json({ ...doc, transcriptStatus: 'ready', summaryStatus: detail.summaryStatus ?? (detail.summaryMarkdown ? 'ready' : 'none'), source: 'pipeline' });
+      return;
+    }
     const arnSafe = (detail.channelArn || '').replace(/[^A-Za-z0-9._-]/g, '_');
     const lvsUrl = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(detail.channelArn)}/recordings/${encodeURIComponent(recordingId)}/segments/transcript.json`;
     log.info({ recordingId, userId, transcriptKey: detail.transcriptKey, arnSafe }, '[recordings] transcript fetch');

@@ -61,6 +61,42 @@ jest.mock('../../lib/ddb-table-name', () => ({
   tableName: (name: string) => `test-${name}`,
 }));
 
+// The webhook no longer persists anything itself: it starts the
+// recording-finalize RUN. These tests keep asserting what lands on the row by
+// running the pipeline's own steps inline (resolve → persist → start
+// transcription), exactly as the executor would, with compose treated as
+// settled. A child run (call-transcription) is recorded, not executed.
+const childRuns: Array<{ pipelineId: string; payload: Record<string, unknown> }> = [];
+const childRunFailures: Error[] = [];
+jest.mock('../../recordings/recordingPipelines', () => {
+  const actual = jest.requireActual('../../recordings/recordingPipelines');
+  const recordChild = async (pipelineId: string, _def: unknown, payload: Record<string, unknown>) => {
+    const failure = childRunFailures.shift();
+    if (failure) throw failure;
+    childRuns.push({ pipelineId, payload });
+    return `run-child-${childRuns.length}`;
+  };
+  const startSystemRun = jest.fn(async (pipelineId: string, _def: unknown, payload: Record<string, unknown>) => {
+    if (pipelineId !== actual.RECORDING_FINALIZE_PIPELINE_ID) return recordChild(pipelineId, _def, payload);
+    // Run the finalize steps the way the executor would; a failing step fails
+    // the RUN, never the webhook that started it.
+    const handlers = actual.buildRecordingPipelineHandlers({ startRun: recordChild }) as Map<string, { execute: (n: unknown, c: Record<string, unknown>, h: unknown) => Promise<{ status: string; output?: Record<string, unknown>; error?: string }> }>;
+    const ctx: Record<string, unknown> = { ...payload, steps: {} };
+    const helpers = { runId: 'run-finalize-test', ownerNodeId: 'test', emit: async () => undefined };
+    void (async () => {
+      for (const kind of ['recording:resolve', 'recording:persist']) {
+        const out = await handlers.get(kind)!.execute({ id: kind, type: kind, data: { type: kind } }, ctx, helpers);
+        if (out.status !== 'completed') return;
+        Object.assign(ctx, out.output ?? {});
+      }
+      ctx.composeStatus = 'ok';
+      await handlers.get('transcription:start')!.execute({ id: 'start', type: 'transcription:start', data: {} }, ctx, helpers);
+    })().catch(() => undefined);
+    return 'run-finalize-test';
+  });
+  return { ...actual, startSystemRun };
+});
+
 // NOTE: import AFTER the mocks above so jest swaps the deps.
 import { lvsWebhooksRouter, startedAtFromRecordingId } from '../lvsWebhooks';
 
@@ -74,7 +110,7 @@ function rawPost(
   headers: Record<string, string> = {},
 ): Promise<{ status: number; body: string }> {
   const { port } = server.address() as AddressInfo;
-  return new Promise((resolve, reject) => {
+  return new Promise<{ status: number; body: string }>((resolve, reject) => {
     const req = http.request(
       {
         host: '127.0.0.1',
@@ -96,6 +132,10 @@ function rawPost(
     req.on('error', reject);
     req.write(body);
     req.end();
+  }).then(async (r: { status: number; body: string }) => {
+    // The webhook answers before the run's steps settle; give them a turn.
+    for (let i = 0; i < 20; i++) await new Promise((res) => setImmediate(res));
+    return r;
   });
 }
 
@@ -678,6 +718,8 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
     updateTranscriptStatusMock.mockResolvedValue(undefined);
     catalogPublishMock.mockClear();
     catalogPublishMock.mockResolvedValue(undefined);
+    childRuns.length = 0;
+    childRunFailures.length = 0;
   });
 
   /** A `recording.completed` delivery that opts into transcription. */
@@ -709,8 +751,10 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
     const res = await deliverTranscribable('r-tx-ok');
     expect(res.status).toBe(204);
 
-    expect(catalogPublishMock).toHaveBeenCalledTimes(1);
-    expect(catalogPublishMock.mock.calls[0]![0]).toBe('transcription:job.queued');
+    // Transcription is a child PIPELINE RUN now, not a queue message.
+    expect(childRuns).toHaveLength(1);
+    expect(childRuns[0]!.pipelineId).toBe('call-transcription');
+    expect(childRuns[0]!.payload.recordingId).toBe('r-tx-ok');
     // Exactly one status write: 'pending'. Nothing corrects a publish that
     // did not fail.
     expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(1);
@@ -718,7 +762,7 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
   });
 
   test('a publish that throws marks the row failed with the reason, not pending', async () => {
-    catalogPublishMock.mockRejectedValueOnce(new Error('ECONNREFUSED 127.0.0.1:3004'));
+    childRunFailures.push(new Error('ECONNREFUSED 127.0.0.1:3004'));
 
     // Still 204 — transcription is post-processing, and the recording itself
     // persisted fine. The webhook has never failed for this and must not start.
@@ -739,7 +783,7 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
   });
 
   test('the corrective write addresses the same row as the pending write', async () => {
-    catalogPublishMock.mockRejectedValueOnce(new Error('boom'));
+    childRunFailures.push(new Error('boom'));
     await deliverTranscribable('r-tx-key');
 
     const [pendingCallId, pendingRecordingId] = updateTranscriptStatusMock.mock.calls[0]!;
@@ -761,11 +805,11 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
     expect(res.status).toBe(204);
     expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(1);
     // And nothing was published — the failure happened before the publish.
-    expect(catalogPublishMock).not.toHaveBeenCalled();
+    expect(childRuns).toHaveLength(0);
   });
 
   test('a corrective write that itself fails does not fail the webhook', async () => {
-    catalogPublishMock.mockRejectedValueOnce(new Error('publish down'));
+    childRunFailures.push(new Error('publish down'));
     updateTranscriptStatusMock
       .mockResolvedValueOnce(undefined)                       // pending — ok
       .mockRejectedValueOnce(new Error('ddb down'));          // failed — also down
@@ -794,7 +838,7 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
     const res = await rawPost(server, '/hooks/lvs/recording', body, signedHeaders(body));
     expect(res.status).toBe(204);
     expect(updateTranscriptStatusMock).not.toHaveBeenCalled();
-    expect(catalogPublishMock).not.toHaveBeenCalled();
+    expect(childRuns).toHaveLength(0);
   });
 });
 

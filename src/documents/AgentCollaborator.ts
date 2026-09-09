@@ -8,7 +8,6 @@
 // route into a document — which is what makes the edit indistinguishable from
 // a person's once it lands: same conflict handling, same undo history, same
 // snapshots, same presence.
-import { WebSocket } from 'ws';
 import type * as YT from 'yjs' with { 'resolution-mode': 'import' };
 // yjs ships ESM types but a CJS build; under `module: node16` the value has to
 // come in through require while the types come in as type-only.
@@ -19,12 +18,9 @@ import type * as AwarenessT from 'y-protocols/awareness' with { 'resolution-mode
 const awarenessProtocol = require('y-protocols/awareness') as typeof AwarenessT;
 import log from '../lib/logger';
 
-export interface AgentIdentity {
-  /** The gateway user id. `agent:` prefix so nothing mistakes it for a person. */
-  userId: string;
-  displayName: string;
-  color: string;
-}
+import { GatewayServiceClient, type ServiceIdentity } from '../gateway/GatewayServiceClient';
+
+export type AgentIdentity = ServiceIdentity & { color: string };
 
 export const HAIKU_AGENT: AgentIdentity = { userId: 'agent:haiku', displayName: 'Haiku', color: '#8b5cf6' };
 
@@ -37,85 +33,43 @@ export interface AgentCollaboratorOptions {
   snapshotTimeoutMs?: number;
 }
 
-const b64url = (s: string) => Buffer.from(s).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
-
-/**
- * The gateway's dev auth (`SKIP_AUTH`) reads identity from a decoded — not
- * verified — bearer token in the subprotocol; that is how the browser's dev
- * identities arrive too. In a signed deployment this is where a service
- * token minted for the agent identity goes instead.
- */
-export function agentToken(identity: AgentIdentity): string {
-  const header = b64url(JSON.stringify({ alg: 'none', typ: 'JWT' }));
-  const payload = b64url(JSON.stringify({
-    sub: identity.userId,
-    given_name: identity.displayName,
-    family_name: '(agent)',
-    email: `${identity.userId.replace(/[^a-z0-9]+/gi, '-')}@agents.local`,
-    iat: Math.floor(Date.now() / 1000),
-  }));
-  return `${header}.${payload}.`;
-}
-
 export class AgentCollaborator {
   readonly doc = new Y.Doc();
   readonly channel: string;
   readonly identity: AgentIdentity;
-  private readonly url: string;
-  private ws: WebSocket | null = null;
+  private readonly client: GatewayServiceClient;
   private awareness: AwarenessT.Awareness | null = null;
   private readonly snapshotTimeoutMs: number;
 
   constructor(opts: AgentCollaboratorOptions) {
     this.identity = opts.identity ?? HAIKU_AGENT;
     this.channel = `doc:${opts.documentId}`;
-    this.url = (opts.gatewayUrl ?? process.env.GATEWAY_WS_URL ?? 'ws://localhost:18080').replace(/\/$/, '');
+    this.client = new GatewayServiceClient(this.identity, opts.gatewayUrl);
     this.snapshotTimeoutMs = opts.snapshotTimeoutMs ?? 4000;
   }
 
-  private send(frame: Record<string, unknown>): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(frame));
-  }
+  private send(frame: Record<string, unknown>): void { this.client.send(frame); }
 
   /** Connect, subscribe, and resolve once the document's current state is in `doc`. */
   async join(): Promise<void> {
-    const url = `${this.url}/?userId=${encodeURIComponent(this.identity.userId)}`;
-    const ws = new WebSocket(url, ['bearer-token-v1', agentToken(this.identity)]);
-    this.ws = ws;
-
     // Our own changes go out as updates; theirs come in and are applied with a
     // `remote` origin so they are never echoed back.
     this.doc.on('update', (update: Uint8Array, origin: unknown) => {
       if (origin === 'remote') return;
       this.send({ service: 'crdt', action: 'update', channel: this.channel, update: Buffer.from(update).toString('base64') });
     });
-
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`gateway did not open within ${this.snapshotTimeoutMs}ms (${this.url})`)), this.snapshotTimeoutMs);
-      ws.once('open', () => { clearTimeout(timer); resolve(); });
-      ws.once('error', (err) => { clearTimeout(timer); reject(err); });
+    await this.client.connect(this.snapshotTimeoutMs);
+    this.client.onFrame((msg) => {
+      if (msg.channel !== this.channel) return;
+      if (msg.type === 'crdt:update' && typeof msg.update === 'string') {
+        Y.applyUpdate(this.doc, new Uint8Array(Buffer.from(msg.update, 'base64')), 'remote');
+      }
     });
-
-    const snapshot = new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        log.warn({ channel: this.channel }, 'agent collaborator: no snapshot arrived; treating the document as empty');
-        resolve();
-      }, this.snapshotTimeoutMs);
-      ws.on('message', (raw) => {
-        let msg: Record<string, unknown>;
-        try { msg = JSON.parse(String(raw)) as Record<string, unknown>; } catch { return; }
-        if (msg.channel !== this.channel) return;
-        if (msg.type === 'crdt:snapshot' && typeof msg.snapshot === 'string') {
-          Y.applyUpdate(this.doc, new Uint8Array(Buffer.from(msg.snapshot, 'base64')), 'remote');
-          clearTimeout(timer);
-          resolve();
-        } else if (msg.type === 'crdt:update' && typeof msg.update === 'string') {
-          Y.applyUpdate(this.doc, new Uint8Array(Buffer.from(msg.update, 'base64')), 'remote');
-        }
-      });
-    });
+    const snapshot = this.client.waitFor((f) => f.channel === this.channel && f.type === 'crdt:snapshot' && typeof f.snapshot === 'string', this.snapshotTimeoutMs);
     this.send({ service: 'crdt', action: 'subscribe', channel: this.channel });
-    await snapshot;
+    const snap = await snapshot;
+    if (snap) Y.applyUpdate(this.doc, new Uint8Array(Buffer.from(snap.snapshot as string, 'base64')), 'remote');
+    else log.warn({ channel: this.channel }, 'agent collaborator: no snapshot arrived; treating the document as empty');
   }
 
   /** Show up in the document's presence, as an editor. */
@@ -144,8 +98,6 @@ export class AgentCollaborator {
       this.send({ service: 'crdt', action: 'awareness', channel: this.channel, update: Buffer.from(update).toString('base64') });
     }
     this.send({ service: 'crdt', action: 'unsubscribe', channel: this.channel });
-    await new Promise((r) => setTimeout(r, 150));
-    this.ws?.close();
-    this.ws = null;
+    await this.client.close(150);
   }
 }

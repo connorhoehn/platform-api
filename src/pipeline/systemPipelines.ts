@@ -4,6 +4,7 @@
 // be edited from the UI, and are served read-only beside a user's own so the
 // pipeline pages can name their steps and list their runs.
 import { buildDocumentAgentEditDefinition, DOCUMENT_AGENT_EDIT_PIPELINE_ID } from '../documents/documentAgentPipeline';
+import { buildRecordingFinalizeDefinition, buildCallTranscriptionDefinition, RECORDING_FINALIZE_PIPELINE_ID, CALL_TRANSCRIPTION_PIPELINE_ID } from '../recordings/recordingPipelines';
 
 export interface SystemPipelineEntry {
   id: string;
@@ -12,6 +13,8 @@ export interface SystemPipelineEntry {
 
 const REGISTRY: SystemPipelineEntry[] = [
   { id: DOCUMENT_AGENT_EDIT_PIPELINE_ID, build: () => buildDocumentAgentEditDefinition() },
+  { id: RECORDING_FINALIZE_PIPELINE_ID, build: () => buildRecordingFinalizeDefinition() },
+  { id: CALL_TRANSCRIPTION_PIPELINE_ID, build: () => buildCallTranscriptionDefinition() },
 ];
 
 export function registerSystemPipeline(entry: SystemPipelineEntry): void {

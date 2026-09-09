@@ -284,6 +284,8 @@ export interface CallRecording {
    *  switch to summaryKey + blob storage; both fields kept so the
    *  migration is a write-shape change, not a type change. */
   summaryMarkdown?: string;
+  /** Transcript stored on the row when `transcriptKey === 'inline'` (the in-process transcription pipeline). */
+  transcriptJson?: string;
   /** ISO timestamp when the worker wrote the transcript. */
   transcriptGeneratedAt?: string;
   /** Last-error string when transcriptStatus === 'failed'. Truncated to 200 chars. */
@@ -1175,6 +1177,8 @@ export class CallRecordingRepository extends BaseRepository {
     patch: {
       status: 'pending' | 'processing' | 'ready' | 'failed';
       transcriptKey?: string;
+      /** The transcript itself, when stored on the row (`transcriptKey === 'inline'`). */
+      transcriptJson?: string;
       summaryKey?: string;
       summaryMarkdown?: string;
       transcriptGeneratedAt?: string;
@@ -1205,6 +1209,10 @@ export class CallRecordingRepository extends BaseRepository {
     if (patch.transcriptKey !== undefined) {
       sets.push('transcriptKey = :k');
       values[':k'] = patch.transcriptKey;
+    }
+    if (patch.transcriptJson !== undefined) {
+      sets.push('transcriptJson = :tj');
+      values[':tj'] = patch.transcriptJson;
     }
     if (patch.summaryKey !== undefined) {
       sets.push('summaryKey = :sk');

@@ -102,6 +102,7 @@ import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
+import { buildRecordingPipelineHandlers } from '../recordings/recordingPipelines';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
@@ -729,6 +730,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   }
   // The chat's /doc command: read → plan (light model) → apply as a collaborator.
   for (const [key, handler] of buildDocumentAgentHandlers()) {
+    customStepHandlers.set(key, handler);
+  }
+  // After a call: finalize the recording and transcribe it — as runs, not inline code.
+  for (const [key, handler] of buildRecordingPipelineHandlers()) {
     customStepHandlers.set(key, handler);
   }
 

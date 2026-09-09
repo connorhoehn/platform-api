@@ -62,6 +62,7 @@ import {
   type TruthTrack,
 } from '../lib/recording-truth';
 import { resolveRecordingProfile } from '@connorhoehn/event-catalog';
+import { startSystemRun, buildRecordingFinalizeDefinition, RECORDING_FINALIZE_PIPELINE_ID } from '../recordings/recordingPipelines';
 
 export const lvsWebhooksRouter = Router();
 
@@ -72,6 +73,8 @@ export const lvsWebhooksRouter = Router();
 // Process-local; lost on restart. Cheap, useful for live debugging.
 // --------------------------------------------------------------------
 export interface LvsDeliveryRecord {
+  /** The recording-finalize run this delivery started. */
+  runId?: string;
   timestamp: string;
   eventType: string;
   arn: string;
@@ -416,301 +419,19 @@ lvsWebhooksRouter.post('/recording', async (req: Request, res: Response) => {
   // arn-index that videoSessions.ts writes at session-create. From
   // there we hop to VideoSession (for participants) and the gateway
   // CallSessionBindingRepository (for callId, queried by lobbyName).
-  let session: any = null;
+  // Everything that used to happen here — the row, the wait for the composed
+  // file, the card in the conversation, transcription — is a pipeline run
+  // now: persisted, retried, resumable, visible. The webhook's whole job is
+  // to say "a recording finished" and answer quickly.
   try {
-    const { getRedisClient } = await import('../lib/redis-client.js');
-    const redis = await getRedisClient();
-    if (redis) {
-      const raw = await redis.get(`video:arn-index:${arn}`);
-      if (raw) {
-        const idx = JSON.parse(raw) as { sessionId: string; lobbyName: string };
-        session = await videoSessionRepo.getSession?.(idx.lobbyName, idx.sessionId).catch(() => null);
-        if (session) {
-          log.info({ arn, sessionId: idx.sessionId, lobbyName: idx.lobbyName }, '[lvs-webhook] resolved arn via Redis index');
-        } else {
-          log.warn({ arn, sessionId: idx.sessionId }, '[lvs-webhook] arn-index hit but VideoSession missing — proceeding with DDB fallback');
-        }
-      } else {
-        log.warn({ arn }, '[lvs-webhook] no arn-index entry — proceeding with DDB fallback');
-      }
-    }
-  } catch (lookupErr: any) {
-    log.warn({ err: lookupErr?.message ?? lookupErr, arn }, '[lvs-webhook] arn lookup threw — proceeding with DDB fallback');
-  }
-
-  // DDB fallback — when Redis miss / Redis down / arn-index expired we
-  // scan document-video-sessions by channelArn. This was the root cause
-  // of "DM recordings never appear in /recordings": DM lobbies create a
-  // fresh VideoSession + arn-index per ring, and any Redis blip between
-  // session-create and recording-completed left the webhook with no
-  // lobbyName → no startedBy → no fan-out row → invisible recording.
-  // Group hangouts dodged this because the static `global-hangout` lobby
-  // had a long-lived arn-index that almost never expired mid-call.
-  if (!session) {
-    try {
-      const matches = await videoSessionRepo.findByChannelArn(arn);
-      if (matches.length > 0) {
-        session = matches[0];
-        log.info({ arn, sessionId: session.sessionId, lobbyName: session.documentId, source: 'ddb-scan' }, '[lvs-webhook] resolved arn via DDB scan fallback');
-      } else {
-        log.warn({ arn }, '[lvs-webhook] DDB scan fallback found no matching VideoSession');
-      }
-    } catch (scanErr: any) {
-      log.warn({ err: scanErr?.message ?? scanErr, arn }, '[lvs-webhook] DDB scan fallback threw');
-    }
-  }
-
-  const lobbyName = session?.documentId ?? '';
-  const callId = lobbyName ? await resolveCallIdByLobby(lobbyName) : null;
-
-  if (!callId) {
-    log.warn({ arn, lobbyName }, '[lvs-webhook] no callId binding — persisting under recordingId-only');
-  }
-
-  // Convert VideoSession participants → CallRecordingParticipant
-  let participants: CallRecordingParticipant[] = (session?.participants ?? []).map((p: any) => ({
-    userId: p.userId,
-    displayName: p.displayName,
-    participantId: p.participantId,
-    joinedAt: p.joinedAt,
-  }));
-
-  // DM-pattern derivation. Final safety net for `dm:<a>:<b>` lobbies when
-  // both the Redis arn-index AND the DDB session-by-arn scan came back
-  // empty (e.g. session row already TTL'd by the time the webhook fires
-  // — rare but happens in soak runs). The lobby name itself encodes the
-  // two participants, so we can fan-out to both userIds and at least keep
-  // the recording reachable from the list view. Display names are
-  // unrecoverable here; FE renders the userId fragment instead.
-  if (participants.length === 0 && lobbyName.startsWith('dm:')) {
-    const ids: string[] = lobbyName
-      .slice(3) // strip "dm:"
-      .split(':')
-      .filter((s: string) => s.length > 0);
-    if (ids.length >= 2) {
-      participants = ids.map((userId: string): CallRecordingParticipant => ({ userId }));
-      log.info({ arn, lobbyName, derivedParticipants: ids.length }, '[lvs-webhook] derived DM participants from lobby name');
-    }
-  }
-
-  // Leg-truth reconciliation — see lib/recording-truth.ts for the full
-  // rationale and the measurements. In short, neither of the two numbers
-  // LVS hands us means what the UI rendered it as:
-  //
-  //   `session.participants` is the CHANNEL's lifetime roster: appended to
-  //   on every join, never deduped, never scoped to one recording, and
-  //   snapshotted after the initiator usually already hung up. Rendering
-  //   its length gave a 2-person DM "7 👥" and dropped the caller entirely.
-  //
-  //   `detail.durationMs` is the SFU channel-session lifetime, which
-  //   includes the ring, the lobby wait and teardown. Rendering it as
-  //   "Duration" overstated every single recording on disk.
-  //
-  // Both corrections are pure functions of the payload we already have,
-  // and both run again on read so a row that predates this code (or one
-  // written by a pod that hasn't rolled) still renders honestly.
-  const rawTracks: TruthTrack[] = Array.isArray(detail.tracks) ? detail.tracks : [];
-  const sessionDurationMs = Number(detail.durationMs ?? 0);
-  // `startedAt` is not a display field — it is HALF THE SORT KEY of the
-  // fan-out index (`${startedAt}#${recordingId}`), so whatever we compute
-  // here decides whether a redelivered webhook overwrites its own row or
-  // opens a second one.
-  //
-  // It used to be `new Date(Date.now() - sessionDurationMs)`, i.e. the
-  // handling clock, which is a different value on every delivery. That is
-  // the duplicate-row bug: recordingId 2026-09-07T10-30-33-757Z-4b2365cf
-  // holds two fan-out rows differing only in 30ms of `startedAt`, with
-  // identical durationMs, participants and callId. Eight rows, seven
-  // recordings, and the list showed one call twice.
-  //
-  // Three sources, in decreasing order of truth:
-  //   1. `detail.startedAt` — LVS now sends it (RecordingManager's
-  //      recording.completed emit). Same event, same value, always.
-  //   2. The recordingId, which LVS mints as
-  //      `<ISO with : and . replaced by ->-<rand>` at recording start —
-  //      the exact same instant, recoverable losslessly. Covers LVS pods
-  //      that predate (1).
-  //   3. The handling clock, as before. Reached only when neither of the
-  //      above parses, and no longer the normal path.
-  const startedAt: string =
-    detail.startedAt
-    ?? startedAtFromRecordingId(recordingId)
-    ?? new Date(Date.now() - sessionDurationMs).toISOString();
-  // Derived from `startedAt` rather than the wall clock for the same
-  // reason: two deliveries of one event must agree.
-  const endedAt: string =
-    detail.endedAt
-    ?? new Date(Date.parse(startedAt) + sessionDurationMs).toISOString();
-  // VideoSessionRecord exposes the creator as `startedBy` (NOT `createdBy`
-  // — that field doesn't exist on the record). Resolved BEFORE
-  // reconciliation now, because the initiator has to be unioned into
-  // participants[]: they were in their own call even when the live roster
-  // no longer says so.
-  const startedBy: string | undefined = session?.startedBy ?? participants[0]?.userId;
-  const reconciled = reconcileParticipants({
-    participants,
-    tracks: rawTracks,
-    startedBy,
-    startedAt,
-    endedAt,
-  });
-  participants = reconciled.participants;
-  const participantCount = reconciled.participantCount;
-  const mediaDurationMs = deriveMediaDurationMs({
-    tracks: rawTracks,
-    sessionDurationMs,
-  });
-
-  try {
-    await callRecordingRepo.putRecording({
-      callId: callId ?? `unknown-${arn}-${recordingId}`,
-      recordingId,
-      channelArn: arn,
-      lobbyName,
-      sessionId: session?.sessionId,
-      startedAt,
-      endedAt,
-      // Media length — what a viewer means by "Duration", and what the
-      // player's own timeline shows. The raw session lifetime is kept
-      // alongside it rather than discarded.
-      durationMs: mediaDurationMs,
-      sessionDurationMs,
-      totalBytes: Number(detail.totalSize ?? detail.totalBytes ?? 0),
-      segments: Array.isArray(detail.segments) ? detail.segments : [],
-      destination: detail.destination === 's3' ? 's3' : 'local',
-      participants,
-      // Distinct PEOPLE (deduped by userId, scoped to this recording,
-      // floored at the recorded-leg count so participantId-only legs still
-      // count) — never `participants.length` on the raw roster, which is a
-      // join count.
-      participantCount,
-      startedBy,
-      // W8 — thumbnail surfaced by LVS RecordingManager. May be a
-      // file:// URL in dev (hostPath) or a backend-specific URL in
-      // prod (S3 signed / CloudFront / etc.). Null when ffmpeg
-      // thumbnail step failed.
-      thumbnailUrl: typeof detail.thumbnailUrl === 'string' ? detail.thumbnailUrl : undefined,
-      // R2 — composed grid playback URL + per-peer raw tracks. LVS
-      // emits these on `recording.completed` when the call had ≥2
-      // producers and `composeEnabled !== false`. Missing for
-      // single-producer calls (legacy) — FE falls back to the first
-      // segment[0].url as the playback target.
-      composedUrl: typeof detail.composedUrl === 'string' ? detail.composedUrl : undefined,
-      tracks: Array.isArray(detail.tracks) ? detail.tracks : undefined,
-    });
-    log.info(
-      {
-        callId,
-        recordingId,
-        arn,
-        participants: participants.length,
-        participantCount,
-        startedBy,
-        legs: rawTracks.length,
-        // Both durations logged so a "the UI says 18s but the file is 8s"
-        // report can be triaged from the log line alone.
-        mediaDurationMs,
-        sessionDurationMs,
-      },
-      '[lvs-webhook] recording persisted',
-    );
-
-    // Transcription pipeline trigger. Wave 3 / ADR-002 — read the
-    // canonical `recordingProfile` first; resolveRecordingProfile expands
-    // it to {composePerPeer, transcribe, …}. The legacy `transcribe`
-    // boolean is still accepted for one release window so LVS pods that
-    // haven't bumped past 14217e7 keep working.
-    //
-    // Best-effort: failures here log + metric but do NOT fail the webhook
-    // 204 — the worst case is "recording exists, transcript missing" which
-    // the user can re-trigger from the UI. We avoid wrapping the put +
-    // publish in an outbox TransactWrite because the put already does a
-    // multi-table fan-out (target + N participant rows) which
-    // publishWithOutbox's single-target model doesn't fit.
-    const webhookSaysTranscribe = detail.transcribe === true || detail.transcribe === 'true';
-    const resolvedProfile = resolveRecordingProfile({
-      recordingProfile: typeof detail.recordingProfile === 'string' ? detail.recordingProfile : undefined,
-      transcribe: webhookSaysTranscribe,
-      composePerPeer: detail.composePerPeer === true || detail.composePerPeer === 'true',
-      // LVS's denormalized `transcribe` reflects ITS resolved config —
-      // including per-channel overrides (e.g. dm-profile transcribe
-      // opt-in via LVS_DM_TRANSCRIBE). Re-resolving from the bare
-      // profile id here used to DROP that override (profile id wins
-      // over legacy flags in resolveRecordingProfile), silently turning
-      // transcription back off for dm recordings. Passing it as an
-      // override keeps profiles whose `overridable` list excludes
-      // `transcribe` unaffected.
-      overrides: webhookSaysTranscribe ? { transcribe: true } : undefined,
-    });
-    const wantTranscribe = resolvedProfile.transcribe === true;
-    if (wantTranscribe) {
-      const persistedCallId = callId ?? `unknown-${arn}-${recordingId}`;
-      // `pending` is written BEFORE the publish on purpose: once the job is
-      // on the queue a worker may pick it up and move the row to
-      // 'processing' at any moment, and a status write sequenced after the
-      // publish would race that and stamp the row back to 'pending'.
-      //
-      // The cost of that ordering is that a failed publish leaves a row
-      // claiming 'pending' for a job that is not on any queue — which the
-      // transcript endpoint can only discover by waiting out
-      // TRANSCRIPT_STALL_MS (~20 minutes) and then guessing 'stalled'. We
-      // know better than that, here and now: the publish threw. So on the
-      // failure path we correct the row to 'failed' with the reason,
-      // turning a twenty-minute timeout into an immediate, specific answer
-      // in the UI.
-      let pendingWritten = false;
-      try {
-        await callRecordingRepo.updateTranscriptStatus(persistedCallId, recordingId, {
-          status: 'pending',
-        });
-        pendingWritten = true;
-        await catalog.publish('transcription:job.queued', {
-          recordingId,
-          callId: persistedCallId,
-          channelArn: arn,
-          tracks: Array.isArray(detail.tracks) ? detail.tracks : [],
-        });
-        log.info({ recordingId, callId: persistedCallId, trackCount: Array.isArray(detail.tracks) ? detail.tracks.length : 0 },
-          '[lvs-webhook] transcription job queued');
-      } catch (txErr: any) {
-        // Don't fail the webhook — transcription is a non-critical
-        // post-processing feature. Log with enough context that an
-        // operator can manually re-trigger from the UI.
-        const reason = typeof txErr?.message === 'string' ? txErr.message : String(txErr);
-        log.warn({ err: reason, recordingId, callId: persistedCallId, pendingWritten },
-          '[lvs-webhook] transcription enqueue failed (recording still persisted)');
-        // Only worth attempting when the `pending` write itself succeeded.
-        // If THAT is what threw (a missing row fails the
-        // attribute_exists(callId) condition) the corrective write would
-        // fail identically, and there is no row to correct anyway.
-        if (pendingWritten) {
-          try {
-            await callRecordingRepo.updateTranscriptStatus(persistedCallId, recordingId, {
-              status: 'failed',
-              transcriptError: `enqueue failed: ${reason}`,
-            });
-          } catch (markErr: any) {
-            // Now the row really is stuck on 'pending' and the stall timer
-            // is the only backstop left. Say so, rather than leaving a
-            // silent gap between the two writes.
-            log.warn({ err: markErr?.message ?? markErr, recordingId, callId: persistedCallId },
-              '[lvs-webhook] could not mark transcript failed — row left pending, stall timer is the only backstop');
-          }
-        }
-      }
-    }
-
-    recordDelivery({
-      timestamp: new Date().toISOString(),
-      eventType,
-      arn,
-      recordingId,
-      hmacOk: true,
-      persisted: true,
-    });
+    const runId = await startSystemRun(RECORDING_FINALIZE_PIPELINE_ID, buildRecordingFinalizeDefinition(), {
+      arn, recordingId, eventType, detail,
+    }, 'system');
+    recordDelivery({ timestamp: new Date().toISOString(), eventType, arn, recordingId, hmacOk: true, persisted: true, error: undefined, runId } as LvsDeliveryRecord);
+    log.info({ arn, recordingId, runId }, '[lvs-webhook] recording-finalize run started');
     res.status(204).end();
   } catch (e: any) {
-    log.error({ err: e?.message ?? e, callId, recordingId }, '[lvs-webhook] persist failed');
+    log.error({ err: e?.message ?? e, arn, recordingId }, "[lvs-webhook] run start failed");
     recordDelivery({
       timestamp: new Date().toISOString(),
       eventType,
