@@ -47,6 +47,47 @@ export interface TransformRequest {
   target: { name: string; fields: TransformTargetField[] };
 }
 
+/**
+ * Macro fences are lifted OUT of the source before the model sees it and put
+ * back afterwards — the model is handed opaque placeholders and told to keep
+ * them where they belong.
+ *
+ * Measured: told "VERBATIM, byte for byte", the light model still dropped a
+ * links block from a page that had little else. A citizen the inbox may be
+ * keyed on cannot depend on a model's compliance, so it does not: the fence
+ * never leaves this process. A placeholder the model loses is re-attached under
+ * a final "## Notes" heading — a transform may misplace a block, never lose one.
+ */
+const FENCE_RE = /```macro:[a-z-]+\n[\s\S]*?\n```/g;
+const placeholder = (i: number) => `[[MACRO_${i + 1}]]`;
+
+export interface LiftedMacros {
+  markdown: string;
+  fences: string[];
+}
+
+export function liftMacros(markdown: string): LiftedMacros {
+  const fences: string[] = [];
+  const lifted = markdown.replace(FENCE_RE, (fence) => {
+    fences.push(fence);
+    return placeholder(fences.length - 1);
+  });
+  return { markdown: lifted, fences };
+}
+
+export function restoreMacros(markdown: string, fences: string[]): string {
+  let out = markdown;
+  const missing: string[] = [];
+  fences.forEach((fence, i) => {
+    const token = placeholder(i);
+    if (out.includes(token)) out = out.split(token).join(fence);
+    else missing.push(fence);
+  });
+  if (missing.length === 0) return out;
+  const notes = /^## Notes\s*$/m.test(out) ? '' : '\n\n## Notes';
+  return `${out.trimEnd()}${notes}\n\n${missing.join('\n\n')}`;
+}
+
 /** The instruction, as one place to read what the model was asked. */
 export function transformPrompts(req: TransformRequest): { system: string; user: string } {
   const fieldList = req.target.fields.length
@@ -56,7 +97,7 @@ export function transformPrompts(req: TransformRequest): { system: string; user:
     'You restructure documents from one known type into another. Output ONLY the transformed document as markdown — no preamble, no explanation, no code fence around the whole document.',
     'You never ask for more input and never refuse. A thin source is still a document: produce the target headings, place whatever content exists under them, carry every macro block, and leave the rest empty. Questions and apologies are not a document and will be discarded.',
     'Rules:',
-    '1. Preserve every ```macro:...``` fenced block VERBATIM, byte for byte, including its YAML. Move it under the most relevant heading; never edit, merge, split or drop one.',
+    '1. Tokens of the form [[MACRO_n]] stand for structured blocks (checklists, callouts, decisions, files). Keep every one of them, each on its own line, under the most relevant heading. Never edit, duplicate or drop a token, and never write one that was not in the source.',
     '2. Use the target type\'s fields as level-2 headings, in the order given. Put the source content that answers each field under it. Leave a field\'s section empty rather than inventing content.',
     '3. Content that fits no target field goes under a final "## Notes" heading. Do not summarise it away.',
     '4. Keep the level-1 title line if the source has one.',
@@ -136,10 +177,11 @@ export function createDocumentTransformRouter(client?: LLMClient): Router {
   router.post('/transform', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const request = validate(req.body);
     llm = llm ?? createLLMClient();
-    const { system, user } = transformPrompts(request);
+    const lifted = liftMacros(request.markdown);
+    const { system, user } = transformPrompts({ ...request, markdown: lifted.markdown });
     const started = Date.now();
     const raw = await completeStream(llm, DEFAULT_MODEL, system, user);
-    const markdown = extractMarkdown(raw);
+    const markdown = restoreMacros(extractMarkdown(raw), lifted.fences);
     if (!markdown) throw new ValidationError('The model returned an empty document');
     if (!looksLikeDocument(markdown)) {
       log.warn({ event: 'document.transform.refused', target: request.target.name, head: markdown.slice(0, 160) }, 'model did not return a document');
