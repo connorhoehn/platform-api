@@ -146,6 +146,14 @@ profilesRouter.post('/', asyncHandler(async (req: Request, res: Response): Promi
 }));
 
 // GET /api/profiles/:userId — read profile with visibility gating (PROF-03, PROF-04, PROF-05)
+// GET /api/profiles/batch?ids=a,b,c — the contacts list reads everyone's
+// forwarding status in one request rather than one per person.
+profilesRouter.get('/batch', asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const ids = String(req.query.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 200);
+  const profiles = (await Promise.all(ids.map((id) => profileRepo.getProfile(id)))).filter((p): p is NonNullable<typeof p> => p !== null);
+  res.status(200).json({ profiles });
+}));
+
 profilesRouter.get('/:userId', asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { userId } = req.params;
 
@@ -173,10 +181,11 @@ profilesRouter.get('/:userId', asyncHandler(async (req: Request, res: Response):
 
 // PUT /api/profiles — update own profile (PROF-02)
 profilesRouter.put('/', asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const { displayName, bio, avatarUrl, visibility } = req.body as {
+  const { displayName, bio, avatarUrl, visibility, callForwarding } = req.body as {
     displayName?: string;
     bio?: string;
     avatarUrl?: string;
+    callForwarding?: { mode?: string; toUserId?: string } | null;
     visibility?: string;
   };
 
@@ -192,6 +201,20 @@ profilesRouter.put('/', asyncHandler(async (req: Request, res: Response): Promis
   }
 
   const userId = req.user!.sub;
+  // Call forwarding is a status others read from the contacts list and a rule
+  // the person's OWN client applies to incoming rings; see CallForwarding.
+  let forwarding: { mode: 'off' | 'dnd' | 'forward'; toUserId?: string } | undefined;
+  if (callForwarding !== undefined) {
+    const mode = callForwarding?.mode ?? 'off';
+    if (mode !== 'off' && mode !== 'dnd' && mode !== 'forward') throw new ValidationError('callForwarding.mode must be off, dnd or forward');
+    if (mode === 'forward') {
+      if (typeof callForwarding?.toUserId !== 'string' || !callForwarding.toUserId) throw new ValidationError('callForwarding.toUserId is required when forwarding');
+      if (callForwarding.toUserId === userId) throw new ValidationError('you cannot forward calls to yourself');
+      forwarding = { mode, toUserId: callForwarding.toUserId };
+    } else {
+      forwarding = { mode };
+    }
+  }
 
   // Check profile exists
   const existing = await profileRepo.getProfile(userId);
@@ -203,6 +226,7 @@ profilesRouter.put('/', asyncHandler(async (req: Request, res: Response): Promis
     ...(displayName !== undefined ? { displayName } : {}),
     ...(bio !== undefined ? { bio } : {}),
     ...(avatarUrl !== undefined ? { avatarUrl } : {}),
+    ...(forwarding !== undefined ? { callForwarding: forwarding } : {}),
     ...(visibility !== undefined ? { visibility: visibility as 'public' | 'private' } : {}),
   });
 

@@ -2,11 +2,25 @@ import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
 
+export interface CallForwarding {
+  mode: 'off' | 'dnd' | 'forward';
+  toUserId?: string;
+}
+
 export interface ProfileItem {
   userId: string;
   displayName: string;
   bio: string;
   avatarUrl: string;
+  /**
+   * Where this person's calls go. `off` rings them; `dnd` has their client
+   * decline at once (the caller is told why); `forward` declines and names
+   * `toUserId` so the caller can ring that person instead. A STATUS others can
+   * read from the contacts list, not a server-side redirect — the gateway
+   * relays invites verbatim, and the callee's own client is the one that knows
+   * it is busy.
+   */
+  callForwarding?: CallForwarding;
   visibility: 'public' | 'private';
   createdAt: string;
   updatedAt: string;
@@ -27,7 +41,7 @@ export class ProfileRepository extends BaseRepository {
 
   async updateProfile(
     userId: string,
-    updates: Partial<Pick<ProfileItem, 'displayName' | 'bio' | 'avatarUrl' | 'visibility'>>,
+    updates: Partial<Pick<ProfileItem, 'displayName' | 'bio' | 'avatarUrl' | 'visibility' | 'callForwarding'>>,
   ): Promise<ProfileItem> {
     const expressions: string[] = [];
     const exprValues: Record<string, unknown> = {};
@@ -47,6 +61,10 @@ export class ProfileRepository extends BaseRepository {
     if (updates.visibility !== undefined) {
       expressions.push('visibility = :visibility');
       exprValues[':visibility'] = updates.visibility;
+    }
+    if (updates.callForwarding !== undefined) {
+      expressions.push('callForwarding = :callForwarding');
+      exprValues[':callForwarding'] = updates.callForwarding;
     }
 
     const now = new Date().toISOString();
