@@ -54,6 +54,7 @@ export function transformPrompts(req: TransformRequest): { system: string; user:
     : '- (the type declares no fields; keep the document\'s own headings)';
   const system = [
     'You restructure documents from one known type into another. Output ONLY the transformed document as markdown — no preamble, no explanation, no code fence around the whole document.',
+    'You never ask for more input and never refuse. A thin source is still a document: produce the target headings, place whatever content exists under them, carry every macro block, and leave the rest empty. Questions and apologies are not a document and will be discarded.',
     'Rules:',
     '1. Preserve every ```macro:...``` fenced block VERBATIM, byte for byte, including its YAML. Move it under the most relevant heading; never edit, merge, split or drop one.',
     '2. Use the target type\'s fields as level-2 headings, in the order given. Put the source content that answers each field under it. Leave a field\'s section empty rather than inventing content.',
@@ -73,6 +74,18 @@ export function transformPrompts(req: TransformRequest): { system: string; user:
     'DOCUMENT>>>',
   ].join('\n');
   return { system, user };
+}
+
+/**
+ * Does the answer look like a document at all?
+ *
+ * A model that asks a question ("Could you provide the source?") returns prose
+ * with no heading and no macro fence. Seeding a page with that would put the
+ * refusal on screen as the document — measured, once — so it is rejected here
+ * with a message the person can act on, and the source page stays untouched.
+ */
+export function looksLikeDocument(markdown: string): boolean {
+  return /^#{1,6}\s+\S/m.test(markdown) || /^```macro:/m.test(markdown);
 }
 
 /** A model that wraps the whole answer in one fence gets unwrapped; anything else is kept as-is. */
@@ -128,6 +141,10 @@ export function createDocumentTransformRouter(client?: LLMClient): Router {
     const raw = await completeStream(llm, DEFAULT_MODEL, system, user);
     const markdown = extractMarkdown(raw);
     if (!markdown) throw new ValidationError('The model returned an empty document');
+    if (!looksLikeDocument(markdown)) {
+      log.warn({ event: 'document.transform.refused', target: request.target.name, head: markdown.slice(0, 160) }, 'model did not return a document');
+      throw new ValidationError('The model did not return a document for this page — try again, or add a little prose first.');
+    }
     log.info({ event: 'document.transform', provider: llm.provider, model: DEFAULT_MODEL, target: request.target.name, ms: Date.now() - started, bytesIn: request.markdown.length, bytesOut: markdown.length, userId: req.user?.sub }, 'transformed');
     res.status(200).json({ markdown, model: DEFAULT_MODEL, provider: llm.provider });
   }));

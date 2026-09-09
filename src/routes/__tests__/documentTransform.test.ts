@@ -1,4 +1,4 @@
-import { completeStream, extractMarkdown, transformPrompts } from '../documentTransform';
+import { completeStream, extractMarkdown, looksLikeDocument, transformPrompts } from '../documentTransform';
 import type { LLMClient, LLMChunk } from 'distributed-core/applications/pipeline';
 
 describe('document transform prompts', () => {
@@ -31,5 +31,16 @@ describe('completeStream', () => {
     });
     expect(await completeStream(chunks([{ done: false, token: 'a' }, { done: true, response: 'FULL', tokensIn: 1, tokensOut: 1 }]), 'm', 's', 'u')).toBe('FULL');
     expect(await completeStream(chunks([{ done: false, token: 'a' }, { done: false, token: 'b' }]), 'm', 's', 'u')).toBe('ab');
+  });
+});
+
+describe('looksLikeDocument', () => {
+  it('accepts a heading or a macro fence, and rejects a question dressed as an answer', () => {
+    expect(looksLikeDocument('# Bug Report\n\n## Summary\nx')).toBe(true);
+    expect(looksLikeDocument('```macro:action-items\nitems: []\n```')).toBe(true);
+    expect(looksLikeDocument('I need to see the actual source document content to transform it.')).toBe(false);
+  });
+  it('is told never to ask or refuse', () => {
+    expect(transformPrompts({ markdown: 'x', target: { name: 'T', fields: [] } }).system).toMatch(/never ask/i);
   });
 });
