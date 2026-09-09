@@ -20,12 +20,17 @@ export const CANVAS_META_KEY = 'meta';
 
 export type DocOp =
   | { op: 'setTitle'; text: string }
+  /** Stamp the document's type (meta) — a transform's first act. */
+  | { op: 'setDocumentType'; typeId?: string; typeName: string; icon?: string }
+  /** Carry a block from the SOURCE outline verbatim — how macros cross a transform without the model retyping them. */
+  | { op: 'copyBlock'; index: number }
+  | { op: 'appendMacro'; macroName: string; yaml: string }
   | { op: 'replaceBlock'; index: number; text: string }
   | { op: 'appendBlock'; kind: 'paragraph' | 'heading'; level?: number; text: string }
   | { op: 'insertBlock'; index: number; kind: 'paragraph' | 'heading'; level?: number; text: string }
   | { op: 'deleteBlock'; index: number };
 
-export interface OutlineBlock { index: number; kind: string; level?: number; text: string }
+export interface OutlineBlock { index: number; kind: string; level?: number; text: string; macroName?: string }
 export interface DocumentOutline { title: string | undefined; blocks: OutlineBlock[]; text: string }
 
 const MAX_TEXT = 4000;
@@ -51,11 +56,12 @@ export function outlineOf(doc: YT.Doc): DocumentOutline {
   const title = typeof meta.get('title') === 'string' ? (meta.get('title') as string) : undefined;
   const blocks: OutlineBlock[] = blocksOf(doc).map((el, index) => {
     const level = el.nodeName === 'heading' ? Number(el.getAttribute('level') ?? 1) : undefined;
-    return { index, kind: el.nodeName, ...(level ? { level } : {}), text: plainText(el).slice(0, MAX_TEXT) };
+    const macroName = el.nodeName === 'macro' ? el.getAttribute('macroName') ?? undefined : undefined;
+    return { index, kind: el.nodeName, ...(level ? { level } : {}), ...(macroName ? { macroName } : {}), text: plainText(el).slice(0, MAX_TEXT) };
   });
   const lines = [
     `title: ${title ?? '(none)'}`,
-    ...blocks.map((b) => `#${b.index} ${b.kind}${b.level ? `(h${b.level})` : ''}: ${b.text || '(empty)'}`),
+    ...blocks.map((b) => `#${b.index} ${b.kind}${b.level ? `(h${b.level})` : ''}${b.macroName ? `(${b.macroName})` : ''}: ${b.text || '(empty)'}`),
   ];
   return { title, blocks, text: lines.join('\n') };
 }
@@ -67,6 +73,22 @@ function makeBlock(kind: 'paragraph' | 'heading', text: string, level?: number):
   t.insert(0, text);
   el.insert(0, [t]);
   return el;
+}
+
+function makeMacro(macroName: string, yaml: string): YT.XmlElement {
+  const el = new Y.XmlElement('macro');
+  el.setAttribute('macroName', macroName);
+  const t = new Y.XmlText();
+  t.insert(0, yaml);
+  el.insert(0, [t]);
+  return el;
+}
+
+/** Rebuild a block from an outline entry — headings/paragraphs by text, macros by name + YAML body. */
+function materialize(b: OutlineBlock): YT.XmlElement {
+  if (b.kind === 'macro' && b.macroName) return makeMacro(b.macroName, b.text);
+  if (b.kind === 'heading') return makeBlock('heading', b.text, b.level);
+  return makeBlock('paragraph', b.text);
 }
 
 function setBlockText(el: YT.XmlElement, text: string): void {
@@ -96,6 +118,9 @@ export function parseOps(text: string): DocOp[] {
     const level = typeof o.level === 'number' ? o.level : undefined;
     switch (o.op) {
       case 'setTitle': if (text) ops.push({ op: 'setTitle', text }); break;
+      case 'setDocumentType': if (typeof o.typeName === 'string' && o.typeName) ops.push({ op: 'setDocumentType', typeName: o.typeName, ...(typeof o.typeId === 'string' ? { typeId: o.typeId } : {}), ...(typeof o.icon === 'string' ? { icon: o.icon } : {}) }); break;
+      case 'copyBlock': if (index !== undefined) ops.push({ op: 'copyBlock', index }); break;
+      case 'appendMacro': if (typeof o.macroName === 'string' && o.macroName && typeof o.yaml === 'string') ops.push({ op: 'appendMacro', macroName: o.macroName, yaml: o.yaml.slice(0, MAX_TEXT) }); break;
       case 'replaceBlock': if (index !== undefined && text !== undefined) ops.push({ op: 'replaceBlock', index, text }); break;
       case 'appendBlock': if (kind && text) ops.push({ op: 'appendBlock', kind, text, ...(level ? { level } : {}) }); break;
       case 'insertBlock': if (index !== undefined && kind && text) ops.push({ op: 'insertBlock', index, kind, text, ...(level ? { level } : {}) }); break;
@@ -109,7 +134,7 @@ export function parseOps(text: string): DocOp[] {
 export interface ApplyResult { applied: number; skipped: number; title?: string }
 
 /** Apply in ONE transaction under `origin`, so the change is one update on the wire. */
-export function applyOps(doc: YT.Doc, ops: DocOp[], origin: unknown = 'agent'): ApplyResult {
+export function applyOps(doc: YT.Doc, ops: DocOp[], origin: unknown = 'agent', sourceBlocks: readonly OutlineBlock[] = []): ApplyResult {
   const result: ApplyResult = { applied: 0, skipped: 0 };
   doc.transact(() => {
     const body = doc.getXmlFragment(CANVAS_BODY_KEY);
@@ -136,6 +161,25 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], origin: unknown = 'agent'): 
           body.insert(body.length, [makeBlock(op.kind, op.text, op.level)]);
           result.applied += 1;
           break;
+        case 'appendMacro':
+          body.insert(body.length, [makeMacro(op.macroName, op.yaml)]);
+          result.applied += 1;
+          break;
+        case 'copyBlock': {
+          const src = sourceBlocks[op.index];
+          if (!src) { result.skipped += 1; break; }
+          body.insert(body.length, [materialize(src)]);
+          result.applied += 1;
+          break;
+        }
+        case 'setDocumentType': {
+          const meta = doc.getMap<unknown>(CANVAS_META_KEY);
+          meta.set('documentType', op.typeName);
+          if (op.typeId) meta.set('documentTypeId', op.typeId);
+          if (op.icon) meta.set('icon', op.icon);
+          result.applied += 1;
+          break;
+        }
         case 'insertBlock': {
           const el = blocks[op.index];
           if (!el) { body.insert(body.length, [makeBlock(op.kind, op.text, op.level)]); result.applied += 1; break; }

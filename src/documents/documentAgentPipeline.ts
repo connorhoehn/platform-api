@@ -6,10 +6,11 @@
 // all day.
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
-import { applyOps, outlineOf, parseOps } from './documentAgentOps';
+import { applyOps, outlineOf, parseOps, type OutlineBlock } from './documentAgentOps';
 import log from '../lib/logger';
 
 export const DOCUMENT_AGENT_EDIT_PIPELINE_ID = 'document-agent-edit';
+export const DOCUMENT_TRANSFORM_PIPELINE_ID = 'document-transform';
 export const DOCUMENT_READ_KIND = 'document:read';
 export const DOCUMENT_APPLY_KIND = 'document:apply';
 
@@ -29,6 +30,48 @@ export const DOCUMENT_EDIT_PROMPT = [
   '',
   'Instruction from {{ context.requestedByName }}: {{ context.instruction }}',
 ].join('\n');
+
+/** What the light model is told for a TRANSFORM: rebuild the source under the target type's fields. */
+export const DOCUMENT_TRANSFORM_PROMPT = [
+  'You restructure a document from one known type into another. Answer with ONLY a JSON array of operations, no prose, no code fence.',
+  'The TARGET page is empty. Build it in order with these operations:',
+  '  {"op":"setDocumentType","typeName":"{{ context.targetName }}","typeId":"{{ context.targetId }}","icon":"{{ context.targetIcon }}"}   — always first',
+  '  {"op":"setTitle","text":"..."}                                — keep the source title (the level-1 heading or the current title)',
+  '  {"op":"appendBlock","kind":"heading","level":2,"text":"<field name>"} — one per target field, in the order given',
+  '  {"op":"copyBlock","index":N}                                  — carry source block #N VERBATIM (this is how every macro block crosses; never retype a macro)',
+  '  {"op":"appendBlock","kind":"paragraph","text":"..."}          — source prose that answers a field, placed under it',
+  '  {"op":"appendMacro","macroName":"field","yaml":"label: <field name>\\ntype: <text|date|checklist|link-block>"} — a typed field the target declares and the source lacks',
+  'Rules: every source macro block (kind "macro") is carried with copyBlock under the most relevant field, exactly once. Content that fits no field goes under a final heading "Notes". Leave a field empty rather than inventing content. Never drop a source block that has text.',
+  '',
+  'Source document (numbered blocks; macros show their kind and YAML):',
+  '{{ context.documentOutline }}',
+  '',
+  'Target type: {{ context.targetName }}',
+  'Target fields, in order:',
+  '{{ context.targetFieldList }}',
+].join('\n');
+
+/** The transform pipeline: read the SOURCE, plan the target with a light model, write the target as a collaborator. */
+export function buildDocumentTransformDefinition(model = process.env.DOCUMENT_AGENT_MODEL || 'haiku'): Record<string, unknown> {
+  const pos = (x: number) => ({ x, y: 0 });
+  return {
+    id: DOCUMENT_TRANSFORM_PIPELINE_ID,
+    name: 'Document transform',
+    description: 'Transform to <type>: read the source page, plan the target under its fields with a light model (macros carried verbatim), write it as a collaborator.',
+    version: 1, status: 'published', publishedVersion: 1,
+    nodes: [
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Transform to <type>' } },
+      { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the source' } },
+      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the target (Haiku)', prompt: DOCUMENT_TRANSFORM_PROMPT, model, allowedTools: [], maxTurns: 1 } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the target as a collaborator' } },
+    ],
+    edges: [
+      { id: 'e1', source: 'trigger', sourceHandle: 'out', target: 'read', targetHandle: 'in' },
+      { id: 'e2', source: 'read', sourceHandle: 'out', target: 'plan', targetHandle: 'in' },
+      { id: 'e3', source: 'plan', sourceHandle: 'out', target: 'apply', targetHandle: 'in' },
+    ],
+  };
+}
 
 /** The definition the route triggers inline — platform-owned, not a per-user record. */
 export function buildDocumentAgentEditDefinition(model = process.env.DOCUMENT_AGENT_MODEL || 'haiku'): Record<string, unknown> {
@@ -63,14 +106,16 @@ export function createDocumentReadHandler(): StepHandler {
   return {
     kind: DOCUMENT_READ_KIND,
     async execute(_node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
-      const documentId = documentIdOf(context);
-      if (!documentId) return { status: 'failed', error: 'documentId missing from the run context' };
-      const agent = new AgentCollaborator({ documentId });
+      // A transform reads the SOURCE and writes the target; an edit reads and writes the same page.
+      const readId = (typeof context.sourceDocumentId === 'string' && context.sourceDocumentId) || documentIdOf(context);
+      if (!readId) return { status: 'failed', error: 'documentId missing from the run context' };
+      const agent = new AgentCollaborator({ documentId: readId });
       try {
         await agent.join();
         const outline = outlineOf(agent.doc);
-        // Merged into context by the executor: `{{ context.documentOutline }}`.
-        return { status: 'completed', output: { documentOutline: outline.text, documentTitle: outline.title ?? '', documentBlocks: outline.blocks.length } };
+        // Merged into context by the executor: `{{ context.documentOutline }}`;
+        // `sourceBlocks` lets `copyBlock` carry a macro across without the model retyping it.
+        return { status: 'completed', output: { documentOutline: outline.text, documentTitle: outline.title ?? '', documentBlocks: outline.blocks.length, sourceBlocks: outline.blocks } };
       } catch (err) {
         return { status: 'failed', error: err instanceof Error ? err.message : String(err) };
       } finally {
@@ -98,7 +143,8 @@ export function createDocumentApplyHandler(): StepHandler {
       try {
         await agent.join();
         agent.announce();
-        const result = applyOps(agent.doc, ops, 'agent');
+        const sourceBlocks = Array.isArray(context.sourceBlocks) ? (context.sourceBlocks as OutlineBlock[]) : [];
+        const result = applyOps(agent.doc, ops, 'agent', sourceBlocks);
         log.info({ documentId, ...result, ops: ops.length }, 'document agent edit applied');
         // The step is done the moment the edit is in the document — the
         // run's status must not lag what people already see. The agent then

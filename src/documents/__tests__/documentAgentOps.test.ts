@@ -56,3 +56,33 @@ describe('applying operations', () => {
     expect(outlineOf(doc).blocks[0]).toMatchObject({ kind: 'heading', level: 1, text: 'Fresh' });
   });
 });
+
+describe('transform operations', () => {
+  it('copies a source macro verbatim, stamps the type, and appends a new typed field', () => {
+    const source = new Y.Doc();
+    const body = source.getXmlFragment(CANVAS_BODY_KEY);
+    const m = new Y.XmlElement('macro'); m.setAttribute('macroName', 'field'); const mt = new Y.XmlText(); mt.insert(0, 'label: Severity\ntype: text'); m.insert(0, [mt]);
+    body.insert(0, [m]);
+    const src = outlineOf(source);
+    expect(src.blocks[0]).toMatchObject({ kind: 'macro', macroName: 'field', text: 'label: Severity\ntype: text' });
+    expect(src.text).toContain('#0 macro(field): label: Severity');
+
+    const target = new Y.Doc();
+    const r = applyOps(target, [
+      { op: 'setDocumentType', typeName: 'Incident', typeId: 't-inc', icon: '🚨' },
+      { op: 'setTitle', text: 'Q3 incident' },
+      { op: 'appendBlock', kind: 'heading', level: 2, text: 'Severity' },
+      { op: 'copyBlock', index: 0 },
+      { op: 'appendMacro', macroName: 'field', yaml: 'label: Owner\ntype: text' },
+      { op: 'copyBlock', index: 9 },
+    ], 'agent', src.blocks);
+    expect(r).toMatchObject({ applied: 5, skipped: 1, title: 'Q3 incident' });
+    const meta = target.getMap(CANVAS_META_KEY);
+    expect(meta.get('documentType')).toBe('Incident');
+    expect(meta.get('documentTypeId')).toBe('t-inc');
+    const out = outlineOf(target);
+    expect(out.blocks.map((b) => `${b.kind}:${b.macroName ?? ''}:${b.text}`)).toEqual([
+      'heading::Q3 incident', 'heading::Severity', 'macro:field:label: Severity\ntype: text', 'macro:field:label: Owner\ntype: text',
+    ]);
+  });
+});
