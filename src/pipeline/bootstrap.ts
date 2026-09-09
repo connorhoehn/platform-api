@@ -101,6 +101,7 @@ import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
 import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
+import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
@@ -114,6 +115,10 @@ import { resumeInterruptedRuns } from './resumeInterruptedRuns';
 import { definitionsRepo } from './definitions-repository';
 import { runWalPreflight } from './WalPreflight';
 import { createShutdown } from './ShutdownOrchestrator';
+import {
+  startPipelineEventRedisRelay,
+  type PipelineEventRedisRelay,
+} from './event-redis-relay';
 import log, { withContext } from '../lib/logger';
 import { publishDurable, catalog } from '../lib/event-catalog';
 import { createValidatingPublisher } from '@connorhoehn/event-catalog';
@@ -722,6 +727,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   for (const [key, handler] of agentHandlers) {
     customStepHandlers.set(key, handler);
   }
+  // The chat's /doc command: read → plan (light model) → apply as a collaborator.
+  for (const [key, handler] of buildDocumentAgentHandlers()) {
+    customStepHandlers.set(key, handler);
+  }
 
   // Wave A (2026-08-25): action-API wiring. When set, action nodes
   // (post-comment / update-document / create-section-item / notify) make
@@ -799,6 +808,35 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // ids, tenant ids, or pipeline ids.
   const runQueueMetrics = getQueueMetrics('run-queue');
   const eventBus = module.getEventBus();
+
+  // --- Live pipeline signal transport (EventBus → Redis → gateway) ---
+  //
+  // The three `publishDurable(...)` subscriptions further down are the DURABLE
+  // path: a DynamoDB outbox row for external consumers, drained through the
+  // message-queue transport. They are not, and never were, how the pipeline
+  // canvas learns that a node started or finished.
+  //
+  // The gateway's `pipeline-relay.ts` pSUBSCRIBEs `dcore:topic:pipeline.events.*`
+  // whenever no MESSAGE_QUEUE_URL / PIPELINE_EVENT_BUS_URL is configured. Until
+  // this relay existed, nothing on the system published to that pattern, so a
+  // run would trigger, execute and complete with every canvas node stuck at
+  // `data-state="idle"` and not one `pipeline:event` frame on the wire.
+  //
+  // This forwards EVERY `pipeline:*` BusEvent — crucially the step-level ones
+  // (`pipeline:step:started` / `:completed` / `:failed` / `:skipped`), which had
+  // no egress of any kind. See event-redis-relay.ts for the wire contract.
+  let pipelineEventRelay: PipelineEventRedisRelay | null = null;
+  try {
+    pipelineEventRelay = await startPipelineEventRedisRelay({ eventBus });
+  } catch (err) {
+    // startPipelineEventRedisRelay swallows its own failures; this is a belt-
+    // and-braces guard so a relay problem can never abort pipeline bootstrap.
+    bootstrapLog.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'pipeline event Redis relay failed to start',
+    );
+  }
+
   const runQueueSubIds: string[] = [];
   runQueueSubIds.push(eventBus.subscribe('pipeline:run:started', async () => {
     runQueueMetrics.recordEnqueued();
@@ -1110,6 +1148,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     executorAuditSubscriber,
     judgeAggregatorSubscriber,
     auditSweeperStop,
+    pipelineEventRelay,
     moduleRegistry,
     resourceRegistry,
     hintedHandoff,

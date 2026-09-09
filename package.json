@@ -4,9 +4,9 @@
   "engines": {
     "node": ">=20"
   },
-  "description": "Application platform API \u2014 user management, content, pipelines, social features",
+  "description": "Application platform API — user management, content, pipelines, social features",
   "scripts": {
-    "dev": "VIDEO_API_URL=http://localhost:3901 VIDEO_PUBLIC_URL=http://localhost:3901 COGNITO_REGION=us-east-1 COGNITO_USER_POOL_ID=us-east-1_localdev000 SKIP_AUTH=true LOCALSTACK_ENDPOINT=http://localhost:8000 REDIS_ENDPOINT=localhost AWS_REGION=us-east-1 ts-node-dev --respawn --transpile-only src/index.ts",
+    "dev": "VIDEO_API_URL=http://localhost:3901 VIDEO_PUBLIC_URL=http://localhost:3901 COGNITO_REGION=us-east-1 COGNITO_USER_POOL_ID=us-east-1_localdev000 SKIP_AUTH=true PIPELINE_LLM_PROVIDER=claude-code LOCALSTACK_ENDPOINT=http://localhost:8000 REDIS_ENDPOINT=localhost AWS_REGION=us-east-1 ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "test": "NODE_OPTIONS='--max-old-space-size=4096' jest",
@@ -43,7 +43,9 @@
     "redis": "^5.0.0",
     "sharp": "^0.34.5",
     "ulid": "^3.0.2",
-    "uuid": "^13.0.0"
+    "uuid": "^13.0.0",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.32"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
@@ -52,6 +54,7 @@
     "@types/jsonwebtoken": "^9.0.6",
     "@types/multer": "^2.1.0",
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "eslint": "^9.0.0",
     "jest": "^30.0.0",
     "js-yaml": "^4.1.0",
