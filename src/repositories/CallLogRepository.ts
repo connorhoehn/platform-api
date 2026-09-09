@@ -99,7 +99,14 @@ export function applyCallEvent(row: CallLogRow | null, event: CallEvent, userId:
   // a new call, not a late report of the old one — otherwise the old
   // `cancelled` outranks the new ring forever and a genuinely missed call reads
   // as cancelled. Start the row over; the id is the only thing carried.
-  if (event.action === 'invite' && row?.endedAt && at > row.endedAt) {
+  // "Previous attempt over" is any terminal outcome, not only an `ended` frame:
+  // the caller's `ended` is addressed to its own tabs (planned 0 to everyone
+  // else — measured), so a callee's row often has `cancelled`/`declined` and
+  // no endedAt at all. An `answered` call still in progress is NOT over — an
+  // invite on it is somebody being added to a live call.
+  const previousOver =
+    !!row && (!!row.endedAt || row.outcome === 'declined' || row.outcome === 'cancelled' || row.outcome === 'missed');
+  if (event.action === 'invite' && row && previousOver && at > (row.endedAt ?? row.startedAt)) {
     next = {
       userId, callId: event.callId, direction: row.direction, callerId: event.callerId,
       ...(event.callerName ?? row.callerName ? { callerName: event.callerName ?? row.callerName } : {}),

@@ -57,3 +57,17 @@ describe('a reused callId', () => {
     expect(row.endedAt).toBeUndefined();
   });
 });
+
+describe('a reused callId after a declined or cancelled attempt', () => {
+  it('starts over on the next invite even when no ended frame ever reached this participant', () => {
+    const T3 = '2026-09-09T10:05:00.000Z', T4 = '2026-09-09T10:06:00.000Z';
+    const declinedThenRung = run([base({}), base({ action: 'declined', at: T1 }), base({ at: T3 }), base({ action: 'missed', at: T4 })], 'bob');
+    expect(declinedThenRung).toMatchObject({ outcome: 'missed', startedAt: T3 });
+    const cancelledThenRung = run([base({}), base({ action: 'cancelled', at: T1 }), base({ at: T3 })], 'bob');
+    expect(cancelledThenRung).toMatchObject({ outcome: 'ringing', startedAt: T3 });
+  });
+  it('does not restart an answered call that is still going when someone is added to it', () => {
+    const row = run([base({}), base({ action: 'accepted', at: T1 }), base({ at: T2, targetUserIds: ['bob', 'cy'] })], 'bob');
+    expect(row).toMatchObject({ outcome: 'answered', startedAt: T0, answeredAt: T1 });
+  });
+});
