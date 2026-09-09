@@ -103,6 +103,7 @@ import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
 import { buildRecordingPipelineHandlers } from '../recordings/recordingPipelines';
+import { withStepRetry } from './withStepRetry';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
@@ -733,8 +734,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     customStepHandlers.set(key, handler);
   }
   // After a call: finalize the recording and transcribe it — as runs, not inline code.
+  // Wrapped so a node's retryPolicy is honoured for custom kinds (the executor
+  // only retries its built-in llm/transform steps).
   for (const [key, handler] of buildRecordingPipelineHandlers()) {
-    customStepHandlers.set(key, handler);
+    customStepHandlers.set(key, withStepRetry(handler));
   }
 
   // Wave A (2026-08-25): action-API wiring. When set, action nodes
