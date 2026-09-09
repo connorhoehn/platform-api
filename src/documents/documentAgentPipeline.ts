@@ -100,7 +100,9 @@ export function createDocumentApplyHandler(): StepHandler {
         agent.announce();
         const result = applyOps(agent.doc, ops, 'agent');
         log.info({ documentId, ...result, ops: ops.length }, 'document agent edit applied');
-        await agent.leave(1500);
+        // Linger as a visible collaborator long enough for people in the
+        // document to see who made the change; then leave like anyone else.
+        await agent.leave(Number(process.env.DOCUMENT_AGENT_PRESENCE_HOLD_MS) || 4000);
         return { status: 'completed', output: { ...result, ops } };
       } catch (err) {
         await agent.leave(0).catch(() => undefined);
