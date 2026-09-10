@@ -135,7 +135,11 @@ describe('GET /api/pipelines/defs', () => {
     mockList.mockResolvedValue([{ id: 'p-1', name: 'My Pipeline' }]);
     const res = await run(buildApp(), 'GET', '/api/pipelines/defs');
     expect(res.statusCode).toBe(200);
-    expect((res.body as { pipelines: unknown[] }).pipelines).toHaveLength(1);
+    // The person's own definitions, followed by the platform-owned system
+    // pipelines (flagged `system: true`) that ship with the code.
+    const pipelines = (res.body as { pipelines: Array<{ id: string; system?: boolean }> }).pipelines;
+    expect(pipelines.filter((p) => !p.system)).toHaveLength(1);
+    expect(pipelines.filter((p) => p.system).map((p) => p.id)).toEqual(expect.arrayContaining(['document-agent-edit', 'call-transcription']));
     expect(mockList).toHaveBeenCalledWith('tester');
   });
 
