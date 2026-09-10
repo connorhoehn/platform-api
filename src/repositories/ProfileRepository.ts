@@ -21,6 +21,12 @@ export interface ProfileItem {
    * it is busy.
    */
   callForwarding?: CallForwarding;
+  /**
+   * Consent to record this person's DM calls. A DM records only when EVERY
+   * party has this on — one person's setting is never enough to record the
+   * other. Absent means false. Rooms are governed by their own setting.
+   */
+  recordCalls?: boolean;
   visibility: 'public' | 'private';
   createdAt: string;
   updatedAt: string;
@@ -41,7 +47,7 @@ export class ProfileRepository extends BaseRepository {
 
   async updateProfile(
     userId: string,
-    updates: Partial<Pick<ProfileItem, 'displayName' | 'bio' | 'avatarUrl' | 'visibility' | 'callForwarding'>>,
+    updates: Partial<Pick<ProfileItem, 'displayName' | 'bio' | 'avatarUrl' | 'visibility' | 'callForwarding' | 'recordCalls'>>,
   ): Promise<ProfileItem> {
     const expressions: string[] = [];
     const exprValues: Record<string, unknown> = {};
@@ -65,6 +71,10 @@ export class ProfileRepository extends BaseRepository {
     if (updates.callForwarding !== undefined) {
       expressions.push('callForwarding = :callForwarding');
       exprValues[':callForwarding'] = updates.callForwarding;
+    }
+    if (updates.recordCalls !== undefined) {
+      expressions.push('recordCalls = :recordCalls');
+      exprValues[':recordCalls'] = updates.recordCalls;
     }
 
     const now = new Date().toISOString();

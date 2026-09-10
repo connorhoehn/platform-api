@@ -339,3 +339,37 @@ describe('PUT /api/profiles — displayName / bio validation', () => {
     expect(res.statusCode).toBe(400);
   });
 });
+
+// Consent to record DM calls lives on the profile; both parties must have it.
+describe('PUT /api/profiles — recordCalls', () => {
+  it('stores the flag and returns it', async () => {
+    mockGetProfile.mockResolvedValue({ userId: 'tester', displayName: 'Grace' });
+    mockUpdateProfile.mockResolvedValue({ userId: 'tester', displayName: 'Grace', recordCalls: true });
+    const res = await run(buildApp(), 'PUT', '/api/profiles', { body: { recordCalls: true } });
+    expect(res.statusCode).toBe(200);
+    expect(mockUpdateProfile).toHaveBeenCalledWith('tester', { recordCalls: true });
+    expect((res.body as { recordCalls: boolean }).recordCalls).toBe(true);
+  });
+
+  it('lets the flag be turned off again', async () => {
+    mockGetProfile.mockResolvedValue({ userId: 'tester', displayName: 'Grace', recordCalls: true });
+    mockUpdateProfile.mockResolvedValue({ userId: 'tester', displayName: 'Grace', recordCalls: false });
+    const res = await run(buildApp(), 'PUT', '/api/profiles', { body: { recordCalls: false } });
+    expect(res.statusCode).toBe(200);
+    expect(mockUpdateProfile).toHaveBeenCalledWith('tester', { recordCalls: false });
+  });
+
+  it('rejects anything that is not a boolean', async () => {
+    mockGetProfile.mockResolvedValue({ userId: 'tester', displayName: 'Grace' });
+    const res = await run(buildApp(), 'PUT', '/api/profiles', { body: { recordCalls: 'yes' } });
+    expect(res.statusCode).toBe(400);
+    expect(mockUpdateProfile).not.toHaveBeenCalled();
+  });
+
+  it('leaves the flag alone when the body does not mention it', async () => {
+    mockGetProfile.mockResolvedValue({ userId: 'tester', displayName: 'Old' });
+    mockUpdateProfile.mockResolvedValue({ userId: 'tester', displayName: 'New' });
+    await run(buildApp(), 'PUT', '/api/profiles', { body: { displayName: 'New' } });
+    expect(mockUpdateProfile).toHaveBeenCalledWith('tester', { displayName: 'New' });
+  });
+});

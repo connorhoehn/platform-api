@@ -107,6 +107,12 @@ export interface VideoSessionRecord {
   transcript?: string;
   aiSummary?: string;
   /**
+   * Whether this call records and why — decided when the session was made
+   * (see recordings/recordingDecision.ts). Absent on rows written before the
+   * decision was recorded; readers must treat that as "unknown", not "off".
+   */
+  recording?: { enabled: boolean; reason: string };
+  /**
    * Epoch seconds. DynamoDB TTL attribute. When unset, records do not
    * auto-expire. `endSession` sets this automatically to endedAt + grace
    * window (default 7 days). The in-memory store filters expired records

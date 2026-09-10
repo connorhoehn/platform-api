@@ -44,9 +44,14 @@ jest.mock('../../lib/ddb-table-name', () => ({
   tableName: (n: string) => `test-${n}`,
 }));
 
+const mockGetSessionsByDocument = jest.fn();
+
 jest.mock('../../repositories', () => ({
   hangoutRoomMemberRepo: {
     listMembers: (...args: unknown[]) => mockListMembers(...args),
+  },
+  videoSessionRepo: {
+    getSessionsByDocument: (...args: unknown[]) => mockGetSessionsByDocument(...args),
   },
 }));
 
@@ -114,7 +119,7 @@ async function run(method: string, url: string): Promise<MockRes> {
   const req = {
     method, url, originalUrl: url, path: url.split('?')[0],
     headers: { 'content-type': 'application/json' },
-    query: {}, body: {}, params: {},
+    query: Object.fromEntries(new URLSearchParams(url.split('?')[1] ?? '')), body: {}, params: {},
     ip: '127.0.0.1',
   } as unknown as Request;
   await new Promise<void>((resolve, reject) => {
@@ -132,6 +137,7 @@ async function run(method: string, url: string): Promise<MockRes> {
 }
 
 beforeEach(() => {
+  mockGetSessionsByDocument.mockReset().mockResolvedValue([]);
   mockDocClientSend.mockReset();
   mockDdbRawSend.mockReset();
   mockGetRecentDeliveries.mockReset();
@@ -252,5 +258,37 @@ describe('GET /api/admin/rooms/:slug', () => {
     expect(body.room.roomId).toBe('r-1');
     expect(body.members).toHaveLength(2);
     expect(body.stats.memberCount).toBe(2);
+  });
+});
+
+// The gateway reads this when a call ends, with only the lobby name in hand.
+describe('GET /api/admin/video/recording-decision', () => {
+  it('requires a lobby', async () => {
+    const res = await run('GET', '/api/admin/video/recording-decision');
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('answers null, not 404, for a lobby that never had a call', async () => {
+    const res = await run('GET', '/api/admin/video/recording-decision?lobbyName=room%3Aquiet');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ lobbyName: 'room:quiet', sessionId: null, recording: null });
+    expect(mockGetSessionsByDocument).toHaveBeenCalledWith('room:quiet');
+  });
+
+  it('returns the decision of the most recent session', async () => {
+    mockGetSessionsByDocument.mockResolvedValue([
+      { sessionId: 'old', status: 'ended', startedAt: '2026-09-01T00:00:00Z', recording: { enabled: true, reason: 'default-on' } },
+      { sessionId: 'new', status: 'ended', startedAt: '2026-09-09T00:00:00Z', recording: { enabled: false, reason: 'room-setting-off' } },
+    ]);
+    const res = await run('GET', '/api/admin/video/recording-decision?lobbyName=room%3Adesign');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ sessionId: 'new', recording: { enabled: false, reason: 'room-setting-off' } });
+  });
+
+  // A row written before decisions existed says nothing, and must not read as "off".
+  it('returns recording: null for a row without a decision', async () => {
+    mockGetSessionsByDocument.mockResolvedValue([{ sessionId: 's', status: 'ended', startedAt: '2026-09-09T00:00:00Z' }]);
+    const res = await run('GET', '/api/admin/video/recording-decision?lobbyName=dm%3Aa%3Ab');
+    expect((res.body as { recording: unknown }).recording).toBeNull();
   });
 });

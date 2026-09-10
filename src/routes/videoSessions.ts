@@ -30,7 +30,8 @@ import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { requireAuth, optionalAuth } from '../middleware/auth';
 import { VIDEO_API_URL } from '../lib/video-auth';
-import { videoSessionRepo, callReactionRepo } from '../repositories';
+import { videoSessionRepo, callReactionRepo, profileRepo } from '../repositories';
+import { decideRecording } from '../recordings/recordingDecision';
 import { VideoSessionRecord } from '../repositories/VideoSessionRepository';
 import {
   asyncHandler,
@@ -232,8 +233,23 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
             destination?: string;
             recordingProfile?: string;
             transcribe?: boolean;
+            reason?: string;
           })
         : null;
+
+    // The recording DECISION, made once and kept: a DM records only when every
+    // party has opted in on their profile (whatever the caller asked for), a
+    // room records what its setting says, anything else keeps the default.
+    // Stamped on the row and returned to the caller so the call chrome can
+    // show "armed" and the thread card can later say why there is none.
+    const recordingDecision = await decideRecording({
+      lobbyName,
+      requested: incomingRecordingConfig
+        ? { enabled: incomingRecordingConfig.enabled, reason: incomingRecordingConfig.reason }
+        : null,
+      callerId: userId,
+      getProfile: (id) => profileRepo.getProfile(id),
+    });
     const profileFromBody = (() => {
       const raw = incomingRecordingConfig?.recordingProfile;
       if (raw === undefined) return undefined;
@@ -242,7 +258,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     })();
     const recordingConfiguration = incomingRecordingConfig
       ? {
-          enabled: incomingRecordingConfig.enabled !== false,
+          enabled: recordingDecision.enabled,
           destination: incomingRecordingConfig.destination ?? 'local',
           // Canonical Wave-3 identifier. Falls back to legacy transcribe
           // boolean → 'hangout' synthesis if FE hasn't been migrated yet.
@@ -259,7 +275,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
         // synthesis (which maps {enabled:true, transcribe:false} → broadcast
         // shape: composePerPeer=false, transcribe=false). New per-peer +
         // transcribe behavior is opt-in via recordingProfile from the FE.
-        { enabled: true, destination: 'local', transcribe: false };
+        { enabled: recordingDecision.enabled, destination: 'local', transcribe: false };
 
     // A 1:1 call must not start recording while the callee is still ringing.
     //
@@ -340,7 +356,9 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       const existing = await videoSessionRepo.findActiveByLobbyName(lobbyName);
       if (existing && existing.channelArn === channelArn) {
         log.info({ sessionId: existing.sessionId, lobbyName }, '[videoSessions] findOrCreate hit (LVS authoritative)');
-        res.status(200).json({ sessionId: existing.sessionId, reused: true });
+        // The row that made the LVS session holds the decision that governs
+        // it; a later joiner's own request did not change what LVS is doing.
+        res.status(200).json({ sessionId: existing.sessionId, reused: true, recording: existing.recording ?? recordingDecision });
         return;
       }
     }
@@ -361,11 +379,12 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       startedAt: now,
       startedBy: userId,
       participants: [],
+      recording: recordingDecision,
     };
 
     try {
       await videoSessionRepo.createSession(record);
-      log.info({ sessionId, lobbyName, channelArn, reused }, '[videoSessions] DDB row written');
+      log.info({ sessionId, lobbyName, channelArn, reused, recording: recordingDecision }, '[videoSessions] DDB row written');
 
       // Close out this lobby's PREVIOUS active rows, which are now provably
       // stale: LVS has just named the channel that is current, so any row
@@ -409,7 +428,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       log.warn({ err: idxErr, channelArn }, '[videoSessions] arn-index write failed');
     }
 
-    res.status(reused ? 200 : 201).json({ sessionId, reused });
+    res.status(reused ? 200 : 201).json({ sessionId, reused, recording: recordingDecision });
   } catch (err) {
     if (err instanceof AppError) throw err;
     log.error({ err }, '[videoSessions] POST /sessions error');

@@ -40,7 +40,7 @@ import {
   HANGOUT_ROOMS_TABLE,
   type HangoutRoom,
 } from '../repositories/HangoutRoomRepository';
-import { hangoutRoomMemberRepo } from '../repositories';
+import { hangoutRoomMemberRepo, videoSessionRepo } from '../repositories';
 import log from '../lib/logger';
 
 // Cap on cross-org room listing — admin endpoint only, but we still
@@ -55,6 +55,45 @@ export const lvsAdminRouter = Router();
 // AttributeValue map (passed through `unmarshall`) so the response
 // mirrors the on-disk shape. Same pattern as lvsWebhooks.ts.
 const ddbRaw = new DynamoDBClient({});
+
+// --------------------------------------------------------------------
+// GET /api/admin/video/recording-decision?lobbyName=<lobby>
+//
+// The recording decision of a lobby's most recent call — read by the
+// gateway when a call ends, so the card it posts into the thread can say
+// whether the call was recorded and, if not, why. The gateway has no user
+// token at that moment (the participants have hung up), only the lobby
+// name, so this sits behind the admin secret like the other
+// service-to-service reads here. Absent decision → `recording: null`,
+// which the gateway turns into "say nothing".
+// --------------------------------------------------------------------
+lvsAdminRouter.get(
+  '/video/recording-decision',
+  requireAdmin,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const lobbyName = typeof req.query.lobbyName === 'string' ? req.query.lobbyName : '';
+    if (!lobbyName) {
+      res.status(400).json({ error: 'lobbyName is required' });
+      return;
+    }
+    const sessions = await videoSessionRepo.getSessionsByDocument(lobbyName);
+    // Most recent first: at call end the row that just ended is the newest.
+    const latest = sessions
+      .slice()
+      .sort((a, b) => String(b.startedAt ?? '').localeCompare(String(a.startedAt ?? '')))[0];
+    if (!latest) {
+      res.status(200).json({ lobbyName, sessionId: null, recording: null });
+      return;
+    }
+    res.status(200).json({
+      lobbyName,
+      sessionId: latest.sessionId,
+      status: latest.status,
+      startedAt: latest.startedAt,
+      recording: latest.recording ?? null,
+    });
+  }),
+);
 
 // --------------------------------------------------------------------
 // GET /api/admin/recordings/health

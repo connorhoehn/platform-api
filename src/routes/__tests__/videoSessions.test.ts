@@ -20,6 +20,8 @@ const mockFindActiveByLobbyName = jest.fn().mockResolvedValue(null);
 const mockRemoveParticipant = jest.fn();
 const mockRemoveParticipantByUserId = jest.fn();
 const mockListActiveCandidates = jest.fn().mockResolvedValue([]);
+// Profiles decide whether a DM records: both parties must have recordCalls on.
+const mockGetProfile = jest.fn().mockResolvedValue(null);
 
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
@@ -42,6 +44,9 @@ jest.mock('../../repositories', () => ({
     removeParticipant: (...args: unknown[]) => mockRemoveParticipant(...args),
     removeParticipantByUserId: (...args: unknown[]) => mockRemoveParticipantByUserId(...args),
     listActiveCandidates: (...args: unknown[]) => mockListActiveCandidates(...args),
+  },
+  profileRepo: {
+    getProfile: (...args: unknown[]) => mockGetProfile(...args),
   },
 }));
 
@@ -162,6 +167,7 @@ beforeEach(() => {
   mockGetSession.mockReset();
   mockFetch.mockReset();
   mockListActiveCandidates.mockReset().mockResolvedValue([]);
+  mockGetProfile.mockReset().mockResolvedValue(null);
   __resetLiveLobbyCacheForTests();
   jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'error').mockImplementation(() => {});
@@ -266,6 +272,8 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
     expect((res.body as { sessionId: string; reused: boolean })).toEqual({
       sessionId: 'existing-vs-id',
       reused: true,
+      // A row written before decisions existed: the joiner's own decision fills in.
+      recording: { enabled: true, reason: 'default-on' },
     });
     // No new DDB row created — we reused the existing one.
     expect(mockCreateSession).not.toHaveBeenCalled();
@@ -1601,5 +1609,105 @@ describe('GET /api/video/sessions/:sessionId', () => {
     mockGetSession.mockRejectedValue(new Error('DDB get failed'));
     const res = await run(buildApp(), 'GET', '/api/video/sessions/vs-1?documentId=doc-1');
     expect(res.statusCode).toBe(500);
+  });
+});
+
+// Recording is a decision, made here and kept: on the row, in the response,
+// and in what LVS is told. A DM records only with everyone's consent.
+describe('POST /api/video/sessions — recording decision', () => {
+  const lastLvsBody = () => JSON.parse((mockFetch.mock.calls[mockFetch.mock.calls.length - 1][1] as RequestInit).body as string);
+  const profiles = (flags: Record<string, boolean | undefined>) =>
+    mockGetProfile.mockImplementation(async (id: string) => (id in flags ? { userId: id, recordCalls: flags[id] } : null));
+
+  it('records a DM when both people have opted in', async () => {
+    profiles({ alice: true, bob: true });
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dm-both'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'dm:alice:bob', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.body).toMatchObject({ recording: { enabled: true, reason: 'dm-both-opted-in' } });
+    expect(lastLvsBody().recordingConfiguration).toMatchObject({ enabled: true, startWhenParticipants: 2 });
+    expect(mockCreateSession.mock.calls[0][0]).toMatchObject({ recording: { enabled: true, reason: 'dm-both-opted-in' } });
+  });
+
+  it('does not record a DM when one person has not opted in, and names them', async () => {
+    profiles({ alice: true, bob: false });
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dm-one'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'dm:alice:bob', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+    });
+    expect(res.body).toMatchObject({ recording: { enabled: false, reason: 'dm-not-opted-in:bob' } });
+    expect(lastLvsBody().recordingConfiguration.enabled).toBe(false);
+  });
+
+  // No profile row at all is the state every account starts in — that is "not opted in".
+  it('treats a missing profile as not opted in', async () => {
+    profiles({ alice: true });
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dm-none'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'dm:alice:bob', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+    });
+    expect(res.body).toMatchObject({ recording: { enabled: false, reason: 'dm-not-opted-in:bob' } });
+  });
+
+  // The transcribe checkbox sends enabled: true; it must not override the other person's choice.
+  it('does not let an explicit enabled: true bypass DM consent', async () => {
+    profiles({ alice: true });
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dm-bypass'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'dm:alice:bob', recordingConfiguration: { enabled: true, recordingProfile: 'hangout' } },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+    });
+    expect(lastLvsBody().recordingConfiguration).toMatchObject({ enabled: false, recordingProfile: 'hangout' });
+  });
+
+  // A hashed group cannot name its members from the lobby, so only the caller's own flag is checked.
+  it('gates a hashed group on the caller alone', async () => {
+    profiles({ alice: false });
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:dmg'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'dmg:9f2c1a4b55de7788aa11bb22', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+    });
+    expect(res.body).toMatchObject({ recording: { enabled: false, reason: 'dm-not-opted-in:alice' } });
+    expect(mockGetProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the reason a room sends with its setting', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:room-off'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'room:design', findOrCreate: true, recordingConfiguration: { enabled: false, reason: 'room-setting-off', destination: 'local' } },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+    });
+    expect(res.body).toMatchObject({ recording: { enabled: false, reason: 'room-setting-off' } });
+    expect(lastLvsBody().recordingConfiguration.enabled).toBe(false);
+    expect(mockGetProfile).not.toHaveBeenCalled();
+  });
+
+  it('records a document call by default and says so', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:doc'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: '6ea7c8fd-1234-4abc-8def-0123456789ab', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
+    });
+    expect(res.body).toMatchObject({ recording: { enabled: true, reason: 'default-on' } });
+    expect(lastLvsBody().recordingConfiguration).toEqual({ enabled: true, destination: 'local', transcribe: false });
+  });
+
+  // A later joiner's own request does not change what LVS is already doing.
+  it('returns the governing row\'s decision on a findOrCreate hit', async () => {
+    profiles({ alice: true, bob: true });
+    mockFetch.mockResolvedValue(lvsSessionReused('arn:channel:dm-reuse'));
+    mockFindActiveByLobbyName.mockResolvedValueOnce({ sessionId: 'existing', channelArn: 'arn:channel:dm-reuse', recording: { enabled: false, reason: 'dm-not-opted-in:bob' } });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'dm:alice:bob', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'bob',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ sessionId: 'existing', reused: true, recording: { enabled: false, reason: 'dm-not-opted-in:bob' } });
   });
 });

@@ -100,11 +100,12 @@ profilesRouter.get('/', asyncHandler(async (req: Request, res: Response): Promis
 
 // POST /api/profiles — create own profile (PROF-01)
 profilesRouter.post('/', asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const { displayName, bio, avatarUrl, visibility } = req.body as {
+  const { displayName, bio, avatarUrl, visibility, recordCalls } = req.body as {
     displayName?: string;
     bio?: string;
     avatarUrl?: string;
     visibility?: string;
+    recordCalls?: unknown;
   };
 
   // Validation
@@ -116,6 +117,9 @@ profilesRouter.post('/', asyncHandler(async (req: Request, res: Response): Promi
   }
   if (visibility !== undefined && visibility !== 'public' && visibility !== 'private') {
     throw new ValidationError('visibility must be public or private');
+  }
+  if (recordCalls !== undefined && typeof recordCalls !== 'boolean') {
+    throw new ValidationError('recordCalls must be a boolean');
   }
 
   const userId = req.user!.sub;
@@ -133,6 +137,7 @@ profilesRouter.post('/', asyncHandler(async (req: Request, res: Response): Promi
     bio: bio ?? '',
     avatarUrl: avatarUrl ?? '',
     visibility: (visibility as 'public' | 'private') ?? 'public',
+    ...(recordCalls === true ? { recordCalls: true } : {}),
     createdAt: now,
     updatedAt: now,
   };
@@ -181,12 +186,13 @@ profilesRouter.get('/:userId', asyncHandler(async (req: Request, res: Response):
 
 // PUT /api/profiles — update own profile (PROF-02)
 profilesRouter.put('/', asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const { displayName, bio, avatarUrl, visibility, callForwarding } = req.body as {
+  const { displayName, bio, avatarUrl, visibility, callForwarding, recordCalls } = req.body as {
     displayName?: string;
     bio?: string;
     avatarUrl?: string;
     callForwarding?: { mode?: string; toUserId?: string } | null;
     visibility?: string;
+    recordCalls?: unknown;
   };
 
   // Validation for provided fields
@@ -198,6 +204,11 @@ profilesRouter.put('/', asyncHandler(async (req: Request, res: Response): Promis
   }
   if (visibility !== undefined && visibility !== 'public' && visibility !== 'private') {
     throw new ValidationError('visibility must be public or private');
+  }
+  // Consent to record DM calls — read by videoSessions when a dm: call is
+  // made; both parties must have it on. A boolean, never a truthy string.
+  if (recordCalls !== undefined && typeof recordCalls !== 'boolean') {
+    throw new ValidationError('recordCalls must be a boolean');
   }
 
   const userId = req.user!.sub;
@@ -227,6 +238,7 @@ profilesRouter.put('/', asyncHandler(async (req: Request, res: Response): Promis
     ...(bio !== undefined ? { bio } : {}),
     ...(avatarUrl !== undefined ? { avatarUrl } : {}),
     ...(forwarding !== undefined ? { callForwarding: forwarding } : {}),
+    ...(recordCalls !== undefined ? { recordCalls } : {}),
     ...(visibility !== undefined ? { visibility: visibility as 'public' | 'private' } : {}),
   });
 

@@ -139,13 +139,10 @@ export function summaryOps(summaryMarkdown: string): Array<Record<string, unknow
 const SETTLED_COMPOSE: ReadonlySet<string> = new Set(['ok', 'degraded', 'failed', 'skipped']);
 const lvsAuth = () => ({ Authorization: `Bearer ${process.env.LVS_ADMIN_TOKEN ?? process.env.VIDEO_ADMIN_TOKEN ?? 'admin'}` });
 
-/** A recording's home in chat: DM lobbies and rooms have one; a bare lobby does not. */
-export function chatChannelForLobby(lobby: string | null | undefined): string | null {
-  if (!lobby) return null;
-  if (lobby.startsWith('dmg:') || lobby.startsWith('dm:')) return `chat:${lobby}`;
-  if (lobby.startsWith('room:')) return lobby;
-  return null;
-}
+// The lobby → conversation rule lives in ./lobbyChannel (it now covers
+// document calls too); re-exported so existing importers keep their path.
+import { chatChannelForLobby } from './lobbyChannel';
+export { chatChannelForLobby };
 
 /** A call started from a document page uses the document id as its lobby. */
 export function documentIdForLobby(lobby: string | null | undefined): string | null {
@@ -242,7 +239,12 @@ export async function startSystemRun(pipelineId: string, definition: Record<stri
 /** Post the run's card into the conversation, if the lobby has one. Never fatal. */
 async function postRunCard(input: { lobbyName: string | null; runId: string; pipelineId: string; command: string; instruction: string; extra?: Record<string, unknown> }): Promise<boolean> {
   const channel = chatChannelForLobby(input.lobbyName);
-  if (!channel) return false;
+  if (!channel) {
+    // Not an error — an ad-hoc lobby has no thread — but not silence either:
+    // this was the only trace when document calls' cards vanished for weeks.
+    log.info({ lobbyName: input.lobbyName, runId: input.runId, command: input.command, reason: 'lobby has no conversation' }, '[recording-pipeline] run card not posted');
+    return false;
+  }
   try {
     await postChatMessage({
       channel,

@@ -584,6 +584,9 @@ hangoutRoomsRouter.post(
       findOrCreate: true,
       recordingConfiguration: {
         enabled: room.settings.recordingEnabled === true,
+        // The decision's reason travels with it, so the session row and the
+        // call card can say "off for #room" rather than just "off".
+        reason: room.settings.recordingEnabled === true ? 'room-setting-on' : 'room-setting-off',
         destination: 'local',
       },
     };
