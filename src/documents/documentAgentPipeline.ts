@@ -77,19 +77,33 @@ export const DOCUMENT_EDIT_PROMPT = [
   'Instruction from {{ context.requestedByName }}: {{ context.instruction }}',
 ].join('\n');
 
-/** What the light model is told for a TRANSFORM: rebuild the source under the target type's fields. */
+/**
+ * What the light model is told for a TRANSFORM: rebuild the source under the
+ * target type's fields. The field list arrives as `- Name (sectionType)` lines
+ * (see the transform-run route); the mark decides the SHAPE each field takes,
+ * mirroring how the client seeds a typed canvas (documentTypeCanvasModel):
+ * text/date/number/boolean → one `field` macro, long-form → a heading and the
+ * blocks that answer it. Measured, not eyeballed: transformPlan.golden.test.ts
+ * records Haiku's answer for nine source×target pairs and asserts the
+ * invariants spelled out below; change the wording here and re-record.
+ */
 export const DOCUMENT_TRANSFORM_PROMPT = [
   'You restructure a document from one known type into another. Answer with ONLY a JSON array of operations, no prose, no code fence.',
-  'The TARGET page is empty. Operations available:',
+  'The TARGET page is empty: never use deleteBlock, replaceBlock, insertBlock or skip. Operations available:',
   '  {"op":"setDocumentType","typeName":"{{ context.targetName }}","typeId":"{{ context.targetId }}","icon":"{{ context.targetIcon }}"}   — always first',
-  '  {"op":"setTitle","text":"<source title> — {{ context.targetName }}"}   — always second',
-  '  {"op":"appendBlock","kind":"heading","level":2,"text":"<field name>"} — a target field',
+  '  {"op":"setTitle","text":"<source title> — {{ context.targetName }}"}   — always second, exactly this shape: the source title as listed, a spaced em dash, the target type name',
+  '  {"op":"appendMacro","macroName":"field","yaml":"label: <field name>\\ntype: <text|date|number|boolean>\\nvalue: <value>"} — a SHORT target field, filled from the source; leave the value line out entirely when the source gives no answer',
+  '  {"op":"appendBlock","kind":"heading","level":2,"text":"<field name>"} — a LONG-FORM target field, or the final "Notes" heading',
   '  {"op":"copyBlock","index":N}                                  — carry source block #N VERBATIM (the only way a macro crosses; never retype a macro)',
-  '  {"op":"appendBlock","kind":"paragraph","text":"..."}          — source prose that answers a field, rewritten only as much as the field needs',
-  '  {"op":"appendMacro","macroName":"field","yaml":"label: <field name>\\ntype: <text|date|checklist|link-block>"} — a typed field the target declares and the source lacks a value for',
-  'Build the page FIELD BY FIELD, in the order the target fields are given: emit the field heading, then IMMEDIATELY the source blocks (copyBlock) and prose that answer THAT field, then move to the next field. Never emit all headings first.',
-  'Source macro blocks (kind "macro"): a field macro whose label matches a target field is copied under that field; action-item, decision, callout, link and attachment macros go under the field they belong to. Every source macro block is copied exactly once.',
-  'Source blocks that answer no target field — including field macros with no counterpart — are copied under a final heading "Notes", in source order. Never drop a source block that has text; never invent content; leave a field with nothing to say as its heading alone.',
+  '  {"op":"appendBlock","kind":"paragraph","text":"..."}          — source prose that answers a long-form field, reworded; prefer copyBlock, and a reworded paragraph keeps every fact, name and number of the original',
+  '  {"op":"appendMacro","macroName":"action-items","yaml":"items: []"} — the empty list under a (checklist) or (tasks) field the source has nothing for',
+  '  {"op":"appendMacro","macroName":"links","yaml":"links: []"}   — the empty list under a (link-block) field the source has nothing for',
+  'Every target field appears EXACTLY ONCE, by its exact name, in the order given. The mark after a field name says which shape it takes:',
+  '- (text), (date), (number) or (boolean): ONE field macro, never a heading. label is the field name exactly as given; type is the mark. The value comes from the source: a source field macro with the same or an equivalent label (its value MOVES here), or a fact the source states outright (its title, a date, a name, a number). Dates are YYYY-MM-DD, numbers bare digits, booleans true or false. When the source does not say, omit the value line — never guess, never fill a placeholder.',
+  '- (rich-text), (checklist), (tasks), (link-block) or no mark: a level-2 heading, then IMMEDIATELY the source blocks that answer it — copyBlock for macros and for paragraphs used as they are, appendBlock paragraphs for prose that needs rewording — then the next field. Never emit all headings first. A field with nothing to say is its heading alone ((checklist)/(tasks): heading + empty action-items macro; (link-block): heading + empty links macro).',
+  'Source blocks: the source\'s level-1 title heading is covered by setTitle and is not copied. A source heading that a target field replaces is not copied either; its paragraphs go under that field. Every other source block with text is placed exactly once: a source field macro whose value moved into a target field macro is done; every other source macro (field, action-items, decision, links, attachment, callout, hitl) is copied exactly once — never retyped, never split — under the field it belongs to; every source paragraph is copied or reworded under the field it answers.',
+  'Leftovers: source blocks that answer no target field go under one final heading "Notes", in source order — a leftover field macro (a Severity, a Status, a Date with no counterpart) is a copyBlock of that macro, never a paragraph that spells it out as "Severity: High". Never invent content; never drop a source block that has text.',
+  'Before answering, walk the source block numbers #1 to the last one: each must be either a copyBlock index, the origin of one field value, or fully reworded into one paragraph. Any number you cannot point to goes under Notes as a copyBlock.',
   '',
   'Source document (numbered blocks; macros show their kind and YAML):',
   '{{ context.documentOutline }}',
