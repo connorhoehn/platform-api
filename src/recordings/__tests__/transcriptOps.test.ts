@@ -41,3 +41,19 @@ describe('the transcription pipeline writes through document:apply', () => {
     expect(ops).toEqual([{ op: 'setTitle', text: 'x' }]);
   });
 });
+
+describe('looksLikeSilence', () => {
+  const { looksLikeSilence } = jest.requireActual<typeof import('../recordingPipelines')>('../recordingPipelines');
+  it('treats the engine’s stock phrases as no speech', () => {
+    expect(looksLikeSilence('you', 27_000)).toBe(true);
+    expect(looksLikeSilence('Thank you.', 5_000)).toBe(true);
+    expect(looksLikeSilence('', 5_000)).toBe(true);
+  });
+  it('treats one or two words over ten seconds as no speech, but not a short clip', () => {
+    expect(looksLikeSilence('hello there', 30_000)).toBe(true);
+    expect(looksLikeSilence('hello there', 3_000)).toBe(false);
+  });
+  it('keeps real speech', () => {
+    expect(looksLikeSilence('the compose step is still queued after twelve attempts', 27_000)).toBe(false);
+  });
+});

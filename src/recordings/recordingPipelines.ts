@@ -314,6 +314,23 @@ function startTranscriptionHandler(deps: RecordingPipelineDeps = {}): StepHandle
 export interface TranscriptSegment { startMs: number; endMs: number; speakerId: string; speakerLabel: string; text: string }
 
 /** Run the local speech engine on a file. Whisper JSON is `{ text }`; lines become segments spread over the media length. */
+/**
+ * Whisper never returns nothing: on near-silence it hallucinates a stock
+ * phrase ("you", "Thank you.", "so so I'm", "Thanks for watching"). A
+ * recording seconds long that yields a single stock phrase — or one or two
+ * words for ten-plus seconds of audio — is treated as no speech, so the
+ * conversation gets "No speech was found" rather than a transcript reading "you".
+ */
+const WHISPER_SILENCE_PHRASES = new Set(['you', 'thank you', 'thanks', 'thank you for watching', 'thanks for watching', 'bye', 'so so im', 'the', 'and', 'uh', 'um', 'hmm', 'okay', 'oh', 'yeah', 'subtitles by the amaraorg community', 'thank you for listening', 'thank you very much']);
+export function looksLikeSilence(text: string, durationMs: number): boolean {
+  const norm = text.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+  if (!norm) return true;
+  if (WHISPER_SILENCE_PHRASES.has(norm)) return true;
+  const words = norm.split(' ').length;
+  // Two words across ten seconds is not a conversation.
+  return durationMs >= 10_000 && words <= 2;
+}
+
 export async function transcribeFile(file: string, durationMs: number): Promise<TranscriptSegment[]> {
   const bin = process.env.SPEECH_CLI ?? '/Applications/OpenSuperWhisper.app/Contents/MacOS/opensuperwhisper';
   const out = await new Promise<string>((resolve, reject) => {
@@ -347,8 +364,13 @@ function transcribeHandler(): StepHandler {
       const file = join(dir, filename);
       await fs.writeFile(file, Buffer.from(await res.arrayBuffer()));
       try {
-        const segments = await transcribeFile(file, rec?.durationMs ?? 0);
-        return ok({ segments, words: segments.reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0) });
+        const durationMs = rec?.durationMs ?? 0;
+        const heard = await transcribeFile(file, durationMs);
+        const text = heard.map((s) => s.text).join(' ');
+        if (looksLikeSilence(text, durationMs)) {
+          return ok({ segments: [], words: 0, discarded: text.slice(0, 80), reason: 'no speech — the engine returned a stock phrase for silence' });
+        }
+        return ok({ segments: heard, words: heard.reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0) });
       } finally {
         await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
       }
