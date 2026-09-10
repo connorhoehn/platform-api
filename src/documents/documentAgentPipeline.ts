@@ -112,7 +112,9 @@ export function buildDocumentTransformDefinition(model = process.env.DOCUMENT_AG
       { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the source', retryPolicy: DOCUMENT_IO_RETRY } },
       { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the target (Haiku)', prompt: DOCUMENT_TRANSFORM_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: DOCUMENT_PLAN_RETRY } },
       // A transform always stamps the new type — that is not a reason to stop and ask.
-      { id: 'review', type: DOCUMENT_REVIEW_KIND, position: pos(600), data: { type: DOCUMENT_REVIEW_KIND, label: 'Check the plan', allowTypeChange: true, retryPolicy: DOCUMENT_IO_RETRY } },
+      // A transform writes a NEW, empty page: the op count is the page, not a
+      // risk, and the type change is the point. Only a deleteBlock would gate it.
+      { id: 'review', type: DOCUMENT_REVIEW_KIND, position: pos(600), data: { type: DOCUMENT_REVIEW_KIND, label: 'Check the plan', allowTypeChange: true, maxOpsWithoutApproval: Number.MAX_SAFE_INTEGER, retryPolicy: DOCUMENT_IO_RETRY } },
       approvalNode(pos(800), opts),
       { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1000), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the target as a collaborator', mode: 'suggest', retryPolicy: DOCUMENT_IO_RETRY } },
     ],

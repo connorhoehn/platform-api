@@ -473,12 +473,19 @@ export function createBridge(
 
       const limit = opts.limit ?? 50;
 
-      // Query DDB for historical runs
+      // The table's sort key is the runId (a UUID), so a DDB `limit` picks by
+      // id order, not by time — `limit=5` returned five arbitrary runs and
+      // dropped the newest. Read a wider window and order by startedAt here.
       const items: PipelineRunItem[] = await pipelineRunRepository.listByPipeline(pipelineId, {
-        limit,
+        limit: Math.min(Math.max(limit * 4, 50), 200),
       });
+      const startedMs = (r: PipelineRunItem): number => {
+        const t = Date.parse(String((r as { startedAt?: unknown }).startedAt ?? (r as { createdAt?: unknown }).createdAt ?? ''));
+        return Number.isFinite(t) ? t : 0;
+      };
+      items.sort((a, b) => startedMs(b) - startedMs(a));
 
-      const runs: PipelineRunSnapshot[] = items.map(runItemToSnapshot);
+      const runs: PipelineRunSnapshot[] = items.slice(0, limit).map(runItemToSnapshot);
 
       return { runs, nextCursor: undefined }; // Pagination via cursor NYI
     },

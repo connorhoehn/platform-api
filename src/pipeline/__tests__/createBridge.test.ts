@@ -506,7 +506,8 @@ describe('createBridge — listRuns()', () => {
     const repo = makeRunRepository();
     const b = bridgeWithRepo(mod, repo);
     await b.listRuns!('p-42', { limit: 15 });
-    expect(repo.listByPipeline).toHaveBeenCalledWith('p-42', { limit: 15 });
+    // The bridge reads a wider window (4× the asked limit, at least 50, at most 200) and orders by startedAt itself.
+    expect(repo.listByPipeline).toHaveBeenCalledWith('p-42', { limit: 60 });
   });
 
   test('defaults limit to 50 when opts omitted', async () => {
@@ -514,7 +515,7 @@ describe('createBridge — listRuns()', () => {
     const repo = makeRunRepository();
     const b = bridgeWithRepo(mod, repo);
     await (b.listRuns as (id: string, opts?: { limit?: number }) => Promise<unknown>)('p-1');
-    expect(repo.listByPipeline).toHaveBeenCalledWith('p-1', { limit: 50 });
+    expect(repo.listByPipeline).toHaveBeenCalledWith('p-1', { limit: 200 });
   });
 
   test('maps PipelineRunItem core fields to PipelineRunSnapshot', async () => {
