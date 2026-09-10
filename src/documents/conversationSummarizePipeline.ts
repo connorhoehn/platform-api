@@ -116,7 +116,10 @@ export function createSummarizePublishHandler(deps: { postCard?: typeof postRunC
         command: '/summarize', instruction,
         extra: { documentId: ctx.documentId, title, messageCount: count, applied },
       });
-      return { status: 'completed', output: { posted, title, messageCount: count, applied } };
+      // The card's 'Open' target — the run-result convention (src/pipeline/runResult.ts).
+      const resultDocumentId = typeof ctx.documentId === 'string' && ctx.documentId ? ctx.documentId : undefined;
+      const result = resultDocumentId ? { kind: 'document' as const, documentId: resultDocumentId } : undefined;
+      return { status: 'completed', output: { posted, title, messageCount: count, applied, ...(result ? { result } : {}) } };
     },
   };
 }

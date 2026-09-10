@@ -358,7 +358,9 @@ export function createDiagramPublishHandler(deps: { postCard?: typeof postRunCar
         command: '/diagram', instruction: title,
         extra: { documentId: ctx.documentId, title, elements },
       });
-      return { status: 'completed', output: { posted, title, elements } };
+      const resultDocumentId = typeof ctx.documentId === 'string' && ctx.documentId ? ctx.documentId : undefined;
+      const result = resultDocumentId ? { kind: 'document' as const, documentId: resultDocumentId } : undefined;
+      return { status: 'completed', output: { posted, title, elements, ...(result ? { result } : {}) } };
     },
   };
 }
