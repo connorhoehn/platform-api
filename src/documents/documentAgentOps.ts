@@ -25,6 +25,7 @@ export type DocOp =
   /** Carry a block from the SOURCE outline verbatim — how macros cross a transform without the model retyping them. */
   | { op: 'copyBlock'; index: number }
   | { op: 'appendMacro'; macroName: string; yaml: string }
+  | { op: 'skip'; reason: string }
   | { op: 'replaceBlock'; index: number; text: string }
   | { op: 'appendBlock'; kind: 'paragraph' | 'heading'; level?: number; text: string }
   | { op: 'insertBlock'; index: number; kind: 'paragraph' | 'heading'; level?: number; text: string }
@@ -120,6 +121,7 @@ export function parseOps(text: string): DocOp[] {
       case 'setTitle': if (text) ops.push({ op: 'setTitle', text }); break;
       case 'setDocumentType': if (typeof o.typeName === 'string' && o.typeName) ops.push({ op: 'setDocumentType', typeName: o.typeName, ...(typeof o.typeId === 'string' ? { typeId: o.typeId } : {}), ...(typeof o.icon === 'string' ? { icon: o.icon } : {}) }); break;
       case 'copyBlock': if (index !== undefined) ops.push({ op: 'copyBlock', index }); break;
+      case 'skip': ops.push({ op: 'skip', reason: typeof o.reason === 'string' ? o.reason.slice(0, 300) : '' }); break;
       case 'appendMacro': if (typeof o.macroName === 'string' && o.macroName && typeof o.yaml === 'string') ops.push({ op: 'appendMacro', macroName: o.macroName, yaml: o.yaml.slice(0, MAX_TEXT) }); break;
       case 'replaceBlock': if (index !== undefined && text !== undefined) ops.push({ op: 'replaceBlock', index, text }); break;
       case 'appendBlock': if (kind && text) ops.push({ op: 'appendBlock', kind, text, ...(level ? { level } : {}) }); break;

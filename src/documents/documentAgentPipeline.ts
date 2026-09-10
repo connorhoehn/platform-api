@@ -18,14 +18,16 @@ export const DOCUMENT_APPLY_KIND = 'document:apply';
 export const DOCUMENT_EDIT_PROMPT = [
   'You edit a collaborative document on behalf of a person. Answer with ONLY a JSON array of operations, no prose, no code fence.',
   'Allowed operations:',
-  '  {"op":"setTitle","text":"..."}                              — rename the document (also rewrites its first level-1 heading)',
+  '  {"op":"setTitle","text":"..."}                              — rename the document (also rewrites its first level-1 heading, or adds one if there is none)',
   '  {"op":"replaceBlock","index":N,"text":"..."}                — replace the text of block #N',
   '  {"op":"appendBlock","kind":"paragraph"|"heading","level":2,"text":"..."} — add a block at the end',
-  '  {"op":"insertBlock","index":N,"kind":"paragraph"|"heading","level":2,"text":"..."} — add a block before #N',
+  '  {"op":"insertBlock","index":N,"kind":"paragraph"|"heading","level":1|2|3,"text":"..."} — add a block before #N',
   '  {"op":"deleteBlock","index":N}                              — remove block #N',
-  'Make the smallest change that satisfies the instruction. Never rewrite blocks the instruction does not concern. If the instruction is unclear, return [].',
+  '  {"op":"skip","reason":"..."}                                — the ONLY thing to return when you will not change the document; say why in one sentence',
+  'Titles: the "title" line is the document\'s NAME as listed; it is often a placeholder or an identifier (e.g. "Verify 0mlyxo", "Untitled", a ticket code). When asked for a title or heading, COMPOSE one from the document\'s content — what the text is about — in a few words; never repeat the listed name or any identifier-looking token, and never answer that a title already exists because the name line is filled. "Add a title" means setTitle with the composed title (it becomes the level-1 heading too).',
+  'Make the smallest change that satisfies the instruction. Never rewrite blocks the instruction does not concern. Never invent facts that are not in the document or the instruction.',
   '',
-  'Document (current title, then numbered blocks):',
+  'Document (listed name, then numbered blocks):',
   '{{ context.documentOutline }}',
   '',
   'Instruction from {{ context.requestedByName }}: {{ context.instruction }}',
@@ -172,9 +174,12 @@ export function createDocumentApplyHandler(): StepHandler {
         if (data.optional) return { status: 'completed', output: { applied: 0, skipped: 'no document on this run' } };
         return { status: 'failed', error: 'documentId missing from the run context' };
       }
-      const { ops, raw: planText } = opsFromContext(context, data);
+      const { ops: planned, raw: planText } = opsFromContext(context, data);
+      const skips = planned.filter((o) => o.op === 'skip') as Array<{ op: 'skip'; reason: string }>;
+      const ops = planned.filter((o) => o.op !== 'skip');
       if (ops.length === 0) {
-        return { status: 'completed', output: { applied: 0, skipped: 0, reason: data.opsFrom ? 'nothing to write' : 'the model proposed no operations', planText: planText.slice(0, 500) } };
+        const reason = skips[0]?.reason || (data.opsFrom ? 'nothing to write' : 'the model proposed no operations');
+        return { status: 'completed', output: { applied: 0, skipped: 0, reason, planText: planText.slice(0, 500) } };
       }
       const agent = new AgentCollaborator({ documentId, identity: data.agent ? { ...HAIKU_AGENT, ...data.agent } : HAIKU_AGENT });
       try {
