@@ -9,6 +9,8 @@ import { asyncHandler, ValidationError } from '../middleware/error-handler';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOCUMENT_AGENT_EDIT_PIPELINE_ID, DOCUMENT_TRANSFORM_PIPELINE_ID } from '../documents/documentAgentPipeline';
+import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID, DEFAULT_HISTORY_LIMIT } from '../documents/conversationSummarizePipeline';
+import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
 import log from '../lib/logger';
 
 export const documentAgentEditRouter = Router();
@@ -81,4 +83,60 @@ documentAgentEditRouter.post('/:documentId/transform-run', requireAuth, asyncHan
   getRunPersistenceService()?.registerTrigger({ runId, pipelineId: DOCUMENT_TRANSFORM_PIPELINE_ID, userId, triggerType: 'manual', at: new Date().toISOString() });
   log.info({ runId, documentId, sourceDocumentId, targetName, userId }, 'document transform run triggered');
   res.status(202).json({ runId, pipelineId: DOCUMENT_TRANSFORM_PIPELINE_ID, documentId, sourceDocumentId, agent: { userId: 'agent:haiku', displayName: 'Haiku' } });
+}));
+
+// POST /api/documents/:documentId/summarize-run — the chat's "/summarize"
+// command. `:documentId` is the NEW, empty page the client just created; the
+// run reads the conversation through the chat service, plans a page, writes it
+// as a collaborator and leaves a card in the thread that opens the page.
+documentAgentEditRouter.post('/:documentId/summarize-run', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const documentId = String(req.params.documentId ?? '');
+  const body = (req.body ?? {}) as { chatChannel?: unknown; requestedByName?: unknown; limit?: unknown };
+  const chatChannel = typeof body.chatChannel === 'string' ? body.chatChannel.trim() : '';
+  if (!documentId) throw new ValidationError('documentId is required');
+  if (!chatChannel) throw new ValidationError('chatChannel is required');
+  const limit = typeof body.limit === 'number' && Number.isFinite(body.limit) && body.limit > 0 ? Math.min(Math.floor(body.limit), 1000) : DEFAULT_HISTORY_LIMIT;
+  const userId = req.user!.sub;
+  const requestedByName = typeof body.requestedByName === 'string' && body.requestedByName ? body.requestedByName.slice(0, 80) : userId;
+  const bridge = getPipelineBridge();
+  if (!bridge?.trigger) { res.status(503).json({ error: 'pipeline engine is not available' }); return; }
+  const out = await Promise.resolve(bridge.trigger({
+    pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID,
+    definition: buildConversationSummarizeDefinition() as never,
+    triggerPayload: { documentId, chatChannel, limit, requestedBy: userId, requestedByName, instruction: `Summarise ${chatChannel}`, requestId: randomUUID() },
+    triggeredBy: { userId },
+  } as never));
+  const runId = (out as { runId: string }).runId;
+  getRunPersistenceService()?.registerTrigger({ runId, pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID, userId, triggerType: 'manual', at: new Date().toISOString() });
+  log.info({ runId, documentId, chatChannel, userId }, 'conversation summarize run triggered');
+  res.status(202).json({ runId, pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID, documentId, chatChannel, agent: { userId: 'agent:haiku', displayName: 'Haiku' } });
+}));
+
+// POST /api/documents/:documentId/diagram-run — the chat's "/diagram <what>"
+// command. `:documentId` is the NEW diagram-shaped document the client just
+// created; the run sketches it with a light model, draws the elements through
+// the CRDT as a collaborator, and leaves a card in the thread that opens it.
+documentAgentEditRouter.post('/:documentId/diagram-run', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const documentId = String(req.params.documentId ?? '');
+  const body = (req.body ?? {}) as { title?: unknown; prompt?: unknown; chatChannel?: unknown; requestedByName?: unknown };
+  const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+  const title = (typeof body.title === 'string' && body.title.trim() ? body.title.trim() : prompt).slice(0, 120);
+  if (!documentId) throw new ValidationError('documentId is required');
+  if (!prompt) throw new ValidationError('prompt is required');
+  if (prompt.length > 2000) throw new ValidationError('prompt must be 2000 characters or fewer');
+  const userId = req.user!.sub;
+  const requestedByName = typeof body.requestedByName === 'string' && body.requestedByName ? body.requestedByName.slice(0, 80) : userId;
+  const chatChannel = typeof body.chatChannel === 'string' && body.chatChannel.trim() ? body.chatChannel.trim() : undefined;
+  const bridge = getPipelineBridge();
+  if (!bridge?.trigger) { res.status(503).json({ error: 'pipeline engine is not available' }); return; }
+  const out = await Promise.resolve(bridge.trigger({
+    pipelineId: DIAGRAM_GENERATE_PIPELINE_ID,
+    definition: buildDiagramGenerateDefinition() as never,
+    triggerPayload: { documentId, title, prompt, requestedBy: userId, requestedByName, ...(chatChannel ? { chatChannel } : {}), instruction: title, requestId: randomUUID() },
+    triggeredBy: { userId },
+  } as never));
+  const runId = (out as { runId: string }).runId;
+  getRunPersistenceService()?.registerTrigger({ runId, pipelineId: DIAGRAM_GENERATE_PIPELINE_ID, userId, triggerType: 'manual', at: new Date().toISOString() });
+  log.info({ runId, documentId, title, userId }, 'diagram generate run triggered');
+  res.status(202).json({ runId, pipelineId: DIAGRAM_GENERATE_PIPELINE_ID, documentId, title, ...(chatChannel ? { chatChannel } : {}), agent: { userId: 'agent:haiku', displayName: 'Haiku' } });
 }));

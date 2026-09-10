@@ -102,6 +102,7 @@ import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
+import { buildChatCommandHandlers } from '../documents/chatCommandHandlers';
 import { buildRecordingPipelineHandlers } from '../recordings/recordingPipelines';
 import { withStepRetry } from './withStepRetry';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
@@ -736,6 +737,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // The chat's /doc command: read → plan (light model) → apply as a collaborator.
   for (const [key, handler] of buildDocumentAgentHandlers()) {
     customStepHandlers.set(key, handler);
+  }
+  // The chat's /summarize and /diagram commands (read the conversation, draw the diagram, post the card). Retry-wrapped like the recording kinds.
+  for (const [key, handler] of buildChatCommandHandlers()) {
+    customStepHandlers.set(key, withStepRetry(handler));
   }
   // After a call: finalize the recording and transcribe it — as runs, not inline code.
   // Wrapped so a node's retryPolicy is honoured for custom kinds (the executor

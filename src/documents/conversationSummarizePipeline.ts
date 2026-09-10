@@ -1,0 +1,128 @@
+// "/summarize" in a chat becomes a PIPELINE RUN that writes a page: read the
+// conversation through the chat service → a light model plans a document
+// (title, headings, prose, and an action-items checklist when people
+// committed to things) → the plan lands in the empty page the client created,
+// as a collaborator → a card in the thread names the page.
+//
+//   conversation-summarize:  trigger → read-history → plan → apply → publish
+//
+// The apply step is the shared `document:apply` — the same write path /doc,
+// Transform and the call transcript use — so this pipeline owns exactly two
+// things: how a conversation is read, and what the model is told about it.
+import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
+import { readChatHistory, type ChatHistoryMessage } from '../gateway/GatewayServiceClient';
+import { DOCUMENT_APPLY_KIND } from './documentAgentPipeline';
+import { postRunCardToChannel, str } from './chatRunCard';
+
+export const CONVERSATION_SUMMARIZE_PIPELINE_ID = 'conversation-summarize';
+export const CHAT_READ_HISTORY_KIND = 'chat:read-history';
+export const SUMMARIZE_PUBLISH_KIND = 'summarize:publish';
+export const DEFAULT_HISTORY_LIMIT = 200;
+
+const PLAN_RETRY = { maxAttempts: 3, backoffMs: 2000, backoffMultiplier: 2, retryUnknown: true } as const;
+
+/**
+ * The conversation as the model reads it: one line per message, oldest first,
+ * `[HH:MM] Name: text`. Run cards (the thread's own /doc, /summarize and
+ * /diagram messages) and empty messages are not conversation and are skipped.
+ */
+export function conversationText(messages: readonly ChatHistoryMessage[]): { text: string; count: number } {
+  const lines: string[] = [];
+  const sorted = [...messages].sort((a, b) => String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')));
+  for (const m of sorted) {
+    const text = typeof m.message === 'string' ? m.message.trim() : '';
+    if (!text) continue;
+    const md = (m.metadata ?? {}) as Record<string, unknown>;
+    if (md.kind === 'agent-run') continue;
+    const name = str(md.displayName) ?? str(m.userId) ?? 'Someone';
+    const at = m.timestamp ? new Date(m.timestamp) : null;
+    const hhmm = at && !Number.isNaN(at.getTime()) ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '--:--';
+    lines.push(`[${hhmm}] ${name}: ${text}`);
+  }
+  return { text: lines.join('\n'), count: lines.length };
+}
+
+/** What the light model is told; the `plan` agent step interpolates it from the run context. */
+export const CONVERSATION_SUMMARY_PROMPT = [
+  'You turn a chat conversation into a short, well-structured page. Answer with ONLY a JSON array of operations, no prose, no code fence.',
+  'Operations available, in the order they should appear:',
+  '  {"op":"setTitle","text":"..."}                                — always first. COMPOSE a title from what the conversation is about, in a few words. Never use the channel name, a date, or the word "summary" alone.',
+  '  {"op":"appendBlock","kind":"heading","level":2,"text":"..."}  — a section heading (Summary, Decisions, Open questions, …)',
+  '  {"op":"appendBlock","kind":"paragraph","text":"..."}          — prose under the heading above it; one idea per paragraph',
+  '  {"op":"appendMacro","macroName":"action-items","yaml":"items:\\n  - assignee: <name>\\n    status: pending\\n    text: <what they will do>\\n  - status: pending\\n    text: <unowned commitment>"}',
+  '      — ONE checklist, under a heading "Action items", ONLY when the conversation contains commitments (someone said they will do something, or asked someone to). Keys per item, in this order: assignee (omit when nobody owns it), status (always pending), text. Names come from the speakers as written.',
+  '  {"op":"skip","reason":"..."}                                  — the ONLY thing to return when the conversation is empty or has nothing worth a page',
+  'Start with a "Summary" section of 2–4 sentences. Add "Decisions" and "Open questions" sections only when the conversation has some. Never invent facts, names or dates that are not in the conversation. Quote people by name when a point is attributable.',
+  '',
+  'Channel: {{ context.chatChannel }}',
+  'Requested by: {{ context.requestedByName }}',
+  'Conversation ({{ context.messageCount }} messages, oldest first):',
+  '{{ context.conversationText }}',
+].join('\n');
+
+export function buildConversationSummarizeDefinition(model = process.env.DOCUMENT_AGENT_MODEL || 'haiku'): Record<string, unknown> {
+  const pos = (x: number) => ({ x, y: 0 });
+  const edge = (source: string, target: string) => ({ id: `${source}->${target}`, source, sourceHandle: 'out', target, targetHandle: 'in' });
+  return {
+    id: CONVERSATION_SUMMARIZE_PIPELINE_ID,
+    name: 'Conversation summary',
+    description: 'A /summarize command from a chat: read the conversation, plan a page with a light model (action items as a checklist), write it as a collaborator, leave a card in the thread.',
+    version: 1, status: 'published', publishedVersion: 1,
+    nodes: [
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/summarize command' } },
+      { id: 'read-history', type: CHAT_READ_HISTORY_KIND, position: pos(200), data: { type: CHAT_READ_HISTORY_KIND, label: 'Read the conversation', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
+      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the page (Haiku)', prompt: CONVERSATION_SUMMARY_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: PLAN_RETRY } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the page as a collaborator', opsFrom: 'steps.plan.text', agent: { userId: 'agent:haiku', displayName: 'Haiku' } } },
+      { id: 'publish', type: SUMMARIZE_PUBLISH_KIND, position: pos(800), data: { type: SUMMARIZE_PUBLISH_KIND, label: 'Post the card to the conversation' } },
+    ],
+    edges: [edge('trigger', 'read-history'), edge('read-history', 'plan'), edge('plan', 'apply'), edge('apply', 'publish')],
+  };
+}
+
+/** Step 1: read the channel through the chat service and hand the model a transcript. */
+export function createChatReadHistoryHandler(deps: { readHistory?: typeof readChatHistory } = {}): StepHandler {
+  const read = deps.readHistory ?? readChatHistory;
+  return {
+    kind: CHAT_READ_HISTORY_KIND,
+    async execute(_node: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
+      const channel = str(ctx.chatChannel);
+      if (!channel) return { status: 'failed', error: 'chatChannel missing from the run context' };
+      const limit = typeof ctx.limit === 'number' && ctx.limit > 0 ? Math.min(Math.floor(ctx.limit), 1000) : DEFAULT_HISTORY_LIMIT;
+      try {
+        const messages = await read({ channel, limit });
+        const { text, count } = conversationText(messages);
+        // Merged into the run context: `{{ context.conversationText }}` and `{{ context.messageCount }}`.
+        return { status: 'completed', output: { conversationText: text || '(no messages)', messageCount: count, rawMessages: messages.length } };
+      } catch (err) {
+        return { status: 'failed', error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  };
+}
+
+/** Last step: the card in the thread — `/summarize <title> — <n> messages` — carrying the page's id. */
+export function createSummarizePublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): StepHandler {
+  const post = deps.postCard ?? postRunCardToChannel;
+  return {
+    kind: SUMMARIZE_PUBLISH_KIND,
+    async execute(_node: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
+      const steps = (ctx.steps ?? {}) as Record<string, Record<string, unknown> | undefined>;
+      const title = str(steps.apply?.title) ?? 'Conversation summary';
+      const count = typeof ctx.messageCount === 'number' ? ctx.messageCount : 0;
+      const applied = typeof steps.apply?.applied === 'number' ? steps.apply.applied : 0;
+      const instruction = applied > 0 ? `${title} — ${count} message${count === 1 ? '' : 's'}` : `Nothing to summarise — ${count} message${count === 1 ? '' : 's'}`;
+      const posted = await post({
+        channel: str(ctx.chatChannel), runId: helpers.runId, pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID,
+        command: '/summarize', instruction,
+        extra: { documentId: ctx.documentId, title, messageCount: count, applied },
+      });
+      return { status: 'completed', output: { posted, title, messageCount: count, applied } };
+    },
+  };
+}
+
+export function buildConversationSummarizeHandlers(): Map<string, StepHandler> {
+  const m = new Map<string, StepHandler>();
+  for (const h of [createChatReadHistoryHandler(), createSummarizePublishHandler()]) m.set(h.kind, h);
+  return m;
+}

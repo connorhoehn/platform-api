@@ -94,6 +94,27 @@ export class GatewayServiceClient {
 export const PIPELINE_IDENTITY: ServiceIdentity = { userId: 'agent:pipeline', displayName: 'Pipeline', color: '#0ea5e9' };
 
 /**
+ * Does this frame carry the chat service's `action`? The gateway emits NESTED
+ * frames — `{ type: 'chat', action: 'joined' | 'history' | 'message' | 'sent' }`
+ * — and an older flat spelling (`type: 'chat:history'`) has been seen in
+ * fixtures. Accept both so a reply is never waited out on a spelling.
+ */
+export function isChatFrame(frame: GatewayFrame, action: string, channel?: string): boolean {
+  if (channel !== undefined && frame.channel !== channel) return false;
+  if (frame.type === 'chat' && frame.action === action) return true;
+  return frame.type === `chat:${action}` || frame.type === action;
+}
+
+/** The chat message record the gateway persists and replays. */
+export interface ChatHistoryMessage {
+  id?: string;
+  userId?: string;
+  message?: string;
+  metadata?: Record<string, unknown>;
+  timestamp?: string;
+}
+
+/**
  * Post a message into a chat channel as a service identity, through the chat
  * service (so it is persisted and fanned out like any message). Join first —
  * the service refuses a send from a client that has not joined.
@@ -103,11 +124,43 @@ export async function postChatMessage(input: { channel: string; message: string;
   await client.connect();
   try {
     client.send({ service: 'chat', action: 'join', channel: input.channel });
-    // The join reply (history) is the signal the subscription is in place.
-    await client.waitFor((f) => f.channel === input.channel && (f.type === 'chat:history' || f.type === 'chat:joined' || f.type === 'history'), 2000);
+    // The joined ack (or the join's history replay) is the signal the subscription is in place.
+    await client.waitFor((f) => isChatFrame(f, 'joined', input.channel) || isChatFrame(f, 'history', input.channel), 2000);
     client.send({ service: 'chat', action: 'send', channel: input.channel, message: input.message, metadata: input.metadata ?? {} });
-    await client.waitFor((f) => f.channel === input.channel && (f.type === 'chat:message' || f.type === 'message') && (f as { message?: unknown }).message === input.message, 2000);
+    // The service acks the sender with `sent`; the fan-out `message` frame nests the record.
+    await client.waitFor((f) => isChatFrame(f, 'sent', input.channel)
+      || (isChatFrame(f, 'message', input.channel) && (f.message === input.message || (f.message as ChatHistoryMessage | undefined)?.message === input.message)), 2000);
   } finally {
+    await client.close();
+  }
+}
+
+/**
+ * Read a channel's history as a service identity: join, ask for `limit`
+ * messages, and hand back the records oldest first. The join itself replays a
+ * short history; the explicit request may answer with more, so whichever
+ * reply carries the most messages wins.
+ */
+export async function readChatHistory(input: { channel: string; limit?: number; identity?: ServiceIdentity; gatewayUrl?: string; timeoutMs?: number }): Promise<ChatHistoryMessage[]> {
+  const client = new GatewayServiceClient(input.identity ?? PIPELINE_IDENTITY, input.gatewayUrl);
+  const timeoutMs = input.timeoutMs ?? 4000;
+  await client.connect(timeoutMs);
+  const seen: ChatHistoryMessage[][] = [];
+  const off = client.onFrame((f) => {
+    if (isChatFrame(f, 'history', input.channel) && Array.isArray(f.messages)) seen.push(f.messages as ChatHistoryMessage[]);
+  });
+  try {
+    client.send({ service: 'chat', action: 'join', channel: input.channel });
+    const joined = await client.waitFor((f) => isChatFrame(f, 'joined', input.channel) || isChatFrame(f, 'history', input.channel), timeoutMs);
+    if (!joined) throw new Error(`the chat service did not confirm the join of ${input.channel} within ${timeoutMs}ms`);
+    client.send({ service: 'chat', action: 'history', channel: input.channel, limit: input.limit ?? 200 });
+    const reply = await client.waitFor((f) => isChatFrame(f, 'history', input.channel), timeoutMs);
+    if (!reply && seen.length === 0) throw new Error(`the chat service did not answer the history request for ${input.channel} within ${timeoutMs}ms`);
+    const best = seen.reduce<ChatHistoryMessage[]>((acc, m) => (m.length > acc.length ? m : acc), []);
+    return [...best].sort((a, b) => String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')));
+  } finally {
+    off();
+    client.send({ service: 'chat', action: 'leave', channel: input.channel });
     await client.close();
   }
 }

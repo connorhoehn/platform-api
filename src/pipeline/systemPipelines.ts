@@ -5,6 +5,8 @@
 // pipeline pages can name their steps and list their runs.
 import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOCUMENT_AGENT_EDIT_PIPELINE_ID, DOCUMENT_TRANSFORM_PIPELINE_ID } from '../documents/documentAgentPipeline';
 import { buildRecordingFinalizeDefinition, buildCallTranscriptionDefinition, RECORDING_FINALIZE_PIPELINE_ID, CALL_TRANSCRIPTION_PIPELINE_ID } from '../recordings/recordingPipelines';
+import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID } from '../documents/conversationSummarizePipeline';
+import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
 
 export interface SystemPipelineEntry {
   id: string;
@@ -16,6 +18,8 @@ const REGISTRY: SystemPipelineEntry[] = [
   { id: DOCUMENT_TRANSFORM_PIPELINE_ID, build: () => buildDocumentTransformDefinition() },
   { id: RECORDING_FINALIZE_PIPELINE_ID, build: () => buildRecordingFinalizeDefinition() },
   { id: CALL_TRANSCRIPTION_PIPELINE_ID, build: () => buildCallTranscriptionDefinition() },
+  { id: CONVERSATION_SUMMARIZE_PIPELINE_ID, build: () => buildConversationSummarizeDefinition() },
+  { id: DIAGRAM_GENERATE_PIPELINE_ID, build: () => buildDiagramGenerateDefinition() },
 ];
 
 export function registerSystemPipeline(entry: SystemPipelineEntry): void {
