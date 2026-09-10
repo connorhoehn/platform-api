@@ -25,7 +25,6 @@ import { ensureOutboxTTL, ensureVideoSessionsTTL, ensurePipelineRunsTTL } from '
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
-import { startTranscriptionSummaryConsumer } from './services/transcription-summary-consumer';
 import { startSummaryProjector } from './services/summary-projector';
 import { startCallReactionConsumer } from './services/call-reaction-consumer';
 import { createPipelineConfigRegistration } from './control-plane/pipeline-config-subscriber';
@@ -176,7 +175,6 @@ const catalogRetry = new RetryManager({
 });
 
 let activityConsumer: { stop: () => Promise<void> } | null = null;
-let transcriptionSummaryConsumer: { stop: () => Promise<void> } | null = null;
 let summaryProjector: { stop: () => Promise<void> } | null = null;
 let callReactionConsumer: { stop: () => Promise<void> } | null = null;
 
@@ -194,19 +192,8 @@ let callReactionConsumer: { stop: () => Promise<void> } | null = null;
       const e = err as { message?: string };
       log.warn({ errMessage: e?.message }, 'activity-consumer failed to start (non-fatal)');
     }
-    // Transcription summary consumer — listens for transcript.ready and
-    // runs the LLM-driven markdown summarization step. Non-fatal —
-    // platform-api stays up even if the consumer fails to subscribe
-    // (e.g. MQ briefly unreachable on boot). Recordings without a
-    // summary stay in 'processing' until a healthy consumer picks them
-    // up on redelivery.
-    try {
-      transcriptionSummaryConsumer = startTranscriptionSummaryConsumer();
-      log.info('transcription-summary-consumer started');
-    } catch (err: unknown) {
-      const e = err as { message?: string };
-      log.warn({ errMessage: e?.message }, 'transcription-summary-consumer failed to start (non-fatal)');
-    }
+    // The meeting-notes summary is a step of the call-transcription pipeline
+    // (src/recordings/recordingPipelines.ts); there is no summary consumer.
     // Wave A — summary-projector: single durable consumer of
     // `transcription:summary.ready`. Projects Action Items onto the
     // call-bound document and fires summary-bound pipelines.
@@ -450,7 +437,6 @@ sd.register('control-plane-registry', async () => {
 });
 sd.register('activity-consumer', async () => {
   if (activityConsumer) await activityConsumer.stop();
-  if (transcriptionSummaryConsumer) await transcriptionSummaryConsumer.stop();
   if (summaryProjector) await summaryProjector.stop();
   if (callReactionConsumer) await callReactionConsumer.stop();
 });

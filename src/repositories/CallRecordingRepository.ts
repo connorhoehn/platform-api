@@ -270,7 +270,7 @@ export interface CallRecording {
    * absent on every row written before this split; readers treat a missing
    * value as "no summary attempt recorded".
    */
-  summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed';
+  summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed' | 'skipped';
   /** Last-error string when `summaryStatus === 'failed'`. Truncated to 200 chars. */
   summaryError?: string;
   /** Blob-storage key (S3/R2) for the merged transcript JSON. Sparse. */
@@ -1183,7 +1183,8 @@ export class CallRecordingRepository extends BaseRepository {
       summaryMarkdown?: string;
       transcriptGeneratedAt?: string;
       transcriptError?: string | null;
-      summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed';
+      /** `skipped`: the transcript is ready but there was no speech to summarise. */
+      summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed' | 'skipped';
       summaryError?: string | null;
       /** Override for the status clock. Tests only; production uses now. */
       statusAt?: string;

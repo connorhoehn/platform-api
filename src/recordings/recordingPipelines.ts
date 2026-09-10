@@ -9,7 +9,13 @@
 // slow (LVS composing the file) and a card in the conversation that moves.
 //
 //   recording-finalize:  trigger → resolve → persist → await-compose → announce → start-transcription
-//   call-transcription:  trigger → transcribe → merge-reactions → store → publish
+//   call-transcription:  trigger → transcribe → merge-reactions → store → summarize → store-summary → apply → publish
+//
+// The meeting-notes summary is a step of the transcription run (a light model
+// over the speaker-tagged transcript, then one row write). It used to be a
+// second writer — an MQ consumer on `transcription:transcript.ready` fed by a
+// Tilt-only worker — racing this pipeline for the same row fields; that
+// consumer is gone, and the row has exactly one writer per field again.
 //
 // Transcription runs in-process against the composed file with the local
 // speech engine, so a laptop with LVS and platform-api produces a transcript
@@ -63,8 +69,72 @@ export const KINDS = {
   transcribe: 'transcription:transcribe',
   mergeReactions: 'transcript:merge-reactions',
   store: 'transcript:store',
+  storeSummary: 'transcript:store-summary',
   publish: 'transcript:publish',
 } as const;
+
+/** The transcript as the summarising model reads it: one speaker-tagged, timestamped line per segment. Empty for silence. */
+export function transcriptText(segments: Array<{ startMs?: number; speakerLabel?: string; text: string }>): string {
+  return segments
+    .filter((s) => s.text && s.text.trim())
+    .map((s) => {
+      const startMs = Number(s.startMs ?? 0);
+      const min = Math.floor(startMs / 60000); const sec = Math.floor((startMs % 60000) / 1000);
+      return `[${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}] ${s.speakerLabel || 'Call'}: ${s.text.trim()}`;
+    })
+    .join('\n');
+}
+
+/** What the light model is told; the `summarize` agent step interpolates it from the run context. */
+export const CALL_SUMMARY_PROMPT = [
+  'You are an organizational knowledge analyst. You will be given a meeting transcript with speaker labels and timestamps. Produce a concise, well-structured markdown summary suitable for participants reviewing the call later.',
+  'If the transcript below is empty or missing, answer with exactly `(no speech)` and nothing else.',
+  '',
+  'Output STRICTLY this markdown structure (omit a section only if its content would be empty after a genuine scan of the transcript):',
+  '',
+  '## Summary',
+  'A 2-4 sentence overview of what the meeting was about and the outcome.',
+  '',
+  '## Topics Discussed',
+  '- Bullet list of distinct topics, each with a one-line summary.',
+  '',
+  '## Key Decisions',
+  '- Bullet list of decisions reached during the call. Quote the deciding speaker by their label when the decision is attributable.',
+  '',
+  '## Action Items',
+  '| Owner | Action | Deadline |',
+  '|-------|--------|----------|',
+  '| Name  | What they committed to do | When (or "TBD") |',
+  '',
+  '## Open Questions',
+  '- Anything raised but not resolved. Cite the asker by speaker label.',
+  '',
+  'Rules:',
+  '- Use the speaker labels verbatim — do not rename participants.',
+  '- Quote sparingly. Paraphrase technical content.',
+  '- If a section has no content, omit the section heading entirely.',
+  '- Do not add a preamble, a signature or a code fence. Start directly with "## Summary".',
+  '',
+  'Transcript:',
+  '{{ context.transcriptText }}',
+].join('\n');
+
+/** A model answer with any surrounding ```fence``` removed. */
+export function stripFences(text: string): string {
+  const t = String(text ?? '').trim();
+  const m = /^```[a-zA-Z0-9_-]*\s*\n([\s\S]*?)\n?```$/.exec(t);
+  return (m ? m[1] : t).trim();
+}
+
+/** The document operations a summary becomes: a heading, then one paragraph per non-empty line. */
+export function summaryOps(summaryMarkdown: string): Array<Record<string, unknown>> {
+  const lines = String(summaryMarkdown ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return [];
+  return [
+    { op: 'appendBlock', kind: 'heading', level: 2, text: 'Call summary' },
+    ...lines.map((text) => ({ op: 'appendBlock', kind: 'paragraph', text })),
+  ];
+}
 
 const SETTLED_COMPOSE: ReadonlySet<string> = new Set(['ok', 'degraded', 'failed', 'skipped']);
 const lvsAuth = () => ({ Authorization: `Bearer ${process.env.LVS_ADMIN_TOKEN ?? process.env.VIDEO_ADMIN_TOKEN ?? 'admin'}` });
@@ -104,23 +174,31 @@ export function buildRecordingFinalizeDefinition(): Record<string, unknown> {
   };
 }
 
-export function buildCallTranscriptionDefinition(): Record<string, unknown> {
+const SUMMARY_RETRY = { maxAttempts: 3, backoffMs: 2000, backoffMultiplier: 2, retryUnknown: true } as const;
+
+export function buildCallTranscriptionDefinition(model = process.env.DOCUMENT_AGENT_MODEL || 'haiku'): Record<string, unknown> {
   return {
     id: CALL_TRANSCRIPTION_PIPELINE_ID,
     name: 'Call transcription',
-    description: 'Transcribe the composed recording, merge in-call reactions by time, store the transcript, publish it to the conversation and the call\'s document.',
+    description: 'Transcribe the composed recording, merge in-call reactions by time, store the transcript, summarise it with a light model, publish it to the conversation and the call\'s document.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Recording ready' } },
       { id: 'transcribe', type: KINDS.transcribe, position: pos(200), data: { type: KINDS.transcribe, label: 'Transcribe the audio', retryPolicy: { maxAttempts: 3, backoffMs: 3000, backoffMultiplier: 2, retryUnknown: true } } },
       { id: 'merge-reactions', type: KINDS.mergeReactions, position: pos(400), data: { type: KINDS.mergeReactions, label: 'Merge reactions' } },
       { id: 'store', type: KINDS.store, position: pos(600), data: { type: KINDS.store, label: 'Store the transcript' } },
+      // The meeting notes: a light model over the speaker-tagged transcript
+      // (`transcriptText`, empty for silence), then one row write. The agent
+      // step always runs; store-summary skips the row's summary when nothing
+      // was said and never reads the model's answer in that case.
+      { id: 'summarize', type: 'agent', position: pos(800), data: { type: 'agent', label: 'Summarise the call (Haiku)', prompt: CALL_SUMMARY_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: SUMMARY_RETRY } },
+      { id: 'store-summary', type: KINDS.storeSummary, position: pos(1000), data: { type: KINDS.storeSummary, label: 'Store the summary', retryPolicy: SUMMARY_RETRY } },
       // The one shared write path into a document — the same step kind /doc and
       // Transform use. Optional: a room call has no document to write into.
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(800), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the transcript into the call document', opsFrom: 'transcriptOps', optional: true, agent: TRANSCRIPT_AGENT } },
-      { id: 'publish', type: KINDS.publish, position: pos(1000), data: { type: KINDS.publish, label: 'Publish to the conversation' } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1200), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the summary and transcript into the call document', opsFrom: 'transcriptOps', optional: true, agent: TRANSCRIPT_AGENT } },
+      { id: 'publish', type: KINDS.publish, position: pos(1400), data: { type: KINDS.publish, label: 'Publish to the conversation' } },
     ],
-    edges: [edge('trigger', 'transcribe'), edge('transcribe', 'merge-reactions'), edge('merge-reactions', 'store'), edge('store', 'apply'), edge('apply', 'publish')],
+    edges: [edge('trigger', 'transcribe'), edge('transcribe', 'merge-reactions'), edge('merge-reactions', 'store'), edge('store', 'summarize'), edge('summarize', 'store-summary'), edge('store-summary', 'apply'), edge('apply', 'publish')],
   };
 }
 
@@ -403,9 +481,41 @@ function storeHandler(): StepHandler {
       const transcript = (ctx.transcript ?? { segments: ctx.segments ?? [] }) as { segments: TranscriptSegment[] };
       const json = JSON.stringify(transcript);
       if (json.length > 350 * 1024) return fail(`transcript too large to store inline (${json.length} bytes)`);
-      await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', transcriptKey: 'inline', transcriptJson: json } as never);
-      // `transcriptOps` is what the shared document:apply step writes next.
-      return ok({ stored: 'inline', bytes: json.length, segments: transcript.segments.length, transcriptOps: transcriptOps(transcript.segments) });
+      // The summary is the next two steps' business; say it is underway so a
+      // reader can tell "not yet" from "this row predates the summary".
+      await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', transcriptKey: 'inline', transcriptJson: json, summaryStatus: 'pending' } as never);
+      const text = transcriptText(transcript.segments);
+      // `transcriptOps` is what the shared document:apply step writes; the
+      // store-summary step puts the summary in front of it when there is one.
+      return ok({ stored: 'inline', bytes: json.length, segments: transcript.segments.length, transcriptText: text, hasSpeech: text.length > 0, transcriptOps: transcriptOps(transcript.segments) });
+    },
+  };
+}
+
+/** Persist the summarising model's answer on the row; for a silent recording, record that there was nothing to summarise without reading the model. */
+function storeSummaryHandler(): StepHandler {
+  return {
+    kind: KINDS.storeSummary,
+    async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
+      const callId = str(ctx.callId); const recordingId = str(ctx.recordingId);
+      if (!callId || !recordingId) return fail('callId and recordingId are required');
+      const now = new Date().toISOString();
+      if (ctx.hasSpeech !== true) {
+        await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', summaryStatus: 'skipped', summaryError: null, transcriptGeneratedAt: now });
+        return ok({ summaryStatus: 'skipped', summaryChars: 0 });
+      }
+      const answer = (ctx.steps as Record<string, { text?: unknown }> | undefined)?.summarize?.text;
+      const summaryMarkdown = stripFences(typeof answer === 'string' ? answer : '');
+      if (!summaryMarkdown || summaryMarkdown === '(no speech)') {
+        // The transcript is stored and stays ready; only the notes over it are
+        // missing, and the row says so on its own axis.
+        const summaryError = summaryMarkdown ? 'the model found no speech in a transcript that has some' : 'the model returned nothing';
+        await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', summaryStatus: 'failed', summaryError, transcriptGeneratedAt: now });
+        return ok({ summaryStatus: 'failed', summaryChars: 0, summaryError });
+      }
+      await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', summaryStatus: 'ready', summaryMarkdown, summaryError: null, transcriptGeneratedAt: now });
+      const existing = Array.isArray(ctx.transcriptOps) ? (ctx.transcriptOps as Array<Record<string, unknown>>) : [];
+      return ok({ summaryStatus: 'ready', summaryChars: summaryMarkdown.length, transcriptOps: [...summaryOps(summaryMarkdown), ...existing] });
     },
   };
 }
@@ -432,6 +542,6 @@ function publishHandler(): StepHandler {
 
 export function buildRecordingPipelineHandlers(deps: RecordingPipelineDeps = {}): Map<string, StepHandler> {
   const m = new Map<string, StepHandler>();
-  for (const h of [resolveHandler(), persistHandler(), awaitComposeHandler(), announceHandler(), startTranscriptionHandler(deps), transcribeHandler(), mergeReactionsHandler(), storeHandler(), publishHandler()]) m.set(h.kind, h);
+  for (const h of [resolveHandler(), persistHandler(), awaitComposeHandler(), announceHandler(), startTranscriptionHandler(deps), transcribeHandler(), mergeReactionsHandler(), storeHandler(), storeSummaryHandler(), publishHandler()]) m.set(h.kind, h);
   return m;
 }

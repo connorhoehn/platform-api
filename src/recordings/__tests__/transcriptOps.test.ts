@@ -1,6 +1,6 @@
 // The transcript crosses into the document as operations for the shared
 // document:apply step — the same step /doc and Transform write through.
-import { transcriptOps, buildCallTranscriptionDefinition } from '../recordingPipelines';
+import { transcriptOps, buildCallTranscriptionDefinition, KINDS } from '../recordingPipelines';
 import { DOCUMENT_APPLY_KIND, opsFromContext } from '../../documents/documentAgentPipeline';
 
 describe('transcriptOps', () => {
@@ -20,13 +20,24 @@ describe('the transcription pipeline writes through document:apply', () => {
   const def = buildCallTranscriptionDefinition() as { nodes: Array<{ id: string; type: string; data: Record<string, unknown> }>; edges: Array<{ source: string; target: string }> };
   const apply = def.nodes.find((n) => n.type === DOCUMENT_APPLY_KIND)!;
 
-  it('has the shared apply node between store and publish, optional, reading transcriptOps', () => {
+  it('has the shared apply node after the summary and before publish, optional, reading transcriptOps', () => {
     expect(apply).toBeDefined();
     expect(apply.data).toMatchObject({ opsFrom: 'transcriptOps', optional: true });
-    expect(def.edges).toEqual(expect.arrayContaining([
-      expect.objectContaining({ source: 'store', target: apply.id }),
-      expect.objectContaining({ source: apply.id, target: 'publish' }),
-    ]));
+    expect(def.edges.map((e) => `${e.source}->${e.target}`)).toEqual([
+      'trigger->transcribe', 'transcribe->merge-reactions', 'merge-reactions->store',
+      'store->summarize', 'summarize->store-summary', `store-summary->${apply.id}`, `${apply.id}->publish`,
+    ]);
+  });
+
+  it('summarises with a light agent step that retries, and stores the answer with a step of its own', () => {
+    const summarize = def.nodes.find((n) => n.id === 'summarize')!;
+    expect(summarize.type).toBe('agent');
+    expect(summarize.data).toMatchObject({ type: 'agent', allowedTools: [], maxTurns: 1, retryPolicy: { maxAttempts: 3, retryUnknown: true } });
+    expect(String(summarize.data.prompt)).toContain('{{ context.transcriptText }}');
+    expect(String(summarize.data.prompt)).toContain('(no speech)');
+    const storeSummary = def.nodes.find((n) => n.id === 'store-summary')!;
+    expect(storeSummary.type).toBe(KINDS.storeSummary);
+    expect(storeSummary.data).toMatchObject({ retryPolicy: { maxAttempts: 3 } });
   });
 
   it('resolves the ops the store step produced', () => {

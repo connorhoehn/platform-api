@@ -11,8 +11,8 @@
  * Used in two places:
  *   1. GET /recordings/:recordingId/transcript (src/routes/recordings.ts)
  *      — playback UI sees reactions inline with speech segments.
- *   2. transcription-summary-consumer — the LLM summary prompt sees the
- *      reaction lines alongside speech.
+ *   2. the call-transcription pipeline (src/recordings/recordingPipelines.ts)
+ *      — the summarising model's prompt sees the reaction lines alongside speech.
  *
  * Pure function, no I/O.
  */

@@ -44,7 +44,6 @@ import {
   QueryCommand,
 } from '@aws-sdk/client-dynamodb';
 import {
-  callRecordingRepo,
   videoSessionRepo,
   type CallRecordingParticipant,
 } from '../repositories';
