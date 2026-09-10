@@ -197,6 +197,8 @@ export const peopleSearchCommand: ChatCommandPipeline = {
   trigger: '/search',
   pipelineId: PEOPLE_SEARCH_PIPELINE_ID,
   description: 'Find people by what they know',
+  label: 'Find people',
+  hint: 'by what they know',
   requires: { argumentText: true },
   buildDefinition: () => buildPeopleSearchDefinition(),
   triggerPayload: (input) => ({

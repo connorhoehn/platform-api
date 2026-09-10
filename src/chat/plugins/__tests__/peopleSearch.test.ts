@@ -161,7 +161,7 @@ describe('registration', () => {
     expect(getCustomStepHandler(PEOPLE_SEARCH_KIND)?.kind).toBe(PEOPLE_SEARCH_KIND);
     expect(getCustomStepHandler(PEOPLE_PUBLISH_KIND)?.kind).toBe(PEOPLE_PUBLISH_KIND);
     expect(listChatCommandPipelines()).toEqual([
-      { trigger: '/search', pipelineId: 'people-search', description: 'Find people by what they know', requires: { argumentText: true } },
+      { trigger: '/search', pipelineId: 'people-search', description: 'Find people by what they know', label: 'Find people', hint: 'by what they know', requires: { argumentText: true } },
     ]);
     const def = getChatCommandPipeline('search')!;
     expect(def.postCard).toBe(false);

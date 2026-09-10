@@ -84,6 +84,8 @@ export function registerBuiltinChatCommands(): void {
   registerChatCommandPipeline({
     trigger: '/doc',
     pipelineId: DOCUMENT_AGENT_EDIT_PIPELINE_ID,
+    label: 'Edit the open document',
+    hint: 'with Haiku, as a collaborator',
     description: 'Edit the document beside the chat: a light model plans the change, a big one waits for your approval, the edit lands as a collaborator.',
     requires: { document: true, argumentText: true },
     postCard: false,
@@ -100,6 +102,8 @@ export function registerBuiltinChatCommands(): void {
   registerChatCommandPipeline({
     trigger: '/transform',
     pipelineId: DOCUMENT_TRANSFORM_PIPELINE_ID,
+    label: 'Transform the open document',
+    hint: 'into another type',
     description: 'Transform the source page into another known type: `documentId` is the new empty page, `extra.sourceDocumentId` the page being transformed, the argument names the type.',
     requires: { document: true, argument: true, extra: ['sourceDocumentId'] },
     postCard: false,
@@ -125,6 +129,8 @@ export function registerBuiltinChatCommands(): void {
   registerChatCommandPipeline({
     trigger: '/summarize',
     pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID,
+    label: 'Summarise this conversation',
+    hint: 'into a new page',
     description: 'Summarise this conversation into a page: `documentId` is the new empty page; `extra.limit` caps how many messages are read.',
     requires: { document: true },
     postCard: false,
@@ -145,6 +151,8 @@ export function registerBuiltinChatCommands(): void {
   registerChatCommandPipeline({
     trigger: '/diagram',
     pipelineId: DIAGRAM_GENERATE_PIPELINE_ID,
+    label: 'Draw a diagram',
+    hint: 'from a description',
     description: 'Draw a diagram from a description into a new diagram document: `documentId` is the new document, the text after the command is what to draw; `extra.title` names it.',
     requires: { document: true, argumentText: true },
     postCard: false,

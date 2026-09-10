@@ -79,7 +79,12 @@ export interface ChatCommandPipeline {
   trigger: string;
   /** Must be (or becomes, on first run) a registered system pipeline. */
   pipelineId: string;
+  /** The long form: what the run does, for the menu's footer and the card. */
   description: string;
+  /** What the menu row says — "Find people". Without one a client falls back to the description or the trigger. */
+  label?: string;
+  /** The row's second clause — "by what they know". */
+  hint?: string;
   /**
    * Resolve anything asynchronous the command needs before the definition and
    * payload are built (a type looked up by name, a person by handle). Returns
@@ -101,7 +106,7 @@ export interface ChatCommandPipeline {
   requires?: ChatCommandRequires;
 }
 
-export type ChatCommandListing = Pick<ChatCommandPipeline, 'trigger' | 'pipelineId' | 'description' | 'requires'>;
+export type ChatCommandListing = Pick<ChatCommandPipeline, 'trigger' | 'pipelineId' | 'description' | 'label' | 'hint' | 'requires'>;
 
 export interface ChatCommandRunOutput {
   runId: string;
@@ -146,7 +151,12 @@ export function getChatCommandPipeline(trigger: string): ChatCommandPipeline | u
 }
 
 export function listChatCommandPipelines(): ChatCommandListing[] {
-  return [...REGISTRY.values()].map(({ trigger, pipelineId, description, requires }) => ({ trigger, pipelineId, description, ...(requires ? { requires } : {}) }));
+  return [...REGISTRY.values()].map(({ trigger, pipelineId, description, label, hint, requires }) => ({
+    trigger, pipelineId, description,
+    ...(label ? { label } : {}),
+    ...(hint ? { hint } : {}),
+    ...(requires ? { requires } : {}),
+  }));
 }
 
 export function knownChatCommandTriggers(): string[] {

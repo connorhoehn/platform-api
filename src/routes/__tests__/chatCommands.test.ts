@@ -97,6 +97,27 @@ describe('GET /api/chat/commands', () => {
     for (const c of commands) expect(typeof (c as { description: string }).description).toBe('string');
   });
 
+  it('carries each command\'s menu label and hint beside its description', async () => {
+    const res = await run(buildApp(), 'GET', '/api/chat/commands');
+    const commands = (res.body as { commands: Array<{ trigger: string; label?: string; hint?: string; description: string }> }).commands;
+    const byTrigger = Object.fromEntries(commands.map((c) => [c.trigger, c]));
+    expect(byTrigger['/search']).toMatchObject({ label: 'Find people', hint: 'by what they know', description: 'Find people by what they know' });
+    expect(byTrigger['/summarize']).toMatchObject({ label: 'Summarise this conversation', hint: 'into a new page' });
+    for (const t of ['/doc', '/transform', '/summarize', '/diagram', '/search']) {
+      expect(typeof byTrigger[t]!.label).toBe('string');
+      expect(typeof byTrigger[t]!.hint).toBe('string');
+    }
+    // The listing is exactly the client contract: nothing executable leaks.
+    expect(Object.keys(byTrigger['/search']!).sort()).toEqual(['description', 'hint', 'label', 'pipelineId', 'requires', 'trigger']);
+  });
+
+  it('lists a command registered with no label or hint without inventing them', async () => {
+    registerChatCommandPipeline({ trigger: '/bare', pipelineId: 'embedder-bare', description: 'Bare.', buildDefinition: () => ({ id: 'embedder-bare', nodes: [], edges: [] }), triggerPayload: () => ({}) });
+    const res = await run(buildApp(), 'GET', '/api/chat/commands');
+    const bare = (res.body as { commands: Array<{ trigger: string }> }).commands.find((c) => c.trigger === '/bare')!;
+    expect(bare).toEqual({ trigger: '/bare', pipelineId: 'embedder-bare', description: 'Bare.' });
+  });
+
   it('lists a command an embedder registered', async () => {
     registerChatCommandPipeline({ trigger: '/triage', pipelineId: 'embedder-triage', description: 'Triage it.', buildDefinition: () => ({ id: 'embedder-triage', nodes: [], edges: [] }), triggerPayload: () => ({}) });
     const res = await run(buildApp(), 'GET', '/api/chat/commands');

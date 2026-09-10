@@ -1,6 +1,6 @@
 // Server-backed chat commands — the registry (src/chat/chatCommandRegistry.ts) over HTTP.
 //
-//   GET  /api/chat/commands                → { commands: [{ trigger, pipelineId, description, requires? }] }
+//   GET  /api/chat/commands                → { commands: [{ trigger, pipelineId, description, label?, hint?, requires? }] }
 //   POST /api/chat/commands/:trigger/run   → 202 { runId, pipelineId, card }
 //
 // `:trigger` is accepted with or without its slash — `/api/chat/commands/summarize/run`
