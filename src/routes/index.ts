@@ -15,7 +15,6 @@ import { documentCommentsRouter } from './documentComments';
 import { voiceCaptureRouter } from './voiceCapture';
 import { sectionReviewsRouter, documentReviewsRouter, myReviewsRouter } from './sectionReviews';
 import { sectionItemsRouter, myItemsRouter } from './sectionItems';
-import { documentTransformRouter } from './documentTransform';
 import { documentAgentEditRouter } from './documentAgentEdit';
 import { callLogRouter } from './callLog';
 import { workItemsRouter } from './workItems';
@@ -80,7 +79,6 @@ import type {
 const router = Router();
 
 // Before the `/documents/:documentId/...` routers, so `transform` is never read as an id.
-router.use('/documents', documentTransformRouter);
 // The chat's /doc command → a pipeline run that edits the document as a collaborator.
 router.use('/documents', documentAgentEditRouter);
 router.use('/calls', callLogRouter);
@@ -134,6 +132,12 @@ router.use('/pipelines/metrics', pipelineMetricsRouter);
 // rule as `/metrics`.
 router.use('/pipelines/dashboard-data', pipelineDashboardDataRouter);
 router.use('/pipelines/defs', pipelineDefinitionsRouter);
+// The same definitions at the address people (and curl) reach for first. The
+// bare collection and the bare id have no other meaning under /pipelines —
+// every sibling mount is a static segment or a `:param` that needs a trailing
+// verb — so these two aliases cannot shadow anything.
+router.get('/pipelines', (req, res, next) => { req.url = '/'; pipelineDefinitionsRouter(req, res, next); });
+router.get('/pipelines/:pipelineId', (req, res, next) => { req.url = `/${encodeURIComponent(String(req.params.pipelineId))}`; pipelineDefinitionsRouter(req, res, next); });
 // Health introspection — same precedence rule as `/metrics` and `/defs`:
 // register the static segment BEFORE any `:pipelineId` mount.
 router.use('/pipelines/health', pipelineHealthRouter);
