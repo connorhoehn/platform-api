@@ -103,6 +103,7 @@ import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
 import { buildChatCommandHandlers } from '../documents/chatCommandHandlers';
+import { buildChatCommandPluginHandlers } from '../chat/plugins';
 import { buildRecordingPipelineHandlers } from '../recordings/recordingPipelines';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
@@ -741,6 +742,8 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   for (const [key, handler] of buildChatCommandHandlers()) {
     customStepHandlers.set(key, handler);
   }
+  // Chat-command plugins (/search …): commands written against the registry, each shipping its own step kinds.
+  for (const [key, handler] of buildChatCommandPluginHandlers()) customStepHandlers.set(key, handler);
   // After a call: finalize the recording and transcribe it — as runs, not inline code.
   // Retries are the executor's: every kind honours its node's `retryPolicy`
   // (distributed-core ≥ 0.45.8), so nothing is wrapped here.

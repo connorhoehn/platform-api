@@ -110,6 +110,16 @@ export class ProfileRepository extends BaseRepository {
   }
 
   /**
+   * A capped page of profiles, as stored. For callers that match on fields
+   * `searchProfiles` does not (the bio); same Scan, same cap, filtering is theirs.
+   */
+  async listProfiles(limit = 500): Promise<ProfileItem[]> {
+    const { ScanCommand } = await import('@aws-sdk/lib-dynamodb');
+    const result = await this.docClient.send(new ScanCommand({ TableName: this.tableName, Limit: Math.max(1, Math.min(limit, 500)) }));
+    return (result.Items ?? []) as ProfileItem[];
+  }
+
+  /**
    * Case-insensitive substring search across displayName.
    *
    * Phase 1 implementation: full-table Scan with a lowercase-contains filter.

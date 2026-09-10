@@ -15,8 +15,11 @@ import {
   listChatCommandPipelines, runChatCommand, type ChatCommandRunInput,
 } from '../chat/chatCommandRegistry';
 import { registerBuiltinChatCommands } from '../chat/builtinChatCommands';
+import { registerChatCommandPlugins } from '../chat/plugins';
 
 registerBuiltinChatCommands();
+// Plugins (/search …) register after the built-ins, the way an embedder's commands would.
+registerChatCommandPlugins();
 
 export const chatCommandsRouter = Router();
 

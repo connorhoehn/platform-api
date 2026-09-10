@@ -17,6 +17,7 @@ import { sectionReviewsRouter, documentReviewsRouter, myReviewsRouter } from './
 import { sectionItemsRouter, myItemsRouter } from './sectionItems';
 import { documentAgentEditRouter } from './documentAgentEdit';
 import { chatCommandsRouter } from './chatCommands';
+import { chatPanelsRouter } from './chatPanels';
 import { requireAuth } from '../middleware/auth';
 import { callLogRouter } from './callLog';
 import { workItemsRouter } from './workItems';
@@ -85,6 +86,8 @@ const router = Router();
 router.use('/documents', documentAgentEditRouter);
 // Server-backed chat commands: GET /api/chat/commands lists them, POST /api/chat/commands/:trigger/run starts one as a pipeline run.
 router.use('/chat/commands', requireAuth, chatCommandsRouter);
+// What a chat card's `panel` result opens: GET /api/chat/panels/:kind/:id → the run's final panelData.
+router.use('/chat/panels', requireAuth, chatPanelsRouter);
 router.use('/calls', callLogRouter);
 router.use('/profiles', profilesRouter);
 router.use('/social', socialRouter);
