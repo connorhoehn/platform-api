@@ -60,8 +60,8 @@ export function buildDiagramGenerateDefinition(model = process.env.DOCUMENT_AGEN
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/diagram command' } },
       { id: 'plan', type: 'agent', position: pos(200), data: { type: 'agent', label: 'Sketch the diagram (Haiku)', prompt: DIAGRAM_PLAN_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: PLAN_RETRY } },
-      { id: 'apply', type: DIAGRAM_APPLY_KIND, position: pos(400), data: { type: DIAGRAM_APPLY_KIND, label: 'Draw it as a collaborator', sketchFrom: 'steps.plan.text' } },
-      { id: 'publish', type: DIAGRAM_PUBLISH_KIND, position: pos(600), data: { type: DIAGRAM_PUBLISH_KIND, label: 'Post the card to the conversation' } },
+      { id: 'apply', type: DIAGRAM_APPLY_KIND, position: pos(400), data: { type: DIAGRAM_APPLY_KIND, label: 'Draw it as a collaborator', sketchFrom: 'steps.plan.text', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
+      { id: 'publish', type: DIAGRAM_PUBLISH_KIND, position: pos(600), data: { type: DIAGRAM_PUBLISH_KIND, label: 'Post the card to the conversation', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
     ],
     edges: [edge('trigger', 'plan'), edge('plan', 'apply'), edge('apply', 'publish')],
   };

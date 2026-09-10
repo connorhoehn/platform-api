@@ -72,8 +72,8 @@ export function buildConversationSummarizeDefinition(model = process.env.DOCUMEN
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/summarize command' } },
       { id: 'read-history', type: CHAT_READ_HISTORY_KIND, position: pos(200), data: { type: CHAT_READ_HISTORY_KIND, label: 'Read the conversation', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
       { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the page (Haiku)', prompt: CONVERSATION_SUMMARY_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: PLAN_RETRY } },
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the page as a collaborator', opsFrom: 'steps.plan.text', agent: { userId: 'agent:haiku', displayName: 'Haiku' } } },
-      { id: 'publish', type: SUMMARIZE_PUBLISH_KIND, position: pos(800), data: { type: SUMMARIZE_PUBLISH_KIND, label: 'Post the card to the conversation' } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the page as a collaborator', opsFrom: 'steps.plan.text', agent: { userId: 'agent:haiku', displayName: 'Haiku' }, retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
+      { id: 'publish', type: SUMMARIZE_PUBLISH_KIND, position: pos(800), data: { type: SUMMARIZE_PUBLISH_KIND, label: 'Post the card to the conversation', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
     ],
     edges: [edge('trigger', 'read-history'), edge('read-history', 'plan'), edge('plan', 'apply'), edge('apply', 'publish')],
   };

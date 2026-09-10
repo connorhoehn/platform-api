@@ -7,6 +7,7 @@ import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOC
 import { buildRecordingFinalizeDefinition, buildCallTranscriptionDefinition, RECORDING_FINALIZE_PIPELINE_ID, CALL_TRANSCRIPTION_PIPELINE_ID } from '../recordings/recordingPipelines';
 import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID } from '../documents/conversationSummarizePipeline';
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
+import { assertSystemPipelinesLint } from './systemPipelineLint';
 
 export interface SystemPipelineEntry {
   id: string;
@@ -22,8 +23,15 @@ const REGISTRY: SystemPipelineEntry[] = [
   { id: DIAGRAM_GENERATE_PIPELINE_ID, build: () => buildDiagramGenerateDefinition() },
 ];
 
+// Retries and approvers are platform properties: a definition that forgets
+// them fails boot here, with every offender named, rather than shipping a step
+// that gives up on its first blip.
+assertSystemPipelinesLint(REGISTRY.map((e) => e.build()));
+
 export function registerSystemPipeline(entry: SystemPipelineEntry): void {
-  if (!REGISTRY.some((e) => e.id === entry.id)) REGISTRY.push(entry);
+  if (REGISTRY.some((e) => e.id === entry.id)) return;
+  assertSystemPipelinesLint([entry.build()]);
+  REGISTRY.push(entry);
 }
 
 export function getSystemPipeline(id: string): Record<string, unknown> | null {

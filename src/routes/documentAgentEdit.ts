@@ -31,7 +31,8 @@ documentAgentEditRouter.post('/:documentId/agent-edit', requireAuth, asyncHandle
     res.status(503).json({ error: 'pipeline engine is not available' });
     return;
   }
-  const definition = buildDocumentAgentEditDefinition();
+  // The requester approves a big edit — set on the definition here, since approvers are not templated.
+  const definition = buildDocumentAgentEditDefinition(undefined, { approverUserId: userId });
   const out = await Promise.resolve(bridge.trigger({
     pipelineId: DOCUMENT_AGENT_EDIT_PIPELINE_ID,
     definition: definition as never,
@@ -68,7 +69,7 @@ documentAgentEditRouter.post('/:documentId/transform-run', requireAuth, asyncHan
   if (!bridge?.trigger) { res.status(503).json({ error: 'pipeline engine is not available' }); return; }
   const out = await Promise.resolve(bridge.trigger({
     pipelineId: DOCUMENT_TRANSFORM_PIPELINE_ID,
-    definition: buildDocumentTransformDefinition() as never,
+    definition: buildDocumentTransformDefinition(undefined, { approverUserId: userId }) as never,
     triggerPayload: {
       documentId, sourceDocumentId, requestedBy: userId,
       requestedByName: typeof body.requestedByName === 'string' && body.requestedByName ? body.requestedByName.slice(0, 80) : userId,

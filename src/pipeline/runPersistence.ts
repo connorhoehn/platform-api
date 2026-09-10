@@ -812,6 +812,26 @@ export class RunPersistenceService {
    * Returns run IDs (with pipelineId) whose lastEventAt is before cutoffMs.
    * Used by StuckRunDetector to find in-flight runs that have gone silent.
    */
+  /**
+   * The attempt history of every step of a run this process is watching —
+   * closed attempts from the step records and the in-flight ones the
+   * step:attempt:* events are still accumulating. The live run snapshot the
+   * detail route serves comes from the executor, which does not carry
+   * attempts; this is where "attempt 2 of 3" comes from while a step retries.
+   */
+  getStepAttempts(runId: string): Record<string, StepAttempt[]> {
+    const state = this.runCache.get(runId);
+    if (!state) return {};
+    const out: Record<string, StepAttempt[]> = {};
+    for (const [stepKey, step] of Object.entries(state.steps)) {
+      if (step.attempts && step.attempts.length > 0) out[stepKey] = step.attempts.map((a) => ({ ...a }));
+    }
+    for (const [stepId, attempts] of Object.entries(state.stepAttempts)) {
+      if (attempts.length > 0) out[stepId] = attempts.map((a) => ({ ...a }));
+    }
+    return out;
+  }
+
   getStaleRunIds(cutoffMs: number): Array<{ runId: string; pipelineId: string }> {
     const result: Array<{ runId: string; pipelineId: string }> = [];
     for (const [runId, state] of this.runCache) {

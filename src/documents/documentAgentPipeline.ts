@@ -1,9 +1,10 @@
 // "/doc change the title to X" in a chat becomes a PIPELINE RUN, not a request
-// handler: read the document → a light model plans the edit → the edit lands
-// through the collaboration channel. Three steps the run store persists, the
-// pipeline UI shows, and the durability machinery (retry, resume, DLQ) covers
-// — the same path any other pipeline takes, exercised by something people do
-// all day.
+// handler: read the document → a light model plans the edit → the plan is
+// reviewed (a big or destructive one pauses for the person who asked) → the
+// edit lands through the collaboration channel. Steps the run store persists,
+// the pipeline UI shows, and the durability machinery (retry, resume, DLQ)
+// covers — the same path any other pipeline takes, exercised by something
+// people do all day.
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
 import { applyOps, outlineOf, parseOps, type OutlineBlock } from './documentAgentOps';
@@ -12,7 +13,48 @@ import log from '../lib/logger';
 export const DOCUMENT_AGENT_EDIT_PIPELINE_ID = 'document-agent-edit';
 export const DOCUMENT_TRANSFORM_PIPELINE_ID = 'document-transform';
 export const DOCUMENT_READ_KIND = 'document:read';
+export const DOCUMENT_REVIEW_KIND = 'document:review-plan';
 export const DOCUMENT_APPLY_KIND = 'document:apply';
+
+/**
+ * Retries are the executor's (distributed-core ≥ 0.45.8 retries every node
+ * kind from `data.retryPolicy`). Reading and writing a document cross the
+ * collaboration channel, so they get three goes; the light model gets two.
+ */
+export const DOCUMENT_IO_RETRY = { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } as const;
+export const DOCUMENT_PLAN_RETRY = { maxAttempts: 2, backoffMs: 3000, backoffMultiplier: 2, retryUnknown: true } as const;
+
+/** Plans with more operations than this pause for a person. */
+export const DEFAULT_APPROVAL_OPS = 8;
+export const APPROVAL_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+/** Options both document pipelines take when they are built. */
+export interface DocumentPipelineOptions {
+  /**
+   * Who must approve a big edit. Set by the route at trigger time (the
+   * requester); the registry build, which names no one, falls back to the
+   * `requester` role so the definition still lints and still lists.
+   */
+  approverUserId?: string;
+}
+
+/** The approval gate shared by both pipelines: skipped unless the review step says a person is needed. */
+function approvalNode(pos: { x: number; y: number }, opts: DocumentPipelineOptions): Record<string, unknown> {
+  const approvers = opts.approverUserId
+    ? [{ type: 'user', value: opts.approverUserId, userId: opts.approverUserId }]
+    : [{ type: 'role', value: 'requester' }];
+  return {
+    id: 'approve', type: 'approval', position: pos,
+    data: {
+      type: 'approval', label: 'Approve a big edit',
+      condition: 'context.needsApproval === true',
+      approvers, requiredCount: 1,
+      timeoutMs: APPROVAL_TIMEOUT_MS, timeoutAction: 'reject',
+      // Not templated by the executor; the review step's `reason` rides the run context and the approvals list shows it.
+      message: 'A big or destructive edit is waiting for your approval.',
+    },
+  };
+}
 
 /** What the light model is told. Interpolated by the agent step from the run context. */
 export const DOCUMENT_EDIT_PROMPT = [
@@ -56,48 +98,60 @@ export const DOCUMENT_TRANSFORM_PROMPT = [
 ].join('\n');
 
 /** The transform pipeline: read the SOURCE, plan the target with a light model, write the target as a collaborator. */
-export function buildDocumentTransformDefinition(model = process.env.DOCUMENT_AGENT_MODEL || 'haiku'): Record<string, unknown> {
+export function buildDocumentTransformDefinition(model = process.env.DOCUMENT_AGENT_MODEL || 'haiku', opts: DocumentPipelineOptions = {}): Record<string, unknown> {
   const pos = (x: number) => ({ x, y: 0 });
   return {
     id: DOCUMENT_TRANSFORM_PIPELINE_ID,
     name: 'Document transform',
-    description: 'Transform to <type>: read the source page, plan the target under its fields with a light model (macros carried verbatim), write it as a collaborator.',
+    description: 'Transform to <type>: read the source page, plan the target under its fields with a light model (macros carried verbatim), pause for approval when the plan is big, write it as a collaborator.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Transform to <type>' } },
-      { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the source' } },
-      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the target (Haiku)', prompt: DOCUMENT_TRANSFORM_PROMPT, model, allowedTools: [], maxTurns: 1 } },
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the target as a collaborator' } },
+      { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the source', retryPolicy: DOCUMENT_IO_RETRY } },
+      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the target (Haiku)', prompt: DOCUMENT_TRANSFORM_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: DOCUMENT_PLAN_RETRY } },
+      // A transform always stamps the new type — that is not a reason to stop and ask.
+      { id: 'review', type: DOCUMENT_REVIEW_KIND, position: pos(600), data: { type: DOCUMENT_REVIEW_KIND, label: 'Check the plan', allowTypeChange: true, retryPolicy: DOCUMENT_IO_RETRY } },
+      approvalNode(pos(800), opts),
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1000), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the target as a collaborator', retryPolicy: DOCUMENT_IO_RETRY } },
     ],
-    edges: [
-      { id: 'e1', source: 'trigger', sourceHandle: 'out', target: 'read', targetHandle: 'in' },
-      { id: 'e2', source: 'read', sourceHandle: 'out', target: 'plan', targetHandle: 'in' },
-      { id: 'e3', source: 'plan', sourceHandle: 'out', target: 'apply', targetHandle: 'in' },
-    ],
+    edges: documentEdges(),
   };
 }
 
+/**
+ * trigger → read → plan → review → approve → apply. The approval's `rejected`
+ * handle is deliberately unwired: the executor gives `rejected` no fallback,
+ * so a reject ends the traversal and the run settles `rejected`.
+ */
+function documentEdges(): Array<Record<string, unknown>> {
+  return [
+    { id: 'e1', source: 'trigger', sourceHandle: 'out', target: 'read', targetHandle: 'in' },
+    { id: 'e2', source: 'read', sourceHandle: 'out', target: 'plan', targetHandle: 'in' },
+    { id: 'e3', source: 'plan', sourceHandle: 'out', target: 'review', targetHandle: 'in' },
+    { id: 'e4', source: 'review', sourceHandle: 'out', target: 'approve', targetHandle: 'in' },
+    { id: 'e5', source: 'approve', sourceHandle: 'approved', target: 'apply', targetHandle: 'in' },
+  ];
+}
+
 /** The definition the route triggers inline — platform-owned, not a per-user record. */
-export function buildDocumentAgentEditDefinition(model = process.env.DOCUMENT_AGENT_MODEL || 'haiku'): Record<string, unknown> {
+export function buildDocumentAgentEditDefinition(model = process.env.DOCUMENT_AGENT_MODEL || 'haiku', opts: DocumentPipelineOptions = {}): Record<string, unknown> {
   const pos = (x: number) => ({ x, y: 0 });
   return {
     id: DOCUMENT_AGENT_EDIT_PIPELINE_ID,
     name: 'Document agent edit',
-    description: 'A /doc command from a chat: read the document, plan the edit with a light model, apply it as a collaborator.',
+    description: 'A /doc command from a chat: read the document, plan the edit with a light model, pause for approval when the plan is big or deletes, apply it as a collaborator.',
     version: 1,
     status: 'published',
     publishedVersion: 1,
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/doc command' } },
-      { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the document' } },
-      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the edit (Haiku)', prompt: DOCUMENT_EDIT_PROMPT, model, allowedTools: [], maxTurns: 1 } },
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Apply as a collaborator' } },
+      { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the document', retryPolicy: DOCUMENT_IO_RETRY } },
+      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the edit (Haiku)', prompt: DOCUMENT_EDIT_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: DOCUMENT_PLAN_RETRY } },
+      { id: 'review', type: DOCUMENT_REVIEW_KIND, position: pos(600), data: { type: DOCUMENT_REVIEW_KIND, label: 'Check the plan', retryPolicy: DOCUMENT_IO_RETRY } },
+      approvalNode(pos(800), opts),
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1000), data: { type: DOCUMENT_APPLY_KIND, label: 'Apply as a collaborator', retryPolicy: DOCUMENT_IO_RETRY } },
     ],
-    edges: [
-      { id: 'e1', source: 'trigger', sourceHandle: 'out', target: 'read', targetHandle: 'in' },
-      { id: 'e2', source: 'read', sourceHandle: 'out', target: 'plan', targetHandle: 'in' },
-      { id: 'e3', source: 'plan', sourceHandle: 'out', target: 'apply', targetHandle: 'in' },
-    ],
+    edges: documentEdges(),
   };
 }
 
@@ -125,6 +179,59 @@ export function createDocumentReadHandler(): StepHandler {
       } finally {
         await agent.leave(0).catch(() => undefined);
       }
+    },
+  };
+}
+
+/** Node options the review step honours. */
+export interface DocumentReviewNodeData {
+  /** Where the plan lives (dotted path); defaults like the apply step. */
+  opsFrom?: string;
+  /** A transform stamps the target type on purpose; do not stop for it. */
+  allowTypeChange?: boolean;
+  /** Per-node override of DOCUMENT_AGENT_APPROVAL_OPS. */
+  maxOpsWithoutApproval?: number;
+}
+
+/** What the review step decides. Merged into the run context; the approval gate reads `needsApproval`. */
+export interface DocumentReviewOutput {
+  needsApproval: boolean;
+  reason: string;
+  opCount: number;
+}
+
+/**
+ * The size of a plan, judged: big edits, deletions and type changes pause the
+ * run for the person who asked. Pure over the plan — the same `parseOps` the
+ * apply step will run, so what is approved is what lands.
+ */
+export function reviewPlan(ops: ReturnType<typeof parseOps>, data: DocumentReviewNodeData = {}): DocumentReviewOutput {
+  const real = ops.filter((o) => o.op !== 'skip');
+  const limit = typeof data.maxOpsWithoutApproval === 'number' ? data.maxOpsWithoutApproval : (Number(process.env.DOCUMENT_AGENT_APPROVAL_OPS) || DEFAULT_APPROVAL_OPS);
+  const deletes = real.filter((o) => o.op === 'deleteBlock').length;
+  const typeChange = !data.allowTypeChange && real.some((o) => o.op === 'setDocumentType');
+  const reasons: string[] = [];
+  if (real.length > limit) reasons.push(`${real.length} changes (more than ${limit})`);
+  if (deletes > 0) reasons.push(`deletes ${deletes} block${deletes === 1 ? '' : 's'}`);
+  if (typeChange) reasons.push('changes the document type');
+  const needsApproval = reasons.length > 0;
+  return {
+    needsApproval,
+    reason: needsApproval ? `The plan ${reasons.join(', ')}.` : (real.length === 0 ? 'The plan changes nothing.' : `${real.length} small change${real.length === 1 ? '' : 's'}; no approval needed.`),
+    opCount: real.length,
+  };
+}
+
+/** Step 3: read the plan and decide whether a person has to see it before it lands. */
+export function createDocumentReviewHandler(): StepHandler {
+  return {
+    kind: DOCUMENT_REVIEW_KIND,
+    async execute(node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
+      const data = ((node as { data?: DocumentReviewNodeData }).data ?? {}) as DocumentReviewNodeData;
+      const { ops } = opsFromContext(context, { opsFrom: data.opsFrom });
+      const output = reviewPlan(ops, data);
+      log.info({ documentId: documentIdOf(context), ...output }, 'document agent plan reviewed');
+      return { status: 'completed', output: { ...output } };
     },
   };
 }
@@ -205,6 +312,7 @@ export function createDocumentApplyHandler(): StepHandler {
 export function buildDocumentAgentHandlers(): Map<string, StepHandler> {
   const m = new Map<string, StepHandler>();
   m.set(DOCUMENT_READ_KIND, createDocumentReadHandler());
+  m.set(DOCUMENT_REVIEW_KIND, createDocumentReviewHandler());
   m.set(DOCUMENT_APPLY_KIND, createDocumentApplyHandler());
   return m;
 }

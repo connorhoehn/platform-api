@@ -463,6 +463,17 @@ pipelineTriggersRouter.get(
         'run-detail lineage overlay failed',
       );
     }
+    // The executor's steps know nothing of attempts either; the persistence
+    // service is accumulating them from step:attempt:* as the run goes, so a
+    // step that is retrying shows "attempt 2 of 3" here, not just "running".
+    const attemptsByStep = getRunPersistenceService()?.getStepAttempts(runId) ?? {};
+    const steps = (snap as { steps?: Record<string, Record<string, unknown>> }).steps;
+    if (steps) {
+      for (const [stepId, attempts] of Object.entries(attemptsByStep)) {
+        const step = steps[stepId];
+        if (step && !('attempts' in step)) steps[stepId] = { ...step, attempts };
+      }
+    }
     res.json(snap);
   }),
 );

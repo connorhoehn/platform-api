@@ -154,6 +154,8 @@ export function documentIdForLobby(lobby: string | null | undefined): string | n
 }
 
 const pos = (x: number) => ({ x, y: 0 });
+/** Every step here talks to LVS, DDB, the gateway or a document; the executor retries each from this. */
+const IO_RETRY = { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } as const;
 const edge = (a: string, b: string) => ({ id: `${a}->${b}`, source: a, sourceHandle: 'out', target: b, targetHandle: 'in' });
 
 export function buildRecordingFinalizeDefinition(): Record<string, unknown> {
@@ -164,11 +166,11 @@ export function buildRecordingFinalizeDefinition(): Record<string, unknown> {
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'webhook', label: 'LVS recording.completed' } },
-      { id: 'resolve', type: KINDS.resolve, position: pos(200), data: { type: KINDS.resolve, label: 'Find the call' } },
-      { id: 'persist', type: KINDS.persist, position: pos(400), data: { type: KINDS.persist, label: 'Save the recording' } },
+      { id: 'resolve', type: KINDS.resolve, position: pos(200), data: { type: KINDS.resolve, label: 'Find the call', retryPolicy: IO_RETRY } },
+      { id: 'persist', type: KINDS.persist, position: pos(400), data: { type: KINDS.persist, label: 'Save the recording', retryPolicy: IO_RETRY } },
       { id: 'await-compose', type: KINDS.awaitCompose, position: pos(600), data: { type: KINDS.awaitCompose, label: 'Wait for the composed file', retryPolicy: { maxAttempts: 12, backoffMs: 5000, backoffMultiplier: 1.2, retryUnknown: true } } },
-      { id: 'announce', type: KINDS.announce, position: pos(800), data: { type: KINDS.announce, label: 'Post to the conversation' } },
-      { id: 'start-transcription', type: KINDS.startTranscription, position: pos(1000), data: { type: KINDS.startTranscription, label: 'Start transcription' } },
+      { id: 'announce', type: KINDS.announce, position: pos(800), data: { type: KINDS.announce, label: 'Post to the conversation', retryPolicy: IO_RETRY } },
+      { id: 'start-transcription', type: KINDS.startTranscription, position: pos(1000), data: { type: KINDS.startTranscription, label: 'Start transcription', retryPolicy: IO_RETRY } },
     ],
     edges: [edge('trigger', 'resolve'), edge('resolve', 'persist'), edge('persist', 'await-compose'), edge('await-compose', 'announce'), edge('announce', 'start-transcription')],
   };
@@ -185,8 +187,8 @@ export function buildCallTranscriptionDefinition(model = process.env.DOCUMENT_AG
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Recording ready' } },
       { id: 'transcribe', type: KINDS.transcribe, position: pos(200), data: { type: KINDS.transcribe, label: 'Transcribe the audio', retryPolicy: { maxAttempts: 3, backoffMs: 3000, backoffMultiplier: 2, retryUnknown: true } } },
-      { id: 'merge-reactions', type: KINDS.mergeReactions, position: pos(400), data: { type: KINDS.mergeReactions, label: 'Merge reactions' } },
-      { id: 'store', type: KINDS.store, position: pos(600), data: { type: KINDS.store, label: 'Store the transcript' } },
+      { id: 'merge-reactions', type: KINDS.mergeReactions, position: pos(400), data: { type: KINDS.mergeReactions, label: 'Merge reactions', retryPolicy: IO_RETRY } },
+      { id: 'store', type: KINDS.store, position: pos(600), data: { type: KINDS.store, label: 'Store the transcript', retryPolicy: IO_RETRY } },
       // The meeting notes: a light model over the speaker-tagged transcript
       // (`transcriptText`, empty for silence), then one row write. The agent
       // step always runs; store-summary skips the row's summary when nothing
@@ -195,8 +197,8 @@ export function buildCallTranscriptionDefinition(model = process.env.DOCUMENT_AG
       { id: 'store-summary', type: KINDS.storeSummary, position: pos(1000), data: { type: KINDS.storeSummary, label: 'Store the summary', retryPolicy: SUMMARY_RETRY } },
       // The one shared write path into a document — the same step kind /doc and
       // Transform use. Optional: a room call has no document to write into.
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1200), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the summary and transcript into the call document', opsFrom: 'transcriptOps', optional: true, agent: TRANSCRIPT_AGENT } },
-      { id: 'publish', type: KINDS.publish, position: pos(1400), data: { type: KINDS.publish, label: 'Publish to the conversation' } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1200), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the summary and transcript into the call document', opsFrom: 'transcriptOps', optional: true, agent: TRANSCRIPT_AGENT, retryPolicy: IO_RETRY } },
+      { id: 'publish', type: KINDS.publish, position: pos(1400), data: { type: KINDS.publish, label: 'Publish to the conversation', retryPolicy: IO_RETRY } },
     ],
     edges: [edge('trigger', 'transcribe'), edge('transcribe', 'merge-reactions'), edge('merge-reactions', 'store'), edge('store', 'summarize'), edge('summarize', 'store-summary'), edge('store-summary', 'apply'), edge('apply', 'publish')],
   };
