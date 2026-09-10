@@ -60,6 +60,7 @@ import type {
   StepSummary,
 } from '../repositories/PipelineRunRepository';
 import { readAttempts } from '../repositories/PipelineRunRepository';
+import { runResultFromContext } from './runResult';
 
 // ---------------------------------------------------------------------------
 // T1 (lib-expansion-3) boundary adapters — keep the wider pipeline shape
@@ -203,6 +204,10 @@ export function runItemToSnapshot(item: PipelineRunItem): PipelineRunSnapshot {
       payload: {},
     },
     triggerType: item.triggerType,
+    // What the run has to show for itself (see runResult.ts): a persisted row
+    // only knows the context its last checkpoint carried, which for a finished
+    // run is the final one.
+    ...(runResultFromContext(item.checkpoint?.context) ? { result: runResultFromContext(item.checkpoint?.context) } : {}),
   };
 }
 
@@ -230,6 +235,11 @@ function toRunSnapshot(run: unknown): PipelineRunSnapshot | null {
     const retryability = classifyRetryability(errorCategory, error.message);
     snap['error'] = { ...error, errorCategory, retryability };
   }
+
+  // Lift `context.result` (the chat-card convention, see runResult.ts) so a
+  // client polling the run never has to know the context layout.
+  const result = runResultFromContext(r['context']);
+  if (result) snap['result'] = result;
 
   return snap as unknown as PipelineRunSnapshot;
 }

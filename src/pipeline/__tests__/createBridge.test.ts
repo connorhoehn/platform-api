@@ -168,6 +168,22 @@ describe('createBridge — getRun()', () => {
     ).toEqual({ hello: 'world' });
   });
 
+  test('lifts a well-formed `context.result` (the chat-card convention) to the top of the snapshot', () => {
+    const mod = makeMockModule();
+    const result = { kind: 'document', documentId: 'doc-1' };
+    mod.getRun.mockReturnValue({ id: 'run-r', pipelineId: 'p-1', status: 'completed', context: { result, steps: {} } });
+    const snap = bridge(mod).getRun('run-r') as unknown as { result?: unknown; context?: { result?: unknown } };
+    expect(snap.result).toEqual(result);
+    // Still where it was, too — the lift is a projection, not a move.
+    expect(snap.context?.result).toEqual(result);
+  });
+
+  test('does not lift a `context.result` that is not one of the three shapes', () => {
+    const mod = makeMockModule();
+    mod.getRun.mockReturnValue({ id: 'run-r', pipelineId: 'p-1', status: 'completed', context: { result: { kind: 'panel', panel: { kind: 'graph' } } } });
+    expect('result' in (bridge(mod).getRun('run-r') as object)).toBe(false);
+  });
+
   test('returns null when the module returns null', () => {
     const mod = makeMockModule();
     mod.getRun.mockReturnValue(null);

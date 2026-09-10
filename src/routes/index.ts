@@ -16,6 +16,8 @@ import { voiceCaptureRouter } from './voiceCapture';
 import { sectionReviewsRouter, documentReviewsRouter, myReviewsRouter } from './sectionReviews';
 import { sectionItemsRouter, myItemsRouter } from './sectionItems';
 import { documentAgentEditRouter } from './documentAgentEdit';
+import { chatCommandsRouter } from './chatCommands';
+import { requireAuth } from '../middleware/auth';
 import { callLogRouter } from './callLog';
 import { workItemsRouter } from './workItems';
 import { documentLifecycleRouter, lifecycleSchemaRouter } from './documentLifecycle';
@@ -81,6 +83,8 @@ const router = Router();
 // Before the `/documents/:documentId/...` routers, so `transform` is never read as an id.
 // The chat's /doc command → a pipeline run that edits the document as a collaborator.
 router.use('/documents', documentAgentEditRouter);
+// Server-backed chat commands: GET /api/chat/commands lists them, POST /api/chat/commands/:trigger/run starts one as a pipeline run.
+router.use('/chat/commands', requireAuth, chatCommandsRouter);
 router.use('/calls', callLogRouter);
 router.use('/profiles', profilesRouter);
 router.use('/social', socialRouter);
