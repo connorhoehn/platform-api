@@ -40,6 +40,7 @@ import {
   NotFoundError,
 } from '../middleware/error-handler';
 import log from '../lib/logger';
+import { startLiveCaptions, stopLiveCaptions } from '../recordings/liveCaptions';
 import { callSfu, mapSfuError } from '../lib/sfu-breaker';
 import {
   recordLvsParticipantReap,
@@ -1263,10 +1264,8 @@ videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async 
 //                 channel that clients subscribe to.
 // enabled=false → delete that tap.
 //
-// Tap ids are tracked in-process per channelArn (single-node dev is the
-// deployment reality); disable falls back to scanning the channel's taps
-// for one pointing at OUR sink URL, so a restarted platform-api can still
-// turn captions off. Idempotent in both directions.
+// The route used to arm the tap itself and keep the tap id in a Map; the
+// run owns that now — see the handler below and recordings/liveCaptions.ts.
 
 // --- in-call emoji reactions (playback) ------------------------------------
 //
@@ -1287,62 +1286,22 @@ videoSessionsRouter.get('/reactions', requireAuth, asyncHandler(async (req: Requ
   res.json({ reactions });
 }));
 
-const CAPTIONS_SINK_URL =
-  process.env.LIVE_CAPTIONS_SINK_URL || 'http://localhost:3915/pcm';
-const captionTapsByArn = new Map<string, string>();
-
+// The tap's lifecycle is a PIPELINE RUN now (recordings/liveCaptions.ts):
+// enabled=true starts a `live-captions` run (arm → stream → disarm → publish)
+// and answers with its runId; enabled=false asks that run to stop, so it
+// finishes through disarm and leaves a card in the conversation. Idempotent in
+// both directions: a second enable returns the run already in flight, and a
+// disable with no run known removes any tap pointing at our sink directly.
 videoSessionsRouter.post('/captions', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { channelArn, enabled } = (req.body ?? {}) as { channelArn?: string; enabled?: boolean };
   if (!channelArn || typeof enabled !== 'boolean') {
     throw new AppError(400, 'channelArn and enabled are required');
   }
-  const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
-  const tapsUrl = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(channelArn)}/taps`;
-  const authHeaders = { Authorization: `Bearer ${adminToken}` };
-
   if (enabled) {
-    const existing = captionTapsByArn.get(channelArn);
-    if (existing) {
-      res.json({ enabled: true, tapId: existing });
-      return;
-    }
-    const createRes = await fetch(tapsUrl, {
-      method: 'POST',
-      headers: { ...authHeaders, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        destination: {
-          type: 'webhook-pcm',
-          url: CAPTIONS_SINK_URL,
-          perParticipant: true,
-          chunkMs: 200,
-        },
-      }),
-    });
-    if (!createRes.ok) {
-      const text = await createRes.text().catch(() => '');
-      throw new AppError(502, `LVS tap create failed (${createRes.status}): ${text.slice(0, 200)}`);
-    }
-    const body = (await createRes.json()) as { tapId?: string; id?: string };
-    const tapId = body.tapId ?? body.id ?? '';
-    if (tapId) captionTapsByArn.set(channelArn, tapId);
-    res.json({ enabled: true, tapId });
+    const out = await startLiveCaptions({ channelArn, userId: req.user?.sub ?? 'system' });
+    res.json({ enabled: true, runId: out.runId, pipelineId: out.pipelineId, reused: out.reused, ...(out.tapIds ? { tapIds: out.tapIds } : {}) });
     return;
   }
-
-  // Disable: tracked id first, then scan for our sink URL.
-  let tapId = captionTapsByArn.get(channelArn) ?? null;
-  if (!tapId) {
-    const listRes = await fetch(tapsUrl, { headers: authHeaders });
-    if (listRes.ok) {
-      const body = (await listRes.json()) as { taps?: Array<{ tapId?: string; id?: string; destination?: { url?: string } }> };
-      const mine = (body.taps ?? []).find((t) => t.destination?.url === CAPTIONS_SINK_URL);
-      tapId = mine?.tapId ?? mine?.id ?? null;
-    }
-  }
-  if (tapId) {
-    await fetch(`${tapsUrl}/${encodeURIComponent(tapId)}`, { method: 'DELETE', headers: authHeaders })
-      .catch(() => undefined); // 404 = already gone
-  }
-  captionTapsByArn.delete(channelArn);
-  res.json({ enabled: false });
+  const out = await stopLiveCaptions({ channelArn });
+  res.json({ enabled: false, runId: out.runId, stopped: out.stopped });
 }));

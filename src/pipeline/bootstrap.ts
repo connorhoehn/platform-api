@@ -105,6 +105,7 @@ import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
 import { buildChatCommandHandlers } from '../documents/chatCommandHandlers';
 import { getCustomStepHandlers, registerCustomStepHandler } from './customStepHandlers';
 import { buildRecordingPipelineHandlers } from '../recordings/recordingPipelines';
+import { buildLiveCaptionsHandlers } from '../recordings/liveCaptions';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
@@ -746,6 +747,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // Retries are the executor's: every kind honours its node's `retryPolicy`
   // (distributed-core ≥ 0.45.8), so nothing is wrapped here.
   for (const [key, handler] of buildRecordingPipelineHandlers()) {
+    customStepHandlers.set(key, handler);
+  }
+  // During a call: the live-captions tap as a run that lasts the call (arm → stream → disarm → publish).
+  for (const [key, handler] of buildLiveCaptionsHandlers()) {
     customStepHandlers.set(key, handler);
   }
   // Seed the LIVE registry (src/pipeline/customStepHandlers.ts) with the

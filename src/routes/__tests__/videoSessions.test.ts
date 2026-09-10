@@ -53,6 +53,15 @@ jest.mock('../../repositories', () => ({
 const mockFetch = jest.fn();
 (globalThis as unknown as { fetch: typeof mockFetch }).fetch = mockFetch;
 
+// The captions toggle starts/stops a `live-captions` run; the run itself is
+// tested in recordings/__tests__/liveCaptions.test.ts.
+const mockStartLiveCaptions = jest.fn();
+const mockStopLiveCaptions = jest.fn();
+jest.mock('../../recordings/liveCaptions', () => ({
+  startLiveCaptions: (...args: unknown[]) => mockStartLiveCaptions(...args),
+  stopLiveCaptions: (...args: unknown[]) => mockStopLiveCaptions(...args),
+}));
+
 import {
   videoSessionsRouter,
   __resetSfuBreakerForTests,
@@ -1709,5 +1718,39 @@ describe('POST /api/video/sessions — recording decision', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ sessionId: 'existing', reused: true, recording: { enabled: false, reason: 'dm-not-opted-in:bob' } });
+  });
+});
+
+describe('POST /api/video/captions — the toggle is a pipeline run', () => {
+  beforeEach(() => { mockStartLiveCaptions.mockReset(); mockStopLiveCaptions.mockReset(); });
+
+  it('enabled:true starts the live-captions run for the channel and returns its runId', async () => {
+    mockStartLiveCaptions.mockResolvedValue({ runId: 'run-lc-1', pipelineId: 'live-captions', reused: false });
+    const res = await run(buildApp(), 'POST', '/api/video/captions', { body: { channelArn: 'arn:lvs:channel/x', enabled: true }, userId: 'dev-grace' });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ enabled: true, runId: 'run-lc-1', pipelineId: 'live-captions', reused: false });
+    expect(mockStartLiveCaptions).toHaveBeenCalledWith({ channelArn: 'arn:lvs:channel/x', userId: 'dev-grace' });
+  });
+
+  it('enabled:false asks that run to stop and names it', async () => {
+    mockStopLiveCaptions.mockResolvedValue({ runId: 'run-lc-1', stopped: true, removed: [] });
+    const res = await run(buildApp(), 'POST', '/api/video/captions', { body: { channelArn: 'arn:lvs:channel/x', enabled: false } });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ enabled: false, runId: 'run-lc-1', stopped: true });
+    expect(mockStopLiveCaptions).toHaveBeenCalledWith({ channelArn: 'arn:lvs:channel/x' });
+  });
+
+  it('carries the direct tap ids when there was no engine to run under', async () => {
+    mockStartLiveCaptions.mockResolvedValue({ runId: null, pipelineId: 'live-captions', reused: false, tapIds: ['tap-1'] });
+    const res = await run(buildApp(), 'POST', '/api/video/captions', { body: { channelArn: 'arn:lvs:channel/x', enabled: true } });
+    expect(res.body).toEqual({ enabled: true, runId: null, pipelineId: 'live-captions', reused: false, tapIds: ['tap-1'] });
+  });
+
+  it('400 without channelArn or a boolean enabled', async () => {
+    const a = await run(buildApp(), 'POST', '/api/video/captions', { body: { enabled: true } });
+    expect(a.statusCode).toBe(400);
+    const b = await run(buildApp(), 'POST', '/api/video/captions', { body: { channelArn: 'arn:x', enabled: 'yes' } });
+    expect(b.statusCode).toBe(400);
+    expect(mockStartLiveCaptions).not.toHaveBeenCalled();
   });
 });

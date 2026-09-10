@@ -18,6 +18,7 @@ import { getPipelineBridge, type PendingApprovalRow } from '../pipeline/bridge-t
 import type { InlinePipelineDefinition } from '../pipeline/http/contracts';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
+import { getLiveCaptionsProgress } from '../recordings/liveCaptions';
 import { stubRunStore } from '../pipeline/stub-run-store';
 import { runItemToSnapshot } from '../pipeline/createBridge';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
@@ -479,13 +480,17 @@ pipelineTriggersRouter.get(
     // the executor's live record for a copy (the step then finished on the
     // orphan and showed `running` forever on this endpoint).
     const attemptsByStep = getRunPersistenceService()?.getStepAttempts(runId) ?? {};
+    // A step that lasts the whole call (live-captions `stream`) keeps what it
+    // has heard so far in memory; the same overlay shows it as `progress`.
+    const progress = getLiveCaptionsProgress(runId);
     const steps = (snap as { steps?: Record<string, Record<string, unknown>> }).steps;
-    if (steps && Object.keys(attemptsByStep).length > 0) {
+    if (steps && (Object.keys(attemptsByStep).length > 0 || (progress && steps[progress.stepId]))) {
       const overlaid: Record<string, Record<string, unknown>> = { ...steps };
       for (const [stepId, attempts] of Object.entries(attemptsByStep)) {
         const step = overlaid[stepId];
         if (step && !('attempts' in step)) overlaid[stepId] = { ...step, attempts };
       }
+      if (progress && overlaid[progress.stepId]) overlaid[progress.stepId] = { ...overlaid[progress.stepId], progress };
       res.json({ ...snap, steps: overlaid });
       return;
     }
