@@ -184,6 +184,56 @@ describe('createBridge — getRun()', () => {
     expect('result' in (bridge(mod).getRun('run-r') as object)).toBe(false);
   });
 
+  test('never hands out the executor\'s live step records — a caller rewriting snapshot steps cannot orphan them', () => {
+    // Live repro (document-agent-edit, recording-finalize): the run-detail
+    // route overlays `attempts` by writing `steps[stepId] = { ...step, attempts }`.
+    // When the snapshot aliased the executor's steps map, that swapped the
+    // executor's in-flight record for a copy; `executeNode` then completed
+    // the orphaned original, and every step polled while running stayed
+    // `running` with no output on the detail endpoint until the process
+    // restarted — while the persisted row was correct all along.
+    const mod = makeMockModule();
+    const liveRecord = { nodeId: 'plan', status: 'running', startedAt: '2026-09-10T00:00:00Z' };
+    const live = {
+      id: 'run-live',
+      pipelineId: 'p-1',
+      status: 'running',
+      startedAt: '2026-09-10T00:00:00Z',
+      currentStepIds: ['plan'],
+      steps: { plan: liveRecord },
+    };
+    mod.getRun.mockReturnValue(live);
+
+    const snap = bridge(mod).getRun('run-live') as unknown as {
+      steps: Record<string, Record<string, unknown>>;
+      currentStepIds: string[];
+    };
+    // Same content...
+    expect(snap.steps.plan).toEqual(liveRecord);
+    // ...but not the same objects, at either level.
+    expect(snap.steps).not.toBe(live.steps);
+    expect(snap.steps.plan).not.toBe(liveRecord);
+    expect(snap.currentStepIds).not.toBe(live.currentStepIds);
+
+    // What the route does: replace the entry and decorate it.
+    snap.steps.plan = { ...snap.steps.plan, attempts: [{ attemptNumber: 1 }] };
+    snap.steps.plan.status = 'completed';
+    snap.currentStepIds.length = 0;
+
+    // The executor's own record is untouched and still the one it holds, so
+    // its `step.status = 'completed'` lands where getRun() will read it.
+    expect(live.steps.plan).toBe(liveRecord);
+    expect(liveRecord.status).toBe('running');
+    expect('attempts' in liveRecord).toBe(false);
+    expect(live.currentStepIds).toEqual(['plan']);
+
+    // And the executor's later completion IS visible on the next snapshot.
+    liveRecord.status = 'completed';
+    (liveRecord as Record<string, unknown>).output = { ops: 3 };
+    const next = bridge(mod).getRun('run-live') as unknown as { steps: Record<string, Record<string, unknown>> };
+    expect(next.steps.plan).toMatchObject({ status: 'completed', output: { ops: 3 } });
+  });
+
   test('returns null when the module returns null', () => {
     const mod = makeMockModule();
     mod.getRun.mockReturnValue(null);

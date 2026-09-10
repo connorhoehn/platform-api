@@ -472,13 +472,22 @@ pipelineTriggersRouter.get(
     // The executor's steps know nothing of attempts either; the persistence
     // service is accumulating them from step:attempt:* as the run goes, so a
     // step that is retrying shows "attempt 2 of 3" here, not just "running".
+    //
+    // Built as a NEW steps map, never written into `snap.steps`: the bridge
+    // copies the executor's records today, but this overlay is the one place
+    // that rewrites step entries, and doing it in place is what used to swap
+    // the executor's live record for a copy (the step then finished on the
+    // orphan and showed `running` forever on this endpoint).
     const attemptsByStep = getRunPersistenceService()?.getStepAttempts(runId) ?? {};
     const steps = (snap as { steps?: Record<string, Record<string, unknown>> }).steps;
-    if (steps) {
+    if (steps && Object.keys(attemptsByStep).length > 0) {
+      const overlaid: Record<string, Record<string, unknown>> = { ...steps };
       for (const [stepId, attempts] of Object.entries(attemptsByStep)) {
-        const step = steps[stepId];
-        if (step && !('attempts' in step)) steps[stepId] = { ...step, attempts };
+        const step = overlaid[stepId];
+        if (step && !('attempts' in step)) overlaid[stepId] = { ...step, attempts };
       }
+      res.json({ ...snap, steps: overlaid });
+      return;
     }
     res.json(snap);
   }),

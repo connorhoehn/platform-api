@@ -225,8 +225,26 @@ function toRunSnapshot(run: unknown): PipelineRunSnapshot | null {
         : undefined;
   if (runId === undefined || typeof r['pipelineId'] !== 'string') return null;
 
-  // Shallow copy so we never mutate the executor's live run object.
+  // Copy so we never mutate the executor's live run object. The top level is
+  // a spread; `steps` gets a fresh map with a fresh record per step, because
+  // that map is exactly what the executor keeps mutating while a step is in
+  // flight (`executeNode` holds the record and flips `status`/`output` on it
+  // when the step finishes). A snapshot that aliased the live map let the
+  // run-detail route's attempts overlay REPLACE a live record with a copy:
+  // the executor then completed the orphaned original, and every step that
+  // had been polled while running stayed `running` with no output on the
+  // detail endpoint for the rest of the process's life — while the persisted
+  // row, fed by `pipeline:step:completed`, was right all along.
   const snap: Record<string, unknown> = { ...r, runId };
+  const liveSteps = r['steps'];
+  if (liveSteps && typeof liveSteps === 'object') {
+    const steps: Record<string, unknown> = {};
+    for (const [stepId, rec] of Object.entries(liveSteps as Record<string, unknown>)) {
+      steps[stepId] = rec && typeof rec === 'object' ? { ...(rec as Record<string, unknown>) } : rec;
+    }
+    snap['steps'] = steps;
+  }
+  if (Array.isArray(r['currentStepIds'])) snap['currentStepIds'] = [...(r['currentStepIds'] as unknown[])];
 
   // Classify error if present (on the copy, never the input).
   const error = r['error'] as { message?: string; stack?: string; nodeId?: string } | undefined;

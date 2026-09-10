@@ -23,6 +23,15 @@ jest.mock('../../repositories/PipelineRunRepository', () => ({
 }));
 jest.mock('../../lib/ddb-client', () => ({ getDynamoClient: () => ({}) }));
 
+// The run-detail GET overlays per-step `attempts` from the persistence
+// service, and the trigger POST registers the trigger on it. Those are the
+// only two methods the routes under test call; `getRunPersistenceService` is
+// the only export the route graph imports from this module.
+const mockStepAttempts = jest.fn((_runId: string): Record<string, unknown[]> => ({}));
+jest.mock('../../pipeline/runPersistence', () => ({
+  getRunPersistenceService: () => ({ getStepAttempts: mockStepAttempts, registerTrigger: jest.fn() }),
+}));
+
 jest.mock('../../lib/redis-client', () => ({
   getRedisClient: async () => null,
 }));
@@ -47,6 +56,7 @@ import {
   setPipelineBridge,
   stubRunStore,
   type PipelineBridge,
+  type PipelineRunSnapshot,
 } from '../pipelineTriggers';
 
 // ---------------------------------------------------------------------------
@@ -350,6 +360,36 @@ describe('GET /pipelines/:pipelineId/runs/:runId (snapshot)', () => {
     const res = await run(app, 'GET', '/pipelines/p1/runs/r1');
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatchObject({ runId: 'r1', status: 'running' });
+  });
+
+  // Reproduced live on document-agent-edit and recording-finalize: every step
+  // that was polled while running stayed `running` with no output on this
+  // endpoint after the run completed (the persisted row was right). The
+  // attempts overlay was writing `steps[stepId] = {...}` straight into the
+  // object the bridge returned — which aliased the executor's live steps map —
+  // so the executor finished the step on a record nobody could see any more.
+  test('the attempts overlay decorates the response without rewriting the step records the bridge returned', async () => {
+    const liveRecord: Record<string, unknown> = { nodeId: 'plan', status: 'running', startedAt: '2026-09-10T00:00:00Z' };
+    const live = { runId: 'r-live', pipelineId: 'p1', status: 'running', steps: { plan: liveRecord } };
+    mockStepAttempts.mockReturnValueOnce({
+      plan: [{ attemptNumber: 1, startedAt: '2026-09-10T00:00:00Z', idempotencyKey: 'r-live:plan:1' }],
+    });
+    setPipelineBridge({
+      getRun: async () => live as unknown as PipelineRunSnapshot,
+      getHistory: async () => [],
+      resolveApproval: async () => {},
+    });
+    const app = buildApp();
+    const res = await run(app, 'GET', '/pipelines/p1/runs/r-live');
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { steps: Record<string, { status: string; attempts?: unknown[] }> };
+    expect(body.steps.plan.status).toBe('running');
+    expect(body.steps.plan.attempts).toHaveLength(1);
+    expect(mockStepAttempts).toHaveBeenCalledWith('r-live');
+
+    // The bridge's object — the executor's, in production — keeps its own record.
+    expect(live.steps.plan).toBe(liveRecord);
+    expect('attempts' in liveRecord).toBe(false);
   });
 });
 
