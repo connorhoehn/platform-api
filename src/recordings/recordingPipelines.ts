@@ -408,9 +408,18 @@ export function looksLikeSilence(text: string, durationMs: number): boolean {
   const norm = text.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
   if (!norm) return true;
   if (WHISPER_SILENCE_PHRASES.has(norm)) return true;
-  const words = norm.split(' ').length;
+  const tokens = norm.split(' ');
+  const words = tokens.length;
   // Two words across ten seconds is not a conversation.
-  return durationMs >= 10_000 && words <= 2;
+  if (durationMs >= 10_000 && words <= 2) return true;
+  // "you you you you you" — one or two tokens repeated is the engine looping on
+  // noise, however many of them there are.
+  const distinct = new Set(tokens).size;
+  if (words >= 3 && distinct <= 2) return true;
+  const counts = new Map<string, number>();
+  for (const t of tokens) counts.set(t, (counts.get(t) ?? 0) + 1);
+  const top = Math.max(...counts.values());
+  return words >= 6 && top / words >= 0.6;
 }
 
 export async function transcribeFile(file: string, durationMs: number): Promise<TranscriptSegment[]> {

@@ -68,3 +68,14 @@ describe('looksLikeSilence', () => {
     expect(looksLikeSilence('the compose step is still queued after twelve attempts', 27_000)).toBe(false);
   });
 });
+
+describe('looksLikeSilence — repeated tokens', () => {
+  const { looksLikeSilence } = jest.requireActual<typeof import('../recordingPipelines')>('../recordingPipelines');
+  it('treats a token looping on noise as no speech', () => {
+    expect(looksLikeSilence('you you you you you you you I I I I I', 360_000)).toBe(true);
+    expect(looksLikeSilence('the the the', 4_000)).toBe(true);
+  });
+  it('keeps a real sentence with a common repeated word', () => {
+    expect(looksLikeSilence('we ship the checkout on Friday and the runbook covers the rollback', 30_000)).toBe(false);
+  });
+});
