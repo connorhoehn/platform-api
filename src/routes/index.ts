@@ -132,12 +132,6 @@ router.use('/pipelines/metrics', pipelineMetricsRouter);
 // rule as `/metrics`.
 router.use('/pipelines/dashboard-data', pipelineDashboardDataRouter);
 router.use('/pipelines/defs', pipelineDefinitionsRouter);
-// The same definitions at the address people (and curl) reach for first. The
-// bare collection and the bare id have no other meaning under /pipelines —
-// every sibling mount is a static segment or a `:param` that needs a trailing
-// verb — so these two aliases cannot shadow anything.
-router.get('/pipelines', (req, res, next) => { req.url = '/'; pipelineDefinitionsRouter(req, res, next); });
-router.get('/pipelines/:pipelineId', (req, res, next) => { req.url = `/${encodeURIComponent(String(req.params.pipelineId))}`; pipelineDefinitionsRouter(req, res, next); });
 // Health introspection — same precedence rule as `/metrics` and `/defs`:
 // register the static segment BEFORE any `:pipelineId` mount.
 router.use('/pipelines/health', pipelineHealthRouter);
@@ -224,6 +218,11 @@ router.use(
 router.use('/pipelines/:runId/cancel', pipelineCancelRouter);
 // Approvals — POST /api/pipelines/:runId/approvals (per PIPELINES_PLAN §17.10).
 router.use('/pipelines/:runId/approvals', pipelineApprovalsRouter);
+// The same definitions at the address people (and curl) reach for first.
+// Registered AFTER every other /pipelines mount: a `:pipelineId` GET declared
+// earlier swallowed /pipelines/dlq, /pipelines/defs and friends (observed).
+router.get('/pipelines', (req, res, next) => { req.url = '/'; pipelineDefinitionsRouter(req, res, next); });
+router.get('/pipelines/:pipelineId', (req, res, next) => { req.url = `/${encodeURIComponent(String(req.params.pipelineId))}`; pipelineDefinitionsRouter(req, res, next); });
 
 // ---------------------------------------------------------------------------
 // /api/v2 — module-shaped pipeline router. Phase A of the distributed-core
