@@ -32,6 +32,7 @@ import {
   type PipelineRunItem,
   type RunItemStatus,
   type StepAttempt,
+  type RunReview,
   type StepSummary,
   type TokenUsageByModel,
 } from '../repositories/PipelineRunRepository';
@@ -100,6 +101,8 @@ interface RunState {
   /** DLQ redrive lineage — see PipelineRunItem. Carried so full-row puts keep them. */
   redriveOf?: string;
   redrivenBy?: string[];
+  /** A person's verdict on the run's suggestions — carried so a late full-row put keeps it. */
+  review?: RunReview;
 }
 
 /** A redrive marks its trigger payload with the run it replaces (failedRunDeadLetters.ts). */
@@ -618,6 +621,25 @@ export class RunPersistenceService {
   }
 
   /**
+   * A review usually arrives after the run is terminal and evicted; when it is
+   * still cached (a late event in flight) the next full-row put must not wipe
+   * what the route just wrote.
+   */
+  setReview(runId: string, review: RunReview): void {
+    const state = this.runCache.get(runId);
+    if (state) state.review = review;
+  }
+
+  /**
+   * The bus the executor publishes on — for a route that has something to say
+   * about a run after the executor is done with it (a review verdict). Every
+   * `pipeline:*` event on it reaches the gateway through the Redis relay.
+   */
+  getEventBus(): EventBus<PipelineEventMap> {
+    return this.eventBus;
+  }
+
+  /**
    * Resolve a run's cache entry, tolerating the cross-topic race where a
    * terminal event arrives before run:started has populated the cache.
    * `started` and `failed` travel on different Redis pub/sub channels with
@@ -872,6 +894,7 @@ export class RunPersistenceService {
       resumeClaimedBy: state.resumeClaimedBy,
       redriveOf: state.redriveOf,
       redrivenBy: state.redrivenBy,
+      review: state.review,
     };
 
     await this.putWithRetry(item, state);

@@ -160,6 +160,26 @@ export interface PipelineRunItem {
    */
   redriveOf?: string;
   redrivenBy?: string[];
+  /**
+   * A person's verdict on what this run SUGGESTED in a document (tracked
+   * changes under `suggestionKey`). Written by POST /runs/:runId/review after
+   * the run is terminal; the run's status does not change — the edit landed as
+   * a proposal, and this is what became of it.
+   */
+  review?: RunReview;
+}
+
+export interface RunReview {
+  decision: 'accept' | 'reject';
+  /** `${user}@${date}` of the suggestion marks the run wrote. */
+  suggestionKey: string;
+  documentId: string;
+  by: string;
+  byName?: string;
+  at: string;
+  comment?: string;
+  /** Set when the decision was applied to the document server-side, by this run. */
+  appliedByRunId?: string;
 }
 
 /**
@@ -387,6 +407,22 @@ export class PipelineRunRepository extends BaseRepository {
         UpdateExpression: 'SET redrivenBy = list_append(if_not_exists(redrivenBy, :empty), :new)',
         ConditionExpression: 'attribute_exists(runId)',
         ExpressionAttributeValues: { ':empty': [], ':new': [newRunId] },
+      });
+      return true;
+    } catch (err) {
+      if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+      throw err;
+    }
+  }
+
+  /** Record a person's verdict on the run's suggestions. False when the run row does not exist. */
+  async setReview(pipelineId: string, runId: string, review: RunReview): Promise<boolean> {
+    try {
+      await this.updateItem({
+        Key: { pipelineId, runId },
+        UpdateExpression: 'SET review = :review',
+        ConditionExpression: 'attribute_exists(runId)',
+        ExpressionAttributeValues: { ':review': review },
       });
       return true;
     } catch (err) {

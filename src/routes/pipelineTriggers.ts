@@ -22,6 +22,7 @@ import { stubRunStore } from '../pipeline/stub-run-store';
 import { runItemToSnapshot } from '../pipeline/createBridge';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
 import { getDynamoClient } from '../lib/ddb-client';
+import { pipelineRunReviewRouter } from './pipelineRunReview';
 
 export { classifyPipelineError, type ErrorCategory };
 export {
@@ -191,6 +192,9 @@ function respondBridgeError(params: {
 // ---------------------------------------------------------------------------
 
 export const pipelineTriggersRouter = Router({ mergeParams: true });
+
+// POST /:runId/review — a person's verdict on the run's suggestions (pipelineRunReview.ts).
+pipelineTriggersRouter.use(pipelineRunReviewRouter);
 
 // POST /
 pipelineTriggersRouter.post(
@@ -444,7 +448,8 @@ pipelineTriggersRouter.get(
         );
       }
       if (persisted) {
-        res.json(runItemToSnapshot(persisted));
+        // The verdict on the run's suggestions lives on the row only (written after the run was terminal).
+        res.json({ ...runItemToSnapshot(persisted), ...(persisted.review ? { review: persisted.review } : {}) });
         return;
       }
       throw new NotFoundError('run not found');
@@ -457,6 +462,7 @@ pipelineTriggersRouter.get(
       const persisted = await getRunRepo().get(pipelineId, runId);
       if (persisted?.redriveOf) snap.redriveOf = persisted.redriveOf;
       if (persisted?.redrivenBy && persisted.redrivenBy.length > 0) snap.redrivenBy = persisted.redrivenBy;
+      if (persisted?.review) (snap as Record<string, unknown>).review = persisted.review;
     } catch (err) {
       reqLog.warn(
         { err: err instanceof Error ? err.message : String(err) },

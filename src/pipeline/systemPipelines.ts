@@ -3,7 +3,7 @@
 // person's records in the definitions table: they ship with the code, cannot
 // be edited from the UI, and are served read-only beside a user's own so the
 // pipeline pages can name their steps and list their runs.
-import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOCUMENT_AGENT_EDIT_PIPELINE_ID, DOCUMENT_TRANSFORM_PIPELINE_ID } from '../documents/documentAgentPipeline';
+import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, buildDocumentReviewApplyDefinition, DOCUMENT_AGENT_EDIT_PIPELINE_ID, DOCUMENT_TRANSFORM_PIPELINE_ID, DOCUMENT_AGENT_REVIEW_PIPELINE_ID } from '../documents/documentAgentPipeline';
 import { buildRecordingFinalizeDefinition, buildCallTranscriptionDefinition, RECORDING_FINALIZE_PIPELINE_ID, CALL_TRANSCRIPTION_PIPELINE_ID } from '../recordings/recordingPipelines';
 import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID } from '../documents/conversationSummarizePipeline';
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
@@ -17,6 +17,7 @@ export interface SystemPipelineEntry {
 const REGISTRY: SystemPipelineEntry[] = [
   { id: DOCUMENT_AGENT_EDIT_PIPELINE_ID, build: () => buildDocumentAgentEditDefinition() },
   { id: DOCUMENT_TRANSFORM_PIPELINE_ID, build: () => buildDocumentTransformDefinition() },
+  { id: DOCUMENT_AGENT_REVIEW_PIPELINE_ID, build: () => buildDocumentReviewApplyDefinition() },
   { id: RECORDING_FINALIZE_PIPELINE_ID, build: () => buildRecordingFinalizeDefinition() },
   { id: CALL_TRANSCRIPTION_PIPELINE_ID, build: () => buildCallTranscriptionDefinition() },
   { id: CONVERSATION_SUMMARIZE_PIPELINE_ID, build: () => buildConversationSummarizeDefinition() },

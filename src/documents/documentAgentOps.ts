@@ -13,6 +13,14 @@ import type * as YT from 'yjs' with { 'resolution-mode': 'import' };
 // come in through require while the types come in as type-only.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const Y = require('yjs') as typeof YT;
+import {
+  acceptSuggestions, createSuggestionIdentity, readSuggestions, rejectSuggestions,
+  suggestDeleteRange, suggestInsertText, suggestReplaceText, suggestionKey,
+  SUGGESTION_DELETE_MARK, SUGGESTION_INSERT_MARK,
+  type SuggestionIdentity, type SuggestionRun,
+} from 'distributed-core/applications/document';
+
+export { createSuggestionIdentity, readSuggestions, suggestionKey, type SuggestionIdentity, type SuggestionRun };
 
 /** The canvas body fragment and the metadata map — the same keys the editor uses. */
 export const CANVAS_BODY_KEY = 'body';
@@ -29,7 +37,10 @@ export type DocOp =
   | { op: 'replaceBlock'; index: number; text: string }
   | { op: 'appendBlock'; kind: 'paragraph' | 'heading'; level?: number; text: string }
   | { op: 'insertBlock'; index: number; kind: 'paragraph' | 'heading'; level?: number; text: string }
-  | { op: 'deleteBlock'; index: number };
+  | { op: 'deleteBlock'; index: number }
+  /** Resolve every suggestion under one key (`${user}@${date}`) across the whole body — a review landing server-side. */
+  | { op: 'acceptSuggestion'; key: string }
+  | { op: 'rejectSuggestion'; key: string };
 
 export interface OutlineBlock { index: number; kind: string; level?: number; text: string; macroName?: string }
 export interface DocumentOutline { title: string | undefined; blocks: OutlineBlock[]; text: string }
@@ -127,17 +138,169 @@ export function parseOps(text: string): DocOp[] {
       case 'appendBlock': if (kind && text) ops.push({ op: 'appendBlock', kind, text, ...(level ? { level } : {}) }); break;
       case 'insertBlock': if (index !== undefined && kind && text) ops.push({ op: 'insertBlock', index, kind, text, ...(level ? { level } : {}) }); break;
       case 'deleteBlock': if (index !== undefined) ops.push({ op: 'deleteBlock', index }); break;
+      case 'acceptSuggestion': if (typeof o.key === 'string' && o.key) ops.push({ op: 'acceptSuggestion', key: o.key.slice(0, 200) }); break;
+      case 'rejectSuggestion': if (typeof o.key === 'string' && o.key) ops.push({ op: 'rejectSuggestion', key: o.key.slice(0, 200) }); break;
       default: break;
     }
   }
   return ops;
 }
 
-export interface ApplyResult { applied: number; skipped: number; title?: string }
+export interface ApplyResult {
+  applied: number;
+  skipped: number;
+  title?: string;
+  /** Set in suggest mode: the `${user}@${date}` every mark this call wrote carries — what a review accepts or rejects. */
+  suggestionKey?: string;
+}
 
-/** Apply in ONE transaction under `origin`, so the change is one update on the wire. */
-export function applyOps(doc: YT.Doc, ops: DocOp[], origin: unknown = 'agent', sourceBlocks: readonly OutlineBlock[] = []): ApplyResult {
-  const result: ApplyResult = { applied: 0, skipped: 0 };
+/**
+ * How an edit lands. `direct` writes the text the way a person typing would;
+ * `suggest` writes TRACKED CHANGES — the editor's suggestion marks, attributed
+ * to `identity` — so nothing the agent proposes is final until a person
+ * accepts it. Block-level marks do not survive Yjs, so every suggestion sits on
+ * inline text: a new block is a block whose text is all insert-marked, a
+ * deleted block is one whose text is all delete-marked (and stays until
+ * accepted).
+ */
+export type ApplyMode = 'direct' | 'suggest';
+
+export interface ApplyOptions {
+  /** Transaction origin (default `'agent'`). */
+  origin?: unknown;
+  /** The SOURCE outline `copyBlock` carries from (a transform). */
+  sourceBlocks?: readonly OutlineBlock[];
+  /** Default `direct`. */
+  mode?: ApplyMode;
+  /** Who the suggestions are attributed to. Required for `suggest`; falls back to direct without one. */
+  identity?: SuggestionIdentity;
+}
+
+/** The XmlText children of a block, in order. */
+function textsOf(el: YT.XmlElement): YT.XmlText[] {
+  return el.toArray().filter((c): c is YT.XmlText => c instanceof Y.XmlText);
+}
+
+/** The block's text to hang a mark on — created (empty, appended) when the block has none. */
+function primaryText(el: YT.XmlElement): YT.XmlText {
+  const texts = textsOf(el);
+  if (texts.length > 0) return texts[texts.length - 1]!;
+  const t = new Y.XmlText();
+  el.insert(el.length, [t]);
+  return t;
+}
+
+/** An empty block of `kind`, to be filled by a suggested insertion once it is in the document. */
+function makeEmptyBlock(kind: 'paragraph' | 'heading' | 'macro', level?: number, macroName?: string): YT.XmlElement {
+  const el = new Y.XmlElement(kind);
+  if (kind === 'heading') el.setAttribute('level', String(level && level >= 1 && level <= 6 ? level : 2));
+  if (kind === 'macro' && macroName) el.setAttribute('macroName', macroName);
+  el.insert(0, [new Y.XmlText()]);
+  return el;
+}
+
+/** Insert a block whose whole text is a suggested insertion. The block is placed FIRST so its text is integrated when the mark is written. */
+function suggestNewBlock(body: YT.XmlFragment, at: number, kind: 'paragraph' | 'heading' | 'macro', text: string, id: SuggestionIdentity, level?: number, macroName?: string): void {
+  const el = makeEmptyBlock(kind, level, macroName);
+  body.insert(at, [el]);
+  suggestInsertText(primaryText(el), 0, text, id);
+}
+
+/** Suggest replacing a block's text: the last text run is rewritten, any others are delete-marked. */
+function suggestBlockText(el: YT.XmlElement, text: string, id: SuggestionIdentity): void {
+  const texts = textsOf(el);
+  for (const t of texts.slice(0, -1)) if (t.length > 0) suggestDeleteRange(t, 0, t.length, id);
+  suggestReplaceText(primaryText(el), text, id);
+}
+
+/** Suggest deleting a block: every text run delete-marked; a ZWS anchor when there is no text at all. */
+function suggestBlockDelete(el: YT.XmlElement, id: SuggestionIdentity): void {
+  const texts = textsOf(el);
+  const total = texts.reduce((n, t) => n + t.length, 0);
+  if (total === 0) { suggestDeleteRange(primaryText(el), 0, 0, id); return; }
+  for (const t of texts) if (t.length > 0) suggestDeleteRange(t, 0, t.length, id);
+}
+
+/** Runs of `key` in a block: does it carry any, and are they all one mark? */
+function keyRuns(el: YT.XmlElement, key: string): SuggestionRun[] {
+  return textsOf(el).flatMap((t) => readSuggestions(t)).filter((r) => r.key === key);
+}
+
+/**
+ * Resolve suggestion `key` across the whole body. A block that was ENTIRELY a
+ * suggestion — a proposed new paragraph on reject, a proposed deletion on
+ * accept — is left with no text by the helpers; that block is removed, since
+ * the editor's own resolve leaves no empty shell either. A block that had text
+ * of its own before the suggestion keeps it.
+ */
+function resolveSuggestion(body: YT.XmlFragment, key: string, decision: 'accept' | 'reject'): number {
+  let touched = 0;
+  const blocks = body.toArray().filter((n): n is YT.XmlElement => n instanceof Y.XmlElement);
+  for (const el of blocks) {
+    const runs = keyRuns(el, key);
+    if (runs.length === 0) continue;
+    touched += 1;
+    const removable = decision === 'accept'
+      ? runs.every((r) => r.markName === SUGGESTION_DELETE_MARK)
+      : runs.every((r) => r.markName === SUGGESTION_INSERT_MARK);
+    for (const t of textsOf(el)) (decision === 'accept' ? acceptSuggestions : rejectSuggestions)(t, key);
+    if (removable && textsOf(el).every((t) => t.length === 0)) {
+      const at = body.toArray().indexOf(el);
+      if (at >= 0) body.delete(at, 1);
+    }
+  }
+  return touched;
+}
+
+/** What a canvas document carries in `meta` once it has been seeded (the client's CanvasSeedHost writes the same keys). */
+export const CANVAS_SCHEMA_VERSION = 2;
+
+export interface CanvasMetaSeed { id: string; title: string; createdBy: string; type?: string; createdAt?: string }
+
+/**
+ * A document created outside the client's seed (an API smoke test, an
+ * external caller, a page a pipeline makes for itself) has no `schemaVersion`
+ * and so opens as a SECTION document — the body a pipeline writes is there but
+ * invisible. Stamp the same metadata the client seed writes, once. Never
+ * touches a document that already has a schemaVersion.
+ */
+export function ensureCanvasMeta(doc: YT.Doc, seed: CanvasMetaSeed, origin: unknown = 'agent'): boolean {
+  const meta = doc.getMap<unknown>(CANVAS_META_KEY);
+  if (meta.get('schemaVersion') !== undefined) return false;
+  doc.transact(() => {
+    if (typeof meta.get('id') !== 'string') meta.set('id', seed.id);
+    if (typeof meta.get('title') !== 'string') meta.set('title', seed.title);
+    meta.set('sourceType', 'notes');
+    meta.set('sourceId', '');
+    meta.set('createdBy', seed.createdBy);
+    meta.set('createdAt', seed.createdAt ?? new Date().toISOString());
+    meta.set('aiModel', '');
+    if (typeof meta.get('status') !== 'string') meta.set('status', 'draft');
+    if (seed.type && typeof meta.get('documentType') !== 'string') meta.set('documentType', seed.type);
+    meta.set('templateApplied', true);
+    meta.set('schemaVersion', CANVAS_SCHEMA_VERSION);
+  }, origin);
+  return true;
+}
+
+/**
+ * Apply in ONE transaction under `origin`, so the change is one update on the
+ * wire. The old positional form `(doc, ops, origin, sourceBlocks)` still works;
+ * the options form adds `mode` + `identity` for tracked changes.
+ *
+ * In suggest mode `setTitle` splits: the h1 mirror is a suggested replace, but
+ * the META title is written directly — a Y.Map scalar has no suggestion
+ * representation (marks live on inline text only), and the header reads
+ * `meta.title`. `setDocumentType` stays direct for the same reason.
+ */
+export function applyOps(doc: YT.Doc, ops: DocOp[], origin?: unknown, sourceBlocks?: readonly OutlineBlock[]): ApplyResult;
+export function applyOps(doc: YT.Doc, ops: DocOp[], options: ApplyOptions): ApplyResult;
+export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = 'agent', sourceBlocksArg: readonly OutlineBlock[] = []): ApplyResult {
+  const opts: ApplyOptions = isApplyOptions(originOrOptions) ? originOrOptions : { origin: originOrOptions, sourceBlocks: sourceBlocksArg };
+  const origin = opts.origin ?? 'agent';
+  const sourceBlocks = opts.sourceBlocks ?? [];
+  const id = opts.mode === 'suggest' && opts.identity ? opts.identity : null;
+  const result: ApplyResult = { applied: 0, skipped: 0, ...(id ? { suggestionKey: suggestionKey(id) } : {}) };
   doc.transact(() => {
     const body = doc.getXmlFragment(CANVAS_BODY_KEY);
     for (const op of ops) {
@@ -146,7 +309,8 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], origin: unknown = 'agent', s
         case 'setTitle': {
           doc.getMap<unknown>(CANVAS_META_KEY).set('title', op.text);
           const h1 = blocks.find((b) => b.nodeName === 'heading' && String(b.getAttribute('level') ?? '1') === '1');
-          if (h1) setBlockText(h1, op.text);
+          if (h1) { if (id) suggestBlockText(h1, op.text, id); else setBlockText(h1, op.text); }
+          else if (id) suggestNewBlock(body, 0, 'heading', op.text, id, 1);
           else body.insert(0, [makeBlock('heading', op.text, 1)]);
           result.title = op.text;
           result.applied += 1;
@@ -155,22 +319,28 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], origin: unknown = 'agent', s
         case 'replaceBlock': {
           const el = blocks[op.index];
           if (!el) { result.skipped += 1; break; }
-          setBlockText(el, op.text);
+          if (id) suggestBlockText(el, op.text, id); else setBlockText(el, op.text);
           result.applied += 1;
           break;
         }
         case 'appendBlock':
-          body.insert(body.length, [makeBlock(op.kind, op.text, op.level)]);
+          if (id) suggestNewBlock(body, body.length, op.kind, op.text, id, op.level);
+          else body.insert(body.length, [makeBlock(op.kind, op.text, op.level)]);
           result.applied += 1;
           break;
         case 'appendMacro':
-          body.insert(body.length, [makeMacro(op.macroName, op.yaml)]);
+          // The YAML body is the macro's inline text, so it carries the mark like a paragraph would.
+          if (id) suggestNewBlock(body, body.length, 'macro', op.yaml, id, undefined, op.macroName);
+          else body.insert(body.length, [makeMacro(op.macroName, op.yaml)]);
           result.applied += 1;
           break;
         case 'copyBlock': {
           const src = sourceBlocks[op.index];
           if (!src) { result.skipped += 1; break; }
-          body.insert(body.length, [materialize(src)]);
+          if (id) {
+            if (src.kind === 'macro' && src.macroName) suggestNewBlock(body, body.length, 'macro', src.text, id, undefined, src.macroName);
+            else suggestNewBlock(body, body.length, src.kind === 'heading' ? 'heading' : 'paragraph', src.text, id, src.level);
+          } else body.insert(body.length, [materialize(src)]);
           result.applied += 1;
           break;
         }
@@ -184,18 +354,27 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], origin: unknown = 'agent', s
         }
         case 'insertBlock': {
           const el = blocks[op.index];
-          if (!el) { body.insert(body.length, [makeBlock(op.kind, op.text, op.level)]); result.applied += 1; break; }
           // Position in the FRAGMENT, which may hold non-element nodes too.
-          const at = body.toArray().indexOf(el);
-          body.insert(at < 0 ? body.length : at, [makeBlock(op.kind, op.text, op.level)]);
+          const at = el ? body.toArray().indexOf(el) : -1;
+          const pos = at < 0 ? body.length : at;
+          if (id) suggestNewBlock(body, pos, op.kind, op.text, id, op.level);
+          else body.insert(pos, [makeBlock(op.kind, op.text, op.level)]);
           result.applied += 1;
           break;
         }
         case 'deleteBlock': {
           const el = blocks[op.index];
           if (!el) { result.skipped += 1; break; }
+          if (id) { suggestBlockDelete(el, id); result.applied += 1; break; }
           const at = body.toArray().indexOf(el);
           if (at >= 0) { body.delete(at, 1); result.applied += 1; } else result.skipped += 1;
+          break;
+        }
+        case 'acceptSuggestion':
+        case 'rejectSuggestion': {
+          // Always direct — a review is the person's decision landing, not a new proposal.
+          const touched = resolveSuggestion(body, op.key, op.op === 'acceptSuggestion' ? 'accept' : 'reject');
+          if (touched > 0) result.applied += 1; else result.skipped += 1;
           break;
         }
         default: result.skipped += 1;
@@ -203,4 +382,10 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], origin: unknown = 'agent', s
     }
   }, origin);
   return result;
+}
+
+function isApplyOptions(v: unknown): v is ApplyOptions {
+  if (!v || typeof v !== 'object') return false;
+  const o = v as Record<string, unknown>;
+  return 'mode' in o || 'identity' in o || 'sourceBlocks' in o || 'origin' in o;
 }

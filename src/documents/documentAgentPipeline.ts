@@ -7,11 +7,13 @@
 // people do all day.
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
-import { applyOps, outlineOf, parseOps, type OutlineBlock } from './documentAgentOps';
+import { applyOps, createSuggestionIdentity, ensureCanvasMeta, outlineOf, parseOps, type ApplyMode, type OutlineBlock } from './documentAgentOps';
 import log from '../lib/logger';
 
 export const DOCUMENT_AGENT_EDIT_PIPELINE_ID = 'document-agent-edit';
 export const DOCUMENT_TRANSFORM_PIPELINE_ID = 'document-transform';
+/** A person's Accept/Reject of an agent's suggestions, landing server-side through the same apply step. */
+export const DOCUMENT_AGENT_REVIEW_PIPELINE_ID = 'document-agent-review';
 export const DOCUMENT_READ_KIND = 'document:read';
 export const DOCUMENT_REVIEW_KIND = 'document:review-plan';
 export const DOCUMENT_APPLY_KIND = 'document:apply';
@@ -112,7 +114,7 @@ export function buildDocumentTransformDefinition(model = process.env.DOCUMENT_AG
       // A transform always stamps the new type — that is not a reason to stop and ask.
       { id: 'review', type: DOCUMENT_REVIEW_KIND, position: pos(600), data: { type: DOCUMENT_REVIEW_KIND, label: 'Check the plan', allowTypeChange: true, retryPolicy: DOCUMENT_IO_RETRY } },
       approvalNode(pos(800), opts),
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1000), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the target as a collaborator', retryPolicy: DOCUMENT_IO_RETRY } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1000), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the target as a collaborator', mode: 'suggest', retryPolicy: DOCUMENT_IO_RETRY } },
     ],
     edges: documentEdges(),
   };
@@ -149,11 +151,35 @@ export function buildDocumentAgentEditDefinition(model = process.env.DOCUMENT_AG
       { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the edit (Haiku)', prompt: DOCUMENT_EDIT_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: DOCUMENT_PLAN_RETRY } },
       { id: 'review', type: DOCUMENT_REVIEW_KIND, position: pos(600), data: { type: DOCUMENT_REVIEW_KIND, label: 'Check the plan', retryPolicy: DOCUMENT_IO_RETRY } },
       approvalNode(pos(800), opts),
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1000), data: { type: DOCUMENT_APPLY_KIND, label: 'Apply as a collaborator', retryPolicy: DOCUMENT_IO_RETRY } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1000), data: { type: DOCUMENT_APPLY_KIND, label: 'Suggest as a collaborator', mode: 'suggest', retryPolicy: DOCUMENT_IO_RETRY } },
     ],
     edges: documentEdges(),
   };
 }
+
+/**
+ * The review landing: trigger → apply, direct mode, operations from
+ * `reviewOps` (`acceptSuggestion` / `rejectSuggestion` under one key). Used
+ * when the document is not open in anyone's editor, so the person's decision
+ * still goes through the one write path and shows up as a run.
+ */
+export function buildDocumentReviewApplyDefinition(): Record<string, unknown> {
+  const pos = (x: number) => ({ x, y: 0 });
+  return {
+    id: DOCUMENT_AGENT_REVIEW_PIPELINE_ID,
+    name: 'Document suggestion review',
+    description: 'A person accepted or rejected an agent\'s suggestions: resolve them in the document as a collaborator.',
+    version: 1, status: 'published', publishedVersion: 1,
+    nodes: [
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Suggestion reviewed' } },
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(200), data: { type: DOCUMENT_APPLY_KIND, label: 'Resolve the suggestions', mode: 'direct', opsFrom: 'reviewOps', agent: REVIEW_AGENT, retryPolicy: DOCUMENT_IO_RETRY } },
+    ],
+    edges: [{ id: 'e1', source: 'trigger', sourceHandle: 'out', target: 'apply', targetHandle: 'in' }],
+  };
+}
+
+/** Presence identity for a review landing — the decision is a person's, so the collaborator is named for the action, not a model. */
+export const REVIEW_AGENT = { userId: 'agent:review', displayName: 'Review', color: '#0ea5e9' } as const;
 
 function documentIdOf(context: Record<string, unknown>): string | null {
   return typeof context.documentId === 'string' && context.documentId ? context.documentId : null;
@@ -248,6 +274,12 @@ export interface DocumentApplyNodeData {
   agent?: { userId: string; displayName: string; color?: string };
   /** When the run has no document, complete (nothing to write) instead of failing. */
   optional?: boolean;
+  /**
+   * `direct` (default) writes text; `suggest` writes tracked changes attributed
+   * to `agent`, which a person then accepts or rejects. The two document
+   * pipelines suggest; a transcript or a summary landing on a fresh page writes.
+   */
+  mode?: ApplyMode;
 }
 
 function readPath(obj: unknown, path: string): unknown {
@@ -288,19 +320,30 @@ export function createDocumentApplyHandler(): StepHandler {
         const reason = skips[0]?.reason || (data.opsFrom ? 'nothing to write' : 'the model proposed no operations');
         return { status: 'completed', output: { applied: 0, skipped: 0, reason, planText: planText.slice(0, 500) } };
       }
-      const agent = new AgentCollaborator({ documentId, identity: data.agent ? { ...HAIKU_AGENT, ...data.agent } : HAIKU_AGENT });
+      const identity = data.agent ? { ...HAIKU_AGENT, ...data.agent } : HAIKU_AGENT;
+      const mode: ApplyMode = data.mode === 'suggest' ? 'suggest' : 'direct';
+      const agent = new AgentCollaborator({ documentId, identity });
       try {
         await agent.join();
         agent.announce();
+        // A page nobody seeded (an API caller's, a smoke test's) is still section-shaped; make it a canvas or the write is invisible.
+        const seeded = ensureCanvasMeta(agent.doc, {
+          id: documentId,
+          title: typeof context.documentTitle === 'string' && context.documentTitle ? context.documentTitle : 'Untitled',
+          createdBy: typeof context.requestedBy === 'string' && context.requestedBy ? context.requestedBy : identity.userId,
+        });
         const sourceBlocks = Array.isArray(context.sourceBlocks) ? (context.sourceBlocks as OutlineBlock[]) : [];
-        const result = applyOps(agent.doc, ops, 'agent', sourceBlocks);
-        log.info({ documentId, ...result, ops: ops.length }, 'document agent edit applied');
+        const result = applyOps(agent.doc, ops, {
+          origin: 'agent', sourceBlocks, mode,
+          ...(mode === 'suggest' ? { identity: createSuggestionIdentity(identity.userId, identity.displayName, Date.now()) } : {}),
+        });
+        log.info({ documentId, ...result, mode, seeded, ops: ops.length }, 'document agent edit applied');
         // The step is done the moment the edit is in the document — the
         // run's status must not lag what people already see. The agent then
         // lingers in presence on its own clock so collaborators can see who
         // made the change, and leaves like anyone else.
         void agent.leave(Number(process.env.DOCUMENT_AGENT_PRESENCE_HOLD_MS) || 4000).catch(() => undefined);
-        return { status: 'completed', output: { ...result, ops } };
+        return { status: 'completed', output: { ...result, mode, ops } };
       } catch (err) {
         await agent.leave(0).catch(() => undefined);
         return { status: 'failed', error: err instanceof Error ? err.message : String(err) };
