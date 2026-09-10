@@ -89,6 +89,8 @@ describe('the publish step', () => {
       { chatChannel: 'room:x', documentId: 'doc-1', messageCount: 12, steps: { apply: { title: 'Rollout plan', applied: 4 } } },
       { runId: 'run-9', emit: async () => undefined } as never);
     expect(postCard).toHaveBeenCalledWith(expect.objectContaining({ channel: 'room:x', runId: 'run-9', pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID, command: '/summarize', instruction: 'Rollout plan — 12 messages', extra: expect.objectContaining({ documentId: 'doc-1' }) }));
-    expect(out).toEqual({ status: 'completed', output: { posted: true, title: 'Rollout plan', messageCount: 12, applied: 4, result: { kind: 'document', documentId: 'doc-1' } } });
+    expect(out).toEqual({ status: 'completed', output: { posted: true, card: expect.objectContaining({ kind: 'agent-run', runId: 'run-9', command: '/summarize', documentId: 'doc-1' }), title: 'Rollout plan', messageCount: 12, applied: 4, result: { kind: 'document', documentId: 'doc-1' } } });
+    // The run context rides along so the post can step down when the client posted the card.
+    expect((postCard.mock.calls[0] as unknown[])[0]).toMatchObject({ context: { chatChannel: 'room:x' } });
   });
 });

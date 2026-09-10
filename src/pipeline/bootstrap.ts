@@ -103,7 +103,7 @@ import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
 import { buildChatCommandHandlers } from '../documents/chatCommandHandlers';
-import { buildChatCommandPluginHandlers } from '../chat/plugins';
+import { getCustomStepHandlers, registerCustomStepHandler } from './customStepHandlers';
 import { buildRecordingPipelineHandlers } from '../recordings/recordingPipelines';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
@@ -742,14 +742,19 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   for (const [key, handler] of buildChatCommandHandlers()) {
     customStepHandlers.set(key, handler);
   }
-  // Chat-command plugins (/search …): commands written against the registry, each shipping its own step kinds.
-  for (const [key, handler] of buildChatCommandPluginHandlers()) customStepHandlers.set(key, handler);
   // After a call: finalize the recording and transcribe it — as runs, not inline code.
   // Retries are the executor's: every kind honours its node's `retryPolicy`
   // (distributed-core ≥ 0.45.8), so nothing is wrapped here.
   for (const [key, handler] of buildRecordingPipelineHandlers()) {
     customStepHandlers.set(key, handler);
   }
+  // Seed the LIVE registry (src/pipeline/customStepHandlers.ts) with the
+  // built-ins and hand THAT map to the module. DC keeps the map by reference
+  // and reads it at every dispatch, so chat-command plugins (src/chat/
+  // chatCommandPlugin.ts) that register step kinds before OR after this
+  // point are dispatchable without the bootstrap knowing their names.
+  for (const [key, handler] of customStepHandlers) registerCustomStepHandler(handler, key);
+  const liveStepHandlers = getCustomStepHandlers();
 
   // Wave A (2026-08-25): action-API wiring. When set, action nodes
   // (post-comment / update-document / create-section-item / notify) make
@@ -785,7 +790,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       eventBusAutoCompactIntervalMs: effectiveAutoCompactIntervalMs,
       eventBusAutoCompactOptions: effectiveAutoCompactOptions,
       ...(eventBusMetricsEnabled ? { eventBusMetrics: metricsRegistry } : {}),
-      ...(customStepHandlers.size > 0 ? { customStepHandlers } : {}),
+      customStepHandlers: liveStepHandlers,
       ...(actionApiBaseUrl ? { actionApiBaseUrl } : {}),
       ...(actionApiBaseUrl && actionApiToken
         ? { actionApiHeaders: { Authorization: `Bearer ${actionApiToken}` } }

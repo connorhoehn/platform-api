@@ -155,6 +155,18 @@ describe('runChatCommand — the fake /search through a stubbed bridge', () => {
     expect(out.card).toMatchObject({ kind: 'agent-run', documentId: 'd-9' });
   });
 
+  test('clientPostsCard: the flag rides in every trigger payload, and the dispatcher does not post a second card', async () => {
+    registerChatCommandPipeline(searchCommand);
+    const out = await runChatCommand({ ...input(), clientPostsCard: true });
+    expect(trigger.mock.calls[0][0].triggerPayload).toMatchObject({ clientPostsCard: true });
+    expect(mockPostCard).not.toHaveBeenCalled();
+    expect(out.card).toMatchObject({ kind: 'agent-run', runId: 'run-1' });
+    // A run with no client says so, and the default post happens.
+    await runChatCommand(input());
+    expect(trigger.mock.calls[1][0].triggerPayload).toMatchObject({ clientPostsCard: false });
+    expect(mockPostCard).toHaveBeenCalledTimes(1);
+  });
+
   test('prepare runs before the builders and can enrich the input', async () => {
     registerChatCommandPipeline({
       ...searchCommand,

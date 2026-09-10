@@ -52,6 +52,15 @@ export interface ChatCommandRunInput {
   requestedByName: string;
   /** Anything else the command's payload needs; validated by `requires.extra`. */
   extra?: Record<string, unknown>;
+  /**
+   * True when the client that sent the command posts the run's card itself
+   * (the app does: it posts the returned `card`, which updates live and opens
+   * the `result`). Merged into every trigger payload as `clientPostsCard`, so
+   * a pipeline's own publish step (`postRunCardToChannel`) leaves the card to
+   * the client instead of posting a second one. Runs started with no client
+   * omit it and keep posting.
+   */
+  clientPostsCard?: boolean;
 }
 
 export interface ChatCommandRequires {
@@ -203,6 +212,7 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
   if (payload.requestedBy === undefined) payload.requestedBy = input.requestedBy;
   if (payload.requestedByName === undefined) payload.requestedByName = input.requestedByName;
   if (payload.chatChannel === undefined) payload.chatChannel = input.channel;
+  payload.clientPostsCard = input.clientPostsCard === true;
 
   const out = await Promise.resolve(bridge.trigger({
     pipelineId: def.pipelineId,
@@ -219,7 +229,8 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
     ...(input.documentId ? { documentId: input.documentId } : {}),
     ...(def.card ? def.card(input) : {}),
   };
-  if (def.postCard !== false) {
+  // The client that posts the card itself gets the metadata and no duplicate from here.
+  if (def.postCard !== false && input.clientPostsCard !== true) {
     const { kind: _k, command: _c, instruction: _i, runId: _r, pipelineId: _p, ...extra } = card;
     await postRunCardToChannel({ channel: input.channel, runId, pipelineId: def.pipelineId, command: trigger, instruction, extra });
   }

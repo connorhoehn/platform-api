@@ -7,7 +7,9 @@
 // and `/api/chat/commands/%2Fsummarize/run` are the same command (Express
 // decodes the segment; the registry normalises). Unknown trigger → 404 with the
 // known ones; unmet `requires` → 400 `{ error, requires }`. Auth is applied at
-// the mount (routes/index.ts); `requestedBy` is `req.user.sub`.
+// the mount (routes/index.ts); `requestedBy` is `req.user.sub`. A body with
+// `clientPostsCard: true` says the client posts the returned card itself, so
+// neither the dispatcher nor the pipeline's publish step posts a second one.
 import { Router, type Request, type Response } from 'express';
 import { asyncHandler, ValidationError } from '../middleware/error-handler';
 import {
@@ -15,11 +17,12 @@ import {
   listChatCommandPipelines, runChatCommand, type ChatCommandRunInput,
 } from '../chat/chatCommandRegistry';
 import { registerBuiltinChatCommands } from '../chat/builtinChatCommands';
-import { registerChatCommandPlugins } from '../chat/plugins';
+import { installBuiltinChatCommandPlugins } from '../chat/plugins';
 
 registerBuiltinChatCommands();
-// Plugins (/search …) register after the built-ins, the way an embedder's commands would.
-registerChatCommandPlugins();
+// The platform's own plugins (/search …) install after the built-ins through the plugin contract;
+// external ones (CHAT_COMMAND_PLUGINS) are loaded by src/index.ts into the same live registries.
+installBuiltinChatCommandPlugins();
 
 export const chatCommandsRouter = Router();
 
@@ -45,6 +48,7 @@ chatCommandsRouter.post('/:trigger/run', asyncHandler(async (req: Request, res: 
     requestedBy: userId,
     requestedByName: typeof body.requestedByName === 'string' && body.requestedByName ? body.requestedByName.slice(0, 80) : userId,
     ...(body.extra && typeof body.extra === 'object' ? { extra: body.extra as Record<string, unknown> } : {}),
+    ...(body.clientPostsCard === true ? { clientPostsCard: true } : {}),
   };
   try {
     const out = await runChatCommand(input);

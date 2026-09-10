@@ -20,7 +20,7 @@ const Y = require('yjs') as typeof YT;
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
 import { CANVAS_META_KEY } from './documentAgentOps';
-import { postRunCardToChannel, str } from './chatRunCard';
+import { postRunCardToChannel, runCardMetadata, str } from './chatRunCard';
 import log from '../lib/logger';
 
 export const DIAGRAM_GENERATE_PIPELINE_ID = 'diagram-generate';
@@ -353,14 +353,17 @@ export function createDiagramPublishHandler(deps: { postCard?: typeof postRunCar
       const steps = (ctx.steps ?? {}) as Record<string, Record<string, unknown> | undefined>;
       const title = str(ctx.title) ?? 'Diagram';
       const elements = typeof steps.apply?.elements === 'number' ? steps.apply.elements : 0;
-      const posted = await post({
+      // `context: ctx` lets the post step down when the client posted the card (clientPostsCard); the metadata is returned either way.
+      const cardInput = {
         channel: str(ctx.chatChannel), runId: helpers.runId, pipelineId: DIAGRAM_GENERATE_PIPELINE_ID,
         command: '/diagram', instruction: title,
         extra: { documentId: ctx.documentId, title, elements },
-      });
+        context: ctx,
+      };
+      const posted = await post(cardInput);
       const resultDocumentId = typeof ctx.documentId === 'string' && ctx.documentId ? ctx.documentId : undefined;
       const result = resultDocumentId ? { kind: 'document' as const, documentId: resultDocumentId } : undefined;
-      return { status: 'completed', output: { posted, title, elements, ...(result ? { result } : {}) } };
+      return { status: 'completed', output: { posted, card: runCardMetadata(cardInput), title, elements, ...(result ? { result } : {}) } };
     },
   };
 }

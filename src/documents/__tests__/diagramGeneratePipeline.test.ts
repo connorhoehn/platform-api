@@ -135,6 +135,7 @@ describe('the publish step', () => {
     const out = await createDiagramPublishHandler({ postCard }).execute({ id: 'publish', type: DIAGRAM_PUBLISH_KIND, data: {} } as never,
       { chatChannel: 'room:x', documentId: 'doc-2', title: 'Checkout flow', steps: { apply: { elements: 7 } } }, { runId: 'run-3', emit: async () => undefined } as never);
     expect(postCard).toHaveBeenCalledWith(expect.objectContaining({ channel: 'room:x', runId: 'run-3', pipelineId: DIAGRAM_GENERATE_PIPELINE_ID, command: '/diagram', instruction: 'Checkout flow', extra: expect.objectContaining({ documentId: 'doc-2' }) }));
-    expect(out).toEqual({ status: 'completed', output: { posted: true, title: 'Checkout flow', elements: 7, result: { kind: 'document', documentId: 'doc-2' } } });
+    expect(out).toEqual({ status: 'completed', output: { posted: true, card: expect.objectContaining({ kind: 'agent-run', runId: 'run-3', command: '/diagram', documentId: 'doc-2' }), title: 'Checkout flow', elements: 7, result: { kind: 'document', documentId: 'doc-2' } } });
+    expect((postCard.mock.calls[0] as unknown[])[0]).toMatchObject({ context: { chatChannel: 'room:x' } });
   });
 });

@@ -12,6 +12,7 @@ import { startInvalidationSubscriber } from './pipeline/definitions-invalidator'
 import { wirePipelineBridge } from '@connorhoehn/pipeline-runtime';
 import { setPipelineBridge, getPipelineBridge } from './pipeline/bridge-types';
 import { bootstrapPipeline } from './pipeline/bootstrap';
+import { chatCommandPluginSpecsFromEnv, createChatCommandPluginContext, loadChatCommandPlugins } from './chat/chatCommandPlugin';
 import { createBridge } from './pipeline/createBridge';
 import { PipelineRunRepository } from './repositories/PipelineRunRepository';
 import { DLQRepository } from './repositories/DLQRepository';
@@ -238,6 +239,17 @@ function backgroundCatalogReconnect(): void {
   };
   attempt(5_000);
 }
+
+// ---------------------------------------------------------------------------
+// Chat-command plugins named in CHAT_COMMAND_PLUGINS (a package, or a path
+// relative to the platform-api root). Everything they register into is live —
+// the command registry, the step-handler map the pipeline module runs on, the
+// system-pipeline list, the panel providers — so this neither waits for nor is
+// awaited by the pipeline bootstrap below. A bad plugin is logged and skipped.
+// ---------------------------------------------------------------------------
+void loadChatCommandPlugins(createChatCommandPluginContext(log), chatCommandPluginSpecsFromEnv()).then(({ loaded, failed }) => {
+  if (loaded.length || failed.length) log.info({ loaded, failed }, 'chat command plugins');
+});
 
 // ---------------------------------------------------------------------------
 // Phase-4: bootstrap distributed-core's PipelineModule and wire its surfaces

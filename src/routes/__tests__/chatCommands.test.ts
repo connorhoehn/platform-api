@@ -152,6 +152,18 @@ describe('POST /api/chat/commands/:trigger/run', () => {
     expect(trigger).not.toHaveBeenCalled();
   });
 
+  it('lists the plugin-installed /search beside the built-ins', async () => {
+    const res = await run(buildApp(), 'GET', '/api/chat/commands');
+    expect((res.body as { commands: Array<{ trigger: string; pipelineId: string }> }).commands).toContainEqual(expect.objectContaining({ trigger: '/search', pipelineId: 'people-search' }));
+  });
+
+  it('clientPostsCard: true from the body reaches the trigger payload; absent it is false', async () => {
+    await run(buildApp(), 'POST', '/api/chat/commands/summarize/run', { channel: 'room:r', text: '/summarize', documentId: 'd', clientPostsCard: true });
+    expect(trigger.mock.calls[0][0].triggerPayload).toMatchObject({ clientPostsCard: true });
+    await run(buildApp(), 'POST', '/api/chat/commands/summarize/run', { channel: 'room:r', text: '/summarize', documentId: 'd', clientPostsCard: 'yes' });
+    expect(trigger.mock.calls[1][0].triggerPayload).toMatchObject({ clientPostsCard: false });
+  });
+
   it('404s an unknown trigger with the known ones', async () => {
     const res = await run(buildApp(), 'POST', '/api/chat/commands/nope/run', { channel: 'room:r', text: '/nope' });
     expect(res.statusCode).toBe(404);

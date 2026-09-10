@@ -1,8 +1,12 @@
 // `/search find me all kubernetes experts` — a chat command backed by a
 // pipeline, written the way an EMBEDDER would write one: nothing here touches
 // the registry's code, the run-result convention, or the run-detail route. It
-// registers a command, ships the two custom steps its definition names, and
-// answers with a `panel` result the card can open.
+// is a `ChatCommandPlugin` (`peopleSearchPlugin`, name `people-search`)
+// installed through the same loader an external plugin goes through
+// (src/chat/chatCommandPlugin.ts): its `setup` registers the command and the
+// two custom steps the definition names, and the run answers with a `panel`
+// result the card can open. No panel data provider — the panels route serves
+// `panelData` from the run itself.
 //
 //   people-search:  trigger → people:search → people:publish
 //
@@ -22,8 +26,9 @@
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import type { ProfileItem } from '../../repositories';
 import { profileRepo } from '../../repositories';
-import { postRunCardToChannel, str } from '../../documents/chatRunCard';
+import { postRunCardToChannel, runCardMetadata, str } from '../../documents/chatRunCard';
 import { registerChatCommandPipeline, type ChatCommandPipeline } from '../chatCommandRegistry';
+import type { ChatCommandPlugin } from '../chatCommandPlugin';
 
 export const PEOPLE_SEARCH_PIPELINE_ID = 'people-search';
 export const PEOPLE_SEARCH_KIND = 'people:search';
@@ -168,12 +173,15 @@ export function createPeoplePublishHandler(deps: { postCard?: typeof postRunCard
       const result = ctx.result && typeof ctx.result === 'object'
         ? ctx.result as Record<string, unknown>
         : { kind: 'panel', panel: { kind: PEOPLE_PANEL_KIND, id: peoplePanelId(helpers.runId), title: panelTitle(terms) } };
-      const posted = await post({
+      // `context: ctx` lets the post step down when the client posted the card (clientPostsCard); the metadata is returned either way.
+      const cardInput = {
         channel: str(ctx.chatChannel), runId: helpers.runId, pipelineId: PEOPLE_SEARCH_PIPELINE_ID,
         command: '/search', instruction,
         extra: { result, query: str(ctx.query) ?? '', terms, matched: n },
-      });
-      return { status: 'completed', output: { posted, matched: n, instruction, result } };
+        context: ctx,
+      };
+      const posted = await post(cardInput);
+      return { status: 'completed', output: { posted, card: runCardMetadata(cardInput), matched: n, instruction, result } };
     },
   };
 }
@@ -200,9 +208,18 @@ export const peopleSearchCommand: ChatCommandPipeline = {
   postCard: false,
 };
 
-let registered = false;
+/** Register just the command (no steps); the plugin below is the whole thing. */
 export function registerPeopleSearchCommand(): void {
-  if (registered) return;
-  registered = true;
   registerChatCommandPipeline(peopleSearchCommand);
 }
+
+/** The plugin — the command plus its step kinds, installed through src/chat/chatCommandPlugin.ts like an external one. */
+export const peopleSearchPlugin: ChatCommandPlugin = {
+  name: 'people-search',
+  setup(ctx) {
+    ctx.registerCommand(peopleSearchCommand);
+    ctx.registerStepHandlers([createPeopleSearchHandler(), createPeoplePublishHandler()]);
+  },
+};
+
+export default peopleSearchPlugin;

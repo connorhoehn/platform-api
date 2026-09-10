@@ -7,6 +7,11 @@
 // this route hands that back. It knows nothing about any particular kind —
 // the id names the run and the run says which kind it is.
 //
+// A plugin whose panel lives in its own store registers a panel data provider
+// for its kind (src/chat/chatPanelProviders.ts, via the plugin context); the
+// route asks the provider first and falls back to the run lookup below when
+// there is no provider for the kind or it answers null.
+//
 // Id scheme: `<pipelineId>:<runId>` (split at the first colon). The live
 // bridge finds a run by runId alone, but only while the process that ran it
 // is still up; the durable row is keyed by (pipelineId, runId), so a panel
@@ -17,6 +22,7 @@ import { asyncHandler, NotFoundError } from '../middleware/error-handler';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { pipelineRunRepo } from '../repositories';
 import { runResultFromContext } from '../pipeline/runResult';
+import { getPanelDataProvider } from '../chat/chatPanelProviders';
 
 export interface ChatPanelsDeps {
   /** The run as the executor holds it, with its `context`; null when this process never ran it. */
@@ -48,8 +54,16 @@ export function createChatPanelsRouter(deps: ChatPanelsDeps = defaultDeps): Rout
   const router = Router();
   router.get('/:kind/:id', asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const kind = String(req.params.kind ?? '');
-    const { pipelineId, runId } = parsePanelId(String(req.params.id ?? ''));
+    const rawId = String(req.params.id ?? '');
+    const { pipelineId, runId } = parsePanelId(rawId);
     if (!kind || !runId) throw new NotFoundError('panel not found');
+
+    // A plugin's own store first; null means "not mine", fall through to the run.
+    const provider = getPanelDataProvider(kind);
+    if (provider) {
+      const data = await Promise.resolve(provider(rawId, { userId: req.user?.sub ?? '' }));
+      if (data !== null && data !== undefined) { res.json(data); return; }
+    }
 
     let context: unknown = null;
     try {

@@ -10,6 +10,7 @@ jest.mock('../../../repositories', () => ({
 }));
 jest.mock('../../../documents/chatRunCard', () => ({
   postRunCardToChannel: (...args: unknown[]) => mockPostCard(...args),
+  runCardMetadata: (i: { runId: string; command: string; extra?: Record<string, unknown> }) => ({ kind: 'agent-run', runId: i.runId, command: i.command, ...(i.extra ?? {}) }),
   str: (v: unknown) => (typeof v === 'string' && v ? v : undefined),
 }));
 jest.mock('../../../lib/logger', () => {
@@ -21,10 +22,11 @@ import type { PipelineNode } from 'distributed-core/applications/pipeline';
 import type { ProfileItem } from '../../../repositories';
 import { lintSystemPipeline } from '../../../pipeline/systemPipelineLint';
 import { clearChatCommandPipelines, listChatCommandPipelines, getChatCommandPipeline } from '../../chatCommandRegistry';
-import { registerChatCommandPlugins, buildChatCommandPluginHandlers } from '..';
+import { installBuiltinChatCommandPlugins } from '..';
+import { clearCustomStepHandlers, getCustomStepHandler, getCustomStepHandlers } from '../../../pipeline/customStepHandlers';
 import {
   parseSearchTerms, rankPeople, panelTitle, peoplePanelId, buildPeopleSearchDefinition,
-  createPeopleSearchHandler, createPeoplePublishHandler, peopleSearchCommand,
+  createPeopleSearchHandler, createPeoplePublishHandler, peopleSearchCommand, peopleSearchPlugin,
   PEOPLE_SEARCH_KIND, PEOPLE_PUBLISH_KIND, PEOPLE_SEARCH_PIPELINE_ID,
 } from '../peopleSearch';
 
@@ -85,7 +87,9 @@ describe('the definition', () => {
     expect(lintSystemPipeline(def)).toEqual([]);
     const kinds = (def.nodes as Array<{ data: { type: string } }>).map((n) => n.data.type);
     expect(kinds).toEqual(['trigger', PEOPLE_SEARCH_KIND, PEOPLE_PUBLISH_KIND]);
-    expect([...buildChatCommandPluginHandlers().keys()]).toEqual([PEOPLE_SEARCH_KIND, PEOPLE_PUBLISH_KIND]);
+    clearCustomStepHandlers();
+    installBuiltinChatCommandPlugins();
+    expect([...getCustomStepHandlers().keys()]).toEqual([PEOPLE_SEARCH_KIND, PEOPLE_PUBLISH_KIND]);
   });
 });
 
@@ -122,12 +126,24 @@ describe('people:publish step', () => {
     const result = { kind: 'panel', panel: { kind: 'graph', id: 'people-search:run-9', title: 'People: kubernetes' } };
     const ctx = { chatChannel: 'room:pipeline-live', query: 'find me all kubernetes experts', terms: ['kubernetes'], people: [{ id: 'u-hank', name: 'Hank', tags: ['kubernetes'], score: 1 }, { id: 'u-bob', name: 'Bob', tags: ['kubernetes'], score: 1 }], result };
     const out = await createPeoplePublishHandler().execute(node, ctx, helpers);
+    // The run context rides along so the post can step down when the client posted the card.
     expect(mockPostCard).toHaveBeenCalledWith({
       channel: 'room:pipeline-live', runId: 'run-9', pipelineId: 'people-search', command: '/search',
       instruction: '2 people match "kubernetes"',
       extra: { result, query: 'find me all kubernetes experts', terms: ['kubernetes'], matched: 2 },
+      context: ctx,
     });
-    expect(out).toEqual({ status: 'completed', output: { posted: true, matched: 2, instruction: '2 people match "kubernetes"', result } });
+    expect(out).toEqual({
+      status: 'completed',
+      output: { posted: true, card: expect.objectContaining({ kind: 'agent-run', runId: 'run-9', command: '/search', result, matched: 2 }), matched: 2, instruction: '2 people match "kubernetes"', result },
+    });
+  });
+  test('clientPostsCard in the context reaches the post, and the card metadata is in the output even when nothing was posted', async () => {
+    mockPostCard.mockResolvedValue(false);
+    const ctx = { chatChannel: 'room:r', clientPostsCard: true, terms: ['k8s'], people: [] };
+    const out = await createPeoplePublishHandler().execute(node, ctx, helpers);
+    expect(mockPostCard.mock.calls[0][0].context).toBe(ctx);
+    expect(out.output).toMatchObject({ posted: false, card: { kind: 'agent-run', runId: 'run-9', command: '/search' } });
   });
   test('one match reads as a person, and a missing result is rebuilt from the run id', async () => {
     const out = await createPeoplePublishHandler().execute(node, { chatChannel: 'room:r', terms: ['k8s'], people: [{ id: 'u', name: 'U', tags: [], score: 1 }] }, helpers);
@@ -137,9 +153,13 @@ describe('people:publish step', () => {
 });
 
 describe('registration', () => {
-  test('the plugins register /search with what it needs; the trigger payload carries the query and channel', () => {
+  test('the built-in plugin registers /search with what it needs and both step kinds; the trigger payload carries the query and channel', () => {
     clearChatCommandPipelines();
-    registerChatCommandPlugins();
+    clearCustomStepHandlers();
+    expect(peopleSearchPlugin.name).toBe('people-search');
+    installBuiltinChatCommandPlugins();
+    expect(getCustomStepHandler(PEOPLE_SEARCH_KIND)?.kind).toBe(PEOPLE_SEARCH_KIND);
+    expect(getCustomStepHandler(PEOPLE_PUBLISH_KIND)?.kind).toBe(PEOPLE_PUBLISH_KIND);
     expect(listChatCommandPipelines()).toEqual([
       { trigger: '/search', pipelineId: 'people-search', description: 'Find people by what they know', requires: { argumentText: true } },
     ]);

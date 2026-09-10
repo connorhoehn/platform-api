@@ -12,7 +12,7 @@
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { readChatHistory, type ChatHistoryMessage } from '../gateway/GatewayServiceClient';
 import { DOCUMENT_APPLY_KIND } from './documentAgentPipeline';
-import { postRunCardToChannel, str } from './chatRunCard';
+import { postRunCardToChannel, runCardMetadata, str } from './chatRunCard';
 
 export const CONVERSATION_SUMMARIZE_PIPELINE_ID = 'conversation-summarize';
 export const CHAT_READ_HISTORY_KIND = 'chat:read-history';
@@ -111,15 +111,18 @@ export function createSummarizePublishHandler(deps: { postCard?: typeof postRunC
       const count = typeof ctx.messageCount === 'number' ? ctx.messageCount : 0;
       const applied = typeof steps.apply?.applied === 'number' ? steps.apply.applied : 0;
       const instruction = applied > 0 ? `${title} — ${count} message${count === 1 ? '' : 's'}` : `Nothing to summarise — ${count} message${count === 1 ? '' : 's'}`;
-      const posted = await post({
+      // `context: ctx` lets the post step down when the client posted the card (clientPostsCard); the metadata is returned either way.
+      const cardInput = {
         channel: str(ctx.chatChannel), runId: helpers.runId, pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID,
         command: '/summarize', instruction,
         extra: { documentId: ctx.documentId, title, messageCount: count, applied },
-      });
+        context: ctx,
+      };
+      const posted = await post(cardInput);
       // The card's 'Open' target — the run-result convention (src/pipeline/runResult.ts).
       const resultDocumentId = typeof ctx.documentId === 'string' && ctx.documentId ? ctx.documentId : undefined;
       const result = resultDocumentId ? { kind: 'document' as const, documentId: resultDocumentId } : undefined;
-      return { status: 'completed', output: { posted, title, messageCount: count, applied, ...(result ? { result } : {}) } };
+      return { status: 'completed', output: { posted, card: runCardMetadata(cardInput), title, messageCount: count, applied, ...(result ? { result } : {}) } };
     },
   };
 }

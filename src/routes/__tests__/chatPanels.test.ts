@@ -12,6 +12,7 @@ jest.mock('../../lib/logger', () => {
 });
 
 import { createChatPanelsRouter, parsePanelId, type ChatPanelsDeps } from '../chatPanels';
+import { registerPanelDataProvider, clearPanelDataProviders } from '../../chat/chatPanelProviders';
 import { errorHandler } from '../../middleware/error-handler';
 
 interface MockRes {
@@ -104,6 +105,24 @@ describe('GET /api/chat/panels/:kind/:id', () => {
     expect((await run(app(), '/api/chat/panels/graph/people-search:run-9')).statusCode).toBe(404);
     getLiveRun.mockReturnValue({ context: { panelData } });
     expect((await run(app(), '/api/chat/panels/graph/people-search:run-9')).statusCode).toBe(404);
+  });
+
+  it('asks a registered panel data provider first, with the whole id and the caller; null falls back to the run', async () => {
+    const provider = jest.fn(async (id: string) => (id === 'org-graph:run-1' ? { title: 'Org graph', nodes: [], edges: [] } : null));
+    registerPanelDataProvider('graph', provider);
+    try {
+      const res = await run(app(), '/api/chat/panels/graph/org-graph:run-1');
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toEqual({ title: 'Org graph', nodes: [], edges: [] });
+      expect(provider).toHaveBeenCalledWith('org-graph:run-1', { userId: 'dev-grace' });
+      expect(getLiveRun).not.toHaveBeenCalled();
+      // Not the provider's id: the run path answers as before.
+      getLiveRun.mockReturnValue({ context });
+      expect((await run(app(), '/api/chat/panels/graph/people-search:run-9')).body).toEqual(panelData);
+      // A provider for another kind is never consulted.
+      expect((await run(app(), '/api/chat/panels/table/people-search:run-9')).statusCode).toBe(404);
+      expect(provider).toHaveBeenCalledTimes(2);
+    } finally { clearPanelDataProviders(); }
   });
 
   it('a throwing live lookup is a miss, not a 500', async () => {
