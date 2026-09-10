@@ -35,8 +35,8 @@ export type DocOp =
   | { op: 'appendMacro'; macroName: string; yaml: string }
   | { op: 'skip'; reason: string }
   | { op: 'replaceBlock'; index: number; text: string }
-  | { op: 'appendBlock'; kind: 'paragraph' | 'heading'; level?: number; text: string }
-  | { op: 'insertBlock'; index: number; kind: 'paragraph' | 'heading'; level?: number; text: string }
+  | { op: 'appendBlock'; kind: BlockKind; level?: number; text: string }
+  | { op: 'insertBlock'; index: number; kind: BlockKind; level?: number; text: string }
   | { op: 'deleteBlock'; index: number }
   /** Resolve every suggestion under one key (`${user}@${date}`) across the whole body — a review landing server-side. */
   | { op: 'acceptSuggestion'; key: string }
@@ -78,8 +78,13 @@ export function outlineOf(doc: YT.Doc): DocumentOutline {
   return { title, blocks, text: lines.join('\n') };
 }
 
-function makeBlock(kind: 'paragraph' | 'heading', text: string, level?: number): YT.XmlElement {
+/** Block kinds the agent may write. A horizontal rule is a divider with no text. */
+export type BlockKind = 'paragraph' | 'heading' | 'horizontalRule';
+export const BLOCK_KINDS: readonly BlockKind[] = ['paragraph', 'heading', 'horizontalRule'];
+
+function makeBlock(kind: BlockKind, text: string, level?: number): YT.XmlElement {
   const el = new Y.XmlElement(kind);
+  if (kind === 'horizontalRule') return el;
   if (kind === 'heading') el.setAttribute('level', String(level && level >= 1 && level <= 6 ? level : 2));
   const t = new Y.XmlText();
   t.insert(0, text);
@@ -100,6 +105,7 @@ function makeMacro(macroName: string, yaml: string): YT.XmlElement {
 function materialize(b: OutlineBlock): YT.XmlElement {
   if (b.kind === 'macro' && b.macroName) return makeMacro(b.macroName, b.text);
   if (b.kind === 'heading') return makeBlock('heading', b.text, b.level);
+  if (b.kind === 'horizontalRule') return makeBlock('horizontalRule', '');
   return makeBlock('paragraph', b.text);
 }
 
@@ -126,7 +132,9 @@ export function parseOps(text: string): DocOp[] {
     const o = item as Record<string, unknown>;
     const text = typeof o.text === 'string' ? o.text.slice(0, MAX_TEXT) : undefined;
     const index = typeof o.index === 'number' && Number.isInteger(o.index) && o.index >= 0 ? o.index : undefined;
-    const kind = o.kind === 'heading' || o.kind === 'paragraph' ? o.kind : undefined;
+    const kind = (BLOCK_KINDS as readonly string[]).includes(String(o.kind)) ? (o.kind as BlockKind) : undefined;
+    // A divider carries no text; every other block needs some.
+    const blockText = kind === 'horizontalRule' ? '' : text;
     const level = typeof o.level === 'number' ? o.level : undefined;
     switch (o.op) {
       case 'setTitle': if (text) ops.push({ op: 'setTitle', text }); break;
@@ -135,8 +143,8 @@ export function parseOps(text: string): DocOp[] {
       case 'skip': ops.push({ op: 'skip', reason: typeof o.reason === 'string' ? o.reason.slice(0, 300) : '' }); break;
       case 'appendMacro': if (typeof o.macroName === 'string' && o.macroName && typeof o.yaml === 'string') ops.push({ op: 'appendMacro', macroName: o.macroName, yaml: o.yaml.slice(0, MAX_TEXT) }); break;
       case 'replaceBlock': if (index !== undefined && text !== undefined) ops.push({ op: 'replaceBlock', index, text }); break;
-      case 'appendBlock': if (kind && text) ops.push({ op: 'appendBlock', kind, text, ...(level ? { level } : {}) }); break;
-      case 'insertBlock': if (index !== undefined && kind && text) ops.push({ op: 'insertBlock', index, kind, text, ...(level ? { level } : {}) }); break;
+      case 'appendBlock': if (kind && blockText !== undefined) ops.push({ op: 'appendBlock', kind, text: blockText, ...(level ? { level } : {}) }); break;
+      case 'insertBlock': if (index !== undefined && kind && blockText !== undefined) ops.push({ op: 'insertBlock', index, kind, text: blockText, ...(level ? { level } : {}) }); break;
       case 'deleteBlock': if (index !== undefined) ops.push({ op: 'deleteBlock', index }); break;
       case 'acceptSuggestion': if (typeof o.key === 'string' && o.key) ops.push({ op: 'acceptSuggestion', key: o.key.slice(0, 200) }); break;
       case 'rejectSuggestion': if (typeof o.key === 'string' && o.key) ops.push({ op: 'rejectSuggestion', key: o.key.slice(0, 200) }); break;
@@ -324,7 +332,8 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
           break;
         }
         case 'appendBlock':
-          if (id) suggestNewBlock(body, body.length, op.kind, op.text, id, op.level);
+          // A divider has no text to carry a suggestion mark, so it lands directly even in suggest mode.
+          if (id && op.kind !== 'horizontalRule') suggestNewBlock(body, body.length, op.kind, op.text, id, op.level);
           else body.insert(body.length, [makeBlock(op.kind, op.text, op.level)]);
           result.applied += 1;
           break;
@@ -357,7 +366,7 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
           // Position in the FRAGMENT, which may hold non-element nodes too.
           const at = el ? body.toArray().indexOf(el) : -1;
           const pos = at < 0 ? body.length : at;
-          if (id) suggestNewBlock(body, pos, op.kind, op.text, id, op.level);
+          if (id && op.kind !== 'horizontalRule') suggestNewBlock(body, pos, op.kind, op.text, id, op.level);
           else body.insert(pos, [makeBlock(op.kind, op.text, op.level)]);
           result.applied += 1;
           break;
