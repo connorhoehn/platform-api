@@ -153,6 +153,13 @@ export interface PipelineRunItem {
   resumeCount?: number;
   /** Node id that claimed the interrupted run for resume (double-resume guard). */
   resumeClaimedBy?: string;
+  /**
+   * DLQ redrive lineage. `redriveOf` names the failed run this one replaces
+   * (lifted from the trigger payload the redrive injects); `redrivenBy` on
+   * the failed run lists every run started to replace it, oldest first.
+   */
+  redriveOf?: string;
+  redrivenBy?: string[];
 }
 
 /**
@@ -360,6 +367,30 @@ export class PipelineRunRepository extends BaseRepository {
       if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
         return null;
       }
+      throw err;
+    }
+  }
+
+  /**
+   * Record that `newRunId` was started to replace the run `(pipelineId, runId)`.
+   * A `list_append` update so two redrives racing on the same run both land,
+   * and a full-row put from run persistence cannot have wiped an earlier
+   * one — the original run is terminal by the time anyone redrives it, so
+   * persistence has already flushed and forgotten it. Conditional on the row
+   * existing: a redrive of a run this table never saw must not create a
+   * phantom row with no status. Returns false when the row was missing.
+   */
+  async appendRedrivenBy(pipelineId: string, runId: string, newRunId: string): Promise<boolean> {
+    try {
+      await this.updateItem({
+        Key: { pipelineId, runId },
+        UpdateExpression: 'SET redrivenBy = list_append(if_not_exists(redrivenBy, :empty), :new)',
+        ConditionExpression: 'attribute_exists(runId)',
+        ExpressionAttributeValues: { ':empty': [], ':new': [newRunId] },
+      });
+      return true;
+    } catch (err) {
+      if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
       throw err;
     }
   }

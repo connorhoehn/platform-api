@@ -108,3 +108,87 @@ describe('retriggerFromDeadLetter', () => {
     expect(trigger).not.toHaveBeenCalled();
   });
 });
+
+describe('attachFailedRunDeadLetters — durable copy', () => {
+  it('persists the same entry it put in memory, dated when the run failed, expiring in 30 days', async () => {
+    const bus = fakeBus();
+    const dlq = fakeDlq();
+    const persist = jest.fn(async () => undefined);
+    const failedAtMs = Date.parse('2026-09-09T12:00:00.000Z');
+    attachFailedRunDeadLetters({ eventBus: bus, dlq: dlq as never, persist, now: () => failedAtMs });
+
+    await bus.emit('pipeline:run:started', { runId: 'r1', pipelineId: 'call-transcription', triggeredBy: { userId: 'dev-grace', triggerType: 'manual', payload: {} } });
+    await bus.emit('pipeline:step:completed', { runId: 'r1', stepId: 'trigger', output: { recordingId: 'rec-1' } });
+    await bus.emit('pipeline:run:failed', { runId: 'r1', error: { nodeId: 'transcribe', message: 'no file' }, at: 'now' });
+
+    expect(persist).toHaveBeenCalledTimes(1);
+    const [entry] = (persist.mock.calls[0] as unknown as [import('../../repositories/DLQRepository').DLQEntry]);
+    expect(entry).toEqual({
+      messageId: 'run-failed:r1',
+      eventType: RUN_RETRIGGER_EVENT,
+      eventPayload: {
+        pipelineId: 'call-transcription',
+        failedRunId: 'r1',
+        triggerPayload: { recordingId: 'rec-1' },
+        triggeredBy: { userId: 'dev-grace', triggerType: 'manual' },
+        error: { nodeId: 'transcribe', message: 'no file' },
+      },
+      lastError: 'PipelineRunFailed: [transcribe] no file',
+      failedAt: '2026-09-09T12:00:00.000Z',
+      totalAttempts: 1,
+      ttl: Math.floor(failedAtMs / 1000) + 30 * 24 * 60 * 60,
+    });
+    // The durable id and the in-memory id are the same so a rehydrate is idempotent.
+    expect(dlq.puts[0].env.id).toBe(entry.messageId);
+  });
+
+  it('keeps the in-memory entry when the store write fails', async () => {
+    const bus = fakeBus();
+    const dlq = fakeDlq();
+    const persist = jest.fn(async () => { throw new Error('ddb down'); });
+    attachFailedRunDeadLetters({ eventBus: bus, dlq: dlq as never, persist });
+    await bus.emit('pipeline:run:started', { runId: 'r1', pipelineId: 'p', triggeredBy: { triggerType: 'manual', payload: {} } });
+    await bus.emit('pipeline:run:failed', { runId: 'r1', error: { nodeId: 'x', message: 'boom' }, at: 'now' });
+    expect(dlq.puts).toHaveLength(1);
+    expect(persist).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not persist when the in-memory put failed', async () => {
+    const bus = fakeBus();
+    const persist = jest.fn(async () => undefined);
+    attachFailedRunDeadLetters({ eventBus: bus, dlq: { put: async () => { throw new Error('full'); } } as never, persist });
+    await bus.emit('pipeline:run:started', { runId: 'r1', pipelineId: 'p', triggeredBy: { triggerType: 'manual', payload: {} } });
+    await bus.emit('pipeline:run:failed', { runId: 'r1', error: { nodeId: 'x', message: 'boom' }, at: 'now' });
+    expect(persist).not.toHaveBeenCalled();
+  });
+});
+
+describe('retriggerFromDeadLetter — lineage', () => {
+  const payload: RunRetriggerPayload = {
+    pipelineId: 'call-transcription', failedRunId: 'r-old',
+    triggerPayload: { recordingId: 'rec-9' }, triggeredBy: { userId: 'dev-grace' },
+    error: { nodeId: 'transcribe', message: 'whisper timed out' },
+  };
+
+  it('records the new run on the original after the trigger returns', async () => {
+    const order: string[] = [];
+    const trigger = jest.fn(async () => { order.push('trigger'); return { runId: 'r-new' }; });
+    const linkRedrive = jest.fn(async () => { order.push('link'); });
+    await retriggerFromDeadLetter(payload, { resolveDefinition: async () => ({ id: 'call-transcription' }), trigger, linkRedrive });
+    expect(linkRedrive).toHaveBeenCalledWith({ pipelineId: 'call-transcription', failedRunId: 'r-old', newRunId: 'r-new' });
+    expect(order).toEqual(['trigger', 'link']);
+  });
+
+  it('still reports the new run when the link cannot be written', async () => {
+    const trigger = jest.fn(async () => ({ runId: 'r-new' }));
+    const linkRedrive = jest.fn(async () => { throw new Error('row gone'); });
+    const out = await retriggerFromDeadLetter(payload, { resolveDefinition: async () => ({ id: 'p' }), trigger, linkRedrive });
+    expect(out.runId).toBe('r-new');
+  });
+
+  it('does not link when the trigger itself fails', async () => {
+    const linkRedrive = jest.fn(async () => undefined);
+    await expect(retriggerFromDeadLetter(payload, { resolveDefinition: async () => ({ id: 'p' }), trigger: async () => { throw new Error('engine down'); }, linkRedrive })).rejects.toThrow(/engine down/);
+    expect(linkRedrive).not.toHaveBeenCalled();
+  });
+});

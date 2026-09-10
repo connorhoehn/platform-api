@@ -15,7 +15,6 @@ import { DocumentTypeRepository } from './DocumentTypeRepository';
 import { TypedDocumentRepository } from './TypedDocumentRepository';
 import { ApprovalRepository } from './ApprovalRepository';
 import { PipelineRunRepository } from './PipelineRunRepository';
-import { PipelineDLQRepository } from './PipelineDLQRepository';
 import { CallRecordingRepository } from './CallRecordingRepository';
 import { CallReactionRepository } from './CallReactionRepository';
 import { HangoutRoomRepository } from './HangoutRoomRepository';
@@ -42,7 +41,6 @@ export const documentTypeRepo = new DocumentTypeRepository(docClient);
 export const typedDocumentRepo = new TypedDocumentRepository(docClient);
 export const approvalRepo = new ApprovalRepository(docClient);
 export const pipelineRunRepo = new PipelineRunRepository(docClient);
-export const pipelineDLQRepo = new PipelineDLQRepository(docClient);
 export const callRecordingRepo = new CallRecordingRepository(docClient);
 export const callReactionRepo = new CallReactionRepository(docClient);
 export const hangoutRoomRepo = new HangoutRoomRepository(docClient);
@@ -117,10 +115,6 @@ export {
   PipelineRunRepository,
   PipelineRunItem,
 } from './PipelineRunRepository';
-export {
-  PipelineDLQRepository,
-  PipelineDLQItem,
-} from './PipelineDLQRepository';
 export {
   CallRecordingRepository,
   CallRecording,

@@ -16,6 +16,7 @@
 import { wrap } from 'distributed-core/messaging-queue';
 import type { BusEvent } from 'distributed-core';
 import type { DeadLetterQueue } from 'distributed-core/messaging-queue';
+import type { DLQEntry } from '../repositories/DLQRepository';
 import baseLog from '../lib/logger';
 
 const log = baseLog.child({ service: 'failed-run-dlq' });
@@ -44,9 +45,18 @@ export interface RunEventSource {
   unsubscribe?(subscriptionId: string): void;
 }
 
+/** How long a persisted failed run stays in the table before DDB expires it. */
+export const FAILED_RUN_DLQ_TTL_SECONDS = 30 * 24 * 60 * 60;
+
 export interface FailedRunDeadLetterOptions {
   eventBus: RunEventSource;
   dlq: DeadLetterQueue<BusEvent>;
+  /**
+   * Durable copy of each entry, written alongside `dlq.put` so the run is
+   * still there to redrive after a restart (deadLetterStore.ts reads them
+   * back at boot). Optional: without it the entry lives in memory only.
+   */
+  persist?: (entry: DLQEntry) => Promise<void>;
   now?: () => number;
 }
 
@@ -98,23 +108,41 @@ export function attachFailedRunDeadLetters(opts: FailedRunDeadLetterOptions): ()
       ...(run.triggeredBy ? { triggeredBy: run.triggeredBy } : {}),
       error: { nodeId: p.error?.nodeId ?? '(unknown)', message: p.error?.message ?? 'run failed' },
     };
+    const messageId = `run-failed:${p.runId}`;
     const event = {
-      id: `run-failed:${p.runId}`,
+      id: messageId,
       type: RUN_RETRIGGER_EVENT,
       payload,
       timestamp: failedAtMs,
       sourceNodeId: 'pipeline-executor',
     } as unknown as BusEvent;
+    // `<Class>: <message>` so the route's ?errorKind= filter can match.
+    const lastError = `PipelineRunFailed: [${payload.error.nodeId}] ${payload.error.message}`;
     try {
-      await dlq.put(wrap(event, { id: event.id as string, now: () => failedAtMs, attemptCount: 0 }), {
-        // `<Class>: <message>` so the route's ?errorKind= filter can match.
-        lastError: `PipelineRunFailed: [${payload.error.nodeId}] ${payload.error.message}`,
+      await dlq.put(wrap(event, { id: messageId, now: () => failedAtMs, attemptCount: 0 }), {
+        lastError,
         failedAtMs,
         totalAttempts: 1,
       });
       log.info({ runId: p.runId, pipelineId: run.pipelineId, nodeId: payload.error.nodeId }, 'failed run dead-lettered');
     } catch (err) {
       log.error({ runId: p.runId, err: err instanceof Error ? err.message : String(err) }, 'could not dead-letter the failed run');
+      return;
+    }
+    if (!opts.persist) return;
+    try {
+      await opts.persist({
+        messageId,
+        eventType: RUN_RETRIGGER_EVENT,
+        eventPayload: payload,
+        lastError,
+        failedAt: new Date(failedAtMs).toISOString(),
+        totalAttempts: 1,
+        ttl: Math.floor(failedAtMs / 1000) + FAILED_RUN_DLQ_TTL_SECONDS,
+      });
+    } catch (err) {
+      // Memory has it; only the restart-survival copy is missing.
+      log.error({ runId: p.runId, err: err instanceof Error ? err.message : String(err) }, 'could not persist the failed run dead letter');
     }
   }));
 
@@ -133,6 +161,13 @@ export interface RetriggerDeps {
   /** Definition lookup: system registry first, then the owner's saved definitions. */
   resolveDefinition: (pipelineId: string, userId?: string) => Promise<Record<string, unknown> | null>;
   trigger: (input: { pipelineId: string; definition: Record<string, unknown>; triggerPayload: Record<string, unknown>; triggeredBy: { userId: string } }) => Promise<{ runId: string }>;
+  /**
+   * Record on the ORIGINAL run that `newRunId` replaced it (its `redrivenBy`).
+   * The new run learns of the original through `redriveOf` in its trigger
+   * payload; this is the other direction. Failures are logged, not thrown —
+   * the redrive already happened.
+   */
+  linkRedrive?: (link: { pipelineId: string; failedRunId: string; newRunId: string }) => Promise<void>;
 }
 
 /** Redrive: run the failed run's pipeline again with the same trigger payload. */
@@ -142,5 +177,12 @@ export async function retriggerFromDeadLetter(payload: RunRetriggerPayload, deps
   if (!definition) throw new Error(`no definition for pipeline ${payload.pipelineId}; cannot re-trigger run ${payload.failedRunId}`);
   const out = await deps.trigger({ pipelineId: payload.pipelineId, definition, triggerPayload: { ...payload.triggerPayload, redriveOf: payload.failedRunId }, triggeredBy: { userId } });
   log.info({ failedRunId: payload.failedRunId, runId: out.runId, pipelineId: payload.pipelineId }, 'failed run re-triggered from the DLQ');
+  if (deps.linkRedrive) {
+    try {
+      await deps.linkRedrive({ pipelineId: payload.pipelineId, failedRunId: payload.failedRunId, newRunId: out.runId });
+    } catch (err) {
+      log.warn({ failedRunId: payload.failedRunId, runId: out.runId, err: err instanceof Error ? err.message : String(err) }, 'could not record redrivenBy on the original run');
+    }
+  }
   return out;
 }

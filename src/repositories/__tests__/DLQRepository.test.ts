@@ -51,6 +51,13 @@ describe('DLQRepository.create', () => {
       ttl: 1700000000,
     });
   });
+
+  it('stamps the failedAt-index hash key so list() can see the row', async () => {
+    const repo = new DLQRepository(docClient);
+    await repo.create(makeEntry());
+    const cmd = mockSend.mock.calls[0][0];
+    expect(cmd.input.Item.partitionKey).toBe('DLQ');
+  });
 });
 
 // ---------------------------------------------------------------------------

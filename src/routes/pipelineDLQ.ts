@@ -7,11 +7,11 @@
 // EventBus. This route exposes that store for operator inspection +
 // targeted redrive.
 //
-// DLQ persistence (Phase 1): when PIPELINE_DLQ_PERSISTENCE_ENABLED=true,
-// the deadLetterHandler also writes entries to the pipeline-dlq DDB table
-// (via DLQRepository). Entries survive restarts but these routes still read
-// from the in-memory DLQ only. Phase 2: add fallback to DDB when entries
-// aren't in memory, or add a parallel /api/pipelines/dlq/durable endpoint.
+// DLQ persistence: when PIPELINE_DLQ_PERSISTENCE_ENABLED is on (default),
+// every entry is also written to the pipeline-dlq DDB table (DLQRepository)
+// and read back into memory at boot (deadLetterStore.ts). These routes read
+// the in-memory queue only; a redrive drops the durable copy in bootstrap's
+// redrive sink, and purge drops it here.
 //
 // Endpoints:
 //   GET  /api/pipelines/dlq?errorKind=…           → paginated list (filters: sinceMs, errorKind)
@@ -47,6 +47,7 @@ import type { DeadLetterQueue } from 'distributed-core/messaging-queue';
 import { asyncHandler } from '../middleware/error-handler';
 import { pipelineWriteRateLimit } from '../middleware/rateLimit';
 import { getPipelineBridge } from './pipelineTriggers';
+import { forgetDeadLetters, getDeadLetterStore } from '../pipeline/deadLetterStore';
 
 export const pipelineDLQRouter = Router();
 
@@ -229,5 +230,8 @@ pipelineDLQRouter.post('/purge', writeLimiter, asyncHandler(async (req, res) => 
   }
 
   const result = await dlq.purge(parsed);
+  // PurgeResult is a count, not the ids; deleting a row that was never
+  // there is a no-op, so forget every requested id.
+  await forgetDeadLetters(getDeadLetterStore(), parsed);
   res.status(200).json(result);
 }));

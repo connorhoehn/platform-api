@@ -194,6 +194,9 @@ export function runItemToSnapshot(item: PipelineRunItem): PipelineRunSnapshot {
     // LIST shape too, so the Runs table can name the rejector without opening
     // the run (and without a live executor, which historical runs don't have).
     ...(item.rejection ? { rejection: item.rejection } : {}),
+    // DLQ redrive lineage, both directions.
+    ...(item.redriveOf ? { redriveOf: item.redriveOf } : {}),
+    ...(item.redrivenBy && item.redrivenBy.length > 0 ? { redrivenBy: item.redrivenBy } : {}),
     triggeredBy: {
       userId: item.triggeredBy === 'system' ? undefined : item.triggeredBy,
       triggerType: item.triggerType ?? 'manual',

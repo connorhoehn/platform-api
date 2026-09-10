@@ -116,6 +116,7 @@ import { scanOrphanedRuns } from './scanOrphanedRuns';
 import { resumeInterruptedRuns } from './resumeInterruptedRuns';
 import { definitionsRepo } from './definitions-repository';
 import { attachFailedRunDeadLetters, isRunRetrigger, retriggerFromDeadLetter, type RunRetriggerPayload } from './failedRunDeadLetters';
+import { forgetDeadLetters, rehydrateDeadLetters, setDeadLetterStore } from './deadLetterStore';
 import { getSystemPipeline } from './systemPipelines';
 import { getPipelineBridge } from '../routes/pipelineTriggers';
 import { runWalPreflight } from './WalPreflight';
@@ -1060,17 +1061,41 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
                 const out = await Promise.resolve(bridge.trigger(input as never));
                 return { runId: (out as { runId: string }).runId };
               },
+              // The other direction of the link: the new run carries
+              // `redriveOf`; the original run gets `redrivenBy`.
+              ...(opts.pipelineRunRepository
+                ? {
+                    linkRedrive: async ({ pipelineId, failedRunId, newRunId }: { pipelineId: string; failedRunId: string; newRunId: string }) => {
+                      await opts.pipelineRunRepository!.appendRedrivenBy(pipelineId, failedRunId, newRunId);
+                    },
+                  }
+                : {}),
             });
-            return;
+          } else {
+            await eventBus.publish(evt.type as never, evt.payload as never);
           }
-          await eventBus.publish(evt.type as never, evt.payload as never);
+          // Redriven: the in-memory queue drops it next; drop the durable copy too.
+          await forgetDeadLetters(dlqRepo ?? null, [env.id]);
         },
       },
     });
     dlqRef.current = dlq;
     // Every run that ends `failed` becomes a dead letter of its own — the
     // operator's one list of things to look at and redrive.
-    attachFailedRunDeadLetters({ eventBus: eventBus as never, dlq });
+    attachFailedRunDeadLetters({
+      eventBus: eventBus as never,
+      dlq,
+      ...(dlqRepo ? { persist: (entry) => dlqRepo.create(entry) } : {}),
+    });
+    // The store is the restart-survival copy of the queue: read it back now,
+    // and let the DLQ route forget what an operator purges.
+    setDeadLetterStore(dlqRepo ?? null);
+    if (dlqRepo) {
+      const inMemoryDlq = dlq;
+      void rehydrateDeadLetters(inMemoryDlq, dlqRepo).catch((err: unknown) => {
+        bootstrapLog.error({ err: err instanceof Error ? err.message : String(err) }, 'could not rehydrate dead letters from the store');
+      });
+    }
   }
 
   // --- hub#2224 Wave 2: executor audit subscriber + sweeper ---

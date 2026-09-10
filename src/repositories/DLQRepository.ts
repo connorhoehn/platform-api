@@ -9,6 +9,13 @@ import { tableName } from '../lib/ddb-table-name';
 
 export interface DLQEntry {
   messageId: string;
+  /**
+   * Constant `'DLQ'` — the hash key of the `failedAt-index` GSI that `list`
+   * queries. Every row must carry it or it is invisible to `list` (rows
+   * written before this field existed are exactly that: present in the table,
+   * never listed, never rehydrated).
+   */
+  partitionKey?: 'DLQ';
   eventType: string;
   eventPayload: unknown;
   lastError: string;
@@ -18,13 +25,15 @@ export interface DLQEntry {
   ttl: number;
 }
 
+const DLQ_PARTITION_KEY = 'DLQ' as const;
+
 export class DLQRepository extends BaseRepository {
   constructor(docClient: DynamoDBDocumentClient) {
     super(tableName('pipeline-dlq'), docClient);
   }
 
   async create(entry: DLQEntry): Promise<void> {
-    return this.putItem(entry as unknown as Record<string, unknown>);
+    return this.putItem({ ...entry, partitionKey: DLQ_PARTITION_KEY } as unknown as Record<string, unknown>);
   }
 
   async get(messageId: string): Promise<DLQEntry | null> {
@@ -47,7 +56,7 @@ export class DLQRepository extends BaseRepository {
     const result = await this.queryWithPagination<DLQEntry>({
       IndexName: 'failedAt-index',
       KeyConditionExpression: 'partitionKey = :pk',
-      ExpressionAttributeValues: { ':pk': 'DLQ' },
+      ExpressionAttributeValues: { ':pk': DLQ_PARTITION_KEY },
       ScanIndexForward: false, // newest first
       Limit: limit,
       ExclusiveStartKey: opts.exclusiveStartKey,

@@ -3,7 +3,7 @@
 // Unit tests for PipelineRunRepository (CRUD + GSI queries, limit clamping)
 // and the readAttempts() backward-compat helper.
 
-import { DynamoDBDocumentClient, DeleteCommand, GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import {
   PipelineRunRepository,
   readAttempts,
@@ -302,5 +302,37 @@ describe('readAttempts', () => {
     const result = readAttempts(summary, 'run-abc', 'node-xyz');
     expect(result[0]!.idempotencyKey).toContain('run-abc');
     expect(result[0]!.idempotencyKey).toContain('node-xyz');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// appendRedrivenBy — DLQ redrive lineage on the ORIGINAL run
+// ---------------------------------------------------------------------------
+
+describe('appendRedrivenBy', () => {
+  it('appends to the list in place, creating it when absent, only if the row exists', async () => {
+    mockSend.mockResolvedValue({});
+    const repo = new PipelineRunRepository(mockDocClient);
+    expect(await repo.appendRedrivenBy('pipeline-1', 'run-old', 'run-new')).toBe(true);
+
+    const cmd = mockSend.mock.calls[0][0] as UpdateCommand;
+    expect(cmd).toBeInstanceOf(UpdateCommand);
+    expect(cmd.input.TableName).toBe('test-pipeline-runs');
+    expect(cmd.input.Key).toEqual({ pipelineId: 'pipeline-1', runId: 'run-old' });
+    expect(cmd.input.UpdateExpression).toBe('SET redrivenBy = list_append(if_not_exists(redrivenBy, :empty), :new)');
+    expect(cmd.input.ConditionExpression).toBe('attribute_exists(runId)');
+    expect(cmd.input.ExpressionAttributeValues).toEqual({ ':empty': [], ':new': ['run-new'] });
+  });
+
+  it('returns false instead of creating a phantom row when the original run is not stored', async () => {
+    mockSend.mockRejectedValue(Object.assign(new Error('cond'), { name: 'ConditionalCheckFailedException' }));
+    const repo = new PipelineRunRepository(mockDocClient);
+    expect(await repo.appendRedrivenBy('pipeline-1', 'ghost', 'run-new')).toBe(false);
+  });
+
+  it('rethrows anything that is not the condition failing', async () => {
+    mockSend.mockRejectedValue(new Error('throttled'));
+    const repo = new PipelineRunRepository(mockDocClient);
+    await expect(repo.appendRedrivenBy('pipeline-1', 'run-old', 'run-new')).rejects.toThrow('throttled');
   });
 });

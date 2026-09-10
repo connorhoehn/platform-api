@@ -97,6 +97,16 @@ interface RunState {
   resumedAt?: string;
   resumeCount?: number;
   resumeClaimedBy?: string;
+  /** DLQ redrive lineage — see PipelineRunItem. Carried so full-row puts keep them. */
+  redriveOf?: string;
+  redrivenBy?: string[];
+}
+
+/** A redrive marks its trigger payload with the run it replaces (failedRunDeadLetters.ts). */
+function redriveOfFromPayload(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const v = (payload as { redriveOf?: unknown }).redriveOf;
+  return typeof v === 'string' && v ? v : undefined;
 }
 
 export class RunPersistenceService {
@@ -224,10 +234,14 @@ export class RunPersistenceService {
   private async handleRunStarted(event: {
     runId: string;
     pipelineId: string;
-    triggeredBy: { triggerType: string; userId?: string };
+    triggeredBy: { triggerType: string; userId?: string; payload?: Record<string, unknown> };
     at: string;
   }): Promise<void> {
     const userId = event.triggeredBy.userId ?? 'system';
+    // The executor puts the trigger payload on `started`, so a redrive is
+    // recognisable here for every caller — including ones that never call
+    // registerTrigger. A registerTrigger that already named it wins.
+    const redriveOf = this.runCache.get(event.runId)?.redriveOf ?? redriveOfFromPayload(event.triggeredBy.payload);
     const state: RunState = {
       pipelineId: event.pipelineId,
       runId: event.runId,
@@ -242,6 +256,7 @@ export class RunPersistenceService {
       stepInputMap: {},
       stepAttempts: {},
       lastEventAt: event.at,
+      ...(redriveOf ? { redriveOf } : {}),
     };
 
     this.runCache.set(event.runId, state);
@@ -560,6 +575,8 @@ export class RunPersistenceService {
       resumedAt: item.resumedAt,
       resumeCount: item.resumeCount,
       resumeClaimedBy: item.resumeClaimedBy,
+      redriveOf: item.redriveOf,
+      redrivenBy: item.redrivenBy,
     });
   }
 
@@ -578,6 +595,8 @@ export class RunPersistenceService {
     userId: string;
     triggerType: string;
     at: string;
+    /** The failed run this one replaces, when the trigger is a DLQ redrive. */
+    redriveOf?: string;
   }): void {
     if (this.runCache.has(args.runId)) return;
     this.runCache.set(args.runId, {
@@ -594,6 +613,7 @@ export class RunPersistenceService {
       stepInputMap: {},
       stepAttempts: {},
       lastEventAt: args.at,
+      ...(args.redriveOf ? { redriveOf: args.redriveOf } : {}),
     });
   }
 
@@ -830,6 +850,8 @@ export class RunPersistenceService {
       resumedAt: state.resumedAt,
       resumeCount: state.resumeCount,
       resumeClaimedBy: state.resumeClaimedBy,
+      redriveOf: state.redriveOf,
+      redrivenBy: state.redrivenBy,
     };
 
     await this.putWithRetry(item, state);

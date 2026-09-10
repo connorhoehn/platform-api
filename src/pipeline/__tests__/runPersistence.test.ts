@@ -1023,3 +1023,74 @@ describe('RunPersistenceService persists FAILED steps into stepsSummary', () => 
     expect(step?.attempts?.[1]).toMatchObject({ attemptNumber: 2, error: 'fetch failed' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// DLQ redrive lineage — `redriveOf` reaches the row from either entry point
+// ---------------------------------------------------------------------------
+
+describe('RunPersistenceService — redriveOf', () => {
+  type Sub = (e: { payload: unknown }) => void | Promise<void>;
+  function makeBus() {
+    const subs = new Map<string, Sub>();
+    return {
+      subscribe: jest.fn((event: string, fn: Sub) => { subs.set(event, fn); }),
+      async publish(event: string, payload: unknown): Promise<void> {
+        const fn = subs.get(event);
+        if (fn) await fn({ payload });
+      },
+    };
+  }
+  function makeService() {
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
+    const bus = makeBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+    return { repo, bus, service };
+  }
+
+  it('lifts redriveOf from the trigger payload on run:started and keeps it through the terminal put', async () => {
+    const { repo, bus } = makeService();
+    await bus.publish('pipeline:run:started', {
+      runId: 'r-new', pipelineId: 'call-transcription',
+      triggeredBy: { triggerType: 'manual', userId: 'dev-grace', payload: { recordingId: 'rec-1', redriveOf: 'r-old' } },
+      at: 't0',
+    });
+    expect((repo.put.mock.calls[0][0] as PipelineRunItem).redriveOf).toBe('r-old');
+    await bus.publish('pipeline:run:completed', { runId: 'r-new', durationMs: 1, at: 't1' });
+    const last = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(last.status).toBe('completed');
+    expect(last.redriveOf).toBe('r-old');
+  });
+
+  it('keeps a redriveOf named by registerTrigger when run:started arrives without one', async () => {
+    const { repo, bus, service } = makeService();
+    service.registerTrigger({ runId: 'r-new', pipelineId: 'p', userId: 'u', triggerType: 'manual', at: 't0', redriveOf: 'r-old' });
+    await bus.publish('pipeline:run:started', {
+      runId: 'r-new', pipelineId: 'p', triggeredBy: { triggerType: 'manual', userId: 'u', payload: {} }, at: 't0',
+    });
+    expect((repo.put.mock.calls[0][0] as PipelineRunItem).redriveOf).toBe('r-old');
+  });
+
+  it('writes no redriveOf for an ordinary run', async () => {
+    const { repo, bus } = makeService();
+    await bus.publish('pipeline:run:started', {
+      runId: 'r1', pipelineId: 'p', triggeredBy: { triggerType: 'manual', userId: 'u', payload: { recordingId: 'rec-1' } }, at: 't0',
+    });
+    expect((repo.put.mock.calls[0][0] as PipelineRunItem).redriveOf).toBeUndefined();
+  });
+
+  it('carries redriveOf and redrivenBy through a resume seed so the next put keeps them', async () => {
+    const { repo, bus, service } = makeService();
+    service.seedResumedRun({
+      pipelineId: 'p', runId: 'r-new', status: 'interrupted', triggeredBy: 'u', triggerType: 'manual', startedAt: 't0',
+      redriveOf: 'r-old', redrivenBy: ['r-newer'],
+    });
+    await bus.publish('pipeline:run:completed', { runId: 'r-new', durationMs: 1, at: 't1' });
+    const last = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(last.redriveOf).toBe('r-old');
+    expect(last.redrivenBy).toEqual(['r-newer']);
+  });
+});

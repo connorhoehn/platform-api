@@ -17,6 +17,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { pipelineDLQRouter } from '../pipelineDLQ';
 import { setPipelineBridge, type PipelineBridge } from '../pipelineTriggers';
 import { _resetRateLimitMemFallback } from '../../middleware/rateLimit';
+import { setDeadLetterStore } from '../../pipeline/deadLetterStore';
 
 // The middleware lazily resolves Redis on first request; force the in-memory
 // fallback path so test runs don't need infra and `_resetRateLimitMemFallback`
@@ -169,6 +170,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   setPipelineBridge(null);
+  setDeadLetterStore(null);
 });
 
 // ---------------------------------------------------------------------------
@@ -269,6 +271,42 @@ describe('POST /api/pipelines/dlq/purge — preview mode', () => {
     };
     expect(body.wouldPurge).toEqual([{ ...e1, errorKind: null }]);
     expect(body.notFound).toEqual([{ id: 'missing' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Purge — the durable copy goes with the in-memory entry
+// ---------------------------------------------------------------------------
+
+describe('POST /api/pipelines/dlq/purge — durable store', () => {
+  test('a real purge deletes every requested id from the store; preview does not', async () => {
+    const dlq = makeFakeDLQ({ e1: { envelope: { id: 'e1' }, lastError: 'x', failedAtMs: 1, totalAttempts: 1, attemptHistory: [] } });
+    wireBridgeWithDLQ(dlq);
+    const deleted: string[] = [];
+    setDeadLetterStore({
+      create: async () => undefined,
+      list: async () => ({ entries: [] }),
+      delete: async (id: string) => { deleted.push(id); },
+    });
+
+    const app = buildApp();
+    const preview = await run(app, 'POST', '/api/pipelines/dlq/purge', { body: { ids: ['e1'], preview: true } });
+    expect(preview.statusCode).toBe(200);
+    expect(deleted).toEqual([]);
+
+    const res = await run(app, 'POST', '/api/pipelines/dlq/purge', { body: { ids: ['e1', 'never-stored'] } });
+    expect(res.statusCode).toBe(200);
+    expect(dlq.purge).toHaveBeenCalledTimes(1);
+    expect(deleted.sort()).toEqual(['e1', 'never-stored']);
+  });
+
+  test('purge still succeeds when no store is wired', async () => {
+    const dlq = makeFakeDLQ();
+    wireBridgeWithDLQ(dlq);
+    const app = buildApp();
+    const res = await run(app, 'POST', '/api/pipelines/dlq/purge', { body: { ids: ['e1'] } });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ purged: 1 });
   });
 });
 

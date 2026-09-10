@@ -449,6 +449,20 @@ pipelineTriggersRouter.get(
       }
       throw new NotFoundError('run not found');
     }
+    // The live snapshot knows nothing of DLQ redrives: `redrivenBy` is
+    // written onto the ROW by the redrive, and `redriveOf` only rides the
+    // trigger payload. Overlay both from the row so a run the executor still
+    // holds answers the same as one it has forgotten.
+    try {
+      const persisted = await getRunRepo().get(pipelineId, runId);
+      if (persisted?.redriveOf) snap.redriveOf = persisted.redriveOf;
+      if (persisted?.redrivenBy && persisted.redrivenBy.length > 0) snap.redrivenBy = persisted.redrivenBy;
+    } catch (err) {
+      reqLog.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'run-detail lineage overlay failed',
+      );
+    }
     res.json(snap);
   }),
 );
