@@ -2,6 +2,7 @@ import type { RunPersistenceService } from './runPersistence';
 import type { StuckRunDetector } from './StuckRunDetector';
 import type { ExecutorAuditSubscriber } from './executor-audit-subscriber';
 import type { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
+import type { PipelineEventRedisRelay } from './event-redis-relay';
 
 interface ShutdownDeps {
   keepAlive: ReturnType<typeof setInterval>;
@@ -13,6 +14,8 @@ interface ShutdownDeps {
   judgeAggregatorSubscriber: JudgeAggregatorSubscriber | null;
   /** Stop fn for the audit sweeper interval (no-op when sweeper disabled). */
   auditSweeperStop: (() => void) | null;
+  /** Live EventBus → Redis egress; null when disabled or it failed to start. */
+  pipelineEventRelay: PipelineEventRedisRelay | null;
   moduleRegistry: { stop(): Promise<void> };
   resourceRegistry: { stop(): Promise<void> };
   hintedHandoff: { stop(): Promise<void> } | null;
@@ -31,6 +34,7 @@ export function createShutdown(deps: ShutdownDeps): () => Promise<void> {
     executorAuditSubscriber,
     judgeAggregatorSubscriber,
     auditSweeperStop,
+    pipelineEventRelay,
     moduleRegistry,
     resourceRegistry,
     hintedHandoff,
@@ -59,6 +63,10 @@ export function createShutdown(deps: ShutdownDeps): () => Promise<void> {
     } catch (err) {
       logger.error({ err: String(err) }, 'resourceRegistry.stop() failed');
     }
+    // Relay stops AFTER the registries: pipeline events emitted while the
+    // module drains (a run failing out, steps being abandoned) should still
+    // reach the canvas rather than vanishing at the start of shutdown.
+    try { if (pipelineEventRelay) await pipelineEventRelay.stop(); } catch (err) { logger.error({ err: String(err) }, 'pipelineEventRelay.stop() failed'); }
     try { if (hintedHandoff) await hintedHandoff.stop(); } catch (err) { logger.error({ err: String(err) }, 'hintedHandoff.stop() failed'); }
     try { if (fdBridge) await fdBridge.stop(); } catch (err) { logger.error({ err: String(err) }, 'fdBridge.stop() failed'); }
     try {

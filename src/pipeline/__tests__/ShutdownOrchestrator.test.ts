@@ -10,6 +10,7 @@ import type { RunPersistenceService } from '../runPersistence';
 import type { StuckRunDetector } from '../StuckRunDetector';
 import type { ExecutorAuditSubscriber } from '../executor-audit-subscriber';
 import type { JudgeAggregatorSubscriber } from '../judge/judge-aggregator-subscriber';
+import type { PipelineEventRedisRelay } from '../event-redis-relay';
 
 function makeLogger() {
   return {
@@ -39,6 +40,9 @@ function makeDeps(overrides: Partial<Parameters<typeof createShutdown>[0]> = {})
     stop: jest.fn(async () => {}),
   });
   const auditSweeperStop = jest.fn();
+  const pipelineEventRelay = stub<PipelineEventRedisRelay>({
+    stop: jest.fn(async () => {}),
+  });
   const moduleRegistry = { stop: jest.fn(async () => {}) };
   const resourceRegistry = { stop: jest.fn(async () => {}) };
   const hintedHandoff = { stop: jest.fn(async () => {}) };
@@ -55,6 +59,7 @@ function makeDeps(overrides: Partial<Parameters<typeof createShutdown>[0]> = {})
     executorAuditSubscriber,
     judgeAggregatorSubscriber,
     auditSweeperStop,
+    pipelineEventRelay,
     moduleRegistry,
     resourceRegistry,
     hintedHandoff,
@@ -120,6 +125,38 @@ describe('createShutdown()', () => {
   it('skips runPersistence when null', async () => {
     const deps = makeDeps({ runPersistence: null });
     await expect(createShutdown(deps)()).resolves.toBeUndefined();
+  });
+
+  it('calls pipelineEventRelay.stop() after the registries', async () => {
+    const order: string[] = [];
+    const deps = makeDeps({
+      resourceRegistry: { stop: jest.fn(async () => { order.push('resourceRegistry'); }) },
+      pipelineEventRelay: stub<PipelineEventRedisRelay>({
+        stop: jest.fn(async () => { order.push('relay'); }),
+      }),
+    });
+    await createShutdown(deps)();
+    // Events emitted while the module drains must still reach the canvas.
+    expect(order).toEqual(['resourceRegistry', 'relay']);
+  });
+
+  it('skips pipelineEventRelay when null', async () => {
+    const deps = makeDeps({ pipelineEventRelay: null });
+    await expect(createShutdown(deps)()).resolves.toBeUndefined();
+  });
+
+  it('continues after pipelineEventRelay.stop() throws', async () => {
+    const deps = makeDeps({
+      pipelineEventRelay: stub<PipelineEventRedisRelay>({
+        stop: jest.fn(async () => { throw new Error('relay exploded'); }),
+      }),
+    });
+    await expect(createShutdown(deps)()).resolves.toBeUndefined();
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.stringContaining('relay exploded') }),
+      'pipelineEventRelay.stop() failed',
+    );
+    expect(deps.cluster.stop).toHaveBeenCalledTimes(1);
   });
 
   it('unsubscribes all run-queue subscription ids', async () => {
