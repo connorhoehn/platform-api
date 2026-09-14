@@ -8,6 +8,7 @@ import { buildRecordingFinalizeDefinition, buildCallTranscriptionDefinition, REC
 import { buildLiveCaptionsDefinition, LIVE_CAPTIONS_PIPELINE_ID } from '../recordings/liveCaptions';
 import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID } from '../documents/conversationSummarizePipeline';
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
+import { buildMediaCatalogDefinition, MEDIA_CATALOG_PIPELINE_ID } from '../media/mediaCatalogPipeline';
 import { assertSystemPipelinesLint } from './systemPipelineLint';
 
 export interface SystemPipelineEntry {
@@ -24,6 +25,7 @@ const REGISTRY: SystemPipelineEntry[] = [
   { id: LIVE_CAPTIONS_PIPELINE_ID, build: () => buildLiveCaptionsDefinition() },
   { id: CONVERSATION_SUMMARIZE_PIPELINE_ID, build: () => buildConversationSummarizeDefinition() },
   { id: DIAGRAM_GENERATE_PIPELINE_ID, build: () => buildDiagramGenerateDefinition() },
+  { id: MEDIA_CATALOG_PIPELINE_ID, build: () => buildMediaCatalogDefinition() },
 ];
 
 // Retries and approvers are platform properties: a definition that forgets

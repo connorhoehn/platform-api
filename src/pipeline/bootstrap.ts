@@ -106,6 +106,7 @@ import { buildChatCommandHandlers } from '../documents/chatCommandHandlers';
 import { getCustomStepHandlers, registerCustomStepHandler } from './customStepHandlers';
 import { buildRecordingPipelineHandlers } from '../recordings/recordingPipelines';
 import { buildLiveCaptionsHandlers } from '../recordings/liveCaptions';
+import { buildMediaCatalogHandlers } from '../media/mediaCatalogPipeline';
 import { getJudgmentAggregateRepo } from './judge/judgeServices';
 import { JudgeAggregatorSubscriber } from './judge/judge-aggregator-subscriber';
 import { buildAppLayerRegistries } from './config/registries';
@@ -751,6 +752,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   }
   // During a call: the live-captions tap as a run that lasts the call (arm → stream → disarm → publish).
   for (const [key, handler] of buildLiveCaptionsHandlers()) {
+    customStepHandlers.set(key, handler);
+  }
+  // The drive walker's batches: thumbnails in, bursts grouped, one scene per burst, catalog written.
+  for (const [key, handler] of buildMediaCatalogHandlers()) {
     customStepHandlers.set(key, handler);
   }
   // Seed the LIVE registry (src/pipeline/customStepHandlers.ts) with the

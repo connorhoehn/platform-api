@@ -140,6 +140,10 @@ export function createApp(): express.Application {
   const { hangoutRoomsRouter } = require('./routes/hangoutRooms');
   app.use('/api/rooms', hangoutRoomsRouter);
 
+  // The media catalog: the host walker posts batches here; the catalog page reads here.
+  const { mediaRouter } = require('./routes/media');
+  app.use('/api/media', mediaRouter);
+
   // API routes (profiles, groups, rooms, etc.) mounted here in later phases
   app.use('/api', apiRouter);
 
