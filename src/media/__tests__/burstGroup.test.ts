@@ -50,6 +50,15 @@ describe('groupBursts', () => {
     expect(bursts.every((b) => b.fileIds.length === 1)).toBe(true);
   });
 
+  it('a RAW and the JPEG beside it are one exposure, whatever their EXIF says', () => {
+    // sharp reads only the RAW's embedded preview: no capture time, no camera.
+    const raw = frame(1, 0, { capturedAt: null, cameraId: null, stem: 'trip/L1111005' });
+    const jpg = frame(2, 0, { stem: 'trip/L1111005' });
+    const next = frame(3, 6, { stem: 'trip/L1111006' });
+    const bursts = groupBursts([raw, jpg, next]);
+    expect(bursts.map((b) => b.fileIds.length)).toEqual([2, 1]);
+  });
+
   it('regroups identically on a rerun over the same files', () => {
     const input = [frame(1, 0), frame(2, 1)];
     expect(groupBursts(input)).toEqual(groupBursts([...input].reverse()));

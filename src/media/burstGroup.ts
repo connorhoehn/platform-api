@@ -20,6 +20,13 @@ export interface BurstCandidate {
   cameraId: string | null;
   /** 64-bit difference hash as 16 hex chars; null for files that have none (video). */
   dhash: string | null;
+  /**
+   * The path without its extension. A RAW and the JPEG the camera wrote
+   * beside it share one — `111LEICA/L1111005` — and are one exposure, not
+   * two; the RAW usually reads with no EXIF (sharp sees only its embedded
+   * preview), so without this the pair never passes the camera test.
+   */
+  stem?: string | null;
 }
 
 export interface Burst {
@@ -82,11 +89,15 @@ export function groupBursts(files: readonly BurstCandidate[], opts: BurstOptions
   };
   for (const f of sorted) {
     const prev = current[current.length - 1];
+    // A sidecar of any frame already in the burst joins it outright. The
+    // pair's time and hash agree anyway; it is the camera field that lies.
+    const sidecar = !!f.stem && current.some((c) => c.stem === f.stem);
     const continues =
-      prev !== undefined &&
-      shotAt(f) - shotAt(prev) <= windowMs &&
-      prev.cameraId === f.cameraId &&
-      hamming(prev.dhash, f.dhash) <= maxHamming;
+      sidecar ||
+      (prev !== undefined &&
+        shotAt(f) - shotAt(prev) <= windowMs &&
+        prev.cameraId === f.cameraId &&
+        hamming(prev.dhash, f.dhash) <= maxHamming);
     if (!continues) flush();
     current.push(f);
   }

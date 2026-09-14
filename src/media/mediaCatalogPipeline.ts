@@ -67,6 +67,13 @@ export const DEFAULT_SCENE_LABELS = [
   'event or party', 'sports', 'vehicle', 'interior', 'night', 'document or screenshot', 'other',
 ] as const;
 
+/** `111LEICA/L1111005.DNG` → `111LEICA/L1111005`: what a RAW shares with the JPEG beside it. */
+export function stemOf(relPath: string): string {
+  const slash = relPath.lastIndexOf('/');
+  const dot = relPath.lastIndexOf('.');
+  return dot > slash + 1 ? relPath.slice(0, dot) : relPath;
+}
+
 /** Thumbnails are keyed by content hash, so a rerun over the same file overwrites, never duplicates. */
 export function thumbnailImageId(fileId: string): string {
   return `media-${fileId}`;
@@ -113,7 +120,11 @@ function ingestHandler(): StepHandler {
         }
         ingested.push({ ...rest, imageId });
       }
-      return ok({ ingested, batchId: batch.batchId, root: batch.root, thumbnailsStored: stored });
+      // `batch` is REPLACED with a slim record: the trigger payload carried
+      // every thumbnail's base64, and a step output merges into the context
+      // root, so leaving `ctx.batch` as posted put ~30 KB per file into every
+      // checkpoint after this one until the run persistence truncated them.
+      return ok({ ingested, batch: { batchId: batch.batchId, root: batch.root, fileCount: batch.files.length }, batchId: batch.batchId, root: batch.root, thumbnailsStored: stored });
     },
   };
 }
@@ -125,7 +136,7 @@ function burstGroupHandler(): StepHandler {
       const files = ctx.ingested as IngestedFile[] | undefined;
       if (!Array.isArray(files)) return fail('ingested files are required (run media:ingest first)');
       const data = (n.data ?? {}) as { windowMs?: number; maxHamming?: number };
-      const bursts = groupBursts(files, { windowMs: data.windowMs, maxHamming: data.maxHamming });
+      const bursts = groupBursts(files.map((f) => ({ ...f, stem: stemOf(f.relPath) })), { windowMs: data.windowMs, maxHamming: data.maxHamming });
       const multi = bursts.filter((b) => b.fileIds.length > 1);
       return ok({ bursts, burstCount: multi.length, framesInBursts: multi.reduce((s, b) => s + b.fileIds.length, 0) });
     },

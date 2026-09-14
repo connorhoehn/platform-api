@@ -71,6 +71,8 @@ describe('media:ingest', () => {
     expect(o.ingested[0]).not.toHaveProperty('thumbnail');
     expect(o.ingested[1].imageId).toBeNull();
     expect(stored.get(thumbnailImageId(ID(1)))?.meta.uploadedBy).toBe('media-walker');
+    // The posted batch (thumbnails and all) does not ride the context past this step.
+    expect((o as unknown as { batch: Record<string, unknown> }).batch).toEqual({ batchId: 'b1', root: '/v', fileCount: 2 });
   });
 
   it('refuses a context with no batch', async () => {

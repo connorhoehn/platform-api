@@ -69,6 +69,10 @@ export function createApp(): express.Application {
   // an EMPTY rawBody — so signed webhooks could never verify (HMAC over zero
   // bytes) and unsigned ones forwarded `body: {}` into the pipeline. Silent
   // payload loss; live pod logged `bodySize: 0` for a 15-byte POST.
+  // The media walker's batches: forty thumbnails is a few MB, forty times the
+  // global limit. Scoped to the one path that carries them; body-parser marks
+  // the request parsed, so the global parser below leaves it alone.
+  app.use('/api/media', express.json({ limit: '40mb' }));
   app.use(express.json({
     type: (req) =>
       shouldParseJsonBody(

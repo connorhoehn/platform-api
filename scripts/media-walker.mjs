@@ -4,6 +4,8 @@
 // The host half of the media catalog. The drive is on the host and
 // platform-api is in a pod, so everything that needs the BYTES happens here:
 // walk, hash, read EXIF, difference-hash, and thumbnail. What leaves the host
+// (127.0.0.1, not localhost: Node resolves localhost to ::1 first and Tilt's
+// port-forward listens on IPv4 only)
 // is a batch of probes (~30 KB per image), posted to /api/media/catalog/batches,
 // which starts one `media-catalog` run per batch.
 //
@@ -27,7 +29,7 @@ const MIME = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.Trashes', '.Spotlight-V100', '.fseventsd', '@eaDir', '.photoslibrary']);
 
 function parseArgs(argv) {
-  const out = { api: process.env.PLATFORM_API_URL ?? 'http://localhost:13001', batch: 40, limit: Infinity, token: process.env.ID_TOKEN ?? null, dryRun: false, reset: false, root: process.env.MEDIA_ROOT ?? null, state: null };
+  const out = { api: process.env.PLATFORM_API_URL ?? 'http://127.0.0.1:13001', batch: 40, limit: Infinity, token: process.env.ID_TOKEN ?? null, dryRun: false, reset: false, root: process.env.MEDIA_ROOT ?? null, state: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -178,7 +180,7 @@ async function main() {
       let last;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try { last = await post(args.api, args.token, { batchId, root, files: batch }); break; }
-        catch (err) { last = err; if (attempt === 3) throw err; await new Promise((r) => setTimeout(r, 1500 * attempt)); }
+        catch (err) { last = err; const why = err.cause?.message ? `${err.message} (${err.cause.message})` : err.message; if (attempt === 3) throw new Error(`POST batch ${batchId} failed after 3 attempts: ${why}`); console.warn(`attempt ${attempt}: ${why}`); await new Promise((r) => setTimeout(r, 1500 * attempt)); }
       }
       runs.push(last.runId);
       console.log(`posted ${batch.length} files → run ${last.runId}`);
