@@ -121,6 +121,8 @@ export class ClaudeCodeLLMClient implements LLMClient {
         });
 
         let fullResponse = '';
+
+        let resultError = '';
         let tokensIn = 0;
         let tokensOut = 0;
         let buffer = '';
@@ -178,6 +180,11 @@ export class ClaudeCodeLLMClient implements LLMClient {
                 if (typeof usage?.['input_tokens'] === 'number') tokensIn = usage['input_tokens'];
                 if (typeof usage?.['output_tokens'] === 'number') tokensOut = usage['output_tokens'];
                 const result = evt['result'];
+                // The CLI explains its own failures HERE, on stdout, as a
+                // result event with is_error ("Not logged in · Please run
+                // /login"), and exits 1 with an empty stderr. Keep it for the
+                // error, or every such failure reads "(no stderr)".
+                if (evt['is_error'] === true && typeof result === 'string') resultError = result;
                 if (typeof result === 'string' && fullResponse === '') {
                   fullResponse = result;
                 }
@@ -186,9 +193,9 @@ export class ClaudeCodeLLMClient implements LLMClient {
           }
 
           const { code } = await exitPromise;
-          if (code !== 0 && !signal?.aborted) {
+          if ((code !== 0 || resultError) && !signal?.aborted) {
             const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
-            throw new Error(`claude exited ${code}: ${stderr || '(no stderr)'}`);
+            throw new Error(`claude exited ${code}: ${stderr || resultError || '(no stderr)'}`);
           }
         } finally {
           abortReg?.dispose();

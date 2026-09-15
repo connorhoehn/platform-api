@@ -73,4 +73,12 @@ USER platformapi
 EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:3001/health || exit 1
-CMD ["node", "dist/index.js"]
+# A one-line supervisor, for local dev's live update: Tilt syncs src, runs
+# tsc, then asks for a restart by killing the node PID this writes — the
+# PROCESS restarts and the CONTAINER does not. It used to `kill 1`, which
+# exited the container; each exit counted as a restart, a handful put the
+# pod in CrashLoopBackOff, Tilt read the restart as a crash and replayed the
+# same update on the next container — a 25s build per start, indefinitely
+# (2026-09-15). A non-zero exit still exits the container, so a real crash
+# still surfaces as one.
+CMD ["sh", "-c", "while :; do node dist/index.js & echo $! > /tmp/platform-api.pid; wait $!; code=$?; [ \"$code\" -eq 0 ] || exit \"$code\"; echo \"[supervisor] node exited 0; starting it again\"; done"]
