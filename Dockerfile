@@ -25,6 +25,22 @@ FROM node:20-alpine AS build
 RUN apk add --no-cache git openssh-client python3 make g++ \
     && mkdir -p -m 0700 /root/.ssh \
     && ssh-keyscan github.com >> /root/.ssh/known_hosts
+# Share ONE authenticated SSH connection across every git call npm makes.
+#
+# Load-bearing. npm resolves each github: pin with its own `git ls-remote`,
+# and git-dep *preparation* spawns a nested `npm install` per dep that
+# re-resolves the whole graph — hundreds of SSH handshakes to github.com in
+# one RUN layer. GitHub's SSH rate limit cuts them off partway with
+#   npm error An unknown git error occurred
+#   npm error command git --no-replace-objects ls-remote ssh://git@github.com/...
+#   npm error Connection closed by 140.82.112.3 port 22
+# The named repo VARIES between runs, which is the tell that it is a
+# connection budget and not an access problem — npm's "make sure you have the
+# correct access rights" sends you hunting a key bug that isn't there.
+# ControlMaster=auto multiplexes the rest over the first connection so the
+# install authenticates once. ControlPath lives in /tmp because $HOME is not
+# writable in every stage.
+ENV GIT_SSH_COMMAND="ssh -o ControlMaster=auto -o ControlPath=/tmp/gh-%r@%h:%p -o ControlPersist=600"
 WORKDIR /app
 # Lockfile intentionally NOT copied into the build context. npm 10.8.2
 # (node:20-alpine) crashes with "Cannot destructure property 'package'
@@ -54,6 +70,10 @@ FROM node:20-alpine
 RUN apk add --no-cache curl git openssh-client python3 make g++ ripgrep \
     && mkdir -p -m 0700 /root/.ssh \
     && ssh-keyscan github.com >> /root/.ssh/known_hosts
+# SSH connection multiplexing — see the note in the build stage. This stage
+# installs the SAME github: pins, so it hits the same rate limit without it.
+# Each stage needs its own ENV; they don't inherit.
+ENV GIT_SSH_COMMAND="ssh -o ControlMaster=auto -o ControlPath=/tmp/gh-%r@%h:%p -o ControlPersist=600"
 RUN npm install -g @anthropic-ai/claude-code
 # typescript installed globally so Tilt live_update's `npx tsc` step has a
 # compiler to invoke. Without this, the runtime image only has the
