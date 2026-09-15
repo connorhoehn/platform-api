@@ -6,6 +6,7 @@
 // covers — the same path any other pipeline takes, exercised by something
 // people do all day.
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
+import { describeError } from '../gateway/GatewayServiceClient';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
 import { applyOps, createSuggestionIdentity, ensureCanvasMeta, outlineOf, parseOps, type ApplyMode, type OutlineBlock } from './documentAgentOps';
 import log from '../lib/logger';
@@ -217,7 +218,7 @@ export function createDocumentReadHandler(): StepHandler {
         // `sourceBlocks` lets `copyBlock` carry a macro across without the model retyping it.
         return { status: 'completed', output: { documentOutline: outline.text, documentTitle: outline.title ?? '', documentBlocks: outline.blocks.length, sourceBlocks: outline.blocks } };
       } catch (err) {
-        return { status: 'failed', error: err instanceof Error ? err.message : String(err) };
+        return { status: 'failed', error: describeError(err) };
       } finally {
         await agent.leave(0).catch(() => undefined);
       }
@@ -362,7 +363,7 @@ export function createDocumentApplyHandler(): StepHandler {
         return { status: 'completed', output: { ...result, mode, ops } };
       } catch (err) {
         await agent.leave(0).catch(() => undefined);
-        return { status: 'failed', error: err instanceof Error ? err.message : String(err) };
+        return { status: 'failed', error: describeError(err) };
       }
     },
   };

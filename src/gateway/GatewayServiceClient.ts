@@ -37,6 +37,19 @@ export function serviceToken(identity: ServiceIdentity): string {
 
 export type GatewayFrame = Record<string, unknown>;
 
+/** A message for any thrown value, including the ones that have none. */
+export function describeError(err: unknown): string {
+  if (err instanceof AggregateError) {
+    const inner = err.errors.map(describeError).filter(Boolean);
+    return inner.length ? [...new Set(inner)].join('; ') : (err.message || err.name);
+  }
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return err.message || (code ? String(code) : err.name);
+  }
+  return String(err);
+}
+
 export class GatewayServiceClient {
   readonly identity: ServiceIdentity;
   private readonly url: string;
@@ -62,7 +75,12 @@ export class GatewayServiceClient {
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`gateway did not open within ${timeoutMs}ms (${this.url})`)), timeoutMs);
       ws.once('open', () => { clearTimeout(timer); resolve(); });
-      ws.once('error', (err) => { clearTimeout(timer); reject(err); });
+      // Named, not passed through: a refused connection on a host with two
+      // addresses (`localhost` → ::1 and 127.0.0.1) surfaces as an
+      // AggregateError whose own message is EMPTY, and every layer above
+      // reported `err.message` — so a pipeline step failed three times with
+      // the error "" and its retry history read as three successes.
+      ws.once('error', (err) => { clearTimeout(timer); reject(new Error(`could not connect to the gateway at ${this.url}: ${describeError(err)}`)); });
     });
   }
 

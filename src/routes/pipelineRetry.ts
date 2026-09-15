@@ -27,6 +27,7 @@ import { recordPipelineTrigger, recordPipelineError } from '../observability/met
 import { getPipelineBridge } from './pipelineTriggers';
 import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
+import { getSystemPipeline } from '../pipeline/systemPipelines';
 import { readAttempts } from '../repositories/PipelineRunRepository';
 import { DefinitionsRepository } from '../pipeline/definitions-repository';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
@@ -110,7 +111,10 @@ pipelineRetryRouter.post(
     }
 
     // Load pipeline definition to validate nodeId exists
-    const definition = await getDefRepo().get(userId, pipelineId);
+    // A person's pipeline, or a platform-owned one: the system registry is
+    // where the document and media pipelines live, and a run of one of those
+    // is as retryable as any other. Same resolution as GET /pipelines/:id.
+    const definition = (await getDefRepo().get(userId, pipelineId)) ?? getSystemPipeline(pipelineId);
     if (!definition) {
       throw new NotFoundError(`Pipeline ${pipelineId} not found`);
     }

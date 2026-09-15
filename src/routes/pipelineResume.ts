@@ -31,6 +31,7 @@ import { recordPipelineTrigger, recordPipelineError } from '../observability/met
 import { getPipelineBridge } from './pipelineTriggers';
 import { normalizeRunStatus } from '@connorhoehn/pipeline-runtime';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
+import { getSystemPipeline } from '../pipeline/systemPipelines';
 import { DefinitionsRepository } from '../pipeline/definitions-repository';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { getDynamoClient } from '../lib/ddb-client';
@@ -128,7 +129,10 @@ pipelineResumeRouter.post(
     }
 
     // 3. Validate that fromNodeId exists in the original DAG.
-    const definition = await getDefRepo().get(userId, pipelineId);
+    // A person's pipeline, or a platform-owned one: the system registry is
+    // where the document and media pipelines live, and a run of one of those
+    // is as retryable as any other. Same resolution as GET /pipelines/:id.
+    const definition = (await getDefRepo().get(userId, pipelineId)) ?? getSystemPipeline(pipelineId);
     if (!definition) {
       throw new NotFoundError(`Pipeline ${pipelineId} not found`);
     }

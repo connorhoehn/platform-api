@@ -27,6 +27,11 @@ jest.mock('../../pipeline/definitions-repository', () => ({
   })),
 }));
 
+const mockSystemPipelineGet = jest.fn();
+jest.mock('../../pipeline/systemPipelines', () => ({
+  getSystemPipeline: (id: string) => mockSystemPipelineGet(id),
+}));
+
 jest.mock('../../lib/ddb-client', () => ({
   getDynamoClient: jest.fn().mockReturnValue({}),
 }));
@@ -329,6 +334,21 @@ describe('POST /pipelines/:pipelineId/runs/:runId/retry/:nodeId', () => {
 
     const body = res.body as { skippedNodes: string[] };
     expect(body.skippedNodes).toEqual(['node-A']);
+  });
+
+  test('202 for a run of a platform-owned pipeline the definitions repo does not have', async () => {
+    // document-agent-edit lives in the system registry, not in anyone's
+    // definitions table; a failed run of it used to 404 here.
+    mockRunRepoGet.mockResolvedValueOnce({ ...baseRun, pipelineId: 'document-agent-edit' });
+    mockDefRepoGet.mockResolvedValueOnce(null);
+    mockSystemPipelineGet.mockReturnValueOnce(baseDef);
+    (getPipelineBridge as jest.Mock).mockReturnValue(mockBridge);
+    mockBridge.trigger.mockResolvedValueOnce({ runId: 'new-run-99' });
+
+    const res = await run(retryApp, 'POST', '/pipelines/document-agent-edit/runs/r1/retry/node-B');
+
+    expect(res.statusCode).toBe(202);
+    expect(mockSystemPipelineGet).toHaveBeenCalledWith('document-agent-edit');
   });
 
   test('404 when original run does not exist', async () => {

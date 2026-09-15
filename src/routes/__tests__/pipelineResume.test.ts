@@ -24,6 +24,11 @@ jest.mock('../../pipeline/definitions-repository', () => ({
   })),
 }));
 
+const mockSystemPipelineGet = jest.fn();
+jest.mock('../../pipeline/systemPipelines', () => ({
+  getSystemPipeline: (id: string) => mockSystemPipelineGet(id),
+}));
+
 jest.mock('../../lib/ddb-client', () => ({
   getDynamoClient: jest.fn().mockReturnValue({}),
 }));
@@ -277,6 +282,19 @@ describe('POST /pipelines/:pipelineId/runs/:runId/resume', () => {
     expect(mockBridge.resumeFromStep).toHaveBeenCalledWith('r1', 'node-A', {
       allowCompleted: true,
     });
+  });
+
+  test('resumes a run of a platform-owned pipeline from the system registry', async () => {
+    mockRunRepoGet.mockResolvedValueOnce({ ...failedRun, pipelineId: 'document-agent-edit' });
+    mockDefRepoGet.mockResolvedValueOnce(null);
+    mockSystemPipelineGet.mockReturnValueOnce(baseDef);
+    const res = await dispatch(
+      app,
+      'POST',
+      '/pipelines/document-agent-edit/runs/r1/resume?fromNodeId=node-B',
+    );
+    expect(res.statusCode).not.toBe(404);
+    expect(mockSystemPipelineGet).toHaveBeenCalledWith('document-agent-edit');
   });
 
   test('404 when the pipeline definition is missing', async () => {
