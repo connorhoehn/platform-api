@@ -22,7 +22,8 @@ describe('the document pipeline definitions', () => {
     // No `rejected` edge on purpose: the executor gives it no fallback, so a reject ends the run as `rejected`.
     expect(def.edges.some((e) => e.sourceHandle === 'rejected')).toBe(false);
     expect(byId(def, 'read')).toMatchObject({ type: DOCUMENT_READ_KIND, data: { retryPolicy: DOCUMENT_IO_RETRY } });
-    expect(byId(def, 'plan')).toMatchObject({ type: 'agent', data: { model: 'haiku', retryPolicy: DOCUMENT_PLAN_RETRY } });
+    // ONE model call at temperature 0 with a short bound — not an agent session.
+    expect(byId(def, 'plan')).toMatchObject({ type: 'document:plan', data: { model: 'haiku', temperature: 0, timeoutMs: 30_000, retryPolicy: DOCUMENT_PLAN_RETRY } });
     expect(byId(def, 'review')).toMatchObject({ type: DOCUMENT_REVIEW_KIND, data: { retryPolicy: DOCUMENT_IO_RETRY } });
     expect(byId(def, 'apply')).toMatchObject({ type: DOCUMENT_APPLY_KIND, data: { retryPolicy: DOCUMENT_IO_RETRY } });
     expect(byId(def, 'approve')).toMatchObject({ type: 'approval', data: {

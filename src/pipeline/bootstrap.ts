@@ -737,7 +737,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     customStepHandlers.set(key, handler);
   }
   // The chat's /doc command: read → plan (light model) → apply as a collaborator.
-  for (const [key, handler] of buildDocumentAgentHandlers()) {
+  for (const [key, handler] of buildDocumentAgentHandlers({ llm: llmClient })) {
     customStepHandlers.set(key, handler);
   }
   // The chat's /summarize and /diagram commands (read the conversation, draw the diagram, post the card).

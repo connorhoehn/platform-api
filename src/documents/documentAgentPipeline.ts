@@ -7,6 +7,9 @@
 // people do all day.
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { describeError } from '../gateway/GatewayServiceClient';
+import type { LLMClient } from 'distributed-core/applications/pipeline';
+import { createLLMClient } from '../pipeline/factories/LLMClientFactory';
+import { interpolateContext } from '../pipeline/agent/AgentStepHandler';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
 import { applyOps, createSuggestionIdentity, ensureCanvasMeta, outlineOf, parseOps, type ApplyMode, type OutlineBlock } from './documentAgentOps';
 import log from '../lib/logger';
@@ -16,6 +19,19 @@ export const DOCUMENT_TRANSFORM_PIPELINE_ID = 'document-transform';
 /** A person's Accept/Reject of an agent's suggestions, landing server-side through the same apply step. */
 export const DOCUMENT_AGENT_REVIEW_PIPELINE_ID = 'document-agent-review';
 export const DOCUMENT_READ_KIND = 'document:read';
+/**
+ * The plan: ONE model call, not an agent session. It used to be an `agent`
+ * step — a `claude -p` process with a tool loop, an 8-turn budget and a
+ * 120-second bound — for a job that is "read this outline, answer with a
+ * JSON array". A person waiting on a /doc edit watched "Deciding what to
+ * change" for two minutes when the model endpoint was wrong, and every
+ * successful edit paid a CLI start-up for nothing. This is a direct
+ * `LLMClient` call: temperature 0 (the same instruction should give the same
+ * plan), a small output cap, and a 30-second bound.
+ */
+export const DOCUMENT_PLAN_KIND = 'document:plan';
+export const DOCUMENT_PLAN_TIMEOUT_MS = 30_000;
+export const DOCUMENT_PLAN_MAX_TOKENS = 1024;
 export const DOCUMENT_REVIEW_KIND = 'document:review-plan';
 export const DOCUMENT_APPLY_KIND = 'document:apply';
 
@@ -125,7 +141,7 @@ export function buildDocumentTransformDefinition(model = process.env.DOCUMENT_AG
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Transform to <type>' } },
       { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the source', retryPolicy: DOCUMENT_IO_RETRY } },
-      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the target (Haiku)', prompt: DOCUMENT_TRANSFORM_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: DOCUMENT_PLAN_RETRY } },
+      { id: 'plan', type: DOCUMENT_PLAN_KIND, position: pos(400), data: { type: DOCUMENT_PLAN_KIND, label: 'Plan the target (Haiku)', prompt: DOCUMENT_TRANSFORM_PROMPT, model, temperature: 0, maxTokens: DOCUMENT_PLAN_MAX_TOKENS, timeoutMs: DOCUMENT_PLAN_TIMEOUT_MS, retryPolicy: DOCUMENT_PLAN_RETRY } },
       // A transform always stamps the new type — that is not a reason to stop and ask.
       // A transform writes a NEW, empty page: the op count is the page, not a
       // risk, and the type change is the point. Only a deleteBlock would gate it.
@@ -165,7 +181,7 @@ export function buildDocumentAgentEditDefinition(model = process.env.DOCUMENT_AG
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/doc command' } },
       { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the document', retryPolicy: DOCUMENT_IO_RETRY } },
-      { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the edit (Haiku)', prompt: DOCUMENT_EDIT_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: DOCUMENT_PLAN_RETRY } },
+      { id: 'plan', type: DOCUMENT_PLAN_KIND, position: pos(400), data: { type: DOCUMENT_PLAN_KIND, label: 'Plan the edit (Haiku)', prompt: DOCUMENT_EDIT_PROMPT, model, temperature: 0, maxTokens: DOCUMENT_PLAN_MAX_TOKENS, timeoutMs: DOCUMENT_PLAN_TIMEOUT_MS, retryPolicy: DOCUMENT_PLAN_RETRY } },
       { id: 'review', type: DOCUMENT_REVIEW_KIND, position: pos(600), data: { type: DOCUMENT_REVIEW_KIND, label: 'Check the plan', retryPolicy: DOCUMENT_IO_RETRY } },
       approvalNode(pos(800), opts),
       { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1000), data: { type: DOCUMENT_APPLY_KIND, label: 'Suggest as a collaborator', mode: 'suggest', retryPolicy: DOCUMENT_IO_RETRY } },
@@ -373,9 +389,59 @@ export function createDocumentApplyHandler(): StepHandler {
   };
 }
 
-export function buildDocumentAgentHandlers(): Map<string, StepHandler> {
+export interface DocumentPlanNodeData {
+  prompt?: string;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  timeoutMs?: number;
+}
+
+export function createDocumentPlanHandler(llm: LLMClient): StepHandler {
+  return {
+    kind: DOCUMENT_PLAN_KIND,
+    async execute(node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
+      const data = ((node as { data?: DocumentPlanNodeData }).data ?? {}) as DocumentPlanNodeData;
+      const rawPrompt = typeof data.prompt === 'string' ? data.prompt : '';
+      if (!rawPrompt.trim()) return { status: 'failed', error: 'plan step has no prompt' };
+      const prompt = interpolateContext(rawPrompt, context);
+      const model = data.model?.trim() || process.env.DOCUMENT_AGENT_MODEL || 'haiku';
+      const temperature = typeof data.temperature === 'number' ? data.temperature : 0;
+      const maxTokens = typeof data.maxTokens === 'number' && data.maxTokens > 0 ? data.maxTokens : DOCUMENT_PLAN_MAX_TOKENS;
+      const timeoutMs = typeof data.timeoutMs === 'number' && data.timeoutMs > 0 ? data.timeoutMs : DOCUMENT_PLAN_TIMEOUT_MS;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const startedAt = Date.now();
+      let text = '';
+      let tokensIn = 0;
+      let tokensOut = 0;
+      try {
+        for await (const chunk of llm.stream(model, '', prompt, { temperature, maxTokens, signal: controller.signal })) {
+          if (chunk.done) {
+            text = chunk.response || text;
+            tokensIn = chunk.tokensIn;
+            tokensOut = chunk.tokensOut;
+          } else {
+            text += chunk.token;
+          }
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return { status: 'failed', error: `plan step stopped: timeout after ${timeoutMs}ms (${llm.provider}, ${model})` };
+        return { status: 'failed', error: `plan step failed (${llm.provider}, ${model}): ${describeError(err)}` };
+      } finally {
+        clearTimeout(timer);
+      }
+      if (controller.signal.aborted) return { status: 'failed', error: `plan step stopped: timeout after ${timeoutMs}ms (${llm.provider}, ${model})` };
+      log.info({ documentId: documentIdOf(context), model, provider: llm.provider, durationMs: Date.now() - startedAt, tokensIn, tokensOut }, 'document agent plan');
+      return { status: 'completed', output: { text, model, provider: llm.provider, temperature, durationMs: Date.now() - startedAt, tokensIn, tokensOut } };
+    },
+  };
+}
+
+export function buildDocumentAgentHandlers(opts: { llm?: LLMClient } = {}): Map<string, StepHandler> {
   const m = new Map<string, StepHandler>();
   m.set(DOCUMENT_READ_KIND, createDocumentReadHandler());
+  m.set(DOCUMENT_PLAN_KIND, createDocumentPlanHandler(opts.llm ?? createLLMClient()));
   m.set(DOCUMENT_REVIEW_KIND, createDocumentReviewHandler());
   m.set(DOCUMENT_APPLY_KIND, createDocumentApplyHandler());
   return m;

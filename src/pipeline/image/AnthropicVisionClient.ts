@@ -105,7 +105,20 @@ export class AnthropicVisionClient implements VisionClientLike {
   private readonly defaultMaxOutputTokens: number;
 
   constructor(opts: AnthropicVisionClientOpts = {}) {
-    this.client = opts.client ?? new Anthropic();
+    // The vision server is its OWN endpoint (a local multimodal model,
+    // say), named by VISION_ANTHROPIC_*. It used to be set through the plain
+    // ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY, which every `claude -p` the
+    // pipeline spawns inherits too — so a dead vision server hijacked the
+    // document plan step and it hung to its timeout. The plain names remain
+    // the fallback for a deployment with one endpoint.
+    this.client = opts.client ?? new Anthropic({
+      ...(process.env['VISION_ANTHROPIC_BASE_URL'] ?? process.env['ANTHROPIC_BASE_URL']
+        ? { baseURL: process.env['VISION_ANTHROPIC_BASE_URL'] ?? process.env['ANTHROPIC_BASE_URL'] }
+        : {}),
+      ...(process.env['VISION_ANTHROPIC_API_KEY'] ?? process.env['ANTHROPIC_API_KEY']
+        ? { apiKey: process.env['VISION_ANTHROPIC_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'] }
+        : {}),
+    });
     this.defaultMaxOutputTokens =
       opts.defaultMaxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   }
