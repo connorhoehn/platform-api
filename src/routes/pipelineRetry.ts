@@ -166,7 +166,18 @@ pipelineRetryRouter.post(
         ? nodeAttempts[nodeAttempts.length - 1].input
         : undefined;
 
+    // The new run's context starts from what the ORIGINAL run started from —
+    // the trigger's output is the run's input (a /doc command's documentId
+    // and instruction, say). Without it a retried step that reads the run
+    // context found nothing there and failed with "documentId missing", a
+    // worse failure than the one being retried.
+    const triggerNode = nodes.find((n) => (n as { type?: string }).type === 'trigger');
+    const triggerOutput = triggerNode ? (stepsSummary[triggerNode.id] as { output?: unknown } | undefined)?.output : undefined;
+    const originalInput = triggerOutput && typeof triggerOutput === 'object' && !Array.isArray(triggerOutput)
+      ? (triggerOutput as Record<string, unknown>)
+      : {};
     const retryPayload = {
+      ...originalInput,
       ...(snapshotInput !== undefined ? { __snapshotInput: snapshotInput } : {}),
       ...(body.inputs ?? {}),
       __retry: {

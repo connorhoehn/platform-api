@@ -199,7 +199,11 @@ export function buildDocumentReviewApplyDefinition(): Record<string, unknown> {
 export const REVIEW_AGENT = { userId: 'agent:review', displayName: 'Review', color: '#0ea5e9' } as const;
 
 function documentIdOf(context: Record<string, unknown>): string | null {
-  return typeof context.documentId === 'string' && context.documentId ? context.documentId : null;
+  if (typeof context.documentId === 'string' && context.documentId) return context.documentId;
+  // A run that did not start from its own trigger — a retry, a replay —
+  // still has the trigger's output under steps.
+  const fromTrigger = readPath(context, 'steps.trigger.output.documentId');
+  return typeof fromTrigger === 'string' && fromTrigger ? fromTrigger : null;
 }
 
 /** Step 1: join the document and hand its outline to the run context. */

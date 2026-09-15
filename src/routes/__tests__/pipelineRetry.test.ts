@@ -351,6 +351,25 @@ describe('POST /pipelines/:pipelineId/runs/:runId/retry/:nodeId', () => {
     expect(mockSystemPipelineGet).toHaveBeenCalledWith('document-agent-edit');
   });
 
+  test('the new run starts from the original trigger output — the run\'s input', async () => {
+    mockRunRepoGet.mockResolvedValueOnce({
+      ...baseRun,
+      stepsSummary: {
+        'node-A': { status: 'completed', output: { documentId: 'doc-7', instruction: 'add a title' } },
+        'node-B': { status: 'failed' },
+      },
+    });
+    mockDefRepoGet.mockResolvedValueOnce({ ...baseDef, nodes: [{ id: 'node-A', type: 'trigger' }, { id: 'node-B' }] });
+    (getPipelineBridge as jest.Mock).mockReturnValue(mockBridge);
+    mockBridge.trigger.mockResolvedValueOnce({ runId: 'new-run-77' });
+
+    const res = await run(retryApp, 'POST', '/pipelines/p1/runs/r1/retry/node-B');
+    expect(res.statusCode).toBe(202);
+    const [triggerArg] = mockBridge.trigger.mock.calls[mockBridge.trigger.mock.calls.length - 1] as [{ triggerPayload: Record<string, unknown> }];
+    expect(triggerArg.triggerPayload.documentId).toBe('doc-7');
+    expect(triggerArg.triggerPayload.instruction).toBe('add a title');
+  });
+
   test('404 when original run does not exist', async () => {
     mockRunRepoGet.mockResolvedValueOnce(null);
 
