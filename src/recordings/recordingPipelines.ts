@@ -40,6 +40,7 @@ import { ddbClient } from '../lib/aws-clients';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { postChatMessage, PIPELINE_IDENTITY } from '../gateway/GatewayServiceClient';
+import { VIDEO_PUBLIC_URL } from '../lib/video-auth';
 import { DOCUMENT_APPLY_KIND } from '../documents/documentAgentPipeline';
 import { resolveRecordingProfile } from '@connorhoehn/event-catalog';
 import log from '../lib/logger';
@@ -340,17 +341,75 @@ function awaitComposeHandler(): StepHandler {
   };
 }
 
+/** "12m 4s" — the length as the card's corner badge wants it. */
+function formatDurationMs(ms: number): string {
+  const total = Math.round(ms / 1000);
+  const h = Math.floor(total / 3600); const m = Math.floor((total % 3600) / 60); const s = total % 60;
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  return `${s}s`;
+}
+
+/** LVS hands the thumbnail back as a path on its own API; the card needs a URL a browser can fetch. */
+function absoluteMediaUrl(u: string | undefined): string | undefined {
+  if (!u) return undefined;
+  if (/^https?:\/\//i.test(u)) return u;
+  if (u.startsWith('/')) return VIDEO_PUBLIC_URL ? `${VIDEO_PUBLIC_URL}${u}` : u;
+  return undefined;
+}
+
+/**
+ * The recording as a card in the conversation — the artifact itself, the way
+ * Teams posts it: thumbnail, length, who it is by. `metadata.kind:
+ * 'recording'` is what ChatPanel renders as a RecordingActivityCard. Posted
+ * whether compose succeeded or not: a failed recording is still a fact the
+ * room should see, and the card says so rather than staying silent.
+ */
+export function recordingCardMetadata(ctx: Record<string, unknown>, runId: string): { message: string; metadata: Record<string, unknown> } {
+  const durationMs = Number(ctx.mediaDurationMs ?? 0);
+  const detail = (ctx.detail ?? {}) as Record<string, unknown>;
+  const participants = (ctx.participants as Array<{ userId?: string; displayName?: string }> | undefined) ?? [];
+  const startedBy = str(ctx.startedBy);
+  const recordedBy = participants.find((p) => p.userId === startedBy)?.displayName ?? startedBy;
+  const status = ctx.composeStatus === 'ok' ? 'ready' : 'failed';
+  const metadata: Record<string, unknown> = {
+    kind: 'recording',
+    recordingId: ctx.recordingId,
+    callId: ctx.callId,
+    lobbyName: ctx.lobbyName ?? null,
+    startedAt: ctx.startedAt ?? null,
+    durationMs,
+    participantCount: Number(ctx.participantCount ?? participants.length) || undefined,
+    status,
+    runId,
+    pipelineId: RECORDING_FINALIZE_PIPELINE_ID,
+  };
+  if (recordedBy) metadata.recordedBy = recordedBy;
+  const thumbnailUrl = absoluteMediaUrl(str(detail.thumbnailUrl));
+  if (thumbnailUrl) metadata.thumbnailUrl = thumbnailUrl;
+  const message = status === 'ready'
+    ? `Recording${durationMs > 0 ? ` — ${formatDurationMs(durationMs)}` : ''}`
+    : `Recording could not be processed (compose ${String(ctx.composeStatus)})`;
+  return { message, metadata };
+}
+
 function announceHandler(): StepHandler {
   return {
     kind: KINDS.announce,
     async execute(_n: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
-      const mins = Math.round(Number(ctx.mediaDurationMs ?? 0) / 60000);
-      const posted = await postRunCard({
-        lobbyName: str(ctx.lobbyName) ?? null, runId: helpers.runId, pipelineId: RECORDING_FINALIZE_PIPELINE_ID,
-        command: 'recording', instruction: `Call recording${mins ? ` (${mins} min)` : ''} — ${ctx.composeStatus === 'ok' ? 'ready to watch' : `compose ${String(ctx.composeStatus)}`}`,
-        extra: { recordingId: ctx.recordingId, callId: ctx.callId },
-      });
-      return ok({ posted, channel: chatChannelForLobby(str(ctx.lobbyName)) });
+      const channel = chatChannelForLobby(str(ctx.lobbyName));
+      if (!channel) {
+        log.info({ lobbyName: ctx.lobbyName, runId: helpers.runId, reason: 'lobby has no conversation' }, '[recording-pipeline] recording card not posted');
+        return ok({ posted: false, channel: null });
+      }
+      const card = recordingCardMetadata(ctx, helpers.runId);
+      try {
+        await postChatMessage({ channel, ...card });
+        return ok({ posted: true, channel });
+      } catch (e) {
+        log.warn({ err: e instanceof Error ? e.message : String(e), channel }, '[recording-pipeline] could not post the recording card');
+        return ok({ posted: false, channel });
+      }
     },
   };
 }
