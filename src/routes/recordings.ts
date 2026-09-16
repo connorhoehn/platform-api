@@ -451,6 +451,21 @@ function mediaView(
  * initiator-inclusive people counts. Duration is already normalized by the
  * repository read path.
  */
+/**
+ * Where the recording is on its way to being watchable, as ONE word the chat
+ * card can show: saving (compose running) → transcribing → summarizing →
+ * ready, or failed. Derived, never stored — it is a reading of three status
+ * fields that each already exist.
+ */
+export function recordingStage(detail: Pick<CallRecording, 'composeStatus' | 'transcriptStatus' | 'summaryStatus'>): 'saving' | 'transcribing' | 'summarizing' | 'ready' | 'failed' {
+  const compose = detail.composeStatus ?? 'queued';
+  if (compose === 'queued' || compose === 'running') return 'saving';
+  if (compose === 'failed') return 'failed';
+  if (detail.transcriptStatus === 'pending' || detail.transcriptStatus === 'processing') return 'transcribing';
+  if (detail.summaryStatus === 'pending' || detail.summaryStatus === 'processing') return 'summarizing';
+  return 'ready';
+}
+
 function publicRecordingView(detail: CallRecording): Record<string, unknown> {
   const people = reconcileParticipants({
     participants: detail.participants,
@@ -463,6 +478,11 @@ function publicRecordingView(detail: CallRecording): Record<string, unknown> {
     ...detail,
     participants: people.participants,
     participantCount: people.participantCount,
+    stage: recordingStage(detail),
+    // The row's ttl is when DynamoDB drops it — which is when the recording
+    // expires, and what the card's "Set to expire" line says.
+    expiresAt: detail.ttl ? new Date(detail.ttl * 1000).toISOString() : null,
+    thumbnailUrl: detail.thumbnailUrl && detail.thumbnailUrl.startsWith('/') ? `${VIDEO_PUBLIC_URL}${detail.thumbnailUrl}` : detail.thumbnailUrl,
     tracks: publicizeTracks(detail.tracks, {
       channelArn: detail.channelArn,
       recordingId: detail.recordingId,

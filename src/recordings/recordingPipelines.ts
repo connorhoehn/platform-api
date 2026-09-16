@@ -167,10 +167,10 @@ export function buildRecordingFinalizeDefinition(): Record<string, unknown> {
       { id: 'resolve', type: KINDS.resolve, position: pos(200), data: { type: KINDS.resolve, label: 'Find the call', retryPolicy: IO_RETRY } },
       { id: 'persist', type: KINDS.persist, position: pos(400), data: { type: KINDS.persist, label: 'Save the recording', retryPolicy: IO_RETRY } },
       { id: 'await-compose', type: KINDS.awaitCompose, position: pos(600), data: { type: KINDS.awaitCompose, label: 'Wait for the composed file', retryPolicy: { maxAttempts: 12, backoffMs: 5000, backoffMultiplier: 1.2, retryUnknown: true } } },
-      { id: 'announce', type: KINDS.announce, position: pos(800), data: { type: KINDS.announce, label: 'Post to the conversation', retryPolicy: IO_RETRY } },
+      { id: 'announce', type: KINDS.announce, position: pos(800), data: { type: KINDS.announce, label: 'Post the recording card', retryPolicy: IO_RETRY } },
       { id: 'start-transcription', type: KINDS.startTranscription, position: pos(1000), data: { type: KINDS.startTranscription, label: 'Start transcription', retryPolicy: IO_RETRY } },
     ],
-    edges: [edge('trigger', 'resolve'), edge('resolve', 'persist'), edge('persist', 'await-compose'), edge('await-compose', 'announce'), edge('announce', 'start-transcription')],
+    edges: [edge('trigger', 'resolve'), edge('resolve', 'persist'), edge('persist', 'announce'), edge('announce', 'await-compose'), edge('await-compose', 'start-transcription')],
   };
 }
 
@@ -371,7 +371,11 @@ export function recordingCardMetadata(ctx: Record<string, unknown>, runId: strin
   const participants = (ctx.participants as Array<{ userId?: string; displayName?: string }> | undefined) ?? [];
   const startedBy = str(ctx.startedBy);
   const recordedBy = participants.find((p) => p.userId === startedBy)?.displayName ?? startedBy;
-  const status = ctx.composeStatus === 'ok' ? 'ready' : 'failed';
+  // Posted the moment the recording is saved — before compose, before the
+  // transcript — the way Teams drops the chiclet in while it says "Saving".
+  // The card reads its LIVE stage from GET /api/recordings/:id, so what is
+  // stamped here is only what a client with no API would still want to show.
+  const status = ctx.composeStatus === undefined ? 'processing' : ctx.composeStatus === 'ok' || ctx.composeStatus === 'degraded' ? 'ready' : 'failed';
   const metadata: Record<string, unknown> = {
     kind: 'recording',
     recordingId: ctx.recordingId,
@@ -380,16 +384,18 @@ export function recordingCardMetadata(ctx: Record<string, unknown>, runId: strin
     startedAt: ctx.startedAt ?? null,
     durationMs,
     participantCount: Number(ctx.participantCount ?? participants.length) || undefined,
+    participants: participants.slice(0, 12).map((p) => ({ userId: p.userId, displayName: p.displayName })),
     status,
+    stage: status === 'processing' ? 'saving' : status,
     runId,
     pipelineId: RECORDING_FINALIZE_PIPELINE_ID,
   };
   if (recordedBy) metadata.recordedBy = recordedBy;
   const thumbnailUrl = absoluteMediaUrl(str(detail.thumbnailUrl));
   if (thumbnailUrl) metadata.thumbnailUrl = thumbnailUrl;
-  const message = status === 'ready'
-    ? `Recording${durationMs > 0 ? ` — ${formatDurationMs(durationMs)}` : ''}`
-    : `Recording could not be processed (compose ${String(ctx.composeStatus)})`;
+  const message = status === 'failed'
+    ? `Recording could not be processed (compose ${String(ctx.composeStatus)})`
+    : `Recording${durationMs > 0 ? ` — ${formatDurationMs(durationMs)}` : ''}`;
   return { message, metadata };
 }
 
