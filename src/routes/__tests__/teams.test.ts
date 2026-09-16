@@ -70,7 +70,12 @@ jest.mock('../../repositories', () => {
 
 import { teamsRouter, channelSlug } from '../teams';
 import { errorHandler } from '../../middleware/error-handler';
-import { RoomSlugConflictError, type HangoutRoom, type TeamItem } from '../../repositories';
+import {
+  RoomSlugConflictError,
+  TeamSlugConflictError,
+  type HangoutRoom,
+  type TeamItem,
+} from '../../repositories';
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -259,7 +264,7 @@ describe('POST /api/teams', () => {
 
   it('suffixes the slug when the name is taken', async () => {
     mockCreateTeam
-      .mockRejectedValueOnce(Object.assign(new Error('taken'), { statusCode: 409 }))
+      .mockRejectedValueOnce(new TeamSlugConflictError('design'))
       .mockImplementationOnce(async (input) => makeTeam({ slug: input.slug }));
 
     const res = await run(buildApp(), 'POST', '/api/teams', { body: { name: 'Design' } });

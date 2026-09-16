@@ -31,6 +31,7 @@ import {
   RoomSlugConflictError,
   TeamNotFoundError,
   TeamAccessDeniedError,
+  TeamSlugConflictError,
   type ChannelPrivacy,
   type HangoutRoom,
   type HangoutRoomVisibility,
@@ -255,7 +256,7 @@ teamsRouter.post(
         });
         break;
       } catch (err) {
-        if ((err as { statusCode?: number })?.statusCode === 409) {
+        if (err instanceof TeamSlugConflictError) {
           lastErr = err;
           continue;
         }
