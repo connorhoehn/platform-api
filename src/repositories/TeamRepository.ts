@@ -64,6 +64,8 @@ export interface TeamMemberItem {
   role: TeamMemberRole;
   addedBy: string;
   joinedAt: string;
+  /** This member's own favourite flag — never set by anyone but themselves. */
+  favorite?: boolean;
 }
 
 export interface CreateTeamInput {
@@ -158,7 +160,7 @@ export class TeamRepository extends BaseRepository {
   async listTeamsForUser(
     orgId: string,
     userId: string,
-  ): Promise<Array<{ team: TeamItem; role: TeamMemberRole }>> {
+  ): Promise<Array<{ team: TeamItem; role: TeamMemberRole; favorite: boolean }>> {
     const result = await this.docClient.send(
       new QueryCommand({
         TableName: TEAM_MEMBERS_TABLE,
@@ -169,11 +171,11 @@ export class TeamRepository extends BaseRepository {
     );
     const memberships = (result.Items ?? []) as TeamMemberItem[];
 
-    const out: Array<{ team: TeamItem; role: TeamMemberRole }> = [];
+    const out: Array<{ team: TeamItem; role: TeamMemberRole; favorite: boolean }> = [];
     for (const m of memberships) {
       const team = await this.getTeam(orgId, m.teamId);
       if (!team || team.state === 'archived') continue;
-      out.push({ team, role: m.role });
+      out.push({ team, role: m.role, favorite: m.favorite === true });
     }
     return out;
   }
@@ -225,6 +227,22 @@ export class TeamRepository extends BaseRepository {
 
   async getMembership(teamId: string, userId: string): Promise<TeamMemberItem | null> {
     return this.members.getItem<TeamMemberItem>({ teamId, userId });
+  }
+
+  /**
+   * Set a member's own favourite flag. Caller-scoped by construction: the
+   * route only ever passes the caller's own userId, so this can never
+   * touch anyone else's row.
+   */
+  async setFavorite(teamId: string, userId: string, favorite: boolean): Promise<TeamMemberItem> {
+    const updated = await this.members.updateItem({
+      Key: { teamId, userId },
+      UpdateExpression: 'SET favorite = :f',
+      ExpressionAttributeValues: { ':f': favorite },
+      ConditionExpression: 'attribute_exists(teamId)',
+      ReturnValues: 'ALL_NEW',
+    });
+    return updated as unknown as TeamMemberItem;
   }
 }
 

@@ -22,6 +22,7 @@ const mockAddTeamMember = jest.fn();
 const mockRemoveTeamMember = jest.fn();
 const mockListTeamMembers = jest.fn();
 const mockGetMembership = jest.fn();
+const mockSetFavorite = jest.fn();
 
 const mockCreateRoom = jest.fn();
 const mockListRoomsByTeam = jest.fn();
@@ -51,6 +52,7 @@ jest.mock('../../repositories', () => {
       removeMember: mockRemoveTeamMember,
       listMembers: mockListTeamMembers,
       getMembership: mockGetMembership,
+      setFavorite: mockSetFavorite,
     },
     hangoutRoomRepo: {
       createRoom: mockCreateRoom,
@@ -218,6 +220,9 @@ beforeEach(() => {
   mockGetMembership.mockReset().mockResolvedValue({
     teamId: '01TEAM', userId: 'dev-eve', role: 'owner', addedBy: 'dev-eve', joinedAt: '',
   });
+  mockSetFavorite.mockReset().mockImplementation(async (teamId: string, userId: string, favorite: boolean) => ({
+    teamId, userId, role: 'owner', addedBy: 'dev-eve', joinedAt: '2026-09-16T00:00:00.000Z', favorite,
+  }));
 
   mockCreateRoom.mockReset().mockImplementation(async (input) => makeChannel({
     slug: input.slug,
@@ -461,16 +466,87 @@ describe('team membership', () => {
 
 describe('GET /api/teams', () => {
   it('returns each team with its channels, for the rail', async () => {
-    mockListTeamsForUser.mockResolvedValue([{ team: makeTeam(), role: 'owner' }]);
+    mockListTeamsForUser.mockResolvedValue([{ team: makeTeam(), role: 'owner', favorite: false }]);
     mockListRoomsByTeam.mockResolvedValue([makeChannel()]);
 
     const res = await run(buildApp(), 'GET', '/api/teams', { userId: 'dev-eve' });
 
     expect(res.statusCode).toBe(200);
-    const body = res.body as { teams: Array<TeamItem & { role: string; channels: HangoutRoom[] }> };
+    const body = res.body as { teams: Array<TeamItem & { role: string; favorite: boolean; channels: HangoutRoom[] }> };
     expect(body.teams).toHaveLength(1);
     expect(body.teams[0]?.role).toBe('owner');
+    expect(body.teams[0]?.favorite).toBe(false);
     expect(body.teams[0]?.channels.map((c) => c.name)).toEqual(['General']);
+  });
+
+  it("carries the CALLER's own favourite flag, per person", async () => {
+    mockListTeamsForUser.mockImplementation(async (_orgId: string, userId: string) => [
+      { team: makeTeam(), role: 'owner', favorite: userId === 'dev-eve' },
+    ]);
+
+    const eveRes = await run(buildApp(), 'GET', '/api/teams', { userId: 'dev-eve' });
+    const carolRes = await run(buildApp(), 'GET', '/api/teams', { userId: 'dev-carol' });
+
+    const eveBody = eveRes.body as { teams: Array<{ favorite: boolean }> };
+    const carolBody = carolRes.body as { teams: Array<{ favorite: boolean }> };
+    expect(eveBody.teams[0]?.favorite).toBe(true);
+    expect(carolBody.teams[0]?.favorite).toBe(false);
+  });
+});
+
+describe('PATCH /api/teams/:teamId/me', () => {
+  it('favourites and un-favourites the team for a member', async () => {
+    const onRes = await run(buildApp(), 'PATCH', '/api/teams/01TEAM/me', {
+      body: { favorite: true },
+      userId: 'dev-eve',
+    });
+    expect(onRes.statusCode).toBe(200);
+    expect(mockSetFavorite).toHaveBeenCalledWith('01TEAM', 'dev-eve', true);
+    expect((onRes.body as { member: { favorite: boolean } }).member.favorite).toBe(true);
+
+    const offRes = await run(buildApp(), 'PATCH', '/api/teams/01TEAM/me', {
+      body: { favorite: false },
+      userId: 'dev-eve',
+    });
+    expect(offRes.statusCode).toBe(200);
+    expect(mockSetFavorite).toHaveBeenLastCalledWith('01TEAM', 'dev-eve', false);
+    expect((offRes.body as { member: { favorite: boolean } }).member.favorite).toBe(false);
+  });
+
+  it('refuses a non-member', async () => {
+    mockGetMembership.mockResolvedValue(null);
+
+    const res = await run(buildApp(), 'PATCH', '/api/teams/01TEAM/me', {
+      body: { favorite: true },
+      userId: 'dev-stranger',
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(mockSetFavorite).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-boolean body', async () => {
+    const res = await run(buildApp(), 'PATCH', '/api/teams/01TEAM/me', {
+      body: { favorite: 'yes' },
+      userId: 'dev-eve',
+    });
+    expect(res.statusCode).toBe(400);
+    expect(mockSetFavorite).not.toHaveBeenCalled();
+  });
+
+  it("never touches another member's row — only the caller's", async () => {
+    mockGetMembership.mockResolvedValue({
+      teamId: '01TEAM', userId: 'dev-carol', role: 'member', addedBy: 'dev-eve', joinedAt: '',
+    });
+
+    const res = await run(buildApp(), 'PATCH', '/api/teams/01TEAM/me', {
+      body: { favorite: true },
+      userId: 'dev-carol',
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(mockSetFavorite).toHaveBeenCalledWith('01TEAM', 'dev-carol', true);
+    expect(mockSetFavorite).not.toHaveBeenCalledWith('01TEAM', 'dev-eve', expect.anything());
   });
 });
 

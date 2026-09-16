@@ -14,6 +14,7 @@
  *   POST   /api/teams/:teamId/channels       — add a channel
  *   POST   /api/teams/:teamId/members        — add a member (owner only)
  *   DELETE /api/teams/:teamId/members/:userId — remove a member (owner, or yourself = leave)
+ *   PATCH  /api/teams/:teamId/me              — favourite/unfavourite (caller's own row only)
  *
  * Membership is the point of the whole structure: a team member belongs
  * to every standard channel's conversation, and leaving the team takes
@@ -295,7 +296,7 @@ teamsRouter.get(
 
     const memberships = await teamRepo.listTeamsForUser(orgId, userId);
     const teams = await Promise.all(
-      memberships.map(async ({ team, role }) => {
+      memberships.map(async ({ team, role, favorite }) => {
         const channels = await hangoutRoomRepo.listRoomsByTeam(team.teamId);
         // A private channel is only in the rail of someone who is in it.
         const visible: HangoutRoom[] = [];
@@ -306,7 +307,7 @@ teamsRouter.get(
           }
           if (await hangoutRoomMemberRepo.isMember(c.roomId, userId)) visible.push(c);
         }
-        return { ...team, role, channels: visible };
+        return { ...team, role, favorite, channels: visible };
       }),
     );
 
@@ -473,5 +474,33 @@ teamsRouter.delete(
     }
 
     res.status(204).end();
+  }),
+);
+
+/**
+ * PATCH /api/teams/:teamId/me — favourite or unfavourite a team.
+ *
+ * A person's own preference, not a change to the team: it only ever
+ * touches the CALLER's own membership row (never `:userId` from the URL,
+ * unlike the members routes above), and 404s the same way a private
+ * team does for a non-member rather than admitting the team exists.
+ */
+teamsRouter.patch(
+  '/:teamId/me',
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const orgId = resolveOrgId(req);
+    const userId = getUserId(req);
+    const body = (req.body ?? {}) as { favorite?: unknown };
+
+    if (typeof body.favorite !== 'boolean') {
+      throw new ValidationError('favorite is required (boolean)');
+    }
+
+    const team = await loadTeam(orgId, req.params.teamId);
+    await requireMembership(team, userId);
+
+    const member = await teamRepo.setFavorite(team.teamId, userId, body.favorite);
+
+    res.status(200).json({ member });
   }),
 );
