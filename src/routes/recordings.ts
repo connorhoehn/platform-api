@@ -137,14 +137,23 @@ recordingsRouter.get(
         },
       });
       const { items, cursor: next } = await callRecordingRepo.listByLobbyName(lobbyName, limit, cursor);
-      res.json({ items: await settleComposeForList(items), cursor: next ?? null });
+      res.json({ items: withListView(await settleComposeForList(items)), cursor: next ?? null });
       return;
     }
 
     const { items, cursor: next } = await callRecordingRepo.listByUser(userId, { limit, cursor });
-    res.json({ items: await settleComposeForList(items), cursor: next ?? null });
+    res.json({ items: withListView(await settleComposeForList(items)), cursor: next ?? null });
   }),
 );
+
+/** What a list row says beyond the stored fields: the stage and the expiry, as the detail does. */
+function withListView<T extends { ttl?: number; composeStatus?: ComposeStatus; transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus'] }>(rows: T[]): Array<T & { stage: ReturnType<typeof recordingStage>; expiresAt: string | null }> {
+  return rows.map((r) => ({
+    ...r,
+    stage: recordingStage(r),
+    expiresAt: r.ttl ? new Date(r.ttl * 1000).toISOString() : null,
+  }));
+}
 
 /**
  * Give every row in a list page a compose status that is actually TRUE.
@@ -392,6 +401,43 @@ async function resolveMedia(detail: CallRecording): Promise<{
   }
   return describeMedia(detail);
 }
+
+// --------------------------------------------------------------------
+// PATCH /api/recordings/:recordingId/expiry — when it expires
+//
+// Teams' "Set to expire … View or change". Body `{ expiresAt: ISO }` sets
+// a new date (at least an hour out); `{ expiresAt: null }` keeps the
+// recording until someone deletes it. Anyone who was in the call may
+// change it — the same gate as reading it; there is no organizer role on
+// a recording yet.
+// --------------------------------------------------------------------
+export const MIN_EXPIRY_LEAD_MS = 60 * 60 * 1000;
+export const MAX_EXPIRY_LEAD_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+
+export function parseExpiryBody(body: unknown, now = Date.now()): { expiresAt: Date | null } | { error: string } {
+  const raw = (body as { expiresAt?: unknown } | undefined)?.expiresAt;
+  if (raw === null) return { expiresAt: null };
+  if (typeof raw !== 'string' || !raw) return { error: 'expiresAt must be an ISO date, or null for no expiration' };
+  const t = Date.parse(raw);
+  if (Number.isNaN(t)) return { error: 'expiresAt is not a date' };
+  if (t < now + MIN_EXPIRY_LEAD_MS) return { error: 'expiresAt must be at least an hour from now' };
+  if (t > now + MAX_EXPIRY_LEAD_MS) return { error: 'expiresAt must be within ten years' };
+  return { expiresAt: new Date(t) };
+}
+
+recordingsRouter.patch(
+  '/recordings/:recordingId/expiry',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const { recordingId } = req.params;
+    const parsed = parseExpiryBody(req.body);
+    if ('error' in parsed) { res.status(400).json({ error: parsed.error }); return; }
+    const detail = await requireOwnRecording(req, recordingId);
+    await callRecordingRepo.updateExpiry(detail, parsed.expiresAt);
+    log.info({ recordingId, callId: detail.callId, expiresAt: parsed.expiresAt?.toISOString() ?? null, by: (req as any).user?.sub }, 'recording expiry changed');
+    res.json({ recordingId, expiresAt: parsed.expiresAt ? parsed.expiresAt.toISOString() : null });
+  }),
+);
 
 // --------------------------------------------------------------------
 // GET /api/recordings/:recordingId — single recording details

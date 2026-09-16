@@ -795,6 +795,47 @@ export class CallRecordingRepository extends BaseRepository {
    * next time. Conditional on the row existing so a reconciliation for a
    * deleted recording can't resurrect it as a status-only ghost.
    */
+  /**
+   * When the recording expires — the row's `ttl`, which DynamoDB TTL turns
+   * into deletion — on the primary row AND every participant fan-out row,
+   * because "list my recordings" reads the fan-out and a recording that
+   * expired from one and not the other would be listed but not openable.
+   * `null` removes the attribute: the recording is kept until someone
+   * deletes it.
+   */
+  async updateExpiry(rec: Pick<CallRecording, 'callId' | 'recordingId' | 'startedAt' | 'participants' | 'startedBy'>, expiresAt: Date | null): Promise<void> {
+    const ttl = expiresAt ? Math.floor(expiresAt.getTime() / 1000) : null;
+    const expr = ttl === null
+      ? { UpdateExpression: 'REMOVE #ttl', ExpressionAttributeNames: { '#ttl': 'ttl' } }
+      : { UpdateExpression: 'SET #ttl = :ttl', ExpressionAttributeNames: { '#ttl': 'ttl' }, ExpressionAttributeValues: { ':ttl': ttl } };
+    await this.docClient.send(
+      new UpdateCommand({
+        TableName: CALL_RECORDINGS_TABLE,
+        Key: { callId: rec.callId, recordingId: rec.recordingId },
+        ...expr,
+        ConditionExpression: 'attribute_exists(callId)',
+      }),
+    );
+    const fanout = fanoutSetFor(rec as CallRecording);
+    await Promise.all(
+      Array.from(fanout).map((userId) =>
+        this.docClient.send(
+          new UpdateCommand({
+            TableName: this.participantsTable,
+            Key: { userId, startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}` },
+            ...expr,
+            ConditionExpression: 'attribute_exists(userId)',
+          }),
+        ).catch((e: unknown) => {
+          // A fan-out row that was never written (an older recording) is
+          // not a reason to fail the change the person asked for.
+          if ((e as { name?: string })?.name === 'ConditionalCheckFailedException') return;
+          throw e;
+        }),
+      ),
+    );
+  }
+
   async updateComposeState(
     callId: string,
     recordingId: string,
