@@ -104,3 +104,40 @@ describe('horizontal rules', () => {
     expect(kinds).toEqual(['heading', 'horizontalRule', 'paragraph', 'horizontalRule']);
   });
 });
+
+describe('tables', () => {
+  it('parses rows, caps and squares them, and drops a table with no rows', () => {
+    const ops = parseOps('[{"op":"appendBlock","kind":"table","rows":[["Column 1","Column 2"],["only one"]]},{"op":"appendBlock","kind":"table","rows":[]},{"op":"appendBlock","kind":"table"}]');
+    expect(ops).toHaveLength(1);
+    expect(ops[0]).toEqual({ op: 'appendBlock', kind: 'table', text: '', rows: [['Column 1', 'Column 2'], ['only one', '']] });
+    const wide = parseOps(`[{"op":"appendBlock","kind":"table","rows":${JSON.stringify(Array.from({ length: 30 }, () => Array.from({ length: 12 }, () => 'x')))}}]`);
+    const rows = (wide[0] as { rows: string[][] }).rows;
+    expect(rows).toHaveLength(20);
+    expect(rows[0]).toHaveLength(8);
+  });
+
+  it('writes the shape the editor\'s table extension reads: table → tableRow → tableHeader|tableCell → paragraph → text', () => {
+    const doc = seed();
+    const result = applyOps(doc, parseOps('[{"op":"appendBlock","kind":"table","rows":[["Name","Owner"],["Audit","Carol"]]}]'), 'test');
+    expect(result.applied).toBe(1);
+    const body = doc.getXmlFragment(CANVAS_BODY_KEY);
+    const table = body.get(body.length - 1) as YT.XmlElement;
+    expect(table.nodeName).toBe('table');
+    const rows = table.toArray() as YT.XmlElement[];
+    expect(rows.map((r) => r.nodeName)).toEqual(['tableRow', 'tableRow']);
+    expect((rows[0]!.toArray() as YT.XmlElement[]).map((c) => c.nodeName)).toEqual(['tableHeader', 'tableHeader']);
+    expect((rows[1]!.toArray() as YT.XmlElement[]).map((c) => c.nodeName)).toEqual(['tableCell', 'tableCell']);
+    const cell = (rows[1]!.toArray() as YT.XmlElement[])[1]!;
+    expect((cell.toArray()[0] as YT.XmlElement).nodeName).toBe('paragraph');
+    expect(((cell.toArray()[0] as YT.XmlElement).toArray()[0] as YT.XmlText).toString()).toBe('Carol');
+    // The outline shows the model the rows, and a copy rebuilds them.
+    const outline = outlineOf(doc);
+    expect(outline.blocks[outline.blocks.length - 1]).toMatchObject({ kind: 'table', text: 'Name | Owner\nAudit | Carol' });
+  });
+
+  it('inserts a table before a block by index', () => {
+    const doc = seed();
+    applyOps(doc, parseOps('[{"op":"insertBlock","index":1,"kind":"table","rows":[["A"]]}]'), 'test');
+    expect(outlineOf(doc).blocks.map((b) => b.kind)).toEqual(['heading', 'table', 'paragraph']);
+  });
+});

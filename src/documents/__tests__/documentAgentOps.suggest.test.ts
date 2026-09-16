@@ -222,3 +222,49 @@ describe('ensureCanvasMeta', () => {
     expect(titled.getMap(CANVAS_META_KEY).get('schemaVersion')).toBe(CANVAS_SCHEMA_VERSION);
   });
 });
+
+describe('a table as a suggestion', () => {
+  function deepTexts(el: YT.XmlElement): YT.XmlText[] {
+    const out: YT.XmlText[] = [];
+    for (const c of el.toArray()) {
+      if (c instanceof Y.XmlText) out.push(c);
+      else if (c instanceof Y.XmlElement) out.push(...deepTexts(c));
+    }
+    return out;
+  }
+
+  it('every cell — an empty one through a zero-width anchor — is insert-marked under the one key', () => {
+    const doc = seed();
+    const ops = parseOps('[{"op":"appendBlock","kind":"table","rows":[["Column 1","Column 2"],["",""]]}]');
+    const result = applyOps(doc, ops, { mode: 'suggest', identity: grace });
+    expect(result).toMatchObject({ applied: 1, suggestionKey: KEY });
+    const table = blocks(doc)[blocks(doc).length - 1]!;
+    expect(table.nodeName).toBe('table');
+    const cellTexts = deepTexts(table);
+    expect(cellTexts).toHaveLength(4);
+    for (const t of cellTexts) {
+      const runs = readSuggestions(t);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ key: KEY, markName: SUGGESTION_INSERT_MARK });
+    }
+    expect(cellTexts[2]!.toDelta().map((d: { insert?: unknown }) => d.insert).join('')).toBe(ZERO_WIDTH_SPACE);
+  });
+
+  it('accepting keeps the table and strips the anchors; rejecting removes the table', () => {
+    const accepted = seed();
+    applyOps(accepted, parseOps('[{"op":"appendBlock","kind":"table","rows":[["H"],[""]]}]'), { mode: 'suggest', identity: grace });
+    applyOps(accepted, [{ op: 'acceptSuggestion', key: KEY }], 'test');
+    const table = blocks(accepted)[blocks(accepted).length - 1]!;
+    expect(table.nodeName).toBe('table');
+    expect(deepTexts(table).map((t) => t.toDelta().map((d: { insert?: unknown }) => d.insert).join(''))).toEqual(['H', '']);
+    expect(deepTexts(table).flatMap((t) => readSuggestions(t))).toHaveLength(0);
+
+    const rejected = seed();
+    const before = blocks(rejected).length;
+    applyOps(rejected, parseOps('[{"op":"appendBlock","kind":"table","rows":[["H"],[""]]}]'), { mode: 'suggest', identity: grace });
+    expect(blocks(rejected)).toHaveLength(before + 1);
+    applyOps(rejected, [{ op: 'rejectSuggestion', key: KEY }], 'test');
+    expect(blocks(rejected)).toHaveLength(before);
+    expect(blocks(rejected).some((b) => b.nodeName === 'table')).toBe(false);
+  });
+});

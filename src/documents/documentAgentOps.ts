@@ -35,8 +35,8 @@ export type DocOp =
   | { op: 'appendMacro'; macroName: string; yaml: string }
   | { op: 'skip'; reason: string }
   | { op: 'replaceBlock'; index: number; text: string }
-  | { op: 'appendBlock'; kind: BlockKind; level?: number; text: string }
-  | { op: 'insertBlock'; index: number; kind: BlockKind; level?: number; text: string }
+  | { op: 'appendBlock'; kind: BlockKind; level?: number; text: string; rows?: string[][] }
+  | { op: 'insertBlock'; index: number; kind: BlockKind; level?: number; text: string; rows?: string[][] }
   | { op: 'deleteBlock'; index: number }
   /** Resolve every suggestion under one key (`${user}@${date}`) across the whole body — a review landing server-side. */
   | { op: 'acceptSuggestion'; key: string }
@@ -69,7 +69,12 @@ export function outlineOf(doc: YT.Doc): DocumentOutline {
   const blocks: OutlineBlock[] = blocksOf(doc).map((el, index) => {
     const level = el.nodeName === 'heading' ? Number(el.getAttribute('level') ?? 1) : undefined;
     const macroName = el.nodeName === 'macro' ? el.getAttribute('macroName') ?? undefined : undefined;
-    return { index, kind: el.nodeName, ...(level ? { level } : {}), ...(macroName ? { macroName } : {}), text: plainText(el).slice(0, MAX_TEXT) };
+    // A table reads as rows — cells joined by " | ", rows by newline — so the
+    // model sees the shape, and copyBlock can rebuild it (see `tableRowsOf`).
+    const text = el.nodeName === 'table'
+      ? tableRowsOf(el).map((r) => r.join(' | ')).join('\n').slice(0, MAX_TEXT)
+      : plainText(el).slice(0, MAX_TEXT);
+    return { index, kind: el.nodeName, ...(level ? { level } : {}), ...(macroName ? { macroName } : {}), text };
   });
   const lines = [
     `title: ${title ?? '(none)'}`,
@@ -78,11 +83,66 @@ export function outlineOf(doc: YT.Doc): DocumentOutline {
   return { title, blocks, text: lines.join('\n') };
 }
 
-/** Block kinds the agent may write. A horizontal rule is a divider with no text. */
-export type BlockKind = 'paragraph' | 'heading' | 'horizontalRule';
-export const BLOCK_KINDS: readonly BlockKind[] = ['paragraph', 'heading', 'horizontalRule'];
+/** Block kinds the agent may write. A horizontal rule is a divider with no text; a table carries `rows`. */
+export type BlockKind = 'paragraph' | 'heading' | 'horizontalRule' | 'table';
+export const BLOCK_KINDS: readonly BlockKind[] = ['paragraph', 'heading', 'horizontalRule', 'table'];
 
-function makeBlock(kind: BlockKind, text: string, level?: number): YT.XmlElement {
+/** A table is capped so a light model cannot hand back a spreadsheet. */
+export const TABLE_MAX_ROWS = 20;
+export const TABLE_MAX_COLS = 8;
+const TABLE_MAX_CELL = 200;
+
+/**
+ * The shape the editor's table extension (tiptap TableKit) reads back
+ * through y-prosemirror: `table` → `tableRow` → `tableHeader` | `tableCell`
+ * → `paragraph` → text. The first row is the header. Cells have no attrs
+ * here; the extension's defaults (colspan 1, rowspan 1) apply. Every cell
+ * gets a paragraph with a text node even when empty, so a suggestion mark
+ * always has somewhere to sit.
+ */
+function makeTable(rows: string[][]): YT.XmlElement {
+  // Children are built as arrays and inserted once: a preliminary Yjs type
+  // (one not yet in a document) has no readable `length` to append at.
+  const table = new Y.XmlElement('table');
+  table.insert(0, rows.map((cells, r) => {
+    const row = new Y.XmlElement('tableRow');
+    row.insert(0, cells.map((cell) => {
+      const td = new Y.XmlElement(r === 0 ? 'tableHeader' : 'tableCell');
+      const para = new Y.XmlElement('paragraph');
+      const t = new Y.XmlText();
+      if (cell) t.insert(0, cell);
+      para.insert(0, [t]);
+      td.insert(0, [para]);
+      return td;
+    }));
+    return row;
+  }));
+  return table;
+}
+
+/** The rows of a table block as plain strings — the inverse of `makeTable`. */
+export function tableRowsOf(table: YT.XmlElement): string[][] {
+  return table.toArray()
+    .filter((n): n is YT.XmlElement => n instanceof Y.XmlElement && n.nodeName === 'tableRow')
+    .map((row) => row.toArray()
+      .filter((c): c is YT.XmlElement => c instanceof Y.XmlElement)
+      .map((cell) => plainText(cell)));
+}
+
+/** Square, capped, trimmed: every row as wide as the widest, within the caps. */
+export function normalizeTableRows(raw: unknown): string[][] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const rows = raw.slice(0, TABLE_MAX_ROWS)
+    .filter((r): r is unknown[] => Array.isArray(r))
+    .map((r) => r.slice(0, TABLE_MAX_COLS).map((c) => (typeof c === 'string' ? c.slice(0, TABLE_MAX_CELL) : typeof c === 'number' ? String(c) : '')));
+  if (rows.length === 0) return undefined;
+  const width = Math.max(...rows.map((r) => r.length));
+  if (width === 0) return undefined;
+  return rows.map((r) => [...r, ...Array.from({ length: width - r.length }, () => '')]);
+}
+
+function makeBlock(kind: BlockKind, text: string, level?: number, rows?: string[][]): YT.XmlElement {
+  if (kind === 'table') return makeTable(rows && rows.length > 0 ? rows : [['']]);
   const el = new Y.XmlElement(kind);
   if (kind === 'horizontalRule') return el;
   if (kind === 'heading') el.setAttribute('level', String(level && level >= 1 && level <= 6 ? level : 2));
@@ -106,6 +166,7 @@ function materialize(b: OutlineBlock): YT.XmlElement {
   if (b.kind === 'macro' && b.macroName) return makeMacro(b.macroName, b.text);
   if (b.kind === 'heading') return makeBlock('heading', b.text, b.level);
   if (b.kind === 'horizontalRule') return makeBlock('horizontalRule', '');
+  if (b.kind === 'table') return makeBlock('table', '', undefined, normalizeTableRows(b.text.split('\n').map((line) => line.split(' | '))));
   return makeBlock('paragraph', b.text);
 }
 
@@ -133,9 +194,11 @@ export function parseOps(text: string): DocOp[] {
     const text = typeof o.text === 'string' ? o.text.slice(0, MAX_TEXT) : undefined;
     const index = typeof o.index === 'number' && Number.isInteger(o.index) && o.index >= 0 ? o.index : undefined;
     const kind = (BLOCK_KINDS as readonly string[]).includes(String(o.kind)) ? (o.kind as BlockKind) : undefined;
-    // A divider carries no text; every other block needs some.
-    const blockText = kind === 'horizontalRule' ? '' : text;
+    // A divider carries no text, a table carries rows; every other block needs text.
+    const rows = kind === 'table' ? normalizeTableRows(o.rows) : undefined;
+    const blockText = kind === 'horizontalRule' || kind === 'table' ? '' : text;
     const level = typeof o.level === 'number' ? o.level : undefined;
+    const blockOk = kind === 'table' ? rows !== undefined : blockText !== undefined;
     switch (o.op) {
       case 'setTitle': if (text) ops.push({ op: 'setTitle', text }); break;
       case 'setDocumentType': if (typeof o.typeName === 'string' && o.typeName) ops.push({ op: 'setDocumentType', typeName: o.typeName, ...(typeof o.typeId === 'string' ? { typeId: o.typeId } : {}), ...(typeof o.icon === 'string' ? { icon: o.icon } : {}) }); break;
@@ -143,8 +206,8 @@ export function parseOps(text: string): DocOp[] {
       case 'skip': ops.push({ op: 'skip', reason: typeof o.reason === 'string' ? o.reason.slice(0, 300) : '' }); break;
       case 'appendMacro': if (typeof o.macroName === 'string' && o.macroName && typeof o.yaml === 'string') ops.push({ op: 'appendMacro', macroName: o.macroName, yaml: o.yaml.slice(0, MAX_TEXT) }); break;
       case 'replaceBlock': if (index !== undefined && text !== undefined) ops.push({ op: 'replaceBlock', index, text }); break;
-      case 'appendBlock': if (kind && blockText !== undefined) ops.push({ op: 'appendBlock', kind, text: blockText, ...(level ? { level } : {}) }); break;
-      case 'insertBlock': if (index !== undefined && kind && blockText !== undefined) ops.push({ op: 'insertBlock', index, kind, text: blockText, ...(level ? { level } : {}) }); break;
+      case 'appendBlock': if (kind && blockOk) ops.push({ op: 'appendBlock', kind, text: blockText ?? '', ...(level ? { level } : {}), ...(rows ? { rows } : {}) }); break;
+      case 'insertBlock': if (index !== undefined && kind && blockOk) ops.push({ op: 'insertBlock', index, kind, text: blockText ?? '', ...(level ? { level } : {}), ...(rows ? { rows } : {}) }); break;
       case 'deleteBlock': if (index !== undefined) ops.push({ op: 'deleteBlock', index }); break;
       case 'acceptSuggestion': if (typeof o.key === 'string' && o.key) ops.push({ op: 'acceptSuggestion', key: o.key.slice(0, 200) }); break;
       case 'rejectSuggestion': if (typeof o.key === 'string' && o.key) ops.push({ op: 'rejectSuggestion', key: o.key.slice(0, 200) }); break;
@@ -184,9 +247,35 @@ export interface ApplyOptions {
   identity?: SuggestionIdentity;
 }
 
-/** The XmlText children of a block, in order. */
+/** The XmlText runs of a block, in order — nested for a table, whose text sits in its cells. */
 function textsOf(el: YT.XmlElement): YT.XmlText[] {
-  return el.toArray().filter((c): c is YT.XmlText => c instanceof Y.XmlText);
+  const out: YT.XmlText[] = [];
+  for (const c of el.toArray()) {
+    if (c instanceof Y.XmlText) out.push(c);
+    else if (c instanceof Y.XmlElement) out.push(...textsOf(c));
+  }
+  return out;
+}
+
+/** A zero-width anchor that carries a mark where a cell has no text of its own. */
+const CELL_ANCHOR = '\u200B';
+
+/**
+ * A table proposed as a suggestion: every cell's text is insert-marked under
+ * the one key, and an empty cell gets a marked zero-width anchor so the whole
+ * table still reads — and resolves — as one insertion. Accepting strips the
+ * anchors (see `resolveSuggestion`); rejecting empties every run and the
+ * table goes with them.
+ */
+function suggestNewTable(body: YT.XmlFragment, at: number, rows: string[][], id: SuggestionIdentity): void {
+  const table = makeTable(rows.map((r) => r.map(() => '')));
+  body.insert(at, [table]);
+  const texts = textsOf(table);
+  let i = 0;
+  for (const r of rows) for (const cell of r) {
+    const t = texts[i++];
+    if (t) suggestInsertText(t, 0, cell || CELL_ANCHOR, id);
+  }
 }
 
 /** The block's text to hang a mark on — created (empty, appended) when the block has none. */
@@ -251,7 +340,11 @@ function resolveSuggestion(body: YT.XmlFragment, key: string, decision: 'accept'
     const removable = decision === 'accept'
       ? runs.every((r) => r.markName === SUGGESTION_DELETE_MARK)
       : runs.every((r) => r.markName === SUGGESTION_INSERT_MARK);
-    for (const t of textsOf(el)) (decision === 'accept' ? acceptSuggestions : rejectSuggestions)(t, key);
+    for (const t of textsOf(el)) {
+      (decision === 'accept' ? acceptSuggestions : rejectSuggestions)(t, key);
+      // An accepted anchor is content now; it was only ever there to carry the mark.
+      if (decision === 'accept' && plainText(t) === CELL_ANCHOR) t.delete(0, t.length);
+    }
     if (removable && textsOf(el).every((t) => t.length === 0)) {
       const at = body.toArray().indexOf(el);
       if (at >= 0) body.delete(at, 1);
@@ -333,8 +426,9 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
         }
         case 'appendBlock':
           // A divider has no text to carry a suggestion mark, so it lands directly even in suggest mode.
-          if (id && op.kind !== 'horizontalRule') suggestNewBlock(body, body.length, op.kind, op.text, id, op.level);
-          else body.insert(body.length, [makeBlock(op.kind, op.text, op.level)]);
+          if (id && op.kind === 'table') suggestNewTable(body, body.length, op.rows ?? [['']], id);
+          else if (id && (op.kind === 'paragraph' || op.kind === 'heading')) suggestNewBlock(body, body.length, op.kind, op.text, id, op.level);
+          else body.insert(body.length, [makeBlock(op.kind, op.text, op.level, op.rows)]);
           result.applied += 1;
           break;
         case 'appendMacro':
@@ -348,6 +442,7 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
           if (!src) { result.skipped += 1; break; }
           if (id) {
             if (src.kind === 'macro' && src.macroName) suggestNewBlock(body, body.length, 'macro', src.text, id, undefined, src.macroName);
+            else if (src.kind === 'table') suggestNewTable(body, body.length, normalizeTableRows(src.text.split('\n').map((line) => line.split(' | '))) ?? [['']], id);
             else suggestNewBlock(body, body.length, src.kind === 'heading' ? 'heading' : 'paragraph', src.text, id, src.level);
           } else body.insert(body.length, [materialize(src)]);
           result.applied += 1;
@@ -366,8 +461,9 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
           // Position in the FRAGMENT, which may hold non-element nodes too.
           const at = el ? body.toArray().indexOf(el) : -1;
           const pos = at < 0 ? body.length : at;
-          if (id && op.kind !== 'horizontalRule') suggestNewBlock(body, pos, op.kind, op.text, id, op.level);
-          else body.insert(pos, [makeBlock(op.kind, op.text, op.level)]);
+          if (id && op.kind === 'table') suggestNewTable(body, pos, op.rows ?? [['']], id);
+          else if (id && (op.kind === 'paragraph' || op.kind === 'heading')) suggestNewBlock(body, pos, op.kind, op.text, id, op.level);
+          else body.insert(pos, [makeBlock(op.kind, op.text, op.level, op.rows)]);
           result.applied += 1;
           break;
         }
