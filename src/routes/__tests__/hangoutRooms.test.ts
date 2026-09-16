@@ -524,3 +524,20 @@ describe('room membership → chat membership mirror', () => {
     expect(mockSyncRoomOnce).not.toHaveBeenCalled();
   });
 });
+
+describe('GET /api/rooms/:slug/members', () => {
+  it('lists a private room\'s members for its owner', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester', visibility: 'private' }));
+    mockListMembers.mockResolvedValue([{ roomId: 'r1', userId: 'dev-carol', role: 'member' }]);
+    const res = await run(buildApp(), 'GET', '/api/rooms/team-standup/members', { userId: 'tester' });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { members: Array<{ userId: string }> }).members.map((m) => m.userId)).toEqual(['dev-carol']);
+  });
+
+  it('refuses an outsider on a private room', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'owner-1', visibility: 'private' }));
+    mockListMembers.mockResolvedValue([]);
+    const res = await run(buildApp(), 'GET', '/api/rooms/team-standup/members', { userId: 'stranger' });
+    expect(res.statusCode).toBe(403);
+  });
+});

@@ -38,8 +38,7 @@ import {
 import {
   asyncHandler,
   ValidationError,
-  AppError,
-} from '../middleware/error-handler';
+  AppError, ForbiddenError } from '../middleware/error-handler';
 import { canCreateRoom } from '../middleware/canCreateRoom';
 import log from '../lib/logger';
 import { mirrorRoomMembers, mirrorRoomMemberRemoval, syncRoomOnce } from '../gateway/chatMembership';
@@ -503,6 +502,26 @@ hangoutRoomsRouter.post(
 
     await hangoutRoomRepo.archiveRoom(orgId, room.roomId);
     res.status(200).json({ ok: true, slug });
+  }),
+);
+
+/**
+ * GET /api/rooms/:slug/members — who is in a private room. The owner and
+ * members may look; the room admin page lists them here (it used to ask
+ * for a route that did not exist and showed "Not Found" over an empty
+ * list). An org-visible room has no roster and answers an empty list.
+ */
+hangoutRoomsRouter.get(
+  '/:slug/members',
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const orgId = resolveOrgId(req);
+    const userId = getUserId(req);
+    const slug = req.params.slug;
+    const room = await loadActiveRoom(orgId, slug);
+    const members = await hangoutRoomMemberRepo.listMembers(room.roomId);
+    const mine = room.createdBy === userId || members.some((m) => m.userId === userId);
+    if (room.visibility === 'private' && !mine) throw new ForbiddenError('Not a member of this room');
+    res.json({ members });
   }),
 );
 
