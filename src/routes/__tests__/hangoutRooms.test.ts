@@ -17,6 +17,17 @@ const mockListRoomsByOrg = jest.fn();
 const mockSearchRooms = jest.fn();
 const mockIsMember = jest.fn();
 const mockAddMember = jest.fn();
+const mockRemoveMember = jest.fn(async () => undefined);
+const mockListMembers = jest.fn(async () => [] as unknown[]);
+
+const mockMirrorRoomMembers = jest.fn();
+const mockMirrorRoomMemberRemoval = jest.fn();
+const mockSyncRoomOnce = jest.fn();
+jest.mock('../../gateway/chatMembership', () => ({
+  mirrorRoomMembers: (...a: unknown[]) => mockMirrorRoomMembers(...a),
+  mirrorRoomMemberRemoval: (...a: unknown[]) => mockMirrorRoomMemberRemoval(...a),
+  syncRoomOnce: (...a: unknown[]) => mockSyncRoomOnce(...a),
+}));
 
 jest.mock('../../repositories', () => {
   const actual = jest.requireActual('../../repositories');
@@ -33,6 +44,8 @@ jest.mock('../../repositories', () => {
     hangoutRoomMemberRepo: {
       isMember: mockIsMember,
       addMember: mockAddMember,
+      removeMember: mockRemoveMember,
+      listMembers: mockListMembers,
     },
   };
 });
@@ -473,5 +486,41 @@ describe('POST /api/rooms/:slug/leave — clientId reaches the video end', () =>
       participantId: 'alice-widget',
       clientId: 'tab-7',
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The room's conversation follows the room's membership (gateway mirror)
+// ---------------------------------------------------------------------------
+
+describe('room membership → chat membership mirror', () => {
+  beforeEach(() => { mockMirrorRoomMembers.mockClear(); mockMirrorRoomMemberRemoval.mockClear(); mockSyncRoomOnce.mockClear(); });
+
+  it('adding a member mirrors them into the conversation as the owner', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester', visibility: 'private' }));
+    mockAddMember.mockResolvedValue({ roomId: 'r1', userId: 'carol', role: 'member', addedBy: 'tester', addedAt: 'now' });
+    const res = await run(buildApp(), 'POST', '/api/rooms/team-standup/members', { userId: 'tester', body: { userId: 'carol' } });
+    expect(res.statusCode).toBe(201);
+    expect(mockMirrorRoomMembers).toHaveBeenCalledWith({ slug: 'team-standup', ownerId: 'tester', members: [{ userId: 'carol' }] });
+  });
+
+  it('removing a member mirrors the removal', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester', visibility: 'private' }));
+    const res = await run(buildApp(), 'DELETE', '/api/rooms/team-standup/members/carol', { userId: 'tester' });
+    expect(res.statusCode).toBe(204);
+    expect(mockMirrorRoomMemberRemoval).toHaveBeenCalledWith({ slug: 'team-standup', userId: 'carol', byOwnerId: 'tester' });
+  });
+
+  it('loading a private room syncs its roster once; an org room does not', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester', visibility: 'private' }));
+    mockIsMember.mockResolvedValue(true);
+    let res = await run(buildApp(), 'GET', '/api/rooms/team-standup', { userId: 'tester' });
+    expect(res.statusCode).toBe(200);
+    expect(mockSyncRoomOnce).toHaveBeenCalledWith('team-standup', expect.any(Function));
+    mockSyncRoomOnce.mockClear();
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester', visibility: 'org' }));
+    res = await run(buildApp(), 'GET', '/api/rooms/team-standup', { userId: 'tester' });
+    expect(res.statusCode).toBe(200);
+    expect(mockSyncRoomOnce).not.toHaveBeenCalled();
   });
 });

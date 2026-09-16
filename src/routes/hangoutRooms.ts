@@ -43,6 +43,7 @@ import {
 } from '../middleware/error-handler';
 import { canCreateRoom } from '../middleware/canCreateRoom';
 import log from '../lib/logger';
+import { mirrorRoomMembers, mirrorRoomMemberRemoval, syncRoomOnce } from '../gateway/chatMembership';
 
 export const hangoutRoomsRouter = Router();
 
@@ -337,6 +338,16 @@ hangoutRoomsRouter.get(
     const room = await loadActiveRoom(orgId, slug);
     await assertCanAccess(room, userId, orgId);
 
+    // A private room's conversation carries the room's members. Converge
+    // here, lazily, so rooms that predate the mirror need no backfill.
+    if (room.visibility === 'private') {
+      syncRoomOnce(slug, async () => ({
+        slug,
+        ownerId: room.createdBy,
+        members: (await hangoutRoomMemberRepo.listMembers(room.roomId)).map((m) => ({ userId: m.userId })),
+      }));
+    }
+
     res.status(200).json({ room });
   }),
 );
@@ -506,6 +517,9 @@ hangoutRoomsRouter.post(
       userId,
     );
     void hangoutRoomRepo.touchLastActive(orgId, room.roomId);
+    // The room's conversation follows: the new member can read it, with its
+    // history — a room member is entitled to the room's past.
+    mirrorRoomMembers({ slug, ownerId: room.createdBy, members: [{ userId: body.userId }] });
     res.status(201).json({ member });
   }),
 );
@@ -528,6 +542,9 @@ hangoutRoomsRouter.delete(
 
     await hangoutRoomMemberRepo.removeMember(room.roomId, targetUserId);
     void hangoutRoomRepo.touchLastActive(orgId, room.roomId);
+    // Out of the room, out of its conversation — the gateway evicts their
+    // live connections too.
+    mirrorRoomMemberRemoval({ slug, userId: targetUserId, byOwnerId: room.createdBy });
     res.status(204).end();
   }),
 );
