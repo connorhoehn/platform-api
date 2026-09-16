@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { profilesRouter } from './profiles';
 import { socialRouter } from './social';
 import { groupsRouter } from './groups';
+import { teamsRouter } from './teams';
 import { groupMembersRouter } from './group-members';
 import { roomsRouter } from './rooms';
 import { groupRoomsRouter } from './group-rooms';
@@ -94,6 +95,10 @@ router.use('/chat/panels', requireAuth, chatPanelsRouter);
 router.use('/calls', callLogRouter);
 router.use('/profiles', profilesRouter);
 router.use('/social', socialRouter);
+// Teams and their channels. A channel is a hangout room carrying the
+// team's teamId, so `/api/rooms/*` still owns everything about one
+// channel; this router owns the team that groups them.
+router.use('/teams', teamsRouter);
 router.use('/groups', groupsRouter);
 router.use('/groups/:groupId', groupMembersRouter);
 router.use('/groups/:groupId/rooms', groupRoomsRouter);

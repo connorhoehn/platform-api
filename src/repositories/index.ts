@@ -20,6 +20,7 @@ import { CallReactionRepository } from './CallReactionRepository';
 import { MediaCatalogRepository } from './MediaCatalogRepository';
 import { HangoutRoomRepository } from './HangoutRoomRepository';
 import { HangoutRoomMemberRepository } from './HangoutRoomMemberRepository';
+import { TeamRepository } from './TeamRepository';
 import { ChangeVerdictRepository } from './ChangeVerdictRepository';
 import { CallLogRepository } from './CallLogRepository';
 import { VoicemailRepository } from './VoicemailRepository';
@@ -47,6 +48,7 @@ export const callReactionRepo = new CallReactionRepository(docClient);
 export const mediaCatalogRepo = new MediaCatalogRepository(docClient);
 export const hangoutRoomRepo = new HangoutRoomRepository(docClient);
 export const hangoutRoomMemberRepo = new HangoutRoomMemberRepository(docClient);
+export const teamRepo = new TeamRepository(docClient);
 export const changeVerdictRepo = new ChangeVerdictRepository(docClient);
 
 export { BaseRepository } from './BaseRepository';
@@ -144,6 +146,7 @@ export {
   HangoutRoomState,
   HangoutRoomVisibility,
   CreateHangoutRoomInput,
+  ChannelPrivacy,
   ListRoomsOpts as ListHangoutRoomsOpts,
   ListRoomsResult as ListHangoutRoomsResult,
   SearchRoomsOpts as SearchHangoutRoomsOpts,
@@ -162,6 +165,20 @@ export {
   ListRoomsForUserResult,
   HANGOUT_ROOM_MEMBERS_TABLE,
 } from './HangoutRoomMemberRepository';
+export {
+  TeamRepository,
+  TeamItem,
+  TeamMemberItem,
+  TeamMemberRole,
+  TeamState,
+  TeamVisibility,
+  CreateTeamInput,
+  TeamSlugConflictError,
+  TeamNotFoundError,
+  TeamAccessDeniedError,
+  TEAMS_TABLE,
+  TEAM_MEMBERS_TABLE,
+} from './TeamRepository';
 export {
   ChangeVerdictRepository,
   ChangeVerdictRow,

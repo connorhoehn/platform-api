@@ -46,6 +46,13 @@ export interface HangoutRoomSettings {
   softCap: number;
 }
 
+/**
+ * A channel inside a team is `standard` (everyone on the team is in it)
+ * or `private` (an explicit few). Absent on a room that is not a team
+ * channel, which is every room that predates teams.
+ */
+export type ChannelPrivacy = 'standard' | 'private';
+
 export interface HangoutRoom {
   orgId: string;
   roomId: string;
@@ -60,6 +67,10 @@ export interface HangoutRoom {
   lastActiveAt: string;
   archivedAt?: string;
   ttl?: number;
+  /** Set when this room is a team's channel; absent for a standalone room. */
+  teamId?: string;
+  /** Only meaningful alongside `teamId`. */
+  channelPrivacy?: ChannelPrivacy;
 }
 
 export interface CreateHangoutRoomInput {
@@ -70,6 +81,8 @@ export interface CreateHangoutRoomInput {
   visibility: HangoutRoomVisibility;
   settings: HangoutRoomSettings;
   createdBy: string;
+  teamId?: string;
+  channelPrivacy?: ChannelPrivacy;
 }
 
 export interface ListRoomsOpts {
@@ -157,6 +170,8 @@ export class HangoutRoomRepository extends BaseRepository {
       settings: input.settings,
       state: 'active',
       lastActiveAt: now,
+      ...(input.teamId !== undefined ? { teamId: input.teamId } : {}),
+      ...(input.channelPrivacy !== undefined ? { channelPrivacy: input.channelPrivacy } : {}),
     };
 
     await this.putItem(room as unknown as Record<string, unknown>);
@@ -222,6 +237,27 @@ export class HangoutRoomRepository extends BaseRepository {
       : undefined;
 
     return cursor ? { items, cursor } : { items };
+  }
+
+  /**
+   * A team's channels, via the teamId GSI. Active channels only — an
+   * archived channel is gone from the team's rail the way an archived
+   * room is gone from the directory. Ordered oldest-first so a team's
+   * General (created with the team) leads, as it does in Teams.
+   */
+  async listRoomsByTeam(teamId: string): Promise<HangoutRoom[]> {
+    const result = await this.docClient.send(
+      new QueryCommand({
+        TableName: HANGOUT_ROOMS_TABLE,
+        IndexName: 'teamId-index',
+        KeyConditionExpression: 'teamId = :t',
+        FilterExpression: '#st = :st',
+        ExpressionAttributeNames: { '#st': 'state' },
+        ExpressionAttributeValues: { ':t': teamId, ':st': 'active' },
+      }),
+    );
+    const items = (result.Items ?? []) as HangoutRoom[];
+    return items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   /**
