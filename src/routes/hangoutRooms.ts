@@ -515,7 +515,7 @@ hangoutRoomsRouter.post(
     const orgId = resolveOrgId(req);
     const userId = getUserId(req);
     const { slug } = req.params;
-    const body = (req.body ?? {}) as { userId?: string; role?: string };
+    const body = (req.body ?? {}) as { userId?: string; role?: string; displayName?: string; byName?: string };
 
     if (!body.userId) throw new ValidationError('userId is required');
     const role = body.role === 'owner' ? 'owner' : 'member';
@@ -535,8 +535,10 @@ hangoutRoomsRouter.post(
     mirrorRoomMembers({
       slug,
       ownerId: room.createdBy,
-      ownerName: await displayNameOf(room.createdBy),
-      members: [{ userId: body.userId, displayName: await displayNameOf(body.userId) }],
+      // The client knows the names (its people directory is presence-fed);
+      // profiles are the fallback, ids the last resort.
+      ownerName: (typeof body.byName === 'string' && body.byName.slice(0, 80)) || await displayNameOf(room.createdBy),
+      members: [{ userId: body.userId, displayName: (typeof body.displayName === 'string' && body.displayName.slice(0, 80)) || await displayNameOf(body.userId) }],
     });
     res.status(201).json({ member });
   }),
@@ -565,9 +567,9 @@ hangoutRoomsRouter.delete(
     mirrorRoomMemberRemoval({
       slug,
       userId: targetUserId,
-      name: await displayNameOf(targetUserId),
+      name: (typeof req.query.name === 'string' && req.query.name.slice(0, 80)) || await displayNameOf(targetUserId),
       byOwnerId: room.createdBy,
-      byOwnerName: await displayNameOf(room.createdBy),
+      byOwnerName: (typeof req.query.byName === 'string' && req.query.byName.slice(0, 80)) || await displayNameOf(room.createdBy),
     });
     res.status(204).end();
   }),

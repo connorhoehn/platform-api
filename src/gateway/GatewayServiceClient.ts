@@ -13,6 +13,13 @@ export interface ServiceIdentity {
   userId: string;
   displayName: string;
   color?: string;
+  /**
+   * `person`: the service is acting AS a signed-in person (mirroring a room
+   * member into its conversation as the room's owner). The token then carries
+   * no "(agent)" family name and a person-shaped email, so the gateway names
+   * them as themselves rather than "dev-eve (agent)". Default `agent`.
+   */
+  kind?: 'agent' | 'person';
 }
 
 const b64url = (s: string) => Buffer.from(s).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
@@ -25,11 +32,12 @@ const b64url = (s: string) => Buffer.from(s).toString('base64').replace(/=+$/, '
  */
 export function serviceToken(identity: ServiceIdentity): string {
   const header = b64url(JSON.stringify({ alg: 'none', typ: 'JWT' }));
+  const person = identity.kind === 'person';
   const payload = b64url(JSON.stringify({
     sub: identity.userId,
     given_name: identity.displayName,
-    family_name: '(agent)',
-    email: `${identity.userId.replace(/[^a-z0-9]+/gi, '-')}@agents.local`,
+    ...(person ? {} : { family_name: '(agent)' }),
+    email: `${identity.userId.replace(/[^a-z0-9]+/gi, '-')}@${person ? 'local.dev' : 'agents.local'}`,
     iat: Math.floor(Date.now() / 1000),
   }));
   return `${header}.${payload}.`;

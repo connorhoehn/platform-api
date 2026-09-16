@@ -91,7 +91,7 @@ export async function fetchChatMembers(client: GatewayServiceClient, channel: st
  */
 export async function ensureRoomChatMembers(input: EnsureRoomChatMembersInput): Promise<{ added: string[] }> {
   const channel = roomChatChannel(input.slug);
-  const client = clientFactory({ userId: input.ownerId, displayName: input.ownerName ?? input.ownerId }, input.gatewayUrl);
+  const client = clientFactory({ userId: input.ownerId, displayName: input.ownerName ?? input.ownerId, kind: 'person' }, input.gatewayUrl);
   await client.connect();
   try {
     const current = await fetchChatMembers(client, channel);
@@ -129,7 +129,7 @@ export async function ensureRoomChatMembers(input: EnsureRoomChatMembersInput): 
 /** Take a person out of the room's conversation, as the owner (or as themselves). */
 export async function removeRoomChatMember(input: RemoveRoomChatMemberInput): Promise<void> {
   const channel = roomChatChannel(input.slug);
-  const client = clientFactory({ userId: input.byOwnerId, displayName: input.byOwnerName ?? input.byOwnerId }, input.gatewayUrl);
+  const client = clientFactory({ userId: input.byOwnerId, displayName: input.byOwnerName ?? input.byOwnerId, kind: 'person' }, input.gatewayUrl);
   await client.connect();
   try {
     const answer = client.waitFor(
