@@ -26,8 +26,15 @@ import log from '../lib/logger';
 export const CALL_LOG_TABLE = tableName('call-log');
 
 export type CallOutcome = 'ringing' | 'answered' | 'missed' | 'declined' | 'cancelled';
-export type CallDirection = 'incoming' | 'outgoing';
-export type CallEventAction = 'invite' | 'accepted' | 'declined' | 'cancelled' | 'ended' | 'missed' | 'voicemail';
+/**
+ * `joined` is the third thing a call can be. A ring has a direction because
+ * somebody aimed it at somebody; walking into a room or the shared hangout is
+ * aimed at a PLACE, so it is neither incoming nor outgoing. Teams lists those
+ * meetings in the same history as its calls, and so do we — with their own
+ * direction rather than a guess at which way the ring went.
+ */
+export type CallDirection = 'incoming' | 'outgoing' | 'joined';
+export type CallEventAction = 'invite' | 'accepted' | 'declined' | 'cancelled' | 'ended' | 'missed' | 'voicemail' | 'joined';
 
 export interface CallEvent {
   callId: string;
@@ -77,6 +84,11 @@ const PRECEDENCE: Record<CallOutcome, number> = { ringing: 0, missed: 1, cancell
 
 /** Everyone a call touches: the caller and the rung. */
 export function participantsOf(event: CallEvent): string[] {
+  // A `joined` event is one person reporting their OWN attendance of a place.
+  // It must never write rows for anyone else: the other people in the room
+  // report their own joins, and a roster snapshot taken at the moment I walked
+  // in would forge history for whoever happened to be standing there.
+  if (event.action === 'joined') return [event.callerId].filter(Boolean);
   return [...new Set([event.callerId, ...event.targetUserIds].filter(Boolean))];
 }
 
@@ -157,6 +169,16 @@ export function applyCallEvent(row: CallLogRow | null, event: CallEvent, userId:
       if (event.voicemailId) next.voicemailId = event.voicemailId;
       if (typeof event.voicemailDurationMs === 'number') next.voicemailDurationMs = event.voicemailDurationMs;
       break;
+    case 'joined':
+      // I am in this call, whatever the row thought before. A place's row can
+      // be created by the ambient invite the shared hangout broadcasts (which
+      // reads as `outgoing` because I sent it), so this OVERWRITES direction
+      // rather than only setting it on a fresh row — the join is the more
+      // specific fact and it is reported by the one client that knows it.
+      next.direction = 'joined';
+      promote('answered');
+      if (!next.answeredAt) next.answeredAt = at;
+      break;
     case 'invite':
     default:
       break;
@@ -166,6 +188,31 @@ export function applyCallEvent(row: CallLogRow | null, event: CallEvent, userId:
     if (Number.isFinite(ms) && ms >= 0) next.durationMs = ms;
   }
   return next;
+}
+
+/**
+ * How long a row may claim to be `ringing` before nobody believes it.
+ *
+ * Clients report the terminal event, and a client that is gone reports
+ * nothing: close the tab that placed a call before its sixty-second ring is
+ * up and the row it wrote stays `ringing` forever. Resolving that at READ
+ * time — here, rather than on the page — is deliberate. The page is one of
+ * three readers (the list, the `missed` lane and the badge all run through
+ * `listForUser`), and a fix in the page would leave the other two telling a
+ * different story about the same row. It is also non-destructive: nothing is
+ * written, so a genuinely late `accepted` report still wins when it lands.
+ *
+ * The bound is the client's 60s ring plus its 30s post-accept media deadline,
+ * with room for a slow reporter — anything past that was never answered.
+ */
+export const STALE_RINGING_MS = 5 * 60_000;
+
+/** A row as a reader should see it: a ring nobody ever resolved is a no-answer. */
+export function resolveStaleRinging(row: CallLogRow, nowMs = Date.now()): CallLogRow {
+  if (row.outcome !== 'ringing') return row;
+  const started = Date.parse(row.startedAt);
+  if (!Number.isFinite(started) || nowMs - started <= STALE_RINGING_MS) return row;
+  return { ...row, outcome: 'missed' };
 }
 
 export type CallLogFilter = 'all' | 'missed' | 'incoming' | 'outgoing' | 'voicemail';
@@ -240,7 +287,9 @@ export class CallLogRepository extends BaseRepository {
       KeyConditionExpression: 'userId = :u',
       ExpressionAttributeValues: { ':u': userId },
     }));
+    const now = Date.now();
     const rows = ((result.Items ?? []) as CallLogRow[])
+      .map((r) => resolveStaleRinging(r, now))
       .filter((r) => matchesFilter(r, filter))
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
     return rows.slice(0, limit);

@@ -1,4 +1,4 @@
-import { applyCallEvent, matchesFilter, participantsOf, type CallEvent, type CallLogRow } from '../CallLogRepository';
+import { applyCallEvent, matchesFilter, participantsOf, resolveStaleRinging, STALE_RINGING_MS, type CallEvent, type CallLogRow } from '../CallLogRepository';
 
 const T0 = '2026-09-09T10:00:00.000Z', T1 = '2026-09-09T10:00:05.000Z', T2 = '2026-09-09T10:03:05.000Z';
 const base = (over: Partial<CallEvent>): CallEvent => ({ callId: 'c1', action: 'invite', callerId: 'ana', callerName: 'Ana', targetUserIds: ['bob'], lobbyName: 'dm:ana:bob', at: T0, ...over });
@@ -90,5 +90,62 @@ describe('voicemail on the call log', () => {
     const ana = run(events, 'ana');
     expect(ana.voicemailId).toBe('vm-2');
     expect(matchesFilter(ana, 'voicemail')).toBe(false);
+  });
+});
+
+describe('a call you joined rather than rang', () => {
+  const join = (over: Partial<CallEvent> = {}): CallEvent =>
+    ({ callId: 'r1', action: 'joined', callerId: 'eve', callerName: 'Eve', targetUserIds: [], lobbyName: 'room:design-standup', at: T0, ...over });
+
+  it('is neither incoming nor outgoing, and counts as answered from the moment you are in', () => {
+    const row = run([join()], 'eve');
+    expect(row).toMatchObject({ direction: 'joined', outcome: 'answered', answeredAt: T0, targetUserIds: [] });
+  });
+
+  it('only ever writes the row of whoever joined — a room roster is not a call list', () => {
+    expect(participantsOf(join({ targetUserIds: ['ana', 'bob'] }))).toEqual(['eve']);
+  });
+
+  it('overrides the direction the ambient shared-hangout invite guessed', () => {
+    // Opening `global-hangout` broadcasts an untargeted invite, which reads as
+    // an outgoing ring to the person who sent it. The join is the truth.
+    const row = run([
+      base({ callId: 'r1', lobbyName: 'global-hangout', targetUserIds: [], callerId: 'eve' }),
+      join({ lobbyName: 'global-hangout', at: T1 }),
+    ], 'eve');
+    expect(row).toMatchObject({ direction: 'joined', outcome: 'answered', startedAt: T0 });
+  });
+
+  it('takes its length from the end the session reports on its way out', () => {
+    const row = run([join(), base({ callId: 'r1', action: 'ended', callerId: 'eve', targetUserIds: [], at: T2 })], 'eve');
+    expect(row).toMatchObject({ outcome: 'answered', durationMs: 185_000 });
+  });
+
+  it('shows up under All and in neither ring lane', () => {
+    const row = run([join()], 'eve');
+    expect(matchesFilter(row, 'all')).toBe(true);
+    expect(matchesFilter(row, 'incoming')).toBe(false);
+    expect(matchesFilter(row, 'outgoing')).toBe(false);
+    expect(matchesFilter(row, 'missed')).toBe(false);
+  });
+});
+
+describe('a ring nobody ever resolved', () => {
+  const ringing = run([base({})], 'ana');
+  const startedMs = Date.parse(ringing.startedAt);
+
+  it('still reads as ringing while a ring could plausibly be in flight', () => {
+    expect(resolveStaleRinging(ringing, startedMs + 30_000).outcome).toBe('ringing');
+  });
+
+  it('reads as a no-answer once no client could still be counting', () => {
+    // The tab that placed it was closed before its sixty-second clock fired,
+    // so no terminal event is ever coming. The reader resolves it.
+    expect(resolveStaleRinging(ringing, startedMs + STALE_RINGING_MS + 1).outcome).toBe('missed');
+  });
+
+  it('never rewrites an outcome that was actually reported', () => {
+    const answered = run([base({}), base({ action: 'accepted', at: T1 })], 'ana');
+    expect(resolveStaleRinging(answered, startedMs + 86_400_000)).toBe(answered);
   });
 });

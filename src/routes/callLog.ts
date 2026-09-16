@@ -9,7 +9,10 @@ import { VOICEMAIL_MAX_BYTES, VOICEMAIL_MAX_DURATION_MS } from '../repositories/
 import type { CallEvent, CallLogFilter } from '../repositories/CallLogRepository';
 
 // `voicemail` is not reportable here — it is applied by POST /voicemail, which owns the bytes.
-const ACTIONS = new Set(['invite', 'accepted', 'declined', 'cancelled', 'ended', 'missed']);
+// `joined` IS reportable: it is how a call you walked into (a room, the shared
+// hangout) reaches the log, since a place broadcasts no ring for the frame
+// reporter to overhear. It only ever writes the reporter's own row.
+const ACTIONS = new Set(['invite', 'accepted', 'declined', 'cancelled', 'ended', 'missed', 'joined']);
 const FILTERS = new Set<CallLogFilter>(['all', 'missed', 'incoming', 'outgoing', 'voicemail']);
 
 function parseEvent(body: unknown, reporterId: string): CallEvent {
@@ -24,7 +27,11 @@ function parseEvent(body: unknown, reporterId: string): CallEvent {
   return {
     callId: b.callId,
     action: b.action as CallEvent['action'],
-    callerId: b.callerId,
+    // A join is a claim about YOURSELF. Taking the caller id from the token
+    // rather than the body means no client can write attendance into somebody
+    // else's history; every other action is a frame both parties saw, so the
+    // body's caller id is the shared fact and stands.
+    callerId: b.action === 'joined' ? reporterId : b.callerId,
     ...(typeof b.callerName === 'string' ? { callerName: b.callerName } : {}),
     targetUserIds: targets,
     lobbyName: b.lobbyName,
