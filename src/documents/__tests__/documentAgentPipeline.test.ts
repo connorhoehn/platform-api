@@ -3,6 +3,7 @@
 // plan before it lands.
 import {
   buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, createDocumentReviewHandler, reviewPlan,
+  suggestionAuthorName,
   DOCUMENT_READ_KIND, DOCUMENT_REVIEW_KIND, DOCUMENT_APPLY_KIND, DOCUMENT_IO_RETRY, DOCUMENT_PLAN_RETRY, APPROVAL_TIMEOUT_MS,
 } from '../documentAgentPipeline';
 import { parseOps } from '../documentAgentOps';
@@ -90,5 +91,25 @@ describe('the review step', () => {
   it('follows opsFrom like the apply step', async () => {
     const out = await createDocumentReviewHandler().execute(node({ opsFrom: 'transcriptOps' }), { transcriptOps: [{ op: 'deleteBlock', index: 0 }] }, helpers);
     expect(out.output).toMatchObject({ needsApproval: true });
+  });
+});
+
+describe('who a suggestion is from', () => {
+  it('names the person who asked, with the model second', () => {
+    // Not "Haiku". That says which engine ran, not who to talk to about the
+    // change — the least useful name on a card in a shared document.
+    expect(suggestionAuthorName('Eve Thompson', 'Haiku')).toBe('Eve Thompson (powered by Haiku)');
+  });
+
+  it('falls back to the agent when nobody is named', () => {
+    // A run started by an API caller or a schedule has no person behind it.
+    // Attributed to something beats attributed to an empty string.
+    for (const nobody of [undefined, null, '', '   ', 42]) {
+      expect(suggestionAuthorName(nobody, 'Haiku')).toBe('Haiku');
+    }
+  });
+
+  it('trims, so a stray space cannot produce " (powered by Haiku)"', () => {
+    expect(suggestionAuthorName('  Eve  ', 'Haiku')).toBe('Eve (powered by Haiku)');
   });
 });

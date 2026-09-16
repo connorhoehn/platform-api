@@ -18,6 +18,24 @@ export const DOCUMENT_AGENT_EDIT_PIPELINE_ID = 'document-agent-edit';
 export const DOCUMENT_TRANSFORM_PIPELINE_ID = 'document-transform';
 /** A person's Accept/Reject of an agent's suggestions, landing server-side through the same apply step. */
 export const DOCUMENT_AGENT_REVIEW_PIPELINE_ID = 'document-agent-review';
+/**
+ * Who a suggestion is FROM: the person who asked, with the model second.
+ *
+ * "Eve (powered by Haiku)" rather than "Haiku". The agent's own name tells a
+ * reader which engine ran and not who to talk to about the change — in a
+ * document with several collaborators that is the least useful name on the
+ * card. `requestedByName` has always been in the run context (the plan prompt
+ * interpolates it); it simply never reached the suggestion mark.
+ *
+ * Falls back to the bare agent name when no person is known, so a run started
+ * by an API caller or a schedule is attributed to something rather than to an
+ * empty string.
+ */
+export function suggestionAuthorName(requestedByName: unknown, agentName: string): string {
+  const person = typeof requestedByName === 'string' ? requestedByName.trim() : '';
+  return person ? `${person} (powered by ${agentName})` : agentName;
+}
+
 export const DOCUMENT_READ_KIND = 'document:read';
 /**
  * The plan: ONE model call, not an agent session. It used to be an `agent`
@@ -375,7 +393,15 @@ export function createDocumentApplyHandler(): StepHandler {
         const sourceBlocks = Array.isArray(context.sourceBlocks) ? (context.sourceBlocks as OutlineBlock[]) : [];
         const result = applyOps(agent.doc, ops, {
           origin: 'agent', sourceBlocks, mode,
-          ...(mode === 'suggest' ? { identity: createSuggestionIdentity(identity.userId, identity.displayName, Date.now()) } : {}),
+          ...(mode === 'suggest'
+            ? {
+              identity: createSuggestionIdentity(
+                identity.userId,
+                suggestionAuthorName(context.requestedByName, identity.displayName),
+                Date.now(),
+              ),
+            }
+            : {}),
         });
         log.info({ documentId, ...result, mode, seeded, ops: ops.length }, 'document agent edit applied');
         // The step is done the moment the edit is in the document — the
