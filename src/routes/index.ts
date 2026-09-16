@@ -16,6 +16,7 @@ import { voiceCaptureRouter } from './voiceCapture';
 import { sectionReviewsRouter, documentReviewsRouter, myReviewsRouter } from './sectionReviews';
 import { sectionItemsRouter, myItemsRouter } from './sectionItems';
 import { documentAgentEditRouter } from './documentAgentEdit';
+import { documentAutomationsRouter } from './documentAutomations';
 import { chatCommandsRouter } from './chatCommands';
 import { chatPanelsRouter } from './chatPanels';
 import { requireAuth } from '../middleware/auth';
@@ -84,6 +85,8 @@ const router = Router();
 // Before the `/documents/:documentId/...` routers, so `transform` is never read as an id.
 // The chat's /doc command → a pipeline run that edits the document as a collaborator.
 router.use('/documents', documentAgentEditRouter);
+// Doc bots: a scheduled instruction against one document.
+router.use('/documents', documentAutomationsRouter);
 // Server-backed chat commands: GET /api/chat/commands lists them, POST /api/chat/commands/:trigger/run starts one as a pipeline run.
 router.use('/chat/commands', requireAuth, chatCommandsRouter);
 // What a chat card's `panel` result opens: GET /api/chat/panels/:kind/:id → the run's final panelData.

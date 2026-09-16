@@ -403,10 +403,15 @@ const scheduler = createScheduleEvaluator({
       return;
     }
     try {
+      // A definition can pin what its scheduled runs start from — a document
+      // automation carries the document and instruction here — the same
+      // fields a manual trigger would post. Without them a run of the
+      // document chain found no documentId and failed at its first step.
+      const pinned = ((definition as { triggerBinding?: { payload?: unknown } }).triggerBinding?.payload ?? {}) as Record<string, unknown>;
       const out = await bridge.trigger({
         pipelineId,
         definition,
-        triggerPayload: { triggerType: 'schedule', ...payload },
+        triggerPayload: { triggerType: 'schedule', ...(pinned && typeof pinned === 'object' ? pinned : {}), ...payload },
         triggeredBy: { userId: `schedule:${pipelineId}` },
       });
       log.info({ pipelineId, runId: out.runId }, 'scheduler fired pipeline run');
