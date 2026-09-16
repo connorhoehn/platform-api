@@ -34,8 +34,7 @@ import {
   type HangoutRoom,
   type HangoutRoomSettings,
   type HangoutRoomVisibility,
-  type HangoutRoomState,
-} from '../repositories';
+  type HangoutRoomState, profileRepo } from '../repositories';
 import {
   asyncHandler,
   ValidationError,
@@ -44,6 +43,20 @@ import {
 import { canCreateRoom } from '../middleware/canCreateRoom';
 import log from '../lib/logger';
 import { mirrorRoomMembers, mirrorRoomMemberRemoval, syncRoomOnce } from '../gateway/chatMembership';
+
+/**
+ * A person's name for the conversation's system line ("Eve added Carol"),
+ * from their profile. Undefined when there is none: the line then falls
+ * back to the id, which is honest, and never blocks the membership mirror.
+ */
+async function displayNameOf(userId: string): Promise<string | undefined> {
+  try {
+    const profile = await profileRepo.getProfile(userId);
+    return profile?.displayName || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export const hangoutRoomsRouter = Router();
 
@@ -344,7 +357,7 @@ hangoutRoomsRouter.get(
       syncRoomOnce(slug, async () => ({
         slug,
         ownerId: room.createdBy,
-        members: (await hangoutRoomMemberRepo.listMembers(room.roomId)).map((m) => ({ userId: m.userId })),
+        members: await Promise.all((await hangoutRoomMemberRepo.listMembers(room.roomId)).map(async (m) => ({ userId: m.userId, displayName: await displayNameOf(m.userId) }))),
       }));
     }
 
@@ -519,7 +532,12 @@ hangoutRoomsRouter.post(
     void hangoutRoomRepo.touchLastActive(orgId, room.roomId);
     // The room's conversation follows: the new member can read it, with its
     // history — a room member is entitled to the room's past.
-    mirrorRoomMembers({ slug, ownerId: room.createdBy, members: [{ userId: body.userId }] });
+    mirrorRoomMembers({
+      slug,
+      ownerId: room.createdBy,
+      ownerName: await displayNameOf(room.createdBy),
+      members: [{ userId: body.userId, displayName: await displayNameOf(body.userId) }],
+    });
     res.status(201).json({ member });
   }),
 );
@@ -544,7 +562,13 @@ hangoutRoomsRouter.delete(
     void hangoutRoomRepo.touchLastActive(orgId, room.roomId);
     // Out of the room, out of its conversation — the gateway evicts their
     // live connections too.
-    mirrorRoomMemberRemoval({ slug, userId: targetUserId, byOwnerId: room.createdBy });
+    mirrorRoomMemberRemoval({
+      slug,
+      userId: targetUserId,
+      name: await displayNameOf(targetUserId),
+      byOwnerId: room.createdBy,
+      byOwnerName: await displayNameOf(room.createdBy),
+    });
     res.status(204).end();
   }),
 );
