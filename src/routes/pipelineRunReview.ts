@@ -9,11 +9,26 @@
 //
 // Two ways the decision reaches the document:
 //   * The reviewer had the page open and resolved the marks in the editor. We
-//     only record (`applyServerSide` absent/false).
+//     only record (`applyServerSide` absent/false). This is the path the
+//     document's MARGIN takes: accepting or rejecting a suggestion in the
+//     gutter is an editor transaction that replicates through Yjs, and it calls
+//     here afterwards so the run that proposed the change learns what became of
+//     it. Before it did, the card in the conversation went on offering Accept
+//     and Reject for marks that were no longer in the document, and pressing
+//     Accept there recorded an acceptance of a change that had been rejected.
 //   * Nobody has the page open. `applyServerSide: true` starts the
 //     `document-agent-review` pipeline — one `document:apply` step in direct
 //     mode with `acceptSuggestion` / `rejectSuggestion` ops — so the resolve
 //     still goes through the one write path and shows up as a run of its own.
+//
+// `comment` is also how a PARTIAL resolve is recorded. A run writes its marks
+// under one suggestion key, but that key can span several section editors and
+// each is resolved on its own, so a person can accept the run's change in one
+// section and reject it in another. `decision` has no value for that — and a
+// third value would be worse than none, because the clients' `reviewOf()` drops
+// a review it does not recognise and the card would go back to offering both
+// buttons. So the first verdict is the decision and the comment says it was not
+// the whole story.
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
 import { asyncHandler, ConflictError, NotFoundError, ValidationError } from '../middleware/error-handler';
@@ -80,8 +95,36 @@ pipelineRunReviewRouter.post(
 
     const run = await getRunRepo().get(pipelineId, runId);
     if (!run) throw new NotFoundError(`run ${runId} not found for pipeline ${pipelineId}`);
-    // One verdict per run: the suggestion is gone from the document once resolved either way.
-    if (run.review) throw new ConflictError(`run ${runId} was already ${run.review.decision}ed by ${run.review.byName ?? run.review.by} at ${run.review.at}`);
+    // One verdict per run, and the FIRST one stands. The suggestion is gone
+    // from the document once resolved either way, so a second verdict is
+    // describing something that is no longer there.
+    //
+    // Two surfaces reach this: the run's card in the conversation, and the
+    // document's own margin (which records here without `applyServerSide` —
+    // the editor already resolved the marks). They race. Whichever lands
+    // second must not overwrite a true record with a false one, and must not
+    // be thrown back at a reader who did nothing wrong:
+    //
+    //   * The SAME verdict arriving twice is the ordinary race — one person
+    //     resolving in the margin while their own card reports it, or two
+    //     people agreeing. It is not a conflict: answer with the record that
+    //     stands. Crucially this returns BEFORE `applyServerSide`, so the
+    //     loser of the race never starts a second `document-agent-review` run
+    //     to re-resolve marks that are already gone.
+    //   * The OPPOSITE verdict is a conflict, and the record is the one that
+    //     landed first. The caller is told what the record actually holds so it
+    //     can show that rather than an error.
+    if (run.review) {
+      const held = run.review;
+      const who = held.byName ?? held.by;
+      if (held.decision === body.decision) {
+        res.status(200).json({ runId, pipelineId, review: held });
+        return;
+      }
+      throw new ConflictError(
+        `These suggestions were already ${held.decision}ed by ${who}, so they are no longer in the document.`,
+      );
+    }
 
     let applied: RunReviewResponse['applied'];
     if (body.applyServerSide) {

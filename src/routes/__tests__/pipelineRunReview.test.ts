@@ -119,6 +119,40 @@ describe('POST /pipelines/:pipelineId/runs/:runId/review', () => {
     expect(mockPublish).not.toHaveBeenCalled();
   });
 
+  // The margin and the card both reach this route, and they race: a person
+  // resolves a suggestion in the gutter while the card beside it is still
+  // offering both buttons. Whichever lands second must not be able to replace a
+  // true record with a false one — and must not be thrown back at somebody who
+  // pressed exactly what they were shown.
+  describe('a run that has already been reviewed', () => {
+    const held = { decision: 'reject', suggestionKey: good.suggestionKey, documentId: 'doc-1', by: 'dev-grace', byName: 'Grace', at: '2026-09-09T00:00:00.000Z' };
+
+    it('refuses the OPPOSITE verdict, keeps the record, and starts no apply run', async () => {
+      mockGet.mockResolvedValue({ pipelineId: 'document-agent-edit', runId: 'run-1', status: 'completed', review: held });
+      const res = await post(app, URL, { ...good, decision: 'accept', applyServerSide: true });
+      expect(res.statusCode).toBe(409);
+      // The message says what actually happened to the suggestions, so the
+      // client can show it instead of "run run-1 was already rejected".
+      expect((res.body as { error: string }).error).toBe('These suggestions were already rejected by Grace, so they are no longer in the document.');
+      expect(mockSetReview).not.toHaveBeenCalled();
+      // The damage the old route did: a `document-agent-review` run whose
+      // acceptSuggestion finds no marks, joins the document and leaves.
+      expect(mockTrigger).not.toHaveBeenCalled();
+    });
+
+    it('answers the SAME verdict with the record that stands, rather than an error', async () => {
+      mockGet.mockResolvedValue({ pipelineId: 'document-agent-edit', runId: 'run-1', status: 'completed', review: held });
+      const res = await post(app, URL, { ...good, applyServerSide: true });
+      expect(res.statusCode).toBe(200);
+      expect((res.body as { review: unknown }).review).toEqual(held);
+      // Nothing is rewritten and nothing is sent in to re-resolve marks that
+      // the first reviewer already resolved.
+      expect(mockSetReview).not.toHaveBeenCalled();
+      expect(mockTrigger).not.toHaveBeenCalled();
+      expect(mockPublish).not.toHaveBeenCalled();
+    });
+  });
+
   it('404 for an unknown run, 409 for a run already reviewed, 400 for a bad body', async () => {
     mockGet.mockResolvedValueOnce(null);
     expect((await post(app, URL, good)).statusCode).toBe(404);
