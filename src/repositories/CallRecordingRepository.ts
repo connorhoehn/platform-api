@@ -999,7 +999,7 @@ export class CallRecordingRepository extends BaseRepository {
     const chunks: RecordingListRow[][] = [];
     for (let i = 0; i < rows.length; i += 100) chunks.push(rows.slice(i, i + 100));
 
-    const byId = new Map<string, ComposableRecording & { transcriptStatus?: CallRecording['transcriptStatus'] }>();
+    const byId = new Map<string, ComposableRecording & { transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus']; ttl?: number }>();
     for (const chunk of chunks) {
       try {
         const res = await this.docClient.send(
@@ -1011,7 +1011,8 @@ export class CallRecordingRepository extends BaseRepository {
                 // the rest are plain attribute names. Projected narrowly so a
                 // 50-row page doesn't drag 50 full track manifests across.
                 ProjectionExpression:
-                  'recordingId, composeStatus, composedUrl, composedSegment, segments, tracks, transcriptStatus',
+                  'recordingId, composeStatus, composedUrl, composedSegment, segments, tracks, transcriptStatus, summaryStatus, #ttl',
+                ExpressionAttributeNames: { '#ttl': 'ttl' },
               },
             },
           }),
