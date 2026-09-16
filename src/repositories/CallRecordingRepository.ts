@@ -946,6 +946,7 @@ export class CallRecordingRepository extends BaseRepository {
     const rows = (out.Items ?? []).map((i) => ({
       callId: i.callId as string,
       recordingId: i.recordingId as string,
+      ttl: typeof i.ttl === 'number' ? (i.ttl as number) : undefined,
       startedAt: i.startedAt as string,
       endedAt: i.endedAt as string,
       // Media length. The fan-out row has no tracks[], so this cannot be
@@ -1032,6 +1033,10 @@ export class CallRecordingRepository extends BaseRepository {
         ...r,
         composeStatus: deriveComposeStatus(primary),
         transcriptStatus: primary.transcriptStatus,
+        summaryStatus: primary.summaryStatus,
+        // The primary's ttl is the expiry; the fan-out row mirrors it but the
+        // primary is what PATCH /expiry writes first.
+        ttl: typeof primary.ttl === 'number' ? primary.ttl : r.ttl,
       };
     });
   }
