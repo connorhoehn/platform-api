@@ -302,6 +302,8 @@ export interface RecordingListRow {
   recordingId: string;
   startedAt: string;
   endedAt: string;
+  /** Epoch seconds when the row expires — the fan-out row carries the primary's. Absent: kept until deleted. */
+  ttl?: number;
   /** Media length — see CallRecording.durationMs. */
   durationMs: number;
   sessionDurationMs?: number;
@@ -1102,6 +1104,7 @@ export class CallRecordingRepository extends BaseRepository {
         // "is this playable" question permanently unanswerable.
         composeStatus: deriveComposeStatus(i),
         transcriptStatus: i.transcriptStatus,
+        ttl: typeof i.ttl === 'number' ? (i.ttl as number) : undefined,
         // Distinct PEOPLE. Deliberately re-derived instead of reading the
         // stored scalar: legacy rows stored `participants.length`, which
         // counted rejoins (the "2, 3, 4, 5, 6, 7 👥 over one evening" bug).
