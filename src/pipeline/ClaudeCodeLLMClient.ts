@@ -195,7 +195,18 @@ export class ClaudeCodeLLMClient implements LLMClient {
           const { code } = await exitPromise;
           if ((code !== 0 || resultError) && !signal?.aborted) {
             const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
-            throw new Error(`claude exited ${code}: ${stderr || resultError || '(no stderr)'}`);
+            const detail = stderr || resultError || '(no stderr)';
+            // "Please run /login" is the CLI's own advice and it is useless
+            // here: there is no terminal in this pod to run it in, and the
+            // person reading it is looking at a failed run card in a chat.
+            // The credentials are a host-extracted snapshot mounted in, so
+            // the actionable instruction is the one that refreshes THAT.
+            const notLoggedIn = /not logged in|\/login|invalid api key|authentication_error/i.test(detail);
+            throw new Error(
+              notLoggedIn
+                ? `claude is not authenticated in this environment: ${detail} — the mounted credentials have gone stale; re-extract them (tilt trigger claude-creds-extract) and run this again`
+                : `claude exited ${code}: ${detail}`,
+            );
           }
         } finally {
           abortReg?.dispose();

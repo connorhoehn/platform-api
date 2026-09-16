@@ -443,3 +443,28 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
     expect(args[args.length - 1]).toBe('the user query');
   });
 });
+
+describe('ClaudeCodeLLMClient.stream() — an unauthenticated CLI', () => {
+  it('replaces "please run /login" with the instruction that actually applies here', async () => {
+    // The CLI reports its own auth failure on STDOUT as a result event and
+    // exits 1 with empty stderr. Its advice — run /login — assumes a
+    // terminal; there is none in the pod, and the person who sees this is
+    // looking at a failed run card in a chat.
+    mockSpawn.mockReturnValue(makeMockChild([
+      JSON.stringify({ type: 'result', is_error: true, result: 'Not logged in · Please run /login' }),
+    ], 1) as unknown as ReturnType<typeof mockSpawn>);
+
+    const client = new ClaudeCodeLLMClient();
+    await expect(collectChunks(client)).rejects.toThrow(/not authenticated in this environment/i);
+    mockSpawn.mockReturnValue(makeMockChild([
+      JSON.stringify({ type: 'result', is_error: true, result: 'Not logged in · Please run /login' }),
+    ], 1) as unknown as ReturnType<typeof mockSpawn>);
+    await expect(collectChunks(client)).rejects.toThrow(/re-extract/i);
+  });
+
+  it('leaves every other failure worded as the CLI worded it', async () => {
+    mockSpawn.mockReturnValue(makeMockChild([], 1, 'model overloaded') as unknown as ReturnType<typeof mockSpawn>);
+    const client = new ClaudeCodeLLMClient();
+    await expect(collectChunks(client)).rejects.toThrow(/claude exited 1: model overloaded/);
+  });
+});
