@@ -34,7 +34,7 @@ export type DocOp =
   | { op: 'copyBlock'; index: number }
   | { op: 'appendMacro'; macroName: string; yaml: string }
   | { op: 'skip'; reason: string }
-  | { op: 'replaceBlock'; index: number; text: string }
+  | { op: 'replaceBlock'; index: number; text: string; rows?: string[][] }
   | { op: 'appendBlock'; kind: BlockKind; level?: number; text: string; rows?: string[][] }
   | { op: 'insertBlock'; index: number; kind: BlockKind; level?: number; text: string; rows?: string[][] }
   | { op: 'deleteBlock'; index: number }
@@ -129,6 +129,32 @@ export function tableRowsOf(table: YT.XmlElement): string[][] {
       .map((cell) => plainText(cell)));
 }
 
+/**
+ * A table the model drew as text — Markdown pipes, or the outline's own
+ * "cell | cell" echo — read back as rows. The prompt says not to; a light
+ * model does it anyway (measured: "| Column 1 | Column 2 |" as a paragraph,
+ * and a table's header cells replaced with "| Name | Owner |"). Undefined
+ * when the text is not a table: fewer than one row with a cell, or no pipes.
+ */
+export function rowsFromPipeText(text: string): string[][] | undefined {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  if (lines.length === 0 || !lines.every((l) => l.includes('|'))) return undefined;
+  const rows: string[][] = [];
+  for (const line of lines) {
+    const inner = line.replace(/^\|/, '').replace(/\|$/, '');
+    const cells = inner.split('|').map((c) => c.trim());
+    // The Markdown separator row: every cell dashes, maybe with alignment colons.
+    if (cells.every((c) => /^:?-{2,}:?$/.test(c) || c === '')) {
+      if (cells.some((c) => /-{2,}/.test(c))) continue;
+    }
+    rows.push(cells);
+  }
+  if (rows.length === 0 || rows.every((r) => r.every((c) => c === ''))) {
+    return rows.length > 0 && rows[0]!.length > 1 ? normalizeTableRows(rows) : undefined;
+  }
+  return normalizeTableRows(rows);
+}
+
 /** Square, capped, trimmed: every row as wide as the widest, within the caps. */
 export function normalizeTableRows(raw: unknown): string[][] | undefined {
   if (!Array.isArray(raw)) return undefined;
@@ -193,9 +219,15 @@ export function parseOps(text: string): DocOp[] {
     const o = item as Record<string, unknown>;
     const text = typeof o.text === 'string' ? o.text.slice(0, MAX_TEXT) : undefined;
     const index = typeof o.index === 'number' && Number.isInteger(o.index) && o.index >= 0 ? o.index : undefined;
-    const kind = (BLOCK_KINDS as readonly string[]).includes(String(o.kind)) ? (o.kind as BlockKind) : undefined;
+    // A paragraph that is a table drawn in pipes IS a table: the model was
+    // told, and does it anyway, so the coercion lives here rather than in
+    // the prompt alone.
+    const pipeRows = typeof text === 'string' && String(o.kind ?? 'paragraph') === 'paragraph' ? rowsFromPipeText(text) : undefined;
+    const kind = pipeRows && (o.op === 'appendBlock' || o.op === 'insertBlock')
+      ? 'table'
+      : (BLOCK_KINDS as readonly string[]).includes(String(o.kind)) ? (o.kind as BlockKind) : undefined;
     // A divider carries no text, a table carries rows; every other block needs text.
-    const rows = kind === 'table' ? normalizeTableRows(o.rows) : undefined;
+    const rows = kind === 'table' ? (normalizeTableRows(o.rows) ?? pipeRows) : undefined;
     const blockText = kind === 'horizontalRule' || kind === 'table' ? '' : text;
     const level = typeof o.level === 'number' ? o.level : undefined;
     const blockOk = kind === 'table' ? rows !== undefined : blockText !== undefined;
@@ -205,7 +237,11 @@ export function parseOps(text: string): DocOp[] {
       case 'copyBlock': if (index !== undefined) ops.push({ op: 'copyBlock', index }); break;
       case 'skip': ops.push({ op: 'skip', reason: typeof o.reason === 'string' ? o.reason.slice(0, 300) : '' }); break;
       case 'appendMacro': if (typeof o.macroName === 'string' && o.macroName && typeof o.yaml === 'string') ops.push({ op: 'appendMacro', macroName: o.macroName, yaml: o.yaml.slice(0, MAX_TEXT) }); break;
-      case 'replaceBlock': if (index !== undefined && text !== undefined) ops.push({ op: 'replaceBlock', index, text }); break;
+      case 'replaceBlock': {
+        const replaceRows = normalizeTableRows(o.rows) ?? pipeRows;
+        if (index !== undefined && (text !== undefined || replaceRows)) ops.push({ op: 'replaceBlock', index, text: text ?? '', ...(replaceRows ? { rows: replaceRows } : {}) });
+        break;
+      }
       case 'appendBlock': if (kind && blockOk) ops.push({ op: 'appendBlock', kind, text: blockText ?? '', ...(level ? { level } : {}), ...(rows ? { rows } : {}) }); break;
       case 'insertBlock': if (index !== undefined && kind && blockOk) ops.push({ op: 'insertBlock', index, kind, text: blockText ?? '', ...(level ? { level } : {}), ...(rows ? { rows } : {}) }); break;
       case 'deleteBlock': if (index !== undefined) ops.push({ op: 'deleteBlock', index }); break;
@@ -420,6 +456,18 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
         case 'replaceBlock': {
           const el = blocks[op.index];
           if (!el) { result.skipped += 1; break; }
+          // Rows given, or the target is a table: the table is rebuilt whole.
+          // Writing text INTO a table element was how header cells became
+          // "| Name | Owner |" — a table's content is rows, not a string.
+          const rows = op.rows ?? (el.nodeName === 'table' ? (rowsFromPipeText(op.text) ?? [[op.text]]) : undefined);
+          if (rows) {
+            const at = body.toArray().indexOf(el);
+            if (at < 0) { result.skipped += 1; break; }
+            if (id) { suggestBlockDelete(el, id); suggestNewTable(body, at + 1, rows, id); }
+            else { body.delete(at, 1); body.insert(at, [makeTable(rows)]); }
+            result.applied += 1;
+            break;
+          }
           if (id) suggestBlockText(el, op.text, id); else setBlockText(el, op.text);
           result.applied += 1;
           break;
