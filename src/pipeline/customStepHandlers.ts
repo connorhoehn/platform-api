@@ -73,6 +73,15 @@ export function hasCustomStepHandler(kind: string): boolean {
  * The description lives on the handler, next to the code that implements it,
  * so the two cannot drift apart the way a central catalog would.
  */
+/**
+ * What travels down an edge, coarsely.
+ *
+ * Deliberately two values. The cost of a false refusal — someone cannot build
+ * a pipeline that would have worked — is much higher than the cost of a miss,
+ * and every extra class is another chance to refuse something valid.
+ */
+export type PayloadClass = 'image' | 'data';
+
 export interface DescribedStepHandler extends StepHandler {
   /** One or two sentences: what this step does, in the run's terms. */
   readonly description?: string;
@@ -98,6 +107,22 @@ export interface DescribedStepHandler extends StepHandler {
   readonly outputs?: readonly string[];
   /** The incoming handles, when they are not just `in`. */
   readonly inputs?: readonly string[];
+  /**
+   * The class of payload this step needs on its input, when it needs a
+   * particular one.
+   *
+   * Handles say which wires exist; this says what may travel down them.
+   * `image:resize` takes pixels, and `image:vision-tag.out → image:resize.in`
+   * connects two real handles while handing a list of tags to a resizer — so
+   * it published, and failed at run time holding the wrong thing.
+   *
+   * Left undeclared means "anything", never "data". An image step that reads a
+   * prompt rather than pixels — `image:generate` — declares nothing here, and
+   * an LLM wired into it is exactly right.
+   */
+  readonly consumes?: PayloadClass;
+  /** The class of payload this step's success output carries. */
+  readonly produces?: PayloadClass;
 }
 
 /** One entry in the step-kind catalog. */
@@ -116,6 +141,10 @@ export interface StepKindInfo {
   outputs?: readonly string[];
   /** Declared incoming handles. Absent means the kind did not say. */
   inputs?: readonly string[];
+  /** Declared input payload class. Absent means it takes anything. */
+  consumes?: PayloadClass;
+  /** Declared output payload class. Absent means unknown. */
+  produces?: PayloadClass;
 }
 
 /**
@@ -147,6 +176,8 @@ export function listStepKinds(): StepKindInfo[] {
     if (h?.emits) entry.emits = h.emits;
     if (h?.outputs?.length) entry.outputs = [...h.outputs];
     if (h?.inputs?.length) entry.inputs = [...h.inputs];
+    if (h?.consumes) entry.consumes = h.consumes;
+    if (h?.produces) entry.produces = h.produces;
     out.push(entry);
   }
   out.sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));

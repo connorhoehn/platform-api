@@ -36,7 +36,8 @@ export type ShapeIssueCode =
   | 'CYCLE_DETECTED'
   | 'NODE_ORPHANED'
   | 'NODE_KIND_UNKNOWN'
-  | 'EDGE_HANDLE_UNKNOWN';
+  | 'EDGE_HANDLE_UNKNOWN'
+  | 'EDGE_PAYLOAD_MISMATCH';
 
 export interface ShapeIssue {
   code: ShapeIssueCode;
@@ -74,7 +75,41 @@ export interface ShapeOptions {
    * on. Undeclared stays unchecked.
    */
   handlesFor?: (kind: string) => { outputs?: readonly string[]; inputs?: readonly string[] } | undefined;
+  /**
+   * What a step kind takes in and hands on, when it declares it.
+   *
+   * Handles answer "does this wire exist"; this answers "may this travel down
+   * it". `image:vision-tag.out → image:resize.in` joins two real handles and
+   * gives a resizer a list of tags — it published, and failed at run time.
+   *
+   * Only a declared mismatch is reported. A kind that declares nothing is not
+   * guessed at, for the same reason the handle checks do not guess.
+   */
+  payloadFor?: (kind: string) => { consumes?: string; produces?: string } | undefined;
 }
+
+/**
+ * Steps that hand on whatever they are given.
+ *
+ * A condition routes, a fork copies, a join merges, a scatter unrolls, an
+ * approval pauses. None of them changes what the payload IS, so their output
+ * class is whatever reached them — resolved by walking back. Without this,
+ * `image-source → condition → image:resize` would look like a mismatch.
+ */
+/** `image` → `an image`, `data` → `a data object`. Read aloud in a sentence. */
+function article(kind: string): string {
+  if (kind === 'image') return 'an image';
+  if (kind === 'data') return 'a data object';
+  return kind;
+}
+
+const PASSTHROUGH_KINDS: ReadonlySet<string> = new Set([
+  'condition',
+  'fork',
+  'join',
+  'scatter',
+  'approval',
+]);
 
 /**
  * Outgoing handles of the canonical node types.
@@ -133,6 +168,38 @@ function outputAllowed(
   if (canonical) return canonical.includes(handle);
   if (declared && declared.length > 0) return declared.includes(handle);
   return null;
+}
+
+/**
+ * What a node's output carries, walking back through pass-through steps.
+ *
+ * Returns null for "cannot tell", which is most of the time and is always a
+ * pass: an undeclared kind, a pass-through fed by nothing or by two different
+ * classes, or a graph that loops (which `CYCLE_DETECTED` owns, not this).
+ */
+function resolveProduced(
+  nodeId: string,
+  typeById: Map<string, string>,
+  incoming: Map<string, string[]>,
+  payloadFor: ((kind: string) => { consumes?: string; produces?: string } | undefined) | undefined,
+  seen: Set<string>,
+): string | null {
+  const type = typeById.get(nodeId);
+  if (!type) return null;
+  if (!PASSTHROUGH_KINDS.has(type)) return payloadFor?.(type)?.produces ?? null;
+  if (seen.has(nodeId)) return null;
+  seen.add(nodeId);
+
+  const sources = incoming.get(nodeId) ?? [];
+  if (sources.length === 0) return null;
+  let resolved: string | null = null;
+  for (const source of sources) {
+    const up = resolveProduced(source, typeById, incoming, payloadFor, seen);
+    if (up === null) return null;
+    if (resolved === null) resolved = up;
+    else if (resolved !== up) return null; // mixed feed — cannot tell
+  }
+  return resolved;
 }
 
 /** Whether `handle` is one this node type can be entered by. `null` = cannot tell. */
@@ -203,6 +270,7 @@ export function validateShape(
   // --- nodes: ids present and unique ---------------------------------------
   const knownKinds = options.knownKinds ? new Set(options.knownKinds) : null;
   const handlesFor = options.handlesFor;
+  const payloadFor = options.payloadFor;
   /** Node id → its declared type, for the handle checks below. */
   const typeById = new Map<string, string>();
   const known = new Set<string>();
@@ -241,6 +309,8 @@ export function validateShape(
   // --- edges: endpoints resolve, no self-loops, handles exist --------------
   const succ = new Map<string, string[]>();
   const degree = new Map<string, number>();
+  /** Edges that survived the endpoint and handle checks, for the payload pass. */
+  const validEdges: Array<{ edgeId?: string; source: string; target: string }> = [];
   for (const id of known) {
     succ.set(id, []);
     degree.set(id, 0);
@@ -311,6 +381,35 @@ export function validateShape(
     (succ.get(source) as string[]).push(target);
     degree.set(source, (degree.get(source) ?? 0) + 1);
     degree.set(target, (degree.get(target) ?? 0) + 1);
+    validEdges.push({ edgeId, source, target });
+  }
+
+  // --- payloads: what travels down an edge, vs what the far end takes -------
+  //
+  // A second pass, because resolving what a pass-through step hands on means
+  // walking back through the graph, and the graph is not complete until every
+  // edge above has been accepted.
+  if (payloadFor) {
+    const incoming = new Map<string, string[]>();
+    for (const e of validEdges) {
+      const list = incoming.get(e.target);
+      if (list) list.push(e.source);
+      else incoming.set(e.target, [e.source]);
+    }
+    for (const e of validEdges) {
+      const targetType = typeById.get(e.target) ?? '';
+      const wanted = payloadFor(targetType)?.consumes;
+      if (!wanted) continue; // takes anything
+      const got = resolveProduced(e.source, typeById, incoming, payloadFor, new Set());
+      if (got === null || got === wanted) continue;
+      errors.push({
+        code: 'EDGE_PAYLOAD_MISMATCH',
+        message: `Edge ${e.edgeId ?? '(unnamed)'} feeds "${e.target}" with ${article(got)}, but ${targetType} needs ${article(wanted)}.`,
+        severity: 'error',
+        edgeId: e.edgeId,
+        nodeId: e.target,
+      });
+    }
   }
 
   // --- triggers -------------------------------------------------------------

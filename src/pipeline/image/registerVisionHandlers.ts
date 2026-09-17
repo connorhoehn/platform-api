@@ -15,6 +15,7 @@
 
 import type { Logger } from 'pino';
 import type { StepHandler } from 'distributed-core/applications/pipeline';
+import type { PayloadClass } from '../customStepHandlers';
 import { createVisionStepHandler } from './VisionStepHandler';
 import { createScatterStepHandler } from './ScatterStepHandler';
 import { createImageCropStepHandler } from './ImageCropStepHandler';
@@ -141,5 +142,70 @@ export function buildVisionStepHandlers(
   handlers.set('image:vision-tag', createImageVisionTagStepHandler(chainedVisionOpts));
   handlers.set('image:vision-extract-text', createImageVisionExtractTextStepHandler(chainedVisionOpts));
 
+  applyPayloadContracts(handlers);
   return handlers;
+}
+
+/**
+ * What each image kind takes in and hands on.
+ *
+ * Handles say which wires exist between two steps; this says what may travel
+ * down them. Without it `image:vision-tag.out → image:resize.in` connects two
+ * perfectly real handles and gives a resizer a list of tags — it published, and
+ * failed at run time holding the wrong thing.
+ *
+ * Declared HERE rather than on each of the twenty-odd factories: this is the
+ * one place the whole family is visible at once, which is what makes an
+ * omission or a wrong answer obvious on review. The contract is one word per
+ * direction, so the usual argument for keeping a description next to its
+ * implementation carries much less weight than being able to read the set as a
+ * set.
+ *
+ * Absent means "anything", never "data". Note who declares no `consumes`:
+ * `image:generate` makes pixels out of a prompt and `image-source` reads the
+ * trigger payload, so both legitimately take something that is not an image,
+ * and saying otherwise would refuse the two most useful image pipelines there
+ * are.
+ */
+const PAYLOAD_CONTRACTS: Record<string, { consumes?: PayloadClass; produces?: PayloadClass }> = {
+  // Sources and generators: pixels out, no pixels required in.
+  'image-source': { produces: 'image' },
+  'image:generate': { produces: 'image' },
+
+  // Transforms: pixels in, pixels out.
+  'image:crop': { consumes: 'image', produces: 'image' },
+  'image:adjust-bw': { consumes: 'image', produces: 'image' },
+  'image:adjust-layer': { consumes: 'image', produces: 'image' },
+  'image:resize': { consumes: 'image', produces: 'image' },
+  'image:transform': { consumes: 'image', produces: 'image' },
+  'image:format-convert': { consumes: 'image', produces: 'image' },
+  'image:sharpen': { consumes: 'image', produces: 'image' },
+  'image:watermark': { consumes: 'image', produces: 'image' },
+  'image:upscale': { consumes: 'image', produces: 'image' },
+  'image:variation': { consumes: 'image', produces: 'image' },
+  'image:edit-prompt': { consumes: 'image', produces: 'image' },
+
+  // Readers: pixels in, facts out. Wiring one of these back into a transform
+  // is the mistake this whole table exists to catch.
+  'image:dimensions': { consumes: 'image', produces: 'data' },
+  'image:save': { consumes: 'image', produces: 'data' },
+  'image:vision-analyze': { consumes: 'image', produces: 'data' },
+  'image:vision-classify': { consumes: 'image', produces: 'data' },
+  'image:vision-describe': { consumes: 'image', produces: 'data' },
+  'image:vision-tag': { consumes: 'image', produces: 'data' },
+  'image:vision-extract-text': { consumes: 'image', produces: 'data' },
+};
+
+/**
+ * Attach the contracts to the handlers this module just built.
+ *
+ * The handlers come from twenty-odd factories that know nothing about payload
+ * classes, so the declaration is applied here rather than threaded through
+ * every signature. Only handlers this module owns are touched.
+ */
+function applyPayloadContracts(handlers: Map<string, StepHandler>): void {
+  for (const [kind, contract] of Object.entries(PAYLOAD_CONTRACTS)) {
+    const handler = handlers.get(kind);
+    if (handler) Object.assign(handler, contract);
+  }
 }

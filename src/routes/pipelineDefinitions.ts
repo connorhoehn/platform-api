@@ -68,6 +68,15 @@ function declaredHandles(): (kind: string) => { outputs?: readonly string[]; inp
   return (kind: string) => byKind.get(kind);
 }
 
+/** What each kind takes in and hands on, for the payload check in `validateShape`. */
+function declaredPayloads(): (kind: string) => { consumes?: string; produces?: string } | undefined {
+  const byKind = new Map<string, { consumes?: string; produces?: string }>();
+  for (const k of listStepKinds()) {
+    if (k.consumes || k.produces) byKind.set(k.kind, { consumes: k.consumes, produces: k.produces });
+  }
+  return (kind: string) => byKind.get(kind);
+}
+
 /**
  * Best-effort cache poke after a write. Refreshes the LOCAL cache
  * immediately AND publishes a Redis invalidation message so other
@@ -308,6 +317,7 @@ pipelineDefinitionsRouter.put(
       validation: validateShape(def, {
         knownKinds: knownStepKinds(),
         handlesFor: declaredHandles(),
+        payloadFor: declaredPayloads(),
       }),
     });
   }),
@@ -405,6 +415,7 @@ pipelineDefinitionsRouter.post(
     const validation = validateShape(current, {
       knownKinds: knownStepKinds(),
       handlesFor: declaredHandles(),
+      payloadFor: declaredPayloads(),
     });
     if (!isPublishable(validation)) {
       log.info(
