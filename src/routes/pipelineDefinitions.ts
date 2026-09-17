@@ -114,7 +114,31 @@ pipelineDefinitionsRouter.get(
     try {
       const items = await definitionsRepo.list(userId);
       // Platform-owned pipelines ride along, read-only, so their runs have a home.
-      res.json({ pipelines: [...items, ...listSystemPipelines()] });
+      //
+      // A system pipeline that has been EDITED exists in both lists: the repo
+      // holds the saved version and the seed still declares the original. This
+      // used to concatenate the two, so `document-agent-review` came back twice
+      // from a list of seventeen — a duplicate row in the picker and the
+      // sidebar, a duplicate React key, and worse for the caller this catalog
+      // is really for: an agent building a map by id took whichever entry came
+      // last, and the seed was appended last, so it read the ORIGINAL
+      // definition and never the saved one.
+      //
+      // Stored wins, seed fills the gaps — the same precedence `GET /:id` has
+      // always used.
+      const byId = new Map<string, unknown>();
+      for (const sys of listSystemPipelines()) {
+        const id = (sys as { id?: unknown }).id;
+        if (typeof id === 'string') byId.set(id, sys);
+      }
+      for (const item of items) {
+        const id = (item as { id?: unknown }).id;
+        if (typeof id === 'string') byId.set(id, item);
+        // A stored row with no usable id cannot collide with anything; keep it
+        // rather than dropping someone's pipeline over a missing field.
+        else byId.set(`__anon-${byId.size}`, item);
+      }
+      res.json({ pipelines: [...byId.values()] });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       log.error({ err: message, action: 'def.list' }, 'failed to list definitions');

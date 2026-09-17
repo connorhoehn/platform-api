@@ -63,6 +63,14 @@ function blocksOf(doc: YT.Doc): YT.XmlElement[] {
 }
 
 /** What the model is shown: numbered blocks, kind and level, plain text. */
+/** The items of a list block as plain strings — the inverse of `makeList`. */
+export function listItemsOf(list: YT.XmlElement): string[] {
+  return list.toArray()
+    .filter((li): li is YT.XmlElement => li instanceof Y.XmlElement)
+    .map((li) => plainText(li).trim())
+    .filter((t) => t.length > 0);
+}
+
 export function outlineOf(doc: YT.Doc): DocumentOutline {
   const meta = doc.getMap<unknown>(CANVAS_META_KEY);
   const title = typeof meta.get('title') === 'string' ? (meta.get('title') as string) : undefined;
@@ -71,9 +79,15 @@ export function outlineOf(doc: YT.Doc): DocumentOutline {
     const macroName = el.nodeName === 'macro' ? el.getAttribute('macroName') ?? undefined : undefined;
     // A table reads as rows — cells joined by " | ", rows by newline — so the
     // model sees the shape, and copyBlock can rebuild it (see `tableRowsOf`).
+    // A table reads as rows; a list reads as ONE ITEM PER LINE, which is both
+    // the shape the model is told to write and what `makeList` reads back —
+    // so copyBlock and replaceBlock round-trip. Plain text would run every
+    // item together into a single unreadable line.
     const text = el.nodeName === 'table'
       ? tableRowsOf(el).map((r) => r.join(' | ')).join('\n').slice(0, MAX_TEXT)
-      : plainText(el).slice(0, MAX_TEXT);
+      : (LIST_KINDS as readonly string[]).includes(el.nodeName)
+        ? listItemsOf(el).join('\n').slice(0, MAX_TEXT)
+        : plainText(el).slice(0, MAX_TEXT);
     return { index, kind: el.nodeName, ...(level ? { level } : {}), ...(macroName ? { macroName } : {}), text };
   });
   const lines = [
@@ -84,8 +98,10 @@ export function outlineOf(doc: YT.Doc): DocumentOutline {
 }
 
 /** Block kinds the agent may write. A horizontal rule is a divider with no text; a table carries `rows`. */
-export type BlockKind = 'paragraph' | 'heading' | 'horizontalRule' | 'table';
-export const BLOCK_KINDS: readonly BlockKind[] = ['paragraph', 'heading', 'horizontalRule', 'table'];
+export type BlockKind = 'paragraph' | 'heading' | 'horizontalRule' | 'table' | 'bulletList' | 'orderedList';
+export const BLOCK_KINDS: readonly BlockKind[] = ['paragraph', 'heading', 'horizontalRule', 'table', 'bulletList', 'orderedList'];
+/** List kinds carry their items as newline-separated `text`, one item per line. */
+const LIST_KINDS: readonly BlockKind[] = ['bulletList', 'orderedList'];
 
 /** A table is capped so a light model cannot hand back a spreadsheet. */
 export const TABLE_MAX_ROWS = 20;
@@ -118,6 +134,51 @@ function makeTable(rows: string[][]): YT.XmlElement {
     return row;
   }));
   return table;
+}
+
+/**
+ * A real list: `bulletList > listItem > paragraph > text`, one item per line
+ * of `text`. Built the same way as `makeTable` — children assembled as arrays
+ * and inserted once, because a preliminary Yjs type has no readable `length`.
+ */
+function makeList(kind: 'bulletList' | 'orderedList', text: string): YT.XmlElement {
+  const items = text.split(/\r?\n/).map((l) => stripListMarker(l.trim())).filter((l) => l.length > 0);
+  const list = new Y.XmlElement(kind);
+  list.insert(0, (items.length > 0 ? items : ['']).map((item) => {
+    const li = new Y.XmlElement('listItem');
+    const para = new Y.XmlElement('paragraph');
+    const t = new Y.XmlText();
+    if (item) t.insert(0, item);
+    para.insert(0, [t]);
+    li.insert(0, [para]);
+    return li;
+  }));
+  return list;
+}
+
+const BULLET_MARKER = /^\s*([•‣▪*+-]|\d+[.)])\s+/;
+
+function stripListMarker(line: string): string {
+  return line.replace(BULLET_MARKER, '');
+}
+
+/**
+ * A paragraph whose every line opens with a bullet or a number IS a list —
+ * same judgement as `rowsFromPipeText` makes about pipes, and for the same
+ * reason: the model is told to emit `bulletList` and writes "• item" into a
+ * paragraph anyway, so the coercion belongs here and not in the prompt alone.
+ * Left as a paragraph, it rendered as one run-on line with literal • in it.
+ *
+ * Returns the marker family so an enumerated list does not come back bulleted.
+ */
+export function listFromMarkerText(text: string): { kind: 'bulletList' | 'orderedList'; text: string } | undefined {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  // One line is a sentence that happens to start with a dash, not a list.
+  if (lines.length < 2 || !lines.every((l) => BULLET_MARKER.test(l))) return undefined;
+  const ordered = lines.every((l) => /^\s*\d+[.)]\s+/.test(l));
+  const items = lines.map(stripListMarker).filter((l) => l.length > 0);
+  if (items.length < 2) return undefined;
+  return { kind: ordered ? 'orderedList' : 'bulletList', text: items.join('\n') };
 }
 
 /** The rows of a table block as plain strings — the inverse of `makeTable`. */
@@ -169,6 +230,7 @@ export function normalizeTableRows(raw: unknown): string[][] | undefined {
 
 function makeBlock(kind: BlockKind, text: string, level?: number, rows?: string[][]): YT.XmlElement {
   if (kind === 'table') return makeTable(rows && rows.length > 0 ? rows : [['']]);
+  if (kind === 'bulletList' || kind === 'orderedList') return makeList(kind, text);
   const el = new Y.XmlElement(kind);
   if (kind === 'horizontalRule') return el;
   if (kind === 'heading') el.setAttribute('level', String(level && level >= 1 && level <= 6 ? level : 2));
@@ -193,6 +255,7 @@ function materialize(b: OutlineBlock): YT.XmlElement {
   if (b.kind === 'heading') return makeBlock('heading', b.text, b.level);
   if (b.kind === 'horizontalRule') return makeBlock('horizontalRule', '');
   if (b.kind === 'table') return makeBlock('table', '', undefined, normalizeTableRows(b.text.split('\n').map((line) => line.split(' | '))));
+  if (b.kind === 'bulletList' || b.kind === 'orderedList') return makeBlock(b.kind, b.text);
   return makeBlock('paragraph', b.text);
 }
 
@@ -223,12 +286,22 @@ export function parseOps(text: string): DocOp[] {
     // told, and does it anyway, so the coercion lives here rather than in
     // the prompt alone.
     const pipeRows = typeof text === 'string' && String(o.kind ?? 'paragraph') === 'paragraph' ? rowsFromPipeText(text) : undefined;
+    // Same coercion, one step later: a paragraph written as "• a\n• b" is a
+    // list. Only when it is not already a table, since a pipe row can open
+    // with a dash.
+    const markerList = !pipeRows && typeof text === 'string' && String(o.kind ?? 'paragraph') === 'paragraph'
+      ? listFromMarkerText(text)
+      : undefined;
     const kind = pipeRows && (o.op === 'appendBlock' || o.op === 'insertBlock')
       ? 'table'
-      : (BLOCK_KINDS as readonly string[]).includes(String(o.kind)) ? (o.kind as BlockKind) : undefined;
+      : markerList && (o.op === 'appendBlock' || o.op === 'insertBlock')
+        ? markerList.kind
+        : (BLOCK_KINDS as readonly string[]).includes(String(o.kind)) ? (o.kind as BlockKind) : undefined;
     // A divider carries no text, a table carries rows; every other block needs text.
     const rows = kind === 'table' ? (normalizeTableRows(o.rows) ?? pipeRows) : undefined;
-    const blockText = kind === 'horizontalRule' || kind === 'table' ? '' : text;
+    const blockText = kind === 'horizontalRule' || kind === 'table'
+      ? ''
+      : markerList && kind === markerList.kind ? markerList.text : text;
     const level = typeof o.level === 'number' ? o.level : undefined;
     const blockOk = kind === 'table' ? rows !== undefined : blockText !== undefined;
     switch (o.op) {

@@ -143,6 +143,34 @@ describe('GET /api/pipelines/defs', () => {
     expect(mockList).toHaveBeenCalledWith('tester');
   });
 
+  // Editing a system pipeline saves a row for it, after which it is in BOTH
+  // the repo and the seed. The list used to concatenate the two and return it
+  // twice.
+  it('lists an edited system pipeline once, preferring the stored version', async () => {
+    mockList.mockResolvedValue([
+      { id: 'document-agent-edit', name: 'Edited by me', version: 6 },
+    ]);
+    const res = await run(buildApp(), 'GET', '/api/pipelines/defs');
+    const pipelines = (res.body as { pipelines: Array<{ id: string; name?: string; version?: number }> }).pipelines;
+    const matches = pipelines.filter((p) => p.id === 'document-agent-edit');
+    expect(matches).toHaveLength(1);
+    // Stored wins — the same precedence GET /:id uses. An agent building a map
+    // by id must not get handed the original seed over the saved definition.
+    expect(matches[0].name).toBe('Edited by me');
+    expect(matches[0].version).toBe(6);
+  });
+
+  it('keeps every id unique across the whole response', async () => {
+    mockList.mockResolvedValue([
+      { id: 'document-agent-edit', name: 'Edited' },
+      { id: 'call-transcription', name: 'Also edited' },
+      { id: 'p-1', name: 'Mine' },
+    ]);
+    const res = await run(buildApp(), 'GET', '/api/pipelines/defs');
+    const ids = (res.body as { pipelines: Array<{ id: string }> }).pipelines.map((p) => p.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
   it('returns 500 on repo failure', async () => {
     mockList.mockRejectedValue(new Error('DDB error'));
     const res = await run(buildApp(), 'GET', '/api/pipelines/defs');
