@@ -24,6 +24,16 @@ interface PublicProfile {
   displayName: string;
   avatarUrl: string;
   visibility: string;
+  /**
+   * Whether a profile row actually exists for this person.
+   *
+   * `visibility` alone cannot answer it: absence falls back to `private`
+   * (see below), so a person who has never opened the profile page is
+   * indistinguishable from one who deliberately hid. Clients were reporting
+   * the first as the second — "This profile is private." claims a choice
+   * that was never made.
+   */
+  hasProfile: boolean;
 }
 
 // Helper: batch-get public profile fields for a list of user IDs.
@@ -55,6 +65,7 @@ async function enrichWithProfiles(userIds: string[]): Promise<PublicProfile[]> {
       // about who may see it, and guessing "public" would publish a person by
       // omission.
       visibility: item?.visibility ?? 'private',
+      hasProfile: item !== undefined,
     };
   });
 }

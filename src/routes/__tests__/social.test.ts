@@ -205,6 +205,28 @@ describe('GET /api/social/following', () => {
     // who may see them, and defaulting to public would publish them by
     // omission.
     expect(ghost.visibility).toBe('private');
+    // ...but say so distinctly, because `private` here is a fallback, not a
+    // decision. Without this flag a client cannot tell "chose to hide" from
+    // "has never filled anything in", and reports the second as the first.
+    expect(ghost.hasProfile).toBe(false);
+
+    const bob = following.find((f) => f.userId === 'u2')!;
+    expect(bob.hasProfile).toBe(true);
+  });
+
+  it('marks a real profile that chose to be private as present', async () => {
+    // The distinction only earns its keep if a deliberate private profile
+    // still reads as a profile.
+    mockDocClientSend.mockResolvedValueOnce({
+      Items: [{ followerId: 'tester', followeeId: 'hidden' }],
+    });
+    mockBatchGetProfiles.mockResolvedValue([
+      { userId: 'hidden', displayName: 'Hidden', avatarUrl: '', visibility: 'private' },
+    ]);
+
+    const res = await run(buildApp(), 'GET', '/api/social/following');
+    const following = (res.body as { following: Array<Record<string, unknown>> }).following;
+    expect(following[0]).toMatchObject({ userId: 'hidden', visibility: 'private', hasProfile: true });
   });
 });
 

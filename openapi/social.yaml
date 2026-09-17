@@ -1357,14 +1357,31 @@ components:
     # (no bio / createdAt / updatedAt).
     PublicProfile:
       type: object
-      required: [userId, displayName, avatarUrl, visibility]
+      required: [userId, displayName, avatarUrl, visibility, hasProfile]
       properties:
         userId: { type: string }
-        displayName: { type: string }
+        displayName:
+          type: string
+          description: |
+            Falls back to `userId` when no profile row exists — see
+            `hasProfile`.
         avatarUrl: { type: string }
         visibility:
           type: string
           enum: [public, private]
+          description: |
+            `private` when no profile row exists: somebody who has created no
+            profile has made no claim about who may see them, and defaulting
+            to `public` would publish them by omission. Read with
+            `hasProfile` to tell a choice from an absence.
+        hasProfile:
+          type: boolean
+          description: |
+            Whether a profile row actually exists for this user. Relationships
+            are kept for people who have never written a profile, so they are
+            returned here with placeholder fields. Without this flag a client
+            cannot distinguish "chose to be private" from "has never filled
+            anything in", and will report the second as the first.
 
     # --- groups ---------------------------------------------------------
     GroupVisibility:
