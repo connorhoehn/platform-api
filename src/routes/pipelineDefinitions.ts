@@ -18,7 +18,12 @@
 //   GET    /:pipelineId              — fetch one
 //   PUT    /:pipelineId              — upsert (body.id must match :pipelineId)
 //   DELETE /:pipelineId              — remove
-//   POST   /:pipelineId/publish      — bump version, mark published
+//   POST   /:pipelineId/publish      — validate, bump version, mark published
+//
+// Validation: PUT stores whatever it is given (a draft is legitimately
+// half-finished) but returns a `validation` block so a non-browser writer sees
+// what it just stored. POST /publish REJECTS a definition with structural
+// errors — see pipeline/validate-shape.ts for why that gate belongs here.
 //
 // Collision note: the existing `pipelineMetricsRouter` is mounted at
 // `/api/pipelines/metrics`. To avoid shadowing the static `metrics` segment
@@ -39,6 +44,7 @@ import { pipelineDefinitionsCache } from '../pipeline/definitions-cache';
 import { publishInvalidate } from '../pipeline/definitions-invalidator';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { withContext } from '../lib/logger';
+import { validateShape, isPublishable } from '../pipeline/validate-shape';
 
 const log = withContext({ route: 'pipelineDefinitions' });
 
@@ -235,7 +241,11 @@ pipelineDefinitionsRouter.put(
       ...(beforeSnap ? { before: beforeSnap } : {}),
       ...(definitionSnapshot(def) ? { after: definitionSnapshot(def)! } : {}),
     });
-    res.json(def);
+    // Report the graph's shape back to whoever wrote it. A draft save is never
+    // blocked — half-wired is a legitimate state on the way to finished — but an
+    // agent posting definitions has no editor to look at, so the only way it
+    // learns that it left a dangling edge is if we say so here.
+    res.json({ ...(def as Record<string, unknown>), validation: validateShape(def) });
   }),
 );
 
@@ -323,6 +333,33 @@ pipelineDefinitionsRouter.post(
       return;
     }
 
+    // The publish gate. Until this existed the only thing checking a pipeline
+    // before it went live was the browser's own validation, which an agent
+    // posting straight at this API never runs. A definition with dangling
+    // edges, two triggers or a cycle was published and failed at run time
+    // instead, a long way from whatever produced it.
+    const validation = validateShape(current);
+    if (!isPublishable(validation)) {
+      log.info(
+        { pipelineId, action: 'def.publish', errors: validation.errors.length },
+        'publish rejected: definition is not structurally sound',
+      );
+      fireAndForgetAudit({
+        action: 'pipeline.definition.publish',
+        actorUserId: userId,
+        pipelineId,
+        outcome: 'error',
+        decision: 'rejected',
+        details: { stage: 'validate', errors: validation.errors.map((e) => e.code) },
+      });
+      res.status(422).json({
+        error: 'invalid_pipeline',
+        detail: 'pipeline has structural errors and cannot be published',
+        validation,
+      });
+      return;
+    }
+
     const beforeSnap = definitionSnapshot(current);
 
     const next = current as {
@@ -372,6 +409,6 @@ pipelineDefinitionsRouter.post(
       ...(beforeSnap ? { before: beforeSnap } : {}),
       ...(definitionSnapshot(next) ? { after: definitionSnapshot(next)! } : {}),
     });
-    res.json(next);
+    res.json({ ...next, validation });
   }),
 );

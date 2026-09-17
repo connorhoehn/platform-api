@@ -254,8 +254,17 @@ describe('PUT /api/pipelines/defs/:pipelineId — error path', () => {
 });
 
 describe('POST /api/pipelines/defs/:pipelineId/publish', () => {
+  /** A structurally sound graph — publish now refuses anything less. */
+  const soundGraph = {
+    nodes: [
+      { id: 't', type: 'trigger' },
+      { id: 'a', type: 'llm' },
+    ],
+    edges: [{ id: 'e1', source: 't', target: 'a' }],
+  };
+
   it('returns 200 with bumped version and published status', async () => {
-    mockGet.mockResolvedValue({ id: 'p-1', version: 2, status: 'draft' });
+    mockGet.mockResolvedValue({ id: 'p-1', version: 2, status: 'draft', ...soundGraph });
     const res = await run(buildApp(), 'POST', '/api/pipelines/defs/p-1/publish');
     expect(res.statusCode).toBe(200);
     const body = res.body as { version: number; status: string; publishedVersion: number };
@@ -265,7 +274,7 @@ describe('POST /api/pipelines/defs/:pipelineId/publish', () => {
   });
 
   it('defaults version to 1 when not set', async () => {
-    mockGet.mockResolvedValue({ id: 'p-1' });
+    mockGet.mockResolvedValue({ id: 'p-1', ...soundGraph });
     const res = await run(buildApp(), 'POST', '/api/pipelines/defs/p-1/publish');
     expect(res.statusCode).toBe(200);
     expect((res.body as { version: number }).version).toBe(1);
@@ -286,12 +295,53 @@ describe('POST /api/pipelines/defs/:pipelineId/publish', () => {
   });
 
   it('returns 500 when repo.put throws during publish write', async () => {
-    mockGet.mockResolvedValue({ id: 'p-1', version: 1, status: 'draft' });
+    mockGet.mockResolvedValue({ id: 'p-1', version: 1, status: 'draft', ...soundGraph });
     mockPut.mockRejectedValue(new Error('DDB write error'));
     const res = await run(buildApp(), 'POST', '/api/pipelines/defs/p-1/publish');
     expect(res.statusCode).toBe(500);
     const body = res.body as { error: string };
     expect(body.error).toBe('internal_error');
+  });
+
+  it('refuses to publish a definition with a dangling edge', async () => {
+    mockGet.mockResolvedValue({
+      id: 'p-1',
+      version: 1,
+      nodes: [{ id: 't', type: 'trigger' }],
+      edges: [{ id: 'e1', source: 't', target: 'deleted-node' }],
+    });
+    const res = await run(buildApp(), 'POST', '/api/pipelines/defs/p-1/publish');
+    expect(res.statusCode).toBe(422);
+    const body = res.body as { error: string; validation: { errors: { code: string }[] } };
+    expect(body.error).toBe('invalid_pipeline');
+    expect(body.validation.errors.map((e) => e.code)).toContain('EDGE_ENDPOINT_UNKNOWN');
+    // Nothing was stored: a rejected publish must not bump the version.
+    expect(mockPut).not.toHaveBeenCalled();
+  });
+
+  it('refuses to publish a definition with no trigger', async () => {
+    mockGet.mockResolvedValue({
+      id: 'p-1',
+      nodes: [{ id: 'a' }, { id: 'b' }],
+      edges: [{ id: 'e1', source: 'a', target: 'b' }],
+    });
+    const res = await run(buildApp(), 'POST', '/api/pipelines/defs/p-1/publish');
+    expect(res.statusCode).toBe(422);
+    expect(mockPut).not.toHaveBeenCalled();
+  });
+
+  it('publishes despite advisory warnings, and reports them', async () => {
+    mockGet.mockResolvedValue({
+      id: 'p-1',
+      version: 1,
+      nodes: [...soundGraph.nodes, { id: 'lonely' }],
+      edges: soundGraph.edges,
+    });
+    const res = await run(buildApp(), 'POST', '/api/pipelines/defs/p-1/publish');
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { validation: { warnings: { code: string }[] } };
+    expect(body.validation.warnings.map((w) => w.code)).toEqual(['NODE_ORPHANED']);
+    expect(mockPut).toHaveBeenCalled();
   });
 });
 
@@ -301,7 +351,14 @@ describe('pokeCacheAfterWrite — refresh error is swallowed', () => {
     const { pipelineDefinitionsCache } = await import('../../pipeline/definitions-cache.js');
     (pipelineDefinitionsCache.refresh as jest.Mock).mockRejectedValueOnce(new Error('cache exploded'));
 
-    mockGet.mockResolvedValue({ id: 'p-1', status: 'draft' });
+    // Sound graph: publish validates before it writes, so a definition with no
+    // nodes would be rejected before the cache poke this test is about.
+    mockGet.mockResolvedValue({
+      id: 'p-1',
+      status: 'draft',
+      nodes: [{ id: 't', type: 'trigger' }, { id: 'a' }],
+      edges: [{ id: 'e1', source: 't', target: 'a' }],
+    });
     const res = await run(buildApp(), 'POST', '/api/pipelines/defs/p-1/publish');
     // Response still succeeds; the refresh error is fire-and-forget
     expect(res.statusCode).toBe(200);
