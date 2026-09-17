@@ -37,6 +37,7 @@ import {
   pipelineDashboardDataRouter,
 } from './pipelineMetrics';
 import { pipelineDefinitionsRouter } from './pipelineDefinitions';
+import { pipelineStepKindsRouter } from './pipelineStepKinds';
 import { pipelineHealthRouter } from './pipelineHealth';
 import {
   pipelineTriggersRouter,
@@ -147,6 +148,9 @@ router.use('/pipelines/metrics', pipelineMetricsRouter);
 // rule as `/metrics`.
 router.use('/pipelines/dashboard-data', pipelineDashboardDataRouter);
 router.use('/pipelines/defs', pipelineDefinitionsRouter);
+// The catalog of executable step kinds. Static segment, same precedence rule
+// as `/metrics` and `/defs`.
+router.use('/pipelines/step-kinds', pipelineStepKindsRouter);
 // Health introspection — same precedence rule as `/metrics` and `/defs`:
 // register the static segment BEFORE any `:pipelineId` mount.
 router.use('/pipelines/health', pipelineHealthRouter);

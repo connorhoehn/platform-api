@@ -169,3 +169,56 @@ describe('validateShape — advisory only', () => {
     expect(result.warnings.map((w) => w.nodeId).sort()).toEqual(['x', 'y']);
   });
 });
+
+describe('validateShape — unrecognised step kinds', () => {
+  const known = ['trigger', 'agent', 'document:apply'];
+
+  it('says nothing about kinds when no catalog is supplied', () => {
+    const result = validateShape(
+      def([trigger, { id: 'a', type: 'invented:kind' }], [
+        { id: 'e1', source: 't', target: 'a' },
+      ]),
+    );
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('warns about a kind the server cannot execute', () => {
+    const result = validateShape(
+      def([trigger, { id: 'a', type: 'invented:kind' }], [
+        { id: 'e1', source: 't', target: 'a' },
+      ]),
+      { knownKinds: known },
+    );
+    const issue = result.warnings.find((w) => w.code === 'NODE_KIND_UNKNOWN');
+    expect(issue?.nodeId).toBe('a');
+    expect(issue?.message).toContain('invented:kind');
+  });
+
+  it('stays quiet when every kind is in the catalog', () => {
+    const result = validateShape(
+      def([trigger, { id: 'a', type: 'document:apply' }], [
+        { id: 'e1', source: 't', target: 'a' },
+      ]),
+      { knownKinds: known },
+    );
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('does not block publish — an unknown kind is advisory', () => {
+    const result = validateShape(
+      def([trigger, { id: 'a', type: 'invented:kind' }], [
+        { id: 'e1', source: 't', target: 'a' },
+      ]),
+      { knownKinds: known },
+    );
+    expect(isPublishable(result)).toBe(true);
+  });
+
+  it('reports a node with no kind at all', () => {
+    const result = validateShape(
+      def([trigger, { id: 'a' }], [{ id: 'e1', source: 't', target: 'a' }]),
+      { knownKinds: known },
+    );
+    expect(result.warnings.find((w) => w.code === 'NODE_KIND_UNKNOWN')?.nodeId).toBe('a');
+  });
+});

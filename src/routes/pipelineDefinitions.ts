@@ -45,8 +45,14 @@ import { publishInvalidate } from '../pipeline/definitions-invalidator';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { withContext } from '../lib/logger';
 import { validateShape, isPublishable } from '../pipeline/validate-shape';
+import { listStepKinds } from '../pipeline/customStepHandlers';
 
 const log = withContext({ route: 'pipelineDefinitions' });
+
+/** The kinds this process can execute, for the unrecognised-kind check. */
+function knownStepKinds(): string[] {
+  return listStepKinds().map((k) => k.kind);
+}
 
 /**
  * Best-effort cache poke after a write. Refreshes the LOCAL cache
@@ -245,7 +251,10 @@ pipelineDefinitionsRouter.put(
     // blocked — half-wired is a legitimate state on the way to finished — but an
     // agent posting definitions has no editor to look at, so the only way it
     // learns that it left a dangling edge is if we say so here.
-    res.json({ ...(def as Record<string, unknown>), validation: validateShape(def) });
+    res.json({
+      ...(def as Record<string, unknown>),
+      validation: validateShape(def, { knownKinds: knownStepKinds() }),
+    });
   }),
 );
 
@@ -338,7 +347,7 @@ pipelineDefinitionsRouter.post(
     // posting straight at this API never runs. A definition with dangling
     // edges, two triggers or a cycle was published and failed at run time
     // instead, a long way from whatever produced it.
-    const validation = validateShape(current);
+    const validation = validateShape(current, { knownKinds: knownStepKinds() });
     if (!isPublishable(validation)) {
       log.info(
         { pipelineId, action: 'def.publish', errors: validation.errors.length },

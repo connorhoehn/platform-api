@@ -340,7 +340,11 @@ describe('POST /api/pipelines/defs/:pipelineId/publish', () => {
     const res = await run(buildApp(), 'POST', '/api/pipelines/defs/p-1/publish');
     expect(res.statusCode).toBe(200);
     const body = res.body as { validation: { warnings: { code: string }[] } };
-    expect(body.validation.warnings.map((w) => w.code)).toEqual(['NODE_ORPHANED']);
+    // `lonely` is both unwired and typeless, so it draws both advisories.
+    expect(body.validation.warnings.map((w) => w.code).sort()).toEqual([
+      'NODE_KIND_UNKNOWN',
+      'NODE_ORPHANED',
+    ]);
     expect(mockPut).toHaveBeenCalled();
   });
 });

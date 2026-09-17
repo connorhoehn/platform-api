@@ -34,7 +34,8 @@ export type ShapeIssueCode =
   | 'TRIGGER_MISSING'
   | 'TRIGGER_MULTIPLE'
   | 'CYCLE_DETECTED'
-  | 'NODE_ORPHANED';
+  | 'NODE_ORPHANED'
+  | 'NODE_KIND_UNKNOWN';
 
 export interface ShapeIssue {
   code: ShapeIssueCode;
@@ -47,6 +48,15 @@ export interface ShapeIssue {
 export interface ShapeValidation {
   errors: ShapeIssue[];
   warnings: ShapeIssue[];
+}
+
+export interface ShapeOptions {
+  /**
+   * Step kinds this server can execute, from `listStepKinds()`. When given, a
+   * node whose type is not among them is reported. Left out, the check is
+   * skipped — so the validator stays pure and testable without the registry.
+   */
+  knownKinds?: Iterable<string>;
 }
 
 /** True when the definition has no errors — i.e. it may be published. */
@@ -79,7 +89,10 @@ function idOf(value: unknown): string | null {
  * Never throws: a definition that is malformed enough to be unreadable comes
  * back as errors, because this runs on request bodies from anywhere.
  */
-export function validateShape(definition: unknown): ShapeValidation {
+export function validateShape(
+  definition: unknown,
+  options: ShapeOptions = {},
+): ShapeValidation {
   const errors: ShapeIssue[] = [];
   const warnings: ShapeIssue[] = [];
 
@@ -114,8 +127,10 @@ export function validateShape(definition: unknown): ShapeValidation {
   }
 
   // --- nodes: ids present and unique ---------------------------------------
+  const knownKinds = options.knownKinds ? new Set(options.knownKinds) : null;
   const known = new Set<string>();
   const triggers: string[] = [];
+  const unknownKinds: Array<{ id: string; kind: string }> = [];
   for (const raw of rawNodes) {
     const node = (raw ?? {}) as LooseNode;
     const id = idOf(node.id);
@@ -138,6 +153,11 @@ export function validateShape(definition: unknown): ShapeValidation {
     }
     known.add(id);
     if (node.type === 'trigger') triggers.push(id);
+
+    const kind = typeof node.type === 'string' ? node.type : '';
+    if (knownKinds && (!kind || !knownKinds.has(kind))) {
+      unknownKinds.push({ id, kind });
+    }
   }
 
   // --- edges: endpoints resolve, no self-loops -----------------------------
@@ -206,6 +226,24 @@ export function validateShape(definition: unknown): ShapeValidation {
       message: `Pipeline contains a cycle through "${cycleNode}"; it would never finish.`,
       severity: 'error',
       nodeId: cycleNode,
+    });
+  }
+
+  // --- unrecognised step kinds (advisory) -----------------------------------
+  // A node whose kind has no handler cannot run, so this is arguably an error.
+  // It is a warning for now because handler registration happens at bootstrap
+  // and this route answers from whatever the CURRENT process has registered —
+  // a replica that had not finished registering a plugin's handlers, or a
+  // deployment mid-roll, would otherwise reject a publish that is perfectly
+  // sound. Worth promoting to an error once registration timing is pinned down.
+  for (const { id, kind } of unknownKinds) {
+    warnings.push({
+      code: 'NODE_KIND_UNKNOWN',
+      message: kind
+        ? `Node "${id}" has kind "${kind}", which this server has no handler for.`
+        : `Node "${id}" has no kind.`,
+      severity: 'warning',
+      nodeId: id,
     });
   }
 

@@ -59,6 +59,42 @@ export function hasCustomStepHandler(kind: string): boolean {
   return HANDLERS.has(kind);
 }
 
+/** One entry in the step-kind catalog. */
+export interface StepKindInfo {
+  kind: string;
+  /**
+   * `builtin` — one of DC's canonical NodeTypes, always executable.
+   * `registered` — a namespaced kind a module registered a handler for.
+   */
+  source: 'builtin' | 'registered';
+}
+
+/**
+ * Every step kind this server can actually execute.
+ *
+ * Exists because nothing could answer the question before. Step kinds are
+ * plain strings on a node (`transcription:transcribe`), registered ad-hoc by
+ * whichever module owns them, and an author — increasingly an agent posting a
+ * definition at the API — had no way to discover which strings are real. A
+ * typo produced a pipeline that saved, published, and then failed at run time.
+ *
+ * Sorted, so the response is stable and diffable.
+ */
+export function listStepKinds(): StepKindInfo[] {
+  const out: StepKindInfo[] = [...CANONICAL_NODE_TYPES].map((kind) => ({
+    kind,
+    source: 'builtin' as const,
+  }));
+  for (const kind of HANDLERS.keys()) {
+    // An overridable canonical type (`agent`) can also carry a handler; it is
+    // already listed as builtin and stays that way.
+    if (CANONICAL_NODE_TYPES.has(kind)) continue;
+    out.push({ kind, source: 'registered' });
+  }
+  out.sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));
+  return out;
+}
+
 /** Test seam. */
 export function clearCustomStepHandlers(): void {
   HANDLERS.clear();
