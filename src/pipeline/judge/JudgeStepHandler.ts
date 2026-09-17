@@ -24,6 +24,7 @@ import type {
   StepHandlerHelpers,
   StepOutcome,
 } from 'distributed-core/applications/pipeline';
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { JudgeClient, DEFAULT_JUDGE_SYSTEM_PROMPT } from './JudgeClient';
 import { aggregateScore, normalizeCriterionScore } from './aggregateScore';
 import { computeJudgeCost, computeCacheHitRatio } from './computeJudgeCost';
@@ -74,11 +75,19 @@ const DEFAULT_MODEL = 'claude-sonnet-4-6';
  */
 type LooseEmit = (event: string, payload: unknown) => Promise<void>;
 
-export function createJudgeStepHandler(opts: JudgeStepHandlerOpts): StepHandler {
+export function createJudgeStepHandler(opts: JudgeStepHandlerOpts): DescribedStepHandler {
   const defaultModel = opts.defaultModel ?? DEFAULT_MODEL;
 
   return {
     kind: 'llm:judge',
+    description:
+      'Scores a previous step against the criteria on this node and routes on the result: out when it passes, fail when it does not.',
+    reads: 'The output of the step named by this node, plus its criteria.',
+    emits: 'The per-criterion scores and whether the whole judgement passed.',
+    // NOT `out`/`error`: a judgement that does not pass is an ANSWER, not a
+    // failure, so it leaves by `fail`. Declared so neither the editor nor the
+    // publish gate has to guess.
+    outputs: ['out', 'fail'],
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

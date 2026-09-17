@@ -35,7 +35,8 @@ export type ShapeIssueCode =
   | 'TRIGGER_MULTIPLE'
   | 'CYCLE_DETECTED'
   | 'NODE_ORPHANED'
-  | 'NODE_KIND_UNKNOWN';
+  | 'NODE_KIND_UNKNOWN'
+  | 'EDGE_HANDLE_UNKNOWN';
 
 export interface ShapeIssue {
   code: ShapeIssueCode;
@@ -57,7 +58,51 @@ export interface ShapeOptions {
    * skipped — so the validator stays pure and testable without the registry.
    */
   knownKinds?: Iterable<string>;
+  /**
+   * The handles a registered step kind declares, when it declares any.
+   *
+   * Handles were checked nowhere on this side, so an edge leaving
+   * `condition.out` — a handle a condition does not have, its real ones being
+   * `true` and `false` — published without complaint and then routed nowhere at
+   * run time. The editor has refused that edge all along; an agent posting the
+   * same definition straight at the API got a 200.
+   *
+   * Canonical node types have a fixed handle set, known below. A registered
+   * kind is only checked when its handler declares `outputs`/`inputs` — the
+   * alternative is guessing, and guessing is how the editor came to refuse
+   * `llm:judge.fail`, which is a real handle that a real handler really routes
+   * on. Undeclared stays unchecked.
+   */
+  handlesFor?: (kind: string) => { outputs?: readonly string[]; inputs?: readonly string[] } | undefined;
 }
+
+/**
+ * Outgoing handles of the canonical node types.
+ *
+ * `fork` and `join` are dynamic — `branch-0…`, `in-0…` — so they are matched by
+ * pattern rather than listed.
+ */
+const CANONICAL_OUTPUTS: Record<string, readonly string[]> = {
+  trigger: ['out'],
+  llm: ['out', 'error'],
+  agent: ['out', 'error'],
+  transform: ['out'],
+  condition: ['true', 'false'],
+  action: ['out', 'error'],
+  join: ['out'],
+  approval: ['approved', 'rejected'],
+};
+
+/** Incoming handles of the canonical node types. A trigger takes none. */
+const CANONICAL_INPUTS: Record<string, readonly string[]> = {
+  llm: ['in'],
+  agent: ['in'],
+  transform: ['in'],
+  condition: ['in'],
+  action: ['in'],
+  fork: ['in'],
+  approval: ['in'],
+};
 
 /** True when the definition has no errors — i.e. it may be published. */
 export function isPublishable(result: ShapeValidation): boolean {
@@ -73,6 +118,35 @@ interface LooseEdge {
   id?: unknown;
   source?: unknown;
   target?: unknown;
+  sourceHandle?: unknown;
+  targetHandle?: unknown;
+}
+
+/** Whether `handle` is one this node type can route out of. `null` = cannot tell. */
+function outputAllowed(
+  type: string,
+  handle: string,
+  declared: readonly string[] | undefined,
+): boolean | null {
+  if (type === 'fork') return /^branch-\d+$/.test(handle);
+  const canonical = CANONICAL_OUTPUTS[type];
+  if (canonical) return canonical.includes(handle);
+  if (declared && declared.length > 0) return declared.includes(handle);
+  return null;
+}
+
+/** Whether `handle` is one this node type can be entered by. `null` = cannot tell. */
+function inputAllowed(
+  type: string,
+  handle: string,
+  declared: readonly string[] | undefined,
+): boolean | null {
+  if (type === 'trigger') return false;
+  if (type === 'join') return /^in-\d+$/.test(handle);
+  const canonical = CANONICAL_INPUTS[type];
+  if (canonical) return canonical.includes(handle);
+  if (declared && declared.length > 0) return declared.includes(handle);
+  return null;
 }
 
 function asArray(value: unknown): unknown[] | null {
@@ -128,6 +202,9 @@ export function validateShape(
 
   // --- nodes: ids present and unique ---------------------------------------
   const knownKinds = options.knownKinds ? new Set(options.knownKinds) : null;
+  const handlesFor = options.handlesFor;
+  /** Node id → its declared type, for the handle checks below. */
+  const typeById = new Map<string, string>();
   const known = new Set<string>();
   const triggers: string[] = [];
   const unknownKinds: Array<{ id: string; kind: string }> = [];
@@ -152,6 +229,7 @@ export function validateShape(
       continue;
     }
     known.add(id);
+    typeById.set(id, typeof node.type === 'string' ? node.type : '');
     if (node.type === 'trigger') triggers.push(id);
 
     const kind = typeof node.type === 'string' ? node.type : '';
@@ -160,7 +238,7 @@ export function validateShape(
     }
   }
 
-  // --- edges: endpoints resolve, no self-loops -----------------------------
+  // --- edges: endpoints resolve, no self-loops, handles exist --------------
   const succ = new Map<string, string[]>();
   const degree = new Map<string, number>();
   for (const id of known) {
@@ -197,6 +275,39 @@ export function validateShape(
       });
       continue;
     }
+    // Handles. Only reported when the answer is known — an undeclared
+    // registered kind is left alone rather than guessed at.
+    const sourceType = typeById.get(source) ?? '';
+    const targetType = typeById.get(target) ?? '';
+    const sourceHandle = typeof edge.sourceHandle === 'string' ? edge.sourceHandle : 'out';
+    const targetHandle = typeof edge.targetHandle === 'string' ? edge.targetHandle : 'in';
+
+    const outOk = outputAllowed(sourceType, sourceHandle, handlesFor?.(sourceType)?.outputs);
+    if (outOk === false) {
+      errors.push({
+        code: 'EDGE_HANDLE_UNKNOWN',
+        message: `Edge ${edgeId ?? '(unnamed)'} leaves "${source}" by "${sourceHandle}", which a ${sourceType} step does not have.`,
+        severity: 'error',
+        edgeId,
+        nodeId: source,
+      });
+      continue;
+    }
+    const inOk = inputAllowed(targetType, targetHandle, handlesFor?.(targetType)?.inputs);
+    if (inOk === false) {
+      errors.push({
+        code: 'EDGE_HANDLE_UNKNOWN',
+        message:
+          targetType === 'trigger'
+            ? `Edge ${edgeId ?? '(unnamed)'} points into trigger "${target}", but a trigger is where a pipeline begins.`
+            : `Edge ${edgeId ?? '(unnamed)'} enters "${target}" by "${targetHandle}", which a ${targetType} step does not have.`,
+        severity: 'error',
+        edgeId,
+        nodeId: target,
+      });
+      continue;
+    }
+
     (succ.get(source) as string[]).push(target);
     degree.set(source, (degree.get(source) ?? 0) + 1);
     degree.set(target, (degree.get(target) ?? 0) + 1);

@@ -55,6 +55,20 @@ function knownStepKinds(): string[] {
 }
 
 /**
+ * The handles a step kind declares, for the edge checks in `validateShape`.
+ *
+ * Built once per validation rather than per edge — `listStepKinds` walks the
+ * whole registry, and a definition can carry a lot of edges.
+ */
+function declaredHandles(): (kind: string) => { outputs?: readonly string[]; inputs?: readonly string[] } | undefined {
+  const byKind = new Map<string, { outputs?: readonly string[]; inputs?: readonly string[] }>();
+  for (const k of listStepKinds()) {
+    if (k.outputs || k.inputs) byKind.set(k.kind, { outputs: k.outputs, inputs: k.inputs });
+  }
+  return (kind: string) => byKind.get(kind);
+}
+
+/**
  * Best-effort cache poke after a write. Refreshes the LOCAL cache
  * immediately AND publishes a Redis invalidation message so other
  * replicas refresh their own caches within milliseconds instead of
@@ -291,7 +305,10 @@ pipelineDefinitionsRouter.put(
     // learns that it left a dangling edge is if we say so here.
     res.json({
       ...(def as Record<string, unknown>),
-      validation: validateShape(def, { knownKinds: knownStepKinds() }),
+      validation: validateShape(def, {
+        knownKinds: knownStepKinds(),
+        handlesFor: declaredHandles(),
+      }),
     });
   }),
 );
@@ -385,7 +402,10 @@ pipelineDefinitionsRouter.post(
     // posting straight at this API never runs. A definition with dangling
     // edges, two triggers or a cycle was published and failed at run time
     // instead, a long way from whatever produced it.
-    const validation = validateShape(current, { knownKinds: knownStepKinds() });
+    const validation = validateShape(current, {
+      knownKinds: knownStepKinds(),
+      handlesFor: declaredHandles(),
+    });
     if (!isPublishable(validation)) {
       log.info(
         { pipelineId, action: 'def.publish', errors: validation.errors.length },

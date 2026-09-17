@@ -80,6 +80,24 @@ export interface DescribedStepHandler extends StepHandler {
   readonly reads?: string;
   /** What it puts back into the run context. */
   readonly emits?: string;
+  /**
+   * The outgoing handles this step can route on, when they are not the usual
+   * `out` and `error`.
+   *
+   * Nothing declared handles anywhere before this, so both ends guessed and
+   * both guessed wrong in opposite directions. `llm:judge` routes on `fail`
+   * when the judgement does not pass — the editor assumes a registered kind
+   * has `out` and `error` only, so it REFUSED a perfectly good
+   * `llm:judge.fail → …` edge; the server validated no handles at all, so it
+   * happily published `condition.out`, a handle a condition does not have.
+   *
+   * A kind that declares its handles gets checked against them, at both ends.
+   * One that declares none is not second-guessed — silence means "unknown",
+   * never "only the defaults".
+   */
+  readonly outputs?: readonly string[];
+  /** The incoming handles, when they are not just `in`. */
+  readonly inputs?: readonly string[];
 }
 
 /** One entry in the step-kind catalog. */
@@ -94,6 +112,10 @@ export interface StepKindInfo {
   description?: string;
   reads?: string;
   emits?: string;
+  /** Declared outgoing handles. Absent means the kind did not say. */
+  outputs?: readonly string[];
+  /** Declared incoming handles. Absent means the kind did not say. */
+  inputs?: readonly string[];
 }
 
 /**
@@ -123,6 +145,8 @@ export function listStepKinds(): StepKindInfo[] {
     if (h?.description) entry.description = h.description;
     if (h?.reads) entry.reads = h.reads;
     if (h?.emits) entry.emits = h.emits;
+    if (h?.outputs?.length) entry.outputs = [...h.outputs];
+    if (h?.inputs?.length) entry.inputs = [...h.inputs];
     out.push(entry);
   }
   out.sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));
