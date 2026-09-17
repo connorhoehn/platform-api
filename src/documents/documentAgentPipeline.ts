@@ -13,6 +13,7 @@ import { interpolateContext } from '../pipeline/agent/AgentStepHandler';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
 import { applyOps, createSuggestionIdentity, ensureCanvasMeta, outlineOf, parseOps, type ApplyMode, type OutlineBlock } from './documentAgentOps';
 import log from '../lib/logger';
+import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 
 export const DOCUMENT_AGENT_EDIT_PIPELINE_ID = 'document-agent-edit';
 export const DOCUMENT_TRANSFORM_PIPELINE_ID = 'document-transform';
@@ -244,9 +245,13 @@ function documentIdOf(context: Record<string, unknown>): string | null {
 }
 
 /** Step 1: join the document and hand its outline to the run context. */
-export function createDocumentReadHandler(): StepHandler {
+export function createDocumentReadHandler(): DescribedStepHandler {
   return {
     kind: DOCUMENT_READ_KIND,
+    description:
+      'Joins the document as the agent and hands its outline to the run, so later steps can refer to blocks by id.',
+    reads: 'sourceDocumentId, else documentId (or the trigger step\'s documentId).',
+    emits: 'The document outline: one entry per block, with its id and text.',
     async execute(_node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
       // A transform reads the SOURCE and writes the target; an edit reads and writes the same page.
       const readId = (typeof context.sourceDocumentId === 'string' && context.sourceDocumentId) || documentIdOf(context);
@@ -307,9 +312,13 @@ export function reviewPlan(ops: ReturnType<typeof parseOps>, data: DocumentRevie
 }
 
 /** Step 3: read the plan and decide whether a person has to see it before it lands. */
-export function createDocumentReviewHandler(): StepHandler {
+export function createDocumentReviewHandler(): DescribedStepHandler {
   return {
     kind: DOCUMENT_REVIEW_KIND,
+    description:
+      'Judges the size of a planned edit and decides whether a person has to see it first. Big edits, deletions and type changes pause the run for whoever asked.',
+    reads: 'The planned operations, from the plan step or from the node\'s opsFrom path.',
+    emits: 'needsApproval, which the approval gate downstream reads.',
     async execute(node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
       const data = ((node as { data?: DocumentReviewNodeData }).data ?? {}) as DocumentReviewNodeData;
       const { ops } = opsFromContext(context, { opsFrom: data.opsFrom });
@@ -361,9 +370,13 @@ export function opsFromContext(context: Record<string, unknown>, data: DocumentA
  * agent, show up in presence, apply the operations, leave. The /doc edit, the
  * transform and the call transcript all land through this one step.
  */
-export function createDocumentApplyHandler(): StepHandler {
+export function createDocumentApplyHandler(): DescribedStepHandler {
   return {
     kind: DOCUMENT_APPLY_KIND,
+    description:
+      'The write path into a document: joins as the agent, applies the operations through the collaboration channel, and leaves. The /doc edit, the transform and the call transcript all land through this one step.',
+    reads: 'documentId and the operations to apply.',
+    emits: 'What landed — the applied operations and the suggestion identity they were written under.',
     async execute(node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
       const data = ((node as { data?: DocumentApplyNodeData }).data ?? {}) as DocumentApplyNodeData;
       const documentId = documentIdOf(context);
@@ -426,9 +439,13 @@ export interface DocumentPlanNodeData {
   timeoutMs?: number;
 }
 
-export function createDocumentPlanHandler(llm: LLMClient): StepHandler {
+export function createDocumentPlanHandler(llm: LLMClient): DescribedStepHandler {
   return {
     kind: DOCUMENT_PLAN_KIND,
+    description:
+      'Asks a light model, in one call, which edits the instruction implies. Temperature 0 so the same instruction gives the same plan; bounded at 30 seconds.',
+    reads: 'The node\'s prompt, interpolated against the run context and the outline.',
+    emits: 'The planned operations, as JSON, for the review and apply steps.',
     async execute(node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
       const data = ((node as { data?: DocumentPlanNodeData }).data ?? {}) as DocumentPlanNodeData;
       const rawPrompt = typeof data.prompt === 'string' ? data.prompt : '';

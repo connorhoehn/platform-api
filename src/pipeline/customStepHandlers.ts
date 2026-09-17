@@ -59,6 +59,29 @@ export function hasCustomStepHandler(kind: string): boolean {
   return HANDLERS.has(kind);
 }
 
+/**
+ * A handler that says what it does.
+ *
+ * DC's `StepHandler` is `kind` plus `execute`, which is all the executor needs
+ * and less than a reader needs. The editor could report that
+ * `document:review-plan` is registered and executable, and not one word about
+ * what it reviews or what it decides — every registered kind rendered the same
+ * generic paragraph. For a system whose definitions are increasingly written by
+ * agents and read back by people auditing them, "this string is real" is the
+ * least interesting true thing to say about a step.
+ *
+ * The description lives on the handler, next to the code that implements it,
+ * so the two cannot drift apart the way a central catalog would.
+ */
+export interface DescribedStepHandler extends StepHandler {
+  /** One or two sentences: what this step does, in the run's terms. */
+  readonly description?: string;
+  /** What it expects to find in the run context, when that is not obvious. */
+  readonly reads?: string;
+  /** What it puts back into the run context. */
+  readonly emits?: string;
+}
+
 /** One entry in the step-kind catalog. */
 export interface StepKindInfo {
   kind: string;
@@ -67,6 +90,10 @@ export interface StepKindInfo {
    * `registered` — a namespaced kind a module registered a handler for.
    */
   source: 'builtin' | 'registered';
+  /** Present only when the handler describes itself. Absent is not an error. */
+  description?: string;
+  reads?: string;
+  emits?: string;
 }
 
 /**
@@ -89,7 +116,14 @@ export function listStepKinds(): StepKindInfo[] {
     // An overridable canonical type (`agent`) can also carry a handler; it is
     // already listed as builtin and stays that way.
     if (CANONICAL_NODE_TYPES.has(kind)) continue;
-    out.push({ kind, source: 'registered' });
+    // Only carry the fields the handler actually set — an absent description is
+    // absent from the response, not an empty string the UI has to special-case.
+    const h = HANDLERS.get(kind) as DescribedStepHandler | undefined;
+    const entry: StepKindInfo = { kind, source: 'registered' };
+    if (h?.description) entry.description = h.description;
+    if (h?.reads) entry.reads = h.reads;
+    if (h?.emits) entry.emits = h.emits;
+    out.push(entry);
   }
   out.sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));
   return out;

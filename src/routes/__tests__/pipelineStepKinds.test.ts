@@ -12,7 +12,7 @@ import {
 import type { Request, Response } from 'express';
 
 interface Body {
-  kinds: Array<{ kind: string; source: string }>;
+  kinds: Array<{ kind: string; source: string; description?: string; reads?: string; emits?: string }>;
   builtin: string[];
   registered: string[];
 }
@@ -28,6 +28,8 @@ function get(): Body {
 }
 
 const stub = (kind: string) => ({ kind, execute: async () => ({}) }) as never;
+const described = (kind: string, extra: Record<string, string>) =>
+  ({ kind, execute: async () => ({}), ...extra }) as never;
 
 describe('GET /api/pipelines/step-kinds', () => {
   afterEach(() => clearCustomStepHandlers());
@@ -65,5 +67,31 @@ describe('GET /api/pipelines/step-kinds', () => {
     registerCustomStepHandler(stub('people:search'));
     const body = get();
     expect(body.builtin.length + body.registered.length).toBe(body.kinds.length);
+  });
+
+  // A registered kind used to render the same generic paragraph as every other
+  // one, in the editor and to any agent reading the catalog. The handler now
+  // carries its own description, next to the code that implements it.
+  it('carries a handler description through to the response', () => {
+    registerCustomStepHandler(
+      described('document:review-plan', {
+        description: 'Decides whether a person has to see the edit first.',
+        reads: 'The planned operations.',
+        emits: 'needsApproval.',
+      }),
+    );
+    const entry = get().kinds.find((k) => k.kind === 'document:review-plan');
+    expect(entry?.description).toBe('Decides whether a person has to see the edit first.');
+    expect(entry?.reads).toBe('The planned operations.');
+    expect(entry?.emits).toBe('needsApproval.');
+  });
+
+  it('omits the fields entirely for a handler that does not describe itself', () => {
+    registerCustomStepHandler(stub('people:search'));
+    const entry = get().kinds.find((k) => k.kind === 'people:search');
+    expect(entry).toBeDefined();
+    expect(entry).not.toHaveProperty('description');
+    expect(entry).not.toHaveProperty('reads');
+    expect(entry).not.toHaveProperty('emits');
   });
 });
