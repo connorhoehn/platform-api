@@ -253,6 +253,39 @@ describe('PUT /api/pipelines/defs/:pipelineId — error path', () => {
   });
 });
 
+describe('PUT optimistic lock only applies to a stored row', () => {
+  it('accepts the first edit of a system pipeline, which has no row yet', async () => {
+    // System pipelines are seeded in code and served by getSystemPipeline when
+    // the repo has nothing. The editor loads one at its declared version and
+    // sends that as expectedVersion, which was compared against a stored 0 — a
+    // conflict with nothing. Every edit to document-agent-review 409'd and the
+    // control snapped back with no error shown.
+    mockGet.mockResolvedValue(null);
+    const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/document-agent-review', {
+      body: { id: 'document-agent-review', name: 'Doc review', expectedVersion: 1 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(mockPut).toHaveBeenCalled();
+  });
+
+  it('still rejects a stale edit when a row does exist', async () => {
+    mockGet.mockResolvedValue({ id: 'p-1', version: 3 });
+    const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', {
+      body: { id: 'p-1', name: 'x', expectedVersion: 1 },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(mockPut).not.toHaveBeenCalled();
+  });
+
+  it('starts a first-written system pipeline at version 1', async () => {
+    mockGet.mockResolvedValue(null);
+    const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/document-agent-review', {
+      body: { id: 'document-agent-review', name: 'Doc review', expectedVersion: 1 },
+    });
+    expect((res.body as { version: number }).version).toBe(1);
+  });
+});
+
 describe('POST /api/pipelines/defs/:pipelineId/publish', () => {
   /** A structurally sound graph — publish now refuses anything less. */
   const soundGraph = {

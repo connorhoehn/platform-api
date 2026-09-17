@@ -184,7 +184,21 @@ pipelineDefinitionsRouter.put(
     // concurrent writer isn't clobbered. Opt-in: clients that don't send
     // expectedVersion get last-writer-wins (but still a monotonic version).
     const expectedVersion = (def as { expectedVersion?: unknown }).expectedVersion;
-    if (typeof expectedVersion === 'number' && expectedVersion !== existingVersion) {
+    // Only when a row actually EXISTS. Optimistic locking guards against
+    // clobbering a concurrent writer, and with no stored row there is no writer
+    // to clobber — this is a create.
+    //
+    // Without that condition the SYSTEM pipelines could never be edited at all.
+    // They are seeded in code and served by `getSystemPipeline` when the repo
+    // has nothing, so the editor loads one at its declared version (1), sends
+    // `expectedVersion: 1`, and is compared against a stored version of 0 — a
+    // conflict with nothing. Every edit to `document-agent-review` and its
+    // siblings 409'd and the control snapped back, with no error shown.
+    if (
+      existing !== null &&
+      typeof expectedVersion === 'number' &&
+      expectedVersion !== existingVersion
+    ) {
       res.status(409).json({
         error: 'version_conflict',
         detail: 'pipeline was modified by another writer; reload before saving',
