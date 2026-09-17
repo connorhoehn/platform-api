@@ -26,17 +26,37 @@ interface PublicProfile {
   visibility: string;
 }
 
-// Helper: batch-get public profile fields for a list of user IDs
+// Helper: batch-get public profile fields for a list of user IDs.
+//
+// A relationship is the fact; a profile is decoration on it. This used to map
+// the profile rows straight out, so anybody the caller followed who had never
+// written a profile was dropped from the answer entirely — the follow was
+// stored and then silently discarded on read. With profiles being opt-in that
+// is the common case, not the edge: a fresh workspace has none, so Following
+// came back empty however many people you had followed, and the UI could only
+// conclude the button did nothing.
+//
+// Every requested id now comes back. A missing profile yields the id as its own
+// display name, which is what the callers already fall back to when a name is
+// absent — and is a truthful "we do not know what they are called" rather than
+// a false "they are not there".
 async function enrichWithProfiles(userIds: string[]): Promise<PublicProfile[]> {
   if (userIds.length === 0) return [];
 
   const profiles = await profileRepo.batchGetProfiles(userIds);
-  return profiles.map((item) => ({
-    userId: item.userId,
-    displayName: item.displayName,
-    avatarUrl: item.avatarUrl,
-    visibility: item.visibility,
-  }));
+  const byId = new Map(profiles.map((item) => [item.userId, item]));
+  return userIds.map((userId) => {
+    const item = byId.get(userId);
+    return {
+      userId,
+      displayName: item?.displayName || userId,
+      avatarUrl: item?.avatarUrl ?? '',
+      // Unknown, not public. A profile nobody has created has made no claim
+      // about who may see it, and guessing "public" would publish a person by
+      // omission.
+      visibility: item?.visibility ?? 'private',
+    };
+  });
 }
 
 // POST /api/social/follow/:userId — follow a user (SOCL-01)

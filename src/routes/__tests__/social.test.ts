@@ -176,6 +176,36 @@ describe('GET /api/social/following', () => {
     expect(res.statusCode).toBe(200);
     expect((res.body as { following: unknown[] }).following).toHaveLength(1);
   });
+
+  // A relationship is the fact; a profile is decoration on it. Dropping the
+  // people who have not written one meant a stored follow vanished on read —
+  // and with profiles opt-in that is the common case, not the edge. A fresh
+  // workspace has none, so Following came back empty however many people you
+  // had followed, and the only conclusion available was "the button is broken".
+  it('keeps someone you follow who has never written a profile', async () => {
+    mockDocClientSend.mockResolvedValueOnce({
+      Items: [
+        { followerId: 'tester', followeeId: 'u2' },
+        { followerId: 'tester', followeeId: 'ghost' },
+      ],
+    });
+    mockBatchGetProfiles.mockResolvedValue([
+      { userId: 'u2', displayName: 'Bob', avatarUrl: '', visibility: 'public' },
+    ]);
+
+    const res = await run(buildApp(), 'GET', '/api/social/following');
+    const following = (res.body as { following: Array<Record<string, string>> }).following;
+    expect(following).toHaveLength(2);
+
+    const ghost = following.find((f) => f.userId === 'ghost')!;
+    // The id stands in for a name — truthful "we do not know what they are
+    // called", which is the fallback every caller already makes.
+    expect(ghost.displayName).toBe('ghost');
+    // NOT public: somebody who has created no profile has made no claim about
+    // who may see them, and defaulting to public would publish them by
+    // omission.
+    expect(ghost.visibility).toBe('private');
+  });
 });
 
 describe('GET /api/social/friends', () => {
