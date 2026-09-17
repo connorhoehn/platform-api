@@ -176,7 +176,24 @@ function parseStoredError(stored: string): { message: string; nodeId: string; er
  * Two mappings would drift, and this one already carries the legacy-status
  * folding that keeps list and detail agreeing.
  */
-export function runItemToSnapshot(item: PipelineRunItem): PipelineRunSnapshot {
+/**
+ * A run as this API returns it: distributed-core's snapshot plus the fields
+ * platform-api computes for itself.
+ *
+ * `estimatedCostUsd` is one of those. runPersistence has been accumulating it
+ * per run for a long time — token usage per model through `computeCost` — and
+ * PipelineRunRepository persists it. It was simply never projected onto the
+ * wire, so every client had to re-derive cost from raw token counts, and the
+ * Runs table showed a dash for every run because the browser could not work
+ * out which model a step had used without a local copy of the definition.
+ * DC's `PipelineRun` has no cost field, so the extension lives here.
+ */
+export type PipelineRunListRow = PipelineRunSnapshot & {
+  /** Estimated USD cost, summed across models. Absent when nothing was spent. */
+  estimatedCostUsd?: number;
+};
+
+export function runItemToSnapshot(item: PipelineRunItem): PipelineRunListRow {
   return {
     runId: item.runId,
     pipelineId: item.pipelineId,
@@ -198,6 +215,11 @@ export function runItemToSnapshot(item: PipelineRunItem): PipelineRunSnapshot {
     // DLQ redrive lineage, both directions.
     ...(item.redriveOf ? { redriveOf: item.redriveOf } : {}),
     ...(item.redrivenBy && item.redrivenBy.length > 0 ? { redrivenBy: item.redrivenBy } : {}),
+    // Omitted rather than zeroed when nothing was spent: a run with no LLM step
+    // has no cost, which is different from a cost of zero dollars.
+    ...(typeof item.estimatedCostUsd === 'number' && item.estimatedCostUsd > 0
+      ? { estimatedCostUsd: item.estimatedCostUsd }
+      : {}),
     triggeredBy: {
       userId: item.triggeredBy === 'system' ? undefined : item.triggeredBy,
       triggerType: item.triggerType ?? 'manual',
@@ -483,7 +505,7 @@ export function createBridge(
     async listRuns(
       pipelineId: string,
       opts: { limit?: number; cursor?: string } = {},
-    ): Promise<{ runs: PipelineRunSnapshot[]; nextCursor?: string }> {
+    ): Promise<{ runs: PipelineRunListRow[]; nextCursor?: string }> {
       if (!pipelineRunRepository) {
         // Fallback to empty when repository not wired
         return { runs: [], nextCursor: undefined };
@@ -503,7 +525,7 @@ export function createBridge(
       };
       items.sort((a, b) => startedMs(b) - startedMs(a));
 
-      const runs: PipelineRunSnapshot[] = items.slice(0, limit).map(runItemToSnapshot);
+      const runs: PipelineRunListRow[] = items.slice(0, limit).map(runItemToSnapshot);
 
       return { runs, nextCursor: undefined }; // Pagination via cursor NYI
     },
