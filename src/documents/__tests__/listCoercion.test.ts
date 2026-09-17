@@ -7,10 +7,10 @@
 // `rowsFromPipeText` already makes about pipes.
 
 import * as Y from 'yjs';
-import { parseOps, applyOps, outlineOf, listFromMarkerText, listItemsOf } from '../documentAgentOps';
+import { parseOps, applyOps, outlineOf, listFromMarkerText, listItemsOf, CANVAS_BODY_KEY } from '../documentAgentOps';
 
 function blocks(doc: Y.Doc): Y.XmlElement[] {
-  return doc.getXmlFragment('default').toArray().filter((n): n is Y.XmlElement => n instanceof Y.XmlElement);
+  return doc.getXmlFragment(CANVAS_BODY_KEY).toArray().filter((n): n is Y.XmlElement => n instanceof Y.XmlElement);
 }
 
 describe('listFromMarkerText', () => {
