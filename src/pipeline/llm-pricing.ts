@@ -25,8 +25,27 @@ const PRICING_TABLE: Record<string, ModelPricing> = {
 const DEFAULT_PRICING: ModelPricing = { inputPerMTok: 1, outputPerMTok: 5 };
 
 /**
- * Resolve pricing for a model string. Performs case-insensitive prefix matching
- * against known models, falling back to the default pricing for unknowns.
+ * Pricing by model FAMILY, for the ids that do not start with a table key.
+ *
+ * Agent steps report the model as the bare family they were configured with —
+ * `haiku`, not `claude-3-haiku-20240307` — so prefix matching missed every one
+ * of them and they were priced at the unknown-model default. Since agent steps
+ * are what this deployment actually runs, that was every priced step.
+ *
+ * Values are the existing table's, one tier each: this is a matching fix, not a
+ * repricing. The table itself is stale — it knows claude-3-* and
+ * claude-sonnet-4-6 and nothing from the Claude 5 family — and wants a pass
+ * from someone who can check today's published rates.
+ */
+const FAMILY_PRICING: ReadonlyArray<readonly [string, ModelPricing]> = [
+  ['opus', PRICING_TABLE['claude-3-opus']!],
+  ['sonnet', PRICING_TABLE['claude-3-sonnet']!],
+  ['haiku', PRICING_TABLE['claude-3-haiku']!],
+];
+
+/**
+ * Resolve pricing for a model string. Case-insensitive: exact key, then prefix,
+ * then family, then the unknown-model default.
  */
 export function getPricing(model: string): ModelPricing {
   const lower = model.toLowerCase();
@@ -35,6 +54,11 @@ export function getPricing(model: string): ModelPricing {
   // Prefix match (e.g. "claude-3-haiku-20240307" → "claude-3-haiku")
   for (const [key, pricing] of Object.entries(PRICING_TABLE)) {
     if (lower.startsWith(key)) return pricing;
+  }
+  // Family match, so `haiku`, `us.anthropic.claude-opus-5` and
+  // `claude-sonnet-5` all price as the tier they are.
+  for (const [family, pricing] of FAMILY_PRICING) {
+    if (lower.includes(family)) return pricing;
   }
   return DEFAULT_PRICING;
 }

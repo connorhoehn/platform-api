@@ -1094,3 +1094,209 @@ describe('RunPersistenceService — redriveOf', () => {
     expect(last.redrivenBy).toEqual(['r-newer']);
   });
 });
+
+describe('RunPersistenceService prices steps that report their own token usage', () => {
+  type Subscriber<P> = (event: { payload: P }) => unknown | Promise<unknown>;
+
+  function makeMockBus() {
+    const subs = new Map<string, Subscriber<unknown>>();
+    return {
+      subscribe: jest.fn((event: string, fn: Subscriber<unknown>) => {
+        subs.set(event, fn);
+      }),
+      async publish<P>(event: string, payload: P): Promise<void> {
+        const fn = subs.get(event);
+        if (fn) await fn({ payload: payload as unknown });
+      },
+    };
+  }
+
+  function makeService() {
+    const repo = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+    return { repo, bus, service };
+  }
+
+  const AGENT_OUTPUT = {
+    text: 'done',
+    turns: 2,
+    model: 'claude-sonnet-4-6',
+    tokensIn: 1000,
+    tokensOut: 500,
+  };
+
+  async function started(bus: ReturnType<typeof makeMockBus>) {
+    await bus.publish('pipeline:run:started', {
+      runId: 'r1',
+      pipelineId: 'p1',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' },
+      at: '2026-01-01T00:00:00.000Z',
+    });
+  }
+
+  /** Finish the run, which is what triggers the full-row write. */
+  async function finished(bus: ReturnType<typeof makeMockBus>) {
+    await bus.publish('pipeline:run:completed', {
+      runId: 'r1', durationMs: 900, at: '2026-01-01T00:00:03.000Z',
+    });
+  }
+
+  function lastItem(repo: { put: jest.Mock }): PipelineRunItem {
+    return repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+  }
+
+  it('prices an agent step from its output, which emits no llm events', async () => {
+    // The gap this closes: an agent step runs its own turn loop and returns the
+    // totals, so nothing ever reached the llm:* accumulator and no run built
+    // from agent steps had a cost at all.
+    const { repo, bus } = makeService();
+    await started(bus);
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r1', stepId: 'summarize', output: AGENT_OUTPUT,
+      durationMs: 900, at: '2026-01-01T00:00:01.000Z',
+    });
+
+    await finished(bus);
+    const item = lastItem(repo);
+    expect(item.tokenUsage?.['claude-sonnet-4-6']).toMatchObject({ tokensIn: 1000, tokensOut: 500 });
+    expect(item.estimatedCostUsd).toBeGreaterThan(0);
+  });
+
+  it('counts each fork branch once, because each really ran', async () => {
+    const { repo, bus } = makeService();
+    await started(bus);
+    for (let i = 0; i < 2; i++) {
+      await bus.publish('pipeline:step:completed', {
+        runId: 'r1', stepId: 'summarize', output: AGENT_OUTPUT,
+        durationMs: 900, at: '2026-01-01T00:00:01.000Z',
+      });
+    }
+    await finished(bus);
+    const item = lastItem(repo);
+    expect(item.tokenUsage?.['claude-sonnet-4-6']).toMatchObject({ tokensIn: 2000, tokensOut: 1000 });
+  });
+
+  it('ignores a step whose output carries no token counts', async () => {
+    const { repo, bus } = makeService();
+    await started(bus);
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r1', stepId: 'store', output: { ok: true },
+      durationMs: 10, at: '2026-01-01T00:00:01.000Z',
+    });
+    await finished(bus);
+    const item = lastItem(repo);
+    expect(item.tokenUsage ?? {}).toEqual({});
+    expect(item.estimatedCostUsd ?? 0).toBe(0);
+  });
+
+  it('ignores a zero-token report rather than pricing nothing at nothing', async () => {
+    const { repo, bus } = makeService();
+    await started(bus);
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r1', stepId: 'noop',
+      output: { model: 'claude-sonnet-4-6', tokensIn: 0, tokensOut: 0 },
+      durationMs: 10, at: '2026-01-01T00:00:01.000Z',
+    });
+    await finished(bus);
+    expect(lastItem(repo).tokenUsage ?? {}).toEqual({});
+  });
+
+  it('ignores a malformed report instead of charging for it', async () => {
+    const { repo, bus } = makeService();
+    await started(bus);
+    for (const bad of [
+      { model: 'm', tokensIn: -5, tokensOut: 10 },
+      { model: '', tokensIn: 10, tokensOut: 10 },
+      { model: 'm', tokensIn: Number.NaN, tokensOut: 10 },
+      { model: 'm', tokensIn: '10', tokensOut: 10 },
+    ]) {
+      await bus.publish('pipeline:step:completed', {
+        runId: 'r1', stepId: `s-${Math.random()}`, output: bad,
+        durationMs: 10, at: '2026-01-01T00:00:01.000Z',
+      });
+    }
+    await finished(bus);
+    expect(lastItem(repo).tokenUsage ?? {}).toEqual({});
+  });
+
+  it('gives a forked node one replay credit per branch it had finished', async () => {
+    // stepsSummary keys repeats as `id`, `id:2` — two branches, two credits,
+    // so a resume can replay both without charging for either.
+    const { repo, bus, service } = makeService();
+    service.seedResumedRun({
+      runId: 'r1', pipelineId: 'p1', status: 'running', triggeredBy: 'u1',
+      triggerType: 'manual', startedAt: '2026-01-01T00:00:00.000Z',
+      stepsSummary: {
+        summarize: { status: 'completed' } as unknown as StepSummary,
+        'summarize:2': { status: 'completed' } as unknown as StepSummary,
+      },
+      tokenUsage: { 'claude-sonnet-4-6': { tokensIn: 2000, tokensOut: 1000 } },
+      estimatedCostUsd: 0.021,
+    } as unknown as PipelineRunItem);
+
+    for (let i = 0; i < 2; i++) {
+      await bus.publish('pipeline:step:completed', {
+        runId: 'r1', stepId: 'summarize', output: AGENT_OUTPUT,
+        durationMs: 900, at: '2026-01-01T00:00:02.000Z',
+      });
+    }
+    await finished(bus);
+    expect(lastItem(repo).tokenUsage?.['claude-sonnet-4-6'])
+      .toMatchObject({ tokensIn: 2000, tokensOut: 1000 });
+  });
+
+  it('charges for work done AFTER a resume, once the credits are spent', async () => {
+    const { repo, bus, service } = makeService();
+    service.seedResumedRun({
+      runId: 'r1', pipelineId: 'p1', status: 'running', triggeredBy: 'u1',
+      triggerType: 'manual', startedAt: '2026-01-01T00:00:00.000Z',
+      stepsSummary: { summarize: { status: 'completed' } as unknown as StepSummary },
+      tokenUsage: { 'claude-sonnet-4-6': { tokensIn: 1000, tokensOut: 500 } },
+      estimatedCostUsd: 0.0105,
+    } as unknown as PipelineRunItem);
+
+    // The replay, then a genuinely new step the run had not reached.
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r1', stepId: 'summarize', output: AGENT_OUTPUT,
+      durationMs: 900, at: '2026-01-01T00:00:02.000Z',
+    });
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r1', stepId: 'publish', output: AGENT_OUTPUT,
+      durationMs: 900, at: '2026-01-01T00:00:03.000Z',
+    });
+    await finished(bus);
+    expect(lastItem(repo).tokenUsage?.['claude-sonnet-4-6'])
+      .toMatchObject({ tokensIn: 2000, tokensOut: 1000 });
+  });
+
+  it('does not re-charge a resumed run for steps it already paid for', async () => {
+    // The double-count this guards. seedResumedRun restores tokenUsage from the
+    // stored row; replaying that step's completion must not add it twice.
+    const { repo, bus, service } = makeService();
+    service.seedResumedRun({
+      runId: 'r1',
+      pipelineId: 'p1',
+      status: 'running',
+      triggeredBy: 'u1',
+      triggerType: 'manual',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      stepsSummary: { summarize: { status: 'completed' } as unknown as StepSummary },
+      tokenUsage: { 'claude-sonnet-4-6': { tokensIn: 1000, tokensOut: 500 } },
+      estimatedCostUsd: 0.0105,
+    } as unknown as PipelineRunItem);
+
+    await bus.publish('pipeline:step:completed', {
+      runId: 'r1', stepId: 'summarize', output: AGENT_OUTPUT,
+      durationMs: 900, at: '2026-01-01T00:00:02.000Z',
+    });
+
+    await finished(bus);
+    const item = lastItem(repo);
+    expect(item.tokenUsage?.['claude-sonnet-4-6']).toMatchObject({ tokensIn: 1000, tokensOut: 500 });
+  });
+});

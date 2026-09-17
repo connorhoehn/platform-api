@@ -51,3 +51,32 @@ describe('computeCost()', () => {
     expect(cost).toBeLessThan(0.001);
   });
 });
+
+describe('getPricing() — model families', () => {
+  it('prices a bare family name, which is what an agent step reports', () => {
+    // The miss that left every agent step on the unknown-model default:
+    // `haiku` does not START with `claude-3-haiku`, so prefix matching failed
+    // and the step was priced at $1/$5 regardless of which model ran.
+    expect(getPricing('haiku')).toEqual(getPricing('claude-3-haiku'));
+    expect(getPricing('sonnet')).toEqual(getPricing('claude-3-sonnet'));
+    expect(getPricing('opus')).toEqual(getPricing('claude-3-opus'));
+  });
+
+  it('prices a Claude 5 id as its tier rather than as unknown', () => {
+    expect(getPricing('claude-opus-5').inputPerMTok).toBe(15);
+    expect(getPricing('claude-sonnet-5').inputPerMTok).toBe(3);
+    expect(getPricing('claude-haiku-4-5').inputPerMTok).toBe(0.25);
+  });
+
+  it('prices a Bedrock inference profile as its tier', () => {
+    expect(getPricing('us.anthropic.claude-opus-4-8').inputPerMTok).toBe(15);
+  });
+
+  it('is case-insensitive about the family too', () => {
+    expect(getPricing('HAIKU')).toEqual(getPricing('haiku'));
+  });
+
+  it('still falls back for a model from no known family', () => {
+    expect(getPricing('some-inhouse-model').inputPerMTok).toBe(1);
+  });
+});

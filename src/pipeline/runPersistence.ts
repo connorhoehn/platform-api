@@ -83,6 +83,23 @@ interface RunState {
   estimatedCostUsd: number;
   /** Maps stepId → model for correlating llm:prompt with llm:response. */
   stepModelMap: Record<string, string>;
+  /**
+   * How many completions per stepId were already priced before a resume.
+   *
+   * Cost is read as money, so it must not double-count. A retried step only
+   * emits `step:completed` for the attempt that succeeded, and two fork
+   * branches of one node are two real executions that should both be charged —
+   * those are right by construction. The case that is not is a RESUMED run
+   * replaying a step it finished in its previous life: its tokens are already
+   * inside the `tokenUsage` restored from the row.
+   *
+   * Keying that on the suffixed step key does not work, because the replayed
+   * completion collides with the pre-crash summary and is filed as
+   * `summarize:2` — a key nothing has priced. So this counts CREDITS per raw
+   * stepId instead: a resume seeds one per pre-crash completion, each replayed
+   * completion spends one, and anything beyond them is new work and is charged.
+   */
+  replayCredits: Record<string, number>;
   /** Transient input snapshot per stepId; captured from llm:prompt; cleared after step:completed. */
   stepInputMap: Record<string, unknown>;
   /** In-flight attempt history per stepId; populated by step:attempt:* events (maxAttempts > 1). */
@@ -110,6 +127,24 @@ function redriveOfFromPayload(payload: unknown): string | undefined {
   if (!payload || typeof payload !== 'object') return undefined;
   const v = (payload as { redriveOf?: unknown }).redriveOf;
   return typeof v === 'string' && v ? v : undefined;
+}
+
+/**
+ * One replay credit per completion already recorded on a stored run.
+ *
+ * `stepsSummary` keys a repeated node as `id`, `id:2`, `id:3` — the same
+ * suffixing handleStepCompleted applies — so the credit for a forked node is
+ * its branch count, and a resumed run can replay all of them without being
+ * charged twice.
+ */
+function creditsFromSummary(summary: Record<string, unknown> | undefined): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const key of Object.keys(summary ?? {})) {
+    const rawId = key.includes(':') ? key.slice(0, key.lastIndexOf(':')) : key;
+    const id = /^\d+$/.test(key.slice(key.lastIndexOf(':') + 1)) ? rawId : key;
+    out[id] = (out[id] ?? 0) + 1;
+  }
+  return out;
 }
 
 export class RunPersistenceService {
@@ -255,6 +290,7 @@ export class RunPersistenceService {
       steps: {},
       tokenUsage: {},
       estimatedCostUsd: 0,
+      replayCredits: {},
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
@@ -302,6 +338,23 @@ export class RunPersistenceService {
       let suffix = 2;
       while (state.steps[`${event.stepId}:${suffix}`]) suffix++;
       stepKey = `${event.stepId}:${suffix}`;
+    }
+
+    // Price the step from its own output when it reported model usage. An agent
+    // step runs its own turn loop and returns the totals rather than emitting
+    // `llm:*` events, so this is the only place its tokens surface. Guarded on
+    // the resolved stepKey, so a fork branch counts once per branch and a
+    // resumed run does not re-count what it already paid for.
+    const credit = state.replayCredits[event.stepId] ?? 0;
+    if (credit > 0) {
+      // A step this run already finished and already paid for, before it was
+      // interrupted. Spend the credit and charge nothing.
+      state.replayCredits[event.stepId] = credit - 1;
+    } else {
+      const reported = this.tokensFromStepOutput(event.output);
+      if (reported) {
+        this.addTokenUsage(state, reported.model, reported.tokensIn, reported.tokensOut);
+      }
     }
 
     // Capture the resolved input from stepInputMap (populated by llm:prompt for LLM nodes).
@@ -568,6 +621,10 @@ export class RunPersistenceService {
       steps: { ...(item.stepsSummary ?? {}) },
       tokenUsage: { ...(item.tokenUsage ?? {}) },
       estimatedCostUsd: item.estimatedCostUsd ?? 0,
+      // The steps that finished before the crash are already inside the
+      // `tokenUsage` restored above. One credit each, so a replayed completion
+      // is recognised and not charged for twice.
+      replayCredits: creditsFromSummary(item.stepsSummary),
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
@@ -612,6 +669,7 @@ export class RunPersistenceService {
       steps: {},
       tokenUsage: {},
       estimatedCostUsd: 0,
+      replayCredits: {},
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
@@ -677,6 +735,7 @@ export class RunPersistenceService {
       steps: {},
       tokenUsage: {},
       estimatedCostUsd: 0,
+      replayCredits: {},
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
@@ -815,19 +874,58 @@ export class RunPersistenceService {
     // Resolve model from the prompt event; fall back to 'unknown' if prompt was missed
     const model = state.stepModelMap[event.stepId] ?? 'unknown';
 
-    // Accumulate token usage for this model
+    this.addTokenUsage(state, model, event.tokensIn, event.tokensOut);
+  }
+
+  /**
+   * Fold one model call's tokens into a run's usage and re-price the run.
+   *
+   * Shared by the `llm:*` event path and the agent-step path below. They are
+   * two ways the same thing happens — a model was called and produced tokens —
+   * and having one place to add them is what keeps the two from disagreeing
+   * about what a run cost.
+   */
+  private addTokenUsage(
+    state: RunState,
+    model: string,
+    tokensIn: number,
+    tokensOut: number,
+  ): void {
     if (!state.tokenUsage[model]) {
       state.tokenUsage[model] = { tokensIn: 0, tokensOut: 0 };
     }
-    state.tokenUsage[model].tokensIn += event.tokensIn;
-    state.tokenUsage[model].tokensOut += event.tokensOut;
+    state.tokenUsage[model].tokensIn += tokensIn;
+    state.tokenUsage[model].tokensOut += tokensOut;
 
-    // Recompute total estimated cost across all models
     let totalCost = 0;
     for (const [m, usage] of Object.entries(state.tokenUsage)) {
       totalCost += computeCost(m, usage.tokensIn, usage.tokensOut);
     }
     state.estimatedCostUsd = Math.round(totalCost * 1_000_000) / 1_000_000; // 6 decimal places
+  }
+
+  /**
+   * Tokens reported by a step's own output, rather than by `llm:*` events.
+   *
+   * Agent steps never emitted `pipeline:llm:prompt` / `:response` — they run
+   * their own multi-turn loop and put the totals in their output — so no run
+   * built from agent steps ever had a cost. Since nothing in this deployment
+   * uses a plain `llm` node, that was every run.
+   *
+   * Returns null when the output is not a step reporting model usage, which is
+   * most of them: a server step's output is whatever that handler returns.
+   */
+  private tokensFromStepOutput(
+    output: unknown,
+  ): { model: string; tokensIn: number; tokensOut: number } | null {
+    if (!output || typeof output !== 'object') return null;
+    const o = output as { model?: unknown; tokensIn?: unknown; tokensOut?: unknown };
+    if (typeof o.model !== 'string' || o.model.length === 0) return null;
+    if (typeof o.tokensIn !== 'number' || typeof o.tokensOut !== 'number') return null;
+    if (!Number.isFinite(o.tokensIn) || !Number.isFinite(o.tokensOut)) return null;
+    if (o.tokensIn < 0 || o.tokensOut < 0) return null;
+    if (o.tokensIn === 0 && o.tokensOut === 0) return null;
+    return { model: o.model, tokensIn: o.tokensIn, tokensOut: o.tokensOut };
   }
 
   /**
