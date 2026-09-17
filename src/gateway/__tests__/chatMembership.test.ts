@@ -75,6 +75,52 @@ describe('ensureRoomChatMembers', () => {
     _setClientFactory(gw.make);
     await expect(ensureRoomChatMembers({ slug: 'design', ownerId: 'eve', members: [{ userId: 'carol' }] })).rejects.toThrow(/not a member/);
   });
+
+  // GAP-12: a removal whose mirror call failed (network blip) is never
+  // retried on its own — the gateway keeps a member the DDB roster no
+  // longer has. An authoritative ensure (the room's full, current member
+  // list) must evict them; a non-authoritative one (the default — most
+  // callers pass a single new member, not the whole roster) must not.
+  describe('GAP-12 removal reconciliation', () => {
+    it('evicts a stale member when the caller declares the list authoritative', async () => {
+      const gw = fakeGateway({ open: false, members: [{ userId: 'eve', role: 'owner' }, { userId: 'carol', role: 'member' }, { userId: 'dave', role: 'member' }] });
+      _setClientFactory(gw.make);
+      // dave was removed from the room in DDB but the gateway never heard about it.
+      const out = await ensureRoomChatMembers({ slug: 'design', ownerId: 'eve', members: [{ userId: 'carol' }], authoritative: true });
+      expect(out.added).toEqual([]);
+      expect(out.removed).toEqual(['dave']);
+      expect(gw.sent).toContainEqual(expect.objectContaining({ action: 'removeMember', channel: 'room:design', userId: 'dave' }));
+    });
+
+    it('never removes anyone when the list is not declared authoritative', async () => {
+      const gw = fakeGateway({ open: false, members: [{ userId: 'eve', role: 'owner' }, { userId: 'carol', role: 'member' }, { userId: 'dave', role: 'member' }] });
+      _setClientFactory(gw.make);
+      // Same stale gateway state as above, but this caller only knows about
+      // one member (e.g. the "add a member" route) — must not evict dave.
+      const out = await ensureRoomChatMembers({ slug: 'design', ownerId: 'eve', members: [{ userId: 'carol' }] });
+      expect(out.removed).toEqual([]);
+      expect(gw.sent.some((f) => f.action === 'removeMember')).toBe(false);
+    });
+
+    it('never removes anyone on an open channel, even when authoritative', async () => {
+      // An open channel's member list is meaningless (no roster yet) — treating
+      // it as "everyone present is stale" would evict people mid-join.
+      const gw = fakeGateway({ open: true, members: [] });
+      _setClientFactory(gw.make);
+      const out = await ensureRoomChatMembers({ slug: 'design', ownerId: 'eve', members: [], authoritative: true });
+      expect(out.removed).toEqual([]);
+      expect(gw.sent.some((f) => f.action === 'removeMember')).toBe(false);
+    });
+
+    it('never removes the owner, even if the caller left them out of members', async () => {
+      const gw = fakeGateway({ open: false, members: [{ userId: 'eve', role: 'owner' }, { userId: 'carol', role: 'member' }] });
+      _setClientFactory(gw.make);
+      const out = await ensureRoomChatMembers({ slug: 'design', ownerId: 'eve', members: [], authoritative: true });
+      // eve (the owner) is always folded into `wanted`, so she's never "stale".
+      expect(out.removed).toEqual(['carol']);
+      expect(gw.sent.some((f) => f.action === 'removeMember' && f.userId === 'eve')).toBe(false);
+    });
+  });
 });
 
 describe('removeRoomChatMember', () => {

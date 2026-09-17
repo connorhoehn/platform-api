@@ -241,7 +241,12 @@ export class RunPersistenceService {
     });
 
     this.eventBus.subscribe('pipeline:llm:response', async (event) => {
-      this.handleLLMResponse(event.payload);
+      await this.handleLLMResponse(event.payload).catch((err) => {
+        log.warn(
+          { runId: event.payload.runId, stepId: event.payload.stepId, err: String(err) },
+          'failed to persist llm:response spend',
+        );
+      });
     });
 
     log.info('run persistence service started');
@@ -862,12 +867,26 @@ export class RunPersistenceService {
     state.stepInputMap[event.stepId] = { prompt: event.prompt, model: event.model };
   }
 
-  private handleLLMResponse(event: {
+  /**
+   * GAP-11: persist spend the moment it is incurred. `pipeline:llm:response`
+   * fires once per completed LLM call (after the stream finishes) — token-
+   * level updates go through the separate `pipeline:llm:token` event, which
+   * this service does not subscribe to — so this is the same granularity as
+   * `step:completed` or a checkpoint, not a hot per-token path. Without this,
+   * tokens were only durable as a side effect of the next `step:completed`
+   * or checkpoint write: a process death between "LLM call returned" and
+   * "step finished" paid for tokens that DDB never learned about, and a
+   * resume re-paid for them from zero. A full `persistRun` here matches the
+   * existing idiom (`handleCheckpoint` already does the same on every
+   * checkpoint, which fires at comparable frequency), so this doesn't
+   * introduce a new write pattern — it closes the one gap in coverage.
+   */
+  private async handleLLMResponse(event: {
     runId: string;
     stepId: string;
     tokensIn: number;
     tokensOut: number;
-  }): void {
+  }): Promise<void> {
     const state = this.runCache.get(event.runId);
     if (!state) return;
 
@@ -875,6 +894,7 @@ export class RunPersistenceService {
     const model = state.stepModelMap[event.stepId] ?? 'unknown';
 
     this.addTokenUsage(state, model, event.tokensIn, event.tokensOut);
+    await this.persistRun(state);
   }
 
   /**

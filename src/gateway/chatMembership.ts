@@ -25,6 +25,19 @@ export interface EnsureRoomChatMembersInput {
   ownerName?: string;
   members: RoomChatMember[];
   gatewayUrl?: string;
+  /**
+   * GAP-12: `members` is the room's COMPLETE roster, so anyone the gateway
+   * has that this list doesn't is a stale addition to reconcile away — not
+   * just a set of people to add.
+   *
+   * Most callers pass a partial list on purpose (e.g. "add this one new
+   * member") and must NOT set this: reconciling removals against a partial
+   * list would evict everyone the caller didn't happen to mention. Only set
+   * it from a call site that just read the room's full membership from the
+   * source of truth (see `syncRoomOnce` at hangoutRooms.ts's private-room
+   * GET route).
+   */
+  authoritative?: boolean;
 }
 
 export interface RemoveRoomChatMemberInput {
@@ -88,8 +101,15 @@ export async function fetchChatMembers(client: GatewayServiceClient, channel: st
  * closes it; everyone arriving through the room gets the whole history —
  * a room member is entitled to the room's past, unlike a person pulled
  * into a chat by hand. Returns who was added (empty when already in sync).
+ *
+ * When `input.authoritative` is set, also evicts anyone the gateway has
+ * that `input.members` doesn't — the reconciliation a failed
+ * `removeRoomChatMember` (see `mirrorRoomMemberRemoval`) never gets on its
+ * own, since that call is fire-and-forget and not retried. Left unset
+ * (the default), this only ever adds: a partial member list must never
+ * drive removals, or it would evict everyone the caller didn't mention.
  */
-export async function ensureRoomChatMembers(input: EnsureRoomChatMembersInput): Promise<{ added: string[] }> {
+export async function ensureRoomChatMembers(input: EnsureRoomChatMembersInput): Promise<{ added: string[]; removed: string[] }> {
   const channel = roomChatChannel(input.slug);
   const client = clientFactory({ userId: input.ownerId, displayName: input.ownerName ?? input.ownerId, kind: 'person' }, input.gatewayUrl);
   await client.connect();
@@ -97,33 +117,75 @@ export async function ensureRoomChatMembers(input: EnsureRoomChatMembersInput): 
     const current = await fetchChatMembers(client, channel);
     const present = new Set(current.open ? [] : current.members.map((m) => m.userId));
     const wanted = [...new Set([input.ownerId, ...input.members.map((m) => m.userId)])];
+    const wantedSet = new Set(wanted);
     const missing = wanted.filter((id) => !present.has(id));
     // The owner is written by the gateway on the first add; adding them by
     // hand as well would make them a plain member of their own room.
     const toAdd = current.open ? missing.filter((id) => id !== input.ownerId) : missing;
-    if (toAdd.length === 0) return { added: [] };
-    const names: Record<string, string> = {};
-    for (const m of input.members) if (m.displayName) names[m.userId] = m.displayName;
-    if (input.ownerName) names[input.ownerId] = input.ownerName;
-    const answer = client.waitFor(
-      (f) => isFor(f, channel) && ((f.type === 'chat' && f.action === 'membersUpdated') || isChatError(f, channel)),
-      REPLY_TIMEOUT_MS,
-    );
-    client.send({
-      service: 'chat',
-      action: 'addMembers',
-      channel,
-      userIds: toAdd,
-      history: { mode: 'all' },
-      ...(Object.keys(names).length ? { names } : {}),
-    });
-    const frame = await answer;
-    if (!frame) throw new Error(`gateway did not answer addMembers for ${channel}`);
-    if (isChatError(frame, channel)) throw new Error(errorMessage(frame));
-    return { added: toAdd };
+
+    // An open channel has no meaningful member list (`present` is forced
+    // empty above) — never treat that as "everyone is extra". And the
+    // owner is always in `wanted` by construction, but the exclusion below
+    // is kept explicit: this must never be the thing that removes them.
+    const toRemove = input.authoritative && !current.open
+      ? [...present].filter((id) => !wantedSet.has(id) && id !== input.ownerId)
+      : [];
+
+    let added: string[] = [];
+    if (toAdd.length > 0) {
+      const names: Record<string, string> = {};
+      for (const m of input.members) if (m.displayName) names[m.userId] = m.displayName;
+      if (input.ownerName) names[input.ownerId] = input.ownerName;
+      const answer = client.waitFor(
+        (f) => isFor(f, channel) && ((f.type === 'chat' && f.action === 'membersUpdated') || isChatError(f, channel)),
+        REPLY_TIMEOUT_MS,
+      );
+      client.send({
+        service: 'chat',
+        action: 'addMembers',
+        channel,
+        userIds: toAdd,
+        history: { mode: 'all' },
+        ...(Object.keys(names).length ? { names } : {}),
+      });
+      const frame = await answer;
+      if (!frame) throw new Error(`gateway did not answer addMembers for ${channel}`);
+      if (isChatError(frame, channel)) throw new Error(errorMessage(frame));
+      added = toAdd;
+    }
+
+    const removed: string[] = [];
+    for (const userId of toRemove) {
+      try {
+        await removeOneChatMember(client, channel, userId);
+        removed.push(userId);
+      } catch (err) {
+        // Best-effort, same as the rest of this module: leave it for the
+        // next reconcile pass rather than failing the whole ensure over
+        // one stale member.
+        log.warn(
+          { slug: input.slug, userId, err: err instanceof Error ? err.message : String(err) },
+          'room chat membership reconcile-removal failed',
+        );
+      }
+    }
+
+    return { added, removed };
   } finally {
     await client.close();
   }
+}
+
+/** Send `removeMember` on an already-connected client and wait for it to land. */
+async function removeOneChatMember(client: GatewayServiceClient, channel: string, userId: string, name?: string): Promise<void> {
+  const answer = client.waitFor(
+    (f) => isFor(f, channel) && ((f.type === 'chat' && f.action === 'membersUpdated') || isChatError(f, channel)),
+    REPLY_TIMEOUT_MS,
+  );
+  client.send({ service: 'chat', action: 'removeMember', channel, userId, ...(name ? { name } : {}) });
+  const frame = await answer;
+  if (!frame) throw new Error(`gateway did not answer removeMember for ${channel}`);
+  if (isChatError(frame, channel)) throw new Error(errorMessage(frame));
 }
 
 /** Take a person out of the room's conversation, as the owner (or as themselves). */
@@ -132,14 +194,7 @@ export async function removeRoomChatMember(input: RemoveRoomChatMemberInput): Pr
   const client = clientFactory({ userId: input.byOwnerId, displayName: input.byOwnerName ?? input.byOwnerId, kind: 'person' }, input.gatewayUrl);
   await client.connect();
   try {
-    const answer = client.waitFor(
-      (f) => isFor(f, channel) && ((f.type === 'chat' && f.action === 'membersUpdated') || isChatError(f, channel)),
-      REPLY_TIMEOUT_MS,
-    );
-    client.send({ service: 'chat', action: 'removeMember', channel, userId: input.userId, ...(input.name ? { name: input.name } : {}) });
-    const frame = await answer;
-    if (!frame) throw new Error(`gateway did not answer removeMember for ${channel}`);
-    if (isChatError(frame, channel)) throw new Error(errorMessage(frame));
+    await removeOneChatMember(client, channel, input.userId, input.name);
   } finally {
     await client.close();
   }
@@ -173,7 +228,9 @@ export function syncRoomOnce(slug: string, load: () => Promise<EnsureRoomChatMem
   if (!claimSync(slug)) return;
   void load()
     .then((input) => ensureRoomChatMembers(input))
-    .then(({ added }) => { if (added.length) log.info({ slug, added }, 'room chat membership synced'); })
+    .then(({ added, removed }) => {
+      if (added.length || removed.length) log.info({ slug, added, removed }, 'room chat membership synced');
+    })
     .catch((err: unknown) => {
       // Let the next load try again rather than waiting out the TTL.
       synced.delete(slug);

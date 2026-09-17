@@ -444,6 +444,40 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     expect(item.estimatedCostUsd).toBeGreaterThan(0);
   });
 
+  // GAP-11: llm:response must persist spend the moment it's incurred, not
+  // wait for the next step:completed or checkpoint. Before the fix, the
+  // handler only mutated in-memory state, so a crash between "tokens spent"
+  // and "step finished" left DDB never knowing about the spend.
+  it('persists token spend as soon as llm:response arrives — before the step completes', async () => {
+    const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
+    const bus = makeMockBus();
+    const service = new RunPersistenceService({
+      eventBus: bus as unknown as ConstructorParameters<typeof RunPersistenceService>[0]['eventBus'],
+      repository: repo as unknown as PipelineRunRepository,
+    });
+    service.start();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rspend', pipelineId: 'pspend',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    repo.put.mockClear(); // drop the run:started write
+
+    await bus.publish('pipeline:llm:prompt', {
+      runId: 'rspend', stepId: 'llm-step', model: 'claude-sonnet-4-6', prompt: 'hello',
+    });
+    await bus.publish('pipeline:llm:response', {
+      runId: 'rspend', stepId: 'llm-step', tokensIn: 100, tokensOut: 50,
+    });
+
+    // The step never completes (process died) — but the spend must already
+    // be durable from the llm:response handler alone.
+    expect(repo.put).toHaveBeenCalledTimes(1);
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(item.tokenUsage?.['claude-sonnet-4-6']).toMatchObject({ tokensIn: 100, tokensOut: 50 });
+    expect(item.estimatedCostUsd).toBeGreaterThan(0);
+  });
+
   it('stores prompt as step input snapshot for LLM steps', async () => {
     const repo = { put: jest.fn<(item: PipelineRunItem) => Promise<void>>().mockResolvedValue(undefined) };
     const bus = makeMockBus();

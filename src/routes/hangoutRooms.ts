@@ -351,12 +351,17 @@ hangoutRoomsRouter.get(
     await assertCanAccess(room, userId, orgId);
 
     // A private room's conversation carries the room's members. Converge
-    // here, lazily, so rooms that predate the mirror need no backfill.
+    // here, lazily, so rooms that predate the mirror need no backfill —
+    // and since `listMembers` is the room's complete, authoritative
+    // roster (unlike the single-member lists the add-member routes pass
+    // to `mirrorRoomMembers`), this is also where GAP-12 evicts anyone
+    // the gateway still has from a removal whose mirror call failed.
     if (room.visibility === 'private') {
       syncRoomOnce(slug, async () => ({
         slug,
         ownerId: room.createdBy,
         members: await Promise.all((await hangoutRoomMemberRepo.listMembers(room.roomId)).map(async (m) => ({ userId: m.userId, displayName: await displayNameOf(m.userId) }))),
+        authoritative: true,
       }));
     }
 
