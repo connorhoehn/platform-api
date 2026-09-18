@@ -12,6 +12,7 @@
 // which synthesize a default prompt internally). This lets authors craft
 // arbitrary description queries per node without configuring a label set.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createVisionLikeHandler, type VisionLikeHandlerOpts } from './visionHandlerFactory';
 
@@ -34,8 +35,16 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 512;
 
 export function createImageVisionDescribeStepHandler(
   opts: VisionLikeHandlerOpts,
-): StepHandler {
-  return createVisionLikeHandler<ImageVisionDescribeNodeData>(
+): DescribedStepHandler {
+  // Spread rather than wrapped: the factory returns a plain object, and the
+  // catalog reads these three fields straight off it.
+  return {
+    description:
+      'Asks a vision model to answer the node\'s own prompt about the image. The one vision step with no output schema, so the answer is prose — use classify or tag when something downstream has to branch on it.',
+    reads: 'The image at imageRefPath — a string imageId, or an object carrying one.',
+    emits:
+      'the caption only: no extracted field, because there is no schema. Plus the model id and token counts.',
+    ...createVisionLikeHandler<ImageVisionDescribeNodeData>(
     {
       kind: 'image:vision-describe',
       defaultModel: DEFAULT_MODEL,
@@ -49,5 +58,6 @@ export function createImageVisionDescribeStepHandler(
       buildUserPrompt: (data) => data.userPrompt,
     },
     opts,
-  );
+    ),
+  };
 }

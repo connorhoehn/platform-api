@@ -8,6 +8,7 @@
 // high-volume task suited to the faster, cheaper model).
 // Default maxOutputTokens: 512 (up to 10 tags + caption fit here easily).
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createVisionLikeHandler, type VisionLikeHandlerOpts } from './visionHandlerFactory';
 import { buildPresetSchema } from './visionSchemaPresets';
@@ -34,8 +35,16 @@ const DEFAULT_MAX_TAGS = 10;
 
 export function createImageVisionTagStepHandler(
   opts: VisionLikeHandlerOpts,
-): StepHandler {
-  return createVisionLikeHandler<ImageVisionTagNodeData>(
+): DescribedStepHandler {
+  // Spread rather than wrapped: the factory returns a plain object, and the
+  // catalog reads these three fields straight off it.
+  return {
+    description:
+      'Asks a vision model for up to N descriptive tags with confidence scores, ordered most to least confident. A candidate list on the node is offered to the model as a preference, not a restriction.',
+    reads: 'The image at imageRefPath — a string imageId, or an object carrying one.',
+    emits:
+      'extracted, holding the ranked tags, plus the caption, the model id and the token counts. The output is an object, so it merges into the root context as well as sitting under this step\'s id.',
+    ...createVisionLikeHandler<ImageVisionTagNodeData>(
     {
       kind: 'image:vision-tag',
       defaultModel: DEFAULT_MODEL,
@@ -65,5 +74,6 @@ export function createImageVisionTagStepHandler(
       },
     },
     opts,
-  );
+    ),
+  };
 }

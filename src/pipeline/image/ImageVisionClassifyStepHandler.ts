@@ -9,6 +9,7 @@
 // Default maxOutputTokens: 256 (label + confidence + one-sentence rationale
 // fit comfortably within this budget).
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createVisionLikeHandler, type VisionLikeHandlerOpts } from './visionHandlerFactory';
 import { buildPresetSchema } from './visionSchemaPresets';
@@ -32,8 +33,16 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 256;
 
 export function createImageVisionClassifyStepHandler(
   opts: VisionLikeHandlerOpts,
-): StepHandler {
-  return createVisionLikeHandler<ImageVisionClassifyNodeData>(
+): DescribedStepHandler {
+  // Spread rather than wrapped: the factory returns a plain object, and the
+  // catalog reads these three fields straight off it.
+  return {
+    description:
+      'Asks a vision model which ONE of the node\'s labels the image belongs to. The label set goes into the prompt and is enforced by an enum schema, so the answer is always one of them.',
+    reads: 'The image at imageRefPath — a string imageId, or an object carrying one.',
+    emits:
+      'extracted, holding the chosen label and its confidence, plus the caption, the model id and the token counts. The output is an object, so it merges into the root context as well as sitting under this step\'s id.',
+    ...createVisionLikeHandler<ImageVisionClassifyNodeData>(
     {
       kind: 'image:vision-classify',
       defaultModel: DEFAULT_MODEL,
@@ -55,5 +64,6 @@ export function createImageVisionClassifyStepHandler(
       },
     },
     opts,
-  );
+    ),
+  };
 }

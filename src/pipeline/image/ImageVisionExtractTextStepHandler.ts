@@ -10,6 +10,7 @@
 // Default maxOutputTokens: 4096 (dense documents can produce large
 // transcriptions; cap high to avoid truncation artefacts).
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createVisionLikeHandler, type VisionLikeHandlerOpts } from './visionHandlerFactory';
 import { buildPresetSchema } from './visionSchemaPresets';
@@ -44,8 +45,16 @@ const DEFAULT_USER_PROMPT = 'Transcribe all visible text in this image.';
 
 export function createImageVisionExtractTextStepHandler(
   opts: VisionLikeHandlerOpts,
-): StepHandler {
-  return createVisionLikeHandler<ImageVisionExtractTextNodeData>(
+): DescribedStepHandler {
+  // Spread rather than wrapped: the factory returns a plain object, and the
+  // catalog reads these three fields straight off it.
+  return {
+    description:
+      'Transcribes the visible text in the image — OCR by way of the vision model rather than a dedicated engine.',
+    reads: 'The image at imageRefPath — a string imageId, or an object carrying one.',
+    emits:
+      'extracted, holding the transcribed text, plus the caption, the model id and the token counts. The output is an object, so it merges into the root context as well as sitting under this step\'s id.',
+    ...createVisionLikeHandler<ImageVisionExtractTextNodeData>(
     {
       kind: 'image:vision-extract-text',
       defaultModel: DEFAULT_MODEL,
@@ -58,5 +67,6 @@ export function createImageVisionExtractTextStepHandler(
       buildUserPrompt: () => DEFAULT_USER_PROMPT,
     },
     opts,
-  );
+    ),
+  };
 }
