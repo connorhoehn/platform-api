@@ -12,7 +12,7 @@ import {
 import type { Request, Response } from 'express';
 
 interface Body {
-  kinds: Array<{ kind: string; source: string; description?: string; reads?: string; emits?: string }>;
+  kinds: Array<{ kind: string; source: string; description?: string; reads?: string; emits?: string; requires?: string[] }>;
   builtin: string[];
   registered: string[];
 }
@@ -93,5 +93,37 @@ describe('GET /api/pipelines/step-kinds', () => {
     expect(entry).not.toHaveProperty('description');
     expect(entry).not.toHaveProperty('reads');
     expect(entry).not.toHaveProperty('emits');
+  });
+
+  // An agent could already discover these by posting and reading the 422.
+  // Saying so up front is the difference between authoring a pipeline and
+  // guessing at one.
+  it('says what configuration a canonical kind cannot publish without', () => {
+    const llm = get().kinds.find((k) => k.kind === 'llm');
+    expect(llm?.requires).toEqual(
+      expect.arrayContaining(['provider', 'model', 'systemPrompt', 'userPromptTemplate']),
+    );
+    const condition = get().kinds.find((k) => k.kind === 'condition');
+    expect(condition?.requires).toEqual(['expression']);
+  });
+
+  it('omits requires for a kind that needs no configuration', () => {
+    const trigger = get().kinds.find((k) => k.kind === 'trigger');
+    expect(trigger).not.toHaveProperty('requires');
+  });
+
+  it('does not guess at a registered kind’s configuration', () => {
+    registerCustomStepHandler(stub('people:search'));
+    const entry = get().kinds.find((k) => k.kind === 'people:search');
+    expect(entry).not.toHaveProperty('requires');
+  });
+
+  // scatter is registered rather than canonical, but the publish gate checks
+  // its itemsPath all the same. The catalog must not stay silent about a field
+  // an agent would then be refused for.
+  it('advertises a required field even for a registered kind the gate checks', () => {
+    registerCustomStepHandler(stub('scatter'));
+    const entry = get().kinds.find((k) => k.kind === 'scatter');
+    expect(entry?.requires).toEqual(['itemsPath']);
   });
 });

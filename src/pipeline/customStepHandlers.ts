@@ -16,6 +16,7 @@
 // `handler.kind`, and it may not shadow a canonical NodeType (except `agent`,
 // which DC lets a consumer override).
 import type { StepHandler } from 'distributed-core/applications/pipeline';
+import { REQUIRED_FIELDS } from './validate-shape';
 
 /** DC's canonical NodeType union; a custom kind may not be one of these. */
 const CANONICAL_NODE_TYPES: ReadonlySet<string> = new Set(['trigger', 'llm', 'transform', 'condition', 'action', 'fork', 'join', 'approval', 'agent']);
@@ -145,6 +146,18 @@ export interface StepKindInfo {
   consumes?: PayloadClass;
   /** Declared output payload class. Absent means unknown. */
   produces?: PayloadClass;
+  /**
+   * Fields a node of this kind must carry before it can be published.
+   *
+   * Populated for the canonical types from the same table the publish gate
+   * checks, so the catalog cannot drift from the rule. An agent could already
+   * find these out by posting and reading the 422; saying so up front is the
+   * difference between authoring a pipeline and guessing at one.
+   *
+   * Absent for a registered kind: its configuration is the executor's
+   * business, and this catalog does not guess at it.
+   */
+  requires?: readonly string[];
 }
 
 /**
@@ -159,10 +172,12 @@ export interface StepKindInfo {
  * Sorted, so the response is stable and diffable.
  */
 export function listStepKinds(): StepKindInfo[] {
-  const out: StepKindInfo[] = [...CANONICAL_NODE_TYPES].map((kind) => ({
-    kind,
-    source: 'builtin' as const,
-  }));
+  const out: StepKindInfo[] = [...CANONICAL_NODE_TYPES].map((kind) => {
+    const entry: StepKindInfo = { kind, source: 'builtin' as const };
+    const requires = REQUIRED_FIELDS[kind];
+    if (requires?.length) entry.requires = [...requires];
+    return entry;
+  });
   for (const kind of HANDLERS.keys()) {
     // An overridable canonical type (`agent`) can also carry a handler; it is
     // already listed as builtin and stays that way.
@@ -178,6 +193,11 @@ export function listStepKinds(): StepKindInfo[] {
     if (h?.inputs?.length) entry.inputs = [...h.inputs];
     if (h?.consumes) entry.consumes = h.consumes;
     if (h?.produces) entry.produces = h.produces;
+    // `scatter` is registered rather than canonical, but the publish gate still
+    // checks its itemsPath. Without this the catalog stayed silent about a
+    // field an agent would then be refused for.
+    const requires = REQUIRED_FIELDS[kind];
+    if (requires?.length) entry.requires = [...requires];
     out.push(entry);
   }
   out.sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));

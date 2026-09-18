@@ -103,7 +103,7 @@ export interface ShapeOptions {
  * the executor's business and is not guessed at here — the same rule the
  * handle and payload checks follow.
  */
-const REQUIRED_FIELDS: Record<string, readonly string[]> = {
+export const REQUIRED_FIELDS: Record<string, readonly string[]> = {
   llm: ['provider', 'model', 'systemPrompt', 'userPromptTemplate'],
   agent: ['prompt'],
   transform: ['transformType', 'expression'],
