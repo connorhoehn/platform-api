@@ -214,7 +214,7 @@ const CANONICAL_DESCRIPTIONS: Record<string, { description: string; reads?: stri
   },
   'condition': {
     description:
-      'Routes on a boolean expression over the context, down `true` or `false`.',
+      'Routes on a boolean expression over the context, down the true or false handle.',
     reads: 'The expression on the node.',
     emits:
       'Nothing of its own. It chooses which edge the run follows.',
