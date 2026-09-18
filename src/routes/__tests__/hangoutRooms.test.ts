@@ -11,6 +11,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 
 const mockCreateRoom = jest.fn();
 const mockGetRoomBySlug = jest.fn();
+const mockUpdateRoom = jest.fn();
 const mockArchiveRoom = jest.fn();
 const mockTouchLastActive = jest.fn();
 const mockListRoomsByOrg = jest.fn();
@@ -36,6 +37,7 @@ jest.mock('../../repositories', () => {
     hangoutRoomRepo: {
       createRoom: mockCreateRoom,
       getRoomBySlug: mockGetRoomBySlug,
+      updateRoom: mockUpdateRoom,
       archiveRoom: mockArchiveRoom,
       touchLastActive: mockTouchLastActive,
       listRoomsByOrg: mockListRoomsByOrg,
@@ -180,6 +182,10 @@ beforeEach(() => {
     settings: input.settings,
   }));
   mockGetRoomBySlug.mockReset().mockResolvedValue(null);
+  mockUpdateRoom.mockReset().mockImplementation(async (_orgId, roomId, partial) => makeRoom({
+    roomId,
+    ...partial,
+  }));
   mockArchiveRoom.mockReset().mockResolvedValue(undefined);
   mockTouchLastActive.mockReset().mockResolvedValue(undefined);
   mockListRoomsByOrg.mockReset().mockResolvedValue({ items: [] });
@@ -323,6 +329,101 @@ describe('POST /api/rooms/:slug/archive — owner or admin gate', () => {
       userId: 'someone-else',
     });
     expect(res.statusCode).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /api/rooms/:slug — rename (channel rename)
+// ---------------------------------------------------------------------------
+
+describe('PATCH /api/rooms/:slug — rename', () => {
+  it('owner renames the room: succeeds, persists the new name, slug unchanged', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester', name: 'Old Name', slug: 'team-standup' }));
+    const res = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', {
+      userId: 'tester',
+      body: { name: 'New Name' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(mockUpdateRoom).toHaveBeenCalledTimes(1);
+    // updateRoom is keyed by roomId, not slug, and the partial carries no
+    // slug field at all — there is no way for this call to touch it.
+    const [, , partial] = mockUpdateRoom.mock.calls[0];
+    expect(partial).toEqual({ name: 'New Name' });
+    expect(partial).not.toHaveProperty('slug');
+    const body = res.body as { room: HangoutRoom };
+    expect(body.room.name).toBe('New Name');
+    expect(body.room.slug).toBe('team-standup');
+  });
+
+  it('non-owner is refused with 403', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'owner-1', slug: 'team-standup' }));
+    const res = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', {
+      userId: 'stranger',
+      body: { name: 'Hijacked Name' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(mockUpdateRoom).not.toHaveBeenCalled();
+  });
+
+  it('empty name is refused with 400', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester' }));
+    const res = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', {
+      userId: 'tester',
+      body: { name: '' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(mockUpdateRoom).not.toHaveBeenCalled();
+  });
+
+  it('whitespace-only name is refused with 400', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester' }));
+    const res = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', {
+      userId: 'tester',
+      body: { name: '   \t  ' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(mockUpdateRoom).not.toHaveBeenCalled();
+  });
+
+  it('name over 100 chars is refused with 400', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester' }));
+    const res = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', {
+      userId: 'tester',
+      body: { name: 'x'.repeat(101) },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(mockUpdateRoom).not.toHaveBeenCalled();
+  });
+
+  it('non-string name is refused with 400', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester' }));
+    const res = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', {
+      userId: 'tester',
+      body: { name: 42 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(mockUpdateRoom).not.toHaveBeenCalled();
+  });
+
+  it('rename trims surrounding whitespace before persisting', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ createdBy: 'tester' }));
+    const res = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', {
+      userId: 'tester',
+      body: { name: '  Trimmed Name  ' },
+    });
+    expect(res.statusCode).toBe(200);
+    const [, , partial] = mockUpdateRoom.mock.calls[0];
+    expect(partial.name).toBe('Trimmed Name');
+  });
+
+  it('404 when the room does not exist', async () => {
+    mockGetRoomBySlug.mockResolvedValue(null);
+    const res = await run(buildApp(), 'PATCH', '/api/rooms/nope', {
+      userId: 'tester',
+      body: { name: 'Anything' },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(mockUpdateRoom).not.toHaveBeenCalled();
   });
 });
 

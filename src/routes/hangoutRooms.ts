@@ -452,6 +452,22 @@ hangoutRoomsRouter.post(
 
 /**
  * PATCH /api/rooms/:slug — partial update. Owner-only.
+ *
+ * Covers renaming a room (`{ name }`), the display-name-only rename Teams
+ * calls "rename channel". Owner-only: same gate as archive and add-member —
+ * a room's identity-ish fields (name, visibility, settings) are structural
+ * changes we restrict to the creator, not something any member can do.
+ * There's no separate "admin" concept here beyond `ROOM_ADMIN_USER_IDS`
+ * (used for archive); we didn't extend that to rename since it isn't a
+ * destructive/moderation action and the existing PATCH gate already covers
+ * the owner.
+ *
+ * IMPORTANT: renaming changes `name` only. `slug` is the room's identity —
+ * it's the DDB partition key component, the gateway's `room:<slug>`
+ * channel key, and every stored message/membership/subscription is keyed
+ * off it. `updateRoom` below is keyed by `roomId` (not slug) and its
+ * UpdateExpression never includes `slug`, so there is no code path here
+ * that can change it — a rename can never orphan existing data.
  */
 hangoutRoomsRouter.patch(
   '/:slug',
@@ -471,7 +487,15 @@ hangoutRoomsRouter.patch(
     };
 
     const partial: Parameters<typeof hangoutRoomRepo.updateRoom>[2] = {};
-    if (typeof body.name === 'string') {
+    if (body.name !== undefined) {
+      // Present but wrong type is a caller bug, not a no-op — reject it
+      // rather than silently dropping the field (matches the CREATE path's
+      // strictness on `name`).
+      if (typeof body.name !== 'string') {
+        throw new ValidationError('name must be a string');
+      }
+      // Trim + same 1–100 bound the CREATE path enforces, so a name that's
+      // valid on create is always valid on rename and vice versa.
       const n = body.name.trim();
       if (!n || n.length > 100) {
         throw new ValidationError('name must be 1–100 chars');
