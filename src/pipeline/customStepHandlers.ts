@@ -171,9 +171,92 @@ export interface StepKindInfo {
  *
  * Sorted, so the response is stable and diffable.
  */
+/**
+ * What the canonical node types do.
+ *
+ * These nine never pass through `DescribedStepHandler` — they are the
+ * executor's own concepts, not registered handlers — so the catalog listed
+ * them with a name and nothing else. An agent reading it to find out what it
+ * may put in `node.type` learned that `condition` exists and not what it does.
+ *
+ * Written from distributed-core's executor rather than from the names: the
+ * parts worth knowing are the ones a name cannot carry — that a fork branch
+ * failing does not fail the run, that an action without `idempotencyMode`
+ * re-fires on every retry, that a transform's non-object result never reaches
+ * the root context, that one rejection settles an approval whatever
+ * requiredCount says.
+ */
+const CANONICAL_DESCRIPTIONS: Record<string, { description: string; reads?: string; emits?: string }> = {
+  'trigger': {
+    description:
+      'Where the run begins. What it puts in the context depends on the trigger type: a document event carries the document, a webhook the request body, a schedule only the time, and a platform trigger whatever the caller passed.',
+  },
+  'llm': {
+    description:
+      'One model call, not a loop. No tools, no turns.',
+    reads: 'The prompts on the node, with {{ context.* }} substituted.',
+    emits:
+      'response, tokensIn and tokensOut. The response is at context.steps.<id>.response.',
+  },
+  'agent': {
+    description:
+      'A bounded agent loop with tool use. Tools are DEFAULT-DENY: no allowlist means no tools, and the output is tagged toolless. maxTurns and timeoutMs are enforced by the executor rather than trusted to the client, so an agent that hangs still lands as a failed step with a stopReason instead of wedging the run.',
+    reads: 'The prompt on the node, plus allowedTools, maxTurns and timeoutMs.',
+    emits:
+      'The agent\'s answer, and its turns and tool calls — recorded even when the step fails.',
+  },
+  'transform': {
+    description:
+      'Reshapes the run context with a JSONPath, a template or an expression.',
+    reads: 'The expression on the node, and whatever it reads from the context.',
+    emits:
+      'With an outputKey, the result at context.<key>. Without one, an OBJECT result merges into the root — a list or a single value does not, and is reachable only at context.steps.<id>.',
+  },
+  'condition': {
+    description:
+      'Routes on a boolean expression over the context, down `true` or `false`.',
+    reads: 'The expression on the node.',
+    emits:
+      'Nothing of its own. It chooses which edge the run follows.',
+  },
+  'action': {
+    description:
+      'Produces a side effect — a comment, a notification, a webhook, a document update. Deduplication happens only when idempotencyMode is set: without it the action fires again on every retry.',
+    reads: 'The action\'s own configuration, with {{ context.* }} substituted.',
+    emits:
+      'Whatever the action returned.',
+  },
+  'fork': {
+    description:
+      'Runs its branches in parallel. A failed branch does NOT fail the run: the failure is handed to the first Join downstream and that Join\'s mode decides. A branch with no Join ahead of it fails silently.',
+    emits:
+      'Nothing of its own. Each branch carries the context on from here.',
+  },
+  'join': {
+    description:
+      'Waits for its branches according to its mode — all, any, or N of M — then merges them. Only the branches that SUCCEEDED are merged.',
+    reads: 'The arrivals from upstream branches.',
+    emits:
+      'The merged context. Under array-collect the branches are kept separate at context.joined rather than merged.',
+  },
+  'approval': {
+    description:
+      'Pauses the run for a person. requiredCount governs approvals only: one rejection decides the gate without waiting for the others, takes the `rejected` edge, and makes the run finish rejected rather than completed.',
+    reads: 'The approver list and requiredCount on the node.',
+    emits:
+      'The decision, who made it and when, plus every approval recorded.',
+  },
+};
+
 export function listStepKinds(): StepKindInfo[] {
   const out: StepKindInfo[] = [...CANONICAL_NODE_TYPES].map((kind) => {
     const entry: StepKindInfo = { kind, source: 'builtin' as const };
+    const described = CANONICAL_DESCRIPTIONS[kind];
+    if (described) {
+      entry.description = described.description;
+      if (described.reads) entry.reads = described.reads;
+      if (described.emits) entry.emits = described.emits;
+    }
     const requires = REQUIRED_FIELDS[kind];
     if (requires?.length) entry.requires = [...requires];
     return entry;
