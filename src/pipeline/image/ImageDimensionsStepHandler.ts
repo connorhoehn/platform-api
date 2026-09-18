@@ -20,6 +20,7 @@
 // Source imageId resolution mirrors the other image steps:
 //   data.sourceImagePath (JSONPath) → fallbacks → fail.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type {
   PipelineNode,
   StepHandler,
@@ -51,9 +52,14 @@ export interface ImageDimensionsStepHandlerOpts {
 
 export function createImageDimensionsStepHandler(
   opts: ImageDimensionsStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:dimensions',
+    description:
+      'Reads the source image\'s size without changing it. Also reports the nearest size the generators accept, so a generate step downstream can match the original\'s shape instead of guessing.',
+    reads: 'The source image at the node\'s path, falling back to the scatter parent and the trigger\'s imageRef/imageId.',
+    emits:
+      'imageId unchanged, width, height, aspectRatio, and genWidth/genHeight — the snapped pair for a generator.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

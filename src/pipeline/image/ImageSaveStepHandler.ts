@@ -16,6 +16,7 @@
 //
 // Non-throwing: missing source, blob-store error → status:'failed'.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type {
   PipelineNode,
   StepHandler,
@@ -67,9 +68,14 @@ export function resolveTemplate(
 
 export function createImageSaveStepHandler(
   opts: ImageSaveStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:save',
+    description:
+      'The terminal step of an image pipeline: records the image against the run so it survives past it.',
+    reads: 'The source image at the node\'s path, falling back to the scatter parent and the trigger\'s imageRef/imageId.',
+    emits:
+      'imageId, width and height of what was saved. No new image is made.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

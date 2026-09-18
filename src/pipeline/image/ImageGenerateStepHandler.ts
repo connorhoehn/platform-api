@@ -24,6 +24,7 @@
 // empty images array            → status:'failed', error:'no images returned (content policy?)'
 // any provider error            → status:'failed', error:e.message
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import type { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 import type {
@@ -100,9 +101,14 @@ export interface ImageGenerateStepHandlerOpts {
 
 export function createImageGenerateStepHandler(
   opts: ImageGenerateStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:generate',
+    description:
+      'Generates an image from a text prompt through Bedrock. Asking for more than one FANS OUT: the step returns every imageId and the executor runs the rest of the branch once per image, four at a time, with each one at context.generatedImage.',
+    reads: 'The prompt on the node. No source image — this is where pixels come from, not a transform.',
+    emits:
+      'One image: imageId, width and height. Several: imageIds, plus a fan-out that gives each arm its own generatedImage.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

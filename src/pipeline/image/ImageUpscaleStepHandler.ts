@@ -14,6 +14,7 @@
 // than the 512 source). Persisting the full 2048 needs the chunked
 // spillover store (second DDB table) — tracked as a follow-up.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import type {
   PipelineNode,
@@ -55,9 +56,14 @@ export interface ImageUpscaleStepHandlerOpts {
 
 export function createImageUpscaleStepHandler(
   opts: ImageUpscaleStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:upscale',
+    description:
+      'Runs 4x super-resolution on the source image, self-hosted rather than through a provider.',
+    reads: 'The source image at the node\'s path, falling back to the scatter parent and the trigger\'s imageRef/imageId.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

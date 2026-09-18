@@ -33,6 +33,7 @@
 //
 // AWS region: PIPELINE_IMAGE_AWS_REGION → AWS_REGION → 'us-east-1'.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import {
   BedrockRuntimeClient,
@@ -88,9 +89,14 @@ const THROTTLING_NAMES = new Set(['ThrottlingException', 'TooManyRequestsExcepti
 
 export function createImageEditPromptStepHandler(
   opts: ImageEditPromptStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:edit-prompt',
+    description:
+      'Inpaints or outpaints a region of the source image from a text prompt, through Nova Canvas.',
+    reads: 'The source image at the node\'s path, falling back to the scatter parent and the trigger\'s imageRef/imageId.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

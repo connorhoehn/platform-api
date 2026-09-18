@@ -18,6 +18,7 @@
 //
 // Non-throwing: missing/invalid resolution → `{status:'failed', error:...}`.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type {
   PipelineNode,
   StepHandler,
@@ -54,9 +55,14 @@ const DEFAULT_TRIGGER_PATH = '$.trigger.imageRef';
 
 export function createImageSourceStepHandler(
   opts: ImageSourceStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image-source',
+    description:
+      'Brings an existing image into the run by its id, so the steps after it have pixels to work on. The usual first step after a trigger that carried an upload.',
+    reads: 'An imageId from the node or from the trigger payload.',
+    emits:
+      'imageId, width and height. No new image is made — it names one that already exists.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

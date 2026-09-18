@@ -30,6 +30,7 @@
 //
 // Non-throwing: bad bbox, missing source, Sharp failures → `status:'failed'`.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import sharp from 'sharp';
 import type {
@@ -104,9 +105,14 @@ const DEFAULT_BBOX_PATH = '$.scatter.item';
 
 export function createImageCropStepHandler(
   opts: ImageCropStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:crop',
+    description:
+      'Crops a region out of the source image using a bounding box.',
+    reads: 'The source image at the node\'s path, falling back to the scatter parent and the trigger\'s imageRef/imageId.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

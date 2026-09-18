@@ -26,6 +26,7 @@
 //
 // AWS region: PIPELINE_IMAGE_AWS_REGION → AWS_REGION → 'us-east-1'.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import {
   BedrockRuntimeClient,
@@ -75,9 +76,14 @@ const THROTTLING_NAMES = new Set(['ThrottlingException', 'TooManyRequestsExcepti
 
 export function createImageVariationStepHandler(
   opts: ImageVariationStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:variation',
+    description:
+      'Generates variations of a source image through Nova Canvas.',
+    reads: 'The source image at the node\'s path, falling back to the scatter parent and the trigger\'s imageRef/imageId.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

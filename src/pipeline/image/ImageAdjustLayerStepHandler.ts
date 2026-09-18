@@ -19,6 +19,7 @@
 //
 // Non-throwing: bad source, blob-store error, Sharp error → status:'failed'.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import sharp from 'sharp';
 import type {
@@ -61,9 +62,14 @@ const FALLBACK_SOURCE_PATHS = ['$.scatter.parentImageId',
 
 export function createImageAdjustLayerStepHandler(
   opts: ImageAdjustLayerStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:adjust-layer',
+    description:
+      'Applies stacked colour and filter adjustments — brightness, contrast, saturation, hue and the rest — in the order the node lists them.',
+    reads: 'The source image at the node\'s path, falling back to the scatter parent and the trigger\'s imageRef/imageId.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,
