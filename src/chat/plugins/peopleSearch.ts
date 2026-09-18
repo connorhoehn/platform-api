@@ -23,6 +23,7 @@
 // run again later; the bridge's `getRun(runId)` is runId-only but forgets
 // every run once the process restarts, and the durable row is keyed by
 // (pipelineId, runId). The id carries both so the panel outlives the process.
+import type { DescribedStepHandler } from '../../pipeline/customStepHandlers';
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import type { ProfileItem } from '../../repositories';
 import { profileRepo } from '../../repositories';
@@ -137,10 +138,15 @@ export function buildPeopleSearchDefinition(): Record<string, unknown> {
 }
 
 /** Step 1: terms → people → `panelData` + `result`. */
-export function createPeopleSearchHandler(deps: { source?: PeopleSource } = {}): StepHandler {
+export function createPeopleSearchHandler(deps: { source?: PeopleSource } = {}): DescribedStepHandler {
   const source: PeopleSource = deps.source ?? profileRepo;
   return {
     kind: PEOPLE_SEARCH_KIND,
+    description:
+      'Ranks people in the directory against the search terms. An empty query is not an error — it returns no one.',
+    reads: 'query, from the chat command.',
+    emits:
+      'The ranked people, the parsed terms, and a title for the panel.',
     async execute(_node: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
       const query = str(ctx.query) ?? '';
       const terms = parseSearchTerms(query);
@@ -161,10 +167,15 @@ export function createPeopleSearchHandler(deps: { source?: PeopleSource } = {}):
 }
 
 /** Step 2: the card in the thread — `/search 3 people match "kubernetes"` — carrying the panel to open. */
-export function createPeoplePublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): StepHandler {
+export function createPeoplePublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): DescribedStepHandler {
   const post = deps.postCard ?? postRunCardToChannel;
   return {
     kind: PEOPLE_PUBLISH_KIND,
+    description:
+      'Posts the search result to the conversation as a panel card saying how many people matched.',
+    reads: 'The people and terms from the search step.',
+    emits:
+      'The card metadata, returned whether or not the step posted it — the client posts it itself when clientPostsCard is set.',
     async execute(_node: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
       const terms = Array.isArray(ctx.terms) ? (ctx.terms as unknown[]).filter((t): t is string => typeof t === 'string') : [];
       const people = Array.isArray(ctx.people) ? (ctx.people as Person[]) : [];

@@ -9,6 +9,7 @@
 // The apply step is the shared `document:apply` — the same write path /doc,
 // Transform and the call transcript use — so this pipeline owns exactly two
 // things: how a conversation is read, and what the model is told about it.
+import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { readChatHistory, type ChatHistoryMessage } from '../gateway/GatewayServiceClient';
 import { DOCUMENT_APPLY_KIND } from './documentAgentPipeline';
@@ -80,10 +81,15 @@ export function buildConversationSummarizeDefinition(model = process.env.DOCUMEN
 }
 
 /** Step 1: read the channel through the chat service and hand the model a transcript. */
-export function createChatReadHistoryHandler(deps: { readHistory?: typeof readChatHistory } = {}): StepHandler {
+export function createChatReadHistoryHandler(deps: { readHistory?: typeof readChatHistory } = {}): DescribedStepHandler {
   const read = deps.readHistory ?? readChatHistory;
   return {
     kind: CHAT_READ_HISTORY_KIND,
+    description:
+      'Reads recent messages from the conversation and flattens them into one block of text for a model to summarise. Capped at 1000 messages.',
+    reads: 'chatChannel, and an optional limit.',
+    emits:
+      'conversationText and messageCount, interpolated by later steps as {{ context.conversationText }}.',
     async execute(_node: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const channel = str(ctx.chatChannel);
       if (!channel) return { status: 'failed', error: 'chatChannel missing from the run context' };

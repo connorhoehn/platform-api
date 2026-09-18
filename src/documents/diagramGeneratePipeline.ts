@@ -12,6 +12,7 @@
 // indices, bound label text elements, arrow bindings at box edges. That keeps
 // the contract small enough for a light model to get right, and keeps what
 // reaches the canvas exactly what `ExcalidrawYjsBinding` would have written.
+import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import type * as YT from 'yjs' with { 'resolution-mode': 'import' };
 // yjs ships ESM types but a CJS build; under `module: node16` the value has to
 // come in through require while the types come in as type-only.
@@ -319,9 +320,14 @@ export function sketchFromContext(ctx: Record<string, unknown>, data: { sketchFr
 }
 
 /** Step 2: join the diagram document as the agent and draw. */
-export function createDiagramApplyHandler(): StepHandler {
+export function createDiagramApplyHandler(): DescribedStepHandler {
   return {
     kind: DIAGRAM_APPLY_KIND,
+    description:
+      'Draws the model\'s proposed diagram into the document as a collaborator: joins the page, writes the boxes and arrows, and leaves. Fails when the model proposed no elements rather than writing an empty canvas.',
+    reads: 'documentId and the sketch, from the planning step or the node’s sketchFrom path.',
+    emits:
+      'How many elements were written, split into boxes, arrows and labels.',
     async execute(node: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const documentId = str(ctx.documentId);
       if (!documentId) return { status: 'failed', error: 'documentId missing from the run context' };
@@ -345,10 +351,15 @@ export function createDiagramApplyHandler(): StepHandler {
 }
 
 /** Last step: the card in the thread — `/diagram <title>` — carrying the document's id. */
-export function createDiagramPublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): StepHandler {
+export function createDiagramPublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): DescribedStepHandler {
   const post = deps.postCard ?? postRunCardToChannel;
   return {
     kind: DIAGRAM_PUBLISH_KIND,
+    description:
+      'Posts the finished diagram back to the conversation as a run card naming the title and how many elements were drawn.',
+    reads: 'chatChannel, documentId, title and the apply step’s element count.',
+    emits:
+      'The card metadata, returned whether or not the step posted it — the client posts it itself when clientPostsCard is set.',
     async execute(_node: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
       const steps = (ctx.steps ?? {}) as Record<string, Record<string, unknown> | undefined>;
       const title = str(ctx.title) ?? 'Diagram';
