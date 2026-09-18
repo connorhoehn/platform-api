@@ -43,6 +43,7 @@ import { postChatMessage, PIPELINE_IDENTITY } from '../gateway/GatewayServiceCli
 import { VIDEO_PUBLIC_URL } from '../lib/video-auth';
 import { DOCUMENT_APPLY_KIND } from '../documents/documentAgentPipeline';
 import { resolveRecordingProfile } from '@connorhoehn/event-catalog';
+import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import log from '../lib/logger';
 
 export const RECORDING_FINALIZE_PIPELINE_ID = 'recording-finalize';
@@ -263,9 +264,14 @@ async function postRunCard(input: { lobbyName: string | null; runId: string; pip
 // recording-finalize steps
 // ---------------------------------------------------------------------------
 
-function resolveHandler(): StepHandler {
+function resolveHandler(): DescribedStepHandler {
   return {
     kind: KINDS.resolve,
+    description:
+      'Finds the video session behind a channel ARN — via the Redis index, falling back to a scan — and works out which call it belongs to.',
+    reads: 'arn and recordingId.',
+    emits:
+      'lobbyName, callId, sessionId, startedBy, the participant list, and the chat channel and document the lobby maps to.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const arn = str(ctx.arn); const recordingId = str(ctx.recordingId);
       if (!arn || !recordingId) return fail('arn and recordingId are required');
@@ -293,9 +299,14 @@ function resolveHandler(): StepHandler {
   };
 }
 
-function persistHandler(): StepHandler {
+function persistHandler(): DescribedStepHandler {
   return {
     kind: KINDS.persist,
+    description:
+      'Writes the recording row: reconciles the participant list against the media tracks, derives the true media duration, and stores the segments, destination and thumbnail.',
+    reads: 'The webhook detail, plus the callId and participants the resolve step worked out.',
+    emits:
+      'startedAt, endedAt, mediaDurationMs and participantCount.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const detail = (ctx.detail ?? {}) as Record<string, any>;
       const arn = str(ctx.arn)!; const recordingId = str(ctx.recordingId)!;
@@ -321,9 +332,14 @@ function persistHandler(): StepHandler {
 }
 
 /** One attempt per execution; the node's retryPolicy turns "still composing" into a wait. */
-function awaitComposeHandler(): StepHandler {
+function awaitComposeHandler(): DescribedStepHandler {
   return {
     kind: KINDS.awaitCompose,
+    description:
+      'Asks LVS whether the composed file is ready yet. Fails while composing is still running, so the node\'s retry policy turns this into a wait rather than an error.',
+    reads: 'arn, recordingId and callId.',
+    emits:
+      'composeStatus, and the composed file\'s key and size once there is one.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const arn = str(ctx.arn)!; const recordingId = str(ctx.recordingId)!; const callId = str(ctx.callId)!;
       const res = await callSfu(`${VIDEO_API_URL}/api/channels/${encodeURIComponent(arn)}/recordings`, { method: 'GET', headers: lvsAuth() });
@@ -399,9 +415,14 @@ export function recordingCardMetadata(ctx: Record<string, unknown>, runId: strin
   return { message, metadata };
 }
 
-function announceHandler(): StepHandler {
+function announceHandler(): DescribedStepHandler {
   return {
     kind: KINDS.announce,
+    description:
+      'Posts the recording card into the lobby\'s conversation. A lobby with no conversation is not a failure — it reports that nothing was posted and the run carries on.',
+    reads: 'lobbyName, and the recording details the card shows.',
+    emits:
+      'Whether a card was posted, and to which channel.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
       const channel = chatChannelForLobby(str(ctx.lobbyName));
       if (!channel) {
@@ -425,10 +446,15 @@ export interface RecordingPipelineDeps {
   startRun?: typeof startSystemRun;
 }
 
-function startTranscriptionHandler(deps: RecordingPipelineDeps = {}): StepHandler {
+function startTranscriptionHandler(deps: RecordingPipelineDeps = {}): DescribedStepHandler {
   const startRun = deps.startRun ?? startSystemRun;
   return {
     kind: KINDS.startTranscription,
+    description:
+      'Decides whether this recording should be transcribed at all — from the recording profile, or TRANSCRIBE_EVERY_RECORDING — and starts the call-transcription pipeline as a child run.',
+    reads: 'The recording profile in the webhook detail, and composeStatus.',
+    emits:
+      'Whether transcription started, and the child run\'s id. On failure the row records why, because "pending" forever is the one answer nobody can act on.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const detail = (ctx.detail ?? {}) as Record<string, any>;
       const webhookSaysTranscribe = detail.transcribe === true || detail.transcribe === 'true';
@@ -503,9 +529,14 @@ export async function transcribeFile(file: string, durationMs: number): Promise<
   return lines.map((text, i) => ({ startMs: i * per, endMs: Math.min(durationMs, (i + 1) * per), speakerId: 'call', speakerLabel: 'Call', text }));
 }
 
-function transcribeHandler(): StepHandler {
+function transcribeHandler(): DescribedStepHandler {
   return {
     kind: KINDS.transcribe,
+    description:
+      'Downloads the composed recording from LVS and runs it through the transcription engine. A stock phrase returned for silence is discarded rather than stored as speech.',
+    reads: 'arn, recordingId, callId and the composed file\'s key.',
+    emits:
+      'The transcript segments and a word count; an empty segment list when there was no speech.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const arn = str(ctx.arn); const recordingId = str(ctx.recordingId); const callId = str(ctx.callId);
       if (!arn || !recordingId || !callId) return fail('arn, recordingId and callId are required');
@@ -534,9 +565,14 @@ function transcribeHandler(): StepHandler {
   };
 }
 
-function mergeReactionsHandler(): StepHandler {
+function mergeReactionsHandler(): DescribedStepHandler {
   return {
     kind: KINDS.mergeReactions,
+    description:
+      'Folds the emoji reactions people left during the call into the transcript\'s timeline, so a reaction sits next to what was being said.',
+    reads: 'The transcript segments and the lobby the call ran in.',
+    emits:
+      'The merged transcript and how many reactions went into it.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const segments = (ctx.segments as TranscriptSegment[]) ?? [];
       const lobbyName = str(ctx.lobbyName); const startedAt = str(ctx.startedAt) ?? new Date().toISOString();
@@ -551,9 +587,14 @@ function mergeReactionsHandler(): StepHandler {
   };
 }
 
-function storeHandler(): StepHandler {
+function storeHandler(): DescribedStepHandler {
   return {
     kind: KINDS.store,
+    description:
+      'Stores the transcript on the recording row and prepares the document operations that write it into a page. Refuses a transcript over 350KB rather than truncating one.',
+    reads: 'callId, recordingId and the merged transcript.',
+    emits:
+      'How it was stored, the byte and segment counts, the transcript as text, whether any speech was found, and the document operations for the apply step.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const callId = str(ctx.callId)!; const recordingId = str(ctx.recordingId)!;
       const transcript = (ctx.transcript ?? { segments: ctx.segments ?? [] }) as { segments: TranscriptSegment[] };
@@ -571,9 +612,14 @@ function storeHandler(): StepHandler {
 }
 
 /** Persist the summarising model's answer on the row; for a silent recording, record that there was nothing to summarise without reading the model. */
-function storeSummaryHandler(): StepHandler {
+function storeSummaryHandler(): DescribedStepHandler {
   return {
     kind: KINDS.storeSummary,
+    description:
+      'Persists the summarising model\'s answer against the recording. A silent recording is recorded as skipped without reading the model at all.',
+    reads: 'hasSpeech, and the summarize step\'s answer.',
+    emits:
+      'The summary status and length, and the document operations with the summary placed above the transcript.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const callId = str(ctx.callId); const recordingId = str(ctx.recordingId);
       if (!callId || !recordingId) return fail('callId and recordingId are required');
@@ -598,9 +644,14 @@ function storeSummaryHandler(): StepHandler {
   };
 }
 
-function publishHandler(): StepHandler {
+function publishHandler(): DescribedStepHandler {
   return {
     kind: KINDS.publish,
+    description:
+      'Posts the finished transcript back to the lobby as a run card, with a word count and the opening line as a preview.',
+    reads: 'The merged transcript, lobbyName, recordingId and callId.',
+    emits:
+      'Whether the card was posted.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
       const transcript = (ctx.transcript ?? { segments: [] }) as { segments: TranscriptSegment[] };
       const words = transcript.segments.reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
