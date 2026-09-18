@@ -316,10 +316,24 @@ describe('PUT optimistic lock only applies to a stored row', () => {
 
 describe('POST /api/pipelines/defs/:pipelineId/publish', () => {
   /** A structurally sound graph — publish now refuses anything less. */
+  // Sound means publishable, which now includes carrying the configuration the
+  // step cannot run without — the same rule the editor has always applied. A
+  // bare `{ id: 'a', type: 'llm' }` was sound when only the graph shape was
+  // checked; it is an llm with no prompt, and it is not sound any more.
   const soundGraph = {
     nodes: [
-      { id: 't', type: 'trigger' },
-      { id: 'a', type: 'llm' },
+      { id: 't', type: 'trigger', data: { type: 'trigger', triggerType: 'manual' } },
+      {
+        id: 'a',
+        type: 'llm',
+        data: {
+          type: 'llm',
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+          systemPrompt: 'Be brief.',
+          userPromptTemplate: 'Summarise {{context.document}}',
+        },
+      },
     ],
     edges: [{ id: 'e1', source: 't', target: 'a' }],
   };

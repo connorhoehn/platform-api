@@ -37,7 +37,8 @@ export type ShapeIssueCode =
   | 'NODE_ORPHANED'
   | 'NODE_KIND_UNKNOWN'
   | 'EDGE_HANDLE_UNKNOWN'
-  | 'EDGE_PAYLOAD_MISMATCH';
+  | 'EDGE_PAYLOAD_MISMATCH'
+  | 'NODE_CONFIG_MISSING';
 
 export interface ShapeIssue {
   code: ShapeIssueCode;
@@ -86,6 +87,50 @@ export interface ShapeOptions {
    * guessed at, for the same reason the handle checks do not guess.
    */
   payloadFor?: (kind: string) => { consumes?: string; produces?: string } | undefined;
+}
+
+/**
+ * Configuration a canonical node type cannot run without.
+ *
+ * These mirror the editor's own per-type rules exactly. The editor has always
+ * refused to publish an `llm` with no prompt or a `condition` with no
+ * expression; this side validated none of it, so an agent posting the same
+ * definition got a 200 and a live pipeline that failed at the first step.
+ * "Per-node-type config stays in the editor" was a reasonable line to draw
+ * when people were the only authors, and it stopped being one.
+ *
+ * Only the canonical types are listed. A registered kind's configuration is
+ * the executor's business and is not guessed at here — the same rule the
+ * handle and payload checks follow.
+ */
+const REQUIRED_FIELDS: Record<string, readonly string[]> = {
+  llm: ['provider', 'model', 'systemPrompt', 'userPromptTemplate'],
+  agent: ['prompt'],
+  transform: ['transformType', 'expression'],
+  condition: ['expression'],
+  action: ['actionType'],
+  join: ['mode', 'mergeStrategy'],
+  scatter: ['itemsPath'],
+};
+
+/**
+ * "a condition", "an llm" — the message is read by people as well as agents.
+ *
+ * Sound, not spelling: `llm` begins with a consonant letter and a vowel sound
+ * ("ell-em"), so the letter test gets it wrong. Only the kinds that exist need
+ * an answer, so they are listed rather than guessed at phonetically.
+ */
+const TAKES_AN: ReadonlySet<string> = new Set(['llm', 'agent', 'action']);
+
+function articleFor(kind: string): string {
+  return TAKES_AN.has(kind) || /^[aeiou]/i.test(kind) ? 'an' : 'a';
+}
+
+/** Present, and not a blank string. */
+function isSupplied(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  return true;
 }
 
 /**
@@ -303,6 +348,23 @@ export function validateShape(
     const kind = typeof node.type === 'string' ? node.type : '';
     if (knownKinds && (!kind || !knownKinds.has(kind))) {
       unknownKinds.push({ id, kind });
+    }
+
+    // Configuration the step cannot run without. Canonical types only.
+    const required = REQUIRED_FIELDS[kind];
+    if (required) {
+      const data = (node as { data?: unknown }).data;
+      const bag = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      for (const field of required) {
+        if (!isSupplied(bag[field])) {
+          errors.push({
+            code: 'NODE_CONFIG_MISSING',
+            message: `Step "${id}" is ${articleFor(kind)} ${kind} and has no ${field}.`,
+            severity: 'error',
+            nodeId: id,
+          });
+        }
+      }
     }
   }
 
