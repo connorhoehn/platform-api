@@ -20,7 +20,7 @@
 // When this handler runs inside a scatter arm (the common case), the per-arm
 // context carries `scatter.item` — the crop spec. The handler reads source
 // image + bbox via configurable JSONPaths so it works equally for:
-//   - Vision-driven scatter: bbox comes from `$.scatter.item.bbox`.
+//   - Vision-driven scatter: bbox comes from the arm's item, `$.scatter.item`.
 //   - Standalone use: source + bbox baked into node.data as literal config.
 //
 // === Output shape ===
@@ -52,7 +52,8 @@ interface ImageCropNodeData {
    */
   sourceImagePath?: string;
   /**
-   * JSONPath to the bbox object in the context. Default: `$.scatter.item.bbox`.
+   * JSONPath to the bbox in the context. Default: `$.scatter.item` — the arm's
+   * item itself, since `coerceBBox` accepts the box nested under `bbox` or flat.
    * Bbox shape: `{ x, y, width, height }` integer pixels in post-resize space.
    */
   bboxPath?: string;
