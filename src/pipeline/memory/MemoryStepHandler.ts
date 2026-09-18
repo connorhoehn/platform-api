@@ -21,6 +21,7 @@
 // The handler never throws: every failure is `{status:'failed', error}` so the
 // executor records a failed step instead of an unhandled rejection.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type {
   PipelineNode,
   StepHandler,
@@ -105,9 +106,14 @@ export function resolveKeyExpression(
 
 export function createMemoryStepHandler(
   opts: MemoryStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'memory',
+    description:
+      'Reads or writes AgentCore Memory under a namespace and a key built from the run context. Refuses a key whose template has unresolved paths rather than substituting an empty string, because that would collapse every run onto one key.',
+    reads: 'namespace and keyExpression, both required; valueField as well when the mode is write.',
+    emits:
+      'On read, what was stored. On write, confirmation of what was put there.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

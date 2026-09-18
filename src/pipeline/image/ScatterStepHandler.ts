@@ -30,6 +30,7 @@
 // Non-throwing: all error paths return `{status:'failed', error:...}`
 // per the audit rule the existing handlers follow.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import type {
   PipelineNode,
   StepHandler,
@@ -64,9 +65,14 @@ interface ScatterNodeData {
 
 const DEFAULT_MAX_CONCURRENCY = 4;
 
-export function createScatterStepHandler(): StepHandler {
+export function createScatterStepHandler(): DescribedStepHandler {
   return {
     kind: 'scatter',
+    description:
+      'Fans the rest of the branch out over an array: the executor walks the downstream subgraph once per item, with the item at context.<alias> and also at context.scatter.item alongside its index and total.',
+    reads: 'itemsPath, a JSONPath into the context that must resolve to an array. Also itemAlias (default \'item\') and maxConcurrency (default 4).',
+    emits:
+      'A fan-out rather than an ordinary output — there is one arm per element, and each arm carries its own copy of the context.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

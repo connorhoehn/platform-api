@@ -107,10 +107,15 @@ export function createChatReadHistoryHandler(deps: { readHistory?: typeof readCh
 }
 
 /** Last step: the card in the thread — `/summarize <title> — <n> messages` — carrying the page's id. */
-export function createSummarizePublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): StepHandler {
+export function createSummarizePublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): DescribedStepHandler {
   const post = deps.postCard ?? postRunCardToChannel;
   return {
     kind: SUMMARIZE_PUBLISH_KIND,
+    description:
+      'Posts the finished conversation summary back to the channel as a run card, saying how many messages went into it — or that there was nothing to summarise.',
+    reads: 'chatChannel, the summary title and the message count from the steps before it.',
+    emits:
+      'Whether a card was posted, the card metadata (returned either way, since the client posts it itself when clientPostsCard is set), the title and the message count.',
     async execute(_node: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
       const steps = (ctx.steps ?? {}) as Record<string, Record<string, unknown> | undefined>;
       const title = str(steps.apply?.title) ?? 'Conversation summary';
