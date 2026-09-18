@@ -21,6 +21,7 @@
 //
 // Non-throwing: bad sourceImagePath, missing blob, Sharp error → status:'failed'.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import sharp from 'sharp';
 import type {
@@ -61,9 +62,14 @@ const FALLBACK_SOURCE_PATHS = ['$.scatter.parentImageId',
 
 export function createImageAdjustBwStepHandler(
   opts: ImageAdjustBwStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:adjust-bw',
+    description:
+      'Converts the source image to black and white.',
+    reads: '$.imageId, falling back to $.scatter.parentImageId and the trigger\'s imageRef/imageId, or whatever sourceImagePath names.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType. Chaining these steps works because each one\'s imageId is the next one\'s source.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

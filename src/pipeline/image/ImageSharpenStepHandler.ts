@@ -17,6 +17,7 @@
 //
 // Non-throwing: bad source, missing blob, Sharp error → status:'failed'.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import sharp from 'sharp';
 import type {
@@ -64,9 +65,14 @@ function clampSigma(s: number): number {
 
 export function createImageSharpenStepHandler(
   opts: ImageSharpenStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:sharpen',
+    description:
+      'Applies an unsharp-mask sharpen to the source image with Sharp.',
+    reads: '$.imageId, falling back to $.scatter.parentImageId and the trigger\'s imageRef/imageId, or whatever sourceImagePath names.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType. Chaining these steps works because each one\'s imageId is the next one\'s source.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

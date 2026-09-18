@@ -27,6 +27,7 @@
 //
 // Non-throwing: all failures return { status: 'failed', error }.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import sharp from 'sharp';
 import type {
@@ -90,9 +91,14 @@ const FALLBACK_SOURCE_PATHS = ['$.scatter.parentImageId',
 
 export function createImageWatermarkStepHandler(
   opts: ImageWatermarkStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:watermark',
+    description:
+      'Composites an overlay image onto the source.',
+    reads: '$.imageId, falling back to $.scatter.parentImageId and the trigger\'s imageRef/imageId, or whatever sourceImagePath names.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType. Chaining these steps works because each one\'s imageId is the next one\'s source.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,

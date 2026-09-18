@@ -17,6 +17,7 @@
 //
 // Non-throwing: bad config, missing source, Sharp error → status:'failed'.
 
+import type { DescribedStepHandler } from '../customStepHandlers';
 import { randomUUID } from 'crypto';
 import sharp from 'sharp';
 import type {
@@ -61,9 +62,14 @@ const VALID_OPS = new Set(['rotate', 'flip', 'flop']);
 
 export function createImageGeometricTransformStepHandler(
   opts: ImageGeometricTransformStepHandlerOpts,
-): StepHandler {
+): DescribedStepHandler {
   return {
     kind: 'image:transform',
+    description:
+      'Rotates, flips or flops the source image with Sharp.',
+    reads: '$.imageId, falling back to $.scatter.parentImageId and the trigger\'s imageRef/imageId, or whatever sourceImagePath names.',
+    emits:
+      'A NEW imageId for the result, plus parentImageId, width, height and mimeType. Chaining these steps works because each one\'s imageId is the next one\'s source.',
     async execute(
       node: PipelineNode,
       context: Record<string, unknown>,
