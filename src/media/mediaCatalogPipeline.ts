@@ -22,6 +22,7 @@ import { buildPresetSchema } from '../pipeline/image/visionSchemaPresets';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { groupBursts, shotAt, type Burst } from './burstGroup';
+import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import log from '../lib/logger';
 
 export const MEDIA_CATALOG_PIPELINE_ID = 'media-catalog';
@@ -92,9 +93,13 @@ function batchOf(ctx: Record<string, unknown>): MediaBatch | null {
 // Steps
 // ---------------------------------------------------------------------------
 
-function ingestHandler(): StepHandler {
+function ingestHandler(): DescribedStepHandler {
   return {
     kind: KINDS.ingest,
+    description:
+      'Takes the walker\'s batch of files, stores each thumbnail in the image blob store, and replaces the batch in the run context with a slim record. The posted batch carries every thumbnail inline, and a step output merges into the context root — left as posted it put tens of kilobytes per file into every later checkpoint.',
+    reads: 'batch.files from the trigger payload.',
+    emits: 'The ingested file list with an imageId per stored thumbnail, plus the batch id, root and how many thumbnails were stored.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const batch = batchOf(ctx);
       if (!batch) return fail('batch.files is required');
@@ -129,9 +134,13 @@ function ingestHandler(): StepHandler {
   };
 }
 
-function burstGroupHandler(): StepHandler {
+function burstGroupHandler(): DescribedStepHandler {
   return {
     kind: KINDS.burstGroup,
+    description:
+      'Groups the batch into bursts — runs of near-identical frames shot within a short window — so the rest of the pipeline can treat a burst as one picture rather than forty.',
+    reads: 'The ingested files; windowMs and maxHamming from the node.',
+    emits: 'The bursts, how many contain more than one frame, and how many frames those account for.',
     async execute(n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const files = ctx.ingested as IngestedFile[] | undefined;
       if (!Array.isArray(files)) return fail('ingested files are required (run media:ingest first)');
@@ -158,9 +167,13 @@ export function sceneFromOutput(output: unknown, rawText: string, labels: readon
   return { label, confidence: conf, caption };
 }
 
-function classifyHandler(): StepHandler {
+function classifyHandler(): DescribedStepHandler {
   return {
     kind: KINDS.classify,
+    description:
+      'Asks a vision model what each burst is a picture of, classifying only the representative frame rather than every one. No vision client is not a failed run — the catalog is still worth having without scenes, which is why this node is marked optional.',
+    reads: 'The ingested files and bursts; the label set, model and token cap from the node.',
+    emits: 'A scene verdict per file, how many were classified, and why it was skipped when there was no model.',
     async execute(n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const files = ctx.ingested as IngestedFile[] | undefined;
       const bursts = ctx.bursts as Burst[] | undefined;
@@ -211,9 +224,13 @@ function classifyHandler(): StepHandler {
   };
 }
 
-function upsertHandler(): StepHandler {
+function upsertHandler(): DescribedStepHandler {
   return {
     kind: KINDS.upsert,
+    description:
+      'Writes the catalog rows: one per file, carrying its burst, its scene verdict and the file\'s own metadata.',
+    reads: 'The ingested files, the bursts, the scene verdicts and the walker root.',
+    emits: 'The rows written.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>, helpers?: { runId?: string }): Promise<StepOutcome> {
       const files = ctx.ingested as IngestedFile[] | undefined;
       const bursts = (ctx.bursts as Burst[] | undefined) ?? [];

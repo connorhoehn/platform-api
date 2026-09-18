@@ -39,6 +39,7 @@ import { getPipelineBridge } from '../pipeline/bridge-types';
 import { postRunCardToChannel } from '../documents/chatRunCard';
 import { startSystemRun } from './recordingPipelines';
 import { chatChannelForLobby } from './lobbyChannel';
+import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import log from '../lib/logger';
 
 export const LIVE_CAPTIONS_PIPELINE_ID = 'live-captions';
@@ -454,9 +455,14 @@ const countWords = (text: string) => text.split(/\s+/).filter(Boolean).length;
 
 export type StreamEndReason = 'call-ended' | 'stopped' | 'max-duration' | 'cancelled';
 
-function armHandler(tap: TapDeps = {}): StepHandler {
+function armHandler(tap: TapDeps = {}): DescribedStepHandler {
   return {
     kind: CAPTION_KINDS.arm,
+    description:
+      'Asks LVS to attach a caption tap to the channel, so spoken lines start arriving on the caption feed.',
+    reads: 'channelArn.',
+    emits:
+      'The tap ids, whether a tap is live yet, the sink URL, and the caption channel later steps subscribe to.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const channelArn = str(ctx.channelArn);
       if (!channelArn) return fail('channelArn is required');
@@ -467,7 +473,7 @@ function armHandler(tap: TapDeps = {}): StepHandler {
   };
 }
 
-function streamHandler(deps: StreamDeps = {}): StepHandler {
+function streamHandler(deps: StreamDeps = {}): DescribedStepHandler {
   const subscribe = deps.subscribe ?? redisCaptionSubscriber;
   const isEnded = deps.isSessionEnded ?? sessionEnded;
   const stopAsked = deps.isStopRequested ?? isStopRequested;
@@ -480,6 +486,11 @@ function streamHandler(deps: StreamDeps = {}): StepHandler {
 
   return {
     kind: CAPTION_KINDS.stream,
+    description:
+      'The long-running step: subscribes to the caption feed and counts lines, words and speakers until the call ends, the maximum duration is reached, someone asks it to stop, or the run is cancelled. Interim (partial) lines are ignored so a sentence is not counted twice as it is revised.',
+    reads: 'channelArn, and the sessionId and lobbyName that identify the call to watch.',
+    emits:
+      'The line, word and speaker counts, how long it ran, and why it stopped.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>, helpers: StepHandlerHelpers): Promise<StepOutcome> {
       const channelArn = str(ctx.channelArn);
       if (!channelArn) return fail('channelArn is required');
@@ -546,9 +557,14 @@ function streamHandler(deps: StreamDeps = {}): StepHandler {
   };
 }
 
-function disarmHandler(tap: TapDeps = {}): StepHandler {
+function disarmHandler(tap: TapDeps = {}): DescribedStepHandler {
   return {
     kind: CAPTION_KINDS.disarm,
+    description:
+      'Removes the caption taps. A refusal LVS might reconsider fails the step so the node\'s retry policy can try again; a tap whose channel is already gone is reported as orphaned instead, since no retry can change that.',
+    reads: 'channelArn and the tap ids the arm step created.',
+    emits:
+      'Which taps were removed and which were already gone.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const channelArn = str(ctx.channelArn);
       if (!channelArn) return fail('channelArn is required');
@@ -562,9 +578,14 @@ function disarmHandler(tap: TapDeps = {}): StepHandler {
   };
 }
 
-function publishHandler(): StepHandler {
+function publishHandler(): DescribedStepHandler {
   return {
     kind: CAPTION_KINDS.publish,
+    description:
+      'Posts a run card back to the lobby saying how many lines were captioned. A lobby with no conversation is not a failure — it records that nothing was posted.',
+    reads: 'lobbyName and the counts from the stream step.',
+    emits:
+      'Whether a card was posted, and to which channel.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>, helpers: StepHandlerHelpers): Promise<StepOutcome> {
       const lobbyName = str(ctx.lobbyName) ?? null;
       const channel = chatChannelForLobby(lobbyName);
