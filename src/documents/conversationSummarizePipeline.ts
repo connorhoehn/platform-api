@@ -70,7 +70,7 @@ export function buildConversationSummarizeDefinition(model = process.env.DOCUMEN
     description: 'A /summarize command from a chat: read the conversation, plan a page with a light model (action items as a checklist), write it as a collaborator, leave a card in the thread.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/summarize command' } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: '/summarize command' } },
       { id: 'read-history', type: CHAT_READ_HISTORY_KIND, position: pos(200), data: { type: CHAT_READ_HISTORY_KIND, label: 'Read the conversation', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
       { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the page (Haiku)', prompt: CONVERSATION_SUMMARY_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: PLAN_RETRY } },
       { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the page as a collaborator', opsFrom: 'steps.plan.text', agent: { userId: 'agent:haiku', displayName: 'Haiku' }, retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },

@@ -164,7 +164,7 @@ export function buildDocumentTransformDefinition(model = process.env.DOCUMENT_AG
     description: 'Transform to <type>: read the source page, plan the target under its fields with a light model (macros carried verbatim), pause for approval when the plan is big, write it as a collaborator.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Transform to <type>' } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: 'Transform to <type>' } },
       { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the source', retryPolicy: DOCUMENT_IO_RETRY } },
       { id: 'plan', type: DOCUMENT_PLAN_KIND, position: pos(400), data: { type: DOCUMENT_PLAN_KIND, label: 'Plan the target (Haiku)', prompt: DOCUMENT_TRANSFORM_PROMPT, model, temperature: 0, maxTokens: DOCUMENT_PLAN_MAX_TOKENS, timeoutMs: DOCUMENT_PLAN_TIMEOUT_MS, retryPolicy: DOCUMENT_PLAN_RETRY } },
       // A transform always stamps the new type — that is not a reason to stop and ask.
@@ -204,7 +204,7 @@ export function buildDocumentAgentEditDefinition(model = process.env.DOCUMENT_AG
     status: 'published',
     publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/doc command' } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: '/doc command' } },
       { id: 'read', type: DOCUMENT_READ_KIND, position: pos(200), data: { type: DOCUMENT_READ_KIND, label: 'Read the document', retryPolicy: DOCUMENT_IO_RETRY } },
       { id: 'plan', type: DOCUMENT_PLAN_KIND, position: pos(400), data: { type: DOCUMENT_PLAN_KIND, label: 'Plan the edit (Haiku)', prompt: DOCUMENT_EDIT_PROMPT, model, temperature: 0, maxTokens: DOCUMENT_PLAN_MAX_TOKENS, timeoutMs: DOCUMENT_PLAN_TIMEOUT_MS, retryPolicy: DOCUMENT_PLAN_RETRY } },
       { id: 'review', type: DOCUMENT_REVIEW_KIND, position: pos(600), data: { type: DOCUMENT_REVIEW_KIND, label: 'Check the plan', retryPolicy: DOCUMENT_IO_RETRY } },
@@ -229,7 +229,7 @@ export function buildDocumentReviewApplyDefinition(): Record<string, unknown> {
     description: 'A person accepted or rejected an agent\'s suggestions: resolve them in the document as a collaborator.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Suggestion reviewed' } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: 'Suggestion reviewed' } },
       { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(200), data: { type: DOCUMENT_APPLY_KIND, label: 'Resolve the suggestions', mode: 'direct', opsFrom: 'reviewOps', agent: REVIEW_AGENT, retryPolicy: DOCUMENT_IO_RETRY } },
     ],
     edges: [{ id: 'e1', source: 'trigger', sourceHandle: 'out', target: 'apply', targetHandle: 'in' }],

@@ -129,7 +129,7 @@ export function buildPeopleSearchDefinition(): Record<string, unknown> {
     description: 'A /search command from a chat: match people by what their profile says they know, answer with a people panel, leave a card in the thread.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/search command' } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: '/search command' } },
       { id: 'search', type: PEOPLE_SEARCH_KIND, position: pos(200), data: { type: PEOPLE_SEARCH_KIND, label: 'Search people', retryPolicy: RETRY } },
       { id: 'publish', type: PEOPLE_PUBLISH_KIND, position: pos(400), data: { type: PEOPLE_PUBLISH_KIND, label: 'Post the card to the conversation', retryPolicy: RETRY } },
     ],

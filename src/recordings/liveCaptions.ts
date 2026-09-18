@@ -390,7 +390,7 @@ export function buildLiveCaptionsDefinition(): Record<string, unknown> {
     description: 'While a call runs: arm the audio tap, stream captions to the call until it ends, remove the tap, tell the conversation.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Captions turned on' } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: 'Captions turned on' } },
       { id: 'arm', type: CAPTION_KINDS.arm, position: pos(200), data: { type: CAPTION_KINDS.arm, label: 'Arm the audio tap', retryPolicy: IO_RETRY } },
       // One attempt is the whole call; a second only if subscribing failed outright.
       { id: 'stream', type: CAPTION_KINDS.stream, position: pos(400), data: { type: CAPTION_KINDS.stream, label: 'Stream captions while the call runs', retryPolicy: { maxAttempts: 2, backoffMs: 2000, backoffMultiplier: 1, retryUnknown: true } } },

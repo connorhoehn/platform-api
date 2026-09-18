@@ -154,6 +154,23 @@ describe('ScheduleEvaluator.evaluateOnce', () => {
     expect(ids).toEqual(['a']);
   });
 
+  // A pipeline started by the platform — a chat command, an app action, a
+  // preceding pipeline — must never be picked up by the scheduler, whatever
+  // else it carries. The filter is an allowlist on `schedule`; this pins it.
+  test('never schedules a platform-triggered pipeline', () => {
+    const pipelines: PipelineForSchedule[] = [
+      pipeline({ id: 'platform-only', triggerBinding: { event: 'platform' } }),
+      // Even one that wrongly carries a cron alongside a platform event.
+      pipeline({ id: 'platform-with-cron', triggerBinding: { event: 'platform', schedule: '* * * * *' } }),
+      pipeline({ id: 'real-schedule', triggerBinding: { event: 'schedule', schedule: '* * * * *' } }),
+    ];
+    const evaluator = new ScheduleEvaluator({
+      listPipelines: () => pipelines,
+      trigger: async () => {},
+    });
+    expect(evaluator.evaluateOnce(new Date(2026, 3, 23, 10, 30))).toEqual(['real-schedule']);
+  });
+
   test('skips pipelines with invalid cron strings', () => {
     const pipelines: PipelineForSchedule[] = [
       pipeline({ id: 'a', triggerBinding: { event: 'schedule', schedule: 'not-a-cron' } }),

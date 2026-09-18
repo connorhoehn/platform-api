@@ -59,7 +59,7 @@ export function buildDiagramGenerateDefinition(model = process.env.DOCUMENT_AGEN
     description: 'A /diagram command from a chat: a light model sketches the boxes and arrows, the sketch becomes Excalidraw elements in the new diagram document, a card in the thread opens it.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: '/diagram command' } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: '/diagram command' } },
       { id: 'plan', type: 'agent', position: pos(200), data: { type: 'agent', label: 'Sketch the diagram (Haiku)', prompt: DIAGRAM_PLAN_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: PLAN_RETRY } },
       { id: 'apply', type: DIAGRAM_APPLY_KIND, position: pos(400), data: { type: DIAGRAM_APPLY_KIND, label: 'Draw it as a collaborator', sketchFrom: 'steps.plan.text', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
       { id: 'publish', type: DIAGRAM_PUBLISH_KIND, position: pos(600), data: { type: DIAGRAM_PUBLISH_KIND, label: 'Post the card to the conversation', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },

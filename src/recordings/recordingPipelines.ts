@@ -184,7 +184,7 @@ export function buildCallTranscriptionDefinition(model = process.env.DOCUMENT_AG
     description: 'Transcribe the composed recording, merge in-call reactions by time, store the transcript, summarise it with a light model, publish it to the conversation and the call\'s document.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
-      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'manual', label: 'Recording ready' } },
+      { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: 'Recording ready' } },
       { id: 'transcribe', type: KINDS.transcribe, position: pos(200), data: { type: KINDS.transcribe, label: 'Transcribe the audio', retryPolicy: { maxAttempts: 3, backoffMs: 3000, backoffMultiplier: 2, retryUnknown: true } } },
       { id: 'merge-reactions', type: KINDS.mergeReactions, position: pos(400), data: { type: KINDS.mergeReactions, label: 'Merge reactions', retryPolicy: IO_RETRY } },
       { id: 'store', type: KINDS.store, position: pos(600), data: { type: KINDS.store, label: 'Store the transcript', retryPolicy: IO_RETRY } },
