@@ -11,6 +11,7 @@ import {
   pipelineRaftStateMachineDeclarations,
   pipelineEventDeclarations,
 } from '@connorhoehn/event-catalog';
+import { workGraphEventDeclarations } from '@connorhoehn/realtime-modules/work-graph';
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
 import { docClient } from './aws-clients';
@@ -629,6 +630,14 @@ catalog.declareAll(pipelineRaftStateMachineDeclarations);
 // step:started/completed/failed/breakpoint/context-mutations, llm:prompt/response,
 // join:waiting/fired.
 catalog.declareAll(pipelineEventDeclarations);
+
+// Active now work graph: six authenticated source lifecycle streams share the
+// dedicated projection queue, while projection revision notifications use a
+// separate durable queue for the gateway. The consumer intentionally drains
+// the declaration's queue through getDurableTransport(); this installed
+// event-catalog version's high-level subscribe(eventName) derives a queue name
+// and does not honor a declaration-level queue override.
+catalog.declareAll([...workGraphEventDeclarations]);
 
 // ---------------------------------------------------------------------------
 // Lifecycle
