@@ -52,6 +52,8 @@ export const teamRepo = new TeamRepository(docClient);
 export const changeVerdictRepo = new ChangeVerdictRepository(docClient);
 
 export { BaseRepository } from './BaseRepository';
+export * from './WorkGraphRepository';
+export * from './WorkSharingRepository';
 export { ProfileRepository, ProfileItem } from './ProfileRepository';
 export { RoomRepository, RoomItem, RoomMemberItem } from './RoomRepository';
 export { GroupRepository, GroupItem, GroupMemberItem } from './GroupRepository';
