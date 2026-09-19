@@ -436,6 +436,25 @@ export class WorkGraphRepository {
           TableName: WORK_GRAPH_TABLE,
           Item: {
             PK: pk,
+            SK: `OUTBOX#${String(next.revision).padStart(12, '0')}#${event.eventId}`,
+            itemKind: 'outbox',
+            eventType: 'work-graph.projection.changed.v1',
+            organizationId: next.organizationId,
+            actorId: next.actorId,
+            day,
+            revision: next.revision,
+            sourceEventId: event.eventId,
+            createdAt: event.receivedAt,
+            expiresAt: Math.floor(Date.parse(event.receivedAt) / 1_000) + EVENT_RETENTION_SECONDS,
+          },
+          ConditionExpression: 'attribute_not_exists(PK)',
+        },
+      },
+      {
+        Put: {
+          TableName: WORK_GRAPH_TABLE,
+          Item: {
+            PK: pk,
             SK: 'META',
             itemKind: 'meta',
             schemaVersion: 1,

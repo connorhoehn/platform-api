@@ -96,10 +96,11 @@ describe('WorkGraphRepository', () => {
       .find((command): command is TransactWriteCommand => command instanceof TransactWriteCommand);
     expect(transaction).toBeDefined();
     const writes = transaction!.input.TransactItems!;
-    expect(writes).toHaveLength(3);
+    expect(writes).toHaveLength(4);
     expect(writes.map((write) => write.Put?.Item?.['SK'])).toEqual([
       'NODE#node-1',
       'EVENT#pipeline#evt-1',
+      'OUTBOX#000000000001#evt-1',
       'META',
     ]);
     const eventPut = writes[1].Put!;
@@ -109,6 +110,12 @@ describe('WorkGraphRepository', () => {
     );
     expect(writes[2].Put?.ConditionExpression).toBe('attribute_not_exists(PK)');
     expect(writes[2].Put?.Item).toMatchObject({
+      eventType: 'work-graph.projection.changed.v1',
+      organizationId: 'org-1',
+      actorId: 'actor-1',
+      revision: 1,
+    });
+    expect(writes[3].Put?.Item).toMatchObject({
       PK: 'WG#org-1#actor-1#2026-09-20',
       revision: 1,
       sourceCheckpoints: { pipeline: '42' },
