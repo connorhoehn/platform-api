@@ -1,0 +1,832 @@
+import type {
+  WorkProjectionState,
+  WorkSourceKind,
+} from '../repositories/WorkGraphRepository';
+import type {
+  SharingAudience,
+  SharingSelection,
+  StoredWorkGrant,
+  WorkHistoryGrant,
+  WorkSharingGrant,
+  WorkSharingViewerContext,
+} from '../repositories/WorkSharingRepository';
+import type {
+  WorkCollaborationCapability,
+  WorkCollaborationRequest,
+  WorkCollaborationTarget,
+} from '../repositories/WorkCollaborationRepository';
+import {
+  authorizeWorkCapability,
+  authorizeWorkGraph,
+  type AuthorizedWorkGraph,
+  type ViewerWorkEdge,
+  type ViewerWorkNode,
+  type WorkGraphPolicyScope,
+  type WorkAclTarget,
+  type WorkSourceAclAdapter,
+  type WorkSourceStatus,
+  sourcesForWorkTarget,
+} from './policy';
+import type { WorkGraphCursorCodec } from './cursor';
+
+const MAX_SHARING_MS = 24 * 60 * 60 * 1_000;
+const MAX_HISTORY_MS = 7 * 24 * 60 * 60 * 1_000;
+const MIN_SHARING_MS = 5 * 60 * 1_000;
+const MAX_COLLABORATION_MS = 24 * 60 * 60 * 1_000;
+const CURSOR_LIFETIME_MS = 15 * 60 * 1_000;
+
+export interface AuthenticatedWorkGraphViewer extends WorkSharingViewerContext {
+  organizationId: string;
+}
+
+export interface WorkGraphDirectory {
+  /** Joins an authenticated platform subject to its server-owned account/org. */
+  resolveViewer(subject: string, organizationClaim?: string): Promise<AuthenticatedWorkGraphViewer | null>;
+  /** Re-resolves memberships for a stored platform account during acceptance. */
+  resolveViewerById(organizationId: string, viewerId: string): Promise<AuthenticatedWorkGraphViewer | null>;
+  personBelongsToOrganization(organizationId: string, personId: string): Promise<boolean>;
+  listPeople(organizationId: string): Promise<Array<{
+    personId: string;
+    updatedAt: string;
+    fresh: boolean;
+  }>>;
+  audienceBelongsToOrganization(organizationId: string, ownerId: string, audience: SharingAudience): Promise<boolean>;
+}
+
+export interface WorkGraphStore {
+  loadProjection(organizationId: string, actorId: string, day: string): Promise<WorkProjectionState | null>;
+}
+
+export interface WorkSharingStore {
+  getGrant(organizationId: string, grantId: string, now: string): Promise<StoredWorkGrant | null>;
+  listEffectiveGrants(
+    organizationId: string,
+    ownerId: string,
+    viewer: WorkSharingViewerContext,
+    now: string,
+  ): Promise<StoredWorkGrant[]>;
+  putGrant(grant: StoredWorkGrant, expectedRevision: number | null): Promise<StoredWorkGrant>;
+  /** Required for atomic current+history creation; partial writes are forbidden. */
+  putGrantPair?(
+    current: WorkSharingGrant,
+    history: WorkHistoryGrant,
+  ): Promise<{ current: WorkSharingGrant; history: WorkHistoryGrant }>;
+}
+
+export interface WorkCollaborationStore {
+  getRequest(organizationId: string, requestId: string): Promise<WorkCollaborationRequest | null>;
+  putRequest(
+    request: WorkCollaborationRequest,
+    expectedRevision: number | null,
+  ): Promise<WorkCollaborationRequest>;
+  findAcceptedRequest(
+    organizationId: string,
+    ownerId: string,
+    requesterId: string,
+    target: WorkCollaborationTarget,
+    capability: WorkCollaborationCapability,
+    now: string,
+  ): Promise<WorkCollaborationRequest | null>;
+}
+
+export interface WorkTargetLocator {
+  locate(
+    organizationId: string,
+    target: WorkCollaborationTarget,
+  ): Promise<{ personId: string; day: string; timezone: string } | null>;
+}
+
+export interface CollaborationLifecycleEnforcer {
+  accepted(request: WorkCollaborationRequest): Promise<void>;
+  revoked(request: WorkCollaborationRequest): Promise<void>;
+}
+
+export type WorkGraphActionDescriptor =
+  | { kind: 'route'; capability: WorkCollaborationCapability; path: string }
+  | {
+    kind: 'source-session';
+    capability: 'observe-terminal';
+    sessionId: string;
+    connectPath: string;
+    expiresAt: string;
+  };
+
+export type WorkSourceActionResult =
+  | { decision: 'allow'; descriptor: unknown }
+  | { decision: 'deny' | 'unavailable' };
+
+export interface WorkSourceActionAdapter {
+  readonly source: WorkSourceKind;
+  exchangeAction(
+    scope: WorkGraphPolicyScope,
+    target: WorkAclTarget,
+    capability: WorkCollaborationCapability,
+    acceptedRequest?: WorkCollaborationRequest,
+  ): Promise<WorkSourceActionResult>;
+}
+
+export interface WorkReference {
+  version: 1;
+  personId: string;
+  day: string;
+  timezone: string;
+  sessionId?: string;
+  target: WorkCollaborationTarget;
+  eventId?: string;
+  observedAt?: string;
+}
+
+export interface WorkReferenceResolution {
+  reference: WorkReference;
+  state: 'available' | 'unavailable';
+  node?: ViewerWorkNode;
+  edge?: ViewerWorkEdge;
+}
+
+export interface WorkGraphSnapshot {
+  schemaVersion: 1;
+  scope: {
+    personId: string;
+    day: string;
+    timezone: string;
+    policyRevision: string;
+  };
+  revision: number;
+  watermark: number;
+  cursor: string;
+  nodes: ViewerWorkNode[];
+  edges: ViewerWorkEdge[];
+  sources: WorkSourceStatus[];
+  partial: boolean;
+}
+
+export class WorkGraphInputError extends Error {
+  readonly code = 'WORK_GRAPH_INVALID_REQUEST';
+}
+
+export class WorkGraphUnavailableError extends Error {
+  readonly code = 'WORK_GRAPH_UNAVAILABLE';
+}
+
+export class WorkGraphAuthorizationUnavailableError extends Error {
+  readonly code = 'WORK_GRAPH_AUTHORIZATION_UNAVAILABLE';
+}
+
+export class WorkGraphCapabilityDeniedError extends Error {
+  readonly code = 'WORK_GRAPH_CAPABILITY_DENIED';
+}
+
+export class WorkGraphConflictError extends Error {
+  readonly code = 'WORK_GRAPH_REVISION_CONFLICT';
+}
+
+export interface WorkGraphOrchestratorDependencies {
+  graph: WorkGraphStore;
+  sharing: WorkSharingStore;
+  collaboration: WorkCollaborationStore;
+  directory: WorkGraphDirectory;
+  locator: WorkTargetLocator;
+  collaborationLifecycle: CollaborationLifecycleEnforcer;
+  sourceAcls: ReadonlyMap<WorkSourceKind, WorkSourceAclAdapter>;
+  sourceActions: ReadonlyMap<WorkSourceKind, WorkSourceActionAdapter>;
+  cursorCodec: WorkGraphCursorCodec;
+  policyRevision(scope: Omit<WorkGraphPolicyScope, 'policyRevision'>): Promise<string>;
+  now(): string;
+  id(): string;
+}
+
+export interface CreateGrantInput {
+  audience: SharingAudience;
+  selection: SharingSelection;
+  expiresAt: string;
+  history?: { dayFrom: string; dayThrough: string; expiresAt: string };
+}
+
+export interface UpdateGrantInput {
+  expectedRevision: number;
+  action?: 'pause' | 'resume' | 'stop';
+  audience?: SharingAudience;
+  selection?: SharingSelection;
+  expiresAt?: string;
+}
+
+export interface CreateCollaborationInput {
+  target: WorkCollaborationTarget;
+  capability: WorkCollaborationCapability;
+  expiresAt: string;
+}
+
+function assertDuration(now: string, expiresAt: string, minimum: number, maximum: number): void {
+  const start = Date.parse(now);
+  const end = Date.parse(expiresAt);
+  if (!Number.isFinite(end) || end - start < minimum || end - start > maximum) {
+    throw new WorkGraphInputError('Expiration is outside the allowed range.');
+  }
+}
+
+function appliesToDay(grant: StoredWorkGrant, day: string): boolean {
+  return !('dayFrom' in grant) || (grant.dayFrom <= day && day <= grant.dayThrough);
+}
+
+function unavailable(): WorkGraphUnavailableError {
+  return new WorkGraphUnavailableError('This work item is unavailable.');
+}
+
+function isSafePath(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const hasUnsafeCharacter = [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 32 || code === 127 || /\s/u.test(character);
+  });
+  return !hasUnsafeCharacter
+    && value.length > 0
+    && value.length <= 2_048
+    && value.startsWith('/')
+    && !value.startsWith('//')
+    && !value.includes('\\')
+    && !value.includes('?')
+    && !value.includes('#');
+}
+
+function exactObject(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const own = Reflect.ownKeys(value);
+  const allowed = new Set(keys);
+  return own.length === allowed.size
+    && own.every((key) => typeof key === 'string' && allowed.has(key));
+}
+
+function validateActionDescriptor(
+  value: unknown,
+  capability: WorkCollaborationCapability,
+  now: string,
+): WorkGraphActionDescriptor | null {
+  if (exactObject(value, ['kind', 'capability', 'path'])
+    && value.kind === 'route'
+    && value.capability === capability
+    && isSafePath(value.path)) {
+    return { kind: 'route', capability, path: value.path };
+  }
+  if (exactObject(value, ['kind', 'capability', 'sessionId', 'connectPath', 'expiresAt'])
+    && value.kind === 'source-session'
+    && capability === 'observe-terminal'
+    && value.capability === 'observe-terminal'
+    && typeof value.sessionId === 'string'
+    && value.sessionId.length > 0
+    && value.sessionId.length <= 128
+    && isSafePath(value.connectPath)
+    && typeof value.expiresAt === 'string'
+    && Number.isFinite(Date.parse(value.expiresAt))
+    && new Date(Date.parse(value.expiresAt)).toISOString() === value.expiresAt
+    && Date.parse(value.expiresAt) > Date.parse(now)) {
+    return {
+      kind: 'source-session',
+      capability: 'observe-terminal',
+      sessionId: value.sessionId,
+      connectPath: value.connectPath,
+      expiresAt: value.expiresAt,
+    };
+  }
+  return null;
+}
+
+export class WorkGraphOrchestrator {
+  constructor(private readonly deps: WorkGraphOrchestratorDependencies) {}
+
+  resolveViewer(subject: string, organizationClaim?: string): Promise<AuthenticatedWorkGraphViewer | null> {
+    return this.deps.directory.resolveViewer(subject, organizationClaim);
+  }
+
+  async listPeople(viewer: AuthenticatedWorkGraphViewer): Promise<Array<{
+    personId: string;
+    sharing: 'active' | 'historical';
+    fresh: boolean;
+    updatedAt: string;
+  }>> {
+    const now = this.deps.now();
+    const candidates = await this.deps.directory.listPeople(viewer.organizationId);
+    const summaries = await Promise.all(candidates.map(async (candidate) => {
+      if (candidate.personId === viewer.viewerId) return null;
+      const grants = await this.deps.sharing.listEffectiveGrants(
+        viewer.organizationId,
+        candidate.personId,
+        viewer,
+        now,
+      );
+      const active = grants.filter((grant) => grant.state === 'active' && Date.parse(grant.expiresAt) > Date.parse(now));
+      if (active.length === 0) return null;
+      return {
+        personId: candidate.personId,
+        sharing: active.some((grant) => !('dayFrom' in grant)) ? 'active' as const : 'historical' as const,
+        fresh: candidate.fresh && active.some((grant) => !('dayFrom' in grant)),
+        updatedAt: candidate.updatedAt,
+      };
+    }));
+    return summaries.filter((value): value is NonNullable<typeof value> => value !== null);
+  }
+
+  async getGraph(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    previousCursor?: string,
+  ): Promise<{ snapshot: WorkGraphSnapshot; authorization: AuthorizedWorkGraph }> {
+    if (!await this.deps.directory.personBelongsToOrganization(viewer.organizationId, personId)) throw unavailable();
+    const now = this.deps.now();
+    const scopeBase = {
+      organizationId: viewer.organizationId,
+      viewerId: viewer.viewerId,
+      personId,
+      day,
+      timezone,
+    };
+    const policyRevision = await this.deps.policyRevision(scopeBase);
+    const scope: WorkGraphPolicyScope = { ...scopeBase, policyRevision };
+    if (previousCursor && !this.deps.cursorCodec.verify(previousCursor, scope, now)) {
+      throw new WorkGraphInputError('Cursor is invalid, expired, or belongs to another graph scope.');
+    }
+
+    const projection = await this.deps.graph.loadProjection(viewer.organizationId, personId, day);
+    let grants: StoredWorkGrant[];
+    if (viewer.viewerId === personId) {
+      grants = [this.ownerGrant(viewer, projection, now)];
+    } else {
+      grants = (await this.deps.sharing.listEffectiveGrants(
+        viewer.organizationId,
+        personId,
+        viewer,
+        now,
+      )).filter((grant) => appliesToDay(grant, day));
+      if (grants.length === 0) throw unavailable();
+    }
+
+    const empty: WorkProjectionState = projection ?? {
+      schemaVersion: 1,
+      organizationId: viewer.organizationId,
+      actorId: personId,
+      revision: 0,
+      sessions: {},
+      nodes: {},
+      edges: {},
+      sourceCheckpoints: {},
+      appliedEventIds: [],
+    };
+    const authorization = await authorizeWorkGraph(empty, scope, grants, this.deps.sourceAcls, now);
+    const subscriptionGeneration = this.deps.id();
+    const cursor = this.deps.cursorCodec.issue({
+      schemaVersion: 1,
+      ...scope,
+      watermark: empty.revision,
+      subscriptionGeneration,
+      issuedAt: now,
+      expiresAt: new Date(Date.parse(now) + CURSOR_LIFETIME_MS).toISOString(),
+    });
+    const nodes = authorization.nodes.slice().sort((a, b) => a.id.localeCompare(b.id)).slice(0, 250);
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    const edges = authorization.edges.slice()
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .filter((edge) => nodeIds.has(edge.fromId) && nodeIds.has(edge.toId))
+      .slice(0, 500);
+    return {
+      snapshot: {
+        schemaVersion: 1,
+        scope: { personId, day, timezone, policyRevision },
+        revision: empty.revision,
+        watermark: empty.revision,
+        cursor,
+        nodes,
+        edges,
+        sources: authorization.sources,
+        partial: authorization.partial,
+      },
+      authorization,
+    };
+  }
+
+  async getNode(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    id: string,
+  ): Promise<ViewerWorkNode> {
+    const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone);
+    const node = snapshot.nodes.find((candidate) => candidate.id === id);
+    if (node) return node;
+    if (authorization.unavailableTargetIds.has(id)) {
+      throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+    }
+    throw unavailable();
+  }
+
+  async getEdge(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    id: string,
+  ): Promise<ViewerWorkEdge> {
+    const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone);
+    const edge = snapshot.edges.find((candidate) => candidate.id === id);
+    if (edge) return edge;
+    if (authorization.unavailableTargetIds.has(id)) {
+      throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+    }
+    throw unavailable();
+  }
+
+  async createGrant(
+    viewer: AuthenticatedWorkGraphViewer,
+    input: CreateGrantInput,
+  ): Promise<{ current: WorkSharingGrant; history?: WorkHistoryGrant }> {
+    const now = this.deps.now();
+    assertDuration(now, input.expiresAt, MIN_SHARING_MS, MAX_SHARING_MS);
+    if (!await this.deps.directory.audienceBelongsToOrganization(
+      viewer.organizationId,
+      viewer.viewerId,
+      input.audience,
+    )) throw new WorkGraphInputError('Audience is not available to this account.');
+
+    const currentId = this.deps.id();
+    const historyId = input.history ? this.deps.id() : undefined;
+    const current: WorkSharingGrant = {
+      schemaVersion: 1,
+      id: currentId,
+      organizationId: viewer.organizationId,
+      ownerId: viewer.viewerId,
+      audience: input.audience,
+      selection: input.selection,
+      state: 'active',
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: input.expiresAt,
+      revision: 1,
+      ...(historyId ? { historyGrantId: historyId } : {}),
+    };
+    if (!input.history) {
+      return { current: await this.deps.sharing.putGrant(current, null) as WorkSharingGrant };
+    }
+    assertDuration(now, input.history.expiresAt, MIN_SHARING_MS, MAX_HISTORY_MS);
+    if (input.history.dayFrom > input.history.dayThrough) {
+      throw new WorkGraphInputError('History day range is invalid.');
+    }
+    const dayRangeMs = Date.parse(`${input.history.dayThrough}T00:00:00.000Z`)
+      - Date.parse(`${input.history.dayFrom}T00:00:00.000Z`);
+    if (dayRangeMs >= MAX_HISTORY_MS) throw new WorkGraphInputError('History day range exceeds seven days.');
+    const history: WorkHistoryGrant = {
+      schemaVersion: 1,
+      id: historyId!,
+      organizationId: viewer.organizationId,
+      ownerId: viewer.viewerId,
+      audience: input.audience,
+      selection: input.selection,
+      state: 'active',
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: input.history.expiresAt,
+      revision: 1,
+      dayFrom: input.history.dayFrom,
+      dayThrough: input.history.dayThrough,
+    };
+    if (!this.deps.sharing.putGrantPair) {
+      throw new WorkGraphAuthorizationUnavailableError('Atomic history sharing is not available.');
+    }
+    return this.deps.sharing.putGrantPair(current, history);
+  }
+
+  async updateGrant(
+    viewer: AuthenticatedWorkGraphViewer,
+    grantId: string,
+    input: UpdateGrantInput,
+  ): Promise<StoredWorkGrant> {
+    const now = this.deps.now();
+    const current = await this.deps.sharing.getGrant(viewer.organizationId, grantId, now);
+    if (!current || current.ownerId !== viewer.viewerId) throw unavailable();
+    if (current.revision !== input.expectedRevision) throw new WorkGraphConflictError('Sharing grant revision conflict.');
+    if (input.action && (input.audience || input.selection || input.expiresAt)) {
+      throw new WorkGraphInputError('A lifecycle action cannot be combined with grant edits.');
+    }
+
+    let next: StoredWorkGrant;
+    if (input.action) {
+      if (input.action === 'pause' && current.state !== 'active') throw new WorkGraphInputError('Only an active grant can pause.');
+      if (input.action === 'resume' && current.state !== 'paused') throw new WorkGraphInputError('Only a paused grant can resume.');
+      if (input.action === 'resume' && Date.parse(current.expiresAt) <= Date.parse(now)) throw unavailable();
+      if (input.action === 'stop' && (current.state === 'stopped' || current.state === 'expired')) throw unavailable();
+      next = {
+        ...current,
+        state: input.action === 'pause' ? 'paused' : input.action === 'resume' ? 'active' : 'stopped',
+        updatedAt: now,
+        revision: current.revision + 1,
+      };
+    } else {
+      if (!input.audience && !input.selection && !input.expiresAt) {
+        throw new WorkGraphInputError('At least one grant change is required.');
+      }
+      if (input.audience && !await this.deps.directory.audienceBelongsToOrganization(
+        viewer.organizationId,
+        viewer.viewerId,
+        input.audience,
+      )) throw new WorkGraphInputError('Audience is not available to this account.');
+      if (input.expiresAt) {
+        const maximum = 'dayFrom' in current ? MAX_HISTORY_MS : MAX_SHARING_MS;
+        assertDuration(current.createdAt, input.expiresAt, MIN_SHARING_MS, maximum);
+        if (Date.parse(input.expiresAt) <= Date.parse(now)) throw new WorkGraphInputError('Expiration must be in the future.');
+      }
+      next = {
+        ...current,
+        ...(input.audience ? { audience: input.audience } : {}),
+        ...(input.selection ? { selection: input.selection } : {}),
+        ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+        updatedAt: now,
+        revision: current.revision + 1,
+      };
+    }
+    try {
+      return await this.deps.sharing.putGrant(next, current.revision);
+    } catch (error) {
+      if ((error as { code?: string }).code === 'WORK_SHARING_REVISION_CONFLICT') {
+        throw new WorkGraphConflictError('Sharing grant revision conflict.');
+      }
+      throw error;
+    }
+  }
+
+  async resolveReferences(
+    viewer: AuthenticatedWorkGraphViewer,
+    references: WorkReference[],
+  ): Promise<WorkReferenceResolution[]> {
+    return Promise.all(references.map(async (reference) => {
+      try {
+        const { snapshot } = await this.getGraph(
+          viewer,
+          reference.personId,
+          reference.day,
+          reference.timezone,
+        );
+        if (reference.target.kind === 'node') {
+          const node = snapshot.nodes.find((candidate) => candidate.id === reference.target.id);
+          return node ? { reference, state: 'available' as const, node } : { reference, state: 'unavailable' as const };
+        }
+        const edge = snapshot.edges.find((candidate) => candidate.id === reference.target.id);
+        return edge ? { reference, state: 'available' as const, edge } : { reference, state: 'unavailable' as const };
+      } catch {
+        // Missing, denied, revoked, expired, cross-org, and source outages are
+        // deliberately indistinguishable in a recipient-specific preview.
+        return { reference, state: 'unavailable' as const };
+      }
+    }));
+  }
+
+  async createCollaborationRequest(
+    viewer: AuthenticatedWorkGraphViewer,
+    input: CreateCollaborationInput,
+  ): Promise<WorkCollaborationRequest> {
+    const now = this.deps.now();
+    assertDuration(now, input.expiresAt, 1, MAX_COLLABORATION_MS);
+    const located = await this.deps.locator.locate(viewer.organizationId, input.target);
+    if (!located || located.personId === viewer.viewerId) throw unavailable();
+    const { snapshot, authorization } = await this.getGraph(
+      viewer,
+      located.personId,
+      located.day,
+      located.timezone,
+    );
+    const projected = input.target.kind === 'node'
+      ? snapshot.nodes.find((item) => item.id === input.target.id)
+      : snapshot.edges.find((item) => item.id === input.target.id);
+    if (!projected) {
+      if (authorization.unavailableTargetIds.has(input.target.id)) {
+        throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+      }
+      throw unavailable();
+    }
+    if (!projected.capabilities.includes(input.capability)) {
+      throw new WorkGraphCapabilityDeniedError('The requested collaboration capability is not available.');
+    }
+    const target = authorization.targets.get(input.target.id);
+    if (!target) throw unavailable();
+    const capability = await authorizeWorkCapability(
+      {
+        organizationId: viewer.organizationId,
+        viewerId: viewer.viewerId,
+        personId: located.personId,
+        day: located.day,
+        timezone: located.timezone,
+        policyRevision: snapshot.scope.policyRevision,
+      },
+      target,
+      input.capability,
+      this.deps.sourceAcls,
+    );
+    if (capability === 'unavailable') {
+      throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+    }
+    if (capability !== 'allow') {
+      throw new WorkGraphCapabilityDeniedError('The requested collaboration capability is not available.');
+    }
+    return this.deps.collaboration.putRequest({
+      schemaVersion: 1,
+      id: this.deps.id(),
+      organizationId: viewer.organizationId,
+      requesterId: viewer.viewerId,
+      ownerId: located.personId,
+      target: input.target,
+      capability: input.capability,
+      state: 'requested',
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: input.expiresAt,
+      revision: 1,
+    }, null);
+  }
+
+  async exchangeAction(
+    viewer: AuthenticatedWorkGraphViewer,
+    input: { target: WorkCollaborationTarget; capability: WorkCollaborationCapability },
+  ): Promise<WorkGraphActionDescriptor> {
+    const now = this.deps.now();
+    const located = await this.deps.locator.locate(viewer.organizationId, input.target);
+    if (!located) throw unavailable();
+    const { snapshot, authorization } = await this.getGraph(
+      viewer,
+      located.personId,
+      located.day,
+      located.timezone,
+    );
+    const projected = input.target.kind === 'node'
+      ? snapshot.nodes.find((item) => item.id === input.target.id)
+      : snapshot.edges.find((item) => item.id === input.target.id);
+    if (!projected?.capabilities.includes(input.capability)) {
+      // Action denial is intentionally indistinguishable from a missing or
+      // revoked target; unlike a request composer, this exchanges live access.
+      throw unavailable();
+    }
+    const target = authorization.targets.get(input.target.id);
+    if (!target) throw unavailable();
+    const scope: WorkGraphPolicyScope = {
+      organizationId: viewer.organizationId,
+      viewerId: viewer.viewerId,
+      personId: located.personId,
+      day: located.day,
+      timezone: located.timezone,
+      policyRevision: snapshot.scope.policyRevision,
+    };
+    const capabilityDecision = await authorizeWorkCapability(
+      scope,
+      target,
+      input.capability,
+      this.deps.sourceAcls,
+    );
+    if (capabilityDecision === 'unavailable') {
+      throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+    }
+    if (capabilityDecision !== 'allow') throw unavailable();
+
+    let acceptedRequest: WorkCollaborationRequest | undefined;
+    if (input.capability === 'control-terminal') {
+      acceptedRequest = await this.deps.collaboration.findAcceptedRequest(
+        viewer.organizationId,
+        located.personId,
+        viewer.viewerId,
+        input.target,
+        input.capability,
+        now,
+      ) ?? undefined;
+      if (!acceptedRequest) throw unavailable();
+    }
+
+    const sources = sourcesForWorkTarget(target);
+    // An action must have exactly one authoritative source owner. Cross-source
+    // relationships remain inspectable but cannot mint an ambiguous action.
+    if (sources.length !== 1) throw unavailable();
+    const adapter = this.deps.sourceActions.get(sources[0]);
+    if (!adapter) {
+      throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+    }
+    let result: WorkSourceActionResult;
+    try {
+      result = await adapter.exchangeAction(scope, target, input.capability, acceptedRequest);
+    } catch {
+      throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+    }
+    if (result.decision === 'unavailable') {
+      throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+    }
+    if (result.decision !== 'allow') throw unavailable();
+    const descriptor = validateActionDescriptor(result.descriptor, input.capability, now);
+    if (!descriptor || (descriptor.kind === 'source-session' && descriptor.sessionId === target.id)) {
+      throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+    }
+    return descriptor;
+  }
+
+  async updateCollaborationRequest(
+    viewer: AuthenticatedWorkGraphViewer,
+    requestId: string,
+    input: { expectedRevision: number; action: 'accept' | 'decline' | 'revoke' },
+  ): Promise<WorkCollaborationRequest> {
+    const now = this.deps.now();
+    const current = await this.deps.collaboration.getRequest(viewer.organizationId, requestId);
+    if (!current || (current.ownerId !== viewer.viewerId && current.requesterId !== viewer.viewerId)) throw unavailable();
+    if (current.revision !== input.expectedRevision) throw new WorkGraphConflictError('Collaboration request revision conflict.');
+    if (Date.parse(current.expiresAt) <= Date.parse(now)) {
+      if (current.state !== 'expired' && current.state !== 'revoked' && current.state !== 'declined') {
+        const expired = await this.deps.collaboration.putRequest({
+          ...current,
+          state: 'expired',
+          updatedAt: now,
+          revision: current.revision + 1,
+        }, current.revision);
+        await this.deps.collaborationLifecycle.revoked(expired);
+      }
+      throw unavailable();
+    }
+    if ((input.action === 'accept' || input.action === 'decline') && current.ownerId !== viewer.viewerId) throw unavailable();
+    if (input.action === 'accept' && current.state !== 'requested') throw new WorkGraphConflictError('Collaboration request is no longer pending.');
+    if (input.action === 'decline' && current.state !== 'requested') throw new WorkGraphConflictError('Collaboration request is no longer pending.');
+    if (input.action === 'revoke' && current.state !== 'requested' && current.state !== 'accepted') {
+      throw new WorkGraphConflictError('Collaboration request is no longer revocable.');
+    }
+
+    if (input.action === 'accept') {
+      const located = await this.deps.locator.locate(viewer.organizationId, current.target);
+      if (!located || located.personId !== current.ownerId) throw unavailable();
+      const requester = await this.deps.directory.resolveViewerById(
+        current.organizationId,
+        current.requesterId,
+      );
+      if (!requester
+        || requester.viewerId !== current.requesterId
+        || requester.organizationId !== current.organizationId) throw unavailable();
+      const { snapshot, authorization } = await this.getGraph(
+        requester,
+        located.personId,
+        located.day,
+        located.timezone,
+      );
+      const projected = current.target.kind === 'node'
+        ? snapshot.nodes.find((item) => item.id === current.target.id)
+        : snapshot.edges.find((item) => item.id === current.target.id);
+      if (!projected?.capabilities.includes(current.capability)) {
+        throw new WorkGraphCapabilityDeniedError('The requested collaboration capability is no longer available.');
+      }
+      const target = authorization.targets.get(current.target.id);
+      if (!target) throw unavailable();
+      const decision = await authorizeWorkCapability({
+        organizationId: current.organizationId,
+        viewerId: current.requesterId,
+        personId: current.ownerId,
+        day: located.day,
+        timezone: located.timezone,
+        policyRevision: snapshot.scope.policyRevision,
+      }, target, current.capability, this.deps.sourceAcls);
+      if (decision === 'unavailable') throw new WorkGraphAuthorizationUnavailableError('Work graph authorization is temporarily unavailable.');
+      if (decision !== 'allow') throw new WorkGraphCapabilityDeniedError('The requested collaboration capability is no longer available.');
+    }
+
+    const next: WorkCollaborationRequest = {
+      ...current,
+      state: input.action === 'accept' ? 'accepted' : input.action === 'decline' ? 'declined' : 'revoked',
+      updatedAt: now,
+      revision: current.revision + 1,
+    };
+    let stored: WorkCollaborationRequest;
+    try {
+      stored = await this.deps.collaboration.putRequest(next, current.revision);
+    } catch (error) {
+      if ((error as { code?: string }).code === 'WORK_COLLABORATION_REVISION_CONFLICT') {
+        throw new WorkGraphConflictError('Collaboration request revision conflict.');
+      }
+      throw error;
+    }
+    if (stored.state === 'accepted') await this.deps.collaborationLifecycle.accepted(stored);
+    if (stored.state === 'revoked') await this.deps.collaborationLifecycle.revoked(stored);
+    return stored;
+  }
+
+  private ownerGrant(
+    viewer: AuthenticatedWorkGraphViewer,
+    projection: WorkProjectionState | null,
+    now: string,
+  ): WorkSharingGrant {
+    return {
+      schemaVersion: 1,
+      id: 'owner-self-access',
+      organizationId: viewer.organizationId,
+      ownerId: viewer.viewerId,
+      audience: { kind: 'people', personIds: [viewer.viewerId] },
+      selection: {
+        nodeIds: Object.keys(projection?.nodes ?? {}),
+        edgeIds: Object.keys(projection?.edges ?? {}),
+        disclosure: 'details',
+      },
+      state: 'active',
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: new Date(Date.parse(now) + MAX_SHARING_MS).toISOString(),
+      revision: 1,
+    };
+  }
+}
