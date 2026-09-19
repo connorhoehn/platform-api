@@ -16,7 +16,8 @@ import { chatCommandPluginSpecsFromEnv, createChatCommandPluginContext, loadChat
 import { createBridge } from './pipeline/createBridge';
 import { PipelineRunRepository } from './repositories/PipelineRunRepository';
 import { DLQRepository } from './repositories/DLQRepository';
-import { docClient } from './lib/aws-clients';
+import { ddbClient, docClient } from './lib/aws-clients';
+import { ensureWorkGraphTable } from './lib/work-graph-dynamo';
 import log from './lib/logger';
 import { assertRequiredInProd } from 'distributed-core';
 import { createShutdownManager, drainHttpServer } from '@connorhoehn/service-runtime';
@@ -56,6 +57,15 @@ void assertRequiredInProd(
     logger: log,
   },
 );
+
+// Feature-flagged at startup: the kill switch prevents any new work-graph
+// delivery while preserving private projection/history rows for later resume.
+if (process.env.ACTIVE_NOW_WORK_GRAPH_ENABLED === 'true') {
+  void assertRequiredInProd(
+    { name: 'ddb-work-graph', ping: () => ensureWorkGraphTable(ddbClient) },
+    { requiredEnvVar: 'WORK_GRAPH_DDB_REQUIRED', logger: log },
+  );
+}
 
 // P0 — video/recording secret gate. Without these, the LVS webhook
 // receiver silently accepts unsigned payloads (HMAC verify skipped) and
