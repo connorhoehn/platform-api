@@ -627,6 +627,7 @@ export class RunPersistenceService {
       runId: item.runId,
       status: 'running',
       triggeredBy: item.triggeredBy,
+      organizationId: item.organizationId,
       triggerType: item.triggerType,
       startedAt: item.startedAt,
       steps: { ...(item.stepsSummary ?? {}) },
@@ -709,6 +710,29 @@ export class RunPersistenceService {
    */
   getEventBus(): EventBus<PipelineEventMap> {
     return this.eventBus;
+  }
+
+  /**
+   * Re-enqueue a durable projection transition from an authoritative stored
+   * run. This repairs a prior outbox/catalog outage without accepting an
+   * external replay payload. The projection event key is deterministic, so
+   * normal startup reconciliation is idempotent.
+   */
+  async reconcileWorkGraphRun(item: PipelineRunItem): Promise<void> {
+    if (!item.organizationId || item.triggeredBy === 'system') return;
+    await this.publishWorkGraphLifecycle({
+      pipelineId: item.pipelineId,
+      runId: item.runId,
+      status: item.status,
+      triggeredBy: item.triggeredBy,
+      triggerType: item.triggerType,
+      organizationId: item.organizationId,
+      startedAt: item.startedAt,
+      completedAt: item.completedAt,
+      steps: item.stepsSummary ?? {},
+      tokenUsage: {}, estimatedCostUsd: 0, replayCredits: {}, stepModelMap: {},
+      stepInputMap: {}, stepAttempts: {}, lastEventAt: item.lastEventAt ?? item.completedAt ?? item.startedAt,
+    }, item.lastEventAt ?? item.completedAt ?? item.startedAt);
   }
 
   /**
@@ -1004,6 +1028,7 @@ export class RunPersistenceService {
       runId: state.runId,
       status: state.status,
       triggeredBy: state.triggeredBy,
+      organizationId: state.organizationId,
       triggerType: state.triggerType,
       startedAt: state.startedAt,
       completedAt: state.completedAt,

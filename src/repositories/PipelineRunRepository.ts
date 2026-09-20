@@ -111,6 +111,8 @@ export interface PipelineRunItem {
   /** Canonical run status. `interrupted` and `stuck` are platform-api lifecycle extensions. */
   status: RunItemStatus;
   triggeredBy: string; // userId or 'system'
+  /** Verified organization captured at the authenticated trigger boundary. */
+  organizationId?: string;
   triggerType: string; // 'manual' | 'schedule' | 'webhook' | 'document-event'
   startedAt: string; // ISO timestamp
   completedAt?: string; // ISO timestamp

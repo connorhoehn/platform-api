@@ -994,6 +994,21 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     // pre-populate the run cache before the framework fires events.
     setRunPersistenceService(runPersistence);
 
+    // The pipeline row is authoritative and carries the verified org only on
+    // newly-authenticated runs. Replay its current lifecycle after a catalog
+    // outage/startup; mapper keys make this safe to repeat and rows without a
+    // verified join remain deliberately invisible.
+    void Promise.all([
+      'pending', 'running', 'awaiting_approval', 'paused_at_breakpoint', 'stuck',
+      'completed', 'failed', 'rejected', 'cancelled',
+    ].map((status) => opts.pipelineRunRepository!.listByStatus(status, { limit: 200 })))
+      .then(async (groups) => {
+        for (const item of groups.flat()) await runPersistence!.reconcileWorkGraphRun(item);
+      })
+      .catch((err: unknown) => {
+        logger.warn(`work graph pipeline reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+
     // Hub#1285: detect runs that have gone silent past the stuck threshold.
     stuckRunDetector = new StuckRunDetector({
       runPersistence,
