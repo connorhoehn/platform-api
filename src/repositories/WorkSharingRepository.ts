@@ -1,7 +1,9 @@
 import {
   DynamoDBDocumentClient,
+  GetCommand,
   PutCommand,
   QueryCommand,
+  TransactWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { tableName } from '../lib/ddb-table-name';
 
@@ -321,6 +323,9 @@ export class WorkSharingRepository {
     now: string,
   ): Promise<StoredWorkGrant | null> {
     if (!isId(organizationId) || !isId(grantId) || !isTimestamp(now)) return null;
+    // A DynamoDB GSI is eventually consistent.  It is useful for discovering
+    // the owner partition, but it is not an authorization read: a just-paused
+    // or revoked grant must not be returned from an old index image.
     const response = await this.docClient.send(new QueryCommand({
       TableName: this.table,
       IndexName: WORK_SHARING_GRANT_LOOKUP_INDEX,
@@ -335,7 +340,20 @@ export class WorkSharingRepository {
     // A grant ID is unique within an organization. Ambiguous/corrupt lookup
     // results fail closed instead of selecting an arbitrary owner's row.
     if (!response.Items || response.Items.length !== 1) return null;
-    const grant = this.readStoredGrant(response.Items[0], organizationId, undefined, grantId);
+    const discovered = response.Items[0];
+    if (!isRecord(discovered)
+      || typeof discovered.PK !== 'string'
+      || typeof discovered.SK !== 'string'
+      || discovered.SK !== grantSortKey(grantId)) return null;
+
+    // Re-read the exact primary-key row consistently.  In particular, never
+    // authorize from the stale `grant` blob returned by the lookup GSI.
+    const current = await this.docClient.send(new GetCommand({
+      TableName: this.table,
+      Key: { PK: discovered.PK, SK: discovered.SK },
+      ConsistentRead: true,
+    }));
+    const grant = this.readStoredGrant(current.Item, organizationId, undefined, grantId);
     if (!grant
       || grant.state === 'expired'
       || Date.parse(grant.expiresAt) <= Date.parse(now)) return null;
@@ -364,6 +382,9 @@ export class WorkSharingRepository {
           ':partition': ownerPartition(organizationId, ownerId),
           ':grantPrefix': 'GRANT#',
         },
+        // This is an authorization query on the base table. TTL cleanup is
+        // asynchronous, so effective state is still checked below.
+        ConsistentRead: true,
         ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
       }));
       items.push(...(response.Items ?? []));
@@ -419,6 +440,59 @@ export class WorkSharingRepository {
       throw error;
     }
     return grant;
+  }
+
+  /**
+   * Creates the current grant and its optional historical companion as one
+   * authorization change.  A current row must never point at a history grant
+   * that was not committed (or vice versa), because readers evaluate either
+   * row independently.
+   */
+  async putGrantPair(
+    currentCandidate: WorkSharingGrant,
+    historyCandidate: WorkHistoryGrant,
+  ): Promise<{ current: WorkSharingGrant; history: WorkHistoryGrant }> {
+    const current = parseGrant(currentCandidate);
+    const history = parseGrant(historyCandidate);
+    if (!current || 'dayFrom' in current || !history || !('dayFrom' in history)) {
+      throw new WorkSharingValidationError('Sharing grant pair does not match the frozen contract.');
+    }
+    if (current.revision !== 1
+      || history.revision !== 1
+      || current.organizationId !== history.organizationId
+      || current.ownerId !== history.ownerId
+      || current.historyGrantId !== history.id) {
+      throw new WorkSharingValidationError('Sharing grant pair is not internally consistent.');
+    }
+
+    const itemFor = (grant: StoredWorkGrant): WorkSharingGrantItem => ({
+      PK: ownerPartition(grant.organizationId, grant.ownerId),
+      SK: grantSortKey(grant.id),
+      grantLookupPk: lookupPartition(grant.organizationId),
+      grantLookupSk: grantSortKey(grant.id),
+      entityType: 'work-sharing-grant',
+      ttl: Math.floor(Date.parse(grant.expiresAt) / 1_000),
+      grant,
+    });
+
+    try {
+      await this.docClient.send(new TransactWriteCommand({
+        TransactItems: [current, history].map((grant) => ({
+          Put: {
+            TableName: this.table,
+            Item: itemFor(grant),
+            ConditionExpression: 'attribute_not_exists(PK) AND attribute_not_exists(SK)',
+          },
+        })),
+      }));
+    } catch (error) {
+      if (isConditionalFailure(error)
+        || (error as { name?: string })?.name === 'TransactionCanceledException') {
+        throw new WorkSharingConflictError(current.id, null);
+      }
+      throw error;
+    }
+    return { current, history };
   }
 
   private readStoredGrant(

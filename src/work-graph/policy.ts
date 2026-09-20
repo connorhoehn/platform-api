@@ -10,6 +10,7 @@ import type {
   StoredWorkGrant,
 } from '../repositories/WorkSharingRepository';
 import type { WorkCollaborationCapability } from '../repositories/WorkCollaborationRepository';
+import { filterForViewer } from '@connorhoehn/realtime-modules/work-graph';
 
 export type WorkDisclosure = 'existence' | 'summary' | 'details';
 export type WorkPolicyDecision = 'allow' | 'deny' | 'unavailable';
@@ -103,6 +104,8 @@ export interface AuthorizedWorkGraph {
   unavailableTargetIds: Set<string>;
   /** Internal-only targets retained for capability reauthorization. */
   targets: Map<string, WorkAclTarget>;
+  /** Internal-to-reader ID mapping used only while filtering replay deltas. */
+  publicTargetIds: Map<string, string>;
 }
 
 const DISCLOSURE_RANK: Record<WorkDisclosure, number> = {
@@ -122,7 +125,6 @@ const CAPABILITIES = new Set<WorkCollaborationCapability>([
   'view-run',
   'dispatch-run',
 ]);
-const EXISTENCE_UPDATED_AT = '1970-01-01T00:00:00.000Z';
 
 function minimumDisclosure(left: WorkDisclosure, right: WorkDisclosure): WorkDisclosure {
   return DISCLOSURE_RANK[left] <= DISCLOSURE_RANK[right] ? left : right;
@@ -185,76 +187,40 @@ function selectedTargets(
   return targets;
 }
 
-function viewerNode(
-  node: StoredWorkNode,
-  disclosure: WorkDisclosure,
-  capabilities: WorkCollaborationCapability[],
-  publicId: string,
-): ViewerWorkNode {
-  if (disclosure === 'existence') {
-    return {
-      id: publicId,
-      kind: 'task',
-      title: 'Shared work item',
-      status: 'idle',
-      disclosure,
-      updatedAt: EXISTENCE_UPDATED_AT,
-      capabilities: [],
-      locked: true,
-    };
+function localCalendarDay(now: string, timezone: string): string | null {
+  const timestamp = Date.parse(now);
+  if (!Number.isFinite(timestamp)) return null;
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      calendar: 'gregory',
+      numberingSystem: 'latn',
+    }).formatToParts(new Date(timestamp));
+    const part = (kind: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === kind)?.value;
+    const year = part('year');
+    const month = part('month');
+    const day = part('day');
+    return year && month && day ? `${year}-${month}-${day}` : null;
+  } catch {
+    return null;
   }
-  const base: ViewerWorkNode = {
-    id: publicId,
-    kind: node.kind,
-    title: node.title,
-    status: node.status,
-    disclosure,
-    updatedAt: node.updatedAt,
-    capabilities,
-  };
-  return disclosure === 'details'
-    ? {
-      ...base,
-      ...(node.description ? { description: node.description } : {}),
-      ...(node.startedAt ? { startedAt: node.startedAt } : {}),
-      ...(node.endedAt ? { endedAt: node.endedAt } : {}),
-    }
-    : base;
 }
 
-function viewerEdge(
-  edge: StoredWorkEdge,
-  disclosure: WorkDisclosure,
-  capabilities: WorkCollaborationCapability[],
-  fromId: string,
-  toId: string,
-): ViewerWorkEdge | null {
-  // Relationship existence itself is sensitive; there is no safe fabricated
-  // relation for an existence-only edge.
-  if (disclosure === 'existence') return null;
-  const base: ViewerWorkEdge = {
-    id: edge.id,
-    fromId,
-    toId,
-    relation: edge.relation,
-    status: edge.status,
-    disclosure,
-    updatedAt: edge.updatedAt,
-    capabilities,
-  };
-  return disclosure === 'details'
-    ? {
-      ...base,
-      ...(edge.label ? { label: edge.label } : {}),
-      ...(edge.startedAt ? { startedAt: edge.startedAt } : {}),
-      ...(edge.endedAt ? { endedAt: edge.endedAt } : {}),
-    }
-    : base;
-}
-
-function appliesToDay(grant: StoredWorkGrant, day: string): boolean {
-  if ('dayFrom' in grant) return grant.dayFrom <= day && day <= grant.dayThrough;
-  return true;
+/**
+ * A normal grant is deliberately live-only. Historical disclosure requires
+ * the separate day-bounded companion grant; otherwise a still-active live
+ * opt-in could be replayed against arbitrary old calendar dates.
+ */
+export function grantAppliesToScope(
+  grant: StoredWorkGrant,
+  scope: Pick<WorkGraphPolicyScope, 'day' | 'timezone'>,
+  checkedAt: string,
+): boolean {
+  if ('dayFrom' in grant) return grant.dayFrom <= scope.day && scope.day <= grant.dayThrough;
+  return localCalendarDay(checkedAt, scope.timezone) === scope.day;
 }
 
 /**
@@ -271,14 +237,17 @@ export async function authorizeWorkGraph(
   checkedAt: string,
 ): Promise<AuthorizedWorkGraph> {
   if (projection.organizationId !== scope.organizationId || projection.actorId !== scope.personId) {
-    return { nodes: [], edges: [], sources: [], partial: false, unavailableTargetIds: new Set(), targets: new Map() };
+    return {
+      nodes: [], edges: [], sources: [], partial: false,
+      unavailableTargetIds: new Set(), targets: new Map(), publicTargetIds: new Map(),
+    };
   }
 
   const effective = grants.filter((grant) => grant.organizationId === scope.organizationId
     && grant.ownerId === scope.personId
     && grant.state === 'active'
     && Date.parse(grant.expiresAt) > Date.parse(checkedAt)
-    && appliesToDay(grant, scope.day));
+    && grantAppliesToScope(grant, scope, checkedAt));
 
   const targetGrants = new Map<string, StoredWorkGrant[]>();
   const allTargets = new Map<string, WorkAclTarget>();
@@ -318,11 +287,23 @@ export async function authorizeWorkGraph(
     }
   }));
 
-  const nodes: ViewerWorkNode[] = [];
-  const edges: ViewerWorkEdge[] = [];
-  const publicNodeIds = new Map<string, string>();
+  const nodeDecisions = new Map<string, {
+    targetId: string;
+    decision: 'allow';
+    maximumDisclosure: WorkDisclosure;
+    capabilities: WorkCollaborationCapability[];
+    existenceLabel?: string;
+    policyRevision: string;
+  }>();
+  const edgeDecisions = new Map<string, {
+    targetId: string;
+    decision: 'allow';
+    maximumDisclosure: WorkDisclosure;
+    capabilities: WorkCollaborationCapability[];
+    existenceLabel?: string;
+    policyRevision: string;
+  }>();
   const unavailableTargetIds = new Set<string>();
-  let placeholder = 0;
 
   const authorizeTarget = (target: WorkAclTarget): { disclosure: WorkDisclosure; capabilities: WorkCollaborationCapability[] } | null => {
     const sourceDecisions: WorkSourceAclDecision[] = [];
@@ -362,25 +343,57 @@ export async function authorizeWorkGraph(
   };
 
   for (const target of allTargets.values()) {
-    if (target.kind !== 'node') continue;
     const allowed = authorizeTarget(target);
     if (!allowed) continue;
-    const publicId = allowed.disclosure === 'existence'
-      ? `work_placeholder_${++placeholder}`
-      : target.id;
-    nodes.push(viewerNode(target.node, allowed.disclosure, allowed.capabilities, publicId));
-    publicNodeIds.set(target.id, publicId);
+    const decision = {
+      targetId: target.id,
+      decision: 'allow' as const,
+      maximumDisclosure: allowed.disclosure,
+      capabilities: allowed.capabilities,
+      // The shared library requires a sanitized existence label and owns
+      // placeholder sequencing/collision handling. It never receives a
+      // source label or internal identifier for this disclosure level.
+      ...(allowed.disclosure === 'existence' ? { existenceLabel: 'Shared work item' } : {}),
+      policyRevision: scope.policyRevision,
+    };
+    if (target.kind === 'node') nodeDecisions.set(target.id, decision);
+    else edgeDecisions.set(target.id, decision);
   }
-  for (const target of allTargets.values()) {
-    if (target.kind !== 'edge') continue;
-    const fromId = publicNodeIds.get(target.edge.fromId);
-    const toId = publicNodeIds.get(target.edge.toId);
-    if (!fromId || !toId) continue;
-    const allowed = authorizeTarget(target);
-    if (!allowed) continue;
-    const projected = viewerEdge(target.edge, allowed.disclosure, allowed.capabilities, fromId, toId);
-    if (projected) edges.push(projected);
+
+  // Keep browser DTO construction in the installed shared library. This
+  // avoids a second, subtly divergent placeholder and selection filter in the
+  // HTTP path; the platform supplies only precomputed, source-authorized
+  // allow decisions above.
+  const projected = effective.length === 0
+    ? { nodes: [], edges: [] }
+    : filterForViewer(projection as never, {
+      scope: scope as never,
+      grant: effective[0] as never,
+      nodeDecisions: nodeDecisions as never,
+      edgeDecisions: edgeDecisions as never,
+    });
+  const nodes = projected.nodes as unknown as ViewerWorkNode[];
+  const edges = projected.edges as unknown as ViewerWorkEdge[];
+  const publicTargetIds = new Map<string, string>();
+  const visibleNodeIds = new Set(nodes.map((node) => node.id));
+  for (const [internalId, decision] of nodeDecisions) {
+    if (decision.maximumDisclosure !== 'existence') {
+      if (visibleNodeIds.has(internalId)) publicTargetIds.set(internalId, internalId);
+      continue;
+    }
+    // Ask the same shared projection code for this one decision to obtain its
+    // stable opaque placeholder. This is intentionally not a local hash or
+    // counter: replay must use exactly the library's viewer/query binding.
+    const single = filterForViewer(projection as never, {
+      scope: scope as never,
+      grant: effective[0] as never,
+      nodeDecisions: new Map([[internalId, decision]]) as never,
+      edgeDecisions: new Map() as never,
+    }) as unknown as { nodes: ViewerWorkNode[] };
+    const publicId = single.nodes[0]?.id;
+    if (publicId && visibleNodeIds.has(publicId)) publicTargetIds.set(internalId, publicId);
   }
+  for (const edge of edges) publicTargetIds.set(edge.id, edge.id);
 
   const sources: WorkSourceStatus[] = [...bySource.keys()].sort().map((source) => ({
     source,
@@ -394,6 +407,7 @@ export async function authorizeWorkGraph(
     partial: unavailableSources.size > 0,
     unavailableTargetIds,
     targets: allTargets,
+    publicTargetIds,
   };
 }
 

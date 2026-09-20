@@ -5,6 +5,7 @@ import {
   TransactWriteCommand,
   type TransactWriteCommandInput,
 } from '@aws-sdk/lib-dynamodb';
+import { intervalOverlapsWorkDay, workDayWindow } from '@connorhoehn/realtime-modules/work-graph';
 import { tableName } from '../lib/ddb-table-name';
 
 /**
@@ -217,10 +218,13 @@ export type WorkGraphReducer = (
 
 const WORK_GRAPH_TABLE = tableName('work-graph');
 const EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+const DELTA_RETENTION_SECONDS = 30 * 60;
 const MAX_APPLIED_EVENT_IDS = 1_000;
 const MAX_TRANSACTION_ITEMS = 100;
+const MAX_FENCED_READ_ATTEMPTS = 3;
+export const WORK_GRAPH_TARGET_LOOKUP_INDEX = 'work-graph-target-lookup';
 
-type ItemKind = 'meta' | 'session' | 'node' | 'edge' | 'event';
+type ItemKind = 'meta' | 'session' | 'node' | 'edge' | 'event' | 'delta' | 'outbox';
 
 interface StoredItem extends Record<string, unknown> {
   PK: string;
@@ -239,6 +243,19 @@ interface MetaItem extends StoredItem {
   appliedEventIds: string[];
   erasing?: boolean;
   eraseExpectedRevision?: number;
+}
+
+export type StoredWorkGraphDeltaOperation =
+  | { kind: 'upsert-node'; node: StoredWorkNode }
+  | { kind: 'remove-node'; nodeId: string }
+  | { kind: 'upsert-edge'; edge: StoredWorkEdge }
+  | { kind: 'remove-edge'; edgeId: string };
+
+export interface StoredWorkGraphDeltaBatch {
+  previousWatermark: number;
+  watermark: number;
+  committedAt: string;
+  operations: StoredWorkGraphDeltaOperation[];
 }
 
 /** A caller made a decision against a projection revision that is no longer current. */
@@ -292,7 +309,16 @@ function eventSortKey(event: Pick<AuthenticatedWorkEvent, 'source' | 'eventId'>)
 }
 
 function withoutStorageFields<T extends object>(item: StoredItem): T {
-  const { PK: _pk, SK: _sk, itemKind: _kind, ...value } = item;
+  const {
+    PK: _pk,
+    SK: _sk,
+    itemKind: _kind,
+    day: _day,
+    targetLookupPk: _targetLookupPk,
+    targetLookupSk: _targetLookupSk,
+    targetActorId: _targetActorId,
+    ...value
+  } = item;
   return value as unknown as T;
 }
 
@@ -339,6 +365,9 @@ function assertProjection(
 
 function entityWrites(
   pk: string,
+  organizationId: string,
+  actorId: string,
+  day: string,
   prefix: 'SESSION' | 'NODE' | 'EDGE',
   itemKind: 'session' | 'node' | 'edge',
   before: Record<string, StoredWorkSession | StoredWorkNode | StoredWorkEdge>,
@@ -350,7 +379,20 @@ function entityWrites(
     writes.push({
       Put: {
         TableName: WORK_GRAPH_TABLE,
-        Item: { PK: pk, SK: `${prefix}#${id}`, itemKind, ...value },
+        Item: {
+          PK: pk,
+          SK: `${prefix}#${id}`,
+          itemKind,
+          ...value,
+          ...(itemKind === 'node' || itemKind === 'edge'
+            ? {
+                day,
+                targetLookupPk: `WGTARGET#${organizationId}`,
+                targetLookupSk: `${itemKind.toUpperCase()}#${id}`,
+                targetActorId: actorId,
+              }
+            : {}),
+        },
       },
     });
   }
@@ -359,6 +401,30 @@ function entityWrites(
     writes.push({ Delete: { TableName: WORK_GRAPH_TABLE, Key: { PK: pk, SK: `${prefix}#${id}` } } });
   }
   return writes;
+}
+
+function deltaOperations(
+  before: WorkProjectionState,
+  after: WorkProjectionState,
+): StoredWorkGraphDeltaOperation[] {
+  const operations: StoredWorkGraphDeltaOperation[] = [];
+  for (const [id, node] of Object.entries(after.nodes)) {
+    if (!sameValue(before.nodes[id], node)) operations.push({ kind: 'upsert-node', node });
+  }
+  for (const id of Object.keys(before.nodes)) {
+    if (after.nodes[id] === undefined) operations.push({ kind: 'remove-node', nodeId: id });
+  }
+  for (const [id, edge] of Object.entries(after.edges)) {
+    if (!sameValue(before.edges[id], edge)) operations.push({ kind: 'upsert-edge', edge });
+  }
+  for (const id of Object.keys(before.edges)) {
+    if (after.edges[id] === undefined) operations.push({ kind: 'remove-edge', edgeId: id });
+  }
+  return operations;
+}
+
+function revisionKey(revision: number): string {
+  return String(revision).padStart(12, '0');
 }
 
 /**
@@ -377,8 +443,96 @@ export class WorkGraphRepository {
     day: string,
   ): Promise<WorkProjectionState | null> {
     const pk = partitionKey(organizationId, actorId, day);
-    const items = await this.queryPartition(pk);
-    return this.hydrateProjection(items, organizationId, actorId);
+    // A paginated Query is not a snapshot. Fence it with strongly-consistent
+    // META reads so a browser never receives a mixed revision (which could
+    // otherwise re-introduce an entity that a concurrent revocation removed).
+    for (let attempt = 0; attempt < MAX_FENCED_READ_ATTEMPTS; attempt += 1) {
+      const before = await this.readMeta(pk);
+      if (!before || before.erasing === true) return null;
+      const items = await this.queryPartition(pk);
+      const after = await this.readMeta(pk);
+      if (!after || after.erasing === true) return null;
+      if (before.revision !== after.revision
+        || before.organizationId !== after.organizationId
+        || before.actorId !== after.actorId) continue;
+      const projection = this.hydrateProjection(items, organizationId, actorId);
+      if (projection && projection.revision === after.revision) return projection;
+    }
+    throw new WorkGraphConcurrencyError(-1, 'Work graph projection changed during a paginated read');
+  }
+
+  /**
+   * A local calendar day can cross two UTC partitions. The source projection
+   * remains UTC-sharded for durable ingestion; this bounded read joins only
+   * the UTC days touched by the requested IANA day and filters by the shared
+   * half-open day window. It deliberately does not scan an organization.
+   */
+  async loadProjectionForLocalDay(
+    organizationId: string,
+    actorId: string,
+    day: string,
+    timezone: string,
+  ): Promise<WorkProjectionState | null> {
+    const window = workDayWindow(day, timezone);
+    const startDay = window.start.slice(0, 10);
+    const lastInstant = new Date(Date.parse(window.end) - 1).toISOString().slice(0, 10);
+    const utcDays = startDay === lastInstant ? [startDay] : [startDay, lastInstant];
+    const projections = (await Promise.all(utcDays.map((utcDay) => this.loadProjection(
+      organizationId,
+      actorId,
+      utcDay,
+    )))).filter((projection): projection is WorkProjectionState => projection !== null);
+    if (projections.length === 0) return null;
+
+    const latest = <T extends { id: string; updatedAt: string; revision: number }>(
+      values: T[],
+    ): Record<string, T> => values.reduce<Record<string, T>>((result, value) => {
+      const existing = result[value.id];
+      if (!existing
+        || value.updatedAt > existing.updatedAt
+        || (value.updatedAt === existing.updatedAt && value.revision > existing.revision)) {
+        result[value.id] = value;
+      }
+      return result;
+    }, {});
+    const overlaps = (value: { startedAt?: string; updatedAt: string; endedAt?: string }): boolean => {
+      try {
+        return intervalOverlapsWorkDay(value.startedAt ?? value.updatedAt, value.endedAt, window);
+      } catch {
+        // An invalid stored time cannot be safely positioned in the reader's
+        // calendar day, so fail closed rather than guessing.
+        return false;
+      }
+    };
+    const nodes = latest(projections.flatMap((projection) => Object.values(projection.nodes))
+      .filter((node) => !node.deletedAt && overlaps(node)));
+    const sessions = latest(projections.flatMap((projection) => Object.values(projection.sessions))
+      .filter(overlaps));
+    const edges = latest(projections.flatMap((projection) => Object.values(projection.edges))
+      .filter((edge) => !edge.deletedAt
+        && overlaps(edge)
+        && nodes[edge.fromId] !== undefined
+        && nodes[edge.toId] !== undefined));
+
+    // Each source commit increments exactly one UTC partition by one, so the
+    // sum changes for every committed event in this bounded local view. It is
+    // a read watermark only; replay continues to use its authoritative UTC
+    // partition and must reset/refetch when a cross-partition scope changes.
+    const revision = projections.reduce((total, projection) => total + projection.revision, 0);
+    if (!Number.isSafeInteger(revision)) {
+      throw new WorkGraphDataIntegrityError('local-day projection revision exceeded safe integer range');
+    }
+    return {
+      schemaVersion: 1,
+      organizationId,
+      actorId,
+      revision,
+      sessions,
+      nodes,
+      edges,
+      sourceCheckpoints: Object.assign({}, ...projections.map((projection) => projection.sourceCheckpoints)),
+      appliedEventIds: projections.flatMap((projection) => projection.appliedEventIds).slice(-MAX_APPLIED_EVENT_IDS),
+    };
   }
 
   async commitEvent(
@@ -412,9 +566,9 @@ export class WorkGraphRepository {
     };
 
     const writes: NonNullable<TransactWriteCommandInput['TransactItems']> = [
-      ...entityWrites(pk, 'SESSION', 'session', current.sessions, next.sessions),
-      ...entityWrites(pk, 'NODE', 'node', current.nodes, next.nodes),
-      ...entityWrites(pk, 'EDGE', 'edge', current.edges, next.edges),
+      ...entityWrites(pk, next.organizationId, next.actorId, day, 'SESSION', 'session', current.sessions, next.sessions),
+      ...entityWrites(pk, next.organizationId, next.actorId, day, 'NODE', 'node', current.nodes, next.nodes),
+      ...entityWrites(pk, next.organizationId, next.actorId, day, 'EDGE', 'edge', current.edges, next.edges),
       {
         Put: {
           TableName: WORK_GRAPH_TABLE,
@@ -426,7 +580,23 @@ export class WorkGraphRepository {
             idempotencyKey: event.idempotencyKey,
             source: event.source,
             occurredAt: event.occurredAt,
-            expiresAt: Math.floor(Date.parse(event.receivedAt) / 1_000) + EVENT_RETENTION_SECONDS,
+            ttl: Math.floor(Date.parse(event.receivedAt) / 1_000) + EVENT_RETENTION_SECONDS,
+          },
+          ConditionExpression: 'attribute_not_exists(PK)',
+        },
+      },
+      {
+        Put: {
+          TableName: WORK_GRAPH_TABLE,
+          Item: {
+            PK: pk,
+            SK: `DELTA#${revisionKey(next.revision)}`,
+            itemKind: 'delta',
+            previousWatermark: current.revision,
+            watermark: next.revision,
+            committedAt: event.receivedAt,
+            operations: deltaOperations(current, next),
+            ttl: Math.floor(Date.parse(event.receivedAt) / 1_000) + DELTA_RETENTION_SECONDS,
           },
           ConditionExpression: 'attribute_not_exists(PK)',
         },
@@ -445,7 +615,7 @@ export class WorkGraphRepository {
             revision: next.revision,
             sourceEventId: event.eventId,
             createdAt: event.receivedAt,
-            expiresAt: Math.floor(Date.parse(event.receivedAt) / 1_000) + EVENT_RETENTION_SECONDS,
+            ttl: Math.floor(Date.parse(event.receivedAt) / 1_000) + EVENT_RETENTION_SECONDS,
           },
           ConditionExpression: 'attribute_not_exists(PK)',
         },
@@ -497,6 +667,84 @@ export class WorkGraphRepository {
     }
   }
 
+  async locateTarget(
+    organizationId: string,
+    target: { kind: 'node' | 'edge'; id: string },
+  ): Promise<{ personId: string; day: string; timezone: string } | null> {
+    const result = await this.docClient.send(new QueryCommand({
+      TableName: WORK_GRAPH_TABLE,
+      IndexName: WORK_GRAPH_TARGET_LOOKUP_INDEX,
+      KeyConditionExpression: 'targetLookupPk = :pk AND targetLookupSk = :sk',
+      ExpressionAttributeValues: {
+        ':pk': `WGTARGET#${organizationId}`,
+        ':sk': `${target.kind.toUpperCase()}#${target.id}`,
+      },
+      Limit: 2,
+    }));
+    if (!result.Items || result.Items.length !== 1) return null;
+    const row = result.Items[0] as Record<string, unknown>;
+    return typeof row.targetActorId === 'string'
+      && typeof row.day === 'string'
+      && isCalendarDate(row.day)
+      ? { personId: row.targetActorId, day: row.day, timezone: 'UTC' }
+      : null;
+  }
+
+  async listDeltas(
+    organizationId: string,
+    actorId: string,
+    day: string,
+    afterWatermark: number,
+    throughWatermark: number,
+    limit: number,
+  ): Promise<{ batches: StoredWorkGraphDeltaBatch[]; complete: boolean }> {
+    if (!Number.isSafeInteger(afterWatermark)
+      || !Number.isSafeInteger(throughWatermark)
+      || afterWatermark < 0
+      || throughWatermark < afterWatermark
+      || !Number.isSafeInteger(limit)
+      || limit < 1
+      || limit > 1_000) throw new RangeError('Invalid work graph replay range');
+    if (throughWatermark === afterWatermark) return { batches: [], complete: true };
+
+    const pk = partitionKey(organizationId, actorId, day);
+    const result = await this.docClient.send(new QueryCommand({
+      TableName: WORK_GRAPH_TABLE,
+      KeyConditionExpression: 'PK = :pk AND SK BETWEEN :from AND :through',
+      ExpressionAttributeValues: {
+        ':pk': pk,
+        ':from': `DELTA#${revisionKey(afterWatermark + 1)}`,
+        ':through': `DELTA#${revisionKey(throughWatermark)}`,
+      },
+      ConsistentRead: true,
+      Limit: limit + 1,
+    }));
+    const batches = (result.Items ?? []).slice(0, limit).flatMap((row) => {
+      if (row.itemKind !== 'delta'
+        || !Number.isSafeInteger(row.previousWatermark)
+        || !Number.isSafeInteger(row.watermark)
+        || typeof row.committedAt !== 'string'
+        || !Array.isArray(row.operations)) return [];
+      return [{
+        previousWatermark: Number(row.previousWatermark),
+        watermark: Number(row.watermark),
+        committedAt: row.committedAt,
+        operations: row.operations as StoredWorkGraphDeltaOperation[],
+      }];
+    });
+    let expected = afterWatermark;
+    for (const batch of batches) {
+      if (batch.previousWatermark !== expected || batch.watermark !== expected + 1) {
+        return { batches, complete: false };
+      }
+      expected = batch.watermark;
+    }
+    return {
+      batches,
+      complete: expected === throughWatermark && (result.Items?.length ?? 0) <= limit,
+    };
+  }
+
   async eraseActorDay(
     organizationId: string,
     actorId: string,
@@ -504,8 +752,7 @@ export class WorkGraphRepository {
     expectedRevision: number,
   ): Promise<void> {
     const pk = partitionKey(organizationId, actorId, day);
-    const items = await this.queryPartition(pk);
-    const meta = items.find((item): item is MetaItem => item.SK === 'META' && item.itemKind === 'meta');
+    const meta = await this.readMeta(pk);
     // A retry after the final conditional delete is idempotent regardless of
     // the revision the caller originally erased.
     if (!meta) return;
@@ -543,6 +790,18 @@ export class WorkGraphRepository {
       }
     }
 
+    // Enumerate only after the META lock is committed. A projection commit
+    // writes entities and META together, so the lock prevents any unlisted
+    // entity from racing in between enumeration and deletion.
+    const items = await this.queryPartition(pk);
+    const lockedMeta = items.find((item): item is MetaItem => item.SK === 'META' && item.itemKind === 'meta');
+    if (!lockedMeta
+      || lockedMeta.erasing !== true
+      || lockedMeta.eraseExpectedRevision !== expectedRevision
+      || lockedMeta.revision !== lockedRevision) {
+      throw new WorkGraphConcurrencyError(expectedRevision);
+    }
+
     const keys = items
       .filter((item) => item.SK !== 'META')
       .map((item) => ({ PK: pk, SK: item.SK }));
@@ -578,6 +837,16 @@ export class WorkGraphRepository {
       ConsistentRead: true,
     }));
     return result.Item !== undefined;
+  }
+
+  private async readMeta(pk: string): Promise<MetaItem | null> {
+    const result = await this.docClient.send(new GetCommand({
+      TableName: WORK_GRAPH_TABLE,
+      Key: { PK: pk, SK: 'META' },
+      ConsistentRead: true,
+    }));
+    const item = result.Item as MetaItem | undefined;
+    return item?.itemKind === 'meta' && item.SK === 'META' ? item : null;
   }
 
   private async queryPartition(pk: string): Promise<StoredItem[]> {

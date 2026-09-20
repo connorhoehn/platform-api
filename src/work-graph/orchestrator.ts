@@ -18,6 +18,7 @@ import type {
 import {
   authorizeWorkCapability,
   authorizeWorkGraph,
+  grantAppliesToScope,
   type AuthorizedWorkGraph,
   type ViewerWorkEdge,
   type ViewerWorkNode,
@@ -55,6 +56,13 @@ export interface WorkGraphDirectory {
 
 export interface WorkGraphStore {
   loadProjection(organizationId: string, actorId: string, day: string): Promise<WorkProjectionState | null>;
+  /** Implemented by the durable UTC-sharded repository for IANA-local reads. */
+  loadProjectionForLocalDay?(
+    organizationId: string,
+    actorId: string,
+    day: string,
+    timezone: string,
+  ): Promise<WorkProjectionState | null>;
 }
 
 export interface WorkSharingStore {
@@ -224,10 +232,6 @@ function assertDuration(now: string, expiresAt: string, minimum: number, maximum
   }
 }
 
-function appliesToDay(grant: StoredWorkGrant, day: string): boolean {
-  return !('dayFrom' in grant) || (grant.dayFrom <= day && day <= grant.dayThrough);
-}
-
 function unavailable(): WorkGraphUnavailableError {
   return new WorkGraphUnavailableError('This work item is unavailable.');
 }
@@ -347,17 +351,19 @@ export class WorkGraphOrchestrator {
       throw new WorkGraphInputError('Cursor is invalid, expired, or belongs to another graph scope.');
     }
 
-    const projection = await this.deps.graph.loadProjection(viewer.organizationId, personId, day);
+    const projection = this.deps.graph.loadProjectionForLocalDay
+      ? await this.deps.graph.loadProjectionForLocalDay(viewer.organizationId, personId, day, timezone)
+      : await this.deps.graph.loadProjection(viewer.organizationId, personId, day);
     let grants: StoredWorkGrant[];
     if (viewer.viewerId === personId) {
-      grants = [this.ownerGrant(viewer, projection, now)];
+      grants = [this.ownerGrant(viewer, projection, now, day)];
     } else {
       grants = (await this.deps.sharing.listEffectiveGrants(
         viewer.organizationId,
         personId,
         viewer,
         now,
-      )).filter((grant) => appliesToDay(grant, day));
+      )).filter((grant) => grantAppliesToScope(grant, { day, timezone }, now));
       if (grants.length === 0) throw unavailable();
     }
 
@@ -810,7 +816,8 @@ export class WorkGraphOrchestrator {
     viewer: AuthenticatedWorkGraphViewer,
     projection: WorkProjectionState | null,
     now: string,
-  ): WorkSharingGrant {
+    day: string,
+  ): WorkHistoryGrant {
     return {
       schemaVersion: 1,
       id: 'owner-self-access',
@@ -827,6 +834,11 @@ export class WorkGraphOrchestrator {
       updatedAt: now,
       expiresAt: new Date(Date.parse(now) + MAX_SHARING_MS).toISOString(),
       revision: 1,
+      // Self-access is not a persisted live grant. Bound the synthetic grant
+      // to the requested day so the same live-only rule cannot accidentally
+      // hide the owner's own historical graph.
+      dayFrom: day,
+      dayThrough: day,
     };
   }
 }

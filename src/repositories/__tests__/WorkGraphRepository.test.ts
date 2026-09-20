@@ -96,26 +96,33 @@ describe('WorkGraphRepository', () => {
       .find((command): command is TransactWriteCommand => command instanceof TransactWriteCommand);
     expect(transaction).toBeDefined();
     const writes = transaction!.input.TransactItems!;
-    expect(writes).toHaveLength(4);
+    expect(writes).toHaveLength(5);
     expect(writes.map((write) => write.Put?.Item?.['SK'])).toEqual([
       'NODE#node-1',
       'EVENT#pipeline#evt-1',
+      'DELTA#000000000001',
       'OUTBOX#000000000001#evt-1',
       'META',
     ]);
     const eventPut = writes[1].Put!;
     expect(eventPut.ConditionExpression).toBe('attribute_not_exists(PK)');
-    expect(eventPut.Item?.['expiresAt']).toBe(
+    expect(eventPut.Item?.['ttl']).toBe(
       Math.floor(Date.parse(event.receivedAt) / 1_000) + 30 * 24 * 60 * 60,
     );
     expect(writes[2].Put?.ConditionExpression).toBe('attribute_not_exists(PK)');
     expect(writes[2].Put?.Item).toMatchObject({
+      previousWatermark: 0,
+      watermark: 1,
+      operations: [{ kind: 'upsert-node', node: expect.objectContaining({ id: 'node-1' }) }],
+    });
+    expect(writes[3].Put?.ConditionExpression).toBe('attribute_not_exists(PK)');
+    expect(writes[3].Put?.Item).toMatchObject({
       eventType: 'work-graph.projection.changed.v1',
       organizationId: 'org-1',
       actorId: 'actor-1',
       revision: 1,
     });
-    expect(writes[3].Put?.Item).toMatchObject({
+    expect(writes[4].Put?.Item).toMatchObject({
       PK: 'WG#org-1#actor-1#2026-09-20',
       revision: 1,
       sourceCheckpoints: { pipeline: '42' },
@@ -125,6 +132,7 @@ describe('WorkGraphRepository', () => {
 
   it('reconstructs a complete projection across query pages after restart', async () => {
     const send: Send = jest.fn()
+      .mockResolvedValueOnce({ Item: meta() })
       .mockResolvedValueOnce({
         Items: [meta(), {
           PK: 'WG#org-1#actor-1#2026-09-20',
@@ -148,7 +156,8 @@ describe('WorkGraphRepository', () => {
           fromId: 'node-1',
           toId: 'node-2',
         }],
-      });
+      })
+      .mockResolvedValueOnce({ Item: meta() });
 
     const restartedRepository = new WorkGraphRepository(client(send), reducer);
     const state = await restartedRepository.loadProjection('org-1', 'actor-1', '2026-09-20');
@@ -156,17 +165,108 @@ describe('WorkGraphRepository', () => {
     expect(state).toMatchObject({ revision: 1, sourceCheckpoints: { pipeline: '42' } });
     expect(Object.keys(state!.nodes)).toEqual(['node-1']);
     expect(Object.keys(state!.edges)).toEqual(['edge-1']);
-    const secondQuery = send.mock.calls[1][0] as QueryCommand;
+    const secondQuery = send.mock.calls.map(([command]) => command)
+      .filter((command): command is QueryCommand => command instanceof QueryCommand)[1];
     expect(secondQuery.input.ExclusiveStartKey).toEqual({
       PK: 'WG#org-1#actor-1#2026-09-20',
       SK: 'NODE#node-1',
     });
   });
 
+  it('retries a paginated read when its META revision changes mid-read', async () => {
+    const metaTwo = { ...meta(2), sourceCheckpoints: { pipeline: '43' } };
+    let getCount = 0;
+    let queryCount = 0;
+    const send: Send = jest.fn(async (command: unknown) => {
+      if (command instanceof GetCommand) {
+        getCount += 1;
+        return { Item: getCount === 1 ? meta(1) : metaTwo };
+      }
+      if (command instanceof QueryCommand) {
+        queryCount += 1;
+        return queryCount === 1
+          ? { Items: [meta(1), {
+            PK: 'WG#org-1#actor-1#2026-09-20', SK: 'NODE#old', itemKind: 'node',
+            id: 'old', organizationId: 'org-1', actorId: 'actor-1', updatedAt: '2026-09-20T00:00:00.000Z',
+          }] }
+          : { Items: [metaTwo, {
+            PK: 'WG#org-1#actor-1#2026-09-20', SK: 'NODE#new', itemKind: 'node',
+            id: 'new', organizationId: 'org-1', actorId: 'actor-1', updatedAt: '2026-09-20T01:00:00.000Z',
+          }] };
+      }
+      return {};
+    });
+    const repository = new WorkGraphRepository(client(send), reducer);
+
+    await expect(repository.loadProjection('org-1', 'actor-1', '2026-09-20')).resolves.toMatchObject({
+      revision: 2,
+      nodes: { new: expect.any(Object) },
+    });
+    expect(queryCount).toBe(2);
+  });
+
+  it('joins only the UTC partitions overlapping an IANA local day', async () => {
+    const itemFor = (day: string, revision: number, nodes: Array<Record<string, unknown>>) => [
+      {
+        ...meta(revision),
+        PK: `WG#org-1#actor-1#${day}`,
+        day,
+      },
+      ...nodes.map((node) => ({
+        PK: `WG#org-1#actor-1#${day}`,
+        SK: `NODE#${node.id}`,
+        itemKind: 'node',
+        organizationId: 'org-1',
+        actorId: 'actor-1',
+        ...node,
+      })),
+    ];
+    const rows = new Map([
+      ['2026-09-20', itemFor('2026-09-20', 2, [
+        {
+          id: 'before-local-day', startedAt: '2026-09-20T03:30:00.000Z',
+          updatedAt: '2026-09-20T03:30:00.000Z', endedAt: '2026-09-20T04:00:00.000Z',
+        },
+        { id: 'inside-first-utc-day', updatedAt: '2026-09-20T04:30:00.000Z' },
+      ])],
+      ['2026-09-21', itemFor('2026-09-21', 3, [
+        { id: 'inside-second-utc-day', updatedAt: '2026-09-21T03:30:00.000Z' },
+      ])],
+    ]);
+    const send: Send = jest.fn(async (command: unknown) => {
+      const pk = command instanceof GetCommand
+        ? String(command.input.Key?.['PK'])
+        : command instanceof QueryCommand
+          ? String(command.input.ExpressionAttributeValues?.[':pk'])
+          : '';
+      const day = pk.slice(-10);
+      const items = rows.get(day) ?? [];
+      if (command instanceof GetCommand) return { Item: items[0] };
+      if (command instanceof QueryCommand) return { Items: items };
+      return {};
+    });
+    const repository = new WorkGraphRepository(client(send), reducer);
+
+    const state = await repository.loadProjectionForLocalDay(
+      'org-1', 'actor-1', '2026-09-20', 'America/New_York',
+    );
+    expect(Object.keys(state!.nodes).sort()).toEqual([
+      'inside-first-utc-day',
+      'inside-second-utc-day',
+    ]);
+    expect(state!.revision).toBe(5);
+  });
+
   it('returns the durable state for a duplicate event without reducing or writing', async () => {
     const reduce = jest.fn(reducer);
+    let getCount = 0;
     const send: Send = jest.fn(async (command: unknown) => {
-      if (command instanceof GetCommand) return { Item: { PK: 'p', SK: 'EVENT#pipeline#evt-1' } };
+      if (command instanceof GetCommand) {
+        getCount += 1;
+        return getCount === 1
+          ? { Item: { PK: 'p', SK: 'EVENT#pipeline#evt-1' } }
+          : { Item: meta() };
+      }
       if (command instanceof QueryCommand) return { Items: [meta()] };
       throw new Error('duplicate must not write');
     });
@@ -204,8 +304,12 @@ describe('WorkGraphRepository', () => {
 
   it('bounds the persisted applied event IDs', async () => {
     const manyIds = Array.from({ length: 1_000 }, (_, index) => `old-${index}`);
+    let getCount = 0;
     const send: Send = jest.fn(async (command: unknown) => {
-      if (command instanceof GetCommand) return {};
+      if (command instanceof GetCommand) {
+        getCount += 1;
+        return getCount === 1 ? {} : { Item: { ...meta(4), appliedEventIds: manyIds } };
+      }
       if (command instanceof QueryCommand) return { Items: [{ ...meta(4), appliedEventIds: manyIds }] };
       return {};
     });
@@ -220,7 +324,7 @@ describe('WorkGraphRepository', () => {
 
   it('locks, paginates, and conditionally erases the entire actor/day partition', async () => {
     const pageOne = [
-      meta(7),
+      { ...meta(8), erasing: true, eraseExpectedRevision: 7 },
       { PK: 'p', SK: 'NODE#one', itemKind: 'node' },
     ];
     const pageTwo = [
@@ -229,6 +333,7 @@ describe('WorkGraphRepository', () => {
     ];
     let queryCount = 0;
     const send: Send = jest.fn(async (command: unknown) => {
+      if (command instanceof GetCommand) return { Item: meta(7) };
       if (command instanceof QueryCommand) {
         queryCount += 1;
         return queryCount === 1
@@ -257,23 +362,33 @@ describe('WorkGraphRepository', () => {
   });
 
   it('keeps organizations in distinct partitions and rejects crossed stored data', async () => {
-    const send: Send = jest.fn()
-      .mockResolvedValueOnce({ Items: [] })
-      .mockResolvedValueOnce({ Items: [{ ...meta(1, 'org-1'), PK: 'WG#org-2#actor-1#2026-09-20' }] });
+    let getCount = 0;
+    const send: Send = jest.fn(async (command: unknown) => {
+      if (command instanceof GetCommand) {
+        getCount += 1;
+        if (getCount === 1) return {};
+        return { Item: { ...meta(1, 'org-1'), PK: 'WG#org-2#actor-1#2026-09-20' } };
+      }
+      if (command instanceof QueryCommand) {
+        return { Items: [{ ...meta(1, 'org-1'), PK: 'WG#org-2#actor-1#2026-09-20' }] };
+      }
+      return {};
+    });
     const repository = new WorkGraphRepository(client(send), reducer);
 
     await expect(repository.loadProjection('org-1', 'actor-1', '2026-09-20')).resolves.toBeNull();
     await expect(repository.loadProjection('org-2', 'actor-1', '2026-09-20'))
       .rejects.toBeInstanceOf(WorkGraphDataIntegrityError);
-    const keys = send.mock.calls.map(([command]) => (command as QueryCommand).input.ExpressionAttributeValues?.[':pk']);
-    expect(keys).toEqual([
-      'WG#org-1#actor-1#2026-09-20',
-      'WG#org-2#actor-1#2026-09-20',
-    ]);
+    const keys = send.mock.calls.map(([command]) => command)
+      .filter((command): command is QueryCommand => command instanceof QueryCommand)
+      .map((command) => command.input.ExpressionAttributeValues?.[':pk']);
+    expect(keys).toEqual(['WG#org-2#actor-1#2026-09-20']);
   });
 
   it('rejects an erase at a stale revision before issuing any delete', async () => {
-    const send: Send = jest.fn().mockResolvedValue({ Items: [meta(3)] });
+    const send: Send = jest.fn(async (command: unknown) => command instanceof GetCommand
+      ? { Item: meta(3) }
+      : {});
     const repository = new WorkGraphRepository(client(send), reducer);
 
     await expect(repository.eraseActorDay('org-1', 'actor-1', '2026-09-20', 2))
@@ -282,7 +397,7 @@ describe('WorkGraphRepository', () => {
   });
 
   it('treats an erase retry after the partition is gone as success', async () => {
-    const send: Send = jest.fn().mockResolvedValue({ Items: [] });
+    const send: Send = jest.fn().mockResolvedValue({});
     const repository = new WorkGraphRepository(client(send), reducer);
 
     await expect(repository.eraseActorDay('org-1', 'actor-1', '2026-09-20', 7))

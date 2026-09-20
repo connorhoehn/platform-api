@@ -1,5 +1,6 @@
 import {
   DynamoDBDocumentClient,
+  GetCommand,
   PutCommand,
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
@@ -52,7 +53,7 @@ interface MemoryClient {
 
 function createMemoryClient(): MemoryClient {
   const rows = new Map<string, Record<string, unknown>>();
-  const send = jest.fn(async (command: PutCommand | QueryCommand) => {
+  const send = jest.fn(async (command: PutCommand | QueryCommand | GetCommand) => {
     if (command instanceof PutCommand) {
       const input = command.input;
       const item = input.Item as Record<string, unknown>;
@@ -79,6 +80,11 @@ function createMemoryClient(): MemoryClient {
         return { Items: matches.slice(0, command.input.Limit) };
       }
       return { Items: all.filter((item) => item['PK'] === values[':partition']) };
+    }
+
+    if (command instanceof GetCommand) {
+      const key = `${String(command.input.Key?.['PK'])}|${String(command.input.Key?.['SK'])}`;
+      return { Item: rows.get(key) };
     }
 
     throw new Error('Unexpected DynamoDB command.');
@@ -247,13 +253,14 @@ describe('WorkSharingRepository', () => {
     expect(effective[0]).toMatchObject({ dayFrom: '2026-09-17', dayThrough: '2026-09-19' });
   });
 
-  it('uses the organization-scoped GSI for id lookup and rejects ambiguous results', async () => {
+  it('uses the GSI only to discover a key, then authorizes from a consistent base read', async () => {
     const memory = createMemoryClient();
     const repository = new WorkSharingRepository(memory.client, 'test-work-graph');
     await repository.putGrant(liveGrant(), null);
     await repository.getGrant('org-1', 'grant-1', NOW);
 
-    const lookup = memory.send.mock.calls.at(-1)?.[0] as QueryCommand;
+    const lookup = memory.send.mock.calls.map(([command]) => command)
+      .find((command): command is QueryCommand => command instanceof QueryCommand)!;
     expect(lookup.input).toMatchObject({
       TableName: 'test-work-graph',
       IndexName: 'work-graph-grant-lookup',
@@ -264,10 +271,41 @@ describe('WorkSharingRepository', () => {
       },
       Limit: 2,
     });
+    const baseRead = memory.send.mock.calls.map(([command]) => command)
+      .find((command): command is GetCommand => command instanceof GetCommand)!;
+    expect(baseRead.input).toMatchObject({
+      TableName: 'test-work-graph',
+      Key: { PK: 'WGGRANT#org-1#owner-1', SK: 'GRANT#grant-1' },
+      ConsistentRead: true,
+    });
 
     const existing = [...memory.rows.values()][0];
     memory.rows.set('duplicate', { ...existing });
     await expect(repository.getGrant('org-1', 'grant-1', NOW)).resolves.toBeNull();
+  });
+
+  it('does not authorize an active GSI image after the base grant was paused', async () => {
+    const memory = createMemoryClient();
+    const repository = new WorkSharingRepository(memory.client, 'test-work-graph');
+    await repository.putGrant(liveGrant(), null);
+    const stale = [...memory.rows.values()][0];
+    const current = { ...stale };
+    current['grant'] = {
+      ...(current['grant'] as WorkSharingGrant),
+      state: 'paused',
+      revision: 2,
+      updatedAt: '2026-09-19T12:10:00.000Z',
+    } satisfies WorkSharingGrant;
+
+    memory.send.mockImplementation(async (command: PutCommand | QueryCommand | GetCommand) => {
+      if (command instanceof QueryCommand) return { Items: [stale] };
+      if (command instanceof GetCommand) return { Item: current };
+      throw new Error('unexpected write');
+    });
+    await expect(repository.getGrant('org-1', 'grant-1', NOW)).resolves.toMatchObject({
+      state: 'paused',
+      revision: 2,
+    });
   });
 
   it('never returns unknown persisted properties', async () => {
