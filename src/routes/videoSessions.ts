@@ -30,7 +30,7 @@ import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { requireAuth, optionalAuth } from '../middleware/auth';
 import { VIDEO_API_URL } from '../lib/video-auth';
-import { videoSessionRepo, callReactionRepo, profileRepo } from '../repositories';
+import { videoSessionRepo, callReactionRepo, profileRepo, workSourceAccountRepo } from '../repositories';
 import { decideRecording } from '../recordings/recordingDecision';
 import { VideoSessionRecord } from '../repositories/VideoSessionRepository';
 import {
@@ -214,6 +214,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     const lobbyName = resolveLobbyName(body) ?? randomUUID();
     const findOrCreate = body.findOrCreate === true;
     const userId = req.user!.sub;
+    const organizationId = req.user!.orgId;
 
     // recordingConfiguration: hangoutRooms.ts's /join forwards
     // `room.settings.recordingEnabled`; DM/global calls default to enabled
@@ -379,12 +380,18 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       status: 'active',
       startedAt: now,
       startedBy: userId,
+      ...(organizationId ? { orgId: organizationId } : {}),
       participants: [],
       recording: recordingDecision,
     };
 
     try {
       await videoSessionRepo.createSession(record);
+      if (organizationId) {
+        await workSourceAccountRepo.ensureVerifiedPrincipal({
+          source: 'meeting', organizationId, subject: userId,
+        });
+      }
       log.info({ sessionId, lobbyName, channelArn, reused, recording: recordingDecision }, '[videoSessions] DDB row written');
 
       // Close out this lobby's PREVIOUS active rows, which are now provably

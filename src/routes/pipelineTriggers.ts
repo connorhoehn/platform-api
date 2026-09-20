@@ -24,6 +24,7 @@ import { runItemToSnapshot } from '../pipeline/createBridge';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
 import { getDynamoClient } from '../lib/ddb-client';
 import { pipelineRunReviewRouter } from './pipelineRunReview';
+import { workSourceAccountRepo } from '../repositories';
 
 export { classifyPipelineError, type ErrorCategory };
 export {
@@ -208,12 +209,23 @@ pipelineTriggersRouter.post(
     async (req, res) => {
       const { pipelineId } = req.params;
       const userId = req.user!.sub;
+      const organizationId = req.user!.orgId;
       const body = (req.body ?? {}) as TriggerRunRequest;
       const reqLog = log.child({
         correlationId: getCorrelationId(),
         userId,
         pipelineId,
       });
+
+      // Establish a create-only source account join before the executor can
+      // publish its first lifecycle transition. `organizationId` is a
+      // verified JWT claim; absent org claims deliberately leave this source
+      // unprojected rather than inventing a shared/default organization.
+      if (organizationId) {
+        await workSourceAccountRepo.ensureVerifiedPrincipal({
+          source: 'pipeline', organizationId, subject: userId,
+        });
+      }
 
       if (body.definition && body.definition.id !== pipelineId) {
         throw new ValidationError(
@@ -262,6 +274,7 @@ pipelineTriggersRouter.post(
             userId,
             triggerType: 'manual',
             at: new Date().toISOString(),
+            ...(organizationId ? { organizationId } : {}),
           });
         } catch (err) {
           respondBridgeError({

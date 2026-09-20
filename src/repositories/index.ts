@@ -24,6 +24,7 @@ import { TeamRepository } from './TeamRepository';
 import { ChangeVerdictRepository } from './ChangeVerdictRepository';
 import { CallLogRepository } from './CallLogRepository';
 import { VoicemailRepository } from './VoicemailRepository';
+import { WorkSourceAccountRepository } from './WorkSourceAccountRepository';
 
 // Singleton instances — share the same docClient across all repositories
 export const profileRepo = new ProfileRepository(docClient);
@@ -45,6 +46,7 @@ export const approvalRepo = new ApprovalRepository(docClient);
 export const pipelineRunRepo = new PipelineRunRepository(docClient);
 export const callRecordingRepo = new CallRecordingRepository(docClient);
 export const callReactionRepo = new CallReactionRepository(docClient);
+export const workSourceAccountRepo = new WorkSourceAccountRepository(docClient);
 export const mediaCatalogRepo = new MediaCatalogRepository(docClient);
 export const hangoutRoomRepo = new HangoutRoomRepository(docClient);
 export const hangoutRoomMemberRepo = new HangoutRoomMemberRepository(docClient);
@@ -54,6 +56,8 @@ export const changeVerdictRepo = new ChangeVerdictRepository(docClient);
 export { BaseRepository } from './BaseRepository';
 export * from './WorkGraphRepository';
 export * from './WorkSharingRepository';
+export * from './WorkCollaborationRepository';
+export * from './WorkSourceAccountRepository';
 export { ProfileRepository, ProfileItem } from './ProfileRepository';
 export { RoomRepository, RoomItem, RoomMemberItem } from './RoomRepository';
 export { GroupRepository, GroupItem, GroupMemberItem } from './GroupRepository';

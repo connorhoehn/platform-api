@@ -39,6 +39,7 @@ import { tableName } from '../lib/ddb-table-name';
 import { ddbClient } from '../lib/aws-clients';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
+import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platformPublisher';
 import { postChatMessage, PIPELINE_IDENTITY } from '../gateway/GatewayServiceClient';
 import { VIDEO_PUBLIC_URL } from '../lib/video-auth';
 import { DOCUMENT_APPLY_KIND } from '../documents/documentAgentPipeline';
@@ -294,7 +295,7 @@ function resolveHandler(): DescribedStepHandler {
         const ids = lobbyName.slice(3).split(':').filter(Boolean);
         if (ids.length >= 2) participants = ids.map((userId) => ({ userId }));
       }
-      return ok({ lobbyName, callId, sessionId: session?.sessionId ?? null, startedBy: session?.startedBy ?? participants[0]?.userId ?? null, participants, chatChannel: chatChannelForLobby(lobbyName), documentId: documentIdForLobby(lobbyName) });
+      return ok({ lobbyName, callId, sessionId: session?.sessionId ?? null, startedBy: session?.startedBy ?? participants[0]?.userId ?? null, organizationId: session?.orgId ?? null, participants, chatChannel: chatChannelForLobby(lobbyName), documentId: documentIdForLobby(lobbyName) });
     },
   };
 }
@@ -324,9 +325,29 @@ function persistHandler(): DescribedStepHandler {
         segments: Array.isArray(detail.segments) ? detail.segments : [],
         destination: detail.destination === 's3' ? 's3' : 'local',
         participants: reconciled.participants, participantCount: reconciled.participantCount, startedBy,
+        ...(str(ctx.organizationId) ? { orgId: str(ctx.organizationId) } : {}),
         thumbnailUrl: str(detail.thumbnailUrl), composedUrl: str(detail.composedUrl), tracks: rawTracks.length ? (rawTracks as unknown as CallRecording['tracks']) : undefined,
       });
-      return ok({ startedAt, endedAt, mediaDurationMs, participantCount: reconciled.participantCount });
+      // Only an organization captured in the authenticated session row can
+      // produce activity. Legacy/LVS-only rows intentionally remain private.
+      const organizationId = str(ctx.organizationId);
+      if (organizationId && startedBy) {
+        const publication = await platformWorkGraphSourcePublisher.meeting({
+          kind: 'recording',
+          meetingId: str(ctx.callId)!,
+          recordingId,
+          recordingOwnerId: startedBy,
+          eventType: 'sfu.recording.completed',
+          organizationId,
+          participantSubject: startedBy,
+          occurredAt: endedAt,
+          sourceSequence: `recording-ready:${recordingId}:${endedAt}`,
+        }, { organizationId, sourceSubject: startedBy });
+        if (!publication.published) {
+          log.warn({ recordingId, reason: publication.reason }, '[recording-pipeline] work graph recording lifecycle denied');
+        }
+      }
+      return ok({ startedAt, endedAt, mediaDurationMs, participantCount: reconciled.participantCount, startedBy, organizationId });
     },
   };
 }
@@ -603,6 +624,16 @@ function storeHandler(): DescribedStepHandler {
       // The summary is the next two steps' business; say it is underway so a
       // reader can tell "not yet" from "this row predates the summary".
       await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', transcriptKey: 'inline', transcriptJson: json, summaryStatus: 'pending' } as never);
+      const organizationId = str(ctx.organizationId);
+      const startedBy = str(ctx.startedBy);
+      if (organizationId && startedBy) {
+        const publication = await platformWorkGraphSourcePublisher.meeting({
+          kind: 'transcript', meetingId: callId, recordingId, recordingOwnerId: startedBy,
+          status: 'ready', organizationId, participantSubject: startedBy,
+          occurredAt: new Date().toISOString(), sourceSequence: `transcript-ready:${recordingId}`,
+        }, { organizationId, sourceSubject: startedBy });
+        if (!publication.published) log.warn({ recordingId, reason: publication.reason }, '[recording-pipeline] work graph transcript lifecycle denied');
+      }
       const text = transcriptText(transcript.segments);
       // `transcriptOps` is what the shared document:apply step writes; the
       // store-summary step puts the summary in front of it when there is one.

@@ -38,6 +38,7 @@ import {
 } from '../repositories/PipelineRunRepository';
 import { withContext } from '../lib/logger';
 import { computeCost } from './llm-pricing';
+import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platformPublisher';
 
 const log = withContext({ service: 'runPersistence' });
 
@@ -71,6 +72,8 @@ interface RunState {
   status: RunItemStatus;
   triggeredBy: string;
   triggerType: string;
+  /** Verified JWT organization captured by the authenticated trigger path. */
+  organizationId?: string;
   startedAt: string;
   completedAt?: string;
   steps: Record<string, StepSummary>;
@@ -285,6 +288,7 @@ export class RunPersistenceService {
     // recognisable here for every caller — including ones that never call
     // registerTrigger. A registerTrigger that already named it wins.
     const redriveOf = this.runCache.get(event.runId)?.redriveOf ?? redriveOfFromPayload(event.triggeredBy.payload);
+    const registered = this.runCache.get(event.runId);
     const state: RunState = {
       pipelineId: event.pipelineId,
       runId: event.runId,
@@ -300,11 +304,13 @@ export class RunPersistenceService {
       stepInputMap: {},
       stepAttempts: {},
       lastEventAt: event.at,
+      ...(registered?.organizationId ? { organizationId: registered.organizationId } : {}),
       ...(redriveOf ? { redriveOf } : {}),
     };
 
     this.runCache.set(event.runId, state);
     await this.persistRun(state);
+    await this.publishWorkGraphLifecycle(state, event.at);
   }
 
   private touchLastEvent(runId: string, at: string): void {
@@ -660,6 +666,8 @@ export class RunPersistenceService {
     userId: string;
     triggerType: string;
     at: string;
+    /** Captured from verified request auth; absent system triggers fail closed. */
+    organizationId?: string;
     /** The failed run this one replaces, when the trigger is a DLQ redrive. */
     redriveOf?: string;
   }): void {
@@ -679,6 +687,7 @@ export class RunPersistenceService {
       stepInputMap: {},
       stepAttempts: {},
       lastEventAt: args.at,
+      ...(args.organizationId ? { organizationId: args.organizationId } : {}),
       ...(args.redriveOf ? { redriveOf: args.redriveOf } : {}),
     });
   }
@@ -773,6 +782,7 @@ export class RunPersistenceService {
     if (event.rejection) state.rejection = event.rejection;
     state.completedAt = event.at;
     await this.persistRun(state);
+    await this.publishWorkGraphLifecycle(state, event.at);
     this.runCache.delete(event.runId);
   }
 
@@ -800,6 +810,7 @@ export class RunPersistenceService {
       this.recordFailedStep(state, failedNodeId, event.error.message, event.at);
     }
     await this.persistRun(state);
+    await this.publishWorkGraphLifecycle(state, event.at);
     this.runCache.delete(event.runId);
   }
 
@@ -814,6 +825,7 @@ export class RunPersistenceService {
     state.status = 'cancelled';
     state.completedAt = event.at;
     await this.persistRun(state);
+    await this.publishWorkGraphLifecycle(state, event.at);
     this.runCache.delete(event.runId);
   }
 
@@ -1016,6 +1028,31 @@ export class RunPersistenceService {
     };
 
     await this.putWithRetry(item, state);
+  }
+
+  /**
+   * Projection is deliberately downstream of successful authoritative run
+   * persistence. Missing organization/source-account joins deny publication;
+   * they never turn a system or webhook trigger into a person-owned event.
+   */
+  private async publishWorkGraphLifecycle(state: RunState, occurredAt: string): Promise<void> {
+    if (!state.organizationId || state.triggeredBy === 'system') return;
+    const result = await platformWorkGraphSourcePublisher.pipeline({
+      kind: 'pipeline-run',
+      run: {
+        runId: state.runId,
+        pipelineId: state.pipelineId,
+        status: state.status,
+        startedAt: state.startedAt,
+        ...(state.completedAt ? { completedAt: state.completedAt } : {}),
+      } as never,
+      attributedSubject: state.triggeredBy,
+      occurredAt,
+      sourceSequence: `${state.status}:${occurredAt}`,
+    }, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
+    if (!result.published) {
+      log.warn({ runId: state.runId, reason: result.reason }, 'work graph pipeline lifecycle was not published');
+    }
   }
 
   /**

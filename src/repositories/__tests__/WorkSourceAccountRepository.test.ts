@@ -74,4 +74,26 @@ describe('WorkSourceAccountRepository', () => {
     await expect(repository.put(mapping({ revision: 2 }), 1))
       .rejects.toBeInstanceOf(WorkSourceAccountConflictError);
   });
+
+  it('creates only a same-subject platform join and refuses to repoint a conflicting row', async () => {
+    const existing = mapping({
+      source: 'pipeline', producerServiceId: 'platform-api', producerOrganizationId: 'org-1',
+      sourceSubject: 'user-1', organizationId: 'org-1', actorId: 'someone-else',
+    });
+    const send = jest.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('exists'), { name: 'ConditionalCheckFailedException' }))
+      .mockResolvedValueOnce({
+        Item: {
+          PK: 'WGACCOUNT#pipeline#org-1', SK: 'SUBJECT#user-1',
+          entityType: 'work-source-account', mapping: existing,
+        },
+      });
+    const repository = new WorkSourceAccountRepository({ send } as unknown as DynamoDBDocumentClient);
+    await expect(repository.ensureVerifiedPrincipal({
+      source: 'pipeline', organizationId: 'org-1', subject: 'user-1', updatedAt: '2026-09-19T20:00:00.000Z',
+    })).resolves.toBe(false);
+    expect((send.mock.calls[0][0] as PutCommand).input.Item).toMatchObject({
+      mapping: expect.objectContaining({ actorId: 'user-1', sourceSubject: 'user-1' }),
+    });
+  });
 });

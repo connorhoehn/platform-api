@@ -102,6 +102,8 @@ export interface VideoSessionRecord {
   startedAt: string;
   endedAt?: string;
   startedBy: string;
+  /** Verified tenant captured when the session was created. Optional for legacy rows. */
+  orgId?: string;
   participants: VideoSessionParticipant[];
   transcriptStatus?: 'pending' | 'processing' | 'available' | 'failed';
   transcript?: string;

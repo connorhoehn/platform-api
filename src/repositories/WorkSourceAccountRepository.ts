@@ -131,4 +131,41 @@ export class WorkSourceAccountRepository {
       throw error;
     }
   }
+
+  /**
+   * Bind a verified platform principal to its same-named source subject. This
+   * is intentionally create-only: a later request cannot repoint an existing
+   * source subject at a different actor or organization.  It is the narrow
+   * bridge used at authenticated pipeline/video entrypoints; webhook payloads
+   * and browser request bodies never reach this method.
+   */
+  async ensureVerifiedPrincipal(input: {
+    source: WorkSourceKind;
+    organizationId: string;
+    subject: string;
+    updatedAt?: string;
+  }): Promise<boolean> {
+    const mapping: WorkSourceAccountMapping = {
+      source: input.source,
+      producerServiceId: 'platform-api',
+      producerOrganizationId: input.organizationId,
+      sourceSubject: input.subject,
+      organizationId: input.organizationId,
+      actorId: input.subject,
+      revision: 1,
+      updatedAt: input.updatedAt ?? new Date().toISOString(),
+    };
+    try {
+      await this.put(mapping, null);
+      return true;
+    } catch (error) {
+      if (!(error instanceof WorkSourceAccountConflictError)) throw error;
+      const current = await this.resolve(
+        input.source, 'platform-api', input.organizationId, input.subject,
+      );
+      // Existing joins must be exactly the authenticated principal. Do not
+      // overwrite a corrupted or differently-owned mapping.
+      return current?.organizationId === input.organizationId && current.actorId === input.subject;
+    }
+  }
 }
