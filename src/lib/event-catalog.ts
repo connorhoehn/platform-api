@@ -147,6 +147,18 @@ catalog.declare({
 });
 
 catalog.declare({
+  name: 'doc:comment_updated',
+  transport: 'signal',
+  producer: 'platform-api',
+  description: 'A document comment was edited; durable state is available through the comments API',
+  schema: {
+    type: 'object',
+    properties: { documentId: { type: 'string' }, comment: { type: 'object' } },
+    required: ['documentId', 'comment'],
+  },
+});
+
+catalog.declare({
   name: 'doc:comment_resolved',
   transport: 'signal',
   producer: 'platform-api',

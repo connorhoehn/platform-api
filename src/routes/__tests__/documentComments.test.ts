@@ -6,6 +6,8 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 
 const mockCreateComment = jest.fn();
+const mockGetComment = jest.fn();
+const mockEditComment = jest.fn();
 const mockGetCommentsForSection = jest.fn();
 const mockGetCommentsForDocument = jest.fn();
 const mockResolveThread = jest.fn();
@@ -15,6 +17,8 @@ const mockDeleteComment = jest.fn();
 jest.mock('../../repositories', () => ({
   documentCommentRepo: {
     createComment: mockCreateComment,
+    getComment: mockGetComment,
+    editComment: mockEditComment,
     getCommentsForSection: mockGetCommentsForSection,
     getCommentsForDocument: mockGetCommentsForDocument,
     resolveThread: mockResolveThread,
@@ -46,6 +50,8 @@ jest.mock('../../middleware/auth', () => ({
 
 import { documentCommentsRouter } from '../documentComments';
 import { errorHandler } from '../../middleware/error-handler';
+import { createDocumentPolicy } from '../../middleware/document-policy';
+import type { DocumentGrantClaims } from '@connorhoehn/realtime-modules/server';
 
 interface MockRes {
   statusCode: number;
@@ -95,7 +101,7 @@ async function run(
     url,
     originalUrl: url,
     path: qIdx >= 0 ? url.slice(0, qIdx) : url,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', authorization: 'Bearer test-grant' },
     query,
     body: opts.body,
     user: { sub: opts.userId ?? 'tester', email: 'tester@example.com' },
@@ -119,9 +125,10 @@ async function run(
 const DOC = 'doc-1';
 const BASE = `/api/documents/${DOC}/comments`;
 
-function buildApp(): express.Express {
+function buildApp(grant?: DocumentGrantClaims): express.Express {
   const app = express();
   app.use(express.json());
+  if (grant) app.use('/api/documents/:documentId', createDocumentPolicy({ tenantId: 'assessment', verify: async () => grant }));
   app.use('/api/documents', documentCommentsRouter);
   app.use(errorHandler);
   return app;
@@ -129,6 +136,8 @@ function buildApp(): express.Express {
 
 beforeEach(() => {
   mockCreateComment.mockReset();
+  mockGetComment.mockReset().mockResolvedValue({ documentId: DOC, commentId: 'c-1', userId: 'tester' });
+  mockEditComment.mockReset().mockResolvedValue({ documentId: DOC, commentId: 'c-1', text: 'Edited' });
   mockGetCommentsForSection.mockReset();
   mockGetCommentsForDocument.mockReset();
   mockResolveThread.mockReset().mockResolvedValue(undefined);
@@ -263,7 +272,7 @@ describe('GET /api/documents/:documentId/comments', () => {
     const res = await run(buildApp(), 'GET', BASE);
     expect(res.statusCode).toBe(200);
     expect((res.body as { comments: unknown[] }).comments).toHaveLength(2);
-    expect(mockGetCommentsForDocument).toHaveBeenCalledWith(DOC, 50);
+    expect(mockGetCommentsForDocument).toHaveBeenCalledWith(DOC, 50, undefined);
   });
 
   it('filters by sectionId when provided', async () => {
@@ -271,7 +280,7 @@ describe('GET /api/documents/:documentId/comments', () => {
 
     const res = await run(buildApp(), 'GET', `${BASE}?sectionId=s-1`);
     expect(res.statusCode).toBe(200);
-    expect(mockGetCommentsForSection).toHaveBeenCalledWith('s-1', 50);
+    expect(mockGetCommentsForSection).toHaveBeenCalledWith(DOC, 's-1', 50, undefined);
   });
 });
 
@@ -305,5 +314,70 @@ describe('DELETE /api/documents/:documentId/comments/:commentId', () => {
     const res = await run(buildApp(), 'DELETE', `${BASE}/c-1`);
     expect(res.statusCode).toBe(204);
     expect(mockDeleteComment).toHaveBeenCalledWith(DOC, 'c-1');
+  });
+});
+
+
+describe('document-wide thread compatibility', () => {
+  it('creates an explicit document-wide root without fabricating a section or anchor', async () => {
+    mockCreateComment.mockImplementation(async (comment) => ({ ...comment, commentId: 'new' }));
+    const res = await run(buildApp(), 'POST', BASE, { body: { scope: 'document', text: 'General feedback' } });
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateComment).toHaveBeenCalledWith(expect.objectContaining({ documentId: DOC, scope: 'document' }));
+    expect(mockCreateComment.mock.calls[0][0]).not.toHaveProperty('sectionId');
+    expect(mockCreateComment.mock.calls[0][0]).not.toHaveProperty('anchor');
+  });
+  it('refuses ambiguous document and span scope', async () => {
+    const res = await run(buildApp(), 'POST', BASE, { body: { scope: 'document', sectionId: 's', text: 'Feedback' } });
+    expect(res.statusCode).toBe(400);
+    expect(mockCreateComment).not.toHaveBeenCalled();
+  });
+  it('refuses a parent belonging to another document', async () => {
+    mockGetComment.mockResolvedValue(null);
+    const res = await run(buildApp(), 'POST', BASE, { body: { parentCommentId: 'other-doc-comment', text: 'Reply' } });
+    expect(res.statusCode).toBe(404);
+    expect(mockGetComment).toHaveBeenCalledWith(DOC, 'other-doc-comment');
+    expect(mockCreateComment).not.toHaveBeenCalled();
+  });
+  it('allows the author to edit text', async () => {
+    const res = await run(buildApp(), 'PATCH', BASE + '/c-1', { body: { text: ' Edited ' } });
+    expect(res.statusCode).toBe(200);
+    expect(mockEditComment).toHaveBeenCalledWith(DOC, 'c-1', 'Edited');
+  });
+  it.each(['PATCH', 'DELETE'])('refuses another author %s', async (method) => {
+    const res = await run(buildApp(), method, BASE + '/c-1', { body: { text: 'Edited' }, userId: 'other' });
+    expect(res.statusCode).toBe(403);
+    expect(mockEditComment).not.toHaveBeenCalled();
+    expect(mockDeleteComment).not.toHaveBeenCalled();
+  });
+  it.each(['PATCH', 'DELETE'])('refuses a missing comment %s rather than creating a phantom record', async (method) => {
+    mockGetComment.mockResolvedValue(null);
+    const res = await run(buildApp(), method, BASE + '/missing', { body: { resolved: true } });
+    expect(res.statusCode).toBe(404);
+    expect(mockResolveThread).not.toHaveBeenCalled();
+    expect(mockDeleteComment).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('mounted comment routes with document grants', () => {
+  const grant = { documentId: DOC, tenantId: 'assessment', sub: 'tester', operations: ['read'] } as DocumentGrantClaims;
+  it('allows a reader to list but refuses the same reader creating a comment', async () => {
+    mockGetCommentsForDocument.mockResolvedValue({ items: [] });
+    const app = buildApp(grant);
+    expect((await run(app, 'GET', BASE)).statusCode).toBe(200);
+    expect((await run(app, 'POST', BASE, { body: { scope: 'document', text: 'Unauthorised' } })).statusCode).toBe(403);
+    expect(mockCreateComment).not.toHaveBeenCalled();
+  });
+  it('refuses a document-scoped token on another document even with a shared section id', async () => {
+    const res = await run(buildApp(grant), 'GET', '/api/documents/other/comments?sectionId=s-1');
+    expect(res.statusCode).toBe(403);
+    expect(mockGetCommentsForSection).not.toHaveBeenCalled();
+  });
+  it('rejects a cursor for another document', async () => {
+    const cursor = Buffer.from(JSON.stringify({ documentId: 'other', commentId: 'c' })).toString('base64url');
+    const res = await run(buildApp(grant), 'GET', BASE + '?cursor=' + cursor);
+    expect(res.statusCode).toBe(400);
+    expect(mockGetCommentsForDocument).not.toHaveBeenCalled();
   });
 });

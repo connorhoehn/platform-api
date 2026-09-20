@@ -1,3 +1,4 @@
+import { filterDocumentLifecycleActions } from '../middleware/document-policy';
 /**
  * Named review requests — "Alice, please review section 3 by Friday".
  *
@@ -258,7 +259,7 @@ documentReviewRequestsRouter.patch(
     res.status(200).json({
       request: updated,
       lifecycle: toView(after),
-      availableActions: availableActionsFor(after, userId),
+      availableActions: filterDocumentLifecycleActions(req, availableActionsFor(after, userId)),
       outstandingReviews: after.outstanding,
     });
   }),

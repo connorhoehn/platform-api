@@ -6,6 +6,8 @@ import type { DocumentCommentAnchor } from '../repositories/DocumentCommentRepos
 import {
   asyncHandler,
   ValidationError,
+  NotFoundError,
+  ForbiddenError,
 } from '../middleware/error-handler';
 import log from '../lib/logger';
 
@@ -92,11 +94,12 @@ export const documentCommentsRouter = Router({ mergeParams: true });
 // POST /api/documents/:documentId/comments — create a comment or threaded reply
 documentCommentsRouter.post('/:documentId/comments', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { documentId } = req.params;
-  const { sectionId, text, parentCommentId, anchor } = req.body as {
+  const { sectionId, text, parentCommentId, anchor, scope } = req.body as {
     sectionId?: string;
     text?: string;
     parentCommentId?: string;
     anchor?: unknown;
+    scope?: unknown;
   };
   const userId = req.user!.sub;
 
@@ -104,19 +107,24 @@ documentCommentsRouter.post('/:documentId/comments', requireAuth, asyncHandler(a
     typeof sectionId === 'string' && sectionId.trim() ? sectionId.trim() : undefined;
   const parsedAnchor = parseAnchor(anchor);
 
-  // A comment has to be ABOUT something, and there are exactly three ways to
-  // say what: the section it was left on (legacy documents), the span of prose
-  // it points at (canvas documents), or the thread it replies to (a reply is
-  // positioned by its root and needs no position of its own). Requiring
-  // `sectionId` unconditionally — as this route used to — is what made an
-  // anchored comment unrepresentable, since a canvas page has no sections to
-  // name and inventing a synthetic id for one would be a lie the gutter would
-  // then try to position against.
-  if (!trimmedSectionId && !parsedAnchor && !parentCommentId) {
-    throw new ValidationError('one of sectionId, anchor or parentCommentId is required');
+  if (scope !== undefined && scope !== 'document') {
+    throw new ValidationError('scope must be document when supplied');
+  }
+  if (scope === 'document' && (trimmedSectionId || parsedAnchor || parentCommentId)) {
+    throw new ValidationError('document scope cannot also specify a section, anchor or parent');
+  }
+  if (!trimmedSectionId && !parsedAnchor && !parentCommentId && scope !== 'document') {
+    throw new ValidationError('one of sectionId, anchor, parentCommentId or scope:document is required');
+  }
+  if (parentCommentId !== undefined) {
+    if (typeof parentCommentId !== 'string' || !parentCommentId.trim()) {
+      throw new ValidationError('parentCommentId must be a non-empty string');
+    }
+    const parent = await documentCommentRepo.getComment(documentId, parentCommentId);
+    if (!parent || parent.documentId !== documentId) throw new NotFoundError('Parent comment not found in this document');
   }
 
-  const trimmedText = (text ?? '').trim();
+  const trimmedText = typeof text === 'string' ? text.trim() : '';
   if (!trimmedText || trimmedText.length > 10000) {
     throw new ValidationError('text is required (max 10000 chars)');
   }
@@ -132,6 +140,7 @@ documentCommentsRouter.post('/:documentId/comments', requireAuth, asyncHandler(a
     ...(trimmedSectionId ? { sectionId: trimmedSectionId } : {}),
     ...(parentCommentId ? { parentCommentId } : {}),
     ...(parsedAnchor ? { anchor: parsedAnchor } : {}),
+    ...(scope === 'document' ? { scope: 'document' as const } : {}),
   });
 
   publishSignal(`doc-comments:${documentId}`, 'doc:comment_added', {
@@ -150,24 +159,48 @@ documentCommentsRouter.get('/:documentId/comments', requireAuth, asyncHandler(as
   const sectionId = req.query['sectionId'] as string | undefined;
   const limit = Math.min(parseInt(req.query['limit'] as string ?? '50', 10) || 50, 200);
 
+  let cursor: Record<string, unknown> | undefined;
+  if (req.query['cursor'] !== undefined) {
+    try {
+      const raw = req.query['cursor'];
+      if (typeof raw !== 'string' || raw.length > 2048) throw new Error('invalid');
+      const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString()) as Record<string, unknown>;
+      if (parsed.documentId !== documentId || typeof parsed.commentId !== 'string') throw new Error('invalid');
+      cursor = { documentId, commentId: parsed.commentId };
+    } catch { throw new ValidationError('Invalid comments cursor'); }
+  }
   let result;
   if (sectionId) {
-    result = await documentCommentRepo.getCommentsForSection(sectionId, limit);
+    result = await documentCommentRepo.getCommentsForSection(documentId, sectionId, limit, cursor);
   } else {
-    result = await documentCommentRepo.getCommentsForDocument(documentId, limit);
+    result = await documentCommentRepo.getCommentsForDocument(documentId, limit, cursor);
   }
 
-  res.status(200).json({ comments: result.items });
+  res.status(200).json({ comments: result.items, ...(result.lastEvaluatedKey ? { nextCursor: Buffer.from(JSON.stringify(result.lastEvaluatedKey)).toString('base64url') } : {}) });
 }));
 
 // PATCH /api/documents/:documentId/comments/:commentId — resolve/unresolve a thread
 documentCommentsRouter.patch('/:documentId/comments/:commentId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { documentId, commentId } = req.params;
-  const { resolved } = req.body as { resolved?: boolean };
+  const { resolved, text } = req.body as { resolved?: boolean; text?: unknown };
   const userId = req.user!.sub;
 
+  const existing = await documentCommentRepo.getComment(documentId, commentId);
+  if (!existing) throw new NotFoundError('Comment not found');
+  if (text !== undefined) {
+    if (existing.userId !== userId) throw new ForbiddenError('Only the author may edit comment text');
+    if (typeof text !== 'string' || !text.trim() || text.trim().length > 10000) {
+      throw new ValidationError('text is required (max 10000 chars)');
+    }
+    if (resolved !== undefined) throw new ValidationError('Edit text and resolve in separate requests');
+    const comment = await documentCommentRepo.editComment(documentId, commentId, text.trim());
+    publishSignal(`doc-comments:${documentId}`, 'doc:comment_updated', { documentId, comment })
+      .catch((err: unknown) => log.error({ event: 'doc:comment_updated', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed'));
+    res.status(200).json({ comment });
+    return;
+  }
   if (typeof resolved !== 'boolean') {
-    throw new ValidationError('resolved (boolean) is required');
+    throw new ValidationError('resolved (boolean) or text is required');
   }
 
   const now = new Date().toISOString();
@@ -200,6 +233,9 @@ documentCommentsRouter.patch('/:documentId/comments/:commentId', requireAuth, as
 documentCommentsRouter.delete('/:documentId/comments/:commentId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { documentId, commentId } = req.params;
 
+  const existing = await documentCommentRepo.getComment(documentId, commentId);
+  if (!existing) throw new NotFoundError('Comment not found');
+  if (existing.userId !== req.user!.sub) throw new ForbiddenError('Only the author may delete a comment');
   await documentCommentRepo.deleteComment(documentId, commentId);
 
   publishSignal(`doc-comments:${documentId}`, 'doc:comment_deleted', {

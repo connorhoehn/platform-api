@@ -55,6 +55,7 @@ export interface DocumentComment {
    * anchored comments simply do not appear in a by-section query, which is the
    * honest answer to "which section is this in?" for a document with none.
    */
+  scope?: 'document';
   sectionId?: string;
   text: string;
   userId: string;
@@ -85,6 +86,7 @@ export class DocumentCommentRepository extends BaseRepository {
   async createComment(comment: {
     documentId: string;
     /** Omit for a canvas comment — it has an `anchor` instead. */
+    scope?: 'document';
     sectionId?: string;
     text: string;
     userId: string;
@@ -122,18 +124,35 @@ export class DocumentCommentRepository extends BaseRepository {
   }
 
   async getCommentsForSection(
+    documentId: string,
     sectionId: string,
     limit?: number,
     lastKey?: Record<string, unknown>,
   ): Promise<{ items: DocumentComment[]; lastEvaluatedKey?: Record<string, unknown> }> {
     return this.queryWithPagination<DocumentComment>({
-      IndexName: 'sectionId-timestamp-index',
-      KeyConditionExpression: 'sectionId = :sid',
-      ExpressionAttributeValues: { ':sid': sectionId },
+      KeyConditionExpression: 'documentId = :docId',
+      FilterExpression: 'sectionId = :sid',
+      ExpressionAttributeValues: { ':docId': documentId, ':sid': sectionId },
       ScanIndexForward: true,
       ...(limit ? { Limit: limit } : {}),
       ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
     });
+  }
+
+  async getComment(documentId: string, commentId: string): Promise<DocumentComment | null> {
+    return this.getItem<DocumentComment>({ documentId, commentId });
+  }
+
+  async editComment(documentId: string, commentId: string, text: string): Promise<DocumentComment> {
+    const result = await this.updateItem({
+      Key: { documentId, commentId },
+      ConditionExpression: 'attribute_exists(commentId)',
+      UpdateExpression: 'SET #text = :text, editedAt = :at',
+      ExpressionAttributeNames: { '#text': 'text' },
+      ExpressionAttributeValues: { ':text': text, ':at': new Date().toISOString() },
+      ReturnValues: 'ALL_NEW',
+    });
+    return result as unknown as DocumentComment;
   }
 
   async resolveThread(
@@ -144,6 +163,7 @@ export class DocumentCommentRepository extends BaseRepository {
   ): Promise<void> {
     await this.updateItem({
       Key: { documentId, commentId },
+      ConditionExpression: 'attribute_exists(commentId)',
       UpdateExpression: 'SET resolved = :r, resolvedBy = :by, resolvedAt = :at',
       ExpressionAttributeValues: {
         ':r': true,
@@ -156,6 +176,7 @@ export class DocumentCommentRepository extends BaseRepository {
   async unresolveThread(documentId: string, commentId: string): Promise<void> {
     await this.updateItem({
       Key: { documentId, commentId },
+      ConditionExpression: 'attribute_exists(commentId)',
       UpdateExpression: 'REMOVE resolved, resolvedBy, resolvedAt',
     });
   }

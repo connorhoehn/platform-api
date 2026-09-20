@@ -25,6 +25,9 @@ export async function requireAuth(
   res: Response,
   next: NextFunction
 ): Promise<void> {
+  // This value is attached only after the document policy verifies signature,
+  // current session epoch, tenant, document and operation on this request.
+  if (req.documentGrant) { next(); return; }
   // Skip auth in local development. We still try to extract the user
   // identity from the bearer when present — the FE's useAuth ships a
   // signed dev token whose `sub` is the actual dev userId (e.g. dev-bob
@@ -32,7 +35,7 @@ export async function requireAuth(
   // request broke per-user fan-outs (every Bob/Alice/Carol call ended
   // up keyed under 'dev-user' instead of their real identity, so
   // listByUser returned zero matches for new recordings).
-  if (process.env.SKIP_AUTH === 'true') {
+  if (process.env.SKIP_AUTH === 'true' && process.env.NODE_ENV !== 'production') {
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {
       const token = authHeader.slice(7);
@@ -88,7 +91,10 @@ export async function optionalAuth(
   _res: Response,
   next: NextFunction
 ): Promise<void> {
-  if (process.env.SKIP_AUTH === 'true') {
+  // This value is attached only after the document policy verifies signature,
+  // current session epoch, tenant, document and operation on this request.
+  if (req.documentGrant) { next(); return; }
+  if (process.env.SKIP_AUTH === 'true' && process.env.NODE_ENV !== 'production') {
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {
       const token = authHeader.slice(7);

@@ -134,19 +134,22 @@ describe('DocumentCommentRepository.getCommentsForSection', () => {
     mockSend.mockResolvedValue({ Items: [] });
   });
 
-  it('queries sectionId-timestamp-index GSI', async () => {
+  it('queries the document partition and filters its section, never a global section GSI', async () => {
     const repo = new DocumentCommentRepository(docClient);
-    await repo.getCommentsForSection('sec-5');
+    await repo.getCommentsForSection('doc-1', 'sec-5');
 
     const cmd = mockSend.mock.calls[0][0];
-    expect(cmd.input.IndexName).toBe('sectionId-timestamp-index');
+    expect(cmd.input.IndexName).toBeUndefined();
+    expect(cmd.input.FilterExpression).toBe('sectionId = :sid');
+    expect(cmd.input.KeyConditionExpression).toBe('documentId = :docId');
+    expect(cmd.input.ExpressionAttributeValues[':docId']).toBe('doc-1');
     expect(cmd.input.ExpressionAttributeValues[':sid']).toBe('sec-5');
     expect(cmd.input.ScanIndexForward).toBe(true);
   });
 
   it('passes Limit when provided', async () => {
     const repo = new DocumentCommentRepository(docClient);
-    await repo.getCommentsForSection('sec-5', 10);
+    await repo.getCommentsForSection('doc-1', 'sec-5', 10);
 
     const cmd = mockSend.mock.calls[0][0];
     expect(cmd.input.Limit).toBe(10);

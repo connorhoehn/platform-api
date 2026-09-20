@@ -1,3 +1,4 @@
+import { requireDocumentPolicy } from '../middleware/document-policy';
 import { Router } from 'express';
 import { profilesRouter } from './profiles';
 import { socialRouter } from './social';
@@ -86,6 +87,13 @@ import type {
 } from '../pipeline/http/contracts';
 
 const router = Router();
+
+// Scope every document workflow before dispatch, including agent edits and
+// import/export. Static schema carries no private document data.
+router.use('/documents/:documentId', (req, res, next) => {
+  if (req.params.documentId === 'lifecycle-schema') { next(); return; }
+  void requireDocumentPolicy(req, res, next);
+});
 
 // Active now work graph. Authentication is applied at the application mount;
 // the router additionally resolves the verified subject + organization into

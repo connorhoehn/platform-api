@@ -1,3 +1,4 @@
+import { filterDocumentLifecycleActions } from '../middleware/document-policy';
 /**
  * Document review-lifecycle routes.
  *
@@ -94,7 +95,7 @@ documentLifecycleRouter.get(
 
     res.status(200).json({
       lifecycle: toView(ctx),
-      availableActions: availableActionsFor(ctx, userId),
+      availableActions: filterDocumentLifecycleActions(req, availableActionsFor(ctx, userId)),
       outstandingReviews: ctx.outstanding,
     });
   }),
@@ -133,7 +134,7 @@ documentLifecycleRouter.post(
         from: result.from,
         to: result.to,
         action: result.action,
-        availableActions: availableActionsFor(ctx, userId),
+        availableActions: filterDocumentLifecycleActions(req, availableActionsFor(ctx, userId)),
       });
     }),
   ),
@@ -171,7 +172,7 @@ documentLifecycleRouter.post(
       res.status(200).json({
         lifecycle: result.lifecycle,
         claimed: result.claimed,
-        availableActions: availableActionsFor(ctx, userId),
+        availableActions: filterDocumentLifecycleActions(req, availableActionsFor(ctx, userId)),
       });
     }),
   ),
