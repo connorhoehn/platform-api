@@ -21,6 +21,55 @@ const row = {
 };
 
 describe('work-graph outbox drainer', () => {
+  it('advances across empty filtered pages and wraps after the last page', async () => {
+    const firstKey = { PK: 'NODE#1', SK: 'META' };
+    const secondKey = { PK: 'NODE#2', SK: 'META' };
+    const pages = [
+      { Items: [], LastEvaluatedKey: firstKey },
+      { Items: [], LastEvaluatedKey: secondKey },
+      { Items: [row] },
+      { Items: [] },
+    ];
+    const send = jest.fn(async (command: unknown) => command instanceof ScanCommand ? pages.shift()! : {});
+    const publish = jest.fn().mockResolvedValue(undefined);
+    const drainer = createWorkGraphOutboxDrainer({ client: { send } as unknown as DynamoDBDocumentClient, publish });
+    for (const count of [0, 0, 1, 0]) await expect(drainer.drainOnce()).resolves.toBe(count);
+    const scans = send.mock.calls.map(([command]) => command).filter((command): command is ScanCommand => command instanceof ScanCommand);
+    expect(scans.map((command) => command.input.ExclusiveStartKey)).toEqual([undefined, firstKey, secondKey, undefined]);
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries the same scan page after a transient scan failure', async () => {
+    const key = { PK: 'NODE#1', SK: 'META' };
+    let scans = 0;
+    const send = jest.fn(async (command: unknown) => {
+      if (!(command instanceof ScanCommand)) return {};
+      if (++scans === 1) return { Items: [], LastEvaluatedKey: key };
+      if (scans === 2) throw new Error('DynamoDB unavailable');
+      return { Items: [row] };
+    });
+    const drainer = createWorkGraphOutboxDrainer({ client: { send } as unknown as DynamoDBDocumentClient, publish: jest.fn() });
+    await drainer.drainOnce();
+    await expect(drainer.drainOnce()).rejects.toThrow('DynamoDB unavailable');
+    await expect(drainer.drainOnce()).resolves.toBe(1);
+    expect((send.mock.calls[2][0] as ScanCommand).input.ExclusiveStartKey).toEqual(key);
+  });
+
+  it('coalesces overlapping timer and manual drains so the scan cursor cannot race', async () => {
+    let finish!: (page: { Items: typeof row[] }) => void;
+    const send = jest.fn((command: unknown) => command instanceof ScanCommand
+      ? new Promise<{ Items: typeof row[] }>((resolve) => { finish = resolve; })
+      : Promise.resolve({}));
+    const publish = jest.fn().mockResolvedValue(undefined);
+    const drainer = createWorkGraphOutboxDrainer({ client: { send } as unknown as DynamoDBDocumentClient, publish });
+    const first = drainer.drainOnce();
+    const second = drainer.drainOnce();
+    finish({ Items: [row] });
+    await expect(Promise.all([first, second])).resolves.toEqual([1, 1]);
+    expect(send.mock.calls.filter(([command]) => command instanceof ScanCommand)).toHaveLength(1);
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+
   it('claims, publishes, and conditionally removes a projection event', async () => {
     const send = jest.fn(async (command: unknown) => command instanceof ScanCommand ? { Items: [row] } : {});
     const publish = jest.fn().mockResolvedValue(undefined);

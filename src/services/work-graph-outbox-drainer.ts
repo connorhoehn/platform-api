@@ -65,6 +65,10 @@ export function createWorkGraphOutboxDrainer(options: {
   const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   const batchSize = options.batchSize ?? 25;
   const now = options.now ?? Date.now;
+  // Scan's Limit applies before its filter. Even a page with no outbox rows
+  // may have a continuation key; starting over would starve later events.
+  let scanCursor: Record<string, unknown> | undefined;
+  let inFlight: Promise<number> | undefined;
 
   async function claim(row: OutboxRow): Promise<boolean> {
     try {
@@ -87,12 +91,13 @@ export function createWorkGraphOutboxDrainer(options: {
     }
   }
 
-  async function drainOnce(): Promise<number> {
+  async function drainPage(): Promise<number> {
     const result = await client.send(new ScanCommand({
       TableName: WORK_GRAPH_TABLE,
       FilterExpression: 'itemKind = :outbox',
       ExpressionAttributeValues: { ':outbox': 'outbox' },
       Limit: batchSize,
+      ...(scanCursor ? { ExclusiveStartKey: scanCursor } : {}),
     }));
     let published = 0;
     for (const value of result.Items ?? []) {
@@ -121,7 +126,16 @@ export function createWorkGraphOutboxDrainer(options: {
         );
       }
     }
+    // Advance only after processing this bounded page. A scan/claim outage
+    // retries the page; failed publications stay leased for the next sweep.
+    scanCursor = result.LastEvaluatedKey;
     return published;
+  }
+
+  function drainOnce(): Promise<number> {
+    // Manual drains and the timer share one cursor and one page of work.
+    if (!inFlight) inFlight = drainPage().finally(() => { inFlight = undefined; });
+    return inFlight;
   }
 
   return { drainOnce };
