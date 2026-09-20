@@ -240,3 +240,18 @@ Deployed via the websocket-gateway Helm chart as a sidecar/companion service. Th
 ### Health Check
 
 `GET /health` returns 200 when the service is ready. The Dockerfile includes a built-in healthcheck on 30s intervals.
+
+### Durable middleware acceptance
+
+The service pins event-catalog 0.6.5, which rejects failed or timed-out MQ
+receipt deletion without treating it as a handler failure or consuming the
+handler's poison budget. Consumers still require idempotency: a completed
+handler may run again if its acknowledgement fails.
+
+The sibling `realtime-examples/examples/middleware-foundation` application
+profile builds this image from its lockfile and verifies team/channel recovery
+after process replacement, registry recovery, and actual MQ outage/redelivery
+using the installed library. Its evidence records the exact image IDs. This
+is isolated local acceptance, not a production authentication or AWS deployment
+claim. Strict compilation and 57 consumer/outbox/projector tests pass (one
+integration test skipped).
