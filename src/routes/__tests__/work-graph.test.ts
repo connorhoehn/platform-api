@@ -137,6 +137,7 @@ function setup(): {
   exchangeAction: jest.Mock;
   accepted: jest.Mock;
   revoked: jest.Mock;
+  sharingRevoked: jest.Mock;
 } {
   let outage = false;
   let capabilities: WorkCollaborationRequest['capability'][] = ['view-document'];
@@ -186,6 +187,7 @@ function setup(): {
   const exchangeAction = jest.fn(async () => actionResult);
   const accepted = jest.fn(async () => undefined);
   const revoked = jest.fn(async () => undefined);
+  const sharingRevoked = jest.fn(async () => undefined);
   const deps: WorkGraphOrchestratorDependencies = {
     graph: {
       loadProjection: jest.fn(async (organizationId, actorId, day) => (
@@ -268,6 +270,7 @@ function setup(): {
       )),
     },
     collaborationLifecycle: { accepted, revoked },
+    sharingLifecycle: { revoked: sharingRevoked },
     sourceAcls: new Map([['document', source]]),
     sourceActions: new Map([['document', { source: 'document', exchangeAction }]]),
     cursorCodec: createWorkGraphCursorCodec('test-secret-that-is-longer-than-thirty-two-bytes'),
@@ -293,6 +296,7 @@ function setup(): {
     exchangeAction,
     accepted,
     revoked,
+    sharingRevoked,
   };
 }
 
@@ -428,6 +432,25 @@ describe('work graph authenticated routes', () => {
     expect(result.statusCode).toBe(409);
     expect(result.body).toEqual({ error: 'WORK_GRAPH_REVISION_CONFLICT', message: 'The expected revision is stale.' });
     expect(putGrant).not.toHaveBeenCalled();
+  });
+
+  it('calls the sharing lifecycle after a pause is durably stored', async () => {
+    const { app, grantRows, sharingRevoked } = setup();
+    const result = await run(
+      app,
+      'PATCH',
+      '/api/work-graph/sharing-grants/grant-1',
+      { sub: 'alice', orgId: 'org-1' },
+      { expectedRevision: 1, action: 'pause' },
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(result.body).toMatchObject({ id: 'grant-1', state: 'paused', revision: 2 });
+    expect(grantRows.get('grant-1')).toMatchObject({ state: 'paused', revision: 2 });
+    expect(sharingRevoked).toHaveBeenCalledTimes(1);
+    expect(sharingRevoked).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'grant-1', ownerId: 'alice', state: 'paused', revision: 2,
+    }));
   });
 
   it('cannot escalate a visible view capability into an edit request', async () => {
@@ -581,6 +604,7 @@ describe('work graph authenticated routes', () => {
     );
     expect(revokedResponse.statusCode).toBe(200);
     expect(revokedResponse.body).toMatchObject({ state: 'revoked', revision: 3 });
+    expect(revoked).toHaveBeenCalledTimes(1);
     expect(revoked).toHaveBeenCalledWith(expect.objectContaining({ id: requestId, state: 'revoked' }));
 
     const afterRevocation = await run(
