@@ -1,5 +1,6 @@
 import express from 'express';
 import { requestContextMiddleware } from '@connorhoehn/service-runtime';
+import { requireDocumentPolicy } from './middleware/document-policy';
 import { requireAuth } from './middleware/auth';
 import { requestLogger } from './middleware/request-logger';
 import { httpMetrics } from './middleware/http-metrics';
@@ -124,7 +125,14 @@ export function createApp(): express.Application {
   const { lvsAdminRouter } = require('./routes/lvsAdmin');
   app.use('/api/admin', lvsAdminRouter);
 
-  // All routes below this line require a valid Cognito JWT
+  // Verify document delegation before the generic Cognito boundary. These
+  // grants use Ed25519 and intentionally are not Cognito login tokens.
+  app.use('/api/documents/:documentId', (req, res, next) => {
+    if (req.params.documentId === 'lifecycle-schema') { next(); return; }
+    void requireDocumentPolicy(req, res, next);
+  });
+  // All other routes retain normal Cognito authentication. requireAuth accepts
+  // a document identity only after the scoped verifier attached it above.
   app.use(requireAuth);
 
   // Pipeline READ rate limit — applied at the mount level so we don't have
