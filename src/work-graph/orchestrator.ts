@@ -29,6 +29,7 @@ import {
   sourcesForWorkTarget,
 } from './policy';
 import type { WorkGraphCursorCodec } from './cursor';
+import { workGraphAuthorizationRevision } from './authorizationRevision';
 
 const MAX_SHARING_MS = 24 * 60 * 60 * 1_000;
 const MAX_HISTORY_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -360,11 +361,7 @@ export class WorkGraphOrchestrator {
       day,
       timezone,
     };
-    const policyRevision = await this.deps.policyRevision(scopeBase);
-    const scope: WorkGraphPolicyScope = { ...scopeBase, policyRevision };
-    if (previousCursor && !this.deps.cursorCodec.verify(previousCursor, scope, now)) {
-      throw new WorkGraphInputError('Cursor is invalid, expired, or belongs to another graph scope.');
-    }
+    const sourceScope: WorkGraphPolicyScope = { ...scopeBase, policyRevision: await this.deps.policyRevision(scopeBase) };
 
     const projection = this.deps.graph.loadProjectionForLocalDay
       ? await this.deps.graph.loadProjectionForLocalDay(viewer.organizationId, personId, day, timezone)
@@ -393,7 +390,12 @@ export class WorkGraphOrchestrator {
       sourceCheckpoints: {},
       appliedEventIds: [],
     };
-    const authorization = await authorizeWorkGraph(empty, scope, grants, this.deps.sourceAcls, now);
+    const authorization = await authorizeWorkGraph(empty, sourceScope, grants, this.deps.sourceAcls, now);
+    const policyRevision = workGraphAuthorizationRevision(sourceScope.policyRevision, authorization);
+    const scope: WorkGraphPolicyScope = { ...scopeBase, policyRevision };
+    if (previousCursor && !this.deps.cursorCodec.verify(previousCursor, scope, now)) {
+      throw new WorkGraphInputError('Cursor is invalid, expired, or belongs to another graph scope.');
+    }
     const subscriptionGeneration = this.deps.id();
     const cursor = this.deps.cursorCodec.issue({
       schemaVersion: 1,

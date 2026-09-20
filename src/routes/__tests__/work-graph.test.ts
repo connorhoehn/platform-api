@@ -301,6 +301,40 @@ function setup(): {
 }
 
 describe('work graph authenticated routes', () => {
+  it('changes the stream policy revision when source access is revoked without any graph or grant mutation', async () => {
+    const { app, source, grantRows } = setup();
+    const url = `/api/work-graph/people/alice/graph?day=${DAY}&timezone=America%2FNew_York`;
+    const viewer = { sub: 'bob', orgId: 'org-1' };
+    const before = await run(app, 'GET', url, viewer);
+    jest.mocked(source.authorizeDisclosure).mockImplementation(async (scope, targets) => new Map(targets.map((target) => [target.id, {
+      targetId: target.id, decision: 'deny', policyRevision: scope.policyRevision,
+    }])));
+    const after = await run(app, 'GET', url, viewer);
+    const snapshot = (res: MockRes) => res.body as { scope: { policyRevision: string }; nodes: unknown[]; watermark: number };
+    expect(before.statusCode).toBe(200);
+    expect(after.statusCode).toBe(200);
+    expect(snapshot(before).nodes).toHaveLength(1);
+    expect(snapshot(after).nodes).toEqual([]);
+    expect(snapshot(after).watermark).toBe(snapshot(before).watermark);
+    expect(grantRows.get('grant-1')?.revision).toBe(1);
+    expect(snapshot(after).scope.policyRevision).not.toBe(snapshot(before).scope.policyRevision);
+  });
+
+  it('invalidates old snapshot cursors after source authorization fails and stabilizes after recovery', async () => {
+    const { app, setOutage } = setup();
+    const url = `/api/work-graph/people/alice/graph?day=${DAY}&timezone=America%2FNew_York`;
+    const viewer = { sub: 'bob', orgId: 'org-1' };
+    const before = await run(app, 'GET', url, viewer);
+    const original = before.body as { scope: { policyRevision: string }; cursor: string };
+    setOutage(true);
+    const after = await run(app, 'GET', url, viewer);
+    expect((after.body as { scope: { policyRevision: string } }).scope.policyRevision).not.toBe(original.scope.policyRevision);
+    expect((await run(app, 'GET', `${url}&cursor=${encodeURIComponent(original.cursor)}`, viewer)).statusCode).toBe(400);
+    setOutage(false);
+    const recovered = await run(app, 'GET', url, viewer);
+    expect((recovered.body as { scope: { policyRevision: string } }).scope.policyRevision).toBe(original.scope.policyRevision);
+  });
+
   it('lists only authenticated owner grant and incoming collaboration control state', async () => {
     const { app, collaborationRows } = setup();
     collaborationRows.set('incoming-1', {
