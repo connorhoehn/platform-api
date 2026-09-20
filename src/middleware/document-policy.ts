@@ -29,6 +29,7 @@ export function documentOperation(req: Pick<Request, 'method' | 'path' | 'body'>
 export function createDocumentPolicy(options: {
   verify: DocumentGrantVerifier;
   tenantId: string;
+  canWrite?: (documentId: string) => Promise<boolean>;
 }) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const bearer = req.headers.authorization;
@@ -50,6 +51,21 @@ export function createDocumentPolicy(options: {
     })) {
       res.status(403).json({ error: 'Document operation forbidden' });
       return;
+    }
+    // Workflow transitions retain their own owner/reviewer/CAS rules, including
+    // the owner's explicit reopen. Content edits cannot bypass the lock through
+    // a REST section/import/agent route after approval or finalization.
+    if (documentOperation(req) === 'edit' && !/^\/lifecycle(?:\/|$)/.test(req.path)) {
+      try {
+        const canWrite = options.canWrite ?? (await import('../services/documentWritePolicy.js')).documentContentWritable;
+        if (!await canWrite(claims.documentId)) {
+          res.status(409).json({ error: 'Document content is locked', code: 'document_locked' });
+          return;
+        }
+      } catch {
+        res.status(503).json({ error: 'Document write policy is unavailable', code: 'document_policy_unavailable' });
+        return;
+      }
     }
     req.documentGrant = claims;
     req.user = { sub: claims.sub, orgId: claims.tenantId };

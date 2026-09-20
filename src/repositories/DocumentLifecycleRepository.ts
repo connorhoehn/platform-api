@@ -16,7 +16,7 @@
  * instead of needing a migration job.
  */
 
-import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
 import {
@@ -82,7 +82,9 @@ export class DocumentLifecycleRepository extends BaseRepository {
    * implicit 'draft' with no recorded owner.
    */
   async get(documentId: string): Promise<DocumentLifecycleItem | null> {
-    const raw = await this.getItem<Record<string, unknown>>({ documentId });
+    // Authorization must observe an acknowledged approval/finalization immediately.
+    const result = await this.docClient.send(new GetCommand({ TableName: this.tableName, Key: { documentId }, ConsistentRead: true }));
+    const raw = result.Item as Record<string, unknown> | undefined;
     if (!raw) return null;
     return hydrate(raw);
   }

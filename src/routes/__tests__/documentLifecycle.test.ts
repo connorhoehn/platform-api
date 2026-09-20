@@ -1234,3 +1234,18 @@ describe('a finalized document is closed to everyone', () => {
     expect((res.body as { availableActions: string[] }).availableActions).toEqual([]);
   });
 });
+
+describe('content write-policy authority', () => {
+  it('denies edits immediately after an approved transition while lifecycle reads remain available', async () => {
+    await seedOwnedDocument('in_review');
+    await seedReviewRequest('bob', { state: 'approved' });
+    expect((await call('GET', `/api/documents/${DOC}/lifecycle/write-policy`)).body).toEqual({ documentId: DOC, canWrite: true, version: 1 });
+    expect((await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, { as: 'bob', body: { action: 'approve' } })).statusCode).toBe(200);
+    expect((await call('GET', `/api/documents/${DOC}/lifecycle/write-policy`)).body).toEqual({ documentId: DOC, canWrite: false, version: 2 });
+    expect((await call('GET', `/api/documents/${DOC}/lifecycle`)).statusCode).toBe(200);
+  });
+  it.each(['final', 'finalized'])('uses existing lock rules for %s', async status => {
+    await seedOwnedDocument(status);
+    expect((await call('GET', `/api/documents/${DOC}/lifecycle/write-policy`)).body).toEqual({ documentId: DOC, canWrite: false, version: 1 });
+  });
+});

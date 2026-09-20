@@ -48,6 +48,20 @@ import {
 
 export const documentLifecycleRouter = Router({ mergeParams: true });
 
+// A transport asks the authoritative workflow service before every content
+// mutation. It receives a decision, not another copy of lifecycle state rules.
+documentLifecycleRouter.get('/write-policy', requireAuth, asyncHandler(async (req, res) => {
+  const { readDocumentWritePolicy } = await import('../services/documentWritePolicy.js');
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const policy = await readDocumentWritePolicy(req.params.documentId);
+    const grantAllowsWrite = !req.documentGrant || req.documentGrant.operations.some(operation => operation === 'edit' || operation === 'manage');
+    res.json({ ...policy, canWrite: policy.canWrite && grantAllowsWrite });
+  } catch {
+    res.status(503).json({ error: 'Document write policy is unavailable', code: 'document_policy_unavailable' });
+  }
+}));
+
 /**
  * Run a handler, emitting `{ error, code }` for lifecycle failures.
  *

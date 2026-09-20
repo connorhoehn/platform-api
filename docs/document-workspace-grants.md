@@ -67,3 +67,21 @@ The assessment BFF remains the compatibility authority for pre-existing comment
 IDs, original authors/timestamps and per-actor reactions until an explicit,
 verified migration transfers those records. This patch does not replace that data
 with new IDs or create a second reactions store.
+
+## Authoritative content locks
+
+`GET /api/documents/:documentId/lifecycle/write-policy` returns
+`{documentId, canWrite, version}` with `Cache-Control: no-store`. It requires the
+same signed document read grant; `canWrite` additionally requires edit or manage.
+The decision uses the existing lifecycle `isLocked` rule and a strongly consistent
+DynamoDB read, so an acknowledged approval/finalization is visible to the next
+mutation. The gateway checks this endpoint on every edit/restore/metadata/upload
+operation and fails closed on unavailable or malformed policy. It does not cache
+allow decisions or reinterpret lifecycle status. Reads and idempotent initial
+seeding remain available.
+
+REST section/import/agent content writes use the same authority. Explicit lifecycle
+transitions, including owner-only reopen, retain their existing state-machine and
+compare-and-swap checks. Comments and review responses remain separate operations.
+This is per-operation authorization, not a cross-service transaction: an operation
+already authorized and in flight may complete while another service transitions.

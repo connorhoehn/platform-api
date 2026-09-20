@@ -82,3 +82,19 @@ it.each([
 ])('maps %s %s to a document operation', (method, path, body, expected) => {
   expect(documentOperation({ method, path, body })).toBe(expected);
 });
+
+it.each(['/sections/s1/items', '/sections/s1', '/import', '/agent-edit'])('refuses content mutation %s after lifecycle locks', async path => {
+  const res = response(); const next = jest.fn(); const canWrite = jest.fn(async () => false);
+  await createDocumentPolicy({ tenantId: 'assessment', verify: async () => ({ ...claims, operations: ['read', 'edit'] }), canWrite })(request({ method: 'POST', path }), res as unknown as Response, next);
+  expect(canWrite).toHaveBeenCalledWith(DOC); expect(res.status).toHaveBeenCalledWith(409); expect(next).not.toHaveBeenCalled();
+});
+it('fails closed when lifecycle lookup is unavailable', async () => {
+  const res = response(); const next = jest.fn();
+  await createDocumentPolicy({ tenantId: 'assessment', verify: async () => ({ ...claims, operations: ['read', 'edit'] }), canWrite: async () => { throw new Error('unavailable'); } })(request({ method: 'PATCH', path: '/sections/s1' }), res as unknown as Response, next);
+  expect(res.status).toHaveBeenCalledWith(503); expect(next).not.toHaveBeenCalled();
+});
+it('leaves explicit reopen to the lifecycle owner/transition guard', async () => {
+  const res = response(); const next = jest.fn(); const canWrite = jest.fn(async () => false);
+  await createDocumentPolicy({ tenantId: 'assessment', verify: async () => ({ ...claims, operations: ['read', 'edit'] }), canWrite })(request({ method: 'POST', path: '/lifecycle/transitions', body: { action: 'reopen' } }), res as unknown as Response, next);
+  expect(canWrite).not.toHaveBeenCalled(); expect(next).toHaveBeenCalledTimes(1);
+});
