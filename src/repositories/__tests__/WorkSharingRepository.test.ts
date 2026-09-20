@@ -326,6 +326,38 @@ describe('WorkSharingRepository', () => {
     });
   });
 
+  it('does not authorize a page-one grant revoked before the next query page', async () => {
+    const memory = createMemoryClient();
+    const repository = new WorkSharingRepository(memory.client, 'test-work-graph');
+    await repository.putGrant(liveGrant(), null);
+    await repository.putGrant(liveGrant({ id: 'grant-2', selection: { nodeIds: ['node-2'], edgeIds: [], disclosure: 'details' } }), null);
+    const first = memory.rows.get('WGGRANT#org-1#owner-1|GRANT#grant-1')!;
+    const second = memory.rows.get('WGGRANT#org-1#owner-1|GRANT#grant-2')!;
+    memory.send.mockImplementation(async (command: PutCommand | QueryCommand | GetCommand) => {
+      if (command instanceof QueryCommand) {
+        expect(command.input.ConsistentRead).toBe(true);
+        if (!command.input.ExclusiveStartKey) {
+          return { Items: [first], LastEvaluatedKey: { PK: first['PK'], SK: first['SK'] } };
+        }
+        memory.rows.set('WGGRANT#org-1#owner-1|GRANT#grant-1', {
+          ...first,
+          grant: liveGrant({ state: 'stopped', revision: 2, updatedAt: NOW }),
+        });
+        return { Items: [second] };
+      }
+      if (command instanceof GetCommand) {
+        expect(command.input.ConsistentRead).toBe(true);
+        const key = `${String(command.input.Key?.['PK'])}|${String(command.input.Key?.['SK'])}`;
+        return { Item: memory.rows.get(key) };
+      }
+      throw new Error('unexpected write');
+    });
+
+    await expect(repository.listEffectiveGrants(
+      'org-1', 'owner-1', { viewerId: 'viewer-1', conversationIds: [] }, NOW,
+    )).resolves.toEqual([second['grant']]);
+  });
+
   it('never returns unknown persisted properties', async () => {
     const memory = createMemoryClient();
     const repository = new WorkSharingRepository(memory.client, 'test-work-graph');

@@ -392,10 +392,28 @@ export class WorkSharingRepository {
     } while (exclusiveStartKey);
 
     const nowMs = Date.parse(now);
-    return items.flatMap((item) => {
+    const candidates = items.flatMap((item) => {
       const grant = this.readStoredGrant(item, organizationId, ownerId);
       return grant && isEffectiveForViewer(grant, viewer, nowMs) ? [grant] : [];
     });
+
+    // Query pages are individually consistent, but a grant read on an early
+    // page may be revoked while later pages load. Validate each candidate
+    // against the base row after pagination before returning authority.
+    const effective: StoredWorkGrant[] = [];
+    for (const candidate of candidates) {
+      const response = await this.docClient.send(new GetCommand({
+        TableName: this.table,
+        Key: {
+          PK: ownerPartition(organizationId, ownerId),
+          SK: grantSortKey(candidate.id),
+        },
+        ConsistentRead: true,
+      }));
+      const current = this.readStoredGrant(response.Item, organizationId, ownerId, candidate.id);
+      if (current && isEffectiveForViewer(current, viewer, nowMs)) effective.push(current);
+    }
+    return effective;
   }
 
   /** Current owner controls. Stopped/expired rows remain durable audit data
