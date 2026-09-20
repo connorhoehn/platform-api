@@ -119,11 +119,15 @@ export interface CollaborationLifecycleEnforcer {
   revoked(request: WorkCollaborationRequest): Promise<void>;
 }
 
+export interface SharingLifecycleEnforcer {
+  revoked(grant: StoredWorkGrant): Promise<void>;
+}
+
 export type WorkGraphActionDescriptor =
   | { kind: 'route'; capability: WorkCollaborationCapability; path: string }
   | {
     kind: 'source-session';
-    capability: 'observe-terminal';
+    capability: 'observe-terminal' | 'control-terminal';
     sessionId: string;
     connectPath: string;
     expiresAt: string;
@@ -205,6 +209,7 @@ export interface WorkGraphOrchestratorDependencies {
   directory: WorkGraphDirectory;
   locator: WorkTargetLocator;
   collaborationLifecycle: CollaborationLifecycleEnforcer;
+  sharingLifecycle?: SharingLifecycleEnforcer;
   sourceAcls: ReadonlyMap<WorkSourceKind, WorkSourceAclAdapter>;
   sourceActions: ReadonlyMap<WorkSourceKind, WorkSourceActionAdapter>;
   cursorCodec: WorkGraphCursorCodec;
@@ -283,8 +288,8 @@ function validateActionDescriptor(
   }
   if (exactObject(value, ['kind', 'capability', 'sessionId', 'connectPath', 'expiresAt'])
     && value.kind === 'source-session'
-    && capability === 'observe-terminal'
-    && value.capability === 'observe-terminal'
+    && (capability === 'observe-terminal' || capability === 'control-terminal')
+    && value.capability === capability
     && typeof value.sessionId === 'string'
     && value.sessionId.length > 0
     && value.sessionId.length <= 128
@@ -295,7 +300,7 @@ function validateActionDescriptor(
     && Date.parse(value.expiresAt) > Date.parse(now)) {
     return {
       kind: 'source-session',
-      capability: 'observe-terminal',
+      capability,
       sessionId: value.sessionId,
       connectPath: value.connectPath,
       expiresAt: value.expiresAt,
@@ -569,7 +574,11 @@ export class WorkGraphOrchestrator {
       };
     }
     try {
-      return await this.deps.sharing.putGrant(next, current.revision);
+      const stored = await this.deps.sharing.putGrant(next, current.revision);
+      if ((stored.state === 'paused' || stored.state === 'stopped') && this.deps.sharingLifecycle) {
+        await this.deps.sharingLifecycle.revoked(stored);
+      }
+      return stored;
     } catch (error) {
       if ((error as { code?: string }).code === 'WORK_SHARING_REVISION_CONFLICT') {
         throw new WorkGraphConflictError('Sharing grant revision conflict.');

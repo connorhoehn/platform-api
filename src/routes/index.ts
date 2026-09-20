@@ -68,6 +68,7 @@ import { typedDocumentsRouter } from './typedDocuments';
 import { approvalsRouter } from './approvals';
 import { createWorkGraphRouter } from './work-graph';
 import { workGraphOrchestrator } from '../work-graph/runtime';
+import { workGraphComputeSessionsRouter } from './work-graph-compute-sessions';
 
 // Module-shaped pipeline router (Phase A of the distributed-core absorption
 // — see .planning/HANDOFF-distributed-core-platform-api-absorption.md). Lives
@@ -90,6 +91,7 @@ const router = Router();
 // the router additionally resolves the verified subject + organization into
 // server-owned memberships before every operation.
 router.use('/work-graph', createWorkGraphRouter(workGraphOrchestrator));
+router.use('/work-graph/compute-sessions', workGraphComputeSessionsRouter);
 
 // Before the `/documents/:documentId/...` routers, so `transform` is never read as an id.
 // The chat's /doc command → a pipeline run that edits the document as a collaborator.

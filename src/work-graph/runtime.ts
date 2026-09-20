@@ -1,17 +1,24 @@
 import { createHash, randomUUID } from 'crypto';
 import {
+  DeleteCommand,
   GetCommand,
   PutCommand,
+  QueryCommand,
   ScanCommand,
   type DynamoDBDocumentClient,
 } from '@aws-sdk/lib-dynamodb';
+import { SERVICE_AUTH_HEADER, signEnvelope } from '@connorhoehn/service-runtime';
 import { projectWorkEvent } from '@connorhoehn/realtime-modules/work-graph';
 import type { WorkGraphDeltaOperation } from '@connorhoehn/realtime-modules/work-graph';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { WorkGraphRepository, type WorkSourceKind } from '../repositories/WorkGraphRepository';
 import { WorkSharingRepository, type SharingAudience } from '../repositories/WorkSharingRepository';
-import { WorkCollaborationRepository, type WorkCollaborationCapability } from '../repositories/WorkCollaborationRepository';
+import {
+  WorkCollaborationRepository,
+  type WorkCollaborationCapability,
+  type WorkCollaborationRequest,
+} from '../repositories/WorkCollaborationRepository';
 import { WorkSourceAccountRepository } from '../repositories/WorkSourceAccountRepository';
 import { createWorkGraphCursorCodec } from './cursor';
 import {
@@ -41,6 +48,19 @@ type Ddb = DynamoDBDocumentClient;
 function sourceRefs(target: WorkAclTarget, source: WorkSourceKind): Array<{ source: WorkSourceKind; resourceId: string }> {
   if (target.kind === 'node') return target.sourceRef.source === source ? [target.sourceRef] : [];
   return target.endpointRefs.filter((ref) => ref.source === source);
+}
+
+function sourceOwnedResourceId(target: WorkAclTarget, source: WorkSourceKind, resourceId: string): string {
+  if (resourceId.includes(':') || target.kind !== 'node') return resourceId;
+  if (source === 'cloud-compute') {
+    if (target.node.kind === 'terminal') return `box:${resourceId}`;
+    if (target.node.kind === 'run') return `job:${resourceId}`;
+  }
+  if (source === 'local-compute') {
+    if (target.node.kind === 'terminal') return `machine:${resourceId}`;
+    if (target.node.kind === 'run') return `job:${resourceId}`;
+  }
+  return resourceId;
 }
 
 async function scanAll(
@@ -165,21 +185,57 @@ interface SourceAuthorization {
   capabilities: WorkCollaborationCapability[];
 }
 
+const COMPUTE_CAPABILITY_PATH = '/internal/work-graph/compute-capabilities';
+
+function computeSourceUrl(): string | null {
+  const value = process.env.WORK_GRAPH_COMPUTE_SOURCE_URL?.trim();
+  return value ? value.replace(/\/+$/, '') : null;
+}
+
+async function computeSourceCall<T>(path: string, body: Record<string, unknown>): Promise<{
+  decision: 'allow'; value: T;
+} | { decision: 'deny' | 'unavailable' }> {
+  const url = computeSourceUrl();
+  const secret = (process.env.WORK_GRAPH_SERVICE_AUTH_SECRET || process.env.SERVICE_AUTH_SECRET || '').trim();
+  if (!url || !secret) return { decision: 'unavailable' };
+  try {
+    const response = await fetch(`${url}${COMPUTE_CAPABILITY_PATH}/${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        [SERVICE_AUTH_HEADER]: signEnvelope(body, { secret, serviceId: 'platform-api' }),
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (response.status === 403 || response.status === 404) return { decision: 'deny' };
+    if (!response.ok) return { decision: 'unavailable' };
+    return { decision: 'allow', value: await response.json() as T };
+  } catch {
+    return { decision: 'unavailable' };
+  }
+}
+
 class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
   constructor(readonly source: WorkSourceKind, private readonly client: Ddb) {}
 
   async authorizeDisclosure(scope: WorkGraphPolicyScope, targets: WorkAclTarget[]): Promise<Map<string, WorkSourceAclDecision>> {
     const result = new Map<string, WorkSourceAclDecision>();
     for (const target of targets) {
-      const decisions = await Promise.all(sourceRefs(target, this.source).map((ref) => this.authorizeRef(scope, ref.resourceId)));
+      const decisions = await Promise.all(sourceRefs(target, this.source).map((ref) => this.authorizeRef(
+        scope,
+        sourceOwnedResourceId(target, this.source, ref.resourceId),
+      )));
       if (decisions.length === 0 || decisions.some((decision) => !decision.ownerValid)) {
         result.set(target.id, { targetId: target.id, decision: 'deny', policyRevision: scope.policyRevision });
         continue;
       }
       const direct = decisions.every((decision) => decision.viewerHasDirectAccess);
-      const capabilities = direct
-        ? decisions[0].capabilities.filter((capability) => decisions.every((decision) => decision.capabilities.includes(capability)))
-        : [];
+      // Capabilities describe source-supported collaboration choices. Direct
+      // access affects disclosure, but an active graph share must still be
+      // able to request a source-approved capability such as terminal control.
+      const capabilities = decisions[0].capabilities
+        .filter((capability) => decisions.every((decision) => decision.capabilities.includes(capability)));
       result.set(target.id, {
         targetId: target.id,
         decision: 'allow',
@@ -196,10 +252,12 @@ class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
     target: WorkAclTarget,
     capability: WorkCollaborationCapability,
   ): Promise<WorkPolicyDecision> {
-    const decisions = await Promise.all(sourceRefs(target, this.source).map((ref) => this.authorizeRef(scope, ref.resourceId)));
+    const decisions = await Promise.all(sourceRefs(target, this.source).map((ref) => this.authorizeRef(
+      scope,
+      sourceOwnedResourceId(target, this.source, ref.resourceId),
+    )));
     return decisions.length > 0
       && decisions.every((decision) => decision.ownerValid
-        && decision.viewerHasDirectAccess
         && decision.capabilities.includes(capability))
       ? 'allow'
       : 'deny';
@@ -269,15 +327,34 @@ class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
         capabilities: resourceId.startsWith('transcript:') ? ['view-transcript'] : ['join-meeting'],
       };
     }
-    // Compute events reached projection only after the durable source-account
-    // join bound their machine/runtime subject to this actor and organization.
-    // Disclosure is therefore source-owner validated, while interactive access
-    // stays absent until AgentCore exposes a capability session endpoint.
-    return {
-      ownerValid: true,
-      viewerHasDirectAccess: scope.viewerId === scope.personId,
-      capabilities: [],
-    };
+    const candidates = resourceId.includes(':')
+      ? [resourceId]
+      : this.source === 'cloud-compute'
+        ? [`box:${resourceId}`, `job:${resourceId}`]
+        : [`machine:${resourceId}`, `job:${resourceId}`];
+    let unavailable = false;
+    for (const candidate of candidates) {
+      const response = await computeSourceCall<{
+        allowed: boolean;
+        directAccess: boolean;
+        capabilities: WorkCollaborationCapability[];
+      }>('authorize', {
+        requestId: randomUUID(),
+        organizationId: scope.organizationId,
+        viewerId: scope.viewerId,
+        personId: scope.personId,
+        resource: { source: this.source, resourceId: candidate },
+      });
+      if (response.decision === 'unavailable') { unavailable = true; continue; }
+      if (response.decision !== 'allow' || response.value.allowed !== true) continue;
+      return {
+        ownerValid: true,
+        viewerHasDirectAccess: response.value.directAccess === true,
+        capabilities: response.value.capabilities.filter((value) => value === 'observe-terminal' || value === 'control-terminal'),
+      };
+    }
+    if (unavailable) throw new Error('compute source authorization unavailable');
+    return { ownerValid: false, viewerHasDirectAccess: false, capabilities: [] };
   }
 }
 
@@ -285,12 +362,13 @@ class DynamoSourceActionAdapter implements WorkSourceActionAdapter {
   constructor(readonly source: WorkSourceKind, private readonly client: Ddb) {}
 
   async exchangeAction(
-    _scope: WorkGraphPolicyScope,
+    scope: WorkGraphPolicyScope,
     target: WorkAclTarget,
     capability: WorkCollaborationCapability,
+    acceptedRequest?: WorkCollaborationRequest,
   ): Promise<{ decision: 'allow'; descriptor: unknown } | { decision: 'deny' | 'unavailable' }> {
     if (target.kind !== 'node' || target.sourceRef.source !== this.source) return { decision: 'deny' };
-    const resourceId = target.sourceRef.resourceId;
+    const resourceId = sourceOwnedResourceId(target, this.source, target.sourceRef.resourceId);
     if (this.source === 'document' && (capability === 'view-document' || capability === 'edit-document')) {
       const documentId = resourceId.includes(':') ? resourceId.slice(0, resourceId.lastIndexOf(':')) : resourceId;
       return { decision: 'allow', descriptor: { kind: 'route', capability, path: `/documents/${encodeURIComponent(documentId)}` } };
@@ -318,8 +396,174 @@ class DynamoSourceActionAdapter implements WorkSourceActionAdapter {
       if (typeof row?.recordingId !== 'string') return { decision: 'deny' };
       return { decision: 'allow', descriptor: { kind: 'route', capability, path: `/social/recordings/${encodeURIComponent(row.recordingId)}` } };
     }
+    if ((this.source === 'cloud-compute' || this.source === 'local-compute')
+      && (capability === 'observe-terminal' || capability === 'control-terminal')) {
+      if (capability === 'control-terminal' && !acceptedRequest) return { decision: 'deny' };
+      const requestKey = acceptedRequest?.id ?? randomUUID();
+      const sourceRequestId = randomUUID();
+      const requestedExpiresAt = acceptedRequest?.expiresAt
+        ?? new Date(Date.now() + 5 * 60_000).toISOString();
+      const opened = await computeSourceCall<{
+        allowed: boolean;
+        session: { sessionId: string; capability: 'observe' | 'control'; expiresAt: string; active: boolean };
+      }>('open', {
+        requestId: sourceRequestId,
+        organizationId: scope.organizationId,
+        viewerId: scope.viewerId,
+        personId: scope.personId,
+        resource: { source: this.source, resourceId },
+        capability: capability === 'control-terminal' ? 'control' : 'observe',
+        expiresAt: requestedExpiresAt,
+      });
+      if (opened.decision !== 'allow') return { decision: opened.decision };
+      if (opened.value.allowed !== true
+        || typeof opened.value.session?.sessionId !== 'string'
+        || typeof opened.value.session.expiresAt !== 'string') return { decision: 'unavailable' };
+      const sessionId = opened.value.session.sessionId;
+      await this.client.send(new PutCommand({
+        TableName: WORK_GRAPH_TABLE,
+        Item: {
+          PK: `WGCAPABILITY#${scope.organizationId}#${scope.personId}`,
+          SK: `REQUEST#${requestKey}#SESSION#${sessionId}`,
+          itemKind: 'work-capability-session',
+          organizationId: scope.organizationId,
+          viewerId: scope.viewerId,
+          personId: scope.personId,
+          requestKey,
+          sessionId,
+          source: this.source,
+          capability,
+          expiresAt: opened.value.session.expiresAt,
+          ttl: Math.floor(Date.parse(opened.value.session.expiresAt) / 1_000),
+        },
+        ConditionExpression: 'attribute_not_exists(PK) AND attribute_not_exists(SK)',
+      }));
+      return {
+        decision: 'allow',
+        descriptor: {
+          kind: 'source-session', capability, sessionId,
+          connectPath: `/social/work-graph/compute/${encodeURIComponent(scope.personId)}/${encodeURIComponent(requestKey)}/${encodeURIComponent(sessionId)}`,
+          expiresAt: opened.value.session.expiresAt,
+        },
+      };
+    }
     return { decision: 'unavailable' };
   }
+}
+
+export interface StoredComputeCapabilitySession {
+  organizationId: string;
+  viewerId: string;
+  personId: string;
+  requestKey: string;
+  sessionId: string;
+  source: 'cloud-compute' | 'local-compute';
+  capability: 'observe-terminal' | 'control-terminal';
+  expiresAt: string;
+}
+
+function readComputeSession(value: Record<string, unknown> | undefined): StoredComputeCapabilitySession | null {
+  if (!value || value.itemKind !== 'work-capability-session'
+    || typeof value.organizationId !== 'string' || typeof value.viewerId !== 'string'
+    || typeof value.personId !== 'string' || typeof value.requestKey !== 'string'
+    || typeof value.sessionId !== 'string' || typeof value.expiresAt !== 'string'
+    || (value.source !== 'cloud-compute' && value.source !== 'local-compute')
+    || (value.capability !== 'observe-terminal' && value.capability !== 'control-terminal')) return null;
+  return value as unknown as StoredComputeCapabilitySession;
+}
+
+function computeSessionKey(
+  organizationId: string,
+  personId: string,
+  requestKey: string,
+  sessionId: string,
+): { PK: string; SK: string } {
+  return {
+    PK: `WGCAPABILITY#${organizationId}#${personId}`,
+    SK: `REQUEST#${requestKey}#SESSION#${sessionId}`,
+  };
+}
+
+export async function loadComputeCapabilitySession(
+  organizationId: string,
+  viewerId: string,
+  personId: string,
+  requestKey: string,
+  sessionId: string,
+): Promise<StoredComputeCapabilitySession | null> {
+  const result = await docClient.send(new GetCommand({
+    TableName: WORK_GRAPH_TABLE,
+    Key: computeSessionKey(organizationId, personId, requestKey, sessionId),
+    ConsistentRead: true,
+  }));
+  const session = readComputeSession(result.Item);
+  return session
+    && session.organizationId === organizationId
+    && session.viewerId === viewerId
+    && session.personId === personId
+    && session.requestKey === requestKey
+    && session.sessionId === sessionId
+    && Date.parse(session.expiresAt) > Date.now()
+    ? session : null;
+}
+
+export async function useComputeCapabilitySession(
+  session: StoredComputeCapabilitySession,
+): Promise<{ allowed: true; result?: { status?: string; cancelled?: boolean } } | { allowed: false }> {
+  const response = await computeSourceCall<{
+    allowed: boolean;
+    result?: { status?: string; cancelled?: boolean };
+  }>('use', {
+    requestId: randomUUID(),
+    sessionId: session.sessionId,
+    capability: session.capability === 'control-terminal' ? 'control' : 'observe',
+  });
+  if (response.decision !== 'allow' || response.value.allowed !== true) return { allowed: false };
+  return { allowed: true, ...(response.value.result ? { result: response.value.result } : {}) };
+}
+
+export async function revalidateComputeCapabilitySession(
+  session: StoredComputeCapabilitySession,
+): Promise<boolean> {
+  const response = await computeSourceCall<{ allowed: boolean }>('revalidate', {
+    requestId: randomUUID(), sessionId: session.sessionId,
+  });
+  return response.decision === 'allow' && response.value.allowed === true;
+}
+
+export async function closeComputeCapabilitySession(session: StoredComputeCapabilitySession): Promise<void> {
+  await docClient.send(new DeleteCommand({
+    TableName: WORK_GRAPH_TABLE,
+    Key: computeSessionKey(session.organizationId, session.personId, session.requestKey, session.sessionId),
+  }));
+  await computeSourceCall('close', { requestId: randomUUID(), sessionId: session.sessionId });
+}
+
+async function closeComputeSessions(
+  organizationId: string,
+  personId: string,
+  requestKey?: string,
+): Promise<void> {
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  do {
+    const result = await docClient.send(new QueryCommand({
+      TableName: WORK_GRAPH_TABLE,
+      KeyConditionExpression: requestKey
+        ? 'PK = :pk AND begins_with(SK, :request)'
+        : 'PK = :pk',
+      ExpressionAttributeValues: {
+        ':pk': `WGCAPABILITY#${organizationId}#${personId}`,
+        ...(requestKey ? { ':request': `REQUEST#${requestKey}#` } : {}),
+      },
+      ConsistentRead: true,
+      ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+    }));
+    for (const item of result.Items ?? []) {
+      const session = readComputeSession(item);
+      if (session) await closeComputeCapabilitySession(session);
+    }
+    exclusiveStartKey = result.LastEvaluatedKey;
+  } while (exclusiveStartKey);
 }
 
 const graphRepository = new WorkGraphRepository(docClient, projectWorkEvent);
@@ -352,7 +596,14 @@ export const workGraphOrchestrator = new WorkGraphOrchestrator({
     // the durable request. A rejected notification can delay closure but can
     // never make a revoked request usable again.
     async accepted() {},
-    async revoked() {},
+    async revoked(request) {
+      await closeComputeSessions(request.organizationId, request.ownerId, request.id);
+    },
+  },
+  sharingLifecycle: {
+    async revoked(grant) {
+      await closeComputeSessions(grant.organizationId, grant.ownerId);
+    },
   },
   sourceAcls,
   sourceActions,
