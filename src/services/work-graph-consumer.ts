@@ -71,6 +71,23 @@ function verifyEnvelope(envelope: EventEnvelope<unknown>): AuthenticatedWorkEven
   return event;
 }
 
+function verifyDirectEvent(payload: unknown, authenticatedServiceId: string): AuthenticatedWorkEvent {
+  if (!isWithinWorkGraphEventLimit(payload)) {
+    throw new WorkGraphIngestionDeniedError('payload-too-large');
+  }
+  const parsed = validateAuthenticatedWorkEvent(payload);
+  if (!parsed.ok) throw new WorkGraphIngestionDeniedError('invalid-payload');
+  const event = parsed.value;
+  const expectedProducer = PRODUCER_BY_SOURCE[event.source];
+  if (authenticatedServiceId !== expectedProducer
+    || event.producer.serviceId !== authenticatedServiceId
+    || event.source !== event.payload.kind
+    || event.source !== event.resource.source) {
+    throw new WorkGraphIngestionDeniedError('producer-or-source-mismatch');
+  }
+  return event;
+}
+
 async function commitWithRetry(
   repository: ProjectionRepository,
   event: AuthenticatedWorkEvent,
@@ -86,6 +103,46 @@ async function commitWithRetry(
       if ((error as { name?: string })?.name !== 'WorkGraphConcurrencyError' || attempt === maximumAttempts) throw error;
     }
   }
+}
+
+async function authorizeAndCommit(
+  repository: ProjectionRepository,
+  accountResolver: SourceAccountResolver,
+  event: AuthenticatedWorkEvent,
+): Promise<void> {
+  const mapped = await accountResolver.resolve(
+    event.source,
+    event.producer.serviceId,
+    event.producer.organizationId,
+    event.actor.sourceSubject,
+  );
+  if (!mapped) throw new WorkGraphIngestionDeniedError('source-account-unmapped');
+  if (mapped.organizationId !== event.actor.organizationId
+    || mapped.organizationId !== event.producer.organizationId
+    || mapped.actorId !== event.actor.actorId) {
+    throw new WorkGraphIngestionDeniedError('source-account-claim-mismatch');
+  }
+  await commitWithRetry(repository, event);
+}
+
+/**
+ * Synchronous authenticated HTTP ingestion used by non-platform producers.
+ * A 2xx is returned only after the server-owned account join and atomic
+ * projection/outbox commit have completed.
+ */
+export async function ingestAuthenticatedWorkEvent(options: {
+  payload: unknown;
+  authenticatedServiceId: string;
+  repository: Pick<WorkGraphRepository, 'loadProjection' | 'commitEvent'>;
+  accountResolver: Pick<WorkSourceAccountRepository, 'resolve'>;
+}): Promise<AuthenticatedWorkEvent> {
+  const event = verifyDirectEvent(options.payload, options.authenticatedServiceId);
+  await authorizeAndCommit(
+    options.repository as ProjectionRepository,
+    options.accountResolver as SourceAccountResolver,
+    event,
+  );
+  return event;
 }
 
 /**
@@ -104,24 +161,11 @@ export function startWorkGraphConsumer(options: {
     WORK_GRAPH_PROJECTION_QUEUE,
     async (envelope) => {
       const event = verifyEnvelope(envelope);
-      const mapped = await (options.accountResolver as SourceAccountResolver).resolve(
-        event.source,
-        event.producer.serviceId,
-        event.producer.organizationId,
-        event.actor.sourceSubject,
+      await authorizeAndCommit(
+        options.repository as ProjectionRepository,
+        options.accountResolver as SourceAccountResolver,
+        event,
       );
-      if (!mapped) throw new WorkGraphIngestionDeniedError('source-account-unmapped');
-
-      // The producer is authenticated by envelope metadata, but neither it nor
-      // the browser chooses the platform actor. A mismatch is quarantined via
-      // queue retry/DLQ instead of accepting the producer's claims.
-      if (mapped.organizationId !== event.actor.organizationId
-        || mapped.organizationId !== event.producer.organizationId
-        || mapped.actorId !== event.actor.actorId) {
-        throw new WorkGraphIngestionDeniedError('source-account-claim-mismatch');
-      }
-
-      await commitWithRetry(options.repository as ProjectionRepository, event);
     },
     { pollingInterval: options.pollingInterval ?? 1_000, batchSize: 10, visibilityTimeout: 30 },
   );

@@ -22,13 +22,17 @@ import log from './lib/logger';
 import { assertRequiredInProd } from 'distributed-core';
 import { createShutdownManager, drainHttpServer } from '@connorhoehn/service-runtime';
 import { RetryManager } from 'distributed-core/transport';
-import { connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
+import { catalog, connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
 import { ensureOutboxTTL, ensureVideoSessionsTTL, ensurePipelineRunsTTL } from './lib/dynamo-setup';
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { startActivityConsumer } from './services/activity-consumer';
 import { startSummaryProjector } from './services/summary-projector';
 import { startCallReactionConsumer } from './services/call-reaction-consumer';
+import { startWorkGraphConsumer } from './services/work-graph-consumer';
+import { startWorkGraphOutboxDrainer } from './services/work-graph-outbox-drainer';
+import { WorkSourceAccountRepository } from './repositories/WorkSourceAccountRepository';
+import { workGraphRepository } from './work-graph/runtime';
 import { createPipelineConfigRegistration } from './control-plane/pipeline-config-subscriber';
 import { createFileUploadEndpointRegistration } from './control-plane/file-upload-subscriber';
 import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
@@ -188,11 +192,30 @@ const catalogRetry = new RetryManager({
 let activityConsumer: { stop: () => Promise<void> } | null = null;
 let summaryProjector: { stop: () => Promise<void> } | null = null;
 let callReactionConsumer: { stop: () => Promise<void> } | null = null;
+let workGraphConsumer: { stop: () => Promise<void> } | null = null;
+let workGraphOutboxDrainer: { stop: () => void } | null = null;
 
 (async () => {
   try {
     await catalogRetry.execute(() => connectCatalog());
     log.info('event-catalog connected');
+    if (process.env.ACTIVE_NOW_WORK_GRAPH_ENABLED === 'true') {
+      try {
+        // Do not consume before the projection table and all lookup indexes
+        // exist. A failed source dependency leaves the feature fail-closed.
+        await ensureWorkGraphTable(ddbClient);
+        workGraphConsumer = startWorkGraphConsumer({
+          transport: catalog.getDurableTransport(),
+          repository: workGraphRepository,
+          accountResolver: new WorkSourceAccountRepository(docClient),
+        });
+        workGraphOutboxDrainer = startWorkGraphOutboxDrainer();
+        log.info('work-graph consumer and outbox drainer started');
+      } catch (err: unknown) {
+        const e = err as { message?: string };
+        log.error({ errMessage: e?.message }, 'work-graph runtime failed to start; feature is unavailable');
+      }
+    }
     // Phase 57b — start the activity.recorded consumer after the catalog
     // has connected. Non-fatal — if the subscribe throws (e.g. event not
     // declared, durable transport down), we log and continue without it.
@@ -466,6 +489,10 @@ sd.register('activity-consumer', async () => {
   if (activityConsumer) await activityConsumer.stop();
   if (summaryProjector) await summaryProjector.stop();
   if (callReactionConsumer) await callReactionConsumer.stop();
+});
+sd.register('work-graph', async () => {
+  workGraphOutboxDrainer?.stop();
+  if (workGraphConsumer) await workGraphConsumer.stop();
 });
 sd.register('outbox-drainer', () => { drainer.stop(); });
 sd.register('pipeline', async () => {

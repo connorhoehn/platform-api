@@ -637,7 +637,11 @@ catalog.declareAll(pipelineEventDeclarations);
 // the declaration's queue through getDurableTransport(); this installed
 // event-catalog version's high-level subscribe(eventName) derives a queue name
 // and does not honor a declaration-level queue override.
-catalog.declareAll([...workGraphEventDeclarations]);
+// event-catalog 0.3.x's fingerprint walker treats repeated object references
+// as cycles even when the declaration is valid JSON. The shared contract
+// intentionally reuses schema fragments, so materialize each declaration as
+// its wire-equivalent JSON value before registration.
+catalog.declareAll(JSON.parse(JSON.stringify(workGraphEventDeclarations)));
 
 // ---------------------------------------------------------------------------
 // Lifecycle

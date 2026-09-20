@@ -145,9 +145,36 @@ export class WorkSourceAccountRepository {
     subject: string;
     updatedAt?: string;
   }): Promise<boolean> {
+    return this.ensureVerifiedSourcePrincipal({
+      ...input,
+      producerServiceId: 'platform-api',
+    });
+  }
+
+  /**
+   * Create-only join for a principal independently verified by platform auth.
+   * Callers must not pass a producer event claim here; runtime uses this only
+   * while resolving an authenticated platform viewer.
+   */
+  async ensureVerifiedSourcePrincipal(input: {
+    source: WorkSourceKind;
+    producerServiceId: 'platform-api' | 'websocket-gateway' | 'aws-agentcore';
+    organizationId: string;
+    subject: string;
+    updatedAt?: string;
+  }): Promise<boolean> {
+    const expectedService: Record<WorkSourceKind, typeof input.producerServiceId> = {
+      pipeline: 'platform-api',
+      meeting: 'platform-api',
+      document: 'websocket-gateway',
+      conversation: 'websocket-gateway',
+      'cloud-compute': 'aws-agentcore',
+      'local-compute': 'aws-agentcore',
+    };
+    if (input.producerServiceId !== expectedService[input.source]) return false;
     const mapping: WorkSourceAccountMapping = {
       source: input.source,
-      producerServiceId: 'platform-api',
+      producerServiceId: input.producerServiceId,
       producerOrganizationId: input.organizationId,
       sourceSubject: input.subject,
       organizationId: input.organizationId,
@@ -161,7 +188,7 @@ export class WorkSourceAccountRepository {
     } catch (error) {
       if (!(error instanceof WorkSourceAccountConflictError)) throw error;
       const current = await this.resolve(
-        input.source, 'platform-api', input.organizationId, input.subject,
+        input.source, input.producerServiceId, input.organizationId, input.subject,
       );
       // Existing joins must be exactly the authenticated principal. Do not
       // overwrite a corrupted or differently-owned mapping.

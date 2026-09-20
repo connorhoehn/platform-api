@@ -11,6 +11,7 @@ import { pipelineWebhooksRouter } from './routes/pipelineWebhooks';
 import { renderPrometheusText } from './observability/metrics';
 import { createCapabilitiesRouter } from './routes/capabilities';
 import { definitionsRepo } from './pipeline/definitions-repository';
+import { internalWorkGraphRouter } from './routes/internal-work-graph';
 
 /**
  * Which requests the GLOBAL `express.json()` is allowed to consume.
@@ -96,6 +97,11 @@ export function createApp(): express.Application {
     res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
     res.status(200).send(renderPrometheusText());
   });
+
+  // Gateway-only signed projection authorization/replay boundary. This is
+  // deliberately mounted before Cognito auth because the caller is a service,
+  // while every request is still bound to a verified socket identity.
+  app.use('/internal/work-graph', internalWorkGraphRouter);
 
   // Pipeline webhooks — public endpoints (no auth) for external systems to
   // fire pipelines. Mounted BEFORE requireAuth because webhook callers don't

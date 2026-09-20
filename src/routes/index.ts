@@ -66,6 +66,8 @@ import { pipelinePreviewVisionRouter } from './pipeline-preview-vision';
 import { documentTypesRouter } from './documentTypes';
 import { typedDocumentsRouter } from './typedDocuments';
 import { approvalsRouter } from './approvals';
+import { createWorkGraphRouter } from './work-graph';
+import { workGraphOrchestrator } from '../work-graph/runtime';
 
 // Module-shaped pipeline router (Phase A of the distributed-core absorption
 // — see .planning/HANDOFF-distributed-core-platform-api-absorption.md). Lives
@@ -83,6 +85,11 @@ import type {
 } from '../pipeline/http/contracts';
 
 const router = Router();
+
+// Active now work graph. Authentication is applied at the application mount;
+// the router additionally resolves the verified subject + organization into
+// server-owned memberships before every operation.
+router.use('/work-graph', createWorkGraphRouter(workGraphOrchestrator));
 
 // Before the `/documents/:documentId/...` routers, so `transform` is never read as an id.
 // The chat's /doc command → a pipeline run that edits the document as a collaborator.

@@ -1,6 +1,7 @@
 import type { EventEnvelope } from '@connorhoehn/event-catalog';
 import type { AuthenticatedWorkEvent, WorkProjectionState } from '@connorhoehn/realtime-modules/work-graph';
 import {
+  ingestAuthenticatedWorkEvent,
   startWorkGraphConsumer,
   WorkGraphIngestionDeniedError,
   WORK_GRAPH_PROJECTION_QUEUE,
@@ -99,5 +100,51 @@ describe('work-graph durable consumer', () => {
     await h.run(envelope());
     expect(h.repository.commitEvent).toHaveBeenNthCalledWith(1, expect.anything(), 0);
     expect(h.repository.commitEvent).toHaveBeenNthCalledWith(2, expect.anything(), 1);
+  });
+});
+
+describe('work-graph authenticated HTTP ingestion', () => {
+  const directHarness = () => ({
+    repository: {
+      loadProjection: jest.fn().mockResolvedValue(null),
+      commitEvent: jest.fn().mockResolvedValue({}),
+    },
+    accountResolver: {
+      resolve: jest.fn().mockResolvedValue({ organizationId: 'org-1', actorId: 'actor-1' }),
+    },
+  });
+
+  it('commits only after the authenticated service and durable account mapping both match', async () => {
+    const h = directHarness();
+    await expect(ingestAuthenticatedWorkEvent({
+      payload: event(),
+      authenticatedServiceId: 'aws-agentcore',
+      ...h,
+    })).resolves.toEqual(expect.objectContaining({ eventId: 'event-1' }));
+    expect(h.accountResolver.resolve).toHaveBeenCalledWith(
+      'cloud-compute', 'aws-agentcore', 'org-1', 'subject-1',
+    );
+    expect(h.repository.commitEvent).toHaveBeenCalledWith(expect.anything(), 0);
+  });
+
+  it('rejects a correctly signed service presenting a source owned by another producer', async () => {
+    const h = directHarness();
+    await expect(ingestAuthenticatedWorkEvent({
+      payload: event(),
+      authenticatedServiceId: 'websocket-gateway',
+      ...h,
+    })).rejects.toEqual(expect.objectContaining({ reason: 'producer-or-source-mismatch' }));
+    expect(h.accountResolver.resolve).not.toHaveBeenCalled();
+  });
+
+  it('rejects arbitrary claimed actor and organization values despite service authentication', async () => {
+    const h = directHarness();
+    h.accountResolver.resolve.mockResolvedValue({ organizationId: 'org-1', actorId: 'actor-2' });
+    await expect(ingestAuthenticatedWorkEvent({
+      payload: event(),
+      authenticatedServiceId: 'aws-agentcore',
+      ...h,
+    })).rejects.toEqual(expect.objectContaining({ reason: 'source-account-claim-mismatch' }));
+    expect(h.repository.commitEvent).not.toHaveBeenCalled();
   });
 });

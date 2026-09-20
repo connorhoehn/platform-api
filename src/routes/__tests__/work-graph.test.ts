@@ -367,7 +367,7 @@ describe('work graph authenticated routes', () => {
     );
     expect(result.statusCode).toBe(200);
     expect((result.body as { nodes: unknown[] }).nodes).toEqual([{
-      id: 'work_placeholder_1',
+      id: expect.stringMatching(/^wg_placeholder_[0-9a-f]{64}$/),
       kind: 'task',
       title: 'Shared work item',
       status: 'idle',

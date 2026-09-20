@@ -704,7 +704,10 @@ export class WorkGraphRepository {
       || throughWatermark < afterWatermark
       || !Number.isSafeInteger(limit)
       || limit < 1
-      || limit > 1_000) throw new RangeError('Invalid work graph replay range');
+      // The gateway deliberately requests one item beyond its 1,000-batch
+      // delivery ceiling so it can distinguish a complete replay from a
+      // silently truncated one.
+      || limit > 1_001) throw new RangeError('Invalid work graph replay range');
     if (throughWatermark === afterWatermark) return { batches: [], complete: true };
 
     const pk = partitionKey(organizationId, actorId, day);

@@ -96,4 +96,31 @@ describe('WorkSourceAccountRepository', () => {
       mapping: expect.objectContaining({ actorId: 'user-1', sourceSubject: 'user-1' }),
     });
   });
+
+  it('allows only the fixed producer for externally verified source principals', async () => {
+    const send = jest.fn().mockResolvedValue({});
+    const repository = new WorkSourceAccountRepository({ send } as unknown as DynamoDBDocumentClient);
+    await expect(repository.ensureVerifiedSourcePrincipal({
+      source: 'conversation',
+      producerServiceId: 'websocket-gateway',
+      organizationId: 'org-1',
+      subject: 'user-1',
+    })).resolves.toBe(true);
+    expect((send.mock.calls[0][0] as PutCommand).input.Item).toMatchObject({
+      mapping: expect.objectContaining({
+        producerServiceId: 'websocket-gateway',
+        organizationId: 'org-1',
+        actorId: 'user-1',
+        sourceSubject: 'user-1',
+      }),
+    });
+
+    await expect(repository.ensureVerifiedSourcePrincipal({
+      source: 'conversation',
+      producerServiceId: 'aws-agentcore',
+      organizationId: 'org-1',
+      subject: 'user-1',
+    })).resolves.toBe(false);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
 });
