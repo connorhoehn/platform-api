@@ -14,6 +14,7 @@ import {
 import { workGraphEventDeclarations } from '@connorhoehn/realtime-modules/work-graph';
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
+import { createServiceRequestHeaders } from '@connorhoehn/service-runtime';
 import { docClient } from './aws-clients';
 import { tableName } from './ddb-table-name';
 import log from './logger';
@@ -28,7 +29,10 @@ const EVENT_CATALOG_URL = process.env.EVENT_CATALOG_URL ?? '';
 
 export const catalog = new EventCatalog({
   redis: { url: REDIS_URL },
-  messageQueue: { url: MESSAGE_QUEUE_URL },
+  messageQueue: { url: MESSAGE_QUEUE_URL,
+    requestHeaders: process.env.MQ_SERVICE_AUTH_SECRET?.trim() ? createServiceRequestHeaders({
+      secret: process.env.MQ_SERVICE_AUTH_SECRET, serviceId: 'platform-api', audience: 'message-queue',
+    }) : undefined },
   serviceName: 'platform-api',
   registryUrl: EVENT_CATALOG_URL || undefined,
 });

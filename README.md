@@ -255,3 +255,11 @@ using the installed library. Its evidence records the exact image IDs. This
 is isolated local acceptance, not a production authentication or AWS deployment
 claim. Strict compilation and 57 consumer/outbox/projector tests pass (one
 integration test skipped).
+
+For authenticated MQ, provide `MQ_SERVICE_AUTH_SECRET` matching the receiver
+and allow `platform-api` in its service allowlist. Catalog queue operations
+use request-bound HMAC signatures through the existing service-runtime helper.
+Provide `EVENT_CATALOG_AUTH_TOKEN` separately for registry registration and
+heartbeats; event-catalog already forwards that credential. These backend keys
+must never be delivered to browser clients. User authorization remains the
+API/identity layer's responsibility.
