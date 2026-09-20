@@ -194,7 +194,20 @@ Used for pub/sub event delivery to websocket-gateway. Not used for caching or se
 Primary persistence layer for all domains. Tables are prefixed with `DDB_TABLE_PREFIX` when running against shared DynamoDB-local.
 
 ### Docker build auth
-The image is built with BuildKit and uses SSH agent forwarding so `npm install` can fetch the four github: pins above from the private repos. Invoke with `DOCKER_BUILDKIT=1 docker build --ssh default -f platform-api/Dockerfile -t platform-api .` so the host's `ssh-agent` is forwarded into the `RUN --mount=type=ssh` steps. See the `Dockerfile` header for the exact build invocation.
+The image is built with BuildKit and uses SSH agent forwarding so `npm ci` can fetch the committed Git dependencies from the private repos. Invoke with `DOCKER_BUILDKIT=1 docker build --ssh default -f platform-api/Dockerfile -t platform-api .` so the host's `ssh-agent` is forwarded into the `RUN --mount=type=ssh` steps. See the `Dockerfile` header for the exact build invocation.
+
+The build and runtime stages now use the same committed `package-lock.json`
+with `npm ci --legacy-peer-deps`. TypeScript errors fail the Docker build;
+merely emitting `dist/index.js` is insufficient. The previous lockfile bypass
+worked around an obsolete service-runtime file dependency and is no longer
+needed by the current pins. Base image tags and globally installed development
+tools still need immutable release pinning before production publication.
+
+For a fresh local schema and crash-recovery acceptance run, use
+[the middleware foundation](https://github.com/connorhoehn/realtime-examples/tree/main/examples/middleware-foundation).
+Its application profile tests team, owner membership and General-channel reads
+after replacing the API and database containers. This development profile is
+not production authentication acceptance.
 
 ## Testing
 
@@ -210,7 +223,8 @@ Tests use Jest with `ts-jest` transformer. Test files live in `src/__tests__/` a
 ### Docker
 
 ```bash
-docker build -t platform-api .
+# From the parent directory containing platform-api/
+docker build --ssh default -f platform-api/Dockerfile -t platform-api .
 docker run -p 3001:3001 \
   -e COGNITO_REGION=us-east-1 \
   -e COGNITO_USER_POOL_ID=<pool-id> \

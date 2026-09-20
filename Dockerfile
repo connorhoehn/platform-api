@@ -42,28 +42,13 @@ RUN apk add --no-cache git openssh-client python3 make g++ \
 # writable in every stage.
 ENV GIT_SSH_COMMAND="ssh -o ControlMaster=auto -o ControlPath=/tmp/gh-%r@%h:%p -o ControlPersist=600"
 WORKDIR /app
-# Lockfile intentionally NOT copied into the build context. npm 10.8.2
-# (node:20-alpine) crashes with "Cannot destructure property 'package'
-# of 'node.target' as it is null" when reifying a lockfile that mixes
-# github: deps with transitive `file:` peer references (service-runtime
-# v0.2.4's published package.json declares distributed-core as
-# `file:../distributed-core` in its peers). The gateway Dockerfile uses
-# the same workaround — `src/package-lock.json` is git-ignored / deleted
-# pre-build for the same reason. SSH agent forwarding is required for
-# the private repo pins (--ssh default at the host).
-COPY platform-api/package.json ./
-# --legacy-peer-deps matches the project's resolution mode, the same as the
-# gateway Dockerfile. Without it this image is the ONLY place that resolves
-# peers strictly, so it fails on conflicts every local `npm install` accepts —
-# a build break that cannot be reproduced outside Docker.
-#
-# The live one: @connorhoehn/pipeline-runtime declares its peer on
-# distributed-core as an EXACT SHA, so any DC bump anywhere makes this install
-# unsatisfiable even though the code is fine.
-RUN --mount=type=ssh npm install --legacy-peer-deps --ignore-scripts
+# Resolve exactly the committed graph in build and runtime. The old
+# npm-10/file-peer workaround does not apply to the current service-runtime pin.
+COPY platform-api/package.json platform-api/package-lock.json ./
+RUN --mount=type=ssh npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
 COPY platform-api/tsconfig.json platform-api/tsconfig.build.json ./
 COPY platform-api/src/ ./src/
-RUN npx tsc --project tsconfig.build.json; test -f dist/index.js
+RUN npm run build && test -f dist/index.js
 
 # Stage 2: Runtime
 FROM node:20-alpine
@@ -83,9 +68,8 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN npm install -g typescript@~5.6.3
 RUN addgroup -g 1001 -S nodejs && adduser -S platformapi -u 1001 -G nodejs
 WORKDIR /app
-COPY platform-api/package.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
-# See build-stage comment for why the lockfile isn't copied.
-RUN --mount=type=ssh npm install --omit=dev --legacy-peer-deps --ignore-scripts && npm cache clean --force
+COPY platform-api/package.json platform-api/package-lock.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
+RUN --mount=type=ssh npm ci --omit=dev --legacy-peer-deps --ignore-scripts --no-audit --no-fund && npm cache clean --force
 COPY --from=build /app/dist ./dist/
 COPY platform-api/src/ ./src/
 RUN chown -R platformapi:nodejs /app
