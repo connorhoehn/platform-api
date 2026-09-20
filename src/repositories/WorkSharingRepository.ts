@@ -398,6 +398,39 @@ export class WorkSharingRepository {
     });
   }
 
+  /** Current owner controls. Stopped/expired rows remain durable audit data
+   * but are not returned as mutable UI state. */
+  async listOwnedGrants(
+    organizationId: string,
+    ownerId: string,
+    now: string,
+  ): Promise<StoredWorkGrant[]> {
+    if (!isId(organizationId) || !isId(ownerId) || !isTimestamp(now)) return [];
+    const grants: StoredWorkGrant[] = [];
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const response = await this.docClient.send(new QueryCommand({
+        TableName: this.table,
+        KeyConditionExpression: 'PK = :partition AND begins_with(SK, :grantPrefix)',
+        ExpressionAttributeValues: {
+          ':partition': ownerPartition(organizationId, ownerId),
+          ':grantPrefix': 'GRANT#',
+        },
+        ConsistentRead: true,
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }));
+      for (const item of response.Items ?? []) {
+        const grant = this.readStoredGrant(item, organizationId, ownerId);
+        if (grant
+          && (grant.state === 'active' || grant.state === 'paused')
+          && Date.parse(grant.expiresAt) > Date.parse(now)) grants.push(grant);
+      }
+      if (grants.length > 500) return [];
+      exclusiveStartKey = response.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    return grants.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
   async putGrant(
     candidate: StoredWorkGrant,
     expectedRevision: number | null,

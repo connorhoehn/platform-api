@@ -74,6 +74,11 @@ export interface WorkSharingStore {
     now: string,
   ): Promise<StoredWorkGrant[]>;
   putGrant(grant: StoredWorkGrant, expectedRevision: number | null): Promise<StoredWorkGrant>;
+  listOwnedGrants?(
+    organizationId: string,
+    ownerId: string,
+    now: string,
+  ): Promise<StoredWorkGrant[]>;
   /** Required for atomic current+history creation; partial writes are forbidden. */
   putGrantPair?(
     current: WorkSharingGrant,
@@ -95,6 +100,11 @@ export interface WorkCollaborationStore {
     capability: WorkCollaborationCapability,
     now: string,
   ): Promise<WorkCollaborationRequest | null>;
+  listOwnedRequests?(
+    organizationId: string,
+    ownerId: string,
+    now: string,
+  ): Promise<WorkCollaborationRequest[]>;
 }
 
 export interface WorkTargetLocator {
@@ -501,6 +511,15 @@ export class WorkGraphOrchestrator {
     return this.deps.sharing.putGrantPair(current, history);
   }
 
+  async listOwnedGrants(viewer: AuthenticatedWorkGraphViewer): Promise<StoredWorkGrant[]> {
+    if (!this.deps.sharing.listOwnedGrants) return [];
+    return this.deps.sharing.listOwnedGrants(
+      viewer.organizationId,
+      viewer.viewerId,
+      this.deps.now(),
+    );
+  }
+
   async updateGrant(
     viewer: AuthenticatedWorkGraphViewer,
     grantId: string,
@@ -646,6 +665,17 @@ export class WorkGraphOrchestrator {
       expiresAt: input.expiresAt,
       revision: 1,
     }, null);
+  }
+
+  async listOwnedCollaborationRequests(
+    viewer: AuthenticatedWorkGraphViewer,
+  ): Promise<WorkCollaborationRequest[]> {
+    if (!this.deps.collaboration.listOwnedRequests) return [];
+    return this.deps.collaboration.listOwnedRequests(
+      viewer.organizationId,
+      viewer.viewerId,
+      this.deps.now(),
+    );
   }
 
   async exchangeAction(

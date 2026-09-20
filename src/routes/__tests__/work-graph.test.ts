@@ -201,6 +201,12 @@ function setup(): {
         if (organizationId !== 'org-1' || ownerId !== 'alice' || viewer.viewerId !== 'bob') return [];
         return [...grantRows.values()].filter((grant) => grant.ownerId === ownerId && grant.state === 'active');
       }),
+      listOwnedGrants: jest.fn(async (organizationId, ownerId) => (
+        organizationId === 'org-1' && ownerId === 'alice'
+          ? [...grantRows.values()].filter((grant) => grant.ownerId === ownerId
+            && (grant.state === 'active' || grant.state === 'paused'))
+          : []
+      )),
       putGrant,
       putGrantPair: jest.fn(async (current, history) => {
         grantRows.set(current.id, current);
@@ -222,6 +228,11 @@ function setup(): {
           && request.target.id === target.id
           && request.capability === capability
           && request.state === 'accepted') ?? null
+      )),
+      listOwnedRequests: jest.fn(async (organizationId, ownerId) => (
+        [...collaborationRows.values()].filter((request) => request.organizationId === organizationId
+          && request.ownerId === ownerId
+          && (request.state === 'requested' || request.state === 'accepted'))
       )),
     },
     directory: {
@@ -286,6 +297,31 @@ function setup(): {
 }
 
 describe('work graph authenticated routes', () => {
+  it('lists only authenticated owner grant and incoming collaboration control state', async () => {
+    const { app, collaborationRows } = setup();
+    collaborationRows.set('incoming-1', {
+      schemaVersion: 1,
+      id: 'incoming-1',
+      organizationId: 'org-1',
+      requesterId: 'bob',
+      ownerId: 'alice',
+      target: { kind: 'node', id: 'node-secret' },
+      capability: 'edit-document',
+      state: 'requested',
+      createdAt: NOW,
+      updatedAt: NOW,
+      expiresAt: '2026-09-19T17:00:00.000Z',
+      revision: 1,
+    });
+    const grants = await run(app, 'GET', '/api/work-graph/sharing-grants', { sub: 'alice', orgId: 'org-1' });
+    const incoming = await run(app, 'GET', '/api/work-graph/collaboration-requests', { sub: 'alice', orgId: 'org-1' });
+    const otherViewer = await run(app, 'GET', '/api/work-graph/collaboration-requests', { sub: 'bob', orgId: 'org-1' });
+    expect(grants.statusCode).toBe(200);
+    expect(grants.body).toEqual([expect.objectContaining({ id: 'grant-1', ownerId: 'alice' })]);
+    expect(incoming.body).toEqual([expect.objectContaining({ id: 'incoming-1', ownerId: 'alice' })]);
+    expect(otherViewer.body).toEqual([]);
+  });
+
   it('denies outsiders and cross-organization viewers with one generic response and no hidden metadata', async () => {
     const { app } = setup();
     const outsider = await run(

@@ -98,6 +98,21 @@ describe('WorkCollaborationRepository', () => {
     )).resolves.toBeNull();
   });
 
+  it('lists only live incoming requests for the authenticated owner', async () => {
+    const memory = memoryClient();
+    const repository = new WorkCollaborationRepository(memory.client, 'test-work-graph');
+    await repository.putRequest(request(), null);
+    await repository.putRequest(request({ id: 'accepted-1', state: 'accepted' }), null);
+    await repository.putRequest(request({ id: 'revoked-1', state: 'revoked' }), null);
+    const owned = await repository.listOwnedRequests('org-1', 'owner-1', NOW);
+    expect(owned).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'request-1', state: 'requested' }),
+      expect.objectContaining({ id: 'accepted-1', state: 'accepted' }),
+    ]));
+    expect(owned.map((item) => item.id)).not.toContain('revoked-1');
+    await expect(repository.listOwnedRequests('org-1', 'other-owner', NOW)).resolves.toEqual([]);
+  });
+
   it('fails closed on cross-org lookup and unknown persisted fields', async () => {
     const memory = memoryClient();
     const repository = new WorkCollaborationRepository(memory.client, 'test-work-graph');

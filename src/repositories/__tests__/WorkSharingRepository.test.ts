@@ -182,6 +182,24 @@ describe('WorkSharingRepository', () => {
       { viewerId: 'viewer-1', conversationIds: [] },
       NOW,
     )).resolves.toEqual([]);
+    await expect(restartedProcess.listOwnedGrants('org-1', 'owner-1', NOW)).resolves.toEqual([]);
+  });
+
+  it('lists only the authenticated owner current mutable grants', async () => {
+    const memory = createMemoryClient();
+    const repository = new WorkSharingRepository(memory.client, 'test-work-graph');
+    await repository.putGrant(liveGrant(), null);
+    await repository.putGrant(liveGrant({ id: 'paused', state: 'paused' }), null);
+    await repository.putGrant(liveGrant({ id: 'stopped', state: 'stopped' }), null);
+    await expect(repository.listOwnedGrants('org-1', 'owner-1', NOW)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'grant-1', state: 'active' }),
+        expect.objectContaining({ id: 'paused', state: 'paused' }),
+      ]),
+    );
+    expect((await repository.listOwnedGrants('org-1', 'owner-1', NOW)).map((grant) => grant.id))
+      .not.toContain('stopped');
+    await expect(repository.listOwnedGrants('org-1', 'other-owner', NOW)).resolves.toEqual([]);
   });
 
   it('isolates organization and owner partitions and fails closed on a corrupted stored scope', async () => {

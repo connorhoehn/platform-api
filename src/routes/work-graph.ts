@@ -298,6 +298,10 @@ export function createWorkGraphRouter(orchestrator: WorkGraphOrchestrator): Rout
     res.status(201).json(await orchestrator.createGrant(viewer, parseCreateGrant(req.body)));
   }));
 
+  router.get('/sharing-grants', handler(async (_req, res, viewer) => {
+    res.status(200).json(await orchestrator.listOwnedGrants(viewer));
+  }));
+
   router.patch('/sharing-grants/:id', handler(async (req, res, viewer) => {
     if (!isId(req.params.id)) throw new WorkGraphInputError('Sharing grant id is invalid.');
     res.status(200).json(await orchestrator.updateGrant(viewer, req.params.id, parseUpdateGrant(req.body)));
@@ -314,6 +318,10 @@ export function createWorkGraphRouter(orchestrator: WorkGraphOrchestrator): Rout
 
   router.post('/collaboration-requests', handler(async (req, res, viewer) => {
     res.status(201).json(await orchestrator.createCollaborationRequest(viewer, parseCreateCollaboration(req.body)));
+  }));
+
+  router.get('/collaboration-requests', handler(async (_req, res, viewer) => {
+    res.status(200).json(await orchestrator.listOwnedCollaborationRequests(viewer));
   }));
 
   router.post('/actions', handler(async (req, res, viewer) => {

@@ -310,6 +310,41 @@ export class WorkCollaborationRepository {
     return matches.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ?? null;
   }
 
+  /** Incoming requests for the authenticated owner. This is a strong base
+   * table read so a just-revoked/expired request cannot reappear from a GSI. */
+  async listOwnedRequests(
+    organizationId: string,
+    ownerId: string,
+    now: string,
+  ): Promise<WorkCollaborationRequest[]> {
+    if (!isId(organizationId) || !isId(ownerId) || !isTimestamp(now)) return [];
+    const requests: WorkCollaborationRequest[] = [];
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const response = await this.docClient.send(new QueryCommand({
+        TableName: this.table,
+        KeyConditionExpression: 'PK = :partition AND begins_with(SK, :requestPrefix)',
+        ExpressionAttributeValues: {
+          ':partition': ownerPartition(organizationId, ownerId),
+          ':requestPrefix': 'REQUEST#',
+        },
+        ConsistentRead: true,
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }));
+      for (const item of response.Items ?? []) {
+        if (!isRecord(item) || typeof item.SK !== 'string') continue;
+        const request = this.readItem(item, organizationId, item.SK.slice('REQUEST#'.length));
+        if (request
+          && request.ownerId === ownerId
+          && (request.state === 'requested' || request.state === 'accepted')
+          && Date.parse(request.expiresAt) > Date.parse(now)) requests.push(request);
+      }
+      if (requests.length > 500) return [];
+      exclusiveStartKey = response.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    return requests.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
   private readItem(
     value: unknown,
     organizationId: string,
