@@ -94,6 +94,11 @@ const PROCESS_KINDS = new Set(['run', 'agent', 'terminal']);
  */
 const OPERATION_RELATIONS = new Set(['produced', 'runs-in', 'operates-on', 'works-on']);
 
+function instant(value: string | undefined): number {
+  const parsed = value === undefined ? Number.NaN : Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function storedNode(authorization: AuthorizedWorkGraph, nodeId: string): StoredWorkNode | undefined {
   const target = authorization.targets.get(nodeId);
   return target && target.kind === 'node' ? target.node : undefined;
@@ -407,9 +412,13 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     edges,
     contextBefore: query.windowStart,
     subtitleFor: (effort) => {
+      // The subtitle describes the artifact the effort is named after, so a
+      // supporting input document cannot speak for the whole frame.
       const artifact = effort.nodeIds
-        .map((id) => details.get(id))
-        .find((detail) => detail?.artifact);
+        .map((id) => ({ node: index.byId.get(id), detail: details.get(id) }))
+        .filter((entry) => entry.detail?.artifact && entry.node?.kind === 'document')
+        .sort((left, right) => instant(right.node?.updatedAt) - instant(left.node?.updatedAt))
+        .map((entry) => entry.detail)[0];
       if (artifact?.artifact) {
         const available = artifact.artifact.revisions[artifact.artifact.revisions.length - 1]?.label;
         const pending = artifact.artifact.pending;
