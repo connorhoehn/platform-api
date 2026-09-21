@@ -30,7 +30,12 @@ import {
 } from './policy';
 import type { WorkGraphCursorCodec } from './cursor';
 import { workGraphAuthorizationRevision } from './authorizationRevision';
-import { buildWorkActivity, type WorkActivityReader } from './activity';
+import {
+  buildWorkActivity,
+  parsePreviewHandle,
+  type RevisionPreview,
+  type WorkActivityReader,
+} from './activity';
 import {
   buildWorkGraphSnapshotV2,
   workDayWindow,
@@ -766,6 +771,61 @@ export class WorkGraphOrchestrator {
       }
       throw error;
     }
+  }
+
+  /**
+   * Serves one revision's preview bytes.
+   *
+   * The handle names a node and a revision the viewer was already given, and
+   * nothing more: it is not a capability. Access is re-decided here against
+   * the live graph and the source's own ACL, so a handle kept from an earlier
+   * session stops working the moment the share does.
+   */
+  async getRevisionPreview(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    handle: string,
+  ): Promise<RevisionPreview> {
+    const reader = this.deps.activityReader;
+    if (!reader) throw new WorkGraphInputError('Revision previews are not available on this deployment.');
+    const parsed = parsePreviewHandle(handle);
+    if (!parsed) throw unavailable();
+
+    const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone);
+    const node = snapshot.nodes.find((candidate) => candidate.id === parsed.nodeId);
+    if (!node || node.kind !== 'document' || node.locked || node.disclosure !== 'details') throw unavailable();
+
+    const target = authorization.targets.get(parsed.nodeId);
+    if (!target || target.kind !== 'node') throw unavailable();
+    const decision = await authorizeWorkCapability(
+      { ...snapshot.scope, organizationId: viewer.organizationId, viewerId: viewer.viewerId },
+      target,
+      'view-document',
+      this.deps.sourceAcls,
+    );
+    if (decision === 'unavailable') throw new WorkGraphAuthorizationUnavailableError('Preview authorization is unavailable.');
+    if (decision !== 'allow') throw new WorkGraphCapabilityDeniedError('Viewing this revision is not permitted.');
+
+    // The revision has to be one this same snapshot listed. A handle naming a
+    // revision the viewer was never shown is indistinguishable from absent.
+    const activity = await buildWorkActivity({
+      query: this.resolveWindow(personId, day, timezone, {}, this.deps.now()),
+      nodes: snapshot.nodes,
+      edges: snapshot.edges,
+      authorization,
+      reader,
+      now: this.deps.now(),
+    });
+    const listed = activity.details
+      .find((detail) => detail.nodeId === parsed.nodeId)?.artifact?.revisions
+      .some((revision) => revision.id === parsed.revisionId);
+    if (!listed) throw unavailable();
+
+    const preview = await reader.revisionPreview(target.sourceRef.resourceId, parsed.revisionId);
+    if (!preview) throw unavailable();
+    return preview;
   }
 
   /**

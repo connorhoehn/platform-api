@@ -369,6 +369,27 @@ export function createWorkGraphRouter(orchestrator: WorkGraphOrchestrator): Rout
     ));
   }));
 
+  /**
+   * The bytes behind one revision preview. Authorization is re-decided on
+   * every request, and the response is inert: no sniffing, no framing, and
+   * nothing cached anywhere shared.
+   */
+  router.get('/previews/:handle', handler(async (req, res, viewer) => {
+    if (!isId(req.params.handle)) throw new WorkGraphInputError('Preview handle is invalid.');
+    const query = parseGraphQuery(req);
+    const preview = await orchestrator.getRevisionPreview(
+      viewer, query.personId, query.day, query.timezone, req.params.handle,
+    );
+    res.status(200)
+      .setHeader('content-type', preview.contentType)
+      .setHeader('content-length', String(preview.body.byteLength))
+      .setHeader('cache-control', 'private, no-store')
+      .setHeader('x-content-type-options', 'nosniff')
+      .setHeader('content-disposition', 'inline')
+      .setHeader('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+      .send(preview.body);
+  }));
+
   router.post('/references/resolve', handler(async (req, res, viewer) => {
     if (!exact(req.body, ['references'])
       || !Array.isArray(req.body.references)

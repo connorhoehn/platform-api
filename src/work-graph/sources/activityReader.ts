@@ -11,6 +11,7 @@ import { GetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } fr
 import { tableName } from '../../lib/ddb-table-name';
 import type {
   ArtifactFacts,
+  RevisionPreview,
   DocumentAttentionFacts,
   MeetingFacts,
   PipelineRunFacts,
@@ -23,10 +24,23 @@ const RECORDINGS_TABLE = tableName('video-call-recordings');
 const DOCUMENTS_TABLE = tableName(process.env.DYNAMODB_DOCUMENTS_TABLE || 'crdt-documents');
 const DOCUMENT_COMMENTS_TABLE = tableName('document-comments');
 const DOCUMENT_LIFECYCLE_TABLE = tableName('document-lifecycle');
+const PIPELINE_DEFINITIONS_TABLE = tableName('pipeline-definitions');
+const PROFILES_TABLE = tableName('social-profiles');
 
 /** A lifecycle transition is evidence of attention for this long, no longer. */
 const ATTENTION_LEASE_MS = 10 * 60 * 1_000;
 const MAX_TRANSCRIPT_SEGMENTS = 500;
+const MAX_PREVIEW_BYTES = 2 * 1024 * 1024;
+const ALLOWED_PREVIEW_TYPES = new Set(['image/svg+xml', 'image/png', 'image/jpeg', 'image/webp']);
+
+/** Markup with no script, no event handler and no outbound reference. */
+function isInertSvg(markup: string): boolean {
+  const lowered = markup.toLowerCase();
+  if (lowered.includes('<script') || lowered.includes('<foreignobject') || lowered.includes('<use')) return false;
+  if (/\son[a-z]+\s*=/.test(lowered)) return false;
+  if (/(href|src)\s*=\s*["']?\s*(?!#)/.test(lowered)) return false;
+  return lowered.includes('<svg');
+}
 const ERROR_SUMMARY_LENGTH = 160;
 
 type Row = Record<string, unknown>;
@@ -100,6 +114,13 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       .filter((value): value is string => !!value);
     const startedAt = iso(row.startedAt);
     if (!startedAt) return null;
+    // The definition's own name, so the card says "Presentation agent" rather
+    // than an internal pipeline id.
+    const definition = await this.client.send(new GetCommand({
+      TableName: PIPELINE_DEFINITIONS_TABLE,
+      Key: { pipelineId: String(row.pipelineId ?? '') },
+    })).catch(() => undefined);
+    const agentLabel = text((definition?.Item as Row | undefined)?.name, 80);
     const attempts = Object.values(steps)
       .map((summary) => (Array.isArray((summary as Row | undefined)?.attempts) ? ((summary as Row).attempts as unknown[]).length : 1));
     return {
@@ -109,6 +130,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       startedAt,
       updatedAt: iso(row.lastEventAt) ?? iso(row.completedAt) ?? startedAt,
       tools: [...new Set(tools)],
+      ...(agentLabel ? { agentLabel } : {}),
       ...(text(row.error, ERROR_SUMMARY_LENGTH) ? { error: text(row.error, ERROR_SUMMARY_LENGTH) as string } : {}),
     };
   }
@@ -156,11 +178,38 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       ? row.pageCount
       : anchors.length || undefined;
     return {
+      ...(text(row.title, 120) ? { name: text(row.title, 120) as string } : {}),
       mediaKind,
       ...(pageCount ? { pageCount } : {}),
       ...(anchors.length ? { anchors } : {}),
       ...(comments?.Count ? { feedbackCount: comments.Count } : {}),
     };
+  }
+
+  /**
+   * Serves a stored preview, and refuses one that could execute. An SVG is
+   * markup: a source that stored a script, an event handler, or an external
+   * reference in one would get it run inside an authorized viewer's page, so
+   * those are rejected here rather than sanitized into something subtly
+   * different from what the source actually holds.
+   */
+  async revisionPreview(documentId: string, revisionId: string): Promise<RevisionPreview | null> {
+    const row = (await this.client.send(new GetCommand({
+      TableName: DOCUMENTS_TABLE,
+      Key: { documentId },
+    }))).Item as Row | undefined;
+    const previews = row?.revisionPreviews;
+    if (!previews || typeof previews !== 'object' || Array.isArray(previews)) return null;
+    const entry = (previews as Row)[revisionId] as Row | undefined;
+    if (!entry || typeof entry.body !== 'string') return null;
+    const contentType = String(entry.contentType ?? '');
+    if (!ALLOWED_PREVIEW_TYPES.has(contentType)) return null;
+    const body = entry.encoding === 'base64'
+      ? Buffer.from(entry.body, 'base64')
+      : Buffer.from(entry.body, 'utf8');
+    if (body.byteLength === 0 || body.byteLength > MAX_PREVIEW_BYTES) return null;
+    if (contentType === 'image/svg+xml' && !isInertSvg(body.toString('utf8'))) return null;
+    return { contentType: contentType as RevisionPreview['contentType'], body };
   }
 
   async transcript(transcriptId: string): Promise<TranscriptFacts | null> {
@@ -201,6 +250,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       : 0;
     return {
       segments,
+      ready: true,
       speakerCount: new Set(segments.map((segment) => segment.speaker)).size,
       actionItemCount: actionItems,
     };
@@ -210,7 +260,22 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const id = meetingId.replace(/^meeting:/, '');
     const row = await scanOne(this.client, RECORDINGS_TABLE, 'callId = :id', { ':id': id });
     if (!row) return null;
+    const attendees = Array.isArray(row.participants)
+      ? row.participants
+        .map((entry) => text((entry as Row | undefined)?.userId, 128))
+        .filter((value): value is string => !!value)
+      : [];
+    const participants = (await Promise.all([...new Set(attendees)].slice(0, 12).map(async (userId) => {
+      const profile = (await this.client.send(new GetCommand({
+        TableName: PROFILES_TABLE, Key: { userId },
+      })).catch(() => undefined))?.Item as Row | undefined;
+      // Without a profile the person is still a real attendee, but naming
+      // them by their account id would put an identifier on the card.
+      const label = text(profile?.displayName, 80);
+      return label ? { id: userId, label } : null;
+    }))).filter((value): value is { id: string; label: string } => !!value);
     return {
+      ...(participants.length ? { participants } : {}),
       ...(iso(row.startedAt) ? { startedAt: iso(row.startedAt) as string } : {}),
       ...(iso(row.endedAt) ? { endedAt: iso(row.endedAt) as string } : {}),
       recorded: typeof row.recordingId === 'string' && row.recordingId.length > 0,
