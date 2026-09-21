@@ -1,0 +1,235 @@
+/**
+ * Reads the v2 activity facts from each source's own authoritative record.
+ *
+ * It performs no authorization of its own: the orchestrator has already
+ * decided which nodes this viewer may see at `details` disclosure, and only
+ * those node identities reach these lookups. Every method returns `null` when
+ * the source has nothing to say, so an absent record discloses nothing rather
+ * than producing a plausible-looking placeholder.
+ */
+import { GetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { tableName } from '../../lib/ddb-table-name';
+import type {
+  ArtifactFacts,
+  DocumentAttentionFacts,
+  MeetingFacts,
+  PipelineRunFacts,
+  TranscriptFacts,
+  WorkActivityReader,
+} from '../activity';
+
+const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
+const RECORDINGS_TABLE = tableName('video-call-recordings');
+const DOCUMENTS_TABLE = tableName(process.env.DYNAMODB_DOCUMENTS_TABLE || 'crdt-documents');
+const DOCUMENT_COMMENTS_TABLE = tableName('document-comments');
+const DOCUMENT_LIFECYCLE_TABLE = tableName('document-lifecycle');
+
+/** A lifecycle transition is evidence of attention for this long, no longer. */
+const ATTENTION_LEASE_MS = 10 * 60 * 1_000;
+const MAX_TRANSCRIPT_SEGMENTS = 500;
+const ERROR_SUMMARY_LENGTH = 160;
+
+type Row = Record<string, unknown>;
+
+function text(value: unknown, limit: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim().replace(/\s+/g, ' ');
+  if (!trimmed) return undefined;
+  return trimmed.length <= limit ? trimmed : `${trimmed.slice(0, limit - 1)}…`;
+}
+
+function iso(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
+}
+
+/** Folds the platform's extra lifecycle states onto the five we can describe. */
+function runStatus(value: unknown): PipelineRunFacts['status'] {
+  switch (String(value)) {
+    case 'running':
+    case 'resuming':
+      return 'running';
+    case 'waiting':
+    case 'paused':
+    case 'pending':
+      return 'waiting';
+    case 'completed':
+    case 'succeeded':
+      return 'completed';
+    case 'failed':
+    case 'rejected':
+    case 'interrupted':
+    case 'stuck':
+      return 'error';
+    default:
+      return 'stopped';
+  }
+}
+
+async function scanOne(client: DynamoDBDocumentClient, table: string, expression: string, values: Row): Promise<Row | undefined> {
+  const result = await client.send(new ScanCommand({
+    TableName: table,
+    FilterExpression: expression,
+    ExpressionAttributeValues: values,
+    Limit: 200,
+  }));
+  const rows = (result.Items ?? []) as Row[];
+  // More than one match is ambiguous provenance, so nothing is disclosed.
+  return rows.length === 1 ? rows[0] : undefined;
+}
+
+export class DynamoWorkActivityReader implements WorkActivityReader {
+  constructor(private readonly client: DynamoDBDocumentClient) {}
+
+  async pipelineRun(runId: string): Promise<PipelineRunFacts | null> {
+    const id = runId.replace(/^run:/, '');
+    const row = await scanOne(this.client, PIPELINE_RUNS_TABLE, 'runId = :run', { ':run': id });
+    if (!row) return null;
+    const steps = row.stepsSummary && typeof row.stepsSummary === 'object' && !Array.isArray(row.stepsSummary)
+      ? (row.stepsSummary as Row)
+      : {};
+    // The tools are the steps this run actually recorded, in execution order.
+    const tools = Object.entries(steps)
+      .map(([stepId, summary]) => ({
+        stepId,
+        startedAt: Date.parse(iso((summary as Row | undefined)?.startedAt) ?? '') || 0,
+      }))
+      .sort((left, right) => left.startedAt - right.startedAt || left.stepId.localeCompare(right.stepId))
+      .map((step) => text(step.stepId, 60))
+      .filter((value): value is string => !!value);
+    const startedAt = iso(row.startedAt);
+    if (!startedAt) return null;
+    const attempts = Object.values(steps)
+      .map((summary) => (Array.isArray((summary as Row | undefined)?.attempts) ? ((summary as Row).attempts as unknown[]).length : 1));
+    return {
+      runId: id,
+      status: runStatus(row.status),
+      attempt: Math.max(1, ...attempts),
+      startedAt,
+      updatedAt: iso(row.lastEventAt) ?? iso(row.completedAt) ?? startedAt,
+      tools: [...new Set(tools)],
+      ...(text(row.error, ERROR_SUMMARY_LENGTH) ? { error: text(row.error, ERROR_SUMMARY_LENGTH) as string } : {}),
+    };
+  }
+
+  async artifact(documentId: string): Promise<ArtifactFacts | null> {
+    const row = (await this.client.send(new GetCommand({
+      TableName: DOCUMENTS_TABLE,
+      Key: { documentId },
+    }))).Item as Row | undefined;
+    if (!row) return null;
+
+    const kind = String(row.type ?? row.documentType ?? '').toLowerCase();
+    const mediaKind: ArtifactFacts['mediaKind'] = kind.includes('present') || kind.includes('deck') || kind.includes('slide')
+      ? 'presentation'
+      : kind.includes('image')
+        ? 'image'
+        : 'document';
+
+    // Slide/page identities are the document's own outline entries, not a
+    // count invented from a preview image.
+    const outline = Array.isArray(row.outline) ? row.outline : Array.isArray(row.slides) ? row.slides : [];
+    const anchors = outline
+      .map((entry, position) => {
+        const item = entry as Row | undefined;
+        const label = text(item?.title ?? item?.label, 80);
+        const id = text(item?.id, 120);
+        if (!label || !id) return undefined;
+        return {
+          kind: (mediaKind === 'presentation' ? 'slide' : 'page') as 'slide' | 'page',
+          id,
+          label,
+          index: position + 1,
+        };
+      })
+      .filter((value): value is NonNullable<typeof value> => !!value);
+
+    const comments = await this.client.send(new QueryCommand({
+      TableName: DOCUMENT_COMMENTS_TABLE,
+      KeyConditionExpression: 'documentId = :doc',
+      ExpressionAttributeValues: { ':doc': documentId },
+      Select: 'COUNT',
+    })).catch(() => undefined);
+
+    const pageCount = typeof row.pageCount === 'number' && Number.isSafeInteger(row.pageCount) && row.pageCount > 0
+      ? row.pageCount
+      : anchors.length || undefined;
+    return {
+      mediaKind,
+      ...(pageCount ? { pageCount } : {}),
+      ...(anchors.length ? { anchors } : {}),
+      ...(comments?.Count ? { feedbackCount: comments.Count } : {}),
+    };
+  }
+
+  async transcript(transcriptId: string): Promise<TranscriptFacts | null> {
+    const id = transcriptId.replace(/^transcript:/, '');
+    const row = await scanOne(
+      this.client,
+      RECORDINGS_TABLE,
+      'transcriptId = :id OR recordingId = :id',
+      { ':id': id },
+    );
+    if (!row || row.transcriptStatus !== 'ready' || typeof row.transcriptJson !== 'string') return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.transcriptJson);
+    } catch {
+      return null;
+    }
+    const raw = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray((parsed as Row | undefined)?.segments)
+        ? ((parsed as Row).segments as unknown[])
+        : [];
+    const segments = raw
+      .map((entry, position) => {
+        const item = entry as Row | undefined;
+        const at = iso(item?.at ?? item?.start ?? item?.timestamp);
+        const speaker = text(item?.speaker, 60);
+        const body = text(item?.text, 1_000);
+        if (!at || !speaker || !body) return undefined;
+        return { id: text(item?.id, 120) ?? `segment-${position + 1}`, at, speaker, text: body };
+      })
+      .filter((value): value is { id: string; at: string; speaker: string; text: string } => !!value)
+      .sort((left, right) => Date.parse(left.at) - Date.parse(right.at))
+      .slice(0, MAX_TRANSCRIPT_SEGMENTS);
+    if (segments.length === 0) return null;
+    const actionItems = Array.isArray((parsed as Row | undefined)?.actionItems)
+      ? ((parsed as Row).actionItems as unknown[]).length
+      : 0;
+    return {
+      segments,
+      speakerCount: new Set(segments.map((segment) => segment.speaker)).size,
+      actionItemCount: actionItems,
+    };
+  }
+
+  async meeting(meetingId: string): Promise<MeetingFacts | null> {
+    const id = meetingId.replace(/^meeting:/, '');
+    const row = await scanOne(this.client, RECORDINGS_TABLE, 'callId = :id', { ':id': id });
+    if (!row) return null;
+    return {
+      ...(iso(row.startedAt) ? { startedAt: iso(row.startedAt) as string } : {}),
+      ...(iso(row.endedAt) ? { endedAt: iso(row.endedAt) as string } : {}),
+      recorded: typeof row.recordingId === 'string' && row.recordingId.length > 0,
+      transcriptAvailable: row.transcriptStatus === 'ready',
+    };
+  }
+
+  async attention(documentId: string): Promise<DocumentAttentionFacts | null> {
+    // The authoritative lifecycle row records who last acted on the document
+    // and when. That is a real, expiring observation — unlike an open socket,
+    // which says nothing about whether a person is reading anything.
+    const row = (await this.client.send(new GetCommand({
+      TableName: DOCUMENT_LIFECYCLE_TABLE,
+      Key: { documentId },
+    })).catch(() => undefined))?.Item as Row | undefined;
+    const observedAt = iso(row?.updatedAt);
+    const actorId = text(row?.updatedBy, 128);
+    if (!row || !observedAt || !actorId) return null;
+    const expiresAt = new Date(Date.parse(observedAt) + ATTENTION_LEASE_MS).toISOString();
+    return { actorId, observedAt, expiresAt };
+  }
+}

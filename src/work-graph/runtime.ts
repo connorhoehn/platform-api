@@ -9,7 +9,11 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { SERVICE_AUTH_HEADER, signEnvelope } from '@connorhoehn/service-runtime';
 import { projectWorkEvent } from '@connorhoehn/realtime-modules/work-graph';
-import type { WorkGraphDeltaOperation } from '@connorhoehn/realtime-modules/work-graph';
+import type {
+  WorkGraphDeltaOperation,
+  WorkGraphQueryV2,
+  WorkGraphSnapshotV2,
+} from '@connorhoehn/realtime-modules/work-graph';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { WorkGraphRepository, type WorkSourceKind } from '../repositories/WorkGraphRepository';
@@ -21,6 +25,7 @@ import {
 } from '../repositories/WorkCollaborationRepository';
 import { WorkSourceAccountRepository } from '../repositories/WorkSourceAccountRepository';
 import { createWorkGraphCursorCodec } from './cursor';
+import { DynamoWorkActivityReader } from './sources/activityReader';
 import {
   WorkGraphOrchestrator,
   WorkGraphUnavailableError,
@@ -608,6 +613,7 @@ export const workGraphOrchestrator = new WorkGraphOrchestrator({
   sourceAcls,
   sourceActions,
   cursorCodec: createWorkGraphCursorCodec(cursorSecret()),
+  activityReader: new DynamoWorkActivityReader(docClient),
   async policyRevision(scope) {
     const viewer = await directory.resolveViewerById(scope.organizationId, scope.viewerId);
     if (!viewer) return 'unavailable';
@@ -634,12 +640,75 @@ export interface GatewayWorkGraphQuery {
   timezone: string;
 }
 
+/**
+ * The additive schemaVersion 2 window a gateway subscription asks this service
+ * to project. Omitting it leaves the authorize/replay bodies and responses
+ * byte-for-byte as they were for a v1 gateway.
+ */
+export interface GatewayWorkGraphViewRequest {
+  windowStart?: string;
+  windowEnd?: string;
+  mode?: 'live' | 'as-of';
+}
+
+/**
+ * The v2 activity view. It travels beside the v1 delta operations rather than
+ * replacing them: these `operations` are freshness leases, a different thing
+ * from the graph mutations in a delta batch.
+ */
+export interface GatewayWorkGraphViewV2 {
+  query: WorkGraphQueryV2;
+  temporal: WorkGraphSnapshotV2['temporal'];
+  efforts: WorkGraphSnapshotV2['efforts'];
+  details: WorkGraphSnapshotV2['details'];
+  operations: WorkGraphSnapshotV2['operations'];
+  eventBuckets: WorkGraphSnapshotV2['eventBuckets'];
+}
+
 export interface GatewayWorkGraphAccess {
   decision: 'allow' | 'deny' | 'unavailable';
   policyRevision: string;
   grantState: 'active' | 'missing';
   expiresAt?: string;
   watermark: number;
+  /** Echoed only for a schemaVersion 2 request. Its absence means v1-only. */
+  schemaVersion?: 2;
+  /**
+   * Present only for an allowed schemaVersion 2 request. It is derived from
+   * the same authorization decision as the `policyRevision` beside it.
+   */
+  view?: GatewayWorkGraphViewV2;
+}
+
+/**
+ * Projects the authorized v2 view for one gateway subscription window. The
+ * strict shared validator runs first, so a view that cannot satisfy the v2
+ * invariants fails here instead of reaching a browser.
+ */
+async function gatewayWorkGraphView(
+  viewer: AuthenticatedWorkGraphViewer,
+  query: GatewayWorkGraphQuery,
+  requested: GatewayWorkGraphViewRequest,
+): Promise<GatewayWorkGraphViewV2> {
+  const snapshot = await workGraphOrchestrator.getGraphV2(
+    viewer,
+    query.personId,
+    query.day,
+    query.timezone,
+    {
+      ...(requested.windowStart ? { windowStart: requested.windowStart } : {}),
+      ...(requested.windowEnd ? { windowEnd: requested.windowEnd } : {}),
+      ...(requested.mode ? { mode: requested.mode } : {}),
+    },
+  );
+  return {
+    query: snapshot.query,
+    temporal: snapshot.temporal,
+    efforts: snapshot.efforts,
+    details: snapshot.details,
+    operations: snapshot.operations,
+    eventBuckets: snapshot.eventBuckets,
+  };
 }
 
 /**
@@ -651,6 +720,7 @@ export async function authorizeGatewayWorkGraph(
   organizationId: string,
   viewerId: string,
   query: GatewayWorkGraphQuery,
+  requestedView?: GatewayWorkGraphViewRequest,
 ): Promise<GatewayWorkGraphAccess> {
   const viewer = await directory.resolveViewerById(organizationId, viewerId);
   if (!viewer) return { decision: 'deny', policyRevision: 'unavailable', grantState: 'missing', watermark: 0 };
@@ -661,6 +731,10 @@ export async function authorizeGatewayWorkGraph(
       query.day,
       query.timezone,
     );
+    // The v2 view is derived from this same decision, never from a cached one.
+    const view = requestedView
+      ? await gatewayWorkGraphView(viewer, query, requestedView)
+      : undefined;
     let expiresAt: string | undefined;
     if (viewerId !== query.personId) {
       const grants = (await sharingRepository.listEffectiveGrants(
@@ -678,6 +752,7 @@ export async function authorizeGatewayWorkGraph(
       grantState: 'active',
       ...(expiresAt ? { expiresAt } : {}),
       watermark: result.snapshot.watermark,
+      ...(view ? { schemaVersion: 2 as const, view } : {}),
     };
   } catch (error) {
     if (error instanceof WorkGraphUnavailableError) {
@@ -692,6 +767,7 @@ export async function replayGatewayWorkGraph(
   viewerId: string,
   query: GatewayWorkGraphQuery,
   request: { afterWatermark: number; throughWatermark: number; since: string; limit: number },
+  requestedView?: GatewayWorkGraphViewRequest,
 ): Promise<{
   batches: Array<{
     previousWatermark: number;
@@ -699,8 +775,13 @@ export async function replayGatewayWorkGraph(
     policyRevision: string;
     operations: WorkGraphDeltaOperation[];
     committedAt: string;
+    /** Present only for a schemaVersion 2 request. */
+    view?: GatewayWorkGraphViewV2;
   }>;
   complete: boolean;
+  /** Echoed only for a schemaVersion 2 request, with the refreshed view. */
+  schemaVersion?: 2;
+  view?: GatewayWorkGraphViewV2;
 }> {
   // A non-UTC local day can span two UTC projection partitions. Its snapshot
   // watermark is a composite revision, not a cursor into either partition's
@@ -757,5 +838,16 @@ export async function replayGatewayWorkGraph(
       committedAt: batch.committedAt,
     };
   });
-  return { batches, complete: safe };
+  if (!requestedView) return { batches, complete: safe };
+  // The activity layer is derived, not delta-encoded: every batch carries the
+  // whole refreshed view, so effort membership can never drift away from the
+  // node/edge state the same authorization decision produced. A zero-batch
+  // replay still returns it, because a lease can expire with no mutation.
+  const view = await gatewayWorkGraphView(viewer, query, requestedView);
+  return {
+    batches: batches.map((batch) => ({ ...batch, view })),
+    complete: safe,
+    schemaVersion: 2 as const,
+    view,
+  };
 }

@@ -30,6 +30,14 @@ import {
 } from './policy';
 import type { WorkGraphCursorCodec } from './cursor';
 import { workGraphAuthorizationRevision } from './authorizationRevision';
+import { buildWorkActivity, type WorkActivityReader } from './activity';
+import {
+  buildWorkGraphSnapshotV2,
+  workDayWindow,
+  type WorkGraphActivityV2,
+  type WorkGraphQueryV2,
+  type WorkGraphSnapshotV2,
+} from '@connorhoehn/realtime-modules/work-graph';
 
 const MAX_SHARING_MS = 24 * 60 * 60 * 1_000;
 const MAX_HISTORY_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -183,6 +191,16 @@ export interface WorkGraphSnapshot {
   partial: boolean;
 }
 
+/** Selected interval inside one person's real IANA local day. */
+export interface WorkGraphWindowInput {
+  windowStart?: string;
+  windowEnd?: string;
+  mode?: 'live' | 'as-of';
+}
+
+/** Default interval when the caller asks for v2 without naming one. */
+const DEFAULT_WINDOW_MS = 15 * 60 * 1_000;
+
 export class WorkGraphInputError extends Error {
   readonly code = 'WORK_GRAPH_INVALID_REQUEST';
 }
@@ -214,6 +232,8 @@ export interface WorkGraphOrchestratorDependencies {
   sourceAcls: ReadonlyMap<WorkSourceKind, WorkSourceAclAdapter>;
   sourceActions: ReadonlyMap<WorkSourceKind, WorkSourceActionAdapter>;
   cursorCodec: WorkGraphCursorCodec;
+  /** Required only to answer a schemaVersion 2 request. v1 never reads it. */
+  activityReader?: WorkActivityReader;
   policyRevision(scope: Omit<WorkGraphPolicyScope, 'policyRevision'>): Promise<string>;
   now(): string;
   id(): string;
@@ -425,6 +445,100 @@ export class WorkGraphOrchestrator {
       },
       authorization,
     };
+  }
+
+  /**
+   * Resolves the requested interval against the person's real local day. DST
+   * is handled by the shared day-window helper, so a 23- or 25-hour day keeps
+   * exact bounds instead of assuming a fixed offset.
+   */
+  private resolveWindow(
+    personId: string,
+    day: string,
+    timezone: string,
+    input: WorkGraphWindowInput,
+    now: string,
+  ): WorkGraphQueryV2 {
+    let bounds;
+    try {
+      bounds = workDayWindow(day, timezone);
+    } catch {
+      throw new WorkGraphInputError('A valid day and timezone are required.');
+    }
+    const dayStart = Date.parse(bounds.start);
+    // The window is half-open on the day, so the last addressable instant is
+    // one millisecond before the next local midnight.
+    const dayEnd = Date.parse(bounds.end) - 1;
+    const parse = (value: string | undefined): number | undefined => {
+      if (value === undefined) return undefined;
+      const parsed = Date.parse(value);
+      if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+        throw new WorkGraphInputError('Window bounds must be exact ISO timestamps.');
+      }
+      return parsed;
+    };
+    const requestedEnd = parse(input.windowEnd);
+    const requestedStart = parse(input.windowStart);
+    const end = Math.max(dayStart + 1, Math.min(requestedEnd ?? Date.parse(now), dayEnd));
+    const start = Math.max(dayStart, Math.min(requestedStart ?? end - DEFAULT_WINDOW_MS, end - 1));
+    if (requestedStart !== undefined && requestedEnd !== undefined && requestedStart >= requestedEnd) {
+      throw new WorkGraphInputError('Window start must precede window end.');
+    }
+    return {
+      schemaVersion: 2,
+      personId,
+      day,
+      timezone,
+      windowStart: new Date(start).toISOString(),
+      windowEnd: new Date(end).toISOString(),
+      mode: input.mode === 'as-of' ? 'as-of' : 'live',
+    };
+  }
+
+  /**
+   * Opt-in schemaVersion 2 answer. It reuses the identical v1 authorization
+   * path, then derives efforts, details, operations and event buckets from
+   * that already-filtered graph. A host without an activity reader gets a 400
+   * rather than an activity layer assembled from nothing.
+   */
+  async getActivity(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    input: WorkGraphWindowInput = {},
+    previousCursor?: string,
+  ): Promise<{ snapshot: WorkGraphSnapshot; query: WorkGraphQueryV2; activity: WorkGraphActivityV2 }> {
+    const reader = this.deps.activityReader;
+    if (!reader) throw new WorkGraphInputError('Schema version 2 is not available on this deployment.');
+    const now = this.deps.now();
+    const query = this.resolveWindow(personId, day, timezone, input, now);
+    const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone, previousCursor);
+    const activity = await buildWorkActivity({
+      query,
+      nodes: snapshot.nodes,
+      edges: snapshot.edges,
+      authorization,
+      reader,
+      now,
+    });
+    return { snapshot, query, activity };
+  }
+
+  /** Assembles and strictly validates the browser-facing v2 snapshot body. */
+  async getGraphV2(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    input: WorkGraphWindowInput = {},
+    previousCursor?: string,
+  ): Promise<WorkGraphSnapshotV2> {
+    const { snapshot, query, activity } = await this.getActivity(viewer, personId, day, timezone, input, previousCursor);
+    const built = buildWorkGraphSnapshotV2({ snapshot: snapshot as never, query, activity });
+    // Failing closed keeps a partially derived activity layer off the wire.
+    if (!built.ok) throw new WorkGraphUnavailableError('This work item is unavailable.');
+    return built.value;
   }
 
   async getNode(

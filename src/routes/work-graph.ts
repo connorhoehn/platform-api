@@ -18,6 +18,7 @@ import {
   type CreateCollaborationInput,
   type CreateGrantInput,
   type UpdateGrantInput,
+  type WorkGraphWindowInput,
   type WorkReference,
 } from '../work-graph/orchestrator';
 
@@ -130,9 +131,44 @@ function reference(value: unknown): WorkReference | null {
   return parsed;
 }
 
+const V2_QUERY_KEYS = ['schemaVersion', 'windowStart', 'windowEnd', 'mode'] as const;
+
+/**
+ * Reads the additive schemaVersion 2 parameters. A request that omits them is
+ * parsed and answered exactly as before, so the v1 route is unchanged.
+ */
+function parseActivityQuery(req: Request): WorkGraphWindowInput | null {
+  const version = req.query['schemaVersion'];
+  if (version === undefined) {
+    if (V2_QUERY_KEYS.some((key) => req.query[key] !== undefined)) {
+      throw new WorkGraphInputError('Window parameters require schemaVersion=2.');
+    }
+    return null;
+  }
+  if (version !== '2') throw new WorkGraphInputError('Unsupported work graph schema version.');
+  const read = (key: 'windowStart' | 'windowEnd'): string | undefined => {
+    const value = req.query[key];
+    if (value === undefined) return undefined;
+    if (!isTimestamp(value)) throw new WorkGraphInputError('Window bounds must be exact ISO timestamps.');
+    return value;
+  };
+  const mode = req.query['mode'];
+  if (mode !== undefined && mode !== 'live' && mode !== 'as-of') {
+    throw new WorkGraphInputError('Window mode must be live or as-of.');
+  }
+  const windowStart = read('windowStart');
+  const windowEnd = read('windowEnd');
+  return {
+    ...(windowStart ? { windowStart } : {}),
+    ...(windowEnd ? { windowEnd } : {}),
+    ...(mode ? { mode } : {}),
+  };
+}
+
 function parseGraphQuery(req: Request): { personId: string; day: string; timezone: string; cursor?: string } {
+  const allowed = new Set(['personId', 'day', 'timezone', 'cursor', ...V2_QUERY_KEYS]);
   const keys = Object.keys(req.query);
-  if (keys.some((key) => key !== 'personId' && key !== 'day' && key !== 'timezone' && key !== 'cursor')) {
+  if (keys.some((key) => !allowed.has(key))) {
     throw new WorkGraphInputError('Unknown graph query parameter.');
   }
   const personId = String(req.params.personId ?? req.query['personId'] ?? '');
@@ -278,6 +314,13 @@ export function createWorkGraphRouter(orchestrator: WorkGraphOrchestrator): Rout
 
   router.get('/people/:personId/graph', handler(async (req, res, viewer) => {
     const query = parseGraphQuery(req);
+    const activity = parseActivityQuery(req);
+    if (activity) {
+      res.status(200).json(await orchestrator.getGraphV2(
+        viewer, query.personId, query.day, query.timezone, activity, query.cursor,
+      ));
+      return;
+    }
     const result = await orchestrator.getGraph(viewer, query.personId, query.day, query.timezone, query.cursor);
     res.status(200).json(result.snapshot);
   }));

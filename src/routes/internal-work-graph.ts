@@ -3,6 +3,7 @@ import { SERVICE_AUTH_HEADER, verifyEnvelope } from '@connorhoehn/service-runtim
 import {
   authorizeGatewayWorkGraph,
   replayGatewayWorkGraph,
+  type GatewayWorkGraphViewRequest,
   type GatewayWorkGraphQuery,
 } from '../work-graph/runtime';
 import { workGraphRepository } from '../work-graph/runtime';
@@ -30,6 +31,31 @@ function query(value: unknown): value is GatewayWorkGraphQuery {
   } catch {
     return false;
   }
+}
+
+function timestamp(value: unknown): boolean {
+  if (typeof value !== 'string' || value.length > 64) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+/**
+ * Additive schemaVersion 2 request. A body without `schemaVersion` and `view`
+ * is parsed and answered exactly as the existing v1 gateway sends and expects.
+ */
+function view(value: unknown): value is GatewayWorkGraphViewRequest {
+  if (!record(value)) return false;
+  if (Object.keys(value).some((key) => !['windowStart', 'windowEnd', 'mode'].includes(key))) return false;
+  return (value.windowStart === undefined || timestamp(value.windowStart))
+    && (value.windowEnd === undefined || timestamp(value.windowEnd))
+    && (value.mode === undefined || value.mode === 'live' || value.mode === 'as-of');
+}
+
+/** Both additive fields travel together; neither alone is a valid request. */
+function requestedView(body: Record<string, unknown>): GatewayWorkGraphViewRequest | null | false {
+  if (body.schemaVersion === undefined && body.view === undefined) return null;
+  if (body.schemaVersion !== 2 || !view(body.view)) return false;
+  return body.view;
 }
 
 function authenticated(req: Request, res: Response, allowedServices: string[]): string | null {
@@ -72,13 +98,17 @@ type ReplayBody = {
   throughWatermark: number;
   since: string;
   limit: number;
+  schemaVersion?: 2;
+  view?: GatewayWorkGraphViewRequest;
 };
 
 function replayBody(value: unknown): value is ReplayBody {
   return base(value)
     && Object.keys(value).every((key) => [
       'organizationId', 'viewerId', 'query', 'afterWatermark', 'throughWatermark', 'since', 'limit',
+      'schemaVersion', 'view',
     ].includes(key))
+    && requestedView(value) !== false
     && Number.isSafeInteger(value.afterWatermark) && Number(value.afterWatermark) >= 0
     && Number.isSafeInteger(value.throughWatermark)
     && Number(value.throughWatermark) >= Number(value.afterWatermark)
@@ -89,7 +119,10 @@ function replayBody(value: unknown): value is ReplayBody {
 router.post('/authorize', async (req, res, next) => {
   try {
     if (!authenticated(req, res, [process.env.WORK_GRAPH_GATEWAY_SERVICE_ID?.trim() || 'realtime-examples'])) return;
-    if (!base(req.body) || Object.keys(req.body).some((key) => !['organizationId', 'viewerId', 'query'].includes(key))) {
+    const requested = base(req.body) ? requestedView(req.body) : false;
+    if (!base(req.body)
+      || requested === false
+      || Object.keys(req.body).some((key) => !['organizationId', 'viewerId', 'query', 'schemaVersion', 'view'].includes(key))) {
       res.status(400).json({ error: 'INVALID_REQUEST' });
       return;
     }
@@ -97,6 +130,7 @@ router.post('/authorize', async (req, res, next) => {
       req.body.organizationId,
       req.body.viewerId,
       req.body.query,
+      requested ?? undefined,
     ));
   } catch (error) {
     next(error);
@@ -120,6 +154,7 @@ router.post('/replay', async (req, res, next) => {
         since: req.body.since,
         limit: Number(req.body.limit),
       },
+      (requestedView(req.body as Record<string, unknown>) || undefined) as GatewayWorkGraphViewRequest | undefined,
     ));
   } catch (error) {
     next(error);
