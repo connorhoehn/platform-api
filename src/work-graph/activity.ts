@@ -287,7 +287,13 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       if (facts) runFacts.set(node.id, facts);
     }));
 
-  await Promise.all(detailed.map(async (node) => {
+  // Meetings first: a transcript's first line names its meeting's span, and
+  // resolving both in one parallel pass left that line to a race.
+  const ordered = [
+    ...detailed.filter((node) => node.kind === 'meeting'),
+    ...detailed.filter((node) => node.kind !== 'meeting'),
+  ];
+  const describe = async (node: ViewerWorkNode): Promise<void> => {
     const stored = storedNode(authorization, node.id);
     const freshness = lease(stored?.updatedAt ?? node.updatedAt, now);
 
@@ -485,7 +491,9 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     if ((node.kind === 'project' || node.kind === 'task') && trim(node.description)) {
       setDetail(node.id, { lines: [trim(node.description) as string] });
     }
-  }));
+  };
+  await Promise.all(ordered.filter((node) => node.kind === 'meeting').map(describe));
+  await Promise.all(ordered.filter((node) => node.kind !== 'meeting').map(describe));
 
   // An operation is evidence that one process edge was observed running. Both
   // the process node and the relationship must still be inside their lease.
