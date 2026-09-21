@@ -116,9 +116,11 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     if (!startedAt) return null;
     // The definition's own name, so the card says "Presentation agent" rather
     // than an internal pipeline id.
+    // The definitions table is keyed (userId, pipelineId): the owner is the
+    // person who triggered this run, which is the same person the graph is of.
     const definition = await this.client.send(new GetCommand({
       TableName: PIPELINE_DEFINITIONS_TABLE,
-      Key: { pipelineId: String(row.pipelineId ?? '') },
+      Key: { userId: String(row.triggeredBy ?? ''), pipelineId: String(row.pipelineId ?? '') },
     })).catch(() => undefined);
     const agentLabel = text((definition?.Item as Row | undefined)?.name, 80);
     const attempts = Object.values(steps)
