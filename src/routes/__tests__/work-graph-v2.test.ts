@@ -206,7 +206,7 @@ function setup(options: { disclosure?: WorkDisclosure; activityReader?: WorkActi
 
 interface Captured { statusCode: number; body: unknown }
 
-async function get(app: express.Express, url: string, sub = 'frank'): Promise<Captured> {
+async function get(app: express.Express, url: string, sub = 'frank', method = 'GET', body?: unknown): Promise<Captured> {
   const captured: Captured = { statusCode: 200, body: undefined };
   let settle!: () => void;
   const finished = new Promise<void>((resolve) => { settle = resolve; });
@@ -218,8 +218,9 @@ async function get(app: express.Express, url: string, sub = 'frank'): Promise<Ca
     end() { settle(); return this; },
   };
   const req = {
-    method: 'GET', url, originalUrl: url,
+    method, url, originalUrl: url,
     headers: { 'content-type': 'application/json' },
+    ...(body === undefined ? {} : { body }),
     params: {}, ip: '127.0.0.1', user: { sub, orgId: 'org-1' },
   } as unknown as Request;
   await new Promise<void>((resolve, reject) => {
@@ -338,6 +339,33 @@ describe('work graph schemaVersion 2 route', () => {
     const app = setup();
     expect((await get(app, v2, 'mallory')).statusCode).toBe(404);
     expect((await get(app, base, 'mallory')).statusCode).toBe(404);
+  });
+
+  it('answers a transcript question by quoting it, and refuses to answer otherwise', async () => {
+    const app = setup();
+    const ask = (question: string, sub = 'frank') => get(
+      app, '/api/work-graph/transcripts/transcript/ask', sub, 'POST',
+      { personId: 'connor', day: DAY, timezone: 'America/New_York', question },
+    );
+
+    const grounded = await ask('who owns the rollback?');
+    expect(grounded.statusCode).toBe(200);
+    const answer = grounded.body as { answer: string | null; grounding: string; citations: Array<{ segmentId: string }> };
+    expect(answer.grounding).toBe('transcript-extract');
+    expect(answer.citations.map((citation) => citation.segmentId)).toEqual(['segment-2']);
+    // Every word of the answer comes from the transcript itself.
+    expect(answer.answer).toBe('Frank: I will take the rollback owner.');
+
+    // Nothing in the transcript supports this, so nothing is invented.
+    const unsupported = await ask('what is the pricing model?');
+    expect((unsupported.body as { answer: string | null }).answer).toBeNull();
+    expect((unsupported.body as { citations: unknown[] }).citations).toEqual([]);
+
+    expect((await ask('', 'frank')).statusCode).toBe(400);
+    expect((await ask('who owns the rollback?', 'mallory')).statusCode).toBe(404);
+    // A node that is not an authorized transcript is indistinguishable from absent.
+    expect((await get(app, '/api/work-graph/transcripts/deck/ask', 'frank', 'POST',
+      { personId: 'connor', day: DAY, timezone: 'America/New_York', question: 'anything?' })).statusCode).toBe(404);
   });
 
   it('refuses schemaVersion 2 on a deployment without an activity reader', async () => {

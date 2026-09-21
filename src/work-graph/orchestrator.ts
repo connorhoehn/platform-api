@@ -201,6 +201,71 @@ export interface WorkGraphWindowInput {
 /** Default interval when the caller asks for v2 without naming one. */
 const DEFAULT_WINDOW_MS = 15 * 60 * 1_000;
 
+export interface TranscriptCitation {
+  segmentId: string;
+  at: string;
+  speaker: string;
+  text: string;
+}
+
+export interface TranscriptAnswer {
+  /** Quoted transcript text, or null when nothing in it supports an answer. */
+  answer: string | null;
+  /** Always extractive: this service never generates transcript content. */
+  grounding: 'transcript-extract';
+  citations: TranscriptCitation[];
+}
+
+const STOP_WORDS = new Set([
+  'a', 'an', 'and', 'any', 'anything', 'are', 'as', 'at', 'be', 'but', 'by', 'can', 'did',
+  'do', 'does', 'for', 'from', 'had', 'has', 'have', 'how', 'i', 'in', 'is', 'it', 'me',
+  'of', 'on', 'or', 'that', 'the', 'their', 'there', 'they', 'this', 'to', 'was', 'we',
+  'were', 'what', 'when', 'where', 'which', 'who', 'why', 'will', 'with', 'you', 'your',
+]);
+const MAX_CITATIONS = 3;
+
+function terms(value: string): string[] {
+  return value
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((word) => word.length > 2 && !STOP_WORDS.has(word));
+}
+
+/**
+ * Ranks segments by how much of the question they actually contain. Ties keep
+ * transcript order so the quoted answer still reads chronologically.
+ */
+function answerFromTranscript(
+  question: string,
+  segments: ReadonlyArray<{ id: string; at: string; speaker: string; text: string }>,
+): TranscriptAnswer {
+  const wanted = new Set(terms(question));
+  if (wanted.size === 0) return { answer: null, grounding: 'transcript-extract', citations: [] };
+  const scored = segments
+    .map((segment, order) => {
+      const words = new Set(terms(segment.text));
+      let score = 0;
+      for (const term of wanted) if (words.has(term)) score += 1;
+      return { segment, order, score };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || left.order - right.order)
+    .slice(0, MAX_CITATIONS)
+    .sort((left, right) => left.order - right.order);
+  if (scored.length === 0) return { answer: null, grounding: 'transcript-extract', citations: [] };
+  const citations = scored.map((entry) => ({
+    segmentId: entry.segment.id,
+    at: entry.segment.at,
+    speaker: entry.segment.speaker,
+    text: entry.segment.text,
+  }));
+  return {
+    answer: citations.map((citation) => `${citation.speaker}: ${citation.text}`).join(' '),
+    grounding: 'transcript-extract',
+    citations,
+  };
+}
+
 export class WorkGraphInputError extends Error {
   readonly code = 'WORK_GRAPH_INVALID_REQUEST';
 }
@@ -701,6 +766,48 @@ export class WorkGraphOrchestrator {
       }
       throw error;
     }
+  }
+
+  /**
+   * Answers a question from an authorized transcript, quoting it.
+   *
+   * The answer is extracted from segments this viewer may already read; no
+   * text is generated, so the reply cannot state anything the transcript does
+   * not. Access is re-checked against the source at call time — a snapshot the
+   * caller happens to hold is not authorization — and a question with no
+   * supporting segment returns no answer rather than a plausible one.
+   */
+  async askTranscript(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    nodeId: string,
+    question: string,
+  ): Promise<TranscriptAnswer> {
+    const reader = this.deps.activityReader;
+    if (!reader) throw new WorkGraphInputError('Transcript questions are not available on this deployment.');
+    const trimmed = question.trim();
+    if (trimmed.length === 0 || trimmed.length > 500) throw new WorkGraphInputError('A question of 1 to 500 characters is required.');
+
+    const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone);
+    const node = snapshot.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node || node.kind !== 'transcript' || node.locked || node.disclosure !== 'details') throw unavailable();
+
+    const target = authorization.targets.get(nodeId);
+    if (!target || target.kind !== 'node') throw unavailable();
+    const decision = await authorizeWorkCapability(
+      { ...snapshot.scope, organizationId: viewer.organizationId, viewerId: viewer.viewerId },
+      target,
+      'view-transcript',
+      this.deps.sourceAcls,
+    );
+    if (decision === 'unavailable') throw new WorkGraphAuthorizationUnavailableError('Transcript authorization is unavailable.');
+    if (decision !== 'allow') throw new WorkGraphCapabilityDeniedError('Reading this transcript is not permitted.');
+
+    const facts = await reader.transcript(target.sourceRef.resourceId);
+    if (!facts || facts.segments.length === 0) throw unavailable();
+    return answerFromTranscript(trimmed, facts.segments);
   }
 
   async resolveReferences(

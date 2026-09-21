@@ -87,6 +87,12 @@ export interface BuildWorkActivityInput {
 /** A source lease, not a lifecycle flag: five minutes without evidence is stale. */
 const FRESHNESS_LEASE_MS = WORK_GRAPH_LIMITS.heartbeatStaleMs;
 const PROCESS_KINDS = new Set(['run', 'agent', 'terminal']);
+/**
+ * Relationships that describe a process doing work. `derived-from` names the
+ * evidence a run consumed, which is provenance rather than execution, so it
+ * never animates as a live operation.
+ */
+const OPERATION_RELATIONS = new Set(['produced', 'runs-in', 'operates-on', 'works-on']);
 
 function storedNode(authorization: AuthorizedWorkGraph, nodeId: string): StoredWorkNode | undefined {
   const target = authorization.targets.get(nodeId);
@@ -375,6 +381,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     // the same full disclosure a node detail does.
     if (!process || process.locked || process.disclosure !== 'details') continue;
     if (edge.disclosure === 'existence' || edge.status !== 'running') continue;
+    if (!OPERATION_RELATIONS.has(edge.relation) || edge.fromId !== process.id) continue;
     const stored = storedNode(authorization, process.id);
     const evidence = lease(stored?.updatedAt ?? process.updatedAt, now);
     if (!evidence) continue;

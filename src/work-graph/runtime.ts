@@ -65,6 +65,13 @@ function sourceOwnedResourceId(target: WorkAclTarget, source: WorkSourceKind, re
     if (target.node.kind === 'terminal') return `machine:${resourceId}`;
     if (target.node.kind === 'run') return `job:${resourceId}`;
   }
+  // The recording ACL decides transcript capability from this prefix. Without
+  // it a transcript node was authorized as its meeting, so a viewer allowed to
+  // read the transcript never received `view-transcript` and Ask stayed off.
+  if (source === 'meeting') {
+    if (target.node.kind === 'transcript') return `transcript:${resourceId}`;
+    if (target.node.kind === 'meeting') return `meeting:${resourceId}`;
+  }
   return resourceId;
 }
 

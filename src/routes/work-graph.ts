@@ -350,6 +350,25 @@ export function createWorkGraphRouter(orchestrator: WorkGraphOrchestrator): Rout
     res.status(200).json(await orchestrator.updateGrant(viewer, req.params.id, parseUpdateGrant(req.body)));
   }));
 
+  /**
+   * A question answered by quoting an authorized transcript. Access is
+   * re-checked against the source on every call, and an unanswerable question
+   * returns `answer: null` rather than anything the transcript does not say.
+   */
+  router.post('/transcripts/:id/ask', handler(async (req, res, viewer) => {
+    if (!isId(req.params.id)) throw new WorkGraphInputError('Transcript node id is invalid.');
+    if (!exact(req.body, ['personId', 'day', 'timezone', 'question'])
+      || !isId(req.body.personId)
+      || !isDay(req.body.day)
+      || !isTimezone(req.body.timezone)
+      || typeof req.body.question !== 'string') {
+      throw new WorkGraphInputError('Transcript question body is invalid.');
+    }
+    res.status(200).json(await orchestrator.askTranscript(
+      viewer, req.body.personId, req.body.day, req.body.timezone, req.params.id, req.body.question,
+    ));
+  }));
+
   router.post('/references/resolve', handler(async (req, res, viewer) => {
     if (!exact(req.body, ['references'])
       || !Array.isArray(req.body.references)
