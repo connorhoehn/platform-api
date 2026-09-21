@@ -15,8 +15,41 @@ import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOC
 import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID, DEFAULT_HISTORY_LIMIT } from '../documents/conversationSummarizePipeline';
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
 import { registerChatCommandPipeline, type ChatCommandRunInput } from './chatCommandRegistry';
+import {
+  AGENT_LOOP_CARD_AGENT, CHAT_AGENT_LOOP_PIPELINE_ID, agentLoopCardLab,
+  buildAgentLoopDefinition, buildAgentLoopRequest, parseAgentLoopCommand, planAgentLoop,
+  type AgentLoopRequest, type LoopPlan,
+} from './agentLoopPlanner';
+import { ClaudeCodeAgentClient } from '../pipeline/agent/ClaudeCodeAgentClient';
+import type { AgentClient } from '../pipeline/agent/types';
 
 export const HAIKU_CARD_AGENT = { userId: 'agent:haiku', displayName: 'Haiku' } as const;
+
+/**
+ * The client the /agent planner asks. Lazily the CLI-backed one, so nothing
+ * is spawned in a process that never runs the command; settable so a test
+ * can hand it a scripted planner instead of a real model.
+ */
+let plannerAgentClient: AgentClient | null | undefined;
+
+export function setAgentLoopPlannerClient(client: AgentClient | null): void {
+  plannerAgentClient = client;
+}
+
+export function getAgentLoopPlannerClient(): AgentClient | null {
+  if (plannerAgentClient === undefined) plannerAgentClient = new ClaudeCodeAgentClient();
+  return plannerAgentClient;
+}
+
+/** The parsed command and its plan, carried from `prepare` to the builders. */
+export interface PreparedAgentLoop { request: AgentLoopRequest; plan: LoopPlan }
+
+/** `prepare` stashed it under `extra.agentLoop`; every builder needs it. */
+export function preparedAgentLoop(input: ChatCommandRunInput): PreparedAgentLoop {
+  const prepared = input.extra?.agentLoop as PreparedAgentLoop | undefined;
+  if (!prepared?.plan || !prepared.request) throw new AppError(500, '/agent was built without a plan');
+  return prepared;
+}
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
 
@@ -75,7 +108,7 @@ export function transformFieldList(fields: TransformTarget['fields']): string {
 
 let registered = false;
 
-/** Register the four built-ins. Idempotent; called once from the chat-commands route module. */
+/** Register the built-ins. Idempotent; called once from the chat-commands route module. */
 export function registerBuiltinChatCommands(): void {
   if (registered) return;
   registered = true;
@@ -145,6 +178,54 @@ export function registerBuiltinChatCommands(): void {
     },
     buildDefinition: () => buildConversationSummarizeDefinition(),
     card: () => ({ agent: HAIKU_CARD_AGENT }),
+  });
+
+  // /agent <instruction> [--model x] [<N>k] — plan the instruction into steps and
+  // run each of them as an agent in one cloud workspace, continuously, on a budget.
+  registerChatCommandPipeline({
+    trigger: '/agent',
+    pipelineId: CHAT_AGENT_LOOP_PIPELINE_ID,
+    label: 'Start an agent loop',
+    hint: 'in a cloud computer · budgeted',
+    description: 'Plan an instruction into agent steps and run them in a cloud workspace until each meets its acceptance. Leading /words are step hints, a trailing `200k` sets the context budget, `--model` picks the model.',
+    requires: { argumentText: true },
+    // The card IS the anchor the conversation gets: it opens the lab.
+    postCard: true,
+    prepare: async (input) => {
+      const request = buildAgentLoopRequest(
+        parseAgentLoopCommand(input.argumentText, input.extra ?? {}),
+        {
+          chatChannel: input.channel,
+          requestedBy: input.requestedBy,
+          ...(input.requestedByName ? { requestedByName: input.requestedByName } : {}),
+          ...(input.documentId ? { references: { documentId: input.documentId } } : {}),
+        },
+      );
+      if (!request.instruction) throw new AppError(400, '/agent needs something to do');
+      const plan = await planAgentLoop(request, getAgentLoopPlannerClient());
+      return { ...input, extra: { ...input.extra, agentLoop: { request, plan } satisfies PreparedAgentLoop } };
+    },
+    buildDefinition: (input) => {
+      const { plan, request } = preparedAgentLoop(input);
+      return buildAgentLoopDefinition(plan, request);
+    },
+    triggerPayload: (input) => {
+      const { plan, request } = preparedAgentLoop(input);
+      return {
+        instruction: request.instruction,
+        hints: request.hints,
+        contextBudgetTokens: request.contextBudgetTokens,
+        model: request.model,
+        plan,
+        chatChannel: request.chatChannel,
+        requestedBy: request.requestedBy,
+        requestedByName: request.requestedByName,
+      };
+    },
+    card: (input) => {
+      const { plan, request } = preparedAgentLoop(input);
+      return { agent: AGENT_LOOP_CARD_AGENT, lab: agentLoopCardLab(plan, request) };
+    },
   });
 
   // /diagram <what> — sketch a whiteboard into the fresh diagram document the client created.

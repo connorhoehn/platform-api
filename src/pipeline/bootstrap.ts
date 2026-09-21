@@ -101,6 +101,7 @@ import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
 import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
+import { DevboxAgentClient, devboxBaseUrl, takeRunLab } from './agent/DevboxAgentClient';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
 import { buildChatCommandHandlers } from '../documents/chatCommandHandlers';
 import { getCustomStepHandlers, registerCustomStepHandler } from './customStepHandlers';
@@ -881,6 +882,37 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   runQueueSubIds.push(eventBus.subscribe('pipeline:run:failed', async () => {
     runQueueMetrics.recordFailed();
   }));
+
+  // --- The run's cloud workspace dies with the run ---
+  //
+  // A `runtime: 'devbox'` step opens ONE agent-core microVM session per run
+  // and every later step of that run resumes it (see DevboxAgentClient). That
+  // is the whole point — the step that researches leaves notes the step that
+  // writes the deck reads — but it means nothing inside a single step's
+  // lifecycle can decide the box is finished with.
+  //
+  // So teardown hangs off the RUN's terminal events, all three of them:
+  // a loop that failed or was stopped leaks a microVM just as expensively as
+  // one that succeeded. `takeRunLab` reads-and-drops, so a run that somehow
+  // emits two terminal events deletes the session once.
+  //
+  // Best-effort by design: a session that will not delete is logged, never
+  // thrown. The run is already over; there is nothing left to fail.
+  if (devboxBaseUrl()) {
+    const devboxForTeardown = new DevboxAgentClient();
+    const stopLabSession = async (evt: unknown): Promise<void> => {
+      const data = ((evt as { payload?: Record<string, unknown> })?.payload ?? {}) as Record<string, unknown>;
+      const runId = typeof data.runId === 'string' ? data.runId : '';
+      if (!runId) return;
+      const lab = takeRunLab(runId);
+      if (!lab?.sessionId) return;
+      const stopped = await devboxForTeardown.deleteSession(lab.sessionId);
+      bootstrapLog.info({ runId, sessionId: lab.sessionId, boxId: lab.boxId, stopped }, 'devbox session teardown');
+    };
+    for (const event of ['pipeline:run:completed', 'pipeline:run:failed', 'pipeline:run:cancelled'] as const) {
+      runQueueSubIds.push(eventBus.subscribe(event, stopLabSession));
+    }
+  }
 
   // Two separate subscriptions to `pipeline:run:completed` below are
   // INTENTIONAL and not a race — they serve completely different purposes:

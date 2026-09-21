@@ -20,6 +20,7 @@ import { documentAgentEditRouter } from './documentAgentEdit';
 import { documentAutomationsRouter } from './documentAutomations';
 import { chatCommandsRouter } from './chatCommands';
 import { chatPanelsRouter } from './chatPanels';
+import { agentLoopsRouter } from './agentLoops';
 import { requireAuth } from '../middleware/auth';
 import { callLogRouter } from './callLog';
 import { workItemsRouter } from './workItems';
@@ -102,6 +103,8 @@ router.use('/documents', documentAutomationsRouter);
 router.use('/chat/commands', requireAuth, chatCommandsRouter);
 // What a chat card's `panel` result opens: GET /api/chat/panels/:kind/:id → the run's final panelData.
 router.use('/chat/panels', requireAuth, chatPanelsRouter);
+// The chat box as a computer lab: one /agent run's status, stream, prompt and stop.
+router.use('/agent-loops', requireAuth, agentLoopsRouter);
 router.use('/calls', callLogRouter);
 router.use('/profiles', profilesRouter);
 router.use('/social', socialRouter);
