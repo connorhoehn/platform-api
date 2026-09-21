@@ -801,11 +801,20 @@ export async function replayGatewayWorkGraph(
   // watermark is a composite revision, not a cursor into either partition's
   // delta log. An empty barrier is safe; any observed change must force the
   // gateway client to fetch a newly authorized composite snapshot.
-  if (query.timezone !== 'UTC' && request.afterWatermark < request.throughWatermark) {
-    return { batches: [], complete: false };
-  }
   const viewer = await directory.resolveViewerById(organizationId, viewerId);
   if (!viewer) return { batches: [], complete: false };
+  if (query.timezone !== 'UTC' && request.afterWatermark < request.throughWatermark) {
+    // The barrier still has to answer in the version it was asked in: a v2
+    // caller that receives no `schemaVersion` reads the deployment as v1-only
+    // and stops asking for the activity layer altogether.
+    if (!requestedView) return { batches: [], complete: false };
+    return {
+      batches: [],
+      complete: false,
+      schemaVersion: 2 as const,
+      view: await gatewayWorkGraphView(viewer, query, requestedView),
+    };
+  }
   const current = await workGraphOrchestrator.getGraph(
     viewer,
     query.personId,
