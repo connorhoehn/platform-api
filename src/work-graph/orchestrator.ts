@@ -607,7 +607,16 @@ export class WorkGraphOrchestrator {
     const { snapshot, query, activity } = await this.getActivity(viewer, personId, day, timezone, input, previousCursor);
     const built = buildWorkGraphSnapshotV2({ snapshot: snapshot as never, query, activity });
     // Failing closed keeps a partially derived activity layer off the wire.
-    if (!built.ok) throw new WorkGraphUnavailableError('This work item is unavailable.');
+    // The reason never reaches the caller — every unavailable answer looks the
+    // same — but an operator needs it, because a viewer-specific validation
+    // failure is otherwise indistinguishable from having no share at all.
+    if (!built.ok) {
+      log.error({
+        personId, day, timezone, viewerId: viewer.viewerId, errors: built.errors,
+        efforts: activity.efforts.length, details: activity.details.length,
+      }, 'v2 work graph snapshot failed its own contract');
+      throw new WorkGraphUnavailableError('This work item is unavailable.');
+    }
     return built.value;
   }
 
