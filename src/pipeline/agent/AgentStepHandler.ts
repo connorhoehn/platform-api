@@ -26,12 +26,14 @@ import type {
 } from 'distributed-core/applications/pipeline';
 import type {
   AgentClient,
+  AgentLabSession,
   AgentNodeData,
   AgentStepOutput,
   AgentToolCall,
 } from './types';
 import { DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT_MS } from './types';
 import { isToolless } from './ClaudeCodeAgentClient';
+import { rememberRunLab } from './DevboxAgentClient';
 
 /**
  * `pipeline:step:agent:tool` is not in DC's `PipelineEventMap`, which
@@ -43,7 +45,14 @@ import { isToolless } from './ClaudeCodeAgentClient';
 type LooseEmit = (event: string, payload: unknown) => Promise<void>;
 
 export interface AgentStepHandlerOpts {
+  /** `runtime: 'local'` (the default, and every pre-devbox definition). */
   agentClient: AgentClient;
+  /**
+   * `runtime: 'devbox'`. Absent means the devbox runtime is not configured
+   * here: a node that asks for it fails saying so rather than silently
+   * running somewhere the author did not choose.
+   */
+  devboxAgentClient?: AgentClient;
   defaultModel?: string;
   /**
    * Working directory handed to the agent's tools. Only meaningful
@@ -79,6 +88,19 @@ export function interpolateContext(
     }
     return value === undefined || value === null ? '' : String(value);
   });
+}
+
+/**
+ * The devbox session an earlier step of this run opened. Step outputs merge
+ * into the run context, so the first devbox step's `lab` is simply there for
+ * the next one — and rides the checkpoint, so it survives a restart.
+ */
+export function labFromContext(context: Record<string, unknown>): AgentLabSession | undefined {
+  const lab = context.lab;
+  if (!lab || typeof lab !== 'object') return undefined;
+  const { sessionId, boxId } = lab as { sessionId?: unknown; boxId?: unknown };
+  if (typeof sessionId !== 'string' || !sessionId) return undefined;
+  return { sessionId, boxId: typeof boxId === 'string' ? boxId : '' };
 }
 
 /** Bound one tool payload so a big Read can't sink the whole trace. */
@@ -118,9 +140,9 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
       const data = node.data as unknown as AgentNodeData;
 
       // A bad subscriber must never take down the step.
-      const safeEmit = async (payload: Record<string, unknown>): Promise<void> => {
+      const safeEmit = async (event: string, payload: Record<string, unknown>): Promise<void> => {
         try {
-          await emit('pipeline:step:agent:tool', payload);
+          await emit(event, payload);
         } catch {
           /* ignore */
         }
@@ -134,6 +156,14 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
       const systemPrompt = data.systemPrompt
         ? interpolateContext(data.systemPrompt, context)
         : undefined;
+
+      // Which runtime runs it. Absent means 'local', so nothing written
+      // before the devbox runtime existed changes behaviour.
+      const runtime: 'local' | 'devbox' = data.runtime === 'devbox' ? 'devbox' : 'local';
+      const client = runtime === 'devbox' ? opts.devboxAgentClient : opts.agentClient;
+      if (!client) {
+        return { status: 'failed', error: 'devbox runtime unavailable: no devbox agent client is configured' };
+      }
 
       const model = data.model?.trim() || defaultModel;
       const maxTurns = Number.isFinite(data.maxTurns) && (data.maxTurns as number) > 0
@@ -156,8 +186,15 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
       let tokensOut = 0;
       let reportedModel = model;
       let stopReason: AgentStepOutput['stopReason'] = 'error';
+      let iterations = 0;
+      let contextTokens = 0;
+      let lab: AgentLabSession | undefined;
 
-      const buildOutput = (): AgentStepOutput => ({
+      const contextBudgetTokens = Number.isFinite(data.contextBudgetTokens) && (data.contextBudgetTokens as number) > 0
+        ? (data.contextBudgetTokens as number)
+        : undefined;
+
+      const buildOutput = (): AgentStepOutput & { lab?: AgentLabSession } => ({
         text,
         turns,
         toolCalls: toolCalls.map((c) => ({
@@ -170,10 +207,18 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
         tokensOut,
         stopReason,
         toolless,
+        iterations: iterations || turns,
+        contextTokens: contextTokens || tokensIn,
+        ...(contextBudgetTokens ? { contextBudgetTokens } : {}),
+        runtime,
+        ...(lab?.sessionId ? { sessionId: lab.sessionId, boxId: lab.boxId } : {}),
+        // Merged into the run context by the executor, so the NEXT devbox
+        // step of this run reuses the same box instead of opening its own.
+        ...(lab?.sessionId ? { lab } : {}),
       });
 
       try {
-        const stream = opts.agentClient.run(prompt, {
+        const stream = client.run(prompt, {
           model,
           ...(systemPrompt ? { systemPrompt } : {}),
           allowedTools,
@@ -181,11 +226,37 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
           timeoutMs,
           signal: helpers.abortSignal,
           ...(opts.cwd ? { cwd: opts.cwd } : {}),
+          ...(runtime === 'devbox'
+            ? {
+                runId: helpers.runId,
+                stepId: helpers.stepId,
+                ...(contextBudgetTokens ? { contextBudgetTokens } : {}),
+                ...(labFromContext(context) ? { lab: labFromContext(context)! } : {}),
+                ...(typeof context.requestedBy === 'string' && context.requestedBy
+                  ? { requestedBy: context.requestedBy }
+                  : {}),
+                ...(data.label ? { label: data.label } : {}),
+              }
+            : {}),
         });
 
         for await (const ev of stream) {
-          if (ev.type === 'tool_start') {
-            await safeEmit({
+          if (ev.type === 'session') {
+            lab = { sessionId: ev.sessionId, boxId: ev.boxId };
+            rememberRunLab(helpers.runId, lab);
+          } else if (ev.type === 'iteration') {
+            iterations = ev.iteration;
+            contextTokens = ev.contextTokens;
+            await safeEmit('pipeline:step:agent:iteration', {
+              runId: helpers.runId,
+              stepId: helpers.stepId,
+              iteration: ev.iteration,
+              contextTokens: ev.contextTokens,
+              ...(ev.contextBudgetTokens ? { contextBudgetTokens: ev.contextBudgetTokens } : {}),
+              model: ev.model,
+            });
+          } else if (ev.type === 'tool_start') {
+            await safeEmit('pipeline:step:agent:tool', {
               runId: helpers.runId,
               stepId: helpers.stepId,
               callIndex: ev.callIndex,
@@ -194,7 +265,7 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
               at: ev.at,
             });
           } else if (ev.type === 'tool_end') {
-            await safeEmit({
+            await safeEmit('pipeline:step:agent:tool', {
               runId: helpers.runId,
               stepId: helpers.stepId,
               callIndex: ev.callIndex,
@@ -211,6 +282,12 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
             reportedModel = ev.model || model;
             stopReason = ev.stopReason;
             toolCalls = ev.toolCalls;
+            if (typeof ev.iterations === 'number') iterations = ev.iterations;
+            if (typeof ev.contextTokens === 'number') contextTokens = ev.contextTokens;
+            if (ev.sessionId) {
+              lab = { sessionId: ev.sessionId, boxId: ev.boxId ?? '' };
+              rememberRunLab(helpers.runId, lab);
+            }
           }
         }
       } catch (err) {
@@ -226,9 +303,11 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
 
       const output = buildOutput();
 
-      // Bounded means bounded: a turn/timeout breach is a FAILURE with
-      // the reason recorded, not a quietly-short success.
-      if (stopReason === 'max_turns' || stopReason === 'timeout' || stopReason === 'error') {
+      // Bounded means bounded: a turn/timeout/budget breach is a FAILURE
+      // with the reason recorded, not a quietly-short success. `budget` is
+      // in that list deliberately — a loop that ran out of context did not
+      // meet its acceptance, and the card must not imply that it did.
+      if (stopReason === 'max_turns' || stopReason === 'timeout' || stopReason === 'error' || stopReason === 'budget') {
         return {
           status: 'failed',
           output,
