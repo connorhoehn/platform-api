@@ -127,6 +127,13 @@ class DynamoWorkGraphDirectory implements WorkGraphDirectory {
       this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'document', producerServiceId: 'websocket-gateway', organizationId: organizationClaim, subject }),
       this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'cloud-compute', producerServiceId: 'aws-agentcore', organizationId: organizationClaim, subject }),
       this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'local-compute', producerServiceId: 'aws-agentcore', organizationId: organizationClaim, subject }),
+      // Pipeline and meeting joins were only created at the authenticated
+      // pipeline-trigger and video-session entrypoints, so a person who had
+      // never used either had their own run and recording events rejected at
+      // ingest. The bind is the same create-only one: this authenticated
+      // subject to its own same-named source subject, never another actor's.
+      this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'pipeline', producerServiceId: 'platform-api', organizationId: organizationClaim, subject }),
+      this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'meeting', producerServiceId: 'platform-api', organizationId: organizationClaim, subject }),
     ]);
     if (joins.some((joined) => !joined)) return null;
     return {

@@ -167,9 +167,15 @@ router.post('/ingest', async (req, res, next) => {
       res.status(503).json({ error: 'WORK_GRAPH_DISABLED' });
       return;
     }
+    // Each producer may still only send its own sources: verifyDirectEvent
+    // requires the authenticated service id to equal the source's expected
+    // producer, so a platform credential admits pipeline and meeting events
+    // and nothing else. Without it the platform's own sources could only
+    // reach the projection through the queue consumer.
     const serviceId = authenticated(req, res, [
       process.env.WORK_GRAPH_SOURCE_GATEWAY_SERVICE_ID?.trim() || 'websocket-gateway',
       process.env.WORK_GRAPH_SOURCE_COMPUTE_SERVICE_ID?.trim() || 'aws-agentcore',
+      process.env.WORK_GRAPH_SOURCE_PLATFORM_SERVICE_ID?.trim() || 'platform-api',
     ]);
     if (!serviceId) return;
     const event = await ingestAuthenticatedWorkEvent({
