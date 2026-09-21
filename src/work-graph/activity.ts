@@ -380,7 +380,10 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     // An attempt identifier is source detail, so an operation lease requires
     // the same full disclosure a node detail does.
     if (!process || process.locked || process.disclosure !== 'details') continue;
-    if (edge.disclosure === 'existence' || edge.status !== 'running') continue;
+    // Liveness is the process node's own fresh source evidence. The
+    // relationship only says which one is being worked on: a `produced` edge
+    // is written by the save record and is not itself marked running.
+    if (edge.disclosure === 'existence') continue;
     if (!OPERATION_RELATIONS.has(edge.relation) || edge.fromId !== process.id) continue;
     const stored = storedNode(authorization, process.id);
     const evidence = lease(stored?.updatedAt ?? process.updatedAt, now);
