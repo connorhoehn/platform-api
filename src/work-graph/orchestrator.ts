@@ -30,6 +30,7 @@ import {
 } from './policy';
 import type { WorkGraphCursorCodec } from './cursor';
 import { workGraphAuthorizationRevision } from './authorizationRevision';
+import log from '../lib/logger';
 import {
   buildWorkActivity,
   parsePreviewHandle,
