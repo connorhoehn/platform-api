@@ -385,6 +385,15 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         : undefined;
       const span = from && through ? `${from}–${through}${minutes ? ` · ${minutes} min` : ''}` : undefined;
       if (span) meetingLines.set(node.id, `${from}–${through}`);
+      // "transcript available" has to mean available to THIS viewer: the
+      // source having one says nothing about whether they may read it.
+      const transcript = (index.in.get(node.id) ?? [])
+        .filter((edge) => edge.relation === 'derived-from')
+        .map((edge) => index.byId.get(edge.fromId))
+        .find((item) => item?.kind === 'transcript' && !item.locked && item.disclosure === 'details');
+      const recorded = facts.recorded
+        ? `Recorded · transcript ${facts.transcriptAvailable && transcript ? 'available' : 'pending'}`
+        : undefined;
       const participants = (facts.participants ?? [])
         .filter((person) => trim(person.label))
         .slice(0, 12)
@@ -393,8 +402,9 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
           label: trim(person.label) as string,
           ...(person.avatarUrl && person.avatarUrl.startsWith('/') ? { avatarUrl: person.avatarUrl } : {}),
         }));
+      const lines = [span, recorded].filter((value): value is string => !!value);
       setDetail(node.id, {
-        ...(span ? { lines: [span] } : {}),
+        ...(lines.length ? { lines } : {}),
         ...(participants.length ? { participants } : {}),
       });
       return;

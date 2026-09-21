@@ -157,13 +157,21 @@ function reader(overrides: Partial<WorkActivityReader> = {}): WorkActivityReader
   };
 }
 
-function setup(options: { disclosure?: WorkDisclosure; activityReader?: WorkActivityReader } = {}): express.Express {
+function setup(options: {
+  disclosure?: WorkDisclosure;
+  activityReader?: WorkActivityReader;
+  /** Node kinds the sources cap at summary, whatever the grant says. */
+  summaryKinds?: StoredWorkNode['kind'][];
+} = {}): express.Express {
+  const capped = new Set(options.summaryKinds ?? []);
   const source: WorkSourceAclAdapter = {
     source: 'document',
     authorizeDisclosure: async (scope, targets) => new Map(targets.map((target) => [target.id, {
       targetId: target.id,
       decision: 'allow' as const,
-      maximumDisclosure: options.disclosure ?? ('details' as const),
+      maximumDisclosure: target.kind === 'node' && capped.has(target.node.kind)
+        ? ('summary' as const)
+        : options.disclosure ?? ('details' as const),
       capabilities: ['view-document' as const, 'view-transcript' as const],
       policyRevision: scope.policyRevision,
     }])),
@@ -284,6 +292,8 @@ describe('work graph schemaVersion 2 route', () => {
 
     expect(body.details.find((detail) => detail.nodeId === 'meeting')?.participants)
       .toEqual([{ id: 'connor', label: 'Connor Hoehn' }, { id: 'frank', label: 'Frank Davis' }]);
+    expect(body.details.find((detail) => detail.nodeId === 'meeting')?.lines)
+      .toEqual(['08:30–09:00 · 30 min', 'Recorded · transcript available']);
     expect(body.details.find((detail) => detail.nodeId === 'release-plan')?.lines)
       .toEqual(['Release plan · rev 6 · 09:08']);
 
@@ -319,6 +329,15 @@ describe('work graph schemaVersion 2 route', () => {
     expect(body.operations.map((operation) => operation.edgeId).sort()).toEqual(['e-produced', 'e-terminal']);
     expect(body.eventBuckets.length).toBeGreaterThan(0);
     expect(body.temporal.mode).toBe('live');
+  });
+
+  it('says a recording is pending when this viewer cannot read its transcript', async () => {
+    // The source has a ready transcript, and the meeting itself is disclosed;
+    // the transcript is not. The card must not promise what it cannot open.
+    const body = (await get(setup({ summaryKinds: ['transcript'] }), v2)).body as WorkGraphSnapshotV2;
+    expect(body.details.find((detail) => detail.nodeId === 'meeting')?.lines)
+      .toEqual(['08:30–09:00 · 30 min', 'Recorded · transcript pending']);
+    expect(body.details.some((detail) => detail.nodeId === 'transcript')).toBe(false);
   });
 
   it('reports a failed attempt with its sanitized message and an error run', async () => {
