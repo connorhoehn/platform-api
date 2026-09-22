@@ -967,12 +967,19 @@ export class RunPersistenceService {
     const failedNodeId = event.error.nodeId;
     const model = state.stepModelMap[failedNodeId];
     const modelSuffix = model ? ` (model: ${model})` : '';
-    state.error = `${failedNodeId}: ${event.error.message}${modelSuffix}`;
+    // A run that dies before it reaches any step (no node ever started —
+    // this same "empty prompt" failure is one way that happens) has no step
+    // to name, and the executor reports its OWN runId as `error.nodeId`
+    // rather than leaving it empty. Prefixing that onto the message put the
+    // run's own uuid in front of a person-facing error; a real step id is
+    // never equal to the run's id, so only that case earns the prefix.
+    const isRealStep = failedNodeId && failedNodeId !== event.runId;
+    state.error = `${isRealStep ? `${failedNodeId}: ` : ''}${event.error.message}${modelSuffix}`;
     // Backfill: step:failed and run:failed arrive on independently-ordered
     // channels, and pre-durationMs executors may not emit step:failed at all
     // for the terminal node. The failed step must exist in stepsSummary or
     // "Retry from here" 400s on it.
-    if (failedNodeId && !state.steps[failedNodeId]) {
+    if (isRealStep && !state.steps[failedNodeId]) {
       this.recordFailedStep(state, failedNodeId, event.error.message, event.at);
     }
     await this.persistRun(state);
@@ -1336,6 +1343,13 @@ export class RunPersistenceService {
    */
   private async publishWorkGraphLifecycle(state: RunState, occurredAt: string): Promise<void> {
     if (!state.organizationId || state.triggeredBy === 'system') return;
+    // `runTitle` is only ever a person's own words — the workGraph plan's
+    // title or their instruction. A run that fails before either lands (it
+    // died at the trigger, before a plan was ever accepted) has neither, and
+    // the projection's own generic "Pipeline run" names nothing a person
+    // reading a failed run card can act on. The pipeline definition's own
+    // name is a real fallback the run always has, even that early.
+    const safeLabel = runTitle(state) ?? await this.systemPipelineName(state.pipelineId);
     const result = await platformWorkGraphSourcePublisher.pipeline({
       kind: 'pipeline-run',
       run: {
@@ -1356,7 +1370,7 @@ export class RunPersistenceService {
         : {}),
       // The run has to be nameable: it is what an effort anchors on when the
       // conversation it came from is not in this person's graph.
-      ...(runTitle(state) ? { safeLabel: runTitle(state) as string } : {}),
+      ...(safeLabel ? { safeLabel } : {}),
     }, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
     if (!result.published) {
       log.warn({ runId: state.runId, reason: result.reason }, 'work graph pipeline lifecycle was not published');
@@ -1500,10 +1514,20 @@ export class RunPersistenceService {
     const clean = (value: unknown): string | undefined =>
       (typeof value === 'string' && value.trim() ? value.trim().slice(0, 80) : undefined);
     const snapshot = clean((item.definitionSnapshot as { name?: unknown } | undefined)?.name);
-    if (snapshot) return snapshot;
+    return snapshot ?? this.systemPipelineName(item.pipelineId);
+  }
+
+  /**
+   * The registered system pipeline's own name — the half of `definitionName`
+   * that needs nothing but a pipelineId, for callers (a live `RunState` has
+   * no persisted `definitionSnapshot` to prefer first) that only have that.
+   * Same lazy-import reasoning as `definitionName` above.
+   */
+  private async systemPipelineName(pipelineId: string): Promise<string | undefined> {
     try {
       const { getSystemPipeline } = await import('./systemPipelines.js');
-      return clean(getSystemPipeline(item.pipelineId)?.name);
+      const name = getSystemPipeline(pipelineId)?.name;
+      return typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : undefined;
     } catch {
       return undefined;
     }

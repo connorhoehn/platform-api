@@ -1025,6 +1025,31 @@ describe('RunPersistenceService persists FAILED steps into stepsSummary', () => 
     expect(item.stepsSummary?.['node-Y:2']).toBeUndefined();
   });
 
+  it('drops the node-id prefix when a run fails before it ever names a step', async () => {
+    // A run that dies at the trigger (an empty-prompt LLM step, for one) has
+    // no real step to blame, and the executor reports its OWN runId as
+    // `error.nodeId` rather than an empty string. The stored error must read
+    // as the failure it is, not as "<runId>: <message>" — a raw uuid a person
+    // reading the failed run card cannot act on.
+    const { repo, bus } = makeService();
+
+    await bus.publish('pipeline:run:started', {
+      runId: 'rf5', pipelineId: 'pf5',
+      triggeredBy: { triggerType: 'manual', userId: 'u1' }, at: 't0',
+    });
+    await bus.publish('pipeline:run:failed', {
+      runId: 'rf5',
+      error: { nodeId: 'rf5', message: "claude exited 1: Error: Input must be provided either through stdin or as a prompt." },
+      at: 't1',
+    });
+
+    const item = repo.put.mock.calls.at(-1)![0] as PipelineRunItem;
+    expect(item.status).toBe('failed');
+    expect(item.error).toBe("claude exited 1: Error: Input must be provided either through stdin or as a prompt.");
+    // Nor does it fabricate a step keyed by the run's own id.
+    expect(item.stepsSummary?.['rf5']).toBeUndefined();
+  });
+
   it('step:failed closes an in-flight attempt history from step:attempt:* events', async () => {
     const { repo, bus } = makeService();
 

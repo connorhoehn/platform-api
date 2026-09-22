@@ -218,6 +218,38 @@ describe('a step says where it is running and what it wrote', () => {
   });
 });
 
+describe('a run that fails before it has a plan or an instruction to be named after', () => {
+  beforeEach(() => { publisher.pipeline.mockClear(); });
+
+  it('names the run after its own pipeline definition rather than shipping no name at all', async () => {
+    // No `registerTrigger` (so no `workGraph`) and no `instruction` in the
+    // trigger payload — the state a run is in when it dies at the trigger,
+    // before either was ever recorded. `runTitle` has nothing to say, and
+    // the projection's own generic "Pipeline run" names nothing a person
+    // reading the failed run card can act on.
+    const { getSystemPipeline } = await import('../systemPipelines.js');
+    const { CONVERSATION_SUMMARIZE_PIPELINE_ID } = await import('../../documents/conversationSummarizePipeline.js');
+    const expectedName = getSystemPipeline(CONVERSATION_SUMMARIZE_PIPELINE_ID)!['name'];
+
+    const { service, emit } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID, userId: 'dev-frank',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org',
+    });
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: CONVERSATION_SUMMARIZE_PIPELINE_ID, at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
+    });
+    publisher.pipeline.mockClear();
+    await emit('pipeline:run:failed', {
+      runId: RUN, at: AT,
+      error: { nodeId: RUN, message: 'claude exited 1: Error: Input must be provided either through stdin or as a prompt.' },
+    });
+
+    expect(published()[0]).toMatchObject({ kind: 'pipeline-run', safeLabel: expectedName });
+  });
+});
+
 describe('replaying a stored run', () => {
   beforeEach(() => { publisher.pipeline.mockClear(); });
 
