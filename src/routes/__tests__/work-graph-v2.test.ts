@@ -586,6 +586,66 @@ describe('work graph schemaVersion 2 route', () => {
       .toBeUndefined();
   });
 
+  it('lists a revision from either record of it, and each of them once', async () => {
+    // v1 and v2 are projected change nodes AND rows; v3 was appended straight
+    // to the document with no save event; the release plan's rev-6 exists only
+    // as a change node. All of them must show, none of them twice.
+    const appended = reader({
+      artifact: async (documentId) => (documentId === 'doc-deck'
+        ? {
+          name: 'Sprint review',
+          mediaKind: 'presentation' as const,
+          revisions: [
+            { id: 'v1', label: 'v1', createdAt: at('13:27'), slideCount: 3, slides: deckSlides('Release readiness') },
+            { id: 'v2', label: 'v2', createdAt: at('13:31'), slideCount: 3, slides: deckSlides('Release readiness and owners') },
+            { id: 'v3', label: 'v3', createdAt: at('13:36'), slideCount: 1, slides: [{ id: 'slide-1', index: 1, title: 'Rollback plan' }] },
+          ],
+        }
+        : { name: 'Release plan', mediaKind: 'document' as const }),
+    });
+    const body = (await get(setup({ activityReader: appended }), v2)).body as WorkGraphSnapshotV2;
+    expect(validateWorkGraphSnapshotV2(body).ok).toBe(true);
+
+    const deck = body.details.find((detail) => detail.nodeId === 'deck');
+    expect(deck?.artifact?.revisions.map((revision) => revision.label)).toEqual(['v1', 'v2', 'v3']);
+    // The row-only revision brought its own slides and its own handle.
+    const newest = deck?.artifact?.revisions[2];
+    expect(newest?.anchors?.map((anchor) => anchor.label)).toEqual(['Rollback plan']);
+    expect(newest?.previewHandle).toBe('deck.v3');
+    expect(deck?.artifact?.pageCount).toBe(1);
+    // The pending attempt is the one after every revision now listed.
+    expect(deck?.artifact?.pending).toMatchObject({ label: 'v4', status: 'generating' });
+
+    // A document with only a projected change node is unchanged.
+    expect(body.details.find((detail) => detail.nodeId === 'release-plan')?.lines)
+      .toEqual(['Release plan · rev 6 · 09:08']);
+  });
+
+  it('serves a revision the document appended without a save event', async () => {
+    const appended = reader({
+      artifact: async (documentId) => (documentId === 'doc-deck'
+        ? {
+          name: 'Sprint review',
+          mediaKind: 'presentation' as const,
+          revisions: [{
+            id: 'v3',
+            label: 'v3',
+            createdAt: at('13:36'),
+            slideCount: 1,
+            slides: [{ id: 'slide-1', index: 1, title: 'Rollback plan' }],
+          }],
+        }
+        : { name: 'Release plan', mediaKind: 'document' as const }),
+      revisionPreview: async (documentId, revisionId, slideId) => (documentId === 'doc-deck' && revisionId === 'v3' && slideId === 'slide-1'
+        ? { contentType: 'image/svg+xml' as const, body: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" id="v3-slide-1"/>', 'utf8') }
+        : null),
+    });
+    const app = setup({ activityReader: appended });
+    const response = await get(app, `/api/work-graph/previews/deck.v3.slide-1?personId=connor&day=${DAY}&timezone=America%2FNew_York`);
+    expect(response.statusCode).toBe(200);
+    expect(String(response.body)).toContain('id="v3-slide-1"');
+  });
+
   it('refuses schemaVersion 2 on a deployment without an activity reader', async () => {
     const response = await get(setup({ activityReader: undefined }), v2);
     expect(response.statusCode).toBe(400);

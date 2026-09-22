@@ -478,16 +478,28 @@ function storedRevisionFacts(row: Row): ArtifactRevisionFacts[] {
           const source = value as Row | undefined;
           const sourceDocument = text(source?.documentId, 200);
           const title = text(source?.title, 120);
-          return sourceDocument && title ? { documentId: sourceDocument, title } : undefined;
+          const kind = source?.kind === 'transcript' || source?.kind === 'document' ? source.kind : undefined;
+          return sourceDocument && title
+            ? { documentId: sourceDocument, title, ...(kind ? { kind } : {}) }
+            : undefined;
         })
-        .filter((value): value is { documentId: string; title: string } => !!value);
+        .filter((value): value is { documentId: string; title: string; kind?: 'document' | 'transcript' } => !!value);
+      const label = text(revision?.label, 80);
+      const createdAt = iso(revision?.createdAt);
       const slideCount = typeof revision?.slideCount === 'number'
         && Number.isSafeInteger(revision.slideCount)
         && revision.slideCount > 0
         ? revision.slideCount
         : slides.length;
       if (!slideCount) return undefined;
-      return { id, slideCount, slides, ...(sources.length ? { sources } : {}) };
+      return {
+        id,
+        ...(label ? { label } : {}),
+        ...(createdAt ? { createdAt } : {}),
+        slideCount,
+        slides,
+        ...(sources.length ? { sources } : {}),
+      };
     })
     .filter((value): value is ArtifactRevisionFacts => !!value);
 }

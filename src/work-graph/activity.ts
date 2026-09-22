@@ -125,6 +125,10 @@ export interface RevisionPreview {
  */
 export interface ArtifactRevisionFacts {
   id: string;
+  /** How the source numbered it, for example `v2`. */
+  label?: string;
+  /** When the source recorded it. A revision with no time cannot be listed. */
+  createdAt?: string;
   /** How many slides the source says this revision has. */
   slideCount: number;
   slides: Array<{ id: string; index: number; title: string }>;
@@ -132,7 +136,7 @@ export interface ArtifactRevisionFacts {
    * The documents this revision cites, as the generator recorded them. Absent
    * when the source declared none — never the run's inputs guessed into place.
    */
-  sources?: Array<{ documentId: string; title: string }>;
+  sources?: Array<{ documentId: string; title: string; kind?: 'document' | 'transcript' }>;
 }
 
 export interface ArtifactFacts {
@@ -588,13 +592,33 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     if (node.kind === 'document') {
       const documentId = stored?.sourceRef.resourceId;
       const facts = documentId ? await reader.artifact(documentId) : null;
-      const revisions = documentId ? revisionsByDocument.get(documentId) ?? [] : [];
       const run = producingRun(index, node.id);
       const attention = documentId ? await reader.attention(documentId) : null;
-      // What each listed revision is actually made of, as its own source
-      // recorded it. A revision the source has no record of keeps whatever the
-      // projected change node said and gains nothing.
+      // What each revision is actually made of, as its own source recorded it.
+      // A revision the source has no record of keeps whatever the projected
+      // change node said and gains nothing.
       const storedRevisions = new Map((facts?.revisions ?? []).map((revision) => [revision.id, revision]));
+      // Two records of the same history: the projected `change` nodes, which
+      // are what a save event writes, and the document's own revision list,
+      // which is what a generator appends directly. Either one alone misses
+      // half of them, so they are merged and de-duplicated by revision id.
+      const projected = documentId ? revisionsByDocument.get(documentId) ?? [] : [];
+      const listedIds = new Set(projected.map((revision) => revision.id));
+      const revisions = [
+        ...projected,
+        ...[...storedRevisions.values()]
+          .filter((revision) => !listedIds.has(revision.id) && !!revision.createdAt)
+          .map((revision) => ({
+            id: revision.id,
+            label: trim(revision.label, WORK_GRAPH_LIMITS.labelLength) ?? revision.id,
+            createdAt: new Date(Date.parse(revision.createdAt as string)).toISOString(),
+          })),
+      ]
+        // Oldest first: the newest revision is the one the pane opens on, and
+        // the contract reads the list in the order the source made them.
+        .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt)
+          || left.id.localeCompare(right.id))
+        .slice(-WORK_GRAPH_V2_LIMITS.revisions);
       const runSources = run
         ? runInputs(index, run.id)
           .map((target) => link(
