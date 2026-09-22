@@ -62,6 +62,9 @@ npm run dev
 | `DDB_TABLE_PREFIX` | Table name prefix for shared DDB | (none) |
 | `PIPELINE_RUN_PERSISTENCE_ENABLED` | Persist pipeline runs to DDB | `true` |
 | `PIPELINE_DLQ_PERSISTENCE_ENABLED` | Persist DLQ entries to DDB | `true` |
+| `WORK_GRAPH_COMPUTE_SOURCE_URL` | aws-agentcore middleware URL: the compute-source ACL asked before a `terminal` node is disclosed, and the default base for the devbox runtime below | (empty = disabled) |
+| `AGENTCORE_DEVBOX_URL` | Where `runtime: 'devbox'` agent steps and `/api/agent-loops` reach the middleware's `/internal/devbox` router. Defaults to `WORK_GRAPH_COMPUTE_SOURCE_URL` — under Tilt they are the same process, and two copies of one host is how one of them goes stale. Unset and undefaulted means a devbox node fails with "devbox runtime unavailable" rather than running somewhere else. | `WORK_GRAPH_COMPUTE_SOURCE_URL` |
+| `WORK_GRAPH_SERVICE_AUTH_SECRET` | HMAC secret for the signed envelope sent to both internal routers above. Falls back to `SERVICE_AUTH_SECRET`. | (falls back) |
 
 ## Service Domains
 
@@ -136,6 +139,23 @@ All authenticated routes require a valid Cognito JWT (or `SKIP_AUTH=true` for lo
 | GET | `/api/pipelines/:id/cost` | Per-pipeline cost aggregation |
 | POST | `/api/pipelines/:runId/cancel` | Cancel a run |
 | POST | `/api/pipelines/:runId/approvals` | Approve/reject gate |
+
+### Agent loops (`/api/agent-loops`)
+
+The chat box as a computer lab. A `/agent <instruction> [--model x] [<N>k]`
+chat command plans the instruction into steps, generates a pipeline whose
+nodes ARE those steps, and runs each of them as an agent in one shared
+agent-core microVM session (`runtime: 'devbox'`). These routes are what the
+lab renders. Open to the requester or a viewer of the channel the command was
+typed in; `shell-url` is the requester's alone.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/agent-loops/:runId` | Status, model, budget, per-step progress, plan and lab |
+| GET | `/api/agent-loops/:runId/tail` | SSE proxy of the box's stream (replay + live), frames unchanged |
+| POST | `/api/agent-loops/:runId/instruct` | A line typed at the `›` prompt; 409 while a step is mid-task |
+| POST | `/api/agent-loops/:runId/shell-url` | A browser terminal on the box (requester only) |
+| POST | `/api/agent-loops/:runId/stop` | Cancel the run and stop the session |
 
 ### Social (`/api`)
 
