@@ -66,6 +66,21 @@ export const MAX_TOOL_PAYLOAD_CHARS = 4_000;
 export const MAX_FRAME_CHARS = 256 * 1024;
 /** Session open / delete / shell-url are small calls; the stream is not. */
 export const CONTROL_TIMEOUT_MS = 15_000;
+/**
+ * Stop BEFORE a task that would overrun the budget, not after.
+ *
+ * The check used to run only once a task had finished, so the last live run
+ * ended at 215.8k against a 200k budget: the loop looked at the ceiling only
+ * after it had already gone through it. A task cannot be un-run, so a session
+ * already at 90% of its budget does not start another one.
+ */
+export const BUDGET_HEADROOM_FRACTION = 0.9;
+
+/** True when there is not enough budget left to justify another task. */
+export function budgetSpent(contextTokens: number, budget: number | undefined): boolean {
+  if (!budget || budget <= 0) return false;
+  return contextTokens >= budget * BUDGET_HEADROOM_FRACTION;
+}
 /** A workspace listing is a pane's worth of rows, not a directory dump. */
 export const MAX_ARTIFACTS = 200;
 
@@ -406,7 +421,11 @@ export class DevboxAgentClient implements AgentClient {
     const toolCalls: AgentToolCall[] = [];
     let text = '';
     let iterations = 0;
-    let contextTokens = 0;
+    // Seeded from what the run has ALREADY spent: this client is constructed
+    // per step, but the devbox session it resumes is the run's, and its
+    // context carries across steps. Starting the count at zero is what let a
+    // later step sail past the ceiling on its first task.
+    let contextTokens = opts.startingContextTokens && opts.startingContextTokens > 0 ? opts.startingContextTokens : 0;
     let tokensIn = 0;
     let tokensOut = 0;
     let stopReason: AgentStopReason = 'max_turns';
@@ -429,6 +448,8 @@ export class DevboxAgentClient implements AgentClient {
     while (iterations < maxTurns) {
       if (opts.signal?.aborted) { stopReason = 'cancelled'; break; }
       if (this.now() >= deadline) { stopReason = 'timeout'; break; }
+      // Before the task, not after it.
+      if (budgetSpent(contextTokens, budget)) { stopReason = 'budget'; break; }
 
       iterations += 1;
       yield { type: 'turn', index: iterations };
@@ -477,7 +498,7 @@ export class DevboxAgentClient implements AgentClient {
       }
       // DONE first: an agent that finished ON the budget boundary finished.
       if (saysDone(iterationOutcome.text)) { stopReason = 'complete'; break; }
-      if (budget && contextTokens >= budget) { stopReason = 'budget'; break; }
+      if (budgetSpent(contextTokens, budget)) { stopReason = 'budget'; break; }
       if (this.now() >= deadline) { stopReason = 'timeout'; break; }
       if (iterations >= maxTurns) { stopReason = 'max_turns'; break; }
     }

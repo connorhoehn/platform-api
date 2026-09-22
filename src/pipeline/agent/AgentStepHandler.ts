@@ -84,6 +84,25 @@ const DEFAULT_MAX_TOOL_PAYLOAD_CHARS = 4_000;
 const MAX_PERSISTED_OUTPUT_CHARS = 60_000;
 
 /**
+ * How much of the earlier steps' work a later prompt may carry.
+ *
+ * A deck step drafts from what the run has already done, so each agent step
+ * appends its final text to `deckPriorWork` in the run context. Capped from
+ * the FRONT (the most recent work is the relevant work) so a long run cannot
+ * grow a prompt without bound.
+ */
+export const MAX_PRIOR_WORK_CHARS = 6_000;
+
+/** Earlier steps' output, newest last, bounded. */
+export function appendPriorWork(existing: unknown, label: string, text: string): string {
+  const before = typeof existing === 'string' && !existing.startsWith('(') ? existing : '';
+  const addition = text.trim() ? `## ${label}\n${text.trim()}` : '';
+  if (!addition) return before || '(the earlier steps produced no text)';
+  const joined = before ? `${before}\n\n${addition}` : addition;
+  return joined.length <= MAX_PRIOR_WORK_CHARS ? joined : joined.slice(-MAX_PRIOR_WORK_CHARS);
+}
+
+/**
  * The few numbers the lab is built from, small enough that nothing will ever
  * truncate them. Mirrored into the run CONTEXT under `loopSteps` so they
  * survive independently of the step output — see buildOutput.
@@ -100,6 +119,22 @@ export interface AgentLoopStepFacts {
   sessionId?: string;
   boxId?: string;
   skipped?: boolean;
+}
+
+/**
+ * The highest context any earlier step of this run reported.
+ *
+ * The devbox session is the RUN's and its context accumulates across steps,
+ * but a client is constructed per step and would otherwise start counting at
+ * zero — which is how a run ended at 215.8k against a 200k budget.
+ */
+export function spentContextTokens(context: Record<string, unknown>): number {
+  let spent = 0;
+  for (const facts of Object.values(loopStepsFromContext(context))) {
+    const value = (facts as { contextTokens?: unknown })?.contextTokens;
+    if (typeof value === 'number' && Number.isFinite(value) && value > spent) spent = value;
+  }
+  return spent;
 }
 
 /** The `loopSteps` map as it stands in the run context. */
@@ -326,6 +361,8 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
         // tool trace showed no iterations, no context and no stop reason, and
         // the lab read `failed` for a run that had finished.
         loopSteps: { ...loopStepsFromContext(context), [helpers.stepId]: stepFacts() },
+        // What a later deck step drafts from.
+        deckPriorWork: appendPriorWork(context.deckPriorWork, data.label ?? helpers.stepId, text),
       });
 
       try {
@@ -342,6 +379,8 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
                 runId: helpers.runId,
                 stepId: helpers.stepId,
                 ...(contextBudgetTokens ? { contextBudgetTokens } : {}),
+                // What earlier steps already spent in this shared session.
+                ...(spentContextTokens(context) > 0 ? { startingContextTokens: spentContextTokens(context) } : {}),
                 ...(labFromContext(context) ? { lab: labFromContext(context)! } : {}),
                 ...(typeof context.requestedBy === 'string' && context.requestedBy
                   ? { requestedBy: context.requestedBy }

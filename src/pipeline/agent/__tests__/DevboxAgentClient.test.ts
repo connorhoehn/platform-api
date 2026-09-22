@@ -131,13 +131,41 @@ describe('DevboxAgentClient', () => {
     ]);
   });
 
-  it('stops with budget when the session\'s context grows past the ceiling', async () => {
+  it('stops with budget as the ceiling comes into reach, WITHOUT overrunning it', async () => {
     // Never says DONE; context grows 30k per resumed task.
     const c = await client((_call, i) => turn('still going', 30_000 * (i + 1)));
     const done = doneEvent(await collect(c.run('x', { maxTurns: 20, contextBudgetTokens: 100_000 })));
     expect(done.stopReason).toBe('budget');
-    expect(done.contextTokens).toBeGreaterThanOrEqual(100_000);
-    expect(done.iterations).toBe(4);
+    // 90k of a 100k budget is the last task it may run: a live run that only
+    // checked afterwards finished at 215.8k of 200k.
+    expect(done.contextTokens).toBe(90_000);
+    expect(done.contextTokens).toBeLessThan(100_000);
+    expect(done.iterations).toBe(3);
+  });
+
+  it('refuses to start a task at all when the run already spent the budget', async () => {
+    const c = await client(() => turn('still going', 10_000));
+    const done = doneEvent(await collect(c.run('x', {
+      maxTurns: 5, contextBudgetTokens: 200_000, startingContextTokens: 195_000,
+    })));
+    expect(done.stopReason).toBe('budget');
+    expect(done.iterations).toBe(0);
+    // The decisive assertion: the box was never asked to do anything.
+    expect(harness!.calls).toHaveLength(0);
+  });
+
+  // The seed gates the FIRST task only. After that the session reports its own
+  // cumulative total, which is the authority — a real box knows what it is
+  // carrying better than we can infer from the previous step's last number.
+  it('lets a step start when the run has spent some budget but not most of it', async () => {
+    const c = await client((_call, i) => turn(i === 0 ? 'still going' : 'DONE', 160_000 + i * 20_000));
+    const done = doneEvent(await collect(c.run('x', {
+      maxTurns: 10, contextBudgetTokens: 200_000, startingContextTokens: 150_000,
+    })));
+    expect(harness!.calls.length).toBeGreaterThan(0);
+    // 160k is under 180k, so a second task was allowed and it finished.
+    expect(done.stopReason).toBe('complete');
+    expect(done.contextTokens).toBe(180_000);
   });
 
   it('stops with max_turns when the agent never finishes and the budget is generous', async () => {

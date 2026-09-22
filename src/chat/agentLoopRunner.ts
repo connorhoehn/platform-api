@@ -31,8 +31,9 @@ import { pipelineRunRepo } from '../repositories';
 import type { PipelineRunItem } from '../repositories/PipelineRunRepository';
 import type { ChatCommandRunInput } from './chatCommandRegistry';
 import {
-  CHAT_AGENT_LOOP_PIPELINE_ID, buildAgentLoopRequest,
-  parseAgentLoopCommand, planAgentLoop, type AgentLoopRequest, type LoopPlan,
+  CHAT_AGENT_LOOP_PIPELINE_ID, MAX_SOURCE_TITLES, MAX_TRANSCRIPT_PROMPT_CHARS,
+  buildAgentLoopRequest, parseAgentLoopCommand, planAgentLoop,
+  type AgentLoopRequest, type AgentLoopSource, type LoopPlan,
 } from './agentLoopPlanner';
 import log from '../lib/logger';
 
@@ -112,6 +113,42 @@ export function defaultRunnerDeps(): AgentLoopRunnerDeps {
   };
 }
 
+/**
+ * Documents the conversation named, which a deck step may cite. Read from
+ * what the composer sent (`extra.documents`, the `#`-referenced documents)
+ * and the conversation's recordings; NEVER invented, because a citation the
+ * user did not choose is a citation to something they cannot check.
+ */
+export function sourcesFromInput(input: ChatCommandRunInput): AgentLoopSource[] {
+  const out: AgentLoopSource[] = [];
+  const seen = new Set<string>();
+  const push = (raw: unknown, kind?: string): void => {
+    if (!raw || typeof raw !== 'object') return;
+    const r = raw as Record<string, unknown>;
+    const documentId = typeof r.documentId === 'string' ? r.documentId : (typeof r.id === 'string' ? r.id : '');
+    const title = typeof r.title === 'string' ? r.title : (typeof r.name === 'string' ? r.name : '');
+    if (!documentId || seen.has(documentId) || out.length >= MAX_SOURCE_TITLES) return;
+    seen.add(documentId);
+    out.push({ documentId, title: (title || documentId).slice(0, 160), ...(kind ? { kind } : {}) });
+  };
+
+  const documents = input.extra?.documents;
+  if (Array.isArray(documents)) for (const d of documents) push(d);
+  const references = input.extra?.references;
+  if (Array.isArray(references)) for (const r of references) push(r);
+  const transcripts = input.extra?.transcripts;
+  if (Array.isArray(transcripts)) for (const t of transcripts) push(t, 'transcript');
+  if (input.documentId) push({ documentId: input.documentId, title: 'The open document' });
+  return out;
+}
+
+/** Transcript text the deck may quote, capped before it ever reaches a prompt. */
+export function transcriptFromInput(input: ChatCommandRunInput): string | undefined {
+  const raw = input.extra?.transcript;
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+  return raw.trim().slice(0, MAX_TRANSCRIPT_PROMPT_CHARS);
+}
+
 /** The command as parsed, with who asked and where. */
 export function requestFromInput(input: ChatCommandRunInput): AgentLoopRequest {
   const request = buildAgentLoopRequest(
@@ -124,7 +161,13 @@ export function requestFromInput(input: ChatCommandRunInput): AgentLoopRequest {
     },
   );
   if (!request.instruction) throw new AppError(400, '/agent needs something to do');
-  return request;
+  const sources = sourcesFromInput(input);
+  const transcript = transcriptFromInput(input);
+  return {
+    ...request,
+    ...(sources.length ? { sources } : {}),
+    ...(transcript ? { transcript } : {}),
+  };
 }
 
 /** Put a loop out of its misery, with the reason on the row. */

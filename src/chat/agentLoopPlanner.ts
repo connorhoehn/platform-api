@@ -21,6 +21,8 @@
 // one. `extra` is consulted only where the text said nothing.
 
 import type { AgentClient, AgentStopReason } from '../pipeline/agent/types';
+import { DECK_STEP_KIND } from '../deck/DeckStepHandler';
+import type { DeckSpec } from '../deck/DeckSpec';
 import log from '../lib/logger';
 
 export const CHAT_AGENT_LOOP_PIPELINE_ID = 'chat-agent-loop';
@@ -103,6 +105,58 @@ export interface AgentLoopReferences {
   workGraph?: { personId: string; nodeId?: string };
 }
 
+/** A document the deck may cite, named by the conversation rather than guessed. */
+export interface AgentLoopSource {
+  documentId: string;
+  title: string;
+  /** 'document' or 'transcript' — what the citation opens. */
+  kind?: string;
+}
+
+/** How much source text a generated prompt may carry. */
+export const MAX_SOURCE_TITLES = 12;
+export const MAX_TRANSCRIPT_PROMPT_CHARS = 8_000;
+
+/**
+ * Dev-only escape hatch. Under `MOCK_AGENTCORE` the drafting agent answers
+ * with the mock's prose, which is not a DeckSpec — correctly, the deck step
+ * then refuses to render. That leaves no way to exercise the real pptx path
+ * locally, so an instruction carrying this marker pins a known-good spec onto
+ * the render node instead. It never fires without the marker, and the marker
+ * is something a person has to type.
+ */
+export const DECK_FIXTURE_MARKER = '[deck-fixture]';
+
+export function wantsDeckFixture(instruction: string): boolean {
+  return String(instruction ?? '').toLowerCase().includes(DECK_FIXTURE_MARKER);
+}
+
+/** A small, valid, self-citing deck, so the local render path has something real to render. */
+export function deckFixtureSpec(request: { instruction: string; requestedByName?: string }, sources: AgentLoopSource[]): DeckSpec {
+  const cite = sources[0] ?? { documentId: 'deck-fixture', title: 'Deck fixture' };
+  const source = [{ documentId: cite.documentId, title: cite.title }];
+  const topic = request.instruction.replace(DECK_FIXTURE_MARKER, '').trim().slice(0, 80) || 'the agent loop';
+  return {
+    title: `Fixture deck — ${topic}`.slice(0, 120),
+    subtitle: 'Rendered from a pinned spec, not from a model',
+    theme: 'plain',
+    slides: [
+      { id: 'title', layout: 'title', title: `Fixture deck — ${topic}`.slice(0, 120), sources: source },
+      {
+        id: 'what-this-is', layout: 'bullets', title: 'What this is', eyebrow: 'Fixture',
+        bullets: [
+          'A pinned DeckSpec, used only when the instruction carries the fixture marker.',
+          'It exercises the real renderer: pptx, per-slide SVG, a stored revision.',
+          'No model wrote it, and nothing here is a claim about the sources.',
+        ],
+        notes: 'This deck exists so the local render path can be exercised end to end.',
+        sources: source,
+      },
+      { id: 'end', layout: 'section', title: 'End of fixture', sources: source },
+    ],
+  };
+}
+
 export interface AgentLoopRequest {
   instruction: string;
   hints: string[];
@@ -112,6 +166,10 @@ export interface AgentLoopRequest {
   requestedBy: string;
   requestedByName?: string;
   references?: AgentLoopReferences;
+  /** Documents the conversation named, which a deck step must cite. */
+  sources?: AgentLoopSource[];
+  /** Transcript text from the conversation's recordings, already capped. */
+  transcript?: string;
 }
 
 /** The part of the command the grammar alone decides. */
@@ -408,6 +466,67 @@ export function agentLoopNodeId(stepId: string): string {
   return `agent:${stepId}`;
 }
 
+/** `deck:s2` — the render node a `kind: 'deck'` step expands into. */
+export function deckLoopNodeId(stepId: string): string {
+  return `${DECK_STEP_KIND}:${stepId}`;
+}
+
+/** What the draft node is called; the render node is `Render <title> (.pptx)`. */
+export function deckDraftTitle(step: LoopStep): string {
+  return `Draft slides for ${step.title}`.slice(0, 120);
+}
+
+export function deckRenderTitle(step: LoopStep): string {
+  return `Render ${step.title} (.pptx)`.slice(0, 120);
+}
+
+/**
+ * What the drafting agent is told. GROUNDED OR NOTHING: it may cite only the
+ * documents the conversation actually named, and the rule that every slide
+ * carries a source is what stops the deck being decorative.
+ *
+ * The sources are listed by id at BUILD time (they are known then), while the
+ * transcript and the earlier steps' work are interpolated from the run
+ * context, so a step that runs an hour later still sees what preceded it.
+ */
+export function deckDraftPrompt(step: LoopStep, request: AgentLoopRequest): string {
+  const sources = (request.sources ?? []).slice(0, MAX_SOURCE_TITLES);
+  const sourceList = sources.length
+    ? sources.map((s) => `- ${s.documentId} — ${s.title}${s.kind === 'transcript' ? ' (transcript)' : ''}`).join('\n')
+    : '- (none: the conversation named no documents)';
+
+  return [
+    'You draft a presentation. Answer with ONLY a JSON object, no prose, no code fence.',
+    '',
+    'Shape:',
+    '{"title":"…","subtitle":"…","theme":"product|engineering|plain","slides":[ … ]}',
+    'Each slide:',
+    '  {"id":"kebab-id","layout":"title|section|bullets|two-column|chart|quote|image","title":"…","eyebrow":"…",',
+    '   "bullets":["…"], "columns":[["…"],["…"]],',
+    '   "chart":{"kind":"bar|line","labels":["…"],"series":[{"name":"…","values":[1,2]}]},',
+    '   "quote":{"text":"…","by":"…"}, "notes":"what to say out loud",',
+    '   "sources":[{"documentId":"…","title":"…","anchor":"optional heading"}]}',
+    '',
+    'Rules:',
+    '- Aim for 8-14 slides. Open with a `title` slide and divide the deck with `section` slides.',
+    '- EVERY slide must cite at least one source, by the exact documentId listed below. A slide you cannot source is a slide you must not write.',
+    '- Only state what the sources actually say. No invented numbers: a chart\'s values must appear in the sources.',
+    '',
+    'Sources you may cite:',
+    sourceList,
+    '',
+    'Transcript of the conversation\'s recordings, if any:',
+    '{{ context.deckTranscript }}',
+    '',
+    'What the earlier steps of this run produced (they also left their work in your workspace — read it):',
+    '{{ context.deckPriorWork }}',
+    '',
+    `Requested by: ${request.requestedByName || request.requestedBy}`,
+    `Build the deck for this step: ${step.prompt}`,
+    `Acceptance: ${step.done}`,
+  ].join('\n');
+}
+
 /** The prompt a node runs: the step, then the sentence that ends the loop. */
 export function agentLoopNodePrompt(step: LoopStep): string {
   return `${step.prompt}\n\nAcceptance: ${step.done}`;
@@ -428,10 +547,14 @@ export function agentLoopNodePrompt(step: LoopStep): string {
  *
  * Every node shares the run's devbox session, so "chained" costs nothing in
  * setup: step 2 resumes the box step 1 left behind.
+ *
+ * A `kind: 'deck'` step is the one that is not one node: it expands into a
+ * draft (agent) and a render (deck) pair, chained draft → render → next.
  */
 export function buildAgentLoopDefinition(plan: LoopPlan, request: AgentLoopRequest): Record<string, unknown> {
   const pos = (i: number) => ({ x: i * 240, y: 0 });
   const steps = plan.steps;
+  const fixture = wantsDeckFixture(request.instruction);
 
   const nodes: Array<Record<string, unknown>> = [
     {
@@ -440,25 +563,61 @@ export function buildAgentLoopDefinition(plan: LoopPlan, request: AgentLoopReque
       position: pos(0),
       data: { type: 'trigger', triggerType: 'platform', label: '/agent command' },
     },
-    ...steps.map((step, i) => ({
-      id: agentLoopNodeId(step.id),
-      type: 'agent',
-      position: pos(i + 1),
-      data: {
-        type: 'agent',
-        prompt: agentLoopNodePrompt(step),
-        model: request.model,
-        runtime: 'devbox',
-        contextBudgetTokens: request.contextBudgetTokens,
-        maxTurns: LOOP_STEP_MAX_TURNS,
-        timeoutMs: LOOP_STEP_TIMEOUT_MS,
-        allowedTools: [...LOOP_STEP_TOOLS],
-        label: step.title,
-        loop: { kind: step.kind, stepId: step.id, ...(step.dependsOn.length ? { dependsOn: step.dependsOn } : {}) },
-        retryPolicy: LOOP_STEP_RETRY,
-      },
-    })),
   ];
+
+  const agentNode = (step: LoopStep, index: number, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: agentLoopNodeId(step.id),
+    type: 'agent',
+    position: pos(index),
+    data: {
+      type: 'agent',
+      prompt: agentLoopNodePrompt(step),
+      model: request.model,
+      runtime: 'devbox',
+      contextBudgetTokens: request.contextBudgetTokens,
+      maxTurns: LOOP_STEP_MAX_TURNS,
+      timeoutMs: LOOP_STEP_TIMEOUT_MS,
+      allowedTools: [...LOOP_STEP_TOOLS],
+      label: step.title,
+      loop: { kind: step.kind, stepId: step.id, ...(step.dependsOn.length ? { dependsOn: step.dependsOn } : {}) },
+      retryPolicy: LOOP_STEP_RETRY,
+      ...over,
+    },
+  });
+
+  for (const step of steps) {
+    if (step.kind === 'deck') {
+      // A DECK STEP IS TWO NODES, because drafting and rendering fail
+      // differently and a person needs to see which one did. The draft is an
+      // ordinary devbox agent step that must answer with a DeckSpec; the
+      // render is the real generator, and it refuses anything that is not a
+      // spec rather than inventing a deck.
+      nodes.push(agentNode(step, nodes.length, {
+        prompt: deckDraftPrompt(step, request),
+        label: deckDraftTitle(step),
+        loop: { kind: step.kind, stepId: step.id, role: 'draft', ...(step.dependsOn.length ? { dependsOn: step.dependsOn } : {}) },
+      }));
+      nodes.push({
+        id: deckLoopNodeId(step.id),
+        type: DECK_STEP_KIND,
+        position: pos(nodes.length),
+        data: {
+          type: DECK_STEP_KIND,
+          label: deckRenderTitle(step),
+          // The draft step's final text IS the spec.
+          specFrom: `$.steps.${agentLoopNodeId(step.id)}.text`,
+          title: step.title,
+          // No documentId: the handler creates the presentation for the
+          // requester, the way /diagram creates its page.
+          loop: { kind: step.kind, stepId: step.id, role: 'render' },
+          retryPolicy: LOOP_STEP_RETRY,
+          ...(fixture ? { spec: deckFixtureSpec(request, request.sources ?? []) } : {}),
+        },
+      });
+      continue;
+    }
+    nodes.push(agentNode(step, nodes.length));
+  }
 
   const edges = nodes.slice(0, -1).map((node, i) => ({
     id: `e${i + 1}`,
@@ -471,7 +630,7 @@ export function buildAgentLoopDefinition(plan: LoopPlan, request: AgentLoopReque
   return {
     id: CHAT_AGENT_LOOP_PIPELINE_ID,
     name: 'Agent loop',
-    description: 'An /agent command from a chat: a planner turns the instruction into steps, and each step runs as an agent in the run\'s shared cloud workspace until it meets its acceptance.',
+    description: 'An /agent command from a chat: a planner turns the instruction into steps, and each step runs as an agent in the run\'s shared cloud workspace until it meets its acceptance. A deck step drafts a grounded DeckSpec and renders a real .pptx.',
     version: 1,
     status: 'published',
     publishedVersion: 1,

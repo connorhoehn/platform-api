@@ -206,6 +206,13 @@ export interface AgentRunOptions {
   /** Who the session is registered to, and what it is called in the fleet. */
   requestedBy?: string;
   label?: string;
+  /**
+   * Devbox only: context the RUN has already spent in this session, before
+   * this step's first task. The session is shared and its context carries
+   * across steps, so a step that starts counting from zero can go straight
+   * through the run's ceiling on its first task.
+   */
+  startingContextTokens?: number;
 }
 
 /** Anything that can run an agent loop and report structured progress. */

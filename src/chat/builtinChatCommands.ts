@@ -248,6 +248,12 @@ export function registerBuiltinChatCommands(): void {
         chatChannel: request.chatChannel,
         requestedBy: request.requestedBy,
         requestedByName: request.requestedByName,
+        // Interpolated by a deck step's drafting prompt. Empty string rather
+        // than absent, so the prompt reads as "no transcript" instead of
+        // leaving a dangling template.
+        deckTranscript: request.transcript ?? '(no transcript for this conversation)',
+        deckPriorWork: '(this is the first step)',
+        ...(request.sources?.length ? { deckSources: request.sources } : {}),
       };
     },
     card: (input) => {

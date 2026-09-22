@@ -5,10 +5,12 @@ import {
   MAX_CONTEXT_BUDGET_TOKENS, MIN_CONTEXT_BUDGET_TOKENS,
   agentLoopNodeId, buildAgentLoopDefinition, buildAgentLoopRequest, extractJsonObject,
   PLANNER_MAX_TURNS, PLANNER_TIMEOUT_MS,
-  fallbackPlan, parseAgentLoopCommand, planAgentLoop, plannerPrompt, plannerStopNotice, validateLoopPlan,
+  fallbackPlan, parseAgentLoopCommand, planAgentLoop, plannerPrompt, plannerStopNotice,
+  validateLoopPlan, wantsDeckFixture,
   type AgentLoopRequest, type LoopPlan, type LoopStep,
 } from '../agentLoopPlanner';
 import type { AgentClient, AgentEvent, AgentStopReason } from '../../pipeline/agent/types';
+import { validateDeckSpec } from '../../deck/DeckSpec';
 
 /** A planner that says exactly what the test tells it to. */
 function scriptedPlanner(text: string | Error, stopReason: AgentStopReason = 'complete'): AgentClient {
@@ -173,14 +175,15 @@ describe('buildAgentLoopDefinition', () => {
   });
 
   it('gives every step a node id of agent:<stepId> and the step title', () => {
-    expect(nodes.map((n) => n.id)).toEqual(['trigger', 'agent:s1', 'agent:s2', 'agent:s3']);
+    // s3 is a deck step, so it is the draft node plus its render node.
+    expect(nodes.map((n) => n.id)).toEqual(['trigger', 'agent:s1', 'agent:s2', 'agent:s3', 'deck:s3']);
     expect(nodes.slice(1).map((n) => (n.data as { label: string }).label))
-      .toEqual(['Book the meeting', 'Draft the agenda', 'Build the deck']);
+      .toEqual(['Book the meeting', 'Draft the agenda', 'Draft slides for Build the deck', 'Render Build the deck (.pptx)']);
     expect(agentLoopNodeId('s4')).toBe('agent:s4');
   });
 
   it('carries the runtime, the budget and the bounds onto each agent node', () => {
-    for (const node of nodes.slice(1)) {
+    for (const node of nodes.filter((n) => n.type === 'agent')) {
       expect(node.type).toBe('agent');
       expect(node.data).toMatchObject({
         type: 'agent', runtime: 'devbox', model: 'opus', contextBudgetTokens: 150_000,
@@ -196,13 +199,18 @@ describe('buildAgentLoopDefinition', () => {
     expect((nodes[2].data as { prompt: string }).prompt).toBe('draft it\n\nAcceptance: agenda.md is written');
   });
 
+  it('gives a deck step its own drafting prompt instead of the generic one', () => {
+    expect((nodes[3].data as { prompt: string }).prompt).toContain('You draft a presentation');
+  });
+
   it('records the plan step on the node so the graph can name what it is doing', () => {
-    expect((nodes[3].data as { loop: unknown }).loop).toEqual({ kind: 'deck', stepId: 's3', dependsOn: ['s1'] });
+    expect((nodes[3].data as { loop: unknown }).loop).toEqual({ kind: 'deck', stepId: 's3', role: 'draft', dependsOn: ['s1'] });
+    expect((nodes[4].data as { loop: unknown }).loop).toEqual({ kind: 'deck', stepId: 's3', role: 'render' });
   });
 
   it('chains in topological order — s3 depends only on s1, but still runs after s2', () => {
     expect(edges.map((e) => `${e.source}->${e.target}`)).toEqual([
-      'trigger->agent:s1', 'agent:s1->agent:s2', 'agent:s2->agent:s3',
+      'trigger->agent:s1', 'agent:s1->agent:s2', 'agent:s2->agent:s3', 'agent:s3->deck:s3',
     ]);
     expect(edges.every((e) => e.sourceHandle === 'out' && e.targetHandle === 'in')).toBe(true);
   });
@@ -302,6 +310,103 @@ describe('the answer the real CLI gives', () => {
       { id: 's1', title: 'Schedule meeting with X team', kind: 'meeting', prompt: 'a', dependsOn: [], done: 'd' },
       { id: 's2', title: 'Create PowerPoint presentation', kind: 'deck', prompt: 'b', dependsOn: ['s1'], done: 'e' },
     ] }, request());
-    expect((def.nodes as Array<{ id: string }>).map((n) => n.id)).toEqual(['trigger', 'agent:s1', 'agent:s2']);
+    // The deck step is a draft node and a render node.
+    expect((def.nodes as Array<{ id: string }>).map((n) => n.id)).toEqual(['trigger', 'agent:s1', 'agent:s2', 'deck:s2']);
+  });
+});
+
+describe('a deck step becomes two nodes', () => {
+  const deckPlan: LoopPlan = {
+    source: 'planner',
+    steps: [
+      { id: 's1', title: 'Gather board work', kind: 'research', prompt: 'gather', dependsOn: [], done: 'notes.md exists' },
+      { id: 's2', title: 'Platform review deck', kind: 'deck', prompt: 'build the deck', dependsOn: ['s1'], done: 'deck.pptx exists' },
+      { id: 's3', title: 'Send it round', kind: 'other', prompt: 'send', dependsOn: ['s2'], done: 'sent' },
+    ],
+  };
+  const req = request({
+    model: 'opus',
+    sources: [{ documentId: 'doc-1', title: 'Board work' }, { documentId: 'rec-1', title: 'Team sync', kind: 'transcript' }],
+  });
+  const def = buildAgentLoopDefinition(deckPlan, req);
+  const nodes = def.nodes as Array<Record<string, unknown>>;
+  const edges = def.edges as Array<Record<string, string>>;
+  const data = (id: string) => nodes.find((n) => n.id === id)!.data as Record<string, unknown>;
+
+  it('adds a render node after the draft, leaving every other step alone', () => {
+    expect(nodes.map((n) => n.id)).toEqual(['trigger', 'agent:s1', 'agent:s2', 'deck:s2', 'agent:s3']);
+    expect(nodes.find((n) => n.id === 'deck:s2')!.type).toBe('deck');
+  });
+
+  it('titles them the way the brief names them', () => {
+    expect(data('agent:s2').label).toBe('Draft slides for Platform review deck');
+    expect(data('deck:s2').label).toBe('Render Platform review deck (.pptx)');
+  });
+
+  it('runs the draft on the devbox like every other step', () => {
+    expect(data('agent:s2')).toMatchObject({ type: 'agent', runtime: 'devbox', model: 'opus' });
+  });
+
+  it('points the render at the draft step\'s text, and names no document so one is created', () => {
+    expect(data('deck:s2')).toMatchObject({ specFrom: '$.steps.agent:s2.text', title: 'Platform review deck' });
+    expect(data('deck:s2')).not.toHaveProperty('documentId');
+  });
+
+  it('chains draft → render → next step', () => {
+    expect(edges.map((e) => `${e.source}->${e.target}`)).toEqual([
+      'trigger->agent:s1', 'agent:s1->agent:s2', 'agent:s2->deck:s2', 'deck:s2->agent:s3',
+    ]);
+  });
+
+  it('grounds the draft prompt in the named sources and demands a citation per slide', () => {
+    const prompt = data('agent:s2').prompt as string;
+    expect(prompt).toContain('doc-1 — Board work');
+    expect(prompt).toContain('rec-1 — Team sync (transcript)');
+    expect(prompt).toContain('EVERY slide must cite at least one source');
+    expect(prompt).toContain('ONLY a JSON object');
+    // The transcript and the earlier steps arrive from the run context.
+    expect(prompt).toContain('{{ context.deckTranscript }}');
+    expect(prompt).toContain('{{ context.deckPriorWork }}');
+    expect(prompt).toContain('build the deck');
+  });
+
+  it('says plainly when the conversation named nothing to cite', () => {
+    const bare = buildAgentLoopDefinition(deckPlan, request());
+    expect(((bare.nodes as Array<Record<string, unknown>>).find((n) => n.id === 'agent:s2')!.data as { prompt: string }).prompt)
+      .toContain('(none: the conversation named no documents)');
+  });
+
+  it('pins no spec without the fixture marker — the mock must not render a fake deck', () => {
+    expect(data('deck:s2')).not.toHaveProperty('spec');
+  });
+});
+
+describe('the [deck-fixture] dev override', () => {
+  const deckPlan: LoopPlan = {
+    source: 'planner',
+    steps: [{ id: 's1', title: 'A deck', kind: 'deck', prompt: 'build', dependsOn: [], done: 'done' }],
+  };
+
+  it('fires only on the marker', () => {
+    expect([wantsDeckFixture('build a deck [deck-fixture]'), wantsDeckFixture('build a deck')]).toEqual([true, false]);
+  });
+
+  it('pins a valid, self-citing spec onto the render node', () => {
+    const def = buildAgentLoopDefinition(deckPlan, request({
+      instruction: 'make the platform deck [deck-fixture]',
+      sources: [{ documentId: 'doc-1', title: 'Board work' }],
+    }));
+    const spec = ((def.nodes as Array<Record<string, unknown>>).find((n) => n.id === 'deck:s1')!.data as { spec: unknown }).spec;
+    const validated = validateDeckSpec(spec);
+    expect(validated.ok).toBe(true);
+    // Every slide cites the document the conversation actually named.
+    expect((spec as { slides: Array<{ sources: Array<{ documentId: string }> }> }).slides
+      .every((s) => s.sources.some((src) => src.documentId === 'doc-1'))).toBe(true);
+  });
+
+  it('still produces a valid spec when nothing was named to cite', () => {
+    const def = buildAgentLoopDefinition(deckPlan, request({ instruction: 'deck [deck-fixture]' }));
+    const spec = ((def.nodes as Array<Record<string, unknown>>).find((n) => n.id === 'deck:s1')!.data as { spec: unknown }).spec;
+    expect(validateDeckSpec(spec).ok).toBe(true);
   });
 });

@@ -34,7 +34,7 @@ import { computeCost } from '../pipeline/llm-pricing';
 import type { PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { SERVICE_AUTH_HEADER, signEnvelope } from '@connorhoehn/service-runtime';
 import { CHAT_AGENT_LOOP_PIPELINE_ID, type LoopPlan } from '../chat/agentLoopPlanner';
-import { agentLoopNodeId } from '../chat/agentLoopPlanner';
+import { agentLoopNodeId, deckLoopNodeId, deckRenderTitle } from '../chat/agentLoopPlanner';
 import log from '../lib/logger';
 
 /**
@@ -68,8 +68,20 @@ export interface AgentLoopStepView {
   stopReason?: string;
   /** Why the step failed, in the executor's own words. The UI shows this. */
   error?: string;
+  /** The executor's raw message, when `error` is the loop's plainer wording. */
+  errorDetail?: string;
   /** True when the run's budget was gone before this step started. */
   skipped?: boolean;
+  /** What a `deck` step produced, once it has. */
+  result?: { documentId: string; revisionId?: string; slideCount?: number; title?: string };
+}
+
+/** A document a run made: the deck it rendered, for the card and the pane. */
+export interface AgentLoopProduced {
+  documentId: string;
+  title: string;
+  revisionId?: string;
+  slideCount?: number;
 }
 
 /** One file the run left in its workspace, as the Files tab lists it. */
@@ -113,6 +125,8 @@ export interface AgentLoopView {
   /** Why `artifacts` is empty, when the reason is not "there are none". */
   artifactsNotice?: string;
   workItem?: AgentLoopWorkItem;
+  /** Documents this run made — a rendered deck, today. Empty until it has. */
+  produced: AgentLoopProduced[];
 }
 
 /** One row of the Computer Lab tab: a person's loop, summarised. */
@@ -132,6 +146,7 @@ export interface AgentLoopSummary {
   contextBudgetTokens: number;
   steps: number;
   chatChannel?: string;
+  produced: AgentLoopProduced[];
 }
 
 /** The run as this route needs it, from wherever it is still known. */
@@ -423,7 +438,9 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
   // step's own output no longer carries them.
   const facts = obj(run.context.loopSteps);
 
-  const steps: AgentLoopStepView[] = plan.steps.map((step) => {
+  const produced: AgentLoopProduced[] = [];
+
+  const steps: AgentLoopStepView[] = plan.steps.flatMap((step) => {
     const nodeId = agentLoopNodeId(step.id);
     const execution = run.steps[nodeId] ?? {};
     const rawOutput = obj(execution.output);
@@ -437,10 +454,10 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
     iterations += stepIterations;
     if (stepContext > contextTokens) contextTokens = stepContext;
     if (str(output.stopReason) === 'budget') sawBudgetStop = true;
-    return {
+    const view: AgentLoopStepView = {
       id: step.id,
       nodeId,
-      title: step.title,
+      title: step.kind === 'deck' ? `Draft slides for ${step.title}`.slice(0, 120) : step.title,
       kind: step.kind,
       status: str(execution.status) || 'pending',
       iterations: stepIterations,
@@ -452,6 +469,48 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
       ...(str(execution.error) ? { error: str(execution.error) } : {}),
       ...(output.skipped === true ? { skipped: true } : {}),
     };
+
+    // A deck step is TWO nodes. The draft is the agent row above; the render
+    // is its own row, because "the model did not answer with a spec" and "the
+    // renderer fell over" are different problems with different fixes.
+    if (step.kind !== 'deck') return [view];
+
+    const renderNodeId = deckLoopNodeId(step.id);
+    const render = run.steps[renderNodeId] ?? {};
+    const renderOutput = obj(render.output);
+    const documentId = str(renderOutput.documentId);
+    if (documentId) {
+      produced.push({
+        documentId,
+        title: str(renderOutput.title) || step.title,
+        ...(str(renderOutput.revisionId) ? { revisionId: str(renderOutput.revisionId) } : {}),
+        ...(num(renderOutput.slideCount) ? { slideCount: num(renderOutput.slideCount) } : {}),
+      });
+    }
+    const renderError = str(render.error);
+    const renderView: AgentLoopStepView = {
+      id: `${step.id}:render`,
+      nodeId: renderNodeId,
+      title: deckRenderTitle(step),
+      kind: 'deck',
+      status: str(render.status) || 'pending',
+      iterations: 0,
+      contextTokens: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      ...(renderError ? deckErrorFields(renderError) : {}),
+      ...(documentId
+        ? {
+            result: {
+              documentId,
+              ...(str(renderOutput.revisionId) ? { revisionId: str(renderOutput.revisionId) } : {}),
+              ...(num(renderOutput.slideCount) ? { slideCount: num(renderOutput.slideCount) } : {}),
+              ...(str(renderOutput.title) ? { title: str(renderOutput.title) } : {}),
+            },
+          }
+        : {}),
+    };
+    return [view, renderView];
   });
 
   const elapsedMs = elapsedMsOf(run, now);
@@ -495,6 +554,7 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
     // no notice means the workspace genuinely has no files.
     artifacts: [],
     ...(workItem ? { workItem } : {}),
+    produced,
   };
 }
 
@@ -517,7 +577,26 @@ export function summaryOf(run: LoadedAgentLoop, now: number): AgentLoopSummary {
     contextBudgetTokens: view.contextBudgetTokens,
     steps: view.steps.length,
     ...(str(run.context.chatChannel) ? { chatChannel: str(run.context.chatChannel) } : {}),
+    produced: view.produced,
   };
+}
+
+/**
+ * What the lab shows when a deck did not render.
+ *
+ * Under `MOCK_AGENTCORE` the drafting agent answers with the mock's prose,
+ * which is not a DeckSpec, and the generator refuses it — correctly: a deck
+ * rendered from nothing would be a fabricated document with a download
+ * button. The refusal deserves a sentence a person can act on ("the draft
+ * step did not produce a spec") rather than the generator's internals, so the
+ * raw message is kept beside it rather than thrown away.
+ */
+export const DRAFT_NOT_A_SPEC = 'draft was not a DeckSpec';
+
+export function deckErrorFields(rawError: string): { error: string; errorDetail?: string } {
+  const notASpec = /no DeckSpec found|not an object|slides|must cite|expected/i.test(rawError);
+  if (!notASpec) return { error: rawError };
+  return { error: DRAFT_NOT_A_SPEC, errorDetail: rawError };
 }
 
 /** A run started inside the half-open window `[startIso, endIso)`. */

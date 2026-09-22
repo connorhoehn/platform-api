@@ -151,9 +151,11 @@ describe('GET /api/agent-loops/:runId', () => {
       lab: { sessionId: 'sess-1', boxId: 'box-1', runtime: 'devbox' },
       plan: { source: 'planner', steps: [{ id: 's1', title: 'Book the meeting', kind: 'meeting' }, { id: 's2', title: 'Build the deck', kind: 'deck' }] },
     });
+    // s2 is a deck step, so it is a draft row and a render row.
     expect((res.body as { steps: unknown[] }).steps).toEqual([
       { id: 's1', nodeId: 'agent:s1', title: 'Book the meeting', kind: 'meeting', status: 'completed', iterations: 3, contextTokens: 42_000, tokensIn: 40_000, tokensOut: 900, stopReason: 'complete' },
-      { id: 's2', nodeId: 'agent:s2', title: 'Build the deck', kind: 'deck', status: 'pending', iterations: 0, contextTokens: 0, tokensIn: 0, tokensOut: 0 },
+      { id: 's2', nodeId: 'agent:s2', title: 'Draft slides for Build the deck', kind: 'deck', status: 'pending', iterations: 0, contextTokens: 0, tokensIn: 0, tokensOut: 0 },
+      { id: 's2:render', nodeId: 'deck:s2', title: 'Render Build the deck (.pptx)', kind: 'deck', status: 'pending', iterations: 0, contextTokens: 0, tokensIn: 0, tokensOut: 0 },
     ]);
   });
 
@@ -451,7 +453,7 @@ describe('GET /api/agent-loops?person=&day=&timezone=', () => {
     const res = await call(buildApp(), 'get', '/api/agent-loops?day=2026-09-21&timezone=UTC', 'dev-frank');
     expect((res.body as { loops: unknown[] }).loops[0]).toMatchObject({
       label: 'box-1', title: 'create a meeting with X team', model: 'opus',
-      environment: 'devbox:task', costUsd: 0.04, steps: 2, chatChannel: 'room:x',
+      environment: 'devbox:task', costUsd: 0.04, steps: 3, chatChannel: 'room:x',
     });
   });
 
@@ -617,5 +619,81 @@ describe('a GET after the process restarted', () => {
     });
     expect((await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank')).body)
       .toMatchObject({ status: 'running' });
+  });
+});
+
+describe('a loop with a deck step', () => {
+  const deckPlan = {
+    source: 'planner',
+    steps: [
+      { id: 's1', title: 'Gather board work', kind: 'research', prompt: 'g', dependsOn: [], done: 'notes' },
+      { id: 's2', title: 'Platform review deck', kind: 'deck', prompt: 'd', dependsOn: ['s1'], done: 'deck' },
+    ],
+  };
+  const withDeck = (over: Record<string, { status?: string; output?: unknown; error?: string }>): LoadedAgentLoop => loadedRun({
+    context: { ...loadedRun().context, plan: deckPlan },
+    steps: {
+      'agent:s1': { status: 'completed', output: { iterations: 2, contextTokens: 40_000 } },
+      ...over,
+    },
+  });
+
+  it('shows the draft and the render as their own rows', async () => {
+    run = withDeck({ 'agent:s2': { status: 'completed' }, 'deck:s2': { status: 'running' } });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    const steps = (res.body as { steps: Array<Record<string, unknown>> }).steps;
+    expect(steps.map((s) => [s.nodeId, s.kind, s.title])).toEqual([
+      ['agent:s1', 'research', 'Gather board work'],
+      ['agent:s2', 'deck', 'Draft slides for Platform review deck'],
+      ['deck:s2', 'deck', 'Render Platform review deck (.pptx)'],
+    ]);
+  });
+
+  it('carries what the render produced onto the step and onto the loop', async () => {
+    run = withDeck({
+      'agent:s2': { status: 'completed' },
+      'deck:s2': { status: 'completed', output: { documentId: 'doc-9', revisionId: 'rev-2', slideCount: 12, title: 'Platform review' } },
+    });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    const body = res.body as { steps: Array<Record<string, unknown>>; produced: unknown[] };
+    expect(body.steps[2].result).toEqual({ documentId: 'doc-9', revisionId: 'rev-2', slideCount: 12, title: 'Platform review' });
+    expect(body.produced).toEqual([{ documentId: 'doc-9', title: 'Platform review', revisionId: 'rev-2', slideCount: 12 }]);
+  });
+
+  it('produces nothing until the render has actually produced something', async () => {
+    run = withDeck({ 'deck:s2': { status: 'running' } });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect((res.body as { produced: unknown[] }).produced).toEqual([]);
+    expect((res.body as { steps: Array<Record<string, unknown>> }).steps[2]).not.toHaveProperty('result');
+  });
+
+  // Under MOCK_AGENTCORE the drafting agent answers with prose. Rendering that
+  // would be a fabricated document with a download button.
+  it('says the draft was not a DeckSpec, and keeps the generator\'s own words beside it', async () => {
+    run = withDeck({
+      'agent:s2': { status: 'completed' },
+      'deck:s2': { status: 'failed', error: 'deck: no DeckSpec found — set the node\'s specFrom to the step that drafts it' },
+    });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    const render = (res.body as { steps: Array<Record<string, unknown>> }).steps[2];
+    expect(render.error).toBe('draft was not a DeckSpec');
+    expect(render.errorDetail).toMatch(/no DeckSpec found/);
+    expect((res.body as { produced: unknown[] }).produced).toEqual([]);
+  });
+
+  it('passes a real renderer failure through as itself', async () => {
+    run = withDeck({ 'deck:s2': { status: 'failed', error: 'deck: the blob store refused the upload' } });
+    const render = (await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank')).body as { steps: Array<Record<string, unknown>> };
+    expect(render.steps[2].error).toBe('deck: the blob store refused the upload');
+    expect(render.steps[2]).not.toHaveProperty('errorDetail');
+  });
+
+  it('lists what the day\'s loops produced, so the Computer Lab tab can link them', async () => {
+    listRunsFor.mockResolvedValue([withDeck({
+      'deck:s2': { status: 'completed', output: { documentId: 'doc-9', revisionId: 'rev-1', slideCount: 8, title: 'Deck' } },
+    })]);
+    const res = await call(buildApp(), 'get', '/api/agent-loops?day=2026-09-21&timezone=UTC', 'dev-frank');
+    expect((res.body as { loops: Array<{ produced: unknown[] }> }).loops[0].produced)
+      .toEqual([{ documentId: 'doc-9', title: 'Deck', revisionId: 'rev-1', slideCount: 8 }]);
   });
 });
