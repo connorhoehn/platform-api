@@ -1379,6 +1379,9 @@ export class RunPersistenceService {
   ): Promise<void> {
     if (!state.organizationId || state.triggeredBy === 'system') return;
     const planned = state.workGraph?.steps.find((step) => step.stepId === stepId);
+    // The trigger is how a run starts, not a step of it, and it is never in
+    // the plan. Warning about it every run trains people to ignore the warn.
+    if (!planned && stepId === 'trigger') return;
     if (!planned) {
       // Silent here once cost a full debugging cycle: every run projected as
       // one opaque node and nothing anywhere said why.

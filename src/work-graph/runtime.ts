@@ -48,6 +48,8 @@ const CHAT_MEMBERS_TABLE = tableName(process.env.DYNAMODB_CHAT_MEMBERS_TABLE || 
 const DOCUMENTS_TABLE = tableName(process.env.DYNAMODB_DOCUMENTS_TABLE || 'crdt-documents');
 const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
 const RECORDINGS_TABLE = tableName('video-call-recordings');
+const HANGOUT_ROOMS_TABLE = tableName('hangout-rooms');
+const HANGOUT_ROOM_MEMBERS_TABLE = tableName('hangout-room-members');
 const MAX_DIRECTORY_USERS = 500;
 
 type Ddb = DynamoDBDocumentClient;
@@ -432,6 +434,29 @@ export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
     const pending = this.isConversationMember(channel, userId);
     batch.members.set(key, pending);
     return pending;
+  }
+
+  /**
+   * Who a booked room belongs to: the person who created it and everyone on
+   * its roster. Read only when no recording exists, so an in-progress or
+   * finished call is still decided by its own record.
+   */
+  private async roomPeople(organizationId: string, roomId: string): Promise<string[]> {
+    const room = (await this.client.send(new GetCommand({
+      TableName: HANGOUT_ROOMS_TABLE,
+      Key: { orgId: organizationId, roomId },
+    })).catch(() => undefined))?.Item;
+    if (!room) return [];
+    const members = await this.client.send(new QueryCommand({
+      TableName: HANGOUT_ROOM_MEMBERS_TABLE,
+      KeyConditionExpression: 'roomId = :room',
+      ExpressionAttributeValues: { ':room': roomId },
+      ProjectionExpression: 'userId',
+    })).catch(() => undefined);
+    return [
+      ...(typeof room.createdBy === 'string' ? [room.createdBy] : []),
+      ...((members?.Items ?? []).flatMap((item) => (typeof item.userId === 'string' ? [item.userId] : []))),
+    ];
   }
 
   private async isConversationMember(channel: string, userId: string): Promise<boolean> {

@@ -468,3 +468,39 @@ describe('a room a step booked', () => {
     ]);
   });
 });
+
+describe('the trigger is not a step', () => {
+  beforeEach(() => { publisher.pipeline.mockClear(); });
+
+  it('projects nothing for it, and does not warn about it either', async () => {
+    // It is how a run starts, never in the plan, and warning every run trains
+    // people to ignore the warn that matters.
+    const { service, emit } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'chat-agent-loop', userId: 'dev-frank',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan,
+    });
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
+    });
+    publisher.pipeline.mockClear();
+    await emit('pipeline:step:completed', { runId: RUN, stepId: 'trigger', durationMs: 1, at: AT });
+    expect(publisher.pipeline).not.toHaveBeenCalled();
+  });
+
+  it('still says so for a step that really should have been planned', async () => {
+    const { service, emit } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'chat-agent-loop', userId: 'dev-frank',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan,
+    });
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
+    });
+    publisher.pipeline.mockClear();
+    await emit('pipeline:step:completed', { runId: RUN, stepId: 'agent:s9', durationMs: 1, at: AT });
+    expect(publisher.pipeline).not.toHaveBeenCalled();
+  });
+});

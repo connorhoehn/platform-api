@@ -37,6 +37,8 @@ const DOCUMENT_COMMENTS_TABLE = tableName('document-comments');
 const DOCUMENT_LIFECYCLE_TABLE = tableName('document-lifecycle');
 const PIPELINE_DEFINITIONS_TABLE = tableName('pipeline-definitions');
 const PROFILES_TABLE = tableName('social-profiles');
+const HANGOUT_ROOMS_TABLE = tableName('hangout-rooms');
+const HANGOUT_ROOM_MEMBERS_TABLE = tableName('hangout-room-members');
 
 /** A lifecycle transition is evidence of attention for this long, no longer. */
 const ATTENTION_LEASE_MS = 10 * 60 * 1_000;
@@ -285,6 +287,39 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     };
   }
 
+  /**
+   * A booked room, from its own record. It reports no times: `createdAt` is
+   * when the room was made, not when it is meant to happen, and the proposed
+   * time is not a field on the room — so nothing is claimed about when it
+   * starts rather than a plausible wrong answer.
+   */
+  private async bookedRoom(roomId: string): Promise<MeetingFacts | null> {
+    const room = await scanOne(this.client, HANGOUT_ROOMS_TABLE, 'roomId = :id', { ':id': roomId });
+    if (!room) return null;
+    const roster = await this.client.send(new QueryCommand({
+      TableName: HANGOUT_ROOM_MEMBERS_TABLE,
+      KeyConditionExpression: 'roomId = :room',
+      ExpressionAttributeValues: { ':room': roomId },
+      ProjectionExpression: 'userId',
+    })).catch(() => undefined);
+    const expected = [
+      ...(text(room.createdBy, 128) ? [text(room.createdBy, 128) as string] : []),
+      ...((roster?.Items ?? []).flatMap((item) => (typeof item.userId === 'string' ? [item.userId] : []))),
+    ];
+    const participants = (await Promise.all([...new Set(expected)].slice(0, 12).map(async (userId) => {
+      const profile = (await this.client.send(new GetCommand({
+        TableName: PROFILES_TABLE, Key: { userId },
+      })).catch(() => undefined))?.Item as Row | undefined;
+      const label = text(profile?.displayName, 80);
+      return label ? { id: userId, label } : null;
+    }))).filter((value): value is { id: string; label: string } => !!value);
+    return {
+      ...(participants.length ? { participants } : {}),
+      recorded: false,
+      transcriptAvailable: false,
+    };
+  }
+
   async artifact(documentId: string): Promise<ArtifactFacts | null> {
     const row = (await this.client.send(new GetCommand({
       TableName: DOCUMENTS_TABLE,
@@ -462,7 +497,10 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
   async meeting(meetingId: string): Promise<MeetingFacts | null> {
     const id = meetingId.replace(/^meeting:/, '');
     const row = await scanOne(this.client, RECORDINGS_TABLE, 'callId = :id', { ':id': id });
-    if (!row) return null;
+    // A room that has not happened yet has no recording. It is still a real
+    // meeting with real people expected on it, and saying nothing about it
+    // left the card blank for the person who had just booked it.
+    if (!row) return this.bookedRoom(id);
     const attendees = Array.isArray(row.participants)
       ? row.participants
         .map((entry) => text((entry as Row | undefined)?.userId, 128))
