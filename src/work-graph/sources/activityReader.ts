@@ -56,6 +56,9 @@ const ERROR_SUMMARY_LENGTH = 160;
 const MAX_REVISIONS = 100;
 const MAX_SLIDES_PER_REVISION = 200;
 const MAX_SOURCES_PER_REVISION = 16;
+/** How many run ids one filtered scan asks about, and how deep it reads. */
+const MAX_IN_OPERANDS = 90;
+const MAX_RUN_SCAN_ROWS = 500;
 
 /**
  * How the presentation store and the blob store are reached. Both are process
@@ -127,9 +130,54 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
   ) {}
 
   async pipelineRun(resource: string): Promise<PipelineRunFacts | null> {
-    const { runId: id, stepId } = parsePipelineStepResourceId(resource);
+    const { runId: id } = parsePipelineStepResourceId(resource);
     const row = await scanOne(this.client, PIPELINE_RUNS_TABLE, 'runId = :run', { ':run': id });
-    if (!row) return null;
+    return row ? this.factsFromRun(resource, row) : null;
+  }
+
+  /**
+   * Every run a graph names, in one scan instead of one per node.
+   *
+   * `pipeline-runs` is keyed `(pipelineId, runId)`, so finding a run by its id
+   * alone is a filtered Scan whichever way it is asked — and a day with fifty
+   * run and step nodes asked fifty times, ten of them for the SAME run because
+   * each of its steps is its own node. The rows are identical; they are just
+   * read once.
+   */
+  async pipelineRuns(resources: string[]): Promise<Map<string, PipelineRunFacts>> {
+    const facts = new Map<string, PipelineRunFacts>();
+    const distinct = [...new Set(resources)];
+    if (distinct.length === 0) return facts;
+    const runIds = [...new Set(distinct.map((resource) => parsePipelineStepResourceId(resource).runId))];
+    const rows = new Map<string, Row | null>();
+    for (let index = 0; index < runIds.length; index += MAX_IN_OPERANDS) {
+      const chunk = runIds.slice(index, index + MAX_IN_OPERANDS);
+      const values = Object.fromEntries(chunk.map((id, position) => [`:r${position}`, id]));
+      const result = await this.client.send(new ScanCommand({
+        TableName: PIPELINE_RUNS_TABLE,
+        FilterExpression: `runId IN (${Object.keys(values).join(', ')})`,
+        ExpressionAttributeValues: values,
+        Limit: MAX_RUN_SCAN_ROWS,
+      }));
+      for (const item of (result.Items ?? []) as Row[]) {
+        const id = typeof item.runId === 'string' ? item.runId : undefined;
+        if (!id || !chunk.includes(id)) continue;
+        // Two rows claiming one run id is ambiguous provenance: it discloses
+        // nothing, exactly as the single-run lookup already refused to.
+        rows.set(id, rows.has(id) ? null : item);
+      }
+    }
+    await Promise.all(distinct.map(async (resource) => {
+      const row = rows.get(parsePipelineStepResourceId(resource).runId);
+      const derived = row ? await this.factsFromRun(resource, row) : null;
+      if (derived) facts.set(resource, derived);
+    }));
+    return facts;
+  }
+
+  /** What one run node — or one step of it — says about itself, from its row. */
+  private async factsFromRun(resource: string, row: Row): Promise<PipelineRunFacts | null> {
+    const { runId: id, stepId } = parsePipelineStepResourceId(resource);
     if (stepId) return this.pipelineStep(id, stepId, row);
     const steps = row.stepsSummary && typeof row.stepsSummary === 'object' && !Array.isArray(row.stepsSummary)
       ? (row.stepsSummary as Row)

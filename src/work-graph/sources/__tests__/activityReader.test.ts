@@ -273,6 +273,62 @@ describe('the row the deck seed leaves behind', () => {
   });
 });
 
+describe('reading a day of runs', () => {
+  const run = (runId: string, steps: Record<string, unknown>): Row => ({
+    runId,
+    pipelineId: 'deck-pipeline',
+    status: 'running',
+    startedAt: '2026-09-22T13:33:00.000Z',
+    lastEventAt: '2026-09-22T13:42:00.000Z',
+    triggeredBy: 'dev-frank',
+    stepsSummary: steps,
+  });
+
+  function scanningReader(rows: Row[]): { reader: DynamoWorkActivityReader; scans: number } {
+    const counter = { scans: 0 };
+    const client = {
+      async send(command: unknown) {
+        if (command instanceof ScanCommand) {
+          counter.scans += 1;
+          return { Items: rows };
+        }
+        return {};
+      },
+    } as unknown as DynamoDBDocumentClient;
+    return { reader: new DynamoWorkActivityReader(client), get scans() { return counter.scans; } };
+  }
+
+  it('reads every run and every step of them in one scan', async () => {
+    // The shape that made frank's graph crawl: one run with many step nodes,
+    // each of which used to scan `pipeline-runs` for the very same row.
+    const rows = [
+      run('run-9', { sources: { status: 'completed', startedAt: '2026-09-22T13:33:00.000Z' }, deck: { status: 'running', startedAt: '2026-09-22T13:40:00.000Z' } }),
+      run('run-12', { deck: { status: 'completed', startedAt: '2026-09-22T13:20:00.000Z' } }),
+    ];
+    const harness = scanningReader(rows);
+    const resources = ['run-9', 'run-9::sources', 'run-9::deck', 'run-12', 'run-12::deck', 'run-9'];
+
+    const facts = await harness.reader.pipelineRuns(resources);
+    expect(harness.scans).toBe(1);
+    expect([...facts.keys()].sort()).toEqual(['run-12', 'run-12::deck', 'run-9', 'run-9::deck', 'run-9::sources']);
+    expect(facts.get('run-9')?.runningStep).toEqual({ stepId: 'deck' });
+    expect(facts.get('run-9::deck')?.step?.stepId).toBe('deck');
+    expect(facts.get('run-12')?.status).toBe('running');
+  });
+
+  it('discloses nothing for a run id two rows both claim, or one no row has', async () => {
+    const harness = scanningReader([run('run-9', {}), run('run-9', {})]);
+    const facts = await harness.reader.pipelineRuns(['run-9', 'run-404']);
+    expect(facts.size).toBe(0);
+  });
+
+  it('asks for nothing when the graph names no runs', async () => {
+    const harness = scanningReader([]);
+    expect((await harness.reader.pipelineRuns([])).size).toBe(0);
+    expect(harness.scans).toBe(0);
+  });
+});
+
 describe('which step a run is inside', () => {
   it('names the running step from the run\'s own step summaries, newest first', async () => {
     const run = {

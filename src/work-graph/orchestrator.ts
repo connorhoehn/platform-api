@@ -584,7 +584,13 @@ export class WorkGraphOrchestrator {
     if (!reader) throw new WorkGraphInputError('Schema version 2 is not available on this deployment.');
     const now = this.deps.now();
     const query = this.resolveWindow(personId, day, timezone, input, now);
+    // Phase timings, off unless an operator asks for them. A slow graph is
+    // either its authorization pass or its source reads, and guessing which
+    // cost hours once already.
+    const profiling = process.env.WORK_GRAPH_PROFILE === '1';
+    const started = profiling ? Date.now() : 0;
     const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone, previousCursor);
+    const authorized = profiling ? Date.now() : 0;
     const activity = await buildWorkActivity({
       query,
       nodes: snapshot.nodes,
@@ -593,6 +599,17 @@ export class WorkGraphOrchestrator {
       reader,
       now,
     });
+    if (profiling) {
+      log.info({
+        personId, day, viewerId: viewer.viewerId,
+        nodes: snapshot.nodes.length,
+        edges: snapshot.edges.length,
+        details: activity.details.length,
+        authorizeMs: authorized - started,
+        activityMs: Date.now() - authorized,
+        totalMs: Date.now() - started,
+      }, 'work graph v2 phase timings');
+    }
     return { snapshot, query, activity };
   }
 

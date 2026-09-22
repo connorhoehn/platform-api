@@ -181,6 +181,11 @@ export interface DocumentAttentionFacts {
 /** Each method reads one source of truth. A `null` result discloses nothing. */
 export interface WorkActivityReader {
   pipelineRun(runId: string): Promise<PipelineRunFacts | null>;
+  /**
+   * The same facts for many resources at once. Optional: a reader without it
+   * is asked one at a time, which is correct but is one round trip per node.
+   */
+  pipelineRuns?(resources: string[]): Promise<Map<string, PipelineRunFacts>>;
   artifact(documentId: string): Promise<ArtifactFacts | null>;
   /**
    * The stored bytes for one revision, or for one slide of it when the caller
@@ -495,14 +500,24 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
   }
 
   const runFacts = new Map<string, PipelineRunFacts>();
-  await Promise.all(detailed
+  const runNodes = detailed
     .filter((node) => node.kind === 'run' || node.kind === 'agent')
-    .map(async (node) => {
-      const stored = storedNode(authorization, node.id);
-      if (!stored) return;
-      const facts = await reader.pipelineRun(stored.sourceRef.resourceId);
-      if (facts) runFacts.set(node.id, facts);
+    .map((node) => ({ node, resourceId: storedNode(authorization, node.id)?.sourceRef.resourceId }))
+    .filter((entry): entry is { node: ViewerWorkNode; resourceId: string } => !!entry.resourceId);
+  if (reader.pipelineRuns) {
+    // One read for the whole day's runs. Every step of a run resolves from the
+    // same row, so a loop with ten steps costs one lookup rather than eleven.
+    const byResource = await reader.pipelineRuns(runNodes.map((entry) => entry.resourceId));
+    for (const entry of runNodes) {
+      const facts = byResource.get(entry.resourceId);
+      if (facts) runFacts.set(entry.node.id, facts);
+    }
+  } else {
+    await Promise.all(runNodes.map(async (entry) => {
+      const facts = await reader.pipelineRun(entry.resourceId);
+      if (facts) runFacts.set(entry.node.id, facts);
     }));
+  }
 
   // Meetings first: a transcript's first line names its meeting's span, and
   // resolving both in one parallel pass left that line to a race.

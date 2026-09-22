@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import {
+  BatchGetCommand,
   DeleteCommand,
   GetCommand,
   PutCommand,
@@ -236,16 +237,87 @@ async function computeSourceCall<T>(path: string, body: Record<string, unknown>)
   }
 }
 
-class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
+/**
+ * Every source row one authorization pass needs, read once.
+ *
+ * Authorizing a target used to read its own row, and a day's graph authorizes
+ * every node in it: a hundred nodes meant a hundred round trips, and for the
+ * run-backed ones a FILTERED SCAN — which walks the whole table to find one
+ * row. Ten steps of one run scanned that same run ten times. The reads are the
+ * same reads; they are just issued once for the whole pass and answered from
+ * memory after that.
+ *
+ * A row remains "exactly one match or nothing": two rows claiming one id is
+ * ambiguous provenance and still authorizes nothing, exactly as before.
+ */
+interface AclBatch {
+  /** `runId` → its run row; absent when unknown or ambiguous. */
+  runs: Map<string, Record<string, unknown> | null>;
+  /** Any of `callId` / `recordingId` / `transcriptId` → its recording row. */
+  recordings: Map<string, Record<string, unknown> | null>;
+  documents: Map<string, Record<string, unknown> | null>;
+  /** `channel\u0000userId` → membership, memoized across targets. */
+  members: Map<string, Promise<boolean>>;
+  /** One compute-source authorization per resource, not per target. */
+  compute: Map<string, Promise<SourceAuthorization>>;
+}
+
+function emptyAclBatch(): AclBatch {
+  return { runs: new Map(), recordings: new Map(), documents: new Map(), members: new Map(), compute: new Map() };
+}
+
+/** Indexes rows by an id attribute, marking an id claimed twice as ambiguous. */
+function indexRows(
+  into: Map<string, Record<string, unknown> | null>,
+  rows: Record<string, unknown>[],
+  attributes: readonly string[],
+  wanted: Set<string>,
+): void {
+  for (const row of rows) {
+    for (const attribute of attributes) {
+      const value = row[attribute];
+      if (typeof value !== 'string' || !wanted.has(value)) continue;
+      into.set(value, into.has(value) ? null : row);
+    }
+  }
+  for (const id of wanted) if (!into.has(id)) into.set(id, null);
+}
+
+/** `id IN (:v0, :v1, …)`, chunked so one expression never exceeds DynamoDB's cap. */
+const MAX_IN_OPERANDS = 90;
+/**
+ * `scanAll` pages at `min(100, maximum - read)`, so a small maximum walks the
+ * table a couple of items per round trip — which is how one run lookup became
+ * dozens of calls. A prefetch always asks for a full page.
+ */
+const MIN_ACL_SCAN_ROWS = 100;
+
+function chunked<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) chunks.push(values.slice(index, index + size));
+  return chunks;
+}
+
+/** Exported for tests: the batched read is the reason a hundred-node day is fast. */
+export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
   constructor(readonly source: WorkSourceKind, private readonly client: Ddb) {}
 
   async authorizeDisclosure(scope: WorkGraphPolicyScope, targets: WorkAclTarget[]): Promise<Map<string, WorkSourceAclDecision>> {
     const result = new Map<string, WorkSourceAclDecision>();
-    for (const target of targets) {
-      const decisions = await Promise.all(sourceRefs(target, this.source).map((ref) => this.authorizeRef(
+    const resourceIds = targets.flatMap((target) => sourceRefs(target, this.source)
+      .map((ref) => sourceOwnedResourceId(target, this.source, ref.resourceId)));
+    const batch = await this.prefetch(resourceIds);
+    // The reads are done; the per-target work is now in-memory, so the pass
+    // no longer serializes a round trip behind every node.
+    const decided = await Promise.all(targets.map(async (target) => ({
+      target,
+      decisions: await Promise.all(sourceRefs(target, this.source).map((ref) => this.authorizeRef(
         scope,
         sourceOwnedResourceId(target, this.source, ref.resourceId),
-      )));
+        batch,
+      ))),
+    })));
+    for (const { target, decisions } of decided) {
       if (decisions.length === 0 || decisions.some((decision) => !decision.ownerValid)) {
         result.set(target.id, { targetId: target.id, decision: 'deny', policyRevision: scope.policyRevision });
         continue;
@@ -272,15 +344,80 @@ class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
     target: WorkAclTarget,
     capability: WorkCollaborationCapability,
   ): Promise<WorkPolicyDecision> {
-    const decisions = await Promise.all(sourceRefs(target, this.source).map((ref) => this.authorizeRef(
-      scope,
-      sourceOwnedResourceId(target, this.source, ref.resourceId),
-    )));
+    const refs = sourceRefs(target, this.source)
+      .map((ref) => sourceOwnedResourceId(target, this.source, ref.resourceId));
+    const batch = await this.prefetch(refs);
+    const decisions = await Promise.all(refs.map((ref) => this.authorizeRef(scope, ref, batch)));
     return decisions.length > 0
       && decisions.every((decision) => decision.ownerValid
         && decision.capabilities.includes(capability))
       ? 'allow'
       : 'deny';
+  }
+
+  /**
+   * Reads every row this pass will ask about, in one query per table.
+   *
+   * `pipeline` and `meeting` rows are found by a non-key attribute, so they
+   * cost a Scan either way — but one Scan filtered to the ids this pass wants,
+   * rather than one per target that pages the table two items at a time.
+   */
+  private async prefetch(resourceIds: string[]): Promise<AclBatch> {
+    const batch = emptyAclBatch();
+    const distinct = [...new Set(resourceIds)];
+    if (distinct.length === 0) return batch;
+
+    if (this.source === 'pipeline') {
+      const runIds = new Set(distinct.map((id) => parsePipelineStepResourceId(id).runId));
+      await Promise.all(chunked([...runIds], MAX_IN_OPERANDS).map(async (chunk) => {
+        const values = Object.fromEntries(chunk.map((id, index) => [`:r${index}`, id]));
+        const rows = await scanAll(this.client, {
+          TableName: PIPELINE_RUNS_TABLE,
+          FilterExpression: `runId IN (${Object.keys(values).join(', ')})`,
+          ExpressionAttributeValues: values,
+        }, Math.max(chunk.length * 2, MIN_ACL_SCAN_ROWS));
+        indexRows(batch.runs, rows, ['runId'], new Set(chunk));
+      }));
+      return batch;
+    }
+
+    if (this.source === 'meeting') {
+      const ids = new Set(distinct.map((id) => id.replace(/^(meeting|recording|transcript):/, '')));
+      await Promise.all(chunked([...ids], MAX_IN_OPERANDS).map(async (chunk) => {
+        const values = Object.fromEntries(chunk.map((id, index) => [`:m${index}`, id]));
+        const names = Object.keys(values).join(', ');
+        const rows = await scanAll(this.client, {
+          TableName: RECORDINGS_TABLE,
+          FilterExpression: `callId IN (${names}) OR recordingId IN (${names}) OR transcriptId IN (${names})`,
+          ExpressionAttributeValues: values,
+        }, Math.max(chunk.length * 2, MIN_ACL_SCAN_ROWS));
+        indexRows(batch.recordings, rows, ['callId', 'recordingId', 'transcriptId'], new Set(chunk));
+      }));
+      return batch;
+    }
+
+    if (this.source === 'document') {
+      const documentIds = new Set(distinct.map((id) => (id.includes(':') ? id.slice(0, id.lastIndexOf(':')) : id)));
+      await Promise.all(chunked([...documentIds], 100).map(async (chunk) => {
+        const response = await this.client.send(new BatchGetCommand({
+          RequestItems: { [DOCUMENTS_TABLE]: { Keys: chunk.map((documentId) => ({ documentId })) } },
+        }));
+        const rows = (response.Responses?.[DOCUMENTS_TABLE] ?? []) as Record<string, unknown>[];
+        indexRows(batch.documents, rows, ['documentId'], new Set(chunk));
+      }));
+      return batch;
+    }
+    return batch;
+  }
+
+  /** Membership is asked for the owner and the viewer of every target; ask once. */
+  private memberOnce(batch: AclBatch, channel: string, userId: string): Promise<boolean> {
+    const key = `${channel}\u0000${userId}`;
+    const known = batch.members.get(key);
+    if (known) return known;
+    const pending = this.isConversationMember(channel, userId);
+    batch.members.set(key, pending);
+    return pending;
   }
 
   private async isConversationMember(channel: string, userId: string): Promise<boolean> {
@@ -292,38 +429,33 @@ class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
     return !!result.Item && result.Item.removedAt === undefined;
   }
 
-  private async authorizeRef(scope: WorkGraphPolicyScope, resourceId: string): Promise<SourceAuthorization> {
+  private async authorizeRef(
+    scope: WorkGraphPolicyScope,
+    resourceId: string,
+    batch: AclBatch,
+  ): Promise<SourceAuthorization> {
     if (this.source === 'conversation') {
       const [owner, viewer] = await Promise.all([
-        this.isConversationMember(resourceId, scope.personId),
-        this.isConversationMember(resourceId, scope.viewerId),
+        this.memberOnce(batch, resourceId, scope.personId),
+        this.memberOnce(batch, resourceId, scope.viewerId),
       ]);
       return { ownerValid: owner, viewerHasDirectAccess: viewer, capabilities: ['message', 'join-conversation'] };
     }
     if (this.source === 'document') {
       const documentId = resourceId.includes(':') ? resourceId.slice(0, resourceId.lastIndexOf(':')) : resourceId;
-      const row = (await this.client.send(new GetCommand({
-        TableName: DOCUMENTS_TABLE,
-        Key: { documentId },
-        ConsistentRead: true,
-      }))).Item;
+      const row = batch.documents.get(documentId) ?? undefined;
       const channel = typeof row?.channel === 'string' ? row.channel : undefined;
       const ownerValid = row?.createdBy === scope.personId
-        || (!!channel && await this.isConversationMember(channel, scope.personId));
+        || (!!channel && await this.memberOnce(batch, channel, scope.personId));
       const viewer = row?.createdBy === scope.viewerId
-        || (!!channel && await this.isConversationMember(channel, scope.viewerId));
+        || (!!channel && await this.memberOnce(batch, channel, scope.viewerId));
       return { ownerValid, viewerHasDirectAccess: viewer, capabilities: ['view-document', ...(row?.createdBy === scope.viewerId ? ['edit-document' as const] : [])] };
     }
     if (this.source === 'pipeline') {
       // A step is addressed `runId::stepId` and a workspace `runId::sessionId`;
       // the run's own row is what decides whether either is visible, so
       // authorize the run. A resource the run does not own is denied.
-      const rows = await scanAll(this.client, {
-        TableName: PIPELINE_RUNS_TABLE,
-        FilterExpression: 'runId = :run',
-        ExpressionAttributeValues: { ':run': parsePipelineStepResourceId(resourceId).runId },
-      }, 2);
-      const row = rows.length === 1 ? rows[0] : undefined;
+      const row = batch.runs.get(parsePipelineStepResourceId(resourceId).runId) ?? undefined;
       return {
         ownerValid: row?.triggeredBy === scope.personId,
         viewerHasDirectAccess: row?.triggeredBy === scope.viewerId || !!row,
@@ -331,12 +463,7 @@ class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
       };
     }
     if (this.source === 'meeting') {
-      const rows = await scanAll(this.client, {
-        TableName: RECORDINGS_TABLE,
-        FilterExpression: 'callId = :id OR recordingId = :id OR transcriptId = :id',
-        ExpressionAttributeValues: { ':id': resourceId.replace(/^(meeting|recording|transcript):/, '') },
-      }, 2);
-      const row = rows.length === 1 ? rows[0] : undefined;
+      const row = batch.recordings.get(resourceId.replace(/^(meeting|recording|transcript):/, '')) ?? undefined;
       const people = new Set<string>([
         ...(Array.isArray(row?.participants)
           ? row.participants.flatMap((value) => value && typeof value === 'object' && typeof (value as { userId?: unknown }).userId === 'string'
@@ -355,6 +482,16 @@ class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
       : this.source === 'cloud-compute'
         ? [`box:${resourceId}`, `job:${resourceId}`]
         : [`machine:${resourceId}`, `job:${resourceId}`];
+    const memoKey = candidates.join('|');
+    const memoized = batch.compute.get(memoKey);
+    if (memoized) return memoized;
+    const pending = this.authorizeCompute(scope, candidates);
+    batch.compute.set(memoKey, pending);
+    return pending;
+  }
+
+  /** One compute-source round trip per resource, however many targets name it. */
+  private async authorizeCompute(scope: WorkGraphPolicyScope, candidates: string[]): Promise<SourceAuthorization> {
     let unavailable = false;
     for (const candidate of candidates) {
       const response = await computeSourceCall<{

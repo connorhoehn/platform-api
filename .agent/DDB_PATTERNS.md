@@ -71,3 +71,39 @@ it exists in local DDB, and record it here.
 | `pipeline-runs` | `(pipelineId, runId)` | `status-startedAt-index` exists; `triggeredBy-startedAt-index` does NOT |
 | `pipeline-runs` | `(loops-by-person#…, loopId)` | pointer rows, above |
 | `chat-members` | `(channel, userId)` | membership; `removedAt` present means removed |
+
+## The work graph: one read per table per pass, not per node
+
+A v2 graph request authorizes every node it will show and then reads the
+source record behind each one. Both used to be per-node, and both are joins on
+a NON-KEY attribute:
+
+| What is looked up | By | Why it costs a Scan |
+|---|---|---|
+| a run (`authorizeRef`, `activityReader.pipelineRuns`) | `runId` | `pipeline-runs` is keyed `(pipelineId, runId)`; there is no `runId` GSI |
+| a recording (`authorizeRef`) | `callId` / `recordingId` / `transcriptId` | only `recordingId-index` exists, and a meeting is addressed three ways |
+
+Per-node, that is a filtered Scan for every run, every STEP of every run (a
+step is `runId::stepId` and resolves to the same row), every workspace and
+every meeting — issued sequentially. `scanAll(…, 2)` made it worse: the page
+limit is `min(100, maximum - read)`, so a two-row cap walked the table two
+items per round trip. dev-frank's ~100-node day took 25–80 s.
+
+**The pattern:** collect every resource id the pass will ask about FIRST, then
+
+- one Scan per table per pass, `FilterExpression: runId IN (:r0 … :rN)`
+  (chunked at 90 operands, page size 100), indexed into a `Map<id, row|null>`;
+- one `BatchGetItem` for the day's documents (`crdt-documents` is keyed by
+  `documentId`, so this one is a real batch, ≤100 keys per call);
+- memoize `chat-members` membership by `(channel, userId)` — the owner and the
+  viewer are asked once, not once per revision node of the same document;
+- memoize the compute source's HTTP authorization by resource.
+
+**Keep ambiguity a denial.** The per-node form refused when a lookup returned
+anything but exactly one row. The batched form must too: index a second row
+for the same id as `null`, and treat `null` and absent the same way. A batch
+that quietly picked the first of two rows would authorize by guess.
+
+Guarded by `src/work-graph/__tests__/sourceAclBatching.test.ts`, which counts
+reads rather than timing them. `WORK_GRAPH_PROFILE=1` logs per-phase
+durations (`authorizeMs` / `activityMs`) for one request.
