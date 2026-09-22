@@ -404,4 +404,34 @@ describe('WorkGraphRepository', () => {
       .resolves.toBeUndefined();
     expect(send).toHaveBeenCalledTimes(1);
   });
+
+  describe('locateTarget', () => {
+    const lookup = (day: string, targetActorId = 'actor-1'): Record<string, unknown> => ({
+      targetLookupPk: 'WGTARGET#org-1',
+      targetLookupSk: 'NODE#wg_node_deck',
+      targetActorId,
+      day,
+    });
+    const locate = (items: Array<Record<string, unknown>>) => new WorkGraphRepository(
+      client(jest.fn(async (command: unknown) => (command instanceof QueryCommand ? { Items: items } : {}))),
+      reducer,
+    ).locateTarget('org-1', { kind: 'node', id: 'wg_node_deck' });
+
+    it('finds a target that is still being worked on after a day boundary', async () => {
+      // The seeded Sprint review deck: one document node projected into both
+      // 2026-09-21 and 2026-09-22. It is one entity, not an ambiguous id, and
+      // refusing it is what made "Open presentation" answer 404.
+      await expect(locate([lookup('2026-09-21'), lookup('2026-09-22')]))
+        .resolves.toEqual({ personId: 'actor-1', day: '2026-09-22', timezone: 'UTC' });
+    });
+
+    it('still refuses a target two different people both claim', async () => {
+      await expect(locate([lookup('2026-09-21'), lookup('2026-09-21', 'actor-2')])).resolves.toBeNull();
+    });
+
+    it('discloses nothing for an unknown target or a row with no usable day', async () => {
+      await expect(locate([])).resolves.toBeNull();
+      await expect(locate([lookup('yesterday')])).resolves.toBeNull();
+    });
+  });
 });

@@ -223,6 +223,8 @@ const MAX_APPLIED_EVENT_IDS = 1_000;
 const MAX_TRANSACTION_ITEMS = 100;
 const MAX_FENCED_READ_ATTEMPTS = 3;
 export const WORK_GRAPH_TARGET_LOOKUP_INDEX = 'work-graph-target-lookup';
+/** How many days of one target's lookup rows a locate reads before giving up. */
+const MAX_TARGET_LOOKUP_DAYS = 32;
 
 type ItemKind = 'meta' | 'session' | 'node' | 'edge' | 'event' | 'delta' | 'outbox';
 
@@ -679,15 +681,27 @@ export class WorkGraphRepository {
         ':pk': `WGTARGET#${organizationId}`,
         ':sk': `${target.kind.toUpperCase()}#${target.id}`,
       },
-      Limit: 2,
+      // One row per day the projection touched this target. A long-lived
+      // entity — a document that is still being revised after midnight — has
+      // several, so the query cannot be capped at "one or it is ambiguous".
+      Limit: MAX_TARGET_LOOKUP_DAYS,
     }));
-    if (!result.Items || result.Items.length !== 1) return null;
-    const row = result.Items[0] as Record<string, unknown>;
-    return typeof row.targetActorId === 'string'
-      && typeof row.day === 'string'
-      && isCalendarDate(row.day)
-      ? { personId: row.targetActorId, day: row.day, timezone: 'UTC' }
-      : null;
+    const rows = (result.Items ?? [])
+      .map((item) => item as Record<string, unknown>)
+      .filter((row) => typeof row.targetActorId === 'string'
+        && typeof row.day === 'string'
+        && isCalendarDate(row.day));
+    if (rows.length === 0) return null;
+    // Two PEOPLE with the same target id is genuinely ambiguous provenance and
+    // still discloses nothing. The same person on two days is not: it is one
+    // entity that outlived a day boundary, and the day it was last projected
+    // into is the one whose graph still describes it.
+    const actors = new Set(rows.map((row) => String(row.targetActorId)));
+    if (actors.size !== 1) return null;
+    const newest = rows
+      .map((row) => String(row.day))
+      .sort((left, right) => (left < right ? 1 : left > right ? -1 : 0))[0]!;
+    return { personId: String(rows[0]!.targetActorId), day: newest, timezone: 'UTC' };
   }
 
   async listDeltas(
