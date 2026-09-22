@@ -570,8 +570,9 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     service.start();
     service.start();
     // subscribe should have been called exactly once per event type
-    // (11 events — DC-25 added pipeline:run:checkpoint)
-    expect(bus.subscribe.mock.calls.length).toBe(11);
+    // (12 events — DC-25 added pipeline:run:checkpoint, and the agent loop
+    // added pipeline:step:agent:iteration)
+    expect(bus.subscribe.mock.calls.length).toBe(12);
   });
 
   it('getStaleRunIds returns runs whose lastEventAt is before the cutoff', async () => {

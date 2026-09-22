@@ -73,6 +73,21 @@ export interface StepAttempt {
  */
 export interface StepSummary {
   status?: PipelineStepStatus;
+  /**
+   * Live agent-loop telemetry, written from `pipeline:step:agent:iteration`
+   * while the step runs. It is what the step itself reported, not a total
+   * derived from the run, and the step's own `output` supersedes it once the
+   * step finishes.
+   */
+  agent?: {
+    model?: string;
+    iterations?: number;
+    contextTokens?: number;
+    contextBudgetTokens?: number;
+    runtime?: string;
+    sessionId?: string;
+    boxId?: string;
+  };
   startedAt?: string;
   completedAt?: string;
   durationMs?: number;
@@ -149,6 +164,14 @@ export interface PipelineRunItem {
    * may have been edited since the run started.
    */
   definitionSnapshot?: unknown;
+  /**
+   * An /agent loop's PENDING row points at the executor run its planner
+   * eventually started. The loop id is what the chat client polls (it is
+   * handed out before the planner finishes, and the executor allocates its
+   * own id at trigger time), so `/api/agent-loops/:runId` resolves either
+   * through this field. Absent on ordinary runs.
+   */
+  agentLoopRunId?: string;
   /** ISO timestamp of the most recent boot-time resume of this run. */
   resumedAt?: string;
   /** Number of times this run has been resumed after an interruption. */

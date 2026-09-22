@@ -39,8 +39,17 @@ import {
 import { withContext } from '../lib/logger';
 import { computeCost } from './llm-pricing';
 import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platformPublisher';
+import { pipelineStepResourceId } from '../work-graph/sources/mapPipeline';
+import type { RunWorkGraphPlan } from './workGraphPlan';
 
 const log = withContext({ service: 'runPersistence' });
+
+/**
+ * How often a still-running step re-announces itself. The freshness lease it
+ * feeds is five minutes, so a minute is frequent enough to keep a twenty
+ * minute agent step live and infrequent enough not to flood the projection.
+ */
+const WORK_GRAPH_STEP_REFRESH_MS = 60_000;
 
 export interface RunPersistenceOptions {
   /** EventBus instance to subscribe to. */
@@ -109,6 +118,12 @@ interface RunState {
   stepAttempts: Record<string, StepAttempt[]>;
   /** ISO timestamp of the most recent event observed for this run. */
   lastEventAt: string;
+  /** What the graph shows for this run. Absent for a run nobody declared one for. */
+  workGraph?: RunWorkGraphPlan;
+  /** The lifecycle each step was last projected at, so it only moves forward. */
+  stepLifecycle: Record<string, string>;
+  /** When that projection happened, for the running step's lease refresh. */
+  stepLifecycleAt: Record<string, string>;
   /** DC-25: latest (compacted) checkpoint — persisted onto the run row. */
   checkpoint?: PersistedCheckpoint;
   /** DC-25: definition snapshot captured from the first checkpoint event. */
@@ -184,6 +199,7 @@ export class RunPersistenceService {
     });
 
     this.eventBus.subscribe('pipeline:step:completed', async (event) => {
+      await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'completed', event.payload.at);
       await this.handleStepCompleted(event.payload).catch((err) => {
         log.warn(
           { runId: event.payload.runId, stepId: event.payload.stepId, err: String(err) },
@@ -193,6 +209,7 @@ export class RunPersistenceService {
     });
 
     this.eventBus.subscribe('pipeline:step:failed', async (event) => {
+      await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'failed', event.payload.at);
       await this.handleStepFailed(event.payload).catch((err) => {
         log.warn(
           { runId: event.payload.runId, stepId: event.payload.stepId, err: String(err) },
@@ -232,10 +249,22 @@ export class RunPersistenceService {
     // Per-attempt retry events (DC-15 — only emitted when maxAttempts > 1)
     this.eventBus.subscribe('pipeline:step:attempt:started', async (event) => {
       this.handleStepAttemptStarted(event.payload);
+      await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'running', event.payload.startedAt);
     });
 
     this.eventBus.subscribe('pipeline:step:attempt:failed', async (event) => {
       this.handleStepAttemptFailed(event.payload);
+    });
+
+    // The agent loop's own turn counter. It is the only evidence a devbox
+    // step is still alive between its start and its completion, so it both
+    // records what the step has spent and refreshes the step node's lease.
+    (this.eventBus as unknown as {
+      subscribe(name: string, handler: (event: { payload: Record<string, unknown> }) => Promise<void>): string;
+    }).subscribe('pipeline:step:agent:iteration', async (event) => {
+      await this.handleAgentIteration(event.payload).catch((err) => {
+        log.warn({ err: String(err) }, 'failed to record step:agent:iteration');
+      });
     });
 
     // LLM cost tracking — correlate prompt (has model) with response (has tokens)
@@ -303,14 +332,19 @@ export class RunPersistenceService {
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
+      stepLifecycle: {},
+      stepLifecycleAt: {},
       lastEventAt: event.at,
       ...(registered?.organizationId ? { organizationId: registered.organizationId } : {}),
+      ...(registered?.workGraph ? { workGraph: registered.workGraph } : {}),
       ...(redriveOf ? { redriveOf } : {}),
     };
 
     this.runCache.set(event.runId, state);
     await this.persistRun(state);
     await this.publishWorkGraphLifecycle(state, event.at);
+    // The run's shape is visible from the start: every planned step, waiting.
+    await this.publishWorkGraphStepPlan(state, event.at);
   }
 
   private touchLastEvent(runId: string, at: string): void {
@@ -640,6 +674,8 @@ export class RunPersistenceService {
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
+      stepLifecycle: {},
+      stepLifecycleAt: {},
       lastEventAt: new Date().toISOString(),
       checkpoint: item.checkpoint,
       definitionSnapshot: item.definitionSnapshot,
@@ -671,6 +707,8 @@ export class RunPersistenceService {
     organizationId?: string;
     /** The failed run this one replaces, when the trigger is a DLQ redrive. */
     redriveOf?: string;
+    /** What the work graph shows for this run: its origin and its steps. */
+    workGraph?: RunWorkGraphPlan;
   }): void {
     if (this.runCache.has(args.runId)) return;
     this.runCache.set(args.runId, {
@@ -687,9 +725,12 @@ export class RunPersistenceService {
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
+      stepLifecycle: {},
+      stepLifecycleAt: {},
       lastEventAt: args.at,
       ...(args.organizationId ? { organizationId: args.organizationId } : {}),
       ...(args.redriveOf ? { redriveOf: args.redriveOf } : {}),
+      ...(args.workGraph ? { workGraph: args.workGraph } : {}),
     });
   }
 
@@ -731,7 +772,7 @@ export class RunPersistenceService {
       completedAt: item.completedAt,
       steps: item.stepsSummary ?? {},
       tokenUsage: {}, estimatedCostUsd: 0, replayCredits: {}, stepModelMap: {},
-      stepInputMap: {}, stepAttempts: {}, lastEventAt: item.lastEventAt ?? item.completedAt ?? item.startedAt,
+      stepInputMap: {}, stepAttempts: {}, stepLifecycle: {}, stepLifecycleAt: {}, lastEventAt: item.lastEventAt ?? item.completedAt ?? item.startedAt,
     }, item.lastEventAt ?? item.completedAt ?? item.startedAt);
   }
 
@@ -777,6 +818,8 @@ export class RunPersistenceService {
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
+      stepLifecycle: {},
+      stepLifecycleAt: {},
       lastEventAt: terminalAt,
     };
   }
@@ -807,6 +850,8 @@ export class RunPersistenceService {
     state.completedAt = event.at;
     await this.persistRun(state);
     await this.publishWorkGraphLifecycle(state, event.at);
+    // A finished run leaves no step queueing work it will never do.
+    await this.closeWorkGraphSteps(state, event.at);
     this.runCache.delete(event.runId);
   }
 
@@ -835,6 +880,8 @@ export class RunPersistenceService {
     }
     await this.persistRun(state);
     await this.publishWorkGraphLifecycle(state, event.at);
+    // A finished run leaves no step queueing work it will never do.
+    await this.closeWorkGraphSteps(state, event.at);
     this.runCache.delete(event.runId);
   }
 
@@ -850,6 +897,8 @@ export class RunPersistenceService {
     state.completedAt = event.at;
     await this.persistRun(state);
     await this.publishWorkGraphLifecycle(state, event.at);
+    // A finished run leaves no step queueing work it will never do.
+    await this.closeWorkGraphSteps(state, event.at);
     this.runCache.delete(event.runId);
   }
 
@@ -869,6 +918,40 @@ export class RunPersistenceService {
       startedAt: event.startedAt,
       idempotencyKey: `${event.runId}:${event.stepId}:${event.attemptNumber}`,
     });
+  }
+
+  /**
+   * One turn of an agent step's loop. It is the step's own report of what it
+   * has spent — model, context against its budget, turns taken — so it is
+   * recorded verbatim onto the step summary and never extrapolated. It also
+   * refreshes the step node's freshness lease, which is the only thing that
+   * distinguishes a step still working from one that stopped answering.
+   */
+  private async handleAgentIteration(payload: Record<string, unknown>): Promise<void> {
+    const runId = typeof payload.runId === 'string' ? payload.runId : '';
+    const stepId = typeof payload.stepId === 'string' ? payload.stepId : '';
+    if (!runId || !stepId) return;
+    const at = typeof payload.at === 'string' ? payload.at : new Date().toISOString();
+    this.touchLastEvent(runId, at);
+    const state = this.runCache.get(runId);
+    if (!state) return;
+    const numeric = (value: unknown): number | undefined =>
+      (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined);
+    const agent = {
+      ...(typeof payload.model === 'string' ? { model: payload.model } : {}),
+      ...(numeric(payload.iteration) !== undefined ? { iterations: numeric(payload.iteration) } : {}),
+      ...(numeric(payload.contextTokens) !== undefined ? { contextTokens: numeric(payload.contextTokens) } : {}),
+      ...(numeric(payload.contextBudgetTokens) !== undefined
+        ? { contextBudgetTokens: numeric(payload.contextBudgetTokens) } : {}),
+      ...(typeof payload.sessionId === 'string' ? { sessionId: payload.sessionId, runtime: 'devbox' } : {}),
+      ...(typeof payload.boxId === 'string' ? { boxId: payload.boxId } : {}),
+    };
+    const summary = state.steps[stepId] ?? { status: 'running' as const, startedAt: at };
+    state.steps[stepId] = { ...summary, status: 'running', agent: { ...(summary.agent ?? {}), ...agent } };
+    await this.persistRun(state).catch((err) => {
+      log.warn({ runId, stepId, err: String(err) }, 'failed to persist agent iteration');
+    });
+    await this.markWorkGraphStep(runId, stepId, 'running', at);
   }
 
   private handleStepAttemptFailed(event: {
@@ -1074,9 +1157,117 @@ export class RunPersistenceService {
       attributedSubject: state.triggeredBy,
       occurredAt,
       sourceSequence: `${state.status}:${occurredAt}`,
+      // The conversation the command was typed in is evidence this run
+      // consumed, and the only thing in the graph it belongs to. It is
+      // declared, never inferred: a run with no chat origin declares nothing.
+      ...(state.workGraph?.conversationId
+        ? { inputRefs: [{ source: 'conversation' as const, resourceId: state.workGraph.conversationId }] }
+        : {}),
     }, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
     if (!result.published) {
       log.warn({ runId: state.runId, reason: result.reason }, 'work graph pipeline lifecycle was not published');
+    }
+  }
+
+  /**
+   * One generated step of the run, projected as its own node so the graph
+   * shows the steps a person was shown on the card and in the editor.
+   *
+   * The step plan comes from the definition that was actually triggered, so a
+   * planner fallback that produced ONE step yields ONE node — the graph never
+   * shows steps that were not planned.
+   */
+  private async publishWorkGraphStep(
+    state: RunState,
+    stepId: string,
+    status: string,
+    occurredAt: string,
+  ): Promise<void> {
+    if (!state.organizationId || state.triggeredBy === 'system') return;
+    const planned = state.workGraph?.steps.find((step) => step.stepId === stepId);
+    if (!planned) return;
+    const result = await platformWorkGraphSourcePublisher.pipeline({
+      kind: 'pipeline-step',
+      run: {
+        runId: state.runId,
+        pipelineId: state.pipelineId,
+        status: state.status,
+        startedAt: state.startedAt,
+      } as never,
+      step: { stepId, status },
+      attributedSubject: state.triggeredBy,
+      occurredAt,
+      sourceSequence: `${stepId}:${status}:${occurredAt}`,
+      safeLabel: planned.title,
+      // The run it belongs to, then the steps it waits on. Both are already
+      // projected pipeline resources, so the chain reads in dependsOn order.
+      inputRefs: [
+        { source: 'pipeline' as const, resourceId: state.runId },
+        ...planned.dependsOn.map((dependency) => ({
+          source: 'pipeline' as const,
+          resourceId: pipelineStepResourceId(state.runId, dependency),
+        })),
+      ],
+    }, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
+    if (!result.published) {
+      log.warn({ runId: state.runId, stepId, reason: result.reason }, 'work graph pipeline step was not published');
+    }
+  }
+
+  /**
+   * Every planned step at once, in dependsOn order, so the run's shape is
+   * visible from the moment it starts rather than appearing a step at a time.
+   * A step already past `status` keeps what it has — the projection only moves
+   * forward, and `waiting` must never overwrite a step that is running.
+   */
+  private async publishWorkGraphStepPlan(state: RunState, occurredAt: string): Promise<void> {
+    const steps = state.workGraph?.steps ?? [];
+    for (const step of steps) {
+      if (state.stepLifecycle[step.stepId]) continue;
+      state.stepLifecycle[step.stepId] = 'pending';
+      await this.publishWorkGraphStep(state, step.stepId, 'pending', occurredAt)
+        .catch((err) => log.warn({ runId: state.runId, stepId: step.stepId, err: String(err) }, 'step projection failed'));
+    }
+  }
+
+  /**
+   * Records a step transition and projects it. Repeated `running` observations
+   * are how a long step keeps its freshness lease alive, so they are published
+   * again — but no more than once a minute, since the lease outlives that by
+   * five.
+   */
+  private async markWorkGraphStep(
+    runId: string,
+    stepId: string,
+    status: 'running' | 'completed' | 'failed' | 'cancelled',
+    occurredAt: string,
+  ): Promise<void> {
+    const state = this.runCache.get(runId);
+    if (!state || !state.workGraph) return;
+    const previous = state.stepLifecycle[stepId];
+    if (previous === status && status === 'running') {
+      const since = Date.parse(occurredAt) - Date.parse(state.stepLifecycleAt[stepId] ?? '');
+      if (Number.isFinite(since) && since < WORK_GRAPH_STEP_REFRESH_MS) return;
+    } else if (previous === status) {
+      return;
+    }
+    state.stepLifecycle[stepId] = status;
+    state.stepLifecycleAt[stepId] = occurredAt;
+    await this.publishWorkGraphStep(state, stepId, status, occurredAt)
+      .catch((err) => log.warn({ runId, stepId, err: String(err) }, 'step projection failed'));
+  }
+
+  /**
+   * A terminal run closes out every step that never reached one of its own.
+   * Leaving them `waiting` would show a finished run still queueing work.
+   */
+  private async closeWorkGraphSteps(state: RunState, occurredAt: string): Promise<void> {
+    for (const step of state.workGraph?.steps ?? []) {
+      const current = state.stepLifecycle[step.stepId];
+      if (current === 'completed' || current === 'failed' || current === 'cancelled') continue;
+      state.stepLifecycle[step.stepId] = 'cancelled';
+      await this.publishWorkGraphStep(state, step.stepId, 'cancelled', occurredAt)
+        .catch((err) => log.warn({ runId: state.runId, stepId: step.stepId, err: String(err) }, 'step projection failed'));
     }
   }
 

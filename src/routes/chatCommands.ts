@@ -46,6 +46,9 @@ chatCommandsRouter.post('/:trigger/run', asyncHandler(async (req: Request, res: 
     ...(argument ? { argument } : {}),
     ...(typeof body.documentId === 'string' && body.documentId ? { documentId: body.documentId } : {}),
     requestedBy: userId,
+    // The verified org claim, not a body field: it decides whether this run is
+    // ever projected into the requester's work graph.
+    ...(req.user!.orgId ? { organizationId: req.user!.orgId } : {}),
     requestedByName: typeof body.requestedByName === 'string' && body.requestedByName ? body.requestedByName.slice(0, 80) : userId,
     ...(body.extra && typeof body.extra === 'object' ? { extra: body.extra as Record<string, unknown> } : {}),
     ...(body.clientPostsCard === true ? { clientPostsCard: true } : {}),
