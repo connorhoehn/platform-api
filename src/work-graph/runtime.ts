@@ -77,6 +77,18 @@ function sourceOwnedResourceId(target: WorkAclTarget, source: WorkSourceKind, re
   return resourceId;
 }
 
+/**
+ * Rows EXAMINED per round trip. A Scan's `Limit` counts what it looks at, not
+ * what the filter keeps, so sizing it by how many MATCHES the caller wants
+ * made an authorization that wants at most two rows walk the whole table two
+ * at a time — dozens of round trips per node, per request, growing with every
+ * meeting and run ever recorded. Correct, and slow enough to turn into
+ * withheld nodes the moment a request runs out of time.
+ */
+const SCAN_PAGE_SIZE = 200;
+/** A poll cannot walk an unbounded table; a hit past this is not found. */
+const MAX_SCAN_PAGES = 25;
+
 async function scanAll(
   client: Ddb,
   input: ConstructorParameters<typeof ScanCommand>[0],
@@ -84,16 +96,18 @@ async function scanAll(
 ): Promise<Record<string, unknown>[]> {
   const rows: Record<string, unknown>[] = [];
   let ExclusiveStartKey: Record<string, unknown> | undefined;
+  let pages = 0;
   do {
     const result = await client.send(new ScanCommand({
       ...input,
       ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
-      Limit: Math.min(100, maximum - rows.length),
+      Limit: SCAN_PAGE_SIZE,
     }));
     rows.push(...((result.Items ?? []) as Record<string, unknown>[]));
     ExclusiveStartKey = result.LastEvaluatedKey;
-  } while (ExclusiveStartKey && rows.length < maximum);
-  return rows;
+    pages += 1;
+  } while (ExclusiveStartKey && rows.length < maximum && pages < MAX_SCAN_PAGES);
+  return rows.slice(0, maximum);
 }
 
 class DynamoWorkGraphDirectory implements WorkGraphDirectory {
