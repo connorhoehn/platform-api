@@ -975,7 +975,10 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     const folded = efforts.filter((effort) => {
       const producers = edges
         .filter((edge) => edge.relation === 'produced' && edge.toId === effort.anchorNodeId)
-        .map((edge) => memberOf.get(edge.fromId))
+        // A step produced it, and the step belongs to a run. The frame is the
+        // RUN's, so folding into the producing step's own effort would put the
+        // room in a second frame beside the loop that booked it.
+        .map((edge) => homeByRun.get(runOf.get(edge.fromId) ?? '') ?? memberOf.get(edge.fromId))
         .filter((home): home is ViewerWorkEffort => !!home && home.id !== effort.id);
       // Produced by exactly one effort, or it stays where it is.
       const home = new Set(producers).size === 1 ? producers[0] : undefined;
@@ -1022,25 +1025,27 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     if (!absorbed) break;
   }
 
-  // A merged effort is named from everything it ended up framing: an effort
-  // anchored on a step was named after that step while it was alone.
+  // Named LAST, from everything the effort ended up framing. The RUN names it
+  // whenever the frame holds one — a step is a part of the work and a room or
+  // a deck is a thing the work made; neither names a frame that has a run. A
+  // run is the pipeline resource with no step of its own in its id, so this
+  // holds however the members were gathered and whatever the anchor is.
   for (const effort of efforts) {
-    const anchor = index.byId.get(effort.anchorNodeId);
-    if (anchor?.kind !== 'run' && anchor?.kind !== 'agent') continue;
     const members = effort.nodeIds
       .map((id) => index.byId.get(id))
       .filter((node): node is ViewerWorkNode => !!node);
-    // The RUN names the effort — a step is a part of the work, not the work.
-    // A run is the pipeline resource with no step of its own in its id, so
-    // this holds however the members were gathered.
     const run = members.find((node) => {
       if (node.kind !== 'run' && node.kind !== 'agent') return false;
       const stored = storedNode(authorization, node.id);
       return stored?.sourceRef.source === 'pipeline'
         && !parsePipelineStepResourceId(stored.sourceRef.resourceId).stepId;
-    }) ?? earliestRun(members);
-    if (run?.title) effort.title = run.title;
+    });
+    const anchor = index.byId.get(effort.anchorNodeId);
+    const named = run
+      ?? ((anchor?.kind === 'run' || anchor?.kind === 'agent') ? earliestRun(members) : undefined);
+    if (named?.title) effort.title = named.title;
   }
+
   // Every relationship BETWEEN an effort's own members belongs to it, however
   // the members got there.
   for (const effort of efforts) {

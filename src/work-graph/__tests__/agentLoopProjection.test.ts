@@ -826,3 +826,60 @@ describe('a room the loop booked', () => {
     expect(detail?.participants?.map((person) => person.label)).toEqual(['Frank Castle']);
   });
 });
+
+describe('what names a frame that holds a run', () => {
+  const ROOM_ID = 'room-9';
+  const meeting = (at: string): AuthenticatedWorkEvent => ({
+    schemaVersion: 1,
+    eventId: `meeting:${at}`, idempotencyKey: `meeting:${at}`,
+    source: 'meeting', sourceSequence: at, occurredAt: at, receivedAt: at,
+    actor: { actorId: ACTOR, organizationId: ORGANIZATION, sourceSubject: SUBJECT },
+    producer: { serviceId: 'platform-api', organizationId: ORGANIZATION, credentialId: 'platform-api-runtime' },
+    resource: { source: 'meeting', resourceId: `meeting:${ROOM_ID}`, resourceVersion: '1' },
+    payload: { kind: 'meeting', lifecycle: 'meeting-scheduled', meetingId: ROOM_ID, safeLabel: 'Schedule and run platform team meeting' },
+  } as AuthenticatedWorkEvent);
+
+  const events = [
+    runEvent('running', `${DAY}T18:00:00.000Z`, false),
+    stepEvent('meeting:create:s1', 'Schedule and run platform team meeting', 'completed', `${DAY}T18:02:00.000Z`),
+    stepEvent('agent:s2', 'Create PPT from meeting and board work', 'running', `${DAY}T18:06:00.000Z`),
+    meeting(`${DAY}T18:03:00.000Z`),
+    // The step declares the room it made, after the room exists.
+    stepEvent('meeting:create:s1', 'Schedule and run platform team meeting', 'completed', `${DAY}T18:04:00.000Z`, [], { producesMeeting: ROOM_ID }),
+  ];
+
+  async function built() {
+    const state = project(events);
+    const { nodes, edges, authorization } = authorize(state);
+    return {
+      nodes,
+      activity: await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW }),
+    };
+  }
+
+  it('puts the room in the loop\'s own frame, not a second one beside it', async () => {
+    const { nodes, activity } = await built();
+    const framing = activity.efforts.filter((effort) => effort.nodeIds
+      .some((id) => nodes.find((node) => node.id === id)?.kind === 'meeting'));
+    expect(framing).toHaveLength(1);
+    // The same frame holds the run and both its steps.
+    const titles = framing[0].nodeIds.map((id) => nodes.find((node) => node.id === id)?.title);
+    expect(titles).toContain('Create PPT from meeting and board work');
+    expect(titles).toContain('Agent loop · create a meeting with the X team');
+  });
+
+  it('is named after the run, never after a step or the thing it made', async () => {
+    const { activity } = await built();
+    for (const effort of activity.efforts) {
+      expect(effort.title).toBe('Agent loop · create a meeting with the X team');
+    }
+  });
+
+  it('leaves a room nothing produced to name its own frame', async () => {
+    const state = project([meeting(`${DAY}T18:03:00.000Z`)]);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
+    expect(activity.efforts).toHaveLength(1);
+    expect(activity.efforts[0].title).toBe('Schedule and run platform team meeting');
+  });
+});
