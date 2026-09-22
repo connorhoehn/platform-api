@@ -6,7 +6,8 @@ jest.mock('../../lib/logger', () => {
 });
 
 import {
-  PENDING_PLAN, failOrphanedLoops, pendingRow, planAndTrigger, requestFromInput, startAgentLoop,
+  PENDING_PLAN, failOrphanedLoops, loopIdsForPersonDays, pendingRow, planAndTrigger,
+  requestFromInput, startAgentLoop, utcDaysSpanned,
   type AgentLoopRunnerDeps,
 } from '../agentLoopRunner';
 import { CHAT_AGENT_LOOP_PIPELINE_ID, type LoopPlan } from '../agentLoopPlanner';
@@ -30,11 +31,15 @@ const REAL_PLAN: LoopPlan = {
 const AT = new Date('2026-09-21T12:00:00.000Z');
 
 function harness(over: Partial<AgentLoopRunnerDeps> = {}): { deps: AgentLoopRunnerDeps; rows: Map<string, PipelineRunItem>; rerun: jest.Mock } {
+  // Keyed the way the table is — (pipelineId, runId) — because a loop now
+  // writes a pointer row under a DIFFERENT partition with the SAME runId, and
+  // a runId-keyed fake would silently let one overwrite the other.
   const rows = new Map<string, PipelineRunItem>();
+  const key = (item: Pick<PipelineRunItem, 'pipelineId' | 'runId'>): string => `${item.pipelineId}|${item.runId}`;
   const rerun = jest.fn().mockResolvedValue('executor-run-1');
   const deps: AgentLoopRunnerDeps = {
-    putRun: async (item) => { rows.set(item.runId, item); },
-    getRun: async (runId) => rows.get(runId) ?? null,
+    putRun: async (item) => { rows.set(key(item), item); },
+    getRun: async (runId) => rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|${runId}`) ?? null,
     plan: async () => REAL_PLAN,
     rerun: (...a: unknown[]) => rerun(...a) as Promise<string>,
     now: () => AT,
@@ -74,7 +79,7 @@ describe('startAgentLoop', () => {
     const { deps, rows } = harness({ plan: () => new Promise(() => { /* never settles */ }) });
     const started = await startAgentLoop(INPUT, deps, () => undefined);
 
-    const row = rows.get(started.runId)!;
+    const row = rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|${started.runId}`)!;
     expect(row).toMatchObject({ pipelineId: CHAT_AGENT_LOOP_PIPELINE_ID, runId: started.runId, status: 'pending', triggeredBy: 'dev-frank' });
     // Everything the pane needs while the planner is still thinking.
     expect(row.checkpoint!.context).toMatchObject({
@@ -94,7 +99,7 @@ describe('planAndTrigger', () => {
   it('re-enters the ordinary command path with the finished plan, and records the executor run', async () => {
     const { deps, rows, rerun } = harness();
     const request = requestFromInput(INPUT);
-    rows.set('loop-1', pendingRow('loop-1', request, AT));
+    rows.set(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`, pendingRow('loop-1', request, AT));
 
     await planAndTrigger('loop-1', request, INPUT, deps);
 
@@ -104,7 +109,7 @@ describe('planAndTrigger', () => {
     expect(passed.extra!.agentLoopId).toBe('loop-1');
     expect(passed.clientPostsCard).toBe(true);
 
-    const row = rows.get('loop-1')!;
+    const row = rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`)!;
     expect(row.agentLoopRunId).toBe('executor-run-1');
     expect(row.checkpoint!.context).toMatchObject({ plan: REAL_PLAN, executorRunId: 'executor-run-1' });
   });
@@ -112,11 +117,11 @@ describe('planAndTrigger', () => {
   it('a trigger that fails leaves a FAILED loop with the reason, never a lost one', async () => {
     const { deps, rows } = harness({ rerun: async () => { throw new Error('pipeline engine is not available'); } });
     const request = requestFromInput(INPUT);
-    rows.set('loop-1', pendingRow('loop-1', request, AT));
+    rows.set(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`, pendingRow('loop-1', request, AT));
 
     await planAndTrigger('loop-1', request, INPUT, deps);
 
-    expect(rows.get('loop-1')).toMatchObject({
+    expect(rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`)).toMatchObject({
       status: 'failed',
       error: 'the agent loop could not be started: pipeline engine is not available',
       completedAt: AT.toISOString(),
@@ -127,12 +132,12 @@ describe('planAndTrigger', () => {
     const fallback: LoopPlan = { source: 'fallback', notice: 'Planner timed out after 90s · single step', steps: REAL_PLAN.steps };
     const { deps, rows, rerun } = harness({ plan: async () => fallback });
     const request = requestFromInput(INPUT);
-    rows.set('loop-1', pendingRow('loop-1', request, AT));
+    rows.set(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`, pendingRow('loop-1', request, AT));
 
     await planAndTrigger('loop-1', request, INPUT, deps);
     expect(rerun).toHaveBeenCalled();
-    expect(rows.get('loop-1')!.status).not.toBe('failed');
-    expect((rows.get('loop-1')!.checkpoint!.context.plan as LoopPlan).source).toBe('fallback');
+    expect(rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`)!.status).not.toBe('failed');
+    expect((rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`)!.checkpoint!.context.plan as LoopPlan).source).toBe('fallback');
   });
 });
 
@@ -208,5 +213,77 @@ describe('failOrphanedLoops — the restart path', () => {
     });
     expect(out.failed).toEqual(['loop-1', 'loop-2']);
     expect(out.sessionsStopped).toBe(0);
+  });
+});
+
+describe('finding a person\'s loops without a GSI', () => {
+  it('writes a per-person-day pointer row beside the loop, at 202 time', async () => {
+    const { deps, rows } = harness({ plan: () => new Promise(() => { /* never */ }) });
+    const started = await startAgentLoop(INPUT, deps, () => undefined);
+
+    const pointer = [...rows.values()].find((r) => r.pipelineId.startsWith('loops-by-person#'))!;
+    expect(pointer).toMatchObject({
+      pipelineId: `loops-by-person#dev-frank#${AT.toISOString().slice(0, 10)}`,
+      runId: started.runId,
+      // Not a run: kept out of every status-keyed query in the service.
+      status: 'index',
+      triggeredBy: 'dev-frank',
+    });
+    expect(pointer.ttl).toBeGreaterThan(AT.getTime() / 1000);
+  });
+
+  it('still starts the loop when the pointer write fails', async () => {
+    let calls = 0;
+    const rows = new Map<string, PipelineRunItem>();
+    const { deps } = harness({
+      plan: () => new Promise(() => { /* never */ }),
+      putRun: async (item) => {
+        calls += 1;
+        if (item.pipelineId.startsWith('loops-by-person#')) throw new Error('index write failed');
+        rows.set(item.runId, item);
+      },
+      getRun: async (runId) => rows.get(runId) ?? null,
+    });
+    const started = await startAgentLoop(INPUT, deps, () => undefined);
+    expect(rows.get(started.runId)).toBeDefined();
+    expect(calls).toBe(2);
+  });
+});
+
+describe('utcDaysSpanned', () => {
+  it('covers the two UTC days a Chicago day straddles', () => {
+    expect(utcDaysSpanned('2026-09-21T05:00:00.000Z', '2026-09-22T05:00:00.000Z'))
+      .toEqual(['2026-09-21', '2026-09-22']);
+  });
+
+  it('is a single day when the window is already UTC-aligned', () => {
+    expect(utcDaysSpanned('2026-09-21T00:00:00.000Z', '2026-09-22T00:00:00.000Z')).toEqual(['2026-09-21']);
+  });
+
+  it('covers the two days a Tokyo day straddles, on the other side', () => {
+    expect(utcDaysSpanned('2026-09-20T15:00:00.000Z', '2026-09-21T15:00:00.000Z'))
+      .toEqual(['2026-09-20', '2026-09-21']);
+  });
+
+  it('does not pull in a day the half-open window cannot reach', () => {
+    // Ends exactly at midnight UTC: the 22nd can hold nothing.
+    expect(utcDaysSpanned('2026-09-21T00:00:00.000Z', '2026-09-22T00:00:00.000Z')).not.toContain('2026-09-22');
+  });
+});
+
+describe('loopIdsForPersonDays', () => {
+  it('reads each day\'s partition and returns the loop ids newest first', async () => {
+    const asked: string[] = [];
+    const ids = await loopIdsForPersonDays(
+      'dev-frank', '2026-09-21T05:00:00.000Z', '2026-09-22T05:00:00.000Z',
+      async (partition) => {
+        asked.push(partition);
+        return partition.endsWith('2026-09-21')
+          ? [{ runId: 'loop-early', startedAt: '2026-09-21T06:00:00.000Z' } as PipelineRunItem]
+          : [{ runId: 'loop-late', startedAt: '2026-09-22T01:00:00.000Z' } as PipelineRunItem];
+      },
+    );
+    expect(asked).toEqual(['loops-by-person#dev-frank#2026-09-21', 'loops-by-person#dev-frank#2026-09-22']);
+    expect(ids).toEqual(['loop-late', 'loop-early']);
   });
 });

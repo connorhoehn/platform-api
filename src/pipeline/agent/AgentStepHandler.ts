@@ -165,6 +165,31 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
         return { status: 'failed', error: 'devbox runtime unavailable: no devbox agent client is configured' };
       }
 
+      // THE RUN'S BUDGET IS THE RUN'S, AND THE SESSION IS SHARED.
+      //
+      // Every devbox step of a run resumes ONE session, so the context it
+      // reports is cumulative: step 2 starts wherever step 1 finished. Once
+      // some step has spent the run's `contextBudgetTokens`, there is no room
+      // left for the ones behind it — and making them each burn an iteration
+      // to rediscover that (and fail) is how a three-step loop ended up
+      // dead-lettered on step 2 with nothing to show.
+      //
+      // So a run that has hit its budget marks the context, and later agent
+      // steps stop before they start, saying so. No tokens, no turns, no
+      // pretending the step ran.
+      if (runtime === 'devbox' && context.budgetExhausted === true) {
+        return {
+          status: 'completed',
+          output: {
+            text: '', turns: 0, toolCalls: [], model: data.model?.trim() || defaultModel,
+            tokensIn: 0, tokensOut: 0, stopReason: 'budget' as const, toolless: false,
+            iterations: 0, contextTokens: 0, runtime,
+            skipped: true,
+            skippedReason: 'the run reached its context budget before this step started',
+          } satisfies AgentStepOutput & { skipped: boolean; skippedReason: string },
+        };
+      }
+
       const model = data.model?.trim() || defaultModel;
       const maxTurns = Number.isFinite(data.maxTurns) && (data.maxTurns as number) > 0
         ? (data.maxTurns as number)
@@ -303,11 +328,28 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
 
       const output = buildOutput();
 
-      // Bounded means bounded: a turn/timeout/budget breach is a FAILURE
-      // with the reason recorded, not a quietly-short success. `budget` is
-      // in that list deliberately — a loop that ran out of context did not
-      // meet its acceptance, and the card must not imply that it did.
-      if (stopReason === 'max_turns' || stopReason === 'timeout' || stopReason === 'error' || stopReason === 'budget') {
+      // A BUDGET STOP IS A BOUND, NOT A FAULT.
+      //
+      // The others in the list below are failures: the agent was still
+      // working and we cut it off. Running out of the context budget is the
+      // loop doing exactly what it was told — it is the ceiling the person
+      // typed (`200k`), reached. Treating it as a step failure failed the
+      // whole run, sent it to the dead-letter queue as an UnknownError, and
+      // tore the session down, for a run that had simply spent its budget.
+      //
+      // So it completes, carrying `stopReason: 'budget'` for anything that
+      // renders it, and sets `budgetExhausted` in the context (step outputs
+      // merge into it) so the steps behind it stop before they start.
+      if (stopReason === 'budget') {
+        return {
+          status: 'completed',
+          output: { ...output, budgetExhausted: true },
+        };
+      }
+
+      // Bounded means bounded: a turn/timeout breach is a FAILURE with the
+      // reason recorded, not a quietly-short success.
+      if (stopReason === 'max_turns' || stopReason === 'timeout' || stopReason === 'error') {
         return {
           status: 'failed',
           output,

@@ -29,6 +29,7 @@ import {
   devboxBaseUrl, devboxSecret, recallRunLab, type DevboxFileEntry,
 } from '../pipeline/agent/DevboxAgentClient';
 import { localDayBounds, todayIn } from '../chat/localDay';
+import { loopIdsForPersonDays } from '../chat/agentLoopRunner';
 import { computeCost } from '../pipeline/llm-pricing';
 import type { PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { SERVICE_AUTH_HEADER, signEnvelope } from '@connorhoehn/service-runtime';
@@ -65,6 +66,10 @@ export interface AgentLoopStepView {
   tokensIn: number;
   tokensOut: number;
   stopReason?: string;
+  /** Why the step failed, in the executor's own words. The UI shows this. */
+  error?: string;
+  /** True when the run's budget was gone before this step started. */
+  skipped?: boolean;
 }
 
 /** One file the run left in its workspace, as the Files tab lists it. */
@@ -135,7 +140,7 @@ export interface LoadedAgentLoop {
   pipelineId: string;
   status: string;
   context: Record<string, unknown>;
-  steps: Record<string, { status?: string; output?: unknown }>;
+  steps: Record<string, { status?: string; output?: unknown; error?: string }>;
   startedAt?: string;
   completedAt?: string;
   /** From the run row's own cost fields. Absent means the run recorded none. */
@@ -154,8 +159,8 @@ export interface AgentLoopsDeps {
   cancelRun: (runId: string, userId: string) => Promise<void>;
   /** The tail proxy's transport, so a test can stand in a stream. */
   fetchImpl: (input: string, init?: RequestInit) => Promise<FetchResponse>;
-  /** Every loop this person started, newest first, for the day filter to narrow. */
-  listRunsFor: (userId: string, limit: number) => Promise<LoadedAgentLoop[]>;
+  /** The loops this person started inside the half-open window, newest first. */
+  listRunsForDay: (userId: string, startIso: string, endIso: string, limit: number) => Promise<LoadedAgentLoop[]>;
   now: () => number;
 }
 
@@ -190,7 +195,11 @@ export function costOfRun(item: Pick<PipelineRunItem, 'estimatedCostUsd' | 'toke
 export function fromRunItem(item: PipelineRunItem): LoadedAgentLoop {
   const steps: LoadedAgentLoop['steps'] = {};
   for (const [nodeId, summary] of Object.entries(item.stepsSummary ?? {})) {
-    steps[nodeId] = { ...(summary.status ? { status: summary.status } : {}), output: summary.output };
+    steps[nodeId] = {
+      ...(summary.status ? { status: summary.status } : {}),
+      ...(summary.error ? { error: summary.error } : {}),
+      output: summary.output,
+    };
   }
   const costUsd = costOfRun(item);
   return {
@@ -284,9 +293,22 @@ const defaultDeps: AgentLoopsDeps = {
     await Promise.resolve(bridge.cancelRun(runId, userId));
   },
   fetchImpl: (input, init) => fetch(input, init),
-  listRunsFor: async (userId, limit) => {
-    const rows = await pipelineRunRepo.listByTriggeredBy(userId, { limit });
-    return rows.filter((r) => r.pipelineId === CHAT_AGENT_LOOP_PIPELINE_ID).map(fromRunItem);
+  /**
+   * NOT `listByTriggeredBy`: that wants a `triggeredBy-startedAt-index` GSI
+   * the deployed table does not have (it answered "The table does not have
+   * the specified index" with a 500). The loop writes a pointer row per
+   * person per UTC day at 202 time instead; this reads those partitions and
+   * then the runs they name. Two key-only Queries and N bounded Gets — no
+   * scan, and no index to provision.
+   */
+  listRunsForDay: async (userId, startIso, endIso, limit) => {
+    const loopIds = await loopIdsForPersonDays(
+      userId, startIso, endIso,
+      (partition, cap) => pipelineRunRepo.listByPipeline(partition, { limit: cap }),
+    );
+    const wanted = loopIds.slice(0, limit);
+    const rows = await Promise.all(wanted.map((id) => pipelineRunRepo.get(CHAT_AGENT_LOOP_PIPELINE_ID, id).catch(() => null)));
+    return rows.filter((r): r is NonNullable<typeof r> => !!r).map(fromRunItem);
   },
   now: () => Date.now(),
 };
@@ -407,6 +429,9 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
       tokensIn: num(output.tokensIn),
       tokensOut: num(output.tokensOut),
       ...(str(output.stopReason) ? { stopReason: str(output.stopReason) } : {}),
+      // A step that failed must say why on the pane, not just go red.
+      ...(str(execution.error) ? { error: str(execution.error) } : {}),
+      ...(output.skipped === true ? { skipped: true } : {}),
     };
   });
 
@@ -521,9 +546,9 @@ export function createAgentLoopsRouter(deps: AgentLoopsDeps = defaultDeps): Rout
     const day = String(req.query.day ?? '').trim() || todayIn(timezone, new Date(now));
     const bounds = localDayBounds(day, timezone, new Date(now));
 
-    // Ask for more than the cap: the day filter throws most of them away, and
-    // a person with a busy week would otherwise see an empty "today".
-    const runs = await deps.listRunsFor(person, MAX_LIST_SCAN);
+    // The lookup is already day-scoped (by UTC day); this narrows the edges
+    // to the person's actual local window.
+    const runs = await deps.listRunsForDay(person, bounds.startIso, bounds.endIso, MAX_LIST_SCAN);
     const onDay = runs.filter((run) => startedWithin(run, bounds.startIso, bounds.endIso));
 
     // Someone else's loops are visible only where the viewer can see the

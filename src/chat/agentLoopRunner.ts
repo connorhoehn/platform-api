@@ -194,7 +194,16 @@ export async function startAgentLoop(
   // Written BEFORE the 202. A loop the client has been told about must never
   // 404 on the URL it was handed, and the only way to guarantee that is for
   // the record to exist before the id leaves this process.
-  await deps.putRun(pendingRow(loopId, request, deps.now()));
+  const at = deps.now();
+  await deps.putRun(pendingRow(loopId, request, at));
+  // The Computer Lab tab finds this loop through here, not through a GSI the
+  // table does not have. Best-effort: a missing pointer costs a listing row,
+  // and must never cost the run itself.
+  try {
+    await deps.putRun(personDayIndexRow(loopId, request, at));
+  } catch (err) {
+    log.warn({ loopId, err: err instanceof Error ? err.message : String(err) }, 'agent loop person-day index row failed');
+  }
   log.info({ loopId, channel: request.chatChannel, userId: request.requestedBy }, 'agent loop accepted, planning in the background');
 
   const planning = planAndTrigger(loopId, request, input, deps).catch(() => undefined);
@@ -249,4 +258,85 @@ export async function failOrphanedLoops(args: {
   }
   if (failed.length) log.warn({ loops: failed, sessionsStopped }, 'agent loops orphaned by a restart were failed');
   return { failed, sessionsStopped };
+}
+
+// ─── Finding a person's loops without a GSI ───────────────────────────
+//
+// The obvious query — "runs this person triggered, newest first" — wants the
+// `triggeredBy-startedAt-index` GSI. The deployed table does not have it
+// (local DDB answered `The table does not have the specified index`), and a
+// scan is not an answer: it reads every run of every pipeline to find one
+// person's day.
+//
+// So the write side pays instead. Each loop writes ONE extra row into the
+// same table under a synthetic partition key, and the read side queries that
+// partition directly. Both sides are a single Query on the table's own key.
+//
+// PARTITIONED BY UTC DAY, NOT LOCAL DAY. The requester's timezone is not
+// known when the row is written — the chat command does not carry one — and
+// guessing it would file runs under a day nobody asked about. A UTC day is a
+// fact at write time; the reader knows the timezone, asks for the one to
+// three UTC days its local window touches, and filters precisely.
+//
+// These rows are NOT runs. `status: 'index'` keeps them out of every
+// status-keyed query in the service (the orphan scans ask for 'pending' and
+// 'running'), and the partition key is not a pipeline id anybody triggers.
+
+/** `loops-by-person#dev-frank#2026-09-21` — the partition one person's day lives in. */
+export function personDayPartition(userId: string, utcDay: string): string {
+  return `loops-by-person#${userId}#${utcDay}`;
+}
+
+/** `YYYY-MM-DD` of an ISO instant, in UTC. */
+export function utcDayOf(iso: string): string {
+  return iso.slice(0, 10);
+}
+
+/** Every UTC day a local-day window touches. One, two, or (at extreme offsets) three. */
+export function utcDaysSpanned(startIso: string, endIso: string): string[] {
+  const days: string[] = [];
+  const start = Date.parse(startIso);
+  const end = Date.parse(endIso);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return days;
+  // The window is half-open, so the last instant that can appear in it is
+  // one millisecond before `end` — using `end` itself would pull in a day
+  // that can hold nothing.
+  for (let t = start; t <= end - 1; t += 24 * 3_600_000) {
+    days.push(new Date(t).toISOString().slice(0, 10));
+  }
+  const lastDay = new Date(end - 1).toISOString().slice(0, 10);
+  if (!days.includes(lastDay)) days.push(lastDay);
+  return days;
+}
+
+/** The pointer row. Its `runId` is the loop id; everything else is bookkeeping. */
+export function personDayIndexRow(loopId: string, request: AgentLoopRequest, at: Date): PipelineRunItem {
+  return {
+    pipelineId: personDayPartition(request.requestedBy, utcDayOf(nowIso(at))),
+    runId: loopId,
+    status: 'index' as PipelineRunItem['status'],
+    triggeredBy: request.requestedBy,
+    triggerType: 'agent-loop-index',
+    startedAt: nowIso(at),
+    // 90 days, matching the run rows these point at.
+    ttl: Math.floor(at.getTime() / 1000) + 90 * 24 * 60 * 60,
+  } as unknown as PipelineRunItem;
+}
+
+/** Loop ids this person started on the UTC days the window touches, newest first. */
+export async function loopIdsForPersonDays(
+  userId: string,
+  startIso: string,
+  endIso: string,
+  listPartition: (partition: string, limit: number) => Promise<PipelineRunItem[]>,
+  limit = 200,
+): Promise<string[]> {
+  const days = utcDaysSpanned(startIso, endIso);
+  const rows: PipelineRunItem[] = [];
+  for (const day of days) {
+    rows.push(...await listPartition(personDayPartition(userId, day), limit));
+  }
+  return rows
+    .sort((a, b) => Date.parse(b.startedAt ?? '') - Date.parse(a.startedAt ?? ''))
+    .map((r) => r.runId);
 }

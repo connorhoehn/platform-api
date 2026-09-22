@@ -136,7 +136,7 @@ beforeEach(() => {
     devbox: () => ({ startTask, shellUrl, deleteSession, listFiles, fetchFile } as never),
     cancelRun: (...a: unknown[]) => cancelRun(...a) as Promise<void>,
     fetchImpl: jest.fn(),
-    listRunsFor: (...a: unknown[]) => listRunsFor(...a) as Promise<LoadedAgentLoop[]>,
+    listRunsForDay: (...a: unknown[]) => listRunsFor(...a) as Promise<LoadedAgentLoop[]>,
     now: () => NOW,
   };
 });
@@ -457,7 +457,7 @@ describe('GET /api/agent-loops?person=&day=&timezone=', () => {
 
   it('defaults to the viewer and to today in their zone', async () => {
     const res = await call(buildApp(), 'get', '/api/agent-loops?timezone=America/Chicago', 'dev-frank');
-    expect(listRunsFor).toHaveBeenCalledWith('dev-frank', 200);
+    expect(listRunsFor).toHaveBeenCalledWith('dev-frank', '2026-09-21T05:00:00.000Z', '2026-09-22T05:00:00.000Z', 200);
     // The fixed clock is 12:00Z on the 21st = 07:00 in Chicago, same day.
     expect(res.body).toMatchObject({ person: 'dev-frank', day: '2026-09-21' });
   });
@@ -518,5 +518,31 @@ describe('a loop that is still being planned', () => {
     run = loadedRun({ executorRunId: 'executor-run-1' });
     await call(buildApp(), 'post', '/api/agent-loops/run-1/stop', 'dev-frank');
     expect(cancelRun).toHaveBeenCalledWith('executor-run-1', 'dev-frank');
+  });
+});
+
+describe('a step that failed', () => {
+  it('carries its error message through, so the pane can show why', async () => {
+    run = loadedRun({
+      status: 'failed',
+      steps: {
+        'agent:s1': { status: 'completed', output: { iterations: 4, contextTokens: 145_800, stopReason: 'complete' } },
+        'agent:s2': { status: 'failed', error: 'agent step stopped: timeout', output: { iterations: 2, contextTokens: 180_000, stopReason: 'timeout' } },
+      },
+    });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    const steps = (res.body as { steps: Array<Record<string, unknown>> }).steps;
+    expect(steps[1]).toMatchObject({ id: 's2', status: 'failed', stopReason: 'timeout', error: 'agent step stopped: timeout' });
+    // A step that did not fail carries no error field at all.
+    expect(steps[0]).not.toHaveProperty('error');
+  });
+
+  it('marks a step the budget skipped, so it does not read as an unexplained blank', async () => {
+    run = loadedRun({
+      steps: { 'agent:s2': { status: 'completed', output: { stopReason: 'budget', iterations: 0, skipped: true } } },
+    });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect((res.body as { steps: Array<Record<string, unknown>> }).steps[1])
+      .toMatchObject({ id: 's2', stopReason: 'budget', skipped: true, iterations: 0 });
   });
 });
