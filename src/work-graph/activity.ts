@@ -16,6 +16,7 @@ import {
   WORK_GRAPH_LIMITS,
   WORK_GRAPH_V2_LIMITS,
   type DeriveWorkEffortsInput,
+  type ViewerWorkEffort,
   type ViewerArtifactRevision,
   type ViewerWorkActivityDetail,
   type ViewerWorkNodeLink,
@@ -24,6 +25,7 @@ import {
   type WorkGraphQueryV2,
 } from '@connorhoehn/realtime-modules/work-graph';
 import type { StoredWorkNode } from '../repositories/WorkGraphRepository';
+import { parsePipelineStepResourceId } from './sources/mapPipeline';
 import type { AuthorizedWorkGraph, ViewerWorkEdge, ViewerWorkNode } from './policy';
 
 /** Source facts, already read from the owning service's own record. */
@@ -229,6 +231,27 @@ function instant(value: string | undefined): number {
  * newest-first would name an effort after whichever step happened to run last.
  * A member the viewer may not read can never supply the name.
  */
+/**
+ * The pipeline run a node belongs to, read from the resource id its own source
+ * wrote: a step is addressed `runId::stepId`, and a run is addressed `runId`.
+ *
+ * This is containment the source stated, not an inference from adjacency — and
+ * unlike the `derived-from` relationship it does not depend on delivery order.
+ * The projection queue is drained in concurrent batches, so a step can be
+ * projected BEFORE its run, and a cross-source edge whose counterpart does not
+ * exist yet is dropped for good. Every step of a run then floated unframed.
+ */
+function pipelineRunOf(authorization: AuthorizedWorkGraph, node: ViewerWorkNode): string | undefined {
+  // Only the run and its steps are addressed this way. A workspace is a
+  // `terminal` addressed by its session id, which is not a run id and must
+  // never be read as one; it joins its run through the `runs-in` relationship
+  // it was projected with, in the same event.
+  if (node.kind !== 'run' && node.kind !== 'agent') return undefined;
+  const stored = storedNode(authorization, node.id);
+  if (stored?.sourceRef.source !== 'pipeline') return undefined;
+  return parsePipelineStepResourceId(stored.sourceRef.resourceId).runId;
+}
+
 function earliestRun(members: readonly ViewerWorkNode[]): ViewerWorkNode | undefined {
   return members
     .filter((member) => (member.kind === 'run' || member.kind === 'agent')
@@ -301,6 +324,17 @@ function clock(value: string | undefined, timezone: string): string | undefined 
  * stopped.
  */
 const SETTLED_STATUSES = new Set(['completed', 'error', 'stopped']);
+
+/**
+ * A step cannot outlive the run it belongs to. Its own terminal transition can
+ * be lost — the run ends, its session is torn down, and a step that was still
+ * `running` never hears about it — so the run's state settles its steps too.
+ * Without this a finished loop kept steps reading `running`, holding leases
+ * and animating operations for five minutes after there was nothing there.
+ */
+function settled(node: ViewerWorkNode, runStatus: string | undefined): boolean {
+  return SETTLED_STATUSES.has(node.status) || (runStatus !== undefined && SETTLED_STATUSES.has(runStatus));
+}
 
 function lease(observedAt: string | undefined, now: string): { observedAt: string; expiresAt: string } | undefined {
   const observed = observedAt === undefined ? Number.NaN : Date.parse(observedAt);
@@ -476,9 +510,21 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     ...detailed.filter((node) => node.kind === 'meeting'),
     ...detailed.filter((node) => node.kind !== 'meeting'),
   ];
+  // The state of each pipeline run, by the resource id its own steps name.
+  const runStatusById = new Map(nodes.flatMap((node) => {
+    const stored = storedNode(authorization, node.id);
+    if (stored?.sourceRef.source !== 'pipeline') return [];
+    const parsed = parsePipelineStepResourceId(stored.sourceRef.resourceId);
+    return parsed.stepId ? [] : [[parsed.runId, node.status] as const];
+  }));
+  const runStatusOf = (node: ViewerWorkNode): string | undefined => {
+    const runId = pipelineRunOf(authorization, node);
+    return runId ? runStatusById.get(runId) : undefined;
+  };
+
   const describe = async (node: ViewerWorkNode): Promise<void> => {
     const stored = storedNode(authorization, node.id);
-    const freshness = SETTLED_STATUSES.has(node.status)
+    const freshness = settled(node, runStatusOf(node))
       ? undefined
       : lease(stored?.updatedAt ?? node.updatedAt, now);
 
@@ -768,7 +814,11 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     // is written by the save record and is not itself marked running.
     if (edge.disclosure === 'existence') continue;
     if (!OPERATION_RELATIONS.has(edge.relation) || edge.fromId !== process.id) continue;
-    if (SETTLED_STATUSES.has(process.status)) continue;
+    if (settled(process, runStatusOf(process))) continue;
+    // A step that has taken no turn has not started working in the workspace
+    // it was given. Claiming an operation for it animates a process that does
+    // not exist yet.
+    if (runFacts.get(process.id)?.step?.iterations === 0) continue;
     const stored = storedNode(authorization, process.id);
     const evidence = lease(stored?.updatedAt ?? process.updatedAt, now);
     if (!evidence) continue;
@@ -848,6 +898,66 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       // after the run that started it — the earliest — not its latest step.
       titleFor: (_anchor, members) => earliestRun(members)?.title,
     }).slice(0, Math.max(0, WORK_GRAPH_V2_LIMITS.efforts - efforts.length)));
+  }
+
+  // One run is one effort. Efforts holding nodes of the same pipeline run are
+  // merged into whichever of them already frames that run — the containment is
+  // in the resource id the source wrote, so it holds whether or not the
+  // `derived-from` relationship survived the order it was delivered in.
+  const runOf = new Map(nodes.flatMap((node) => {
+    const runId = pipelineRunOf(authorization, node);
+    return runId ? [[node.id, runId] as const] : [];
+  }));
+  const homeByRun = new Map<string, ViewerWorkEffort>();
+  const merged: ViewerWorkEffort[] = [];
+  for (const effort of efforts) {
+    const runIds = [...new Set(effort.nodeIds.flatMap((id) => (runOf.get(id) ? [runOf.get(id) as string] : [])))];
+    // Only an effort that is ENTIRELY one run's work may be absorbed; an
+    // effort anchored on a conversation or a project keeps its own frame and
+    // takes the run's nodes with it.
+    const home = runIds.length === 1 ? homeByRun.get(runIds[0]) : undefined;
+    if (home && effort.anchorNodeId !== home.anchorNodeId) {
+      home.nodeIds = [...new Set([...home.nodeIds, ...effort.nodeIds])];
+      home.edgeIds = [...new Set([...home.edgeIds, ...effort.edgeIds])];
+      home.contextNodeIds = [...new Set([...home.contextNodeIds, ...effort.contextNodeIds])];
+      continue;
+    }
+    merged.push(effort);
+    for (const runId of runIds) {
+      // The effort that frames the RUN's own node is the home, whichever came
+      // first: it is the one whose anchor can name the whole loop.
+      const holdsTheRun = effort.nodeIds.some((id) => storedNode(authorization, id)?.sourceRef.resourceId === runId);
+      if (!homeByRun.has(runId) || holdsTheRun) homeByRun.set(runId, effort);
+    }
+  }
+  efforts.length = 0;
+  efforts.push(...merged);
+  // Anything the source says belongs to a framed run, but that reached no
+  // effort of its own — a step whose every relationship was dropped.
+  const framed = new Set(efforts.flatMap((effort) => effort.nodeIds));
+  for (const [nodeId, runId] of runOf) {
+    const home = homeByRun.get(runId);
+    if (!home || framed.has(nodeId)) continue;
+    home.nodeIds = [...new Set([...home.nodeIds, nodeId])];
+  }
+  // A merged effort is named from everything it ended up framing: an effort
+  // anchored on a step was named after that step while it was alone.
+  for (const effort of efforts) {
+    const anchor = index.byId.get(effort.anchorNodeId);
+    if (anchor?.kind !== 'run' && anchor?.kind !== 'agent') continue;
+    const name = earliestRun(effort.nodeIds
+      .map((id) => index.byId.get(id))
+      .filter((node): node is ViewerWorkNode => !!node))?.title;
+    if (name) effort.title = name;
+  }
+  // Every relationship BETWEEN an effort's own members belongs to it, however
+  // the members got there.
+  for (const effort of efforts) {
+    const members = new Set(effort.nodeIds);
+    effort.edgeIds = [...new Set([
+      ...effort.edgeIds,
+      ...edges.filter((edge) => members.has(edge.fromId) && members.has(edge.toId)).map((edge) => edge.id),
+    ])];
   }
 
   // Latest-state projection cannot reconstruct a past minute, so an as-of

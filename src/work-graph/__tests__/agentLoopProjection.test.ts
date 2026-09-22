@@ -579,3 +579,91 @@ describe('a finished run holds no lease', () => {
     },
   );
 });
+
+describe('a run frames its steps even when their relationships never resolved', () => {
+  // The projection queue is drained in concurrent batches, so a step can be
+  // projected BEFORE its run — and a cross-source relationship whose
+  // counterpart does not exist yet is dropped for good. The containment is in
+  // the resource id either way.
+  const outOfOrder = [
+    stepEvent('agent:s1', 'Draft slides', 'running', `${DAY}T18:04:30.000Z`, [], {
+      workspace: { resourceId: 'session-1' },
+    }),
+    stepEvent('deck:s1', 'Render the deck (.pptx)', 'completed', `${DAY}T18:04:35.000Z`),
+    runEvent('running', `${DAY}T18:00:00.000Z`, false),
+  ];
+
+  it('drops the step-to-run relationship when the run arrives second', () => {
+    const state = project(outOfOrder);
+    const toRun = Object.values(state.edges)
+      .filter((edge) => state.nodes[edge.toId]?.sourceRef.resourceId === RUN);
+    expect(toRun).toHaveLength(0);
+  });
+
+  it('frames them as one effort regardless', async () => {
+    const state = project(outOfOrder);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
+    expect(activity.efforts).toHaveLength(1);
+    // The run, both its steps, and the workspace they share.
+    expect(activity.efforts[0].nodeIds).toHaveLength(4);
+    expect(activity.efforts[0].title).toBe('Agent loop · create a meeting with the X team');
+    const titles = activity.efforts[0].nodeIds.map((id) => nodes.find((node) => node.id === id)?.title).sort();
+    expect(titles).toEqual([
+      'Agent loop · create a meeting with the X team', 'Cloud workspace', 'Draft slides', 'Render the deck (.pptx)',
+    ]);
+  });
+
+  it('keeps the conversation as the frame when there is one', async () => {
+    const state = project([conversationEvent(`${DAY}T17:59:00.000Z`), runEvent('running', `${DAY}T18:00:00.000Z`), ...outOfOrder.slice(0, 2)]);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
+    expect(activity.efforts).toHaveLength(1);
+    expect(nodes.find((node) => node.id === activity.efforts[0].anchorNodeId)?.kind).toBe('conversation');
+    expect(activity.efforts[0].nodeIds).toHaveLength(5);
+  });
+});
+
+describe('a step does not outlive its run', () => {
+  const stale = [
+    runEvent('running', `${DAY}T18:00:00.000Z`, false),
+    stepEvent('agent:s1', 'Draft slides', 'running', `${DAY}T18:04:30.000Z`, [], {
+      workspace: { resourceId: 'session-1' },
+    }),
+    // The run ends on its budget; the step's own terminal transition is lost
+    // with the session it was running in.
+    runEvent('budget', `${DAY}T18:04:50.000Z`, false),
+  ];
+
+  it('withdraws the step\'s lease and operation when its run has settled', async () => {
+    const state = project(stale);
+    const { nodes, edges, authorization } = authorize(state);
+    const step = nodes.find((node) => node.title === 'Draft slides');
+    expect(step?.status).toBe('running');   // the projection still says so
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
+    expect(activity.details.find((detail) => detail.nodeId === step?.id)?.freshness).toBeUndefined();
+    expect(activity.operations).toHaveLength(0);
+  });
+
+  it('claims no operation for a step that has taken no turn', async () => {
+    const state = project([
+      runEvent('running', `${DAY}T18:00:00.000Z`, false),
+      stepEvent('agent:s1', 'Draft slides', 'running', `${DAY}T18:04:30.000Z`, [], {
+        workspace: { resourceId: 'session-1' },
+      }),
+    ]);
+    const { nodes, edges, authorization } = authorize(state);
+    const step = nodes.find((node) => node.title === 'Draft slides');
+    const activity = await buildWorkActivity({
+      query, nodes, edges, authorization, now: NOW,
+      reader: reader({ [`${RUN}::agent:s1`]: {
+        runId: RUN, status: 'running', attempt: 1,
+        startedAt: `${DAY}T18:04:30.000Z`, updatedAt: `${DAY}T18:04:30.000Z`, tools: [],
+        step: { stepId: 'agent:s1', model: 'sonnet', iterations: 0, runtime: 'devbox', sessionId: 'session-1' },
+      } }),
+    });
+    expect(activity.operations).toHaveLength(0);
+    // It is still framed and still described — just not animated.
+    expect(activity.details.find((detail) => detail.nodeId === step?.id)?.lines?.[0]).toContain('Sonnet');
+  });
+});
