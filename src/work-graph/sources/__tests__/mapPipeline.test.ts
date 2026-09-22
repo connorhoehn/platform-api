@@ -336,3 +336,20 @@ describe('a step that says where it runs and what it writes', () => {
       .toMatchObject({ reason: 'invalid-input-reference' });
   });
 });
+
+describe('the platform\'s own terminal run states', () => {
+  it.each([
+    ['budget', 'completed'],
+    ['stopped', 'cancelled'],
+  ])('closes a run that ended as %s', (status, lifecycle) => {
+    expect(eventOf(mapPipeline(source(status as never), context)).payload.lifecycle).toBe(lifecycle);
+  });
+
+  it('is not case- or whitespace-sensitive about them', () => {
+    expect(eventOf(mapPipeline(source(' Budget ' as never), context)).payload.lifecycle).toBe('completed');
+  });
+
+  it('still refuses a status nobody has defined, rather than guessing', () => {
+    expect(mapPipeline(source('vibing' as never), context)).toMatchObject({ reason: 'unsupported-run-status' });
+  });
+});

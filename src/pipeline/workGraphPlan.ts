@@ -62,3 +62,45 @@ export function workGraphPlanFromDefinition(
   }));
   return { ...named, steps };
 }
+
+/**
+ * What a persisted run row still knows about how it should read in the graph.
+ *
+ * A command that answers before its run exists writes a row first, and puts
+ * the instruction and the conversation on that row's checkpoint context. When
+ * such a run is replayed — after a catalog outage, or at startup — that is the
+ * only place its name and its origin survive. Nothing is invented: a row that
+ * carries neither yields neither.
+ */
+export function workGraphPlanFromStoredRun(
+  item: { checkpoint?: { context?: Record<string, unknown> } | undefined; pipelineId?: string },
+  definitionName?: string,
+): { workGraph?: RunWorkGraphPlan; instruction?: string } {
+  const context = item.checkpoint?.context ?? {};
+  const text = (value: unknown): string | undefined =>
+    (typeof value === 'string' && value.trim() ? value.trim().replace(/\s+/g, ' ') : undefined);
+  const instruction = text(context.instruction);
+  const conversationId = text(context.chatChannel);
+  // The plan's own steps, when the row got as far as having any.
+  const plan = context.plan as { steps?: unknown } | undefined;
+  const steps = Array.isArray(plan?.steps)
+    ? (plan.steps as Array<Record<string, unknown>>)
+      .filter((step) => text(step.id) && text(step.title))
+      .map((step) => ({
+        stepId: `agent:${text(step.id) as string}`,
+        title: (text(step.title) as string).slice(0, 160),
+        dependsOn: Array.isArray(step.dependsOn)
+          ? (step.dependsOn as unknown[]).flatMap((id) => (text(id) ? [`agent:${text(id) as string}`] : []))
+          : [],
+      }))
+    : [];
+  if (!instruction && !conversationId && steps.length === 0) return {};
+  return {
+    workGraph: {
+      ...(conversationId ? { conversationId } : {}),
+      ...(definitionName ? { title: definitionName } : {}),
+      steps,
+    },
+    ...(instruction ? { instruction } : {}),
+  };
+}

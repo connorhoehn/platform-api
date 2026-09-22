@@ -71,6 +71,8 @@ function runStatus(value: unknown): PipelineRunFacts['status'] {
       return 'waiting';
     case 'completed':
     case 'succeeded':
+    // Spending the budget is how a bounded run finishes, not how it fails.
+    case 'budget':
       return 'completed';
     case 'failed':
     case 'rejected':

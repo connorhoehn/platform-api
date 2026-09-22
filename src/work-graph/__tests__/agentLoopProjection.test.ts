@@ -11,7 +11,7 @@ import { projectWorkEvent, type AuthenticatedWorkEvent, type WorkProjectionState
 import { mapPipeline, pipelineStepResourceId, type AuthenticatedPipelineContext } from '../sources/mapPipeline';
 import { agentStepLines, buildWorkActivity, formatTokens, type PipelineRunFacts, type WorkActivityReader } from '../activity';
 import type { AuthorizedWorkGraph, ViewerWorkEdge, ViewerWorkNode } from '../policy';
-import { workGraphPlanFromDefinition } from '../../pipeline/workGraphPlan';
+import { workGraphPlanFromDefinition, workGraphPlanFromStoredRun } from '../../pipeline/workGraphPlan';
 
 const ORGANIZATION = 'dev-org';
 const ACTOR = 'dev-frank';
@@ -472,5 +472,72 @@ describe('a run started in a channel the person has never posted in', () => {
     const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
     expect(activity.efforts).toHaveLength(1);
     expect(nodes.find((node) => node.id === activity.efforts[0].anchorNodeId)?.kind).toBe('conversation');
+  });
+});
+
+describe('a loop that ended on its context budget', () => {
+  it('closes the run, so it stops reading as running and holds no lease', async () => {
+    const state = project([
+      conversationEvent(`${DAY}T17:59:00.000Z`),
+      runEvent('running', `${DAY}T18:00:00.000Z`),
+      stepEvent('agent:s1', 'Draft the agenda', 'running', `${DAY}T18:04:30.000Z`, [], {
+        workspace: { resourceId: 'session-1' },
+      }),
+      stepEvent('agent:s1', 'Draft the agenda', 'completed', `${DAY}T18:04:40.000Z`, [], {
+        workspace: { resourceId: 'session-1' },
+      }),
+      runEvent('budget', `${DAY}T18:04:50.000Z`),
+    ]);
+    const { nodes, edges, authorization } = authorize(state);
+    const run = nodes.find((node) => node.title?.startsWith('Agent loop'));
+    // Spending the budget it was given is how a bounded run finishes.
+    expect(run?.status).toBe('completed');
+    expect(nodes.find((node) => node.title === 'Draft the agenda')?.status).toBe('completed');
+    const activity = await buildWorkActivity({
+      query, nodes, edges, authorization, reader: reader({}), now: NOW,
+    });
+    expect(activity.operations).toHaveLength(0);
+  });
+
+  it('reads a stopped run as stopped, not as still working', () => {
+    const state = project([
+      runEvent('running', `${DAY}T18:00:00.000Z`, false),
+      runEvent('stopped', `${DAY}T18:04:50.000Z`, false),
+    ]);
+    expect(Object.values(state.nodes)[0].status).toBe('stopped');
+  });
+});
+
+describe('workGraphPlanFromStoredRun', () => {
+  it('recovers the name, the origin and the steps from a row written at accept time', () => {
+    expect(workGraphPlanFromStoredRun({
+      checkpoint: {
+        context: {
+          instruction: 'create a meeting with the X team',
+          chatChannel: CHANNEL,
+          plan: { steps: [{ id: 's1', title: 'Draft the agenda', dependsOn: [] }] },
+        },
+      },
+    }, 'Agent loop')).toEqual({
+      instruction: 'create a meeting with the X team',
+      workGraph: {
+        conversationId: CHANNEL,
+        title: 'Agent loop',
+        steps: [{ stepId: 'agent:s1', title: 'Draft the agenda', dependsOn: [] }],
+      },
+    });
+  });
+
+  it('recovers what it can from a row whose planner never answered', () => {
+    const recovered = workGraphPlanFromStoredRun({
+      checkpoint: { context: { instruction: 'create a meeting', chatChannel: CHANNEL, plan: { steps: [] } } },
+    }, 'Agent loop');
+    expect(recovered.instruction).toBe('create a meeting');
+    expect(recovered.workGraph?.steps).toEqual([]);
+  });
+
+  it('invents nothing for an ordinary run with no such record', () => {
+    expect(workGraphPlanFromStoredRun({})).toEqual({});
+    expect(workGraphPlanFromStoredRun({ checkpoint: { context: { currentStepIds: [] } } })).toEqual({});
   });
 });

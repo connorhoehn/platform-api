@@ -42,7 +42,7 @@ import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platform
 import { pipelineStepResourceId } from '../work-graph/sources/mapPipeline';
 import { recallRunLab } from './agent/DevboxAgentClient';
 import { parseRunResult } from './runResult';
-import type { RunWorkGraphPlan } from './workGraphPlan';
+import { workGraphPlanFromStoredRun, type RunWorkGraphPlan } from './workGraphPlan';
 
 const log = withContext({ service: 'runPersistence' });
 
@@ -52,6 +52,20 @@ const log = withContext({ service: 'runPersistence' });
  * minute agent step live and infrequent enough not to flood the projection.
  */
 const WORK_GRAPH_STEP_REFRESH_MS = 60_000;
+
+/**
+ * "Agent loop · create a meeting with the X team" — the pipeline's own name
+ * and what the person actually asked for. The instruction is the half that
+ * tells two runs of the same pipeline apart, so a run with one is named after
+ * it. "Pipeline run" names nothing and is never what this returns when there
+ * is anything better to say.
+ */
+function runTitle(state: { workGraph?: RunWorkGraphPlan; instruction?: string }): string | undefined {
+  const name = state.workGraph?.title;
+  const instruction = state.instruction?.trim();
+  if (!instruction) return name;
+  return `${name ? `${name} · ` : ''}${instruction}`.slice(0, 160);
+}
 
 export interface RunPersistenceOptions {
   /** EventBus instance to subscribe to. */
@@ -122,6 +136,8 @@ interface RunState {
   lastEventAt: string;
   /** What the graph shows for this run. Absent for a run nobody declared one for. */
   workGraph?: RunWorkGraphPlan;
+  /** What the person asked for, from the trigger payload. Names the run. */
+  instruction?: string;
   /** The lifecycle each step was last projected at, so it only moves forward. */
   stepLifecycle: Record<string, string>;
   /** When that projection happened, for the running step's lease refresh. */
@@ -329,16 +345,9 @@ export class RunPersistenceService {
     // registerTrigger. A registerTrigger that already named it wins.
     const redriveOf = this.runCache.get(event.runId)?.redriveOf ?? redriveOfFromPayload(event.triggeredBy.payload);
     const registered = this.runCache.get(event.runId);
-    // "Agent loop · create a meeting with the X team": the pipeline's own name
-    // and the instruction the trigger carried. The instruction is what the
-    // person typed, so it is the half that identifies this run among others.
     const instruction = typeof event.triggeredBy.payload?.instruction === 'string'
       ? event.triggeredBy.payload.instruction.trim().replace(/\s+/g, ' ')
       : '';
-    const planTitle = registered?.workGraph?.title;
-    const runTitle = instruction
-      ? `${planTitle ? `${planTitle} · ` : ''}${instruction}`.slice(0, 160)
-      : planTitle;
     const state: RunState = {
       pipelineId: event.pipelineId,
       runId: event.runId,
@@ -357,17 +366,15 @@ export class RunPersistenceService {
       stepLifecycleAt: {},
       lastEventAt: event.at,
       ...(registered?.organizationId ? { organizationId: registered.organizationId } : {}),
-      ...(registered?.workGraph
-        ? { workGraph: { ...registered.workGraph, ...(runTitle ? { title: runTitle } : {}) } }
-        : {}),
+      ...(registered?.workGraph ? { workGraph: registered.workGraph } : {}),
+      ...(instruction ? { instruction } : {}),
       ...(redriveOf ? { redriveOf } : {}),
     };
 
     this.runCache.set(event.runId, state);
     await this.persistRun(state);
-    await this.publishWorkGraphLifecycle(state, event.at);
     // The run's shape is visible from the start: every planned step, waiting.
-    await this.publishWorkGraphStepPlan(state, event.at);
+    await this.announceWorkGraphRun(state, event.at);
   }
 
   private touchLastEvent(runId: string, at: string): void {
@@ -733,7 +740,23 @@ export class RunPersistenceService {
     /** What the work graph shows for this run: its origin and its steps. */
     workGraph?: RunWorkGraphPlan;
   }): void {
-    if (this.runCache.has(args.runId)) return;
+    const existing = this.runCache.get(args.runId);
+    if (existing) {
+      // The executor publishes `run:started` on an in-process bus, so it can
+      // reach the cache BEFORE `bridge.trigger` has even returned the run id
+      // this call is made with. Bailing out here discarded the only things the
+      // caller knows and the events do not: the verified organization, the
+      // conversation the run came from, and which nodes are its steps — and
+      // the run was then projected as a nameless, unanchored, stepless node.
+      if (args.organizationId && !existing.organizationId) existing.organizationId = args.organizationId;
+      if (args.workGraph && !existing.workGraph) existing.workGraph = args.workGraph;
+      if (args.redriveOf && !existing.redriveOf) existing.redriveOf = args.redriveOf;
+      // Say it again, now that there is something to say. The mapper's keys
+      // are deterministic per transition, so the re-announcement is a second
+      // observation of the same run rather than a duplicate.
+      void this.announceWorkGraphRun(existing, args.at);
+      return;
+    }
     this.runCache.set(args.runId, {
       pipelineId: args.pipelineId,
       runId: args.runId,
@@ -784,7 +807,14 @@ export class RunPersistenceService {
    */
   async reconcileWorkGraphRun(item: PipelineRunItem): Promise<void> {
     if (!item.organizationId || item.triggeredBy === 'system') return;
+    // A run that died before its steps existed — an /agent loop whose planner
+    // never answered — has only the row written when the command was accepted.
+    // That row still knows what was asked for and where, and replaying it as
+    // an unnamed, unanchored "Pipeline run" throws both away.
+    const stored = workGraphPlanFromStoredRun(item, await this.definitionName(item.pipelineId));
     await this.publishWorkGraphLifecycle({
+      ...(stored.workGraph ? { workGraph: stored.workGraph } : {}),
+      ...(stored.instruction ? { instruction: stored.instruction } : {}),
       pipelineId: item.pipelineId,
       runId: item.runId,
       status: item.status,
@@ -1188,7 +1218,7 @@ export class RunPersistenceService {
         : {}),
       // The run has to be nameable: it is what an effort anchors on when the
       // conversation it came from is not in this person's graph.
-      ...(state.workGraph?.title ? { safeLabel: state.workGraph.title } : {}),
+      ...(runTitle(state) ? { safeLabel: runTitle(state) as string } : {}),
     }, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
     if (!result.published) {
       log.warn({ runId: state.runId, reason: result.reason }, 'work graph pipeline lifecycle was not published');
@@ -1275,6 +1305,34 @@ export class RunPersistenceService {
     const output = state.steps[stepId]?.output as { result?: unknown } | undefined;
     const result = parseRunResult(output?.result);
     return result?.kind === 'document' ? [{ source: 'document', resourceId: result.documentId }] : [];
+  }
+
+  /**
+   * The registered pipeline's own display name, when it has one.
+   *
+   * Imported lazily and on purpose: `systemPipelines` BUILDS every definition
+   * at module load, and some of those modules import this one. A static import
+   * here is a cycle that leaves a definition half-initialised.
+   */
+  private async definitionName(pipelineId: string): Promise<string | undefined> {
+    try {
+      const { getSystemPipeline } = await import('./systemPipelines.js');
+      const name = getSystemPipeline(pipelineId)?.name;
+      return typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The run and its planned steps, together. Both are safe to repeat: the
+   * projection keys each transition, and a step already past `waiting` keeps
+   * what it has.
+   */
+  private async announceWorkGraphRun(state: RunState, occurredAt: string): Promise<void> {
+    await this.publishWorkGraphLifecycle(state, occurredAt)
+      .catch((err) => log.warn({ runId: state.runId, err: String(err) }, 'run projection failed'));
+    await this.publishWorkGraphStepPlan(state, occurredAt);
   }
 
   /**

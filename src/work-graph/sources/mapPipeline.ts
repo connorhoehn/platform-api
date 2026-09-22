@@ -224,6 +224,20 @@ function hasIdentityContext(context: AuthenticatedPipelineContext): boolean {
 }
 
 function lifecycleForStatus(raw: string): PipelineLifecycle | undefined {
+  // The platform's own terminal states, which the runtime's vocabulary does
+  // not name. A run that spent the context budget it was given DID finish —
+  // it reached the bound, which is not the same as failing — and one that was
+  // stopped ended without finishing. Leaving either unmapped was worse than
+  // both: the transition was refused, so the node stayed `running` for ever
+  // and kept a lease it had no business holding.
+  switch (raw.trim().toLowerCase()) {
+    case 'budget':
+      return 'completed';
+    case 'stopped':
+      return 'cancelled';
+    default:
+      break;
+  }
   switch (normalizeRunStatus(raw)) {
     case 'pending':
     case 'running':
