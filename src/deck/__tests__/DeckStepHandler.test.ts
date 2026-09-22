@@ -9,8 +9,10 @@ import { hidePptxNodeDetection } from './pptxTestEnv';
 
 class FakeStore implements PresentationDocumentStore {
   readonly calls: AppendRevisionInput[] = [];
+  /** Rows the store already holds, by id — what `get` answers with. */
+  readonly rows = new Map<string, { documentId: string; title?: string; type?: string }>();
 
-  async get(): Promise<null> { return null; }
+  async get(documentId: string) { return (this.rows.get(documentId) ?? null) as never; }
 
   async appendRevision(input: AppendRevisionInput): Promise<AppendRevisionResult> {
     this.calls.push(input);
@@ -149,5 +151,53 @@ describe('the deck step', () => {
     const outcome = await handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'd' }, helpers());
     expect(outcome.status).toBe('failed');
     expect(outcome.error).toContain('IMAGE_BLOB_STORE=fs');
+  }, 30_000);
+});
+
+
+describe('a deck never writes into another kind of document', () => {
+  let store: FakeStore;
+  let restore: () => void;
+
+  beforeAll(() => { restore = hidePptxNodeDetection(); });
+  afterAll(() => restore());
+  beforeEach(() => { store = new FakeStore(); });
+
+  it('files a new presentation when the run’s documentId is the agenda page', async () => {
+    // What a four-kind loop leaves in the context: the agenda step's own page.
+    store.rows.set('doc-agenda-1', { documentId: 'doc-agenda-1', title: 'Fixture agenda — the loop', type: 'page' });
+    const spec = sampleDeck();
+    spec.slides[0]!.sources = [{ documentId: 'doc-agenda-1', title: 'Fixture agenda — the loop' }];
+
+    const handler = createDeckStepHandler({ store, newDocumentId: () => 'doc-presentation-new' });
+    const outcome = await handler.execute(
+      node({ type: 'deck', spec }),
+      { documentId: 'doc-agenda-1', requestedBy: 'dev-frank' },
+      helpers(),
+    );
+
+    expect(outcome.status).toBe('completed');
+    const output = outcome.output as Record<string, unknown>;
+    expect(output.documentId).toBe('doc-presentation-new');
+    expect(output.displacedDocument).toEqual({ documentId: 'doc-agenda-1', title: 'Fixture agenda — the loop', type: 'page' });
+    expect(output.citesDisplacedDocument).toBe(true);
+    expect(String((output.notices as string[])[0])).toContain('not a presentation');
+    // The page itself is untouched: the only write names the new document.
+    expect(store.calls).toHaveLength(1);
+    expect(store.calls[0]!.documentId).toBe('doc-presentation-new');
+  }, 30_000);
+
+  it('adds a revision to a real presentation, as before', async () => {
+    store.rows.set('doc-deck-1', { documentId: 'doc-deck-1', title: 'Sprint review', type: 'presentation' });
+    const handler = createDeckStepHandler({ store, newDocumentId: () => 'unused' });
+    const outcome = await handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'doc-deck-1' }, helpers());
+    expect((outcome.output as Record<string, unknown>).documentId).toBe('doc-deck-1');
+    expect((outcome.output as Record<string, unknown>).displacedDocument).toBeUndefined();
+  }, 30_000);
+
+  it('uses the id it was given when no row exists yet — the client made the page', async () => {
+    const handler = createDeckStepHandler({ store, newDocumentId: () => 'unused' });
+    const outcome = await handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'doc-fresh' }, helpers());
+    expect((outcome.output as Record<string, unknown>).documentId).toBe('doc-fresh');
   }, 30_000);
 });

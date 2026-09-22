@@ -99,6 +99,19 @@ describe('the agenda step', () => {
     expect(String(puts[0]!.agendaText)).toContain('Release risks');
   });
 
+  it('never writes into the document the run was already carrying', async () => {
+    // The mirror of the deck's guard: an agenda page is always its own new
+    // document, so it cannot land inside a presentation the run is building.
+    const { opts, puts } = deps();
+    const outcome = await createAgendaStepHandler(opts).execute(
+      node({ agenda: DRAFT }),
+      { ...context, documentId: 'doc-presentation-1' },
+      helpers,
+    );
+    expect((outcome.output as Record<string, unknown>).documentId).toBe('doc-agenda-1');
+    expect(puts[0]!.documentId).toBe('doc-agenda-1');
+  });
+
   it('fails rather than writing a page under the name of an agenda with nothing in it', async () => {
     const { opts, puts } = deps();
     const outcome = await createAgendaStepHandler(opts).execute(node({ agenda: { title: 'Empty', items: [] } as never }), context, helpers);

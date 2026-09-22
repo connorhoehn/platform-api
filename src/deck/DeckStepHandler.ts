@@ -15,6 +15,7 @@ import { renderAllSlideSvgs } from './renderSlideSvg';
 import { SOURCES_SLIDE_ID, SOURCES_SLIDE_TITLE } from './theme';
 import {
   getPresentationDocumentStore,
+  PRESENTATION_DOCUMENT_TYPE,
   type PresentationDocumentStore,
 } from './presentationDocuments';
 
@@ -121,10 +122,28 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
       }
       const spec = validation.spec;
 
-      const documentId = str(resolve(data.documentId, context))
+      const candidate = str(resolve(data.documentId, context))
         ?? str(data.documentId)
-        ?? firstOf(DOCUMENT_FALLBACK_PATHS, context)
-        ?? newDocumentId();
+        ?? firstOf(DOCUMENT_FALLBACK_PATHS, context);
+      // A loop run's context carries whatever the step before it produced —
+      // an agenda step leaves its own `documentId` there — and a deck rendered
+      // onto that id would file its revision inside somebody else's page. The
+      // deck writes into a presentation or into a new one, never into a
+      // document of another kind.
+      const notices: string[] = [];
+      let documentId = candidate ?? newDocumentId();
+      let displaced: { documentId: string; title: string; type: string } | undefined;
+      if (candidate) {
+        const existing = await store.get(candidate).catch(() => null);
+        const type = str(existing?.type);
+        if (existing && type !== PRESENTATION_DOCUMENT_TYPE) {
+          displaced = { documentId: candidate, title: str(existing.title) ?? candidate, type: type ?? 'unknown' };
+          documentId = newDocumentId();
+          notices.push(
+            `${displaced.title} is a ${displaced.type}, not a presentation, so the deck was filed as a new presentation instead of a revision of it.`,
+          );
+        }
+      }
       const requestedBy = firstOf(REQUESTER_FALLBACK_PATHS, context) ?? 'agent:deck';
       const transcriptIds = [...new Set([
         ...TRANSCRIPT_SOURCE_PATHS.map((path) => str(readPath(context, path))).filter((value): value is string => !!value),
@@ -173,6 +192,14 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
             slideCount: revision.slideCount,
             previewHandles,
             title,
+            ...(notices.length ? { notices } : {}),
+            ...(displaced
+              ? {
+                // Named, so the run says which document it did NOT write into.
+                displacedDocument: displaced,
+                citesDisplacedDocument: spec.slides.some((slide) => slide.sources.some((source) => source.documentId === displaced!.documentId)),
+              }
+              : {}),
             pptxSizeBytes: revision.asset.sizeBytes,
             slides: revision.slides.map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
             // What the run PRODUCED, declared on the step's own output: the run
