@@ -34,7 +34,7 @@ import { computeCost } from '../pipeline/llm-pricing';
 import type { PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { SERVICE_AUTH_HEADER, signEnvelope } from '@connorhoehn/service-runtime';
 import { CHAT_AGENT_LOOP_PIPELINE_ID, type LoopPlan } from '../chat/agentLoopPlanner';
-import { agentLoopNodeId, deckLoopNodeId, deckRenderTitle } from '../chat/agentLoopPlanner';
+import { loopStepNodes } from '../chat/agentLoopPlanner';
 import log from '../lib/logger';
 
 /**
@@ -120,6 +120,10 @@ export interface AgentLoopView {
   iterations: number;
   lab: { sessionId?: string; boxId?: string; runtime: string };
   steps: AgentLoopStepView[];
+  /** Why the run failed: the first node that did, in its own words. */
+  error?: string;
+  /** Which node that was, so a pane can point at the row. */
+  errorNodeId?: string;
   plan: { source: string; steps: Array<{ id: string; title: string; kind: string }>; notice?: string };
   artifacts: AgentLoopArtifact[];
   /** Why `artifacts` is empty, when the reason is not "there are none". */
@@ -154,6 +158,8 @@ export interface LoadedAgentLoop {
   runId: string;
   pipelineId: string;
   status: string;
+  /** The run row's own terminal error, when it recorded one. */
+  error?: string;
   context: Record<string, unknown>;
   steps: Record<string, { status?: string; output?: unknown; error?: string }>;
   startedAt?: string;
@@ -225,6 +231,7 @@ export function fromRunItem(item: PipelineRunItem): LoadedAgentLoop {
     steps,
     ...(item.startedAt ? { startedAt: item.startedAt } : {}),
     ...(item.completedAt ? { completedAt: item.completedAt } : {}),
+    ...(item.error ? { error: item.error } : {}),
     ...(costUsd !== undefined ? { costUsd } : {}),
   };
 }
@@ -283,6 +290,7 @@ async function loadOne(runId: string): Promise<LoadedAgentLoop | null> {
     ...(str(live.startedAt) || stored?.startedAt ? { startedAt: str(live.startedAt) || stored!.startedAt! } : {}),
     ...(str(live.completedAt) || stored?.completedAt ? { completedAt: str(live.completedAt) || stored!.completedAt! } : {}),
     ...(stored?.costUsd !== undefined ? { costUsd: stored.costUsd } : {}),
+    ...(str(live.error) || stored?.error ? { error: str(live.error) || stored!.error! } : {}),
     ...(executorRunId ? { executorRunId } : {}),
   };
 }
@@ -437,81 +445,79 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
   // is small enough to survive, and they are read from there whenever the
   // step's own output no longer carries them.
   const facts = obj(run.context.loopSteps);
+  const runError = str(run.error);
 
   const produced: AgentLoopProduced[] = [];
+  // The first node that failed is what the run failed of. Without it the
+  // run-level error was null while a node sat dead-lettered.
+  const failures: Array<{ nodeId: string; message: string }> = [];
 
-  const steps: AgentLoopStepView[] = plan.steps.flatMap((step) => {
-    const nodeId = agentLoopNodeId(step.id);
-    const execution = run.steps[nodeId] ?? {};
-    const rawOutput = obj(execution.output);
-    const fallback = obj(facts[nodeId]);
-    // A truncated output keeps none of its fields; prefer it only where it
-    // actually still has the value.
-    const output: Record<string, unknown> = { ...fallback, ...rawOutput };
-    if (rawOutput.truncated === true) Object.assign(output, fallback);
-    const stepIterations = num(output.iterations);
-    const stepContext = num(output.contextTokens);
-    iterations += stepIterations;
-    if (stepContext > contextTokens) contextTokens = stepContext;
-    if (str(output.stopReason) === 'budget') sawBudgetStop = true;
-    const view: AgentLoopStepView = {
-      id: step.id,
-      nodeId,
-      title: step.kind === 'deck' ? `Draft slides for ${step.title}`.slice(0, 120) : step.title,
-      kind: step.kind,
-      status: str(execution.status) || 'pending',
-      iterations: stepIterations,
-      contextTokens: stepContext,
-      tokensIn: num(output.tokensIn),
-      tokensOut: num(output.tokensOut),
-      ...(str(output.stopReason) ? { stopReason: str(output.stopReason) } : {}),
-      // A step that failed must say why on the pane, not just go red.
-      ...(str(execution.error) ? { error: str(execution.error) } : {}),
-      ...(output.skipped === true ? { skipped: true } : {}),
-    };
+  const steps: AgentLoopStepView[] = plan.steps.flatMap((step) =>
+    // EVERY node the step actually became, not just `agent:<id>`. A meeting
+    // step has no agent node at all, so mapping by plan id alone reported a
+    // failed `meeting:create:s2` as a pending `agent:s2` with no error.
+    loopStepNodes(step).map((node): AgentLoopStepView => {
+      const execution = run.steps[node.nodeId] ?? {};
+      const rawOutput = obj(execution.output);
+      const fallback = obj(facts[node.nodeId]);
+      // A truncated output keeps none of its fields; prefer it only where it
+      // actually still has the value.
+      const output: Record<string, unknown> = { ...fallback, ...rawOutput };
+      if (rawOutput.truncated === true) Object.assign(output, fallback);
 
-    // A deck step is TWO nodes. The draft is the agent row above; the render
-    // is its own row, because "the model did not answer with a spec" and "the
-    // renderer fell over" are different problems with different fixes.
-    if (step.kind !== 'deck') return [view];
+      const stepIterations = num(output.iterations);
+      const stepContext = num(output.contextTokens);
+      iterations += stepIterations;
+      if (stepContext > contextTokens) contextTokens = stepContext;
+      if (str(output.stopReason) === 'budget') sawBudgetStop = true;
 
-    const renderNodeId = deckLoopNodeId(step.id);
-    const render = run.steps[renderNodeId] ?? {};
-    const renderOutput = obj(render.output);
-    const documentId = str(renderOutput.documentId);
-    if (documentId) {
-      produced.push({
-        documentId,
-        title: str(renderOutput.title) || step.title,
-        ...(str(renderOutput.revisionId) ? { revisionId: str(renderOutput.revisionId) } : {}),
-        ...(num(renderOutput.slideCount) ? { slideCount: num(renderOutput.slideCount) } : {}),
-      });
-    }
-    const renderError = str(render.error);
-    const renderView: AgentLoopStepView = {
-      id: `${step.id}:render`,
-      nodeId: renderNodeId,
-      title: deckRenderTitle(step),
-      kind: 'deck',
-      status: str(render.status) || 'pending',
-      iterations: 0,
-      contextTokens: 0,
-      tokensIn: 0,
-      tokensOut: 0,
-      ...(renderError ? deckErrorFields(renderError) : {}),
-      ...(documentId
-        ? {
-            result: {
-              documentId,
-              ...(str(renderOutput.revisionId) ? { revisionId: str(renderOutput.revisionId) } : {}),
-              ...(num(renderOutput.slideCount) ? { slideCount: num(renderOutput.slideCount) } : {}),
-              ...(str(renderOutput.title) ? { title: str(renderOutput.title) } : {}),
-            },
-          }
-        : {}),
-    };
-    return [view, renderView];
-  });
+      // What the node made, whatever kind made it: a deck revision, an agenda
+      // page, a meeting room.
+      const documentId = str(output.documentId) || str(output.roomId);
+      if (documentId && node.role !== 'draft' && node.role !== 'only') {
+        produced.push({
+          documentId,
+          title: str(output.title) || step.title,
+          ...(str(output.revisionId) ? { revisionId: str(output.revisionId) } : {}),
+          ...(num(output.slideCount) ? { slideCount: num(output.slideCount) } : {}),
+        });
+      }
+
+      const rawError = str(execution.error);
+      if (rawError) failures.push({ nodeId: node.nodeId, message: rawError });
+
+      return {
+        // The plan step's id for its first node; the node's role after that,
+        // so a client can still tell which plan step a row belongs to.
+        id: node.role === 'only' || node.role === 'draft' || node.role === 'create' ? step.id : `${step.id}:${node.role}`,
+        nodeId: node.nodeId,
+        title: node.title,
+        kind: step.kind,
+        status: str(execution.status) || 'pending',
+        iterations: stepIterations,
+        contextTokens: stepContext,
+        tokensIn: num(output.tokensIn),
+        tokensOut: num(output.tokensOut),
+        ...(str(output.stopReason) ? { stopReason: str(output.stopReason) } : {}),
+        // A step that failed must say why on the pane, not just go red.
+        ...(rawError ? (node.nodeKind === 'agent' ? { error: rawError } : deckErrorFields(rawError)) : {}),
+        ...(output.skipped === true ? { skipped: true } : {}),
+        ...(documentId && node.role !== 'draft' && node.role !== 'only'
+          ? {
+              result: {
+                documentId,
+                ...(str(output.revisionId) ? { revisionId: str(output.revisionId) } : {}),
+                ...(num(output.slideCount) ? { slideCount: num(output.slideCount) } : {}),
+                ...(str(output.title) ? { title: str(output.title) } : {}),
+              },
+            }
+          : {}),
+      };
+    }),
+  );
+
+  // The first node that failed is what the run failed of.
+  const failure = failures[0];
 
   const elapsedMs = elapsedMsOf(run, now);
   const project = projectOf(run);
@@ -545,6 +551,10 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
     iterations,
     lab: labOf(run),
     steps,
+    // The run row's own error when it has one, else the first failed node's.
+    // A run whose node was dead-lettered used to report `error: null`.
+    ...(runError || failure ? { error: runError || failure!.message } : {}),
+    ...(failure ? { errorNodeId: failure.nodeId } : {}),
     plan: {
       source: plan.source,
       ...(plan.notice ? { notice: plan.notice } : {}),

@@ -64,7 +64,7 @@ async function call(app: express.Express, method: string, url: string, userId: s
 const PLAN = {
   source: 'planner',
   steps: [
-    { id: 's1', title: 'Book the meeting', kind: 'meeting', prompt: 'book', dependsOn: [], done: 'invite exists' },
+    { id: 's1', title: 'Gather the board work', kind: 'research', prompt: 'gather', dependsOn: [], done: 'notes exist' },
     { id: 's2', title: 'Build the deck', kind: 'deck', prompt: 'build', dependsOn: ['s1'], done: 'deck exists' },
   ],
 };
@@ -149,11 +149,11 @@ describe('GET /api/agent-loops/:runId', () => {
       runId: 'run-1', status: 'running', model: 'opus',
       contextBudgetTokens: 200_000, contextTokens: 42_000, iterations: 3,
       lab: { sessionId: 'sess-1', boxId: 'box-1', runtime: 'devbox' },
-      plan: { source: 'planner', steps: [{ id: 's1', title: 'Book the meeting', kind: 'meeting' }, { id: 's2', title: 'Build the deck', kind: 'deck' }] },
+      plan: { source: 'planner', steps: [{ id: 's1', title: 'Gather the board work', kind: 'research' }, { id: 's2', title: 'Build the deck', kind: 'deck' }] },
     });
     // s2 is a deck step, so it is a draft row and a render row.
     expect((res.body as { steps: unknown[] }).steps).toEqual([
-      { id: 's1', nodeId: 'agent:s1', title: 'Book the meeting', kind: 'meeting', status: 'completed', iterations: 3, contextTokens: 42_000, tokensIn: 40_000, tokensOut: 900, stopReason: 'complete' },
+      { id: 's1', nodeId: 'agent:s1', title: 'Gather the board work', kind: 'research', status: 'completed', iterations: 3, contextTokens: 42_000, tokensIn: 40_000, tokensOut: 900, stopReason: 'complete' },
       { id: 's2', nodeId: 'agent:s2', title: 'Draft slides for Build the deck', kind: 'deck', status: 'pending', iterations: 0, contextTokens: 0, tokensIn: 0, tokensOut: 0 },
       { id: 's2:render', nodeId: 'deck:s2', title: 'Render Build the deck (.pptx)', kind: 'deck', status: 'pending', iterations: 0, contextTokens: 0, tokensIn: 0, tokensOut: 0 },
     ]);
@@ -695,5 +695,87 @@ describe('a loop with a deck step', () => {
     const res = await call(buildApp(), 'get', '/api/agent-loops?day=2026-09-21&timezone=UTC', 'dev-frank');
     expect((res.body as { loops: Array<{ produced: unknown[] }> }).loops[0].produced)
       .toEqual([{ documentId: 'doc-9', title: 'Deck', revisionId: 'rev-1', slideCount: 8 }]);
+  });
+});
+
+describe('a loop whose steps are not all agent nodes', () => {
+  // The live defect: the executor ran agent:s1, meeting:create:s2, agent:s3,
+  // deck:s3, but the GET listed agent:s1, agent:s2, agent:s3, deck:s3 — so a
+  // dead-lettered meeting:create:s2 showed as a PENDING agent:s2 with no
+  // error, and the run-level error was null.
+  const fourKinds = {
+    source: 'planner',
+    steps: [
+      { id: 's1', title: 'Write the agenda', kind: 'agenda', prompt: 'a', dependsOn: [], done: 'x' },
+      { id: 's2', title: 'Book the platform sync', kind: 'meeting', prompt: 'm', dependsOn: ['s1'], done: 'x' },
+      { id: 's3', title: 'Build the review deck', kind: 'deck', prompt: 'd', dependsOn: ['s2'], done: 'x' },
+      { id: 's4', title: 'Chase the stragglers', kind: 'other', prompt: 'o', dependsOn: ['s3'], done: 'x' },
+    ],
+  };
+  const withNodes = (steps: Record<string, { status?: string; output?: unknown; error?: string }>, over: Partial<LoadedAgentLoop> = {}): LoadedAgentLoop =>
+    loadedRun({ context: { ...loadedRun().context, plan: fourKinds }, steps, ...over });
+
+  it('lists the real node ids the definition generated, not agent:<planId>', async () => {
+    run = withNodes({});
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect((res.body as { steps: Array<{ nodeId: string }> }).steps.map((s) => s.nodeId)).toEqual([
+      'agent:s1', 'agenda:write:s1', 'meeting:create:s2', 'agent:s3', 'deck:s3', 'agent:s4',
+    ]);
+  });
+
+  it('shows a failed capability node as failed, with its error', async () => {
+    run = withNodes({
+      'agent:s1': { status: 'completed' },
+      'agenda:write:s1': { status: 'completed', output: { documentId: 'doc-1', title: 'Agenda' } },
+      'meeting:create:s2': { status: 'failed', error: 'meeting: no team named "platform"' },
+    }, { status: 'failed' });
+
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    const body = res.body as { steps: Array<Record<string, unknown>>; error?: string; errorNodeId?: string };
+    const meeting = body.steps.find((s) => s.nodeId === 'meeting:create:s2')!;
+    expect(meeting).toMatchObject({ status: 'failed', kind: 'meeting', error: 'meeting: no team named "platform"' });
+    // And the run says what it failed of, instead of a null error.
+    expect(body.error).toBe('meeting: no team named "platform"');
+    expect(body.errorNodeId).toBe('meeting:create:s2');
+  });
+
+  it('prefers the run row\'s own error when it recorded one', async () => {
+    run = withNodes(
+      { 'meeting:create:s2': { status: 'failed', error: 'meeting: no team named "platform"' } },
+      { status: 'failed', error: 'run failed at agent:s3' },
+    );
+    const body = (await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank')).body as { error: string; errorNodeId: string };
+    expect(body.error).toBe('run failed at agent:s3');
+    expect(body.errorNodeId).toBe('meeting:create:s2');
+  });
+
+  it('reports no error at all for a run where nothing failed', async () => {
+    run = withNodes({ 'agent:s1': { status: 'completed' }, 'meeting:create:s2': { status: 'completed' } });
+    const body = (await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank')).body as Record<string, unknown>;
+    expect(body).not.toHaveProperty('error');
+    expect(body).not.toHaveProperty('errorNodeId');
+  });
+
+  it('collects what each capability node produced, whatever kind made it', async () => {
+    run = withNodes({
+      'agenda:write:s1': { status: 'completed', output: { documentId: 'doc-1', title: 'Agenda' } },
+      'meeting:create:s2': { status: 'completed', output: { roomId: 'room-7', title: 'Platform sync' } },
+      'deck:s3': { status: 'completed', output: { documentId: 'doc-9', revisionId: 'rev-1', slideCount: 10, title: 'Review' } },
+    });
+    const body = (await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank')).body as { produced: Array<Record<string, unknown>> };
+    expect(body.produced).toEqual([
+      { documentId: 'doc-1', title: 'Agenda' },
+      { documentId: 'room-7', title: 'Platform sync' },
+      { documentId: 'doc-9', title: 'Review', revisionId: 'rev-1', slideCount: 10 },
+    ]);
+  });
+
+  it('keeps the drafting agent rows distinct from the nodes that act', async () => {
+    run = withNodes({ 'agent:s1': { status: 'running' } });
+    const steps = ((await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank')).body as { steps: Array<Record<string, unknown>> }).steps;
+    expect(steps.slice(0, 2).map((s) => [s.id, s.title])).toEqual([
+      ['s1', 'Draft the agenda for Write the agenda'],
+      ['s1:write', 'Write Write the agenda as a page'],
+    ]);
   });
 });

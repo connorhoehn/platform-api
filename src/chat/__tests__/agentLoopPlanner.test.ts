@@ -6,7 +6,7 @@ import {
   agentLoopNodeId, buildAgentLoopDefinition, buildAgentLoopRequest, extractJsonObject,
   PLANNER_MAX_TURNS, PLANNER_TIMEOUT_MS,
   fallbackPlan, parseAgentLoopCommand, planAgentLoop, plannerPrompt, plannerStopNotice,
-  isSilentCliFailure, validateLoopPlan, wantsDeckFixture,
+  isSilentCliFailure, loopStepNodes, validateLoopPlan, wantsDeckFixture,
   type AgentLoopRequest, type LoopPlan, type LoopStep,
 } from '../agentLoopPlanner';
 import type { AgentClient, AgentEvent, AgentStopReason } from '../../pipeline/agent/types';
@@ -537,5 +537,56 @@ describe('lastStderrLines', () => {
 
   it('is empty for empty stderr, so the caller can say "(no stderr)" honestly', () => {
     expect([lastStderrLines(''), lastStderrLines('  \n \n ')]).toEqual(['', '']);
+  });
+});
+
+describe('loopStepNodes agrees with what the builder actually emits', () => {
+  const allKinds: LoopPlan = {
+    source: 'planner',
+    steps: [
+      { id: 's1', title: 'Write the agenda', kind: 'agenda', prompt: 'a', dependsOn: [], done: 'agenda exists' },
+      { id: 's2', title: 'Book the platform sync', kind: 'meeting', prompt: 'm', dependsOn: ['s1'], done: 'room exists' },
+      { id: 's3', title: 'Build the review deck', kind: 'deck', prompt: 'd', dependsOn: ['s2'], done: 'deck exists' },
+      { id: 's4', title: 'Chase the stragglers', kind: 'other', prompt: 'o', dependsOn: ['s3'], done: 'chased' },
+    ],
+  };
+
+  // THE DRIFT GUARD. The route enumerates a loop's rows through
+  // loopStepNodes; if the builder ever expands a kind differently, this fails
+  // here rather than as a step that silently reads `pending` in the UI.
+  it('enumerates exactly the node ids the definition contains, in order', () => {
+    const def = buildAgentLoopDefinition(allKinds, request());
+    const built = (def.nodes as Array<{ id: string }>).map((n) => n.id).filter((id) => id !== 'trigger');
+    const enumerated = allKinds.steps.flatMap((step) => loopStepNodes(step).map((n) => n.nodeId));
+    expect(enumerated).toEqual(built);
+  });
+
+  it('gives each node the title the definition gave it', () => {
+    const def = buildAgentLoopDefinition(allKinds, request());
+    const labels = new Map((def.nodes as Array<{ id: string; data: { label?: string } }>).map((n) => [n.id, n.data.label]));
+    for (const step of allKinds.steps) {
+      for (const node of loopStepNodes(step)) {
+        expect({ id: node.nodeId, title: node.title }).toEqual({ id: node.nodeId, title: labels.get(node.nodeId) });
+      }
+    }
+  });
+
+  it('knows a meeting step has no drafting agent at all', () => {
+    expect(loopStepNodes(allKinds.steps[1])).toEqual([
+      { nodeId: 'meeting:create:s2', title: 'Book the platform sync', nodeKind: 'meeting:create', role: 'create' },
+    ]);
+  });
+
+  it('pairs a draft with the node that does the thing, for agenda and deck', () => {
+    expect(loopStepNodes(allKinds.steps[0]).map((n) => [n.nodeId, n.role]))
+      .toEqual([['agent:s1', 'draft'], ['agenda:write:s1', 'write']]);
+    expect(loopStepNodes(allKinds.steps[2]).map((n) => [n.nodeId, n.role]))
+      .toEqual([['agent:s3', 'draft'], ['deck:s3', 'render']]);
+  });
+
+  it('leaves an ordinary step as one agent node', () => {
+    expect(loopStepNodes(allKinds.steps[3])).toEqual([
+      { nodeId: 'agent:s4', title: 'Chase the stragglers', nodeKind: 'agent', role: 'only' },
+    ]);
   });
 });
