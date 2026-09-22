@@ -812,6 +812,16 @@ export class RunPersistenceService {
     // That row still knows what was asked for and where, and replaying it as
     // an unnamed, unanchored "Pipeline run" throws both away.
     const stored = workGraphPlanFromStoredRun(item, await this.definitionName(item.pipelineId));
+    // A replay at the SAME instant is exactly idempotent — same event key, and
+    // never newer — so it can only ever re-assert what the projection already
+    // has. That is right for an outage replay and useless for a repair: a run
+    // projected before its name was known would keep 'Pipeline run' for ever.
+    // One millisecond later is a real second observation of the stored row,
+    // and stays inside the run's own day, which decides its partition.
+    const observed = item.lastEventAt ?? item.completedAt ?? item.startedAt;
+    const occurredAt = stored.instruction
+      ? new Date(Date.parse(observed) + 1).toISOString()
+      : observed;
     await this.publishWorkGraphLifecycle({
       ...(stored.workGraph ? { workGraph: stored.workGraph } : {}),
       ...(stored.instruction ? { instruction: stored.instruction } : {}),
@@ -825,8 +835,8 @@ export class RunPersistenceService {
       completedAt: item.completedAt,
       steps: item.stepsSummary ?? {},
       tokenUsage: {}, estimatedCostUsd: 0, replayCredits: {}, stepModelMap: {},
-      stepInputMap: {}, stepAttempts: {}, stepLifecycle: {}, stepLifecycleAt: {}, lastEventAt: item.lastEventAt ?? item.completedAt ?? item.startedAt,
-    }, item.lastEventAt ?? item.completedAt ?? item.startedAt);
+      stepInputMap: {}, stepAttempts: {}, stepLifecycle: {}, stepLifecycleAt: {}, lastEventAt: observed,
+    }, occurredAt);
   }
 
   /**
@@ -1241,7 +1251,14 @@ export class RunPersistenceService {
   ): Promise<void> {
     if (!state.organizationId || state.triggeredBy === 'system') return;
     const planned = state.workGraph?.steps.find((step) => step.stepId === stepId);
-    if (!planned) return;
+    if (!planned) {
+      // Silent here once cost a full debugging cycle: every run projected as
+      // one opaque node and nothing anywhere said why.
+      log.warn({
+        runId: state.runId, stepId, planned: state.workGraph?.steps.map((step) => step.stepId) ?? null,
+      }, 'work graph step is not in the run plan');
+      return;
+    }
     const result = await platformWorkGraphSourcePublisher.pipeline({
       kind: 'pipeline-step',
       run: {
@@ -1330,6 +1347,13 @@ export class RunPersistenceService {
    * what it has.
    */
   private async announceWorkGraphRun(state: RunState, occurredAt: string): Promise<void> {
+    log.info({
+      runId: state.runId,
+      steps: state.workGraph?.steps.length ?? 0,
+      conversationId: state.workGraph?.conversationId ?? null,
+      title: runTitle(state) ?? null,
+      organizationId: state.organizationId ?? null,
+    }, 'work graph run announced');
     await this.publishWorkGraphLifecycle(state, occurredAt)
       .catch((err) => log.warn({ runId: state.runId, err: String(err) }, 'run projection failed'));
     await this.publishWorkGraphStepPlan(state, occurredAt);

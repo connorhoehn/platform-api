@@ -9,6 +9,11 @@ const mockPostCard = jest.fn().mockResolvedValue(true);
 jest.mock('../../pipeline/runPersistence', () => ({
   getRunPersistenceService: () => ({ registerTrigger: mockRegisterTrigger }),
 }));
+// The source-account join is a DDB write; the registry only has to CALL it.
+const mockEnsurePrincipal = jest.fn().mockResolvedValue(true);
+jest.mock('../../repositories', () => ({
+  workSourceAccountRepo: { ensureVerifiedPrincipal: (...args: unknown[]) => mockEnsurePrincipal(...args) },
+}));
 jest.mock('../../documents/chatRunCard', () => ({
   postRunCardToChannel: (...args: unknown[]) => mockPostCard(...args),
   str: (v: unknown) => (typeof v === 'string' && v ? v : undefined),
@@ -207,5 +212,92 @@ describe('the result convention', () => {
     } as unknown as PipelineRunItem;
     expect((runItemToSnapshot(item) as Record<string, unknown>).result).toEqual(SEARCH_RESULT);
     expect((runItemToSnapshot({ ...item, checkpoint: undefined }) as Record<string, unknown>).result).toBeUndefined();
+  });
+});
+
+// The /agent loop answers its POST before the run exists, plans in the
+// background, then RE-ENTERS `runChatCommand` with the plan in `extra`. That
+// second pass is the only one that builds the real definition, so everything
+// the work graph is told about the run is decided there.
+describe('the work-graph plan on the async-planning re-entry', () => {
+  const planned: ChatCommandPipeline = {
+    trigger: '/agent',
+    pipelineId: 'chat-agent-loop',
+    description: 'plan an instruction into agent steps',
+    buildDefinition: () => ({
+      id: 'chat-agent-loop',
+      name: 'Agent loop',
+      nodes: [
+        { id: 'trigger', type: 'trigger', position: { x: 0, y: 0 }, data: { type: 'trigger', label: '/agent command' } },
+        { id: 'agent:s1', type: 'agent', position: { x: 1, y: 0 }, data: { type: 'agent', label: 'Draft the agenda', retryPolicy: { maxAttempts: 2, backoffMs: 5000 } } },
+        { id: 'agent:s2', type: 'agent', position: { x: 2, y: 0 }, data: { type: 'agent', label: 'Build the deck', retryPolicy: { maxAttempts: 2, backoffMs: 5000 } } },
+        { id: 'deck:s2', type: 'deck', position: { x: 3, y: 0 }, data: { type: 'deck', label: 'Render the deck', retryPolicy: { maxAttempts: 2, backoffMs: 5000 } } },
+      ],
+      edges: [
+        { id: 'e1', source: 'trigger', target: 'agent:s1' },
+        { id: 'e2', source: 'agent:s1', target: 'agent:s2' },
+        { id: 'e3', source: 'agent:s2', target: 'deck:s2' },
+      ],
+    }),
+    triggerPayload: () => ({ instruction: 'create a meeting with the X team' }),
+  };
+
+  const input = (): ChatCommandRunInput => ({
+    trigger: '/agent', channel: 'chat:c:general', text: '/agent create a meeting with the X team',
+    argumentText: 'create a meeting with the X team',
+    requestedBy: 'dev-frank', requestedByName: 'Frank', organizationId: 'dev-org',
+    extra: { agentLoop: { plan: { source: 'planner', steps: [] } } },
+  });
+
+  beforeEach(() => {
+    clearChatCommandPipelines();
+    mockRegisterTrigger.mockClear();
+    registerChatCommandPipeline(planned);
+  });
+
+  /**
+   * The engine NORMALISES the definition it is handed — this stands in for
+   * that. Reading the plan after the trigger returned a pipeline name with no
+   * steps at all, and every run then projected as one opaque node.
+   */
+  const normalisingBridge = (): PipelineBridge => ({
+    trigger: (args: { definition?: Record<string, unknown> }) => {
+      for (const node of (args.definition?.nodes ?? []) as Array<Record<string, unknown>>) {
+        node.data = { type: (node.data as Record<string, unknown>)?.type };
+      }
+      return { runId: 'executor-run-1' };
+    },
+  } as unknown as PipelineBridge);
+
+  it('registers every planned step even though the bridge rewrites the definition', async () => {
+    setPipelineBridge(normalisingBridge());
+    await runChatCommand(input());
+    expect(mockRegisterTrigger).toHaveBeenCalledTimes(1);
+    const args = mockRegisterTrigger.mock.calls[0][0] as {
+      runId: string; organizationId?: string; workGraph?: { title?: string; conversationId?: string; steps: Array<{ stepId: string; title: string; dependsOn: string[] }> };
+    };
+    expect(args.runId).toBe('executor-run-1');
+    expect(args.organizationId).toBe('dev-org');
+    expect(args.workGraph?.title).toBe('Agent loop');
+    expect(args.workGraph?.conversationId).toBe('chat:c:general');
+    expect(args.workGraph?.steps).toEqual([
+      { stepId: 'agent:s1', title: 'Draft the agenda', dependsOn: [] },
+      { stepId: 'agent:s2', title: 'Build the deck', dependsOn: ['agent:s1'] },
+      { stepId: 'deck:s2', title: 'Render the deck', dependsOn: ['agent:s2'] },
+    ]);
+  });
+
+  it('joins the pipeline source account before the run can publish anything', async () => {
+    setPipelineBridge(normalisingBridge());
+    await runChatCommand(input());
+    expect(mockEnsurePrincipal).toHaveBeenCalledWith({
+      source: 'pipeline', organizationId: 'dev-org', subject: 'dev-frank',
+    });
+  });
+
+  it('carries the verified organization, without which nothing is projected', async () => {
+    setPipelineBridge(normalisingBridge());
+    await runChatCommand({ ...input(), organizationId: undefined });
+    expect((mockRegisterTrigger.mock.calls[0][0] as { organizationId?: string }).organizationId).toBeUndefined();
   });
 });

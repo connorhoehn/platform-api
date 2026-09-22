@@ -283,6 +283,15 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
   if (payload.chatChannel === undefined) payload.chatChannel = input.channel;
   payload.clientPostsCard = input.clientPostsCard === true;
 
+  // Read BEFORE the bridge is handed the definition. The engine normalises
+  // what it is given — a definition that comes back out of `trigger` has had
+  // its node `data` rewritten — and reading the plan afterwards yielded a
+  // pipeline name with no steps at all, so every run projected as one opaque
+  // node. The graph shows this run as the steps the definition declares,
+  // hanging off the conversation the command was typed in; a planner that fell
+  // back to a single step therefore yields a single node, honestly.
+  const workGraph = workGraphPlanFromDefinition(definition, input.channel);
+
   const out = await Promise.resolve(bridge.trigger({
     pipelineId: def.pipelineId,
     definition: definition as never,
@@ -290,10 +299,6 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
     triggeredBy: { userId: input.requestedBy },
   } as never));
   const runId = (out as { runId: string }).runId;
-  // The graph shows this run as the steps the definition actually declares,
-  // hanging off the conversation the command was typed in. A planner that fell
-  // back to a single step therefore yields a single node — honestly.
-  const workGraph = workGraphPlanFromDefinition(definition, input.channel);
   getRunPersistenceService()?.registerTrigger({
     runId,
     pipelineId: def.pipelineId,
