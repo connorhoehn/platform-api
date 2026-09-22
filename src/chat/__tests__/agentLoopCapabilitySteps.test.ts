@@ -86,9 +86,14 @@ describe('the fixture loop runs every kind with no model', () => {
     expect(nodes.find((candidate) => candidate.id === deckLoopNodeId('s3'))!.data.spec).toBeDefined();
   });
 
-  it('pins nothing on the meeting node, which needs no model either way', () => {
+  it('pins the meeting’s inputs, so nothing about it depends on reading a sentence', () => {
     const node = nodes.find((candidate) => candidate.id === meetingLoopNodeId('s1'))!;
-    expect(node.data.agenda).toBeUndefined();
+    expect(node.data).toMatchObject({ proposeInMinutes: 24 * 60 });
     expect(node.data.spec).toBeUndefined();
+  });
+
+  it('pins the team the instruction names, when it names one', () => {
+    const nodesWithTeam = nodesOf(buildAgentLoopDefinition(plan, request('[deck-fixture] create a meeting with the platform team and a ppt')));
+    expect(nodesWithTeam.find((candidate) => candidate.id === meetingLoopNodeId('s1'))!.data.team).toBe('platform');
   });
 });

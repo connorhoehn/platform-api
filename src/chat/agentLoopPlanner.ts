@@ -22,7 +22,7 @@
 
 import type { AgentClient, AgentStopReason } from '../pipeline/agent/types';
 import { DECK_STEP_KIND } from '../deck/DeckStepHandler';
-import { MEETING_STEP_KIND } from '../loop/meetingStepHandler';
+import { MEETING_STEP_KIND, teamNameFrom } from '../loop/meetingStepHandler';
 import { AGENDA_STEP_KIND, type Agenda } from '../loop/agendaStepHandler';
 import { isSilentClaudeFailure } from '../pipeline/claudeCliErrors';
 import type { DeckSpec } from '../deck/DeckSpec';
@@ -558,6 +558,12 @@ export function agendaDraftPrompt(step: LoopStep, request: AgentLoopRequest): st
   ].join('\n');
 }
 
+/** What the fixture loop pins on a meeting node: the team it names, and a fixed proposal. */
+export function meetingFixture(request: AgentLoopRequest): { team?: string; proposeInMinutes: number } {
+  const team = teamNameFrom(request.instruction);
+  return { ...(team ? { team } : {}), proposeInMinutes: 24 * 60 };
+}
+
 /** A small, valid agenda, so the local loop completes this kind with no model. */
 export function agendaFixture(step: LoopStep, request: AgentLoopRequest): Agenda {
   const topic = request.instruction.replace(DECK_FIXTURE_MARKER, '').trim().slice(0, 80) || step.title;
@@ -626,6 +632,47 @@ export function deckDraftPrompt(step: LoopStep, request: AgentLoopRequest): stri
     `Build the deck for this step: ${step.prompt}`,
     `Acceptance: ${step.done}`,
   ].join('\n');
+}
+
+/**
+ * The NODES one plan step becomes — the single source of truth for the
+ * expansion, so a reader of the run does not have to re-derive it.
+ *
+ * WHY THIS EXISTS: `GET /api/agent-loops/:runId` used to map a plan step to
+ * `agent:<id>` and stop there. A `meeting` step has no agent node at all, so
+ * a failed `meeting:create:s2` was reported as `agent:s2`, `pending`, with no
+ * error and no run-level error either — the one step that had actually broken
+ * was the one the pane said had not started. Everything that enumerates a
+ * loop's steps now goes through here, and a test asserts this agrees with
+ * what `buildAgentLoopDefinition` really emitted.
+ */
+export interface LoopStepNode {
+  nodeId: string;
+  title: string;
+  /** 'agent' for a drafting/working node, else the capability's own kind. */
+  nodeKind: string;
+  /** What this node does within the step: the only node, a draft, or the act. */
+  role: 'only' | 'draft' | 'render' | 'write' | 'create';
+}
+
+export function loopStepNodes(step: LoopStep): LoopStepNode[] {
+  switch (step.kind) {
+    case 'deck':
+      return [
+        { nodeId: agentLoopNodeId(step.id), title: deckDraftTitle(step), nodeKind: 'agent', role: 'draft' },
+        { nodeId: deckLoopNodeId(step.id), title: deckRenderTitle(step), nodeKind: DECK_STEP_KIND, role: 'render' },
+      ];
+    case 'agenda':
+      return [
+        { nodeId: agentLoopNodeId(step.id), title: agendaDraftTitle(step), nodeKind: 'agent', role: 'draft' },
+        { nodeId: agendaLoopNodeId(step.id), title: agendaWriteTitle(step), nodeKind: AGENDA_STEP_KIND, role: 'write' },
+      ];
+    case 'meeting':
+      // No drafting agent: there is nothing for a model to write.
+      return [{ nodeId: meetingLoopNodeId(step.id), title: step.title, nodeKind: MEETING_STEP_KIND, role: 'create' }];
+    default:
+      return [{ nodeId: agentLoopNodeId(step.id), title: step.title, nodeKind: 'agent', role: 'only' }];
+  }
 }
 
 /** The prompt a node runs: the step, then the sentence that ends the loop. */
@@ -732,6 +779,11 @@ export function buildAgentLoopDefinition(plan: LoopPlan, request: AgentLoopReque
           title: step.title,
           loop: { kind: step.kind, stepId: step.id, ...(step.dependsOn.length ? { dependsOn: step.dependsOn } : {}) },
           retryPolicy: LOOP_STEP_RETRY,
+          // The fixture path pins what the sentence would otherwise have to be
+          // read for: the team, and a fixed proposal. The room it creates is
+          // still real — that is the capability being exercised — but nothing
+          // about it depends on a model.
+          ...(fixture ? meetingFixture(request) : {}),
         },
       });
       continue;

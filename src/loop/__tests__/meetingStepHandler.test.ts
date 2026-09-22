@@ -3,7 +3,7 @@ jest.mock('../../lib/aws-clients', () => ({ docClient: { send: jest.fn() }, ddbC
 jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `test-${name}` }));
 
 import type { PipelineNode, StepHandlerHelpers } from 'distributed-core/applications/pipeline';
-import { createMeetingStepHandler, meetingSlug, proposedStart, teamNameFrom } from '../meetingStepHandler';
+import { createMeetingStepHandler, meetingSlug, proposedStart, resolveOrganization, teamNameFrom } from '../meetingStepHandler';
 
 const helpers = { runId: 'run-9', stepId: 'meeting', emit: async () => undefined } as unknown as StepHandlerHelpers;
 const node = (data: Record<string, unknown> = {}): PipelineNode => ({
@@ -38,6 +38,7 @@ function deps(over: Record<string, unknown> = {}) {
           { teamId: 'team-platform', userId: 'dev-frank', role: 'member' },
         ],
       },
+      profiles: { searchProfiles: async () => [] },
       now: () => new Date('2026-09-22T09:12:00.000Z'),
       ...over,
     } as never,
@@ -89,14 +90,15 @@ describe('the meeting step', () => {
     ]);
   });
 
-  it('leaves the attendees empty, with a notice, when the directory has no such team', async () => {
+  it('leaves the attendees empty, with a notice, when the directory has no such team or person', async () => {
     const { opts, added } = deps({
       teams: { getTeamBySlug: async () => null, listTeamsForUser: async () => [], listMembers: async () => [] },
+      profiles: { searchProfiles: async () => [] },
     });
     const outcome = await createMeetingStepHandler(opts).execute(node(), { ...context, instruction: 'a meeting with the marketing team' }, helpers);
     const output = outcome.output as Record<string, unknown>;
     expect(output.attendees).toEqual([]);
-    expect((output.notices as string[])[0]).toContain('No team named "marketing"');
+    expect((output.notices as string[])[0]).toContain('No team or person named "marketing"');
     expect(added.map((entry) => entry.userId)).toEqual(['dev-connor']);
   });
 
@@ -106,11 +108,37 @@ describe('the meeting step', () => {
     expect(((outcome.output as Record<string, unknown>).notices as string[])[0]).toContain('named no team');
   });
 
-  it('refuses to make a room outside an organization', async () => {
+  it('refuses to make a room when nothing names an organization', async () => {
     const { opts } = deps();
     const outcome = await createMeetingStepHandler(opts).execute(node(), { requestedBy: 'dev-connor' }, helpers);
     expect(outcome.status).toBe('failed');
-    expect(outcome.error).toContain('organizationId');
+    expect(outcome.error).toContain('no organization');
+  });
+
+  it('uses the deployment’s configured organization when the run named none, and says so', async () => {
+    const original = process.env.WORK_GRAPH_ORG;
+    process.env.WORK_GRAPH_ORG = 'dev-org';
+    try {
+      const { opts, created } = deps();
+      const outcome = await createMeetingStepHandler(opts).execute(node({ title: 'Platform sync' }), { requestedBy: 'dev-connor', instruction: 'with the platform team' }, helpers);
+      expect(outcome.status).toBe('completed');
+      expect(created[0]).toMatchObject({ orgId: 'dev-org' });
+      expect((outcome.output as Record<string, unknown>).notices).toContain('The run named no organization, so the room was made in dev-org.');
+    } finally {
+      if (original === undefined) delete process.env.WORK_GRAPH_ORG; else process.env.WORK_GRAPH_ORG = original;
+    }
+  });
+
+  it('adds the person of that name when the directory has no such team', async () => {
+    const { opts, added } = deps({
+      teams: { getTeamBySlug: async () => null, listTeamsForUser: async () => [], listMembers: async () => [] },
+      profiles: { searchProfiles: async () => [{ userId: 'dev-frank', displayName: 'Frank' }] },
+    });
+    const outcome = await createMeetingStepHandler(opts).execute(node(), { ...context, instruction: 'a meeting with the Frank team' }, helpers);
+    const output = outcome.output as Record<string, unknown>;
+    expect(output.attendees).toEqual(['dev-frank']);
+    expect((output.notices as string[])[0]).toContain('No team named "Frank"');
+    expect(added.map((entry) => entry.userId)).toEqual(['dev-frank', 'dev-connor']);
   });
 
   it('finds the team by name when the slug misses', async () => {
@@ -140,5 +168,33 @@ describe('reading the instruction', () => {
 
   it('proposes a whole hour', () => {
     expect(proposedStart(new Date('2026-09-22T09:12:00.000Z'), 60)).toBe('2026-09-22T10:00:00.000Z');
+  });
+});
+
+
+describe('resolveOrganization', () => {
+  const original = { org: process.env.WORK_GRAPH_ORG, skip: process.env.SKIP_AUTH };
+  afterEach(() => {
+    if (original.org === undefined) delete process.env.WORK_GRAPH_ORG; else process.env.WORK_GRAPH_ORG = original.org;
+    if (original.skip === undefined) delete process.env.SKIP_AUTH; else process.env.SKIP_AUTH = original.skip;
+  });
+
+  it('takes what the run declared, without a notice', () => {
+    expect(resolveOrganization({ organizationId: 'org-1' })).toEqual({ organizationId: 'org-1' });
+  });
+
+  it('falls back to the deployment’s org, and to local dev, saying which', () => {
+    delete process.env.WORK_GRAPH_ORG;
+    process.env.SKIP_AUTH = 'true';
+    expect(resolveOrganization({})).toEqual({
+      organizationId: 'default-org',
+      notice: 'The run named no organization, so the room was made in default-org.',
+    });
+  });
+
+  it('answers with nothing when neither the run nor the deployment says', () => {
+    delete process.env.WORK_GRAPH_ORG;
+    delete process.env.SKIP_AUTH;
+    expect(resolveOrganization({})).toEqual({});
   });
 });

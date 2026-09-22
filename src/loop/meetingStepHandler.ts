@@ -17,7 +17,7 @@
 
 import type { PipelineNode, StepHandlerHelpers, StepOutcome } from 'distributed-core/applications/pipeline';
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
-import { hangoutRoomRepo, hangoutRoomMemberRepo, teamRepo } from '../repositories';
+import { hangoutRoomRepo, hangoutRoomMemberRepo, profileRepo, teamRepo } from '../repositories';
 import { readPath } from '../pipeline/image/ScatterStepHandler';
 import log from '../lib/logger';
 
@@ -45,6 +45,28 @@ const ORG_PATHS = ['$.organizationId', '$.orgId', '$.trigger.organizationId'];
 const REQUESTER_PATHS = ['$.requestedBy', '$.trigger.requestedBy'];
 const DEFAULT_PROPOSAL_MINUTES = 24 * 60;
 const MAX_ATTENDEES = 50;
+/** The org a local deployment puts everything in — the same default the rooms route uses. */
+const DEV_ORG_ID = 'default-org';
+
+/**
+ * The organization a room will belong to.
+ *
+ * A chat command carries one; a run started another way may not, and a loop's
+ * first version carried none at all — which failed the step outright with
+ * "no organizationId" and dead-lettered the run. Local development has a
+ * standing answer (the same `default-org` the rooms route falls back to), and
+ * taking it is said out loud rather than assumed silently.
+ */
+export function resolveOrganization(context: Record<string, unknown>): { organizationId?: string; notice?: string } {
+  const declared = firstOf(ORG_PATHS, context);
+  if (declared) return { organizationId: declared };
+  const configured = str(process.env.WORK_GRAPH_ORG) ?? str(process.env.DEFAULT_ORG_ID);
+  if (configured) return { organizationId: configured, notice: `The run named no organization, so the room was made in ${configured}.` };
+  if (process.env.SKIP_AUTH === 'true') {
+    return { organizationId: DEV_ORG_ID, notice: `The run named no organization, so the room was made in ${DEV_ORG_ID}.` };
+  }
+  return {};
+}
 
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
@@ -92,6 +114,7 @@ export interface MeetingStepHandlerOpts {
   rooms?: Pick<typeof hangoutRoomRepo, 'createRoom'>;
   members?: Pick<typeof hangoutRoomMemberRepo, 'addMember'>;
   teams?: Pick<typeof teamRepo, 'listTeamsForUser' | 'getTeamBySlug' | 'listMembers'>;
+  profiles?: Pick<typeof profileRepo, 'searchProfiles'>;
   now?: () => Date;
 }
 
@@ -116,6 +139,7 @@ export function createMeetingStepHandler(opts: MeetingStepHandlerOpts = {}): Des
   const rooms = opts.rooms ?? hangoutRoomRepo;
   const members = opts.members ?? hangoutRoomMemberRepo;
   const teams = opts.teams ?? teamRepo;
+  const profiles = opts.profiles ?? profileRepo;
   const now = opts.now ?? (() => new Date());
 
   return {
@@ -128,16 +152,21 @@ export function createMeetingStepHandler(opts: MeetingStepHandlerOpts = {}): Des
     async execute(node: PipelineNode, context: Record<string, unknown>, helpers: StepHandlerHelpers): Promise<StepOutcome> {
       const data = (node.data ?? {}) as unknown as MeetingNodeData;
       const requestedBy = firstOf(REQUESTER_PATHS, context) ?? 'agent:loop';
-      const organizationId = firstOf(ORG_PATHS, context);
+      const organization = resolveOrganization(context);
       const source = str(data.title) ?? str(data.label) ?? firstOf(TITLE_PATHS, context) ?? 'Meeting';
       const title = source.slice(0, 120);
       const teamName = str(data.team) ?? firstOf(TEAM_PATHS, context) ?? teamNameFrom(source) ?? teamNameFrom(firstOf(TITLE_PATHS, context));
       const startsAt = proposedStart(now(), data.proposeInMinutes ?? DEFAULT_PROPOSAL_MINUTES);
       const notices: string[] = [];
 
-      if (!organizationId) {
-        return { status: 'failed', error: 'meeting: the run has no organizationId, and a room belongs to an organization' };
+      if (!organization.organizationId) {
+        return {
+          status: 'failed',
+          error: 'meeting: no organization — the run declared none and this deployment configures no default (WORK_GRAPH_ORG)',
+        };
       }
+      const organizationId = organization.organizationId;
+      if (organization.notice) notices.push(organization.notice);
 
       // ── The directory ────────────────────────────────────────────────────
       let attendees: MeetingAttendee[] = [];
@@ -145,7 +174,17 @@ export function createMeetingStepHandler(opts: MeetingStepHandlerOpts = {}): Des
       if (teamName) {
         team = await resolveTeam(teams, organizationId, requestedBy, teamName);
         if (!team) {
-          notices.push(`No team named "${teamName}" in the directory, so nobody was added.`);
+          // No such team. The name may still be a person's — "a meeting with
+          // Frank" — so the directory is asked once, and whatever it says is
+          // reported rather than left to look like a full invitation.
+          const people = await profiles.searchProfiles(teamName, 5).catch(() => []);
+          const matched = people.filter((profile) => profile.displayName?.trim().toLowerCase() === teamName.toLowerCase());
+          if (matched.length) {
+            attendees = matched.map((profile) => ({ userId: profile.userId, role: 'member' }));
+            notices.push(`No team named "${teamName}", so the ${matched.length === 1 ? 'person' : 'people'} of that name in the directory were added instead.`);
+          } else {
+            notices.push(`No team or person named "${teamName}" in the directory, so nobody was added.`);
+          }
         } else {
           const roster = await teams.listMembers(team.teamId).catch(() => []);
           attendees = (roster as Array<{ userId: string; role: string }>)

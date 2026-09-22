@@ -334,6 +334,10 @@ export function registerBuiltinChatCommands(): void {
     triggerPayload: (input) => {
       const { plan, request } = preparedAgentLoop(input);
       return {
+        // The organization the command was typed in. A step that creates
+        // something an organization owns (a room, a page) has no other way to
+        // know it, and a run without one used to fail at that step.
+        ...(input.organizationId ? { organizationId: input.organizationId } : {}),
         instruction: request.instruction,
         hints: request.hints,
         contextBudgetTokens: request.contextBudgetTokens,
