@@ -276,10 +276,12 @@ interface AclBatch {
   members: Map<string, Promise<boolean>>;
   /** One compute-source authorization per resource, not per target. */
   compute: Map<string, Promise<SourceAuthorization>>;
+  /** `roomId` → the people a booked room concerns, memoized per request. */
+  rooms: Map<string, Promise<string[]>>;
 }
 
 function emptyAclBatch(): AclBatch {
-  return { runs: new Map(), recordings: new Map(), documents: new Map(), members: new Map(), compute: new Map() };
+  return { runs: new Map(), recordings: new Map(), documents: new Map(), members: new Map(), compute: new Map(), rooms: new Map() };
 }
 
 /** Indexes rows by an id attribute, marking an id claimed twice as ambiguous. */
@@ -502,7 +504,8 @@ export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
       };
     }
     if (this.source === 'meeting') {
-      const row = batch.recordings.get(resourceId.replace(/^(meeting|recording|transcript):/, '')) ?? undefined;
+      const meetingId = resourceId.replace(/^(meeting|recording|transcript):/, '');
+      const row = batch.recordings.get(meetingId) ?? undefined;
       const people = new Set<string>([
         ...(Array.isArray(row?.participants)
           ? row.participants.flatMap((value) => value && typeof value === 'object' && typeof (value as { userId?: unknown }).userId === 'string'
@@ -510,6 +513,16 @@ export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
           : []),
         ...(typeof row?.startedBy === 'string' ? [row.startedBy] : []),
       ]);
+      // A room that has not happened yet has no recording to be authorized
+      // from — it is a booking, and the people it concerns are whoever made it
+      // and whoever is expected on it. Looked up only for a meeting with no
+      // recording, which is the rare case, and memoized for the request.
+      if (!row) {
+        if (!batch.rooms.has(meetingId)) {
+          batch.rooms.set(meetingId, this.roomPeople(scope.organizationId, meetingId));
+        }
+        for (const person of await (batch.rooms.get(meetingId) as Promise<string[]>)) people.add(person);
+      }
       return {
         ownerValid: people.has(scope.personId),
         viewerHasDirectAccess: people.has(scope.viewerId),
