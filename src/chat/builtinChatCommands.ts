@@ -15,6 +15,9 @@ import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOC
 import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID, DEFAULT_HISTORY_LIMIT } from '../documents/conversationSummarizePipeline';
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
 import { buildDeckGenerateDefinition, DECK_GENERATE_PIPELINE_ID, DECK_HISTORY_LIMIT } from '../documents/deckGeneratePipeline';
+import { buildDeckFixture } from '../deck/deckFixture';
+import { renderDeckPreview } from '../deck/preview';
+import { randomUUID } from 'node:crypto';
 import { registerChatCommandPipeline, type ChatCommandRunInput } from './chatCommandRegistry';
 import {
   AGENT_LOOP_CARD_AGENT, CHAT_AGENT_LOOP_PIPELINE_ID, agentLoopCardLab,
@@ -107,6 +110,49 @@ export function transformFieldList(fields: TransformTarget['fields']): string {
   return fields.length ? fields.map((f) => `- ${f.name}${f.sectionType ? ` (${f.sectionType})` : ''}`).join('\n') : '- (the type declares no fields; keep the source headings)';
 }
 
+/** `/deck` flags: `--preview` and `--from transcript|documents`. */
+export interface DeckCommandArgs {
+  /** The instruction with the flags removed. */
+  prompt: string;
+  /** Answer with a preview card and persist nothing. */
+  preview: boolean;
+  /** What the deck is built from, when the person said. */
+  from?: 'transcript' | 'documents';
+}
+
+/**
+ * Parses `/deck`'s own grammar. `--from #anything` and a bare `#doc` both mean
+ * the referenced documents; `--from transcript` means the meeting's transcript.
+ * Everything else stays in the instruction — the deck is about the words, and
+ * an unrecognised flag must not silently vanish from what was asked for.
+ */
+export function parseDeckCommand(argumentText: string): DeckCommandArgs {
+  let preview = false;
+  let from: DeckCommandArgs['from'];
+  const words = argumentText.trim().split(/\s+/).filter(Boolean);
+  const kept: string[] = [];
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index]!;
+    const lowered = word.toLowerCase();
+    if (lowered === '--preview') { preview = true; continue; }
+    if (lowered === '--from' || lowered.startsWith('--from=')) {
+      const value = (lowered.startsWith('--from=') ? lowered.slice('--from='.length) : (words[index + 1] ?? '')).toLowerCase();
+      if (!lowered.startsWith('--from=')) index += 1;
+      if (value.startsWith('transcript') || value.startsWith('recording') || value.startsWith('meeting')) from = 'transcript';
+      else if (value) from = 'documents';
+      continue;
+    }
+    kept.push(word);
+  }
+  return { prompt: kept.join(' ').trim(), preview, ...(from ? { from } : {}) };
+}
+
+/** The recording a `--from transcript` deck reads, when the client named one. */
+function deckRecordingId(input: ChatCommandRunInput): string | undefined {
+  const raw = input.extra?.recordingId ?? input.extra?.transcriptRecordingId;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+}
+
 /**
  * The documents a `/deck` must cite: what the composer referenced with `#`
  * (`extra.documents`, the shape `ComposedMessage.documents` already has), minus
@@ -129,6 +175,52 @@ export function deckSourcesFromInput(input: ChatCommandRunInput): Array<{ docume
   }
   return out;
 }
+
+/**
+ * `/deck --preview`: the deck as it would be, before anything is written.
+ *
+ * It derives a spec from the named material and renders slide 1, and the card
+ * carries that SVG itself — there is no preview handle, because a handle
+ * addresses a stored revision and this stored nothing. The id it answers with
+ * is `deck-preview:<uuid>`, which is not a run id and says so.
+ */
+export async function buildDeckPreviewCard(input: ChatCommandRunInput): Promise<Record<string, unknown>> {
+  const args = parseDeckCommand(input.argumentText ?? '');
+  const sources = deckSourcesFromInput(input);
+  const recordingId = deckRecordingId(input);
+  const documentId = args.from === 'transcript' ? undefined : sources[0]?.documentId;
+  if (!documentId && !recordingId) {
+    throw new AppError(400, '/deck --preview needs a document (reference one with #) or a recording to build from');
+  }
+  const result = await buildDeckFixture(
+    { ...(documentId ? { documentId } : {}), ...(recordingId ? { recordingId } : {}), personId: input.requestedBy },
+    args.prompt || undefined,
+    {},
+  );
+  const preview = renderDeckPreview(result.spec);
+  const first = preview.slides[0]!;
+  return {
+    kind: 'deck-preview',
+    persisted: false,
+    title: result.spec.title,
+    specSource: result.source,
+    ...(result.reason ? { specSourceReason: result.reason } : {}),
+    slideCount: preview.slides.length,
+    warnings: preview.warnings,
+    thumbnail: { slideId: first.id, title: first.title, contentType: 'image/svg+xml', svg: first.svg },
+    sources: sources.length ? sources : undefined,
+    spec: result.spec,
+    agent: HAIKU_CARD_AGENT,
+  };
+}
+
+/**
+ * The preview a `--preview` run rendered, handed from `start` to `card` — the
+ * registry calls them in that order for the same input, and this is the only
+ * seam between them. Keyed by requester and taken out on read, so a preview is
+ * never shown to a second person or a second time.
+ */
+const deckPreviewCards = new Map<string, Record<string, unknown>>();
 
 let registered = false;
 
@@ -284,24 +376,39 @@ export function registerBuiltinChatCommands(): void {
     card: (input) => ({ title: (str(input.extra?.title) ?? input.argumentText.trim()).slice(0, 120), agent: HAIKU_CARD_AGENT }),
   });
 
-  // /deck <what> [#doc …] — build a real presentation, grounded in the documents
-  // the composer referenced and the conversation itself, into the fresh
-  // presentation document the client created.
+  // /deck <what> [#doc …] [--from transcript|documents] [--preview] — build a
+  // real presentation, grounded in the documents the composer referenced and
+  // the meeting or conversation, into the fresh presentation document the
+  // client created. `--preview` answers with the deck as it would be and writes
+  // nothing.
   registerChatCommandPipeline({
     trigger: '/deck',
     pipelineId: DECK_GENERATE_PIPELINE_ID,
     label: 'Build a presentation',
     hint: 'from the referenced documents',
-    description: 'Build a .pptx from the documents you reference with # and this conversation: `documentId` is the new presentation, `extra.documents` are the sources it must cite, the text after the command is what the deck is about.',
+    description: 'Build a .pptx from the documents you reference with # and this conversation: `documentId` is the new presentation, `extra.documents` are the sources it must cite, the text after the command is what the deck is about. `--from transcript` reads the meeting recording in `extra.recordingId`; `--preview` answers with the slides and stores nothing.',
     requires: { document: true, argumentText: true },
     postCard: false,
+    // `--preview` never reaches the pipeline: it derives a spec, renders slide 1
+    // and answers with it. The id is `deck-preview:<uuid>` — not a run id, and
+    // the card says `persisted: false` so nothing downstream mistakes it.
+    start: async (input) => {
+      if (!parseDeckCommand(input.argumentText ?? '').preview) return null;
+      const card = await buildDeckPreviewCard(input);
+      deckPreviewCards.set(input.requestedBy, card);
+      return { runId: `deck-preview:${randomUUID()}` };
+    },
     buildDefinition: () => buildDeckGenerateDefinition(),
     triggerPayload: (input) => {
-      const prompt = input.argumentText.trim().slice(0, 2000);
+      const args = parseDeckCommand(input.argumentText ?? '');
+      const prompt = (args.prompt || input.argumentText.trim()).slice(0, 2000);
       const title = (str(input.extra?.title) ?? prompt).slice(0, 120);
+      const recordingId = deckRecordingId(input);
       return {
         documentId: input.documentId, title, prompt,
         sources: deckSourcesFromInput(input),
+        ...(recordingId ? { recordingId } : {}),
+        ...(args.from ? { from: args.from } : {}),
         limit: DECK_HISTORY_LIMIT,
         chatChannel: input.channel,
         requestedBy: input.requestedBy, requestedByName: input.requestedByName,
@@ -309,14 +416,22 @@ export function registerBuiltinChatCommands(): void {
       };
     },
     // The card names what the deck stands on, so the thread can see the sources
-    // before the deck exists.
+    // before the deck exists — and carries the rendered preview when the
+    // command asked for one.
     card: (input) => {
+      const args = parseDeckCommand(input.argumentText ?? '');
       const sources = deckSourcesFromInput(input);
+      const preview = args.preview ? deckPreviewCards.get(input.requestedBy) : undefined;
+      if (preview) deckPreviewCards.delete(input.requestedBy);
+      const recordingId = deckRecordingId(input);
       return {
-        title: (str(input.extra?.title) ?? input.argumentText.trim()).slice(0, 120),
+        title: ((str(input.extra?.title) ?? args.prompt) || input.argumentText.trim()).slice(0, 120),
         sources,
         sourceNames: sources.map((source) => source.title),
+        ...(args.from ? { from: args.from } : {}),
+        ...(recordingId ? { recordingId } : {}),
         agent: HAIKU_CARD_AGENT,
+        ...(preview ?? {}),
       };
     },
   });

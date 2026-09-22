@@ -42,6 +42,48 @@ describe('the deck:read-sources step', () => {
   });
 });
 
+describe('the deck:read-sources step, with a recording', () => {
+  const material = {
+    transcript: {
+      transcriptId: 'active-now-transcript',
+      title: 'Planning sync',
+      segments: [
+        { speaker: 'Connor', text: 'Release risks before noon.' },
+        { speaker: 'Frank', text: 'I will take the rollback owner.' },
+      ],
+    },
+  };
+
+  it('prefers the named recording over the chat text, and cites it by its own id', async () => {
+    const handler = createDeckReadSourcesHandler({
+      readDocument: async () => ({ text: '' }),
+      readMaterial: async () => material,
+    });
+    const outcome = await handler.execute(node, {
+      recordingId: 'rec-1',
+      conversationText: '[09:15] Frank: unrelated chatter',
+    }, helpers);
+
+    const output = outcome.output as Record<string, unknown>;
+    expect(output.transcriptFrom).toBe('recording');
+    expect(output.transcriptSource).toEqual({ documentId: 'active-now-transcript', title: 'Planning sync' });
+    expect(output.sourcesBlock).toContain('Connor: Release risks before noon.');
+    expect(output.sourcesBlock).not.toContain('unrelated chatter');
+    expect(output.sourceList).toContain('- Planning sync (documentId: active-now-transcript)');
+  });
+
+  it('falls back to the conversation when the recording has no transcript', async () => {
+    const handler = createDeckReadSourcesHandler({
+      readDocument: async () => ({ text: '' }),
+      readMaterial: async () => ({}),
+    });
+    const outcome = await handler.execute(node, { recordingId: 'rec-1', conversationText: '[09:15] Frank: chatter' }, helpers);
+    const output = outcome.output as Record<string, unknown>;
+    expect(output.transcriptFrom).toBe('conversation');
+    expect(output.sourcesBlock).toContain('chatter');
+  });
+});
+
 describe('parseSourceRefs', () => {
   it('takes ids and titles under either name, deduped and capped', () => {
     expect(parseSourceRefs([

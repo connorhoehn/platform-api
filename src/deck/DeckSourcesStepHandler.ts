@@ -12,6 +12,7 @@ import type { PipelineNode, StepOutcome } from 'distributed-core/applications/pi
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import { AgentCollaborator, HAIKU_AGENT } from '../documents/AgentCollaborator';
 import { outlineOf } from '../documents/documentAgentOps';
+import { readFixtureMaterial } from './deckFixture';
 import log from '../lib/logger';
 
 export const DECK_READ_SOURCES_KIND = 'deck:read-sources';
@@ -65,6 +66,7 @@ export async function readDocumentText(documentId: string): Promise<{ text?: str
 export function sourcesBlock(
   sections: Array<{ documentId: string; title: string; text?: string; error?: string }>,
   transcript?: string,
+  transcriptRef: { documentId: string; title: string } = { documentId: 'transcript', title: 'Meeting transcript' },
 ): string {
   const parts = sections.map((section) => [
     `### ${section.title}`,
@@ -76,26 +78,48 @@ export function sourcesBlock(
         : '(this document is empty)',
   ].join('\n'));
   if (transcript?.trim()) {
-    parts.push(['### Meeting transcript', 'documentId: transcript', transcript.trim().slice(0, MAX_TRANSCRIPT_CHARS)].join('\n'));
+    parts.push([`### ${transcriptRef.title}`, `documentId: ${transcriptRef.documentId}`, transcript.trim().slice(0, MAX_TRANSCRIPT_CHARS)].join('\n'));
   }
   return parts.join('\n\n') || '(no sources were provided)';
 }
 
 export interface DeckReadSourcesOpts {
   readDocument?: typeof readDocumentText;
+  readMaterial?: typeof readFixtureMaterial;
 }
 
 export function createDeckReadSourcesHandler(opts: DeckReadSourcesOpts = {}): DescribedStepHandler {
   const read = opts.readDocument ?? readDocumentText;
+  const readMaterial = opts.readMaterial ?? readFixtureMaterial;
   return {
     kind: DECK_READ_SOURCES_KIND,
     description:
       'Reads the documents the deck must be grounded in and flattens them, with the conversation transcript, into one prompt block.',
-    reads: 'sources (documentId + title) from the trigger, and conversationText when a step before it read the chat.',
-    emits: 'sourcesBlock, sourceList and how many documents were readable — a document that could not be read says so in the block.',
+    reads: 'sources (documentId + title) from the trigger, recordingId when the command named a meeting, and conversationText when a step before it read the chat.',
+    emits: 'sourcesBlock, sourceList, which transcript was used (a recording\'s or the conversation\'s) and how many documents were readable — a document that could not be read says so in the block.',
     async execute(_node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
       const refs = parseSourceRefs(context.sources);
-      const transcript = str(context.conversationText);
+      // `/deck --from transcript` names a recording: its transcript is the
+      // source, and the chat text is not a substitute for it — when the
+      // recording has none, the block says so and the deck cites nothing it
+      // did not read.
+      const recordingId = str(context.recordingId);
+      let recorded: { transcriptId: string; title: string; text: string } | undefined;
+      if (recordingId) {
+        try {
+          const material = await readMaterial({ recordingId });
+          if (material.transcript) {
+            recorded = {
+              transcriptId: material.transcript.transcriptId,
+              title: material.transcript.title,
+              text: material.transcript.segments.map((segment) => `${segment.speaker}: ${segment.text}`).join('\n'),
+            };
+          }
+        } catch (err) {
+          log.warn({ recordingId, err: err instanceof Error ? err.message : String(err) }, 'deck: the recording transcript could not be read');
+        }
+      }
+      const transcript = recorded?.text ?? str(context.conversationText);
       const sections: Array<{ documentId: string; title: string; text?: string; error?: string }> = [];
       let unavailable = 0;
       for (const ref of refs) {
@@ -106,15 +130,20 @@ export function createDeckReadSourcesHandler(opts: DeckReadSourcesOpts = {}): De
         }
         sections.push({ ...ref, ...result });
       }
+      const transcriptRef = recorded
+        ? { documentId: recorded.transcriptId, title: recorded.title }
+        : { documentId: 'transcript', title: 'Meeting transcript' };
       const sourceList = refs.map((ref) => `- ${ref.title} (documentId: ${ref.documentId})`).join('\n')
-        + (transcript ? `${refs.length ? '\n' : ''}- Meeting transcript (documentId: transcript)` : '');
+        + (transcript ? `${refs.length ? '\n' : ''}- ${transcriptRef.title} (documentId: ${transcriptRef.documentId})` : '');
       if (!refs.length && !transcript) {
         return { status: 'failed', error: 'deck: no sources — a deck is only allowed to say what its inputs say' };
       }
       return {
         status: 'completed',
         output: {
-          sourcesBlock: sourcesBlock(sections, transcript),
+          sourcesBlock: sourcesBlock(sections, transcript, transcriptRef),
+          transcriptSource: transcript ? transcriptRef : undefined,
+          transcriptFrom: recorded ? 'recording' : transcript ? 'conversation' : 'none',
           sourceList: sourceList || '(none)',
           sourcesRead: sections.length - unavailable,
           sourcesUnavailable: unavailable,
