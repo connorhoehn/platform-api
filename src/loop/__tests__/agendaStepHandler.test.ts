@@ -64,6 +64,12 @@ describe('the agenda step', () => {
     expect(output).toMatchObject({
       documentId: 'doc-agenda-1', title: 'Platform sync', itemCount: 2, written: 'document',
     });
+    // The same items just written to the page, so a run card can excerpt the
+    // agenda without a second read of the document body.
+    expect(output.items).toEqual([
+      { text: 'Release risks', owner: 'Frank' },
+      { text: 'Coverage checks' },
+    ]);
     expect(output.owners).toEqual(['Connor', 'Frank']);
     expect(output.result).toEqual({ kind: 'document', documentId: 'doc-agenda-1' });
     expect(output.artifacts).toEqual([{ artifactId: 'doc-agenda-1', kind: 'page', title: 'Platform sync' }]);

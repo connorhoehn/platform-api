@@ -168,7 +168,7 @@ export function createAgendaStepHandler(opts: AgendaStepHandlerOpts = {}): Descr
     description:
       'Turns a drafted agenda into a real page in the Documents explorer, and declares that page as the run\'s artifact so the deck can cite it.',
     reads: 'The drafted agenda JSON at the node\'s agendaFrom (or inline), and the meeting the run created, when there is one.',
-    emits: 'documentId, title, the item count and the owners — and whether the body reached the document or only the row.',
+    emits: 'documentId, title, the item count, the items themselves (text, owner) and the owners — and whether the body reached the document or only the row.',
     async execute(node: PipelineNode, context: Record<string, unknown>, helpers: StepHandlerHelpers): Promise<StepOutcome> {
       const data = (node.data ?? {}) as unknown as AgendaNodeData;
       const fallbackTitle = str(data.title, 120) ?? str(data.label, 120) ?? str(context.instruction, 120) ?? 'Agenda';
@@ -233,6 +233,9 @@ export function createAgendaStepHandler(opts: AgendaStepHandlerOpts = {}): Descr
           documentId,
           title: agenda.title,
           itemCount: agenda.items.length,
+          // The same items just written to the page, so a caller can excerpt
+          // the agenda without a second read of the document body.
+          items: agenda.items.map((item) => ({ text: item.text, ...(item.owner ? { owner: item.owner } : {}) })),
           owners: agenda.owners,
           written,
           applied,
