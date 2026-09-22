@@ -30,6 +30,7 @@ import {
   sectionReviewRequestsRouter,
 } from './documentReviewRequests';
 import { documentImportExportRouter } from './documentImportExport';
+import { documentRevisionsRouter } from './documentRevisions';
 import { videoSessionsRouter } from './videoSessions';
 import { recordingsRouter } from './recordings';
 import {
@@ -143,6 +144,10 @@ router.use('/items', myItemsRouter);
 // Must precede the '/documents/:documentId' mount below, which would otherwise
 // swallow '/work-items' as a sub-path of the import/export router.
 router.use('/documents/:documentId/work-items', workItemsRouter);
+// A presentation's stored revisions: the .pptx and the per-slide SVG previews
+// the deck generator files. Same reason as work-items — it must precede the
+// '/documents/:documentId' mount, which would otherwise swallow '/revisions'.
+router.use('/documents/:documentId/revisions', documentRevisionsRouter);
 router.use('/documents/:documentId', documentImportExportRouter);
 // Ambient voice capture — authenticated PCM proxy in front of the
 // live-captions sidecar. See routes/voiceCapture.ts.
