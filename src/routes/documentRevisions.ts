@@ -18,6 +18,8 @@ import { requireAuth } from '../middleware/auth';
 import { asyncHandler, AppError, NotFoundError, ValidationError } from '../middleware/error-handler';
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
 import { PPTX_CONTENT_TYPE, renderPptx } from '../deck/renderPptx';
+import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platformPublisher';
+import { workSourceAccountRepo } from '../repositories';
 import { SVG_CONTENT_TYPE } from '../deck/renderSlideSvg';
 import { previewDeckSpec } from '../deck/preview';
 import log from '../lib/logger';
@@ -123,6 +125,24 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
     ...(label ? { label } : {}),
   });
   log.info({ documentId, revisionId: revision.id, slides: revision.slideCount, userId: createdBy }, 'deck revision saved');
+  // A revision saved by hand reaches the work graph the same way a rendered
+  // one does — same source, same node — with no run to claim as its
+  // provenance, because a person made it.
+  if (req.user?.orgId) {
+    await workSourceAccountRepo.ensureVerifiedPrincipal({
+      source: 'document', organizationId: req.user.orgId, subject: createdBy,
+    }).catch(() => undefined);
+    const projected = await platformWorkGraphSourcePublisher.document({
+      kind: 'document-revision',
+      documentId,
+      revisionId: revision.id,
+      occurredAt: revision.createdAt,
+      safeLabel: title,
+    }, { organizationId: req.user.orgId, sourceSubject: createdBy }).catch(() => null);
+    if (!projected?.published) {
+      log.warn({ documentId, revisionId: revision.id, reason: projected?.reason ?? 'publish-failed' }, 'deck revision was not projected');
+    }
+  }
   res.status(201).json({
     documentId,
     revision: {
