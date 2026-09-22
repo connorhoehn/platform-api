@@ -940,15 +940,48 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     if (!home || framed.has(nodeId)) continue;
     home.nodeIds = [...new Set([...home.nodeIds, nodeId])];
   }
+  // Whatever a framed member is related to belongs in the same frame: the
+  // workspace a step runs in and the artifact it produced are a `terminal` and
+  // a `document`, neither of which may anchor an effort, so alone they were
+  // framed by nothing and the pane could not show a loop's deck under it. The
+  // relationship was declared by a source, and a node reached from exactly one
+  // effort is unambiguous; one reached from several is left where it is.
+  for (let hop = 0; hop < 3; hop += 1) {
+    const memberOf = new Map<string, ViewerWorkEffort | null>();
+    for (const effort of efforts) for (const id of effort.nodeIds) memberOf.set(id, effort);
+    let absorbed = false;
+    for (const node of nodes) {
+      if (memberOf.has(node.id)) continue;
+      const homes = new Set(edges
+        .filter((edge) => edge.fromId === node.id || edge.toId === node.id)
+        .map((edge) => memberOf.get(edge.fromId === node.id ? edge.toId : edge.fromId))
+        .filter((effort): effort is ViewerWorkEffort => !!effort));
+      if (homes.size !== 1) continue;
+      const [home] = homes;
+      home.nodeIds = [...home.nodeIds, node.id];
+      absorbed = true;
+    }
+    if (!absorbed) break;
+  }
+
   // A merged effort is named from everything it ended up framing: an effort
   // anchored on a step was named after that step while it was alone.
   for (const effort of efforts) {
     const anchor = index.byId.get(effort.anchorNodeId);
     if (anchor?.kind !== 'run' && anchor?.kind !== 'agent') continue;
-    const name = earliestRun(effort.nodeIds
+    const members = effort.nodeIds
       .map((id) => index.byId.get(id))
-      .filter((node): node is ViewerWorkNode => !!node))?.title;
-    if (name) effort.title = name;
+      .filter((node): node is ViewerWorkNode => !!node);
+    // The RUN names the effort — a step is a part of the work, not the work.
+    // A run is the pipeline resource with no step of its own in its id, so
+    // this holds however the members were gathered.
+    const run = members.find((node) => {
+      if (node.kind !== 'run' && node.kind !== 'agent') return false;
+      const stored = storedNode(authorization, node.id);
+      return stored?.sourceRef.source === 'pipeline'
+        && !parsePipelineStepResourceId(stored.sourceRef.resourceId).stepId;
+    }) ?? earliestRun(members);
+    if (run?.title) effort.title = run.title;
   }
   // Every relationship BETWEEN an effort's own members belongs to it, however
   // the members got there.

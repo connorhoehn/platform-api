@@ -667,3 +667,54 @@ describe('a step does not outlive its run', () => {
     expect(activity.details.find((detail) => detail.nodeId === step?.id)?.lines?.[0]).toContain('Sonnet');
   });
 });
+
+describe('what a loop\'s frame is called, and what is inside it', () => {
+  const events = [
+    documentEvent(`${DAY}T18:06:00.000Z`),
+    runEvent('running', `${DAY}T18:00:00.000Z`, false),
+    stepEvent('agent:s1', 'Draft slides for Create PowerPoint presentation', 'completed', `${DAY}T18:04:30.000Z`, [], {
+      workspace: { resourceId: 'session-1', safeLabel: 'Cloud workspace · box-7' },
+    }),
+    stepEvent('deck:s1', 'Render Create PowerPoint presentation (.pptx)', 'completed', `${DAY}T18:05:30.000Z`, [], {
+      workspace: { resourceId: 'session-1', safeLabel: 'Cloud workspace · box-7' },
+      produces: 'doc-1',
+    }),
+  ];
+
+  async function framed() {
+    const state = project(events);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
+    return { nodes, activity };
+  }
+
+  it('is named after the run, never after whichever step ran first', async () => {
+    const { activity } = await framed();
+    expect(activity.efforts).toHaveLength(1);
+    expect(activity.efforts[0].title).toBe('Agent loop · create a meeting with the X team');
+  });
+
+  it('holds the deck it produced and the workspace it ran in, not just runs', async () => {
+    const { nodes, activity } = await framed();
+    const kinds = [...new Set(activity.efforts[0].nodeIds
+      .map((id) => nodes.find((node) => node.id === id)?.kind))].sort();
+    // The revision comes with its document, through the document's own edge.
+    expect(kinds).toEqual(['change', 'document', 'run', 'terminal']);
+    const titles = activity.efforts[0].nodeIds.map((id) => nodes.find((node) => node.id === id)?.title);
+    expect(titles).toContain('Team deck');
+    expect(titles).toContain('Cloud workspace · box-7');
+  });
+
+  it('leaves a document two efforts both reach where it is, rather than picking one', async () => {
+    const state = project([
+      ...events,
+      // A second, unrelated run that also declares the same document.
+      { ...runEvent('running', `${DAY}T18:07:00.000Z`, false), eventId: 'other-run', payload: { kind: 'pipeline', lifecycle: 'started', pipelineId: 'other', runId: 'other-run-1', attempt: 1, safeLabel: 'Another run', produces: [{ source: 'document', resourceId: 'doc-1' }] }, resource: { source: 'pipeline', resourceId: 'run:other-run-1', resourceVersion: '2' } } as AuthenticatedWorkEvent,
+    ]);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
+    const homes = activity.efforts.filter((effort) => effort.nodeIds
+      .some((id) => nodes.find((node) => node.id === id)?.title === 'Team deck'));
+    expect(homes.length).toBeLessThanOrEqual(1);
+  });
+});
