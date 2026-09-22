@@ -208,3 +208,54 @@ describe('a step says where it is running and what it wrote', () => {
     expect(steps).toMatchObject([{ step: { stepId: 'agent:s2', status: 'cancelled' } }]);
   });
 });
+
+describe('replaying a stored run', () => {
+  beforeEach(() => { publisher.pipeline.mockClear(); });
+
+  const service = () => harness().service;
+  const row = (over: Record<string, unknown> = {}) => ({
+    pipelineId: 'chat-agent-loop', runId: 'loop-1', status: 'failed',
+    triggeredBy: 'dev-frank', triggerType: 'manual', organizationId: 'dev-org',
+    startedAt: AT, lastEventAt: AT,
+    checkpoint: { sequenceNumber: 0, at: AT, currentStepIds: [], context: {
+      loopId: 'loop-1', instruction: 'create a meeting with the X team', chatChannel: 'chat:c:general',
+      plan: { steps: [] },
+    } },
+    ...over,
+  }) as never;
+
+  it('says nothing for a row that only points at the run that really happened', async () => {
+    // One loop, one run node: the accept-time row and the executor run were
+    // projected as two, with two titles, and the steps framed under one.
+    await service().reconcileWorkGraphRun(row({ agentLoopRunId: 'executor-run-1' }));
+    expect(published()).toHaveLength(0);
+  });
+
+  it('still speaks for a loop whose planner never answered', async () => {
+    await service().reconcileWorkGraphRun(row());
+    expect(published()[0]).toMatchObject({
+      kind: 'pipeline-run',
+      safeLabel: 'create a meeting with the X team',
+      inputRefs: [{ source: 'conversation', resourceId: 'chat:c:general' }],
+    });
+  });
+
+  it('names it from the definition the row kept, when it kept one', async () => {
+    await service().reconcileWorkGraphRun(row({ definitionSnapshot: { name: 'Agent loop' } }));
+    expect(published()[0]).toMatchObject({ safeLabel: 'Agent loop · create a meeting with the X team' });
+  });
+
+  it('is a NEW observation, so it can repair a name and not merely re-assert one', async () => {
+    await service().reconcileWorkGraphRun(row());
+    expect(Date.parse((published()[0] as { occurredAt: string }).occurredAt)).toBeGreaterThan(Date.parse(AT));
+  });
+
+  it('replays an ordinary run exactly as it stands', async () => {
+    await service().reconcileWorkGraphRun({
+      pipelineId: 'nightly', runId: 'run-9', status: 'completed', triggeredBy: 'dev-frank',
+      triggerType: 'manual', organizationId: 'dev-org', startedAt: AT, lastEventAt: AT,
+    } as never);
+    expect(published()[0]).toMatchObject({ kind: 'pipeline-run', occurredAt: AT });
+    expect(published()[0]).not.toHaveProperty('safeLabel');
+  });
+});

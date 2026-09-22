@@ -808,11 +808,19 @@ export class RunPersistenceService {
    */
   async reconcileWorkGraphRun(item: PipelineRunItem): Promise<void> {
     if (!item.organizationId || item.triggeredBy === 'system') return;
+    // A command that answers before its run exists writes a row under an id
+    // of its own and later points that row at the run the executor actually
+    // started. The row is a POINTER, not a second run: projecting it made one
+    // loop two run nodes with two titles — the accept-time row's and the
+    // announced one — and the steps, the workspace and the artifact framed
+    // themselves under whichever of the two they named. The run it points at
+    // speaks for itself, so this row says nothing.
+    if (typeof item.agentLoopRunId === 'string' && item.agentLoopRunId && item.agentLoopRunId !== item.runId) return;
     // A run that died before its steps existed — an /agent loop whose planner
     // never answered — has only the row written when the command was accepted.
     // That row still knows what was asked for and where, and replaying it as
     // an unnamed, unanchored "Pipeline run" throws both away.
-    const stored = workGraphPlanFromStoredRun(item, await this.definitionName(item.pipelineId));
+    const stored = workGraphPlanFromStoredRun(item, await this.definitionName(item));
     // A replay at the SAME instant is exactly idempotent — same event key, and
     // never newer — so it can only ever re-assert what the projection already
     // has. That is right for an outage replay and useless for a repair: a run
@@ -1338,17 +1346,23 @@ export class RunPersistenceService {
   }
 
   /**
-   * The registered pipeline's own display name, when it has one.
+   * The pipeline's own display name, from the definition this run executed if
+   * the row kept one, otherwise from the registered system pipeline.
    *
-   * Imported lazily and on purpose: `systemPipelines` BUILDS every definition
-   * at module load, and some of those modules import this one. A static import
-   * here is a cycle that leaves a definition half-initialised.
+   * `systemPipelines` is imported lazily and on purpose: it BUILDS every
+   * definition at module load, and some of those modules import this one, so a
+   * static import is a cycle that leaves a definition half-initialised. A
+   * pipeline registered on first use is also simply absent at startup, which
+   * is when reconciliation runs — hence the row's own snapshot first.
    */
-  private async definitionName(pipelineId: string): Promise<string | undefined> {
+  private async definitionName(item: PipelineRunItem): Promise<string | undefined> {
+    const clean = (value: unknown): string | undefined =>
+      (typeof value === 'string' && value.trim() ? value.trim().slice(0, 80) : undefined);
+    const snapshot = clean((item.definitionSnapshot as { name?: unknown } | undefined)?.name);
+    if (snapshot) return snapshot;
     try {
       const { getSystemPipeline } = await import('./systemPipelines.js');
-      const name = getSystemPipeline(pipelineId)?.name;
-      return typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : undefined;
+      return clean(getSystemPipeline(item.pipelineId)?.name);
     } catch {
       return undefined;
     }
