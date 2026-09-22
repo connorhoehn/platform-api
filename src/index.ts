@@ -208,6 +208,18 @@ let workGraphOutboxDrainer: { stop: () => void } | null = null;
           transport: catalog.getDurableTransport(),
           repository: workGraphRepository,
           accountResolver: new WorkSourceAccountRepository(docClient),
+          // The document source has two declared writers. Admitting a second
+          // service says who may SPEAK, not what they may say: the platform
+          // may describe a presentation its own deck store wrote, and a CRDT
+          // page stays the gateway's to describe.
+          ownership: {
+            ownsDocument: async (serviceId, documentId) => {
+              if (serviceId !== 'platform-api') return false;
+              const { getPresentationDocumentStore } = await import('./deck/presentationDocuments.js');
+              const row = await getPresentationDocumentStore().get(documentId).catch(() => null);
+              return !!row;
+            },
+          },
         });
         workGraphOutboxDrainer = startWorkGraphOutboxDrainer();
         log.info('work-graph consumer and outbox drainer started');

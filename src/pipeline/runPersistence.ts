@@ -284,6 +284,17 @@ export class RunPersistenceService {
       this.handleStepAttemptFailed(event.payload);
     });
 
+    // A deck the run rendered. The platform's deck store wrote the row, so
+    // the platform is the document's producer and says so on the same event
+    // the gateway publishes for a page — one deck, one node, either way.
+    (this.eventBus as unknown as {
+      subscribe(name: string, handler: (event: { payload: Record<string, unknown> }) => Promise<void>): string;
+    }).subscribe('pipeline:step:deck:produced', async (event) => {
+      await this.handleDeckProduced(event.payload).catch((err) => {
+        log.warn({ err: String(err) }, 'failed to project a produced deck');
+      });
+    });
+
     // The agent loop's own turn counter. It is the only evidence a devbox
     // step is still alive between its start and its completion, so it both
     // records what the step has spent and refreshes the step node's lease.
@@ -1024,6 +1035,33 @@ export class RunPersistenceService {
       log.warn({ runId, stepId, err: String(err) }, 'failed to persist agent iteration');
     });
     await this.markWorkGraphStep(runId, stepId, 'running', at);
+  }
+
+  /**
+   * The revision a deck step just wrote. Its provenance is the run that wrote
+   * it — declared by the run, never inferred from who was busy at the time —
+   * which is what draws the deck under the loop that made it.
+   */
+  private async handleDeckProduced(payload: Record<string, unknown>): Promise<void> {
+    const text = (value: unknown): string | undefined =>
+      (typeof value === 'string' && value.trim() ? value.trim() : undefined);
+    const runId = text(payload.runId);
+    const documentId = text(payload.documentId);
+    const revisionId = text(payload.revisionId);
+    if (!runId || !documentId || !revisionId) return;
+    const state = this.runCache.get(runId);
+    if (!state?.organizationId || state.triggeredBy === 'system') return;
+    const result = await platformWorkGraphSourcePublisher.document({
+      kind: 'document-revision',
+      documentId,
+      revisionId,
+      occurredAt: text(payload.at) ?? new Date().toISOString(),
+      ...(text(payload.title) ? { safeLabel: text(payload.title) as string } : {}),
+      producedByRunId: runId,
+    }, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
+    if (!result.published) {
+      log.warn({ runId, documentId, reason: result.reason }, 'produced deck was not projected');
+    }
   }
 
   private handleStepAttemptFailed(event: {

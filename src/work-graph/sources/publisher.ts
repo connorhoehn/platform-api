@@ -11,6 +11,7 @@
 import type { AuthenticatedWorkEvent, WorkSourceKind } from '@connorhoehn/realtime-modules/work-graph';
 import { mapMeeting, type MeetingSourceRecord } from './mapMeeting';
 import { mapPipeline, type PipelineSourceRecord } from './mapPipeline';
+import { mapDocumentRevision, type DocumentRevisionSourceRecord } from './mapDocument';
 
 export interface WorkGraphSourceAccountResolver {
   resolve(
@@ -37,7 +38,7 @@ interface PublisherOptions {
   now?: () => Date;
 }
 
-function eventName(source: 'pipeline' | 'meeting'): string {
+function eventName(source: 'pipeline' | 'meeting' | 'document'): string {
   return `work-graph.${source}.lifecycle.v1`;
 }
 
@@ -72,6 +73,33 @@ export class PlatformWorkGraphSourcePublisher {
     if (!result.supported) return { published: false, reason: 'unsupported-source-record' };
     await this.options.publisher.publish(eventName('pipeline'), result.event as AuthenticatedWorkEvent);
     return { published: true, event: result.event as AuthenticatedWorkEvent };
+  }
+
+  /**
+   * A presentation the platform's own deck store wrote. It publishes the SAME
+   * declared event the gateway publishes for a CRDT page, so one document is
+   * one node whichever service observed it — the identity an artifact card and
+   * "Open presentation" both address.
+   */
+  async document(
+    record: DocumentRevisionSourceRecord,
+    identity: { organizationId: string; sourceSubject: string },
+  ): Promise<WorkGraphProducerResult> {
+    const mapped = await this.options.accounts.resolve(
+      'document', 'platform-api', identity.organizationId, identity.sourceSubject,
+    );
+    if (!mapped) return { published: false, reason: 'source-account-unmapped' };
+    if (mapped.organizationId !== identity.organizationId) {
+      return { published: false, reason: 'source-account-mismatch' };
+    }
+    const result = mapDocumentRevision(record, {
+      actor: { actorId: mapped.actorId, organizationId: mapped.organizationId, sourceSubject: identity.sourceSubject },
+      producer: { serviceId: 'platform-api', organizationId: mapped.organizationId, credentialId: this.options.credentialId },
+      receivedAt: this.now().toISOString(),
+    });
+    if (!result.supported) return { published: false, reason: 'unsupported-source-record' };
+    await this.options.publisher.publish(eventName('document'), result.event as unknown as AuthenticatedWorkEvent);
+    return { published: true, event: result.event as unknown as AuthenticatedWorkEvent };
   }
 
   async meeting(

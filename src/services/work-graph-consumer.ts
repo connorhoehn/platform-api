@@ -2,6 +2,7 @@ import type { EventEnvelope } from '@connorhoehn/event-catalog';
 import {
   isWithinWorkGraphEventLimit,
   validateAuthenticatedWorkEvent,
+  workGraphProducersFor,
   type AuthenticatedWorkEvent,
   type WorkSourceKind,
 } from '@connorhoehn/realtime-modules/work-graph';
@@ -11,6 +12,13 @@ import log from '../lib/logger';
 
 export const WORK_GRAPH_PROJECTION_QUEUE = 'work-graph-projection-v1';
 
+/**
+ * The service a source's events are DECLARED to come from, for the envelope's
+ * own producer metadata. `workGraphProducersFor` is the authority on who may
+ * publish: a document is written either by the gateway (a CRDT page) or by the
+ * platform (a generated presentation, whose row the platform's deck store
+ * writes), and both must reach the same node.
+ */
 const PRODUCER_BY_SOURCE: Record<WorkSourceKind, string> = {
   'cloud-compute': 'aws-agentcore',
   'local-compute': 'aws-agentcore',
@@ -19,6 +27,16 @@ const PRODUCER_BY_SOURCE: Record<WorkSourceKind, string> = {
   conversation: 'websocket-gateway',
   meeting: 'platform-api',
 };
+
+/**
+ * Admitting a second service says who may SPEAK, never what they may say. A
+ * publisher still has to own the thing it describes, checked against that
+ * service's own store — platform-api writes presentations, and a CRDT page is
+ * the gateway's to describe however the queue is addressed.
+ */
+export interface WorkGraphOwnershipCheck {
+  ownsDocument(serviceId: string, documentId: string): Promise<boolean>;
+}
 
 interface DurableTransport {
   subscribe(
@@ -83,10 +101,10 @@ function verifyEnvelope(envelope: EventEnvelope<unknown>): AuthenticatedWorkEven
   const parsed = validateAuthenticatedWorkEvent(envelope.payload);
   if (!parsed.ok) throw new WorkGraphIngestionDeniedError('invalid-payload', payloadShape(envelope.payload));
   const event = parsed.value;
-  const expectedProducer = PRODUCER_BY_SOURCE[event.source];
+  const allowed = workGraphProducersFor(event.source);
   if (envelope.eventName !== `work-graph.${event.source}.lifecycle.v1`
-    || envelope.metadata.producer !== expectedProducer
-    || event.producer.serviceId !== expectedProducer
+    || envelope.metadata.producer !== PRODUCER_BY_SOURCE[event.source]
+    || !allowed.includes(event.producer.serviceId)
     || event.source !== event.payload.kind
     || event.source !== event.resource.source) {
     throw new WorkGraphIngestionDeniedError('producer-or-source-mismatch', payloadShape(envelope.payload));
@@ -101,8 +119,7 @@ function verifyDirectEvent(payload: unknown, authenticatedServiceId: string): Au
   const parsed = validateAuthenticatedWorkEvent(payload);
   if (!parsed.ok) throw new WorkGraphIngestionDeniedError('invalid-payload', payloadShape(payload));
   const event = parsed.value;
-  const expectedProducer = PRODUCER_BY_SOURCE[event.source];
-  if (authenticatedServiceId !== expectedProducer
+  if (!workGraphProducersFor(event.source).includes(authenticatedServiceId)
     || event.producer.serviceId !== authenticatedServiceId
     || event.source !== event.payload.kind
     || event.source !== event.resource.source) {
@@ -132,7 +149,20 @@ async function authorizeAndCommit(
   repository: ProjectionRepository,
   accountResolver: SourceAccountResolver,
   event: AuthenticatedWorkEvent,
+  ownership?: WorkGraphOwnershipCheck,
 ): Promise<void> {
+  // A source with more than one writer needs the writer checked against the
+  // thing it is describing, not just against the source. The platform may
+  // describe a presentation its own deck store wrote; a CRDT page stays the
+  // gateway's to describe.
+  if (ownership && event.source === 'document'
+    && event.producer.serviceId !== PRODUCER_BY_SOURCE.document) {
+    const documentId = (event.payload as { documentId?: unknown }).documentId;
+    if (typeof documentId !== 'string'
+      || !await ownership.ownsDocument(event.producer.serviceId, documentId)) {
+      throw new WorkGraphIngestionDeniedError('producer-does-not-own-document');
+    }
+  }
   const mapped = await accountResolver.resolve(
     event.source,
     event.producer.serviceId,
@@ -158,12 +188,14 @@ export async function ingestAuthenticatedWorkEvent(options: {
   authenticatedServiceId: string;
   repository: Pick<WorkGraphRepository, 'loadProjection' | 'commitEvent'>;
   accountResolver: Pick<WorkSourceAccountRepository, 'resolve'>;
+  ownership?: WorkGraphOwnershipCheck;
 }): Promise<AuthenticatedWorkEvent> {
   const event = verifyDirectEvent(options.payload, options.authenticatedServiceId);
   await authorizeAndCommit(
     options.repository as ProjectionRepository,
     options.accountResolver as SourceAccountResolver,
     event,
+    options.ownership,
   );
   return event;
 }
@@ -178,6 +210,8 @@ export function startWorkGraphConsumer(options: {
   transport: DurableTransport;
   repository: Pick<WorkGraphRepository, 'loadProjection' | 'commitEvent'>;
   accountResolver: Pick<WorkSourceAccountRepository, 'resolve'>;
+  /** Required for any source with more than one declared writer. */
+  ownership?: WorkGraphOwnershipCheck;
   pollingInterval?: number;
 }): { stop(): Promise<void> } {
   const cancel = options.transport.subscribe(
@@ -188,6 +222,7 @@ export function startWorkGraphConsumer(options: {
         options.repository as ProjectionRepository,
         options.accountResolver as SourceAccountResolver,
         event,
+        options.ownership,
       );
     },
     { pollingInterval: options.pollingInterval ?? 1_000, batchSize: 10, visibilityTimeout: 30 },

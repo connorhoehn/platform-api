@@ -6,7 +6,10 @@
  * the run's organization, origin and steps has even been handed its run id.
  */
 jest.mock('../../work-graph/sources/platformPublisher', () => ({
-  platformWorkGraphSourcePublisher: { pipeline: jest.fn(async () => ({ published: true })) },
+  platformWorkGraphSourcePublisher: {
+    pipeline: jest.fn(async () => ({ published: true })),
+    document: jest.fn(async () => ({ published: true })),
+  },
 }));
 
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
@@ -14,7 +17,7 @@ import { RunPersistenceService } from '../runPersistence';
 import type { PipelineRunRepository } from '../../repositories/PipelineRunRepository';
 
 const publisher = (jest.requireMock('../../work-graph/sources/platformPublisher') as {
-  platformWorkGraphSourcePublisher: { pipeline: jest.Mock };
+  platformWorkGraphSourcePublisher: { pipeline: jest.Mock; document: jest.Mock };
 }).platformWorkGraphSourcePublisher;
 
 type Handler = (event: { payload: Record<string, unknown> }) => Promise<void>;
@@ -258,5 +261,59 @@ describe('replaying a stored run', () => {
     } as never);
     expect(published()[0]).toMatchObject({ kind: 'pipeline-run', occurredAt: AT });
     expect(published()[0]).not.toHaveProperty('safeLabel');
+  });
+});
+
+describe('a deck the run rendered', () => {
+  beforeEach(() => { publisher.pipeline.mockClear(); publisher.document.mockClear(); });
+
+  async function startedRun() {
+    const { service, emit } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'chat-agent-loop', userId: 'dev-frank',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan,
+    });
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
+    });
+    return { emit };
+  }
+
+  it('is published on the document source, with the run as its provenance', async () => {
+    const { emit } = await startedRun();
+    await emit('pipeline:step:deck:produced', {
+      runId: RUN, stepId: 'deck:s1', documentId: 'deck-1', revisionId: 'v1',
+      slideCount: 7, title: 'Sprint review', at: AT,
+    });
+    expect(publisher.document).toHaveBeenCalledTimes(1);
+    expect(publisher.document.mock.calls[0][0]).toMatchObject({
+      kind: 'document-revision', documentId: 'deck-1', revisionId: 'v1',
+      safeLabel: 'Sprint review', producedByRunId: RUN,
+    });
+    expect(publisher.document.mock.calls[0][1]).toEqual({
+      organizationId: 'dev-org', sourceSubject: 'dev-frank',
+    });
+  });
+
+  it('says nothing for a deck whose run has no verified organization', async () => {
+    const { service, emit } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'chat-agent-loop', userId: 'dev-frank', triggerType: 'manual', at: AT,
+    });
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
+    });
+    await emit('pipeline:step:deck:produced', {
+      runId: RUN, stepId: 'deck:s1', documentId: 'deck-1', revisionId: 'v1', at: AT,
+    });
+    expect(publisher.document).not.toHaveBeenCalled();
+  });
+
+  it('ignores a produced event that names no revision', async () => {
+    const { emit } = await startedRun();
+    await emit('pipeline:step:deck:produced', { runId: RUN, documentId: 'deck-1', at: AT });
+    expect(publisher.document).not.toHaveBeenCalled();
   });
 });

@@ -261,9 +261,16 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
   // skipped it produced runs whose events were dropped at ingest with no
   // error anywhere — the run happened and the graph never heard of it.
   if (input.organizationId) {
-    await workSourceAccountRepo.ensureVerifiedPrincipal({
-      source: 'pipeline', organizationId: input.organizationId, subject: input.requestedBy,
-    });
+    await Promise.all([
+      workSourceAccountRepo.ensureVerifiedPrincipal({
+        source: 'pipeline', organizationId: input.organizationId, subject: input.requestedBy,
+      }),
+      // A run that renders a deck publishes it on the DOCUMENT source, and the
+      // consumer re-checks that join before it will accept one.
+      workSourceAccountRepo.ensureVerifiedPrincipal({
+        source: 'document', organizationId: input.organizationId, subject: input.requestedBy,
+      }),
+    ]);
   } else {
     log.warn({ trigger, userId: input.requestedBy }, 'chat command run has no organization; it will not reach the work graph');
   }

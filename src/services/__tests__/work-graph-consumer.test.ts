@@ -183,3 +183,81 @@ describe('a denied event says which one it was', () => {
     expect((denied as Error).message).not.toContain('Draft');
   });
 });
+
+describe('a source with two declared writers', () => {
+  const documentEvent = (serviceId: string, documentId = 'deck-1') => ({
+    eventName: 'work-graph.document.lifecycle.v1',
+    metadata: { producer: 'websocket-gateway' },
+    payload: {
+      schemaVersion: 1, eventId: `e-${documentId}`, idempotencyKey: `e-${documentId}`,
+      source: 'document', sourceSequence: '1',
+      occurredAt: '2026-09-22T04:00:00.000Z', receivedAt: '2026-09-22T04:00:01.000Z',
+      actor: { actorId: 'dev-frank', organizationId: 'dev-org', sourceSubject: 'dev-frank' },
+      producer: { serviceId, organizationId: 'dev-org', credentialId: 'c' },
+      resource: { source: 'document', resourceId: documentId, resourceVersion: 'v1' },
+      payload: { kind: 'document', lifecycle: 'revision-saved', documentId, revisionId: 'v1' },
+    },
+  });
+
+  function consumer(ownership?: { ownsDocument: (s: string, d: string) => Promise<boolean> }) {
+    const repository = {
+      loadProjection: jest.fn(async () => ({ revision: 0 })),
+      commitEvent: jest.fn(async () => ({ revision: 1 })),
+    };
+    const accountResolver = {
+      resolve: jest.fn(async () => ({ organizationId: 'dev-org', actorId: 'dev-frank' })),
+    };
+    let consume!: (input: unknown) => Promise<void>;
+    startWorkGraphConsumer({
+      transport: { subscribe: (_q: string, handler: (input: unknown) => Promise<void>) => { consume = handler; return () => undefined; } } as never,
+      repository: repository as never,
+      accountResolver: accountResolver as never,
+      ...(ownership ? { ownership } : {}),
+    });
+    return { consume: (e: unknown) => consume(e), repository };
+  }
+
+  it('accepts the gateway, as it always did', async () => {
+    const { consume, repository } = consumer({ ownsDocument: async () => false });
+    await consume(documentEvent('websocket-gateway'));
+    expect(repository.commitEvent).toHaveBeenCalled();
+  });
+
+  it('accepts the platform for a presentation its own store wrote', async () => {
+    const owned = jest.fn(async () => true);
+    const { consume, repository } = consumer({ ownsDocument: owned });
+    await consume(documentEvent('platform-api'));
+    expect(owned).toHaveBeenCalledWith('platform-api', 'deck-1');
+    expect(repository.commitEvent).toHaveBeenCalled();
+  });
+
+  it('refuses the platform for a document it does not own', async () => {
+    // Admitting a second service says who may SPEAK, not what they may say:
+    // a CRDT page stays the gateway's to describe.
+    const { consume, repository } = consumer({ ownsDocument: async () => false });
+    const denied = await consume(documentEvent('platform-api', 'page-9')).catch((e: Error) => e);
+    expect((denied as Error).message).toContain('producer-does-not-own-document');
+    expect(repository.commitEvent).not.toHaveBeenCalled();
+  });
+
+  it('refuses a service nobody declared', async () => {
+    const { consume } = consumer({ ownsDocument: async () => true });
+    const denied = await consume(documentEvent('some-other-service')).catch((e: Error) => e);
+    expect((denied as Error).message).toContain('producer-or-source-mismatch');
+  });
+
+  it('keeps every other source to its single writer', async () => {
+    const { consume } = consumer({ ownsDocument: async () => true });
+    const denied = await consume({
+      ...documentEvent('platform-api'),
+      eventName: 'work-graph.conversation.lifecycle.v1',
+      payload: {
+        ...documentEvent('platform-api').payload,
+        source: 'conversation',
+        resource: { source: 'conversation', resourceId: 'chat:c:general', resourceVersion: '1' },
+        payload: { kind: 'conversation', lifecycle: 'contributed', conversationId: 'chat:c:general', conversationKind: 'channel' },
+      },
+    }).catch((e: Error) => e);
+    expect((denied as Error).message).toContain('producer-or-source-mismatch');
+  });
+});
