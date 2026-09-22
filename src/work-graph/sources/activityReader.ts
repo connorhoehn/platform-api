@@ -9,8 +9,16 @@
  */
 import { GetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { tableName } from '../../lib/ddb-table-name';
+import {
+  getPresentationDocumentStore,
+  type PresentationDocumentStore,
+  type StoredSlide,
+} from '../../deck/presentationDocuments';
+import type { AssetBlobStore } from '../../pipeline/image/ImageBlobStore';
+import { getAssetBlobStore } from '../../pipeline/image/visionServices';
 import type {
   ArtifactFacts,
+  ArtifactRevisionFacts,
   RevisionPreview,
   DocumentAttentionFacts,
   MeetingFacts,
@@ -43,6 +51,20 @@ function isInertSvg(markup: string): boolean {
   return lowered.includes('<svg');
 }
 const ERROR_SUMMARY_LENGTH = 160;
+const MAX_REVISIONS = 100;
+const MAX_SLIDES_PER_REVISION = 200;
+const MAX_SOURCES_PER_REVISION = 16;
+
+/**
+ * How the presentation store and the blob store are reached. Both are process
+ * singletons built on first use, so they are resolved at call time rather than
+ * at construction: a deployment with no blob store still serves everything
+ * else the reader can answer.
+ */
+export interface WorkActivityReaderDependencies {
+  presentations?: () => PresentationDocumentStore;
+  blobs?: () => AssetBlobStore;
+}
 
 type Row = Record<string, unknown>;
 
@@ -97,7 +119,10 @@ async function scanOne(client: DynamoDBDocumentClient, table: string, expression
 }
 
 export class DynamoWorkActivityReader implements WorkActivityReader {
-  constructor(private readonly client: DynamoDBDocumentClient) {}
+  constructor(
+    private readonly client: DynamoDBDocumentClient,
+    private readonly deps: WorkActivityReaderDependencies = {},
+  ) {}
 
   async pipelineRun(resource: string): Promise<PipelineRunFacts | null> {
     const { runId: id, stepId } = parsePipelineStepResourceId(resource);
@@ -129,6 +154,15 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const agentLabel = text((definition?.Item as Row | undefined)?.name, 80);
     const attempts = Object.values(steps)
       .map((summary) => (Array.isArray((summary as Row | undefined)?.attempts) ? ((summary as Row).attempts as unknown[]).length : 1));
+    // The step the run is inside right now. A forked node is filed as `id:2`,
+    // so the summary key is trimmed back to the step the plan declared.
+    const running = Object.entries(steps)
+      .filter(([, summary]) => (summary as Row | undefined)?.status === 'running')
+      .map(([stepId, summary]) => ({
+        stepId: stepId.split(':')[0]!,
+        startedAt: Date.parse(iso((summary as Row | undefined)?.startedAt) ?? '') || 0,
+      }))
+      .sort((left, right) => right.startedAt - left.startedAt)[0];
     return {
       runId: id,
       status: runStatus(row.status),
@@ -136,6 +170,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       startedAt,
       updatedAt: iso(row.lastEventAt) ?? iso(row.completedAt) ?? startedAt,
       tools: [...new Set(tools)],
+      ...(running && text(running.stepId, 60) ? { runningStep: { stepId: text(running.stepId, 60) as string } } : {}),
       ...(agentLabel ? { agentLabel } : {}),
       ...(text(row.error, ERROR_SUMMARY_LENGTH) ? { error: text(row.error, ERROR_SUMMARY_LENGTH) as string } : {}),
     };
@@ -242,11 +277,13 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const pageCount = typeof row.pageCount === 'number' && Number.isSafeInteger(row.pageCount) && row.pageCount > 0
       ? row.pageCount
       : anchors.length || undefined;
+    const revisions = storedRevisionFacts(row);
     return {
       ...(text(row.title, 120) ? { name: text(row.title, 120) as string } : {}),
       mediaKind,
       ...(pageCount ? { pageCount } : {}),
       ...(anchors.length ? { anchors } : {}),
+      ...(revisions.length ? { revisions } : {}),
       ...(comments?.Count ? { feedbackCount: comments.Count } : {}),
     };
   }
@@ -258,7 +295,8 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
    * those are rejected here rather than sanitized into something subtly
    * different from what the source actually holds.
    */
-  async revisionPreview(documentId: string, revisionId: string): Promise<RevisionPreview | null> {
+  async revisionPreview(documentId: string, revisionId: string, slideId?: string): Promise<RevisionPreview | null> {
+    if (slideId !== undefined) return this.slidePreview(documentId, revisionId, slideId);
     const row = (await this.client.send(new GetCommand({
       TableName: DOCUMENTS_TABLE,
       Key: { documentId },
@@ -275,6 +313,36 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     if (body.byteLength === 0 || body.byteLength > MAX_PREVIEW_BYTES) return null;
     if (contentType === 'image/svg+xml' && !isInertSvg(body.toString('utf8'))) return null;
     return { contentType: contentType as RevisionPreview['contentType'], body };
+  }
+
+  /**
+   * One slide's own rendered image.
+   *
+   * The revision record names the blob the generator wrote for that slide; the
+   * bytes come from the blob store the record points at, and are held to the
+   * same inert-markup rule as an inline preview. A slide the record does not
+   * name — or whose bytes are gone — is absent, never another slide's image.
+   */
+  private async slidePreview(documentId: string, revisionId: string, slideId: string): Promise<RevisionPreview | null> {
+    const store = (this.deps.presentations ?? getPresentationDocumentStore);
+    const row = await Promise.resolve()
+      .then(() => store().get(documentId))
+      .catch(() => null);
+    if (!row) return null;
+    const recorded = row.revisions?.find((revision) => revision.id === revisionId)?.slides
+      ?? row.revisionSlides?.[revisionId]
+      ?? [];
+    const slide = recorded.find((entry) => entry?.id === slideId);
+    if (!slide?.asset?.key) return null;
+    const blob = await Promise.resolve()
+      .then(() => (this.deps.blobs ?? getAssetBlobStore)().getBlob(slide.asset.key))
+      .catch(() => null);
+    if (!blob) return null;
+    const contentType = String(blob.asset?.contentType ?? slide.asset.contentType ?? '');
+    if (!ALLOWED_PREVIEW_TYPES.has(contentType)) return null;
+    if (blob.body.byteLength === 0 || blob.body.byteLength > MAX_PREVIEW_BYTES) return null;
+    if (contentType === 'image/svg+xml' && !isInertSvg(blob.body.toString('utf8'))) return null;
+    return { contentType: contentType as RevisionPreview['contentType'], body: blob.body };
   }
 
   async transcript(transcriptId: string): Promise<TranscriptFacts | null> {
@@ -362,4 +430,64 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const expiresAt = new Date(Date.parse(observedAt) + ATTENTION_LEASE_MS).toISOString();
     return { actorId, observedAt, expiresAt };
   }
+}
+
+/**
+ * What each stored revision is made of, read from the document's own row.
+ *
+ * `revisions[]` is written by the presentation store; `revisionSlides[rev]` is
+ * the same list keyed by revision, and either is authoritative. A row that
+ * records neither — the hand-seeded deck, or any text document — yields no
+ * revision facts at all, so nothing downstream invents a slide list for it.
+ */
+function storedRevisionFacts(row: Row): ArtifactRevisionFacts[] {
+  const stored = Array.isArray(row.revisions) ? row.revisions : [];
+  const byRevision = row.revisionSlides && typeof row.revisionSlides === 'object' && !Array.isArray(row.revisionSlides)
+    ? row.revisionSlides as Row
+    : {};
+  return stored
+    .slice(0, MAX_REVISIONS)
+    .map((entry) => {
+      const revision = entry as Row | undefined;
+      const id = text(revision?.id, 120);
+      if (!id) return undefined;
+      // Either place is authoritative; the revision's own list wins when it has
+      // one, and an empty list there is not a claim that the revision is empty.
+      const own = Array.isArray(revision?.slides) ? revision.slides as unknown[] : [];
+      const recorded = own.length
+        ? own
+        : Array.isArray(byRevision[id]) ? byRevision[id] as unknown[] : [];
+      const slides = recorded
+        .slice(0, MAX_SLIDES_PER_REVISION)
+        .map((value, position) => {
+          const slide = value as Partial<StoredSlide> | undefined;
+          const slideId = text(slide?.id, 120);
+          if (!slideId) return undefined;
+          const index = typeof slide?.index === 'number' && Number.isSafeInteger(slide.index) && slide.index > 0
+            ? slide.index
+            : position + 1;
+          // A slide the source did not title is still a real slide; its number
+          // is the only thing we know about it, so that is what it is called.
+          return { id: slideId, index, title: text(slide?.title, 80) ?? `Slide ${index}` };
+        })
+        .filter((value): value is { id: string; index: number; title: string } => !!value);
+      const declared = Array.isArray(revision?.sources) ? revision.sources as unknown[] : [];
+      const sources = declared
+        .slice(0, MAX_SOURCES_PER_REVISION)
+        .map((value) => {
+          const source = value as Row | undefined;
+          const sourceDocument = text(source?.documentId, 200);
+          const title = text(source?.title, 120);
+          return sourceDocument && title ? { documentId: sourceDocument, title } : undefined;
+        })
+        .filter((value): value is { documentId: string; title: string } => !!value);
+      const slideCount = typeof revision?.slideCount === 'number'
+        && Number.isSafeInteger(revision.slideCount)
+        && revision.slideCount > 0
+        ? revision.slideCount
+        : slides.length;
+      if (!slideCount) return undefined;
+      return { id, slideCount, slides, ...(sources.length ? { sources } : {}) };
+    })
+    .filter((value): value is ArtifactRevisionFacts => !!value);
 }

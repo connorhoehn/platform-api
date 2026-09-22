@@ -33,7 +33,7 @@ import { workGraphAuthorizationRevision } from './authorizationRevision';
 import log from '../lib/logger';
 import {
   buildWorkActivity,
-  parsePreviewHandle,
+  parsePreviewHandles,
   type RevisionPreview,
   type WorkActivityReader,
 } from './activity';
@@ -800,12 +800,38 @@ export class WorkGraphOrchestrator {
   ): Promise<RevisionPreview> {
     const reader = this.deps.activityReader;
     if (!reader) throw new WorkGraphInputError('Revision previews are not available on this deployment.');
-    const parsed = parsePreviewHandle(handle);
-    if (!parsed) throw unavailable();
+    const candidates = parsePreviewHandles(handle);
+    if (candidates.length === 0) throw unavailable();
 
     const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone);
-    const node = snapshot.nodes.find((candidate) => candidate.id === parsed.nodeId);
-    if (!node || node.kind !== 'document' || node.locked || node.disclosure !== 'details') throw unavailable();
+    // A handle reads as a slide or as a revision; only the ones naming an
+    // artifact node this viewer already holds at full disclosure survive.
+    const named = candidates.filter((candidate) => {
+      const node = snapshot.nodes.find((item) => item.id === candidate.nodeId);
+      return !!node && node.kind === 'document' && !node.locked && node.disclosure === 'details';
+    });
+    if (named.length === 0) throw unavailable();
+
+    // The revision — and the slide, when the handle names one — has to be one
+    // this same snapshot listed. A handle naming a revision the viewer was
+    // never shown is indistinguishable from absent.
+    const activity = await buildWorkActivity({
+      query: this.resolveWindow(personId, day, timezone, {}, this.deps.now()),
+      nodes: snapshot.nodes,
+      edges: snapshot.edges,
+      authorization,
+      reader,
+      now: this.deps.now(),
+    });
+    const parsed = named.find((candidate) => {
+      const revision = activity.details
+        .find((detail) => detail.nodeId === candidate.nodeId)?.artifact?.revisions
+        .find((item) => item.id === candidate.revisionId);
+      if (!revision) return false;
+      return candidate.slideId === undefined
+        || (revision.anchors ?? []).some((anchor) => anchor.id === candidate.slideId);
+    });
+    if (!parsed) throw unavailable();
 
     const target = authorization.targets.get(parsed.nodeId);
     if (!target || target.kind !== 'node') throw unavailable();
@@ -818,22 +844,7 @@ export class WorkGraphOrchestrator {
     if (decision === 'unavailable') throw new WorkGraphAuthorizationUnavailableError('Preview authorization is unavailable.');
     if (decision !== 'allow') throw new WorkGraphCapabilityDeniedError('Viewing this revision is not permitted.');
 
-    // The revision has to be one this same snapshot listed. A handle naming a
-    // revision the viewer was never shown is indistinguishable from absent.
-    const activity = await buildWorkActivity({
-      query: this.resolveWindow(personId, day, timezone, {}, this.deps.now()),
-      nodes: snapshot.nodes,
-      edges: snapshot.edges,
-      authorization,
-      reader,
-      now: this.deps.now(),
-    });
-    const listed = activity.details
-      .find((detail) => detail.nodeId === parsed.nodeId)?.artifact?.revisions
-      .some((revision) => revision.id === parsed.revisionId);
-    if (!listed) throw unavailable();
-
-    const preview = await reader.revisionPreview(target.sourceRef.resourceId, parsed.revisionId);
+    const preview = await reader.revisionPreview(target.sourceRef.resourceId, parsed.revisionId, parsed.slideId);
     if (!preview) throw unavailable();
     return preview;
   }

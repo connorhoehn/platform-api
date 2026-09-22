@@ -116,6 +116,15 @@ const grant: StoredWorkGrant = {
   revision: 1,
 };
 
+/** Three slides, the middle one titled differently per revision. */
+function deckSlides(middle: string): Array<{ id: string; index: number; title: string }> {
+  return [
+    { id: 'slide-1', index: 1, title: 'Sprint review' },
+    { id: 'slide-2', index: 2, title: middle },
+    { id: 'slide-3', index: 3, title: 'Next steps' },
+  ];
+}
+
 function reader(overrides: Partial<WorkActivityReader> = {}): WorkActivityReader {
   return {
     pipelineRun: async (runId) => (runId === 'run-9'
@@ -131,11 +140,19 @@ function reader(overrides: Partial<WorkActivityReader> = {}): WorkActivityReader
         mediaKind: 'presentation' as const,
         pageCount: 12,
         anchors: [{ kind: 'slide' as const, id: 'slide-4', label: 'Release readiness', index: 4 }],
+        // What the presentation store actually wrote: each revision has its
+        // own slides, and v2 retitled one of them.
+        revisions: [
+          { id: 'v1', slideCount: 3, slides: deckSlides('Release readiness') },
+          { id: 'v2', slideCount: 3, slides: deckSlides('Release readiness and owners') },
+        ],
         feedbackCount: 2,
       }
       : { name: 'Release plan', mediaKind: 'document' as const }),
-    revisionPreview: async (documentId, revisionId) => (documentId === 'doc-deck' && revisionId === 'v2'
-      ? { contentType: 'image/svg+xml' as const, body: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>', 'utf8') }
+    revisionPreview: async (documentId, revisionId, slideId) => (documentId === 'doc-deck'
+      && ((revisionId === 'v2' && slideId === undefined)
+        || (revisionId === 'v1' && slideId === 'slide-3'))
+      ? { contentType: 'image/svg+xml' as const, body: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" id="${revisionId}-${slideId ?? 'cover'}"/>`, 'utf8') }
       : null),
     transcript: async (transcriptId) => (transcriptId === 'transcript-1'
       ? {
@@ -301,7 +318,8 @@ describe('work graph schemaVersion 2 route', () => {
     expect(deck?.artifact?.mediaKind).toBe('presentation');
     expect(deck?.artifact?.revisions.map((revision) => revision.label)).toEqual(['v1', 'v2']);
     expect(deck?.artifact?.pending).toMatchObject({ revisionId: 'v3', label: 'v3', status: 'generating', attemptId: 'attempt-3' });
-    expect(deck?.artifact?.pageCount).toBe(12);
+    // The newest revision's own slide count, not the document's page count.
+    expect(deck?.artifact?.pageCount).toBe(3);
     expect(deck?.feedback).toEqual({ count: 2, through: NOW });
     expect(deck?.footer).toEqual({ label: 'First draft · 09:27', note: 'Shared' });
     expect(deck?.artifact?.revisions[1].previewHandle).toBe('deck.v2');
@@ -432,6 +450,140 @@ describe('work graph schemaVersion 2 route', () => {
     expect((await get(app, url('transcript.v2'))).statusCode).toBe(404);
     expect((await get(app, url('deck.v2'), 'mallory')).statusCode).toBe(404);
     expect((await get(app, url('nothandle'))).statusCode).toBe(404);
+  });
+
+  it('gives every revision its own slides, so the navigator moves between real ones', async () => {
+    const body = (await get(setup(), v2)).body as WorkGraphSnapshotV2;
+    expect(validateWorkGraphSnapshotV2(body).ok).toBe(true);
+    const deck = body.details.find((detail) => detail.nodeId === 'deck');
+    const [v1, v2Revision] = deck?.artifact?.revisions ?? [];
+
+    // Both revisions carry all three slides — not just the newest, and not the
+    // document outline repeated on each of them.
+    expect(v1?.anchors?.map((anchor) => `${anchor.index}. ${anchor.label}`))
+      .toEqual(['1. Sprint review', '2. Release readiness', '3. Next steps']);
+    expect(v2Revision?.anchors?.map((anchor) => anchor.label))
+      .toEqual(['Sprint review', 'Release readiness and owners', 'Next steps']);
+    expect(v1?.anchors?.every((anchor) => anchor.kind === 'slide')).toBe(true);
+    expect(deck?.artifact?.pageCount).toBe(3);
+    expect(v1?.previewHandle).toBe('deck.v1');
+  });
+
+  it('keeps a document whose source records no per-revision slides exactly as it was', async () => {
+    // The hand-seeded deck: an outline and one preview per revision, no
+    // `revisions[]` on the row. Its newest revision still gets the outline.
+    const seeded = reader({
+      artifact: async (documentId) => (documentId === 'doc-deck'
+        ? {
+          name: 'Sprint review',
+          mediaKind: 'presentation' as const,
+          pageCount: 12,
+          anchors: [{ kind: 'slide' as const, id: 'slide-4', label: 'Release readiness', index: 4 }],
+          feedbackCount: 2,
+        }
+        : { name: 'Release plan', mediaKind: 'document' as const }),
+    });
+    const body = (await get(setup({ activityReader: seeded }), v2)).body as WorkGraphSnapshotV2;
+    const deck = body.details.find((detail) => detail.nodeId === 'deck');
+    expect(deck?.artifact?.pageCount).toBe(12);
+    expect(deck?.artifact?.revisions[0]?.anchors).toBeUndefined();
+    expect(deck?.artifact?.revisions[1]?.anchors?.map((anchor) => anchor.id)).toEqual(['slide-4']);
+  });
+
+  it('serves one slide of one revision, and only a slide the snapshot listed', async () => {
+    const app = setup();
+    const url = (handle: string) => `/api/work-graph/previews/${handle}?personId=connor&day=${DAY}&timezone=America%2FNew_York`;
+
+    const slide = await get(app, url('deck.v1.slide-3'));
+    expect(slide.statusCode).toBe(200);
+    expect(slide.headers['content-type']).toBe('image/svg+xml');
+    expect(String(slide.body)).toContain('id="v1-slide-3"');
+
+    // The revision handle still names the revision's own cover image.
+    const cover = await get(app, url('deck.v2'));
+    expect(cover.statusCode).toBe(200);
+    expect(String(cover.body)).toContain('id="v2-cover"');
+
+    // A slide this revision does not have, a revision that was never listed,
+    // and a viewer with no share are the same answer.
+    expect((await get(app, url('deck.v1.slide-9'))).statusCode).toBe(404);
+    expect((await get(app, url('deck.v9.slide-1'))).statusCode).toBe(404);
+    expect((await get(app, url('deck.v1.slide-3'), 'mallory')).statusCode).toBe(404);
+  });
+
+  it('names the artifact\'s provenance from what the revision itself cited', async () => {
+    const cited = reader({
+      artifact: async (documentId) => (documentId === 'doc-deck'
+        ? {
+          name: 'Sprint review',
+          mediaKind: 'presentation' as const,
+          revisions: [
+            { id: 'v1', slideCount: 3, slides: deckSlides('Release readiness') },
+            {
+              id: 'v2',
+              slideCount: 3,
+              slides: deckSlides('Release readiness and owners'),
+              // The deck cited only the plan, though its run read both.
+              sources: [{ documentId: 'doc-release', title: 'Release plan' }],
+            },
+          ],
+        }
+        : { name: 'Release plan', mediaKind: 'document' as const }),
+    });
+    const body = (await get(setup({ activityReader: cited }), v2)).body as WorkGraphSnapshotV2;
+    const deck = body.details.find((detail) => detail.nodeId === 'deck');
+    expect(deck?.sources?.map((item) => item.nodeId)).toEqual(['release-plan']);
+  });
+
+  it('drops a cited document this viewer has no node for', async () => {
+    const elsewhere = reader({
+      artifact: async (documentId) => (documentId === 'doc-deck'
+        ? {
+          name: 'Sprint review',
+          mediaKind: 'presentation' as const,
+          revisions: [{
+            id: 'v2',
+            slideCount: 1,
+            slides: [{ id: 'slide-1', index: 1, title: 'Sprint review' }],
+            sources: [{ documentId: 'doc-somewhere-else', title: 'Private notes' }],
+          }],
+        }
+        : { name: 'Release plan', mediaKind: 'document' as const }),
+    });
+    const body = (await get(setup({ activityReader: elsewhere }), v2)).body as WorkGraphSnapshotV2;
+    const deck = body.details.find((detail) => detail.nodeId === 'deck');
+    expect(deck?.sources).toBeUndefined();
+  });
+
+  it('says the pending attempt is rendering only while the deck step is running', async () => {
+    const rendering = reader({
+      pipelineRun: async (runId) => (runId === 'run-9'
+        ? {
+          runId, status: 'running' as const, attempt: 3, agentLabel: 'Presentation agent',
+          startedAt: at('13:33'), updatedAt: at('13:42'),
+          tools: ['Sources', 'Deck'],
+          runningStep: { stepId: 'deck' },
+        }
+        : null),
+    });
+    const body = (await get(setup({ activityReader: rendering }), v2)).body as WorkGraphSnapshotV2;
+    expect(validateWorkGraphSnapshotV2(body).ok).toBe(true);
+    expect(body.details.find((detail) => detail.nodeId === 'deck')?.artifact?.pending)
+      .toMatchObject({ label: 'v3', status: 'generating', message: 'Rendering v3' });
+
+    // A run inside a different step is still generating, and says nothing more.
+    const reading = reader({
+      pipelineRun: async (runId) => (runId === 'run-9'
+        ? {
+          runId, status: 'running' as const, attempt: 3,
+          startedAt: at('13:33'), updatedAt: at('13:42'), tools: ['Sources'],
+          runningStep: { stepId: 'sources' },
+        }
+        : null),
+    });
+    const quiet = (await get(setup({ activityReader: reading }), v2)).body as WorkGraphSnapshotV2;
+    expect(quiet.details.find((detail) => detail.nodeId === 'deck')?.artifact?.pending?.message)
+      .toBeUndefined();
   });
 
   it('refuses schemaVersion 2 on a deployment without an activity reader', async () => {

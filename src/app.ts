@@ -75,6 +75,11 @@ export function createApp(): express.Application {
   // global limit. Scoped to the one path that carries them; body-parser marks
   // the request parsed, so the global parser below leaves it alone.
   app.use('/api/media', express.json({ limit: '40mb' }));
+  // A DeckSpec is bigger than the 100kb the global parser allows — 40 slides of
+  // bullets, notes and citations. These two paths take one up to 2mb so the
+  // deck routes' own cap (MAX_SPEC_BYTES) is what answers 413, rather than
+  // body-parser throwing a 500 on the way in.
+  app.use(['/api/deck', '/api/documents/:documentId/revisions'], express.json({ limit: '2mb' }));
   app.use(express.json({
     type: (req) =>
       shouldParseJsonBody(

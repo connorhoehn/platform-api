@@ -16,6 +16,7 @@ import {
   WORK_GRAPH_LIMITS,
   WORK_GRAPH_V2_LIMITS,
   type DeriveWorkEffortsInput,
+  type ViewerArtifactRevision,
   type ViewerWorkActivityDetail,
   type ViewerWorkNodeLink,
   type ViewerWorkOperation,
@@ -38,6 +39,12 @@ export interface PipelineRunFacts {
   tools: string[];
   /** Sanitized failure summary. Never a stack trace, path, or credential. */
   error?: string;
+  /**
+   * The step this run is executing right now, taken from the run's own step
+   * state. A run is "running" for as long as it holds the lease; this says
+   * which of its steps is actually doing the work.
+   */
+  runningStep?: { stepId: string };
   /**
    * Present only when the node names ONE step of the run (`runId#stepId`).
    * Every field is copied from the step's own recorded output or its live
@@ -70,19 +77,62 @@ export const PREVIEW_HANDLE_SEPARATOR = '.';
  * carries no source identifier and grants nothing on its own — the route it
  * is handed to re-authorizes the node before serving a byte.
  */
-export function previewHandle(nodeId: string, revisionId: string): string {
-  return `${nodeId}${PREVIEW_HANDLE_SEPARATOR}${revisionId}`;
+export function previewHandle(nodeId: string, revisionId: string, slideId?: string): string {
+  return [nodeId, revisionId, ...(slideId ? [slideId] : [])].join(PREVIEW_HANDLE_SEPARATOR);
 }
 
-export function parsePreviewHandle(handle: string): { nodeId: string; revisionId: string } | null {
-  const separator = handle.lastIndexOf(PREVIEW_HANDLE_SEPARATOR);
-  if (separator <= 0 || separator === handle.length - 1) return null;
-  return { nodeId: handle.slice(0, separator), revisionId: handle.slice(separator + 1) };
+export interface ParsedPreviewHandle {
+  nodeId: string;
+  revisionId: string;
+  /** Present only for a per-slide handle, `<nodeId>.<revisionId>.<slideId>`. */
+  slideId?: string;
+}
+
+/**
+ * Every reading of a handle, most specific first.
+ *
+ * A node id may itself contain dots, so `a.b.c` is either slide `c` of
+ * revision `b` on node `a`, or revision `c` on node `a.b`. Both are returned
+ * and the caller keeps whichever one this snapshot actually listed — guessing
+ * here would answer for a revision the viewer was never shown.
+ */
+export function parsePreviewHandles(handle: string): ParsedPreviewHandle[] {
+  const parts = handle.split(PREVIEW_HANDLE_SEPARATOR);
+  const candidates: ParsedPreviewHandle[] = [];
+  if (parts.length >= 3) {
+    const slideId = parts[parts.length - 1]!;
+    const revisionId = parts[parts.length - 2]!;
+    const nodeId = parts.slice(0, parts.length - 2).join(PREVIEW_HANDLE_SEPARATOR);
+    if (nodeId && revisionId && slideId) candidates.push({ nodeId, revisionId, slideId });
+  }
+  if (parts.length >= 2) {
+    const revisionId = parts[parts.length - 1]!;
+    const nodeId = parts.slice(0, parts.length - 1).join(PREVIEW_HANDLE_SEPARATOR);
+    if (nodeId && revisionId) candidates.push({ nodeId, revisionId });
+  }
+  return candidates;
 }
 
 export interface RevisionPreview {
   contentType: 'image/svg+xml' | 'image/png' | 'image/jpeg' | 'image/webp';
   body: Buffer;
+}
+
+/**
+ * One revision as the source's own record describes it: the slides it is made
+ * of and the documents it declared it was built from. A presentation stores
+ * this per revision, so slide 7 of v1 is a different slide from slide 7 of v2.
+ */
+export interface ArtifactRevisionFacts {
+  id: string;
+  /** How many slides the source says this revision has. */
+  slideCount: number;
+  slides: Array<{ id: string; index: number; title: string }>;
+  /**
+   * The documents this revision cites, as the generator recorded them. Absent
+   * when the source declared none — never the run's inputs guessed into place.
+   */
+  sources?: Array<{ documentId: string; title: string }>;
 }
 
 export interface ArtifactFacts {
@@ -92,6 +142,8 @@ export interface ArtifactFacts {
   pageCount?: number;
   /** Addressable units of the newest available revision. */
   anchors?: Array<{ kind: 'slide' | 'page' | 'block'; id: string; label: string; index?: number }>;
+  /** What each stored revision is made of, keyed by the source's revision id. */
+  revisions?: ArtifactRevisionFacts[];
   /** Comments this viewer may read, counted at the query cutoff. */
   feedbackCount?: number;
 }
@@ -124,8 +176,11 @@ export interface DocumentAttentionFacts {
 export interface WorkActivityReader {
   pipelineRun(runId: string): Promise<PipelineRunFacts | null>;
   artifact(documentId: string): Promise<ArtifactFacts | null>;
-  /** The stored bytes for one revision, or null when the source has none. */
-  revisionPreview(documentId: string, revisionId: string): Promise<RevisionPreview | null>;
+  /**
+   * The stored bytes for one revision, or for one slide of it when the caller
+   * names a slide. Null when the source has none.
+   */
+  revisionPreview(documentId: string, revisionId: string, slideId?: string): Promise<RevisionPreview | null>;
   transcript(transcriptId: string): Promise<TranscriptFacts | null>;
   meeting(meetingId: string): Promise<MeetingFacts | null>;
   /** Authoritative human attention, with its own expiry. Never a socket. */
@@ -314,6 +369,25 @@ function producingRun(index: GraphIndex, documentId: string): ViewerWorkNode | u
   return undefined;
 }
 
+/**
+ * The step that draws a presentation's slides. A run holding its lease is
+ * "running"; a run inside THIS step is rendering, which is what the pending
+ * attempt on the card is allowed to say it is doing.
+ */
+const PRESENTATION_RENDER_STEP = 'deck';
+
+/**
+ * Whether the run is rendering right now, from the run's own step state: the
+ * run record's running step, or — when the loop files each step as its own
+ * node — that step node's own record. Never inferred from the run's status.
+ */
+function isRendering(runState: PipelineRunFacts, runFacts: Map<string, PipelineRunFacts>): boolean {
+  if (runState.runningStep?.stepId === PRESENTATION_RENDER_STEP) return true;
+  return [...runFacts.values()].some((facts) => facts.runId === runState.runId
+    && facts.status === 'running'
+    && facts.step?.stepId === PRESENTATION_RENDER_STEP);
+}
+
 /** The evidence a run declared it consumed. Only `derived-from` counts. */
 function runInputs(index: GraphIndex, runId: string): ViewerWorkNode[] {
   return (index.out.get(runId) ?? [])
@@ -362,6 +436,15 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       ...revision,
       label: revisionLabel(revision.id, position),
     })));
+  }
+
+  // Which node a source record belongs to, so a document a revision cites by
+  // its own id can be named as the node this viewer already sees — and dropped
+  // entirely when they see no such node.
+  const nodesByResource = new Map<string, ViewerWorkNode>();
+  for (const node of nodes) {
+    const resourceId = storedNode(authorization, node.id)?.sourceRef.resourceId;
+    if (resourceId && !nodesByResource.has(resourceId)) nodesByResource.set(resourceId, node);
   }
 
   const runFacts = new Map<string, PipelineRunFacts>();
@@ -508,7 +591,11 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       const revisions = documentId ? revisionsByDocument.get(documentId) ?? [] : [];
       const run = producingRun(index, node.id);
       const attention = documentId ? await reader.attention(documentId) : null;
-      const sources = run
+      // What each listed revision is actually made of, as its own source
+      // recorded it. A revision the source has no record of keeps whatever the
+      // projected change node said and gains nothing.
+      const storedRevisions = new Map((facts?.revisions ?? []).map((revision) => [revision.id, revision]));
+      const runSources = run
         ? runInputs(index, run.id)
           .map((target) => link(
             target,
@@ -516,6 +603,21 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
           ))
           .filter((value): value is ViewerWorkNodeLink => !!value)
         : [];
+      // Provenance is what the newest revision itself cited, when it cited
+      // anything: a deck records the documents its slides were written from,
+      // which is narrower and more truthful than everything its run read. A
+      // citation the viewer has no node for is dropped, not named by its id.
+      const declaredSources = [...revisions].reverse()
+        .map((revision) => storedRevisions.get(revision.id)?.sources)
+        .find((list) => !!list && list.length > 0);
+      const sources = declaredSources
+        ? declaredSources
+          .map((source) => nodesByResource.get(source.documentId))
+          .map((target) => (target
+            ? link(target, target.kind === 'transcript' ? 'Meeting transcript' : trim(target.description))
+            : undefined))
+          .filter((value): value is ViewerWorkNodeLink => !!value)
+        : runSources;
 
       const newestRevision = revisions[revisions.length - 1];
       if (!run) {
@@ -536,28 +638,48 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
           : undefined;
       // The attempt is named by the run's own attempt counter, and the pending
       // revision id is the one the source has not yet written.
+      const pendingLabel = `v${revisions.length + 1}`;
+      // "Rendering v3" is the run's own step state speaking, not a word chosen
+      // for a running run: a generating attempt says nothing until the step
+      // that draws the slides is the one executing.
+      const renderingMessage = pendingStatus === 'generating' && runState && isRendering(runState, runFacts)
+        ? `Rendering ${pendingLabel}`
+        : undefined;
       const pending = pendingStatus && runState
         ? {
-          revisionId: `v${revisions.length + 1}`,
+          revisionId: pendingLabel,
           attemptId: `attempt-${runState.attempt}`,
-          label: `v${revisions.length + 1}`,
+          label: pendingLabel,
           status: pendingStatus,
           startedAt: new Date(Date.parse(runState.startedAt)).toISOString(),
           updatedAt: new Date(Math.max(Date.parse(runState.updatedAt), Date.parse(runState.startedAt))).toISOString(),
           ...(pendingStatus === 'failed' && trim(runState.error) ? { message: trim(runState.error) as string } : {}),
+          ...(renderingMessage ? { message: renderingMessage } : {}),
         }
         : undefined;
 
-      const anchoredRevisions = revisions.map((revision, position) => ({
-        ...revision,
-        // The handle is offered for every listed revision; the route decides
-        // whether bytes exist, so a missing preview is a 404 and not a
-        // differently-shaped snapshot.
-        previewHandle: previewHandle(node.id, revision.id),
-        ...(position === revisions.length - 1 && facts?.anchors?.length
-          ? { anchors: facts.anchors.slice(0, 200) }
-          : {}),
-      }));
+      const anchoredRevisions: ViewerArtifactRevision[] = revisions.map((revision, position) => {
+        // Every slide of THIS revision, named by the revision's own record, so
+        // the navigator moves between real slides rather than repeating the
+        // newest revision's outline on every one of them. Each slide's bytes
+        // are reachable as `<previewHandle>.<slideId>`.
+        const slides = storedRevisions.get(revision.id)?.slides ?? [];
+        const anchors = slides.length
+          ? slides.map((slide) => ({ kind: 'slide' as const, id: slide.id, label: slide.title, index: slide.index }))
+          : position === revisions.length - 1 ? facts?.anchors ?? [] : [];
+        return {
+          ...revision,
+          // The handle is offered for every listed revision; the route decides
+          // whether bytes exist, so a missing preview is a 404 and not a
+          // differently-shaped snapshot.
+          previewHandle: previewHandle(node.id, revision.id),
+          ...(anchors.length ? { anchors: anchors.slice(0, WORK_GRAPH_V2_LIMITS.anchors) } : {}),
+        };
+      });
+      // The newest revision's own slide count, which is what the pane counts
+      // against; the document's `pageCount` is the fallback for a source that
+      // records no per-revision slides.
+      const pageCount = (newest && storedRevisions.get(newest.id)?.slideCount) || facts?.pageCount;
 
       const firstDraft = revisions[0] && clock(revisions[0].createdAt, query.timezone);
       setDetail(node.id, {
@@ -568,7 +690,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         ...(sources.length ? { sources } : {}),
         artifact: {
           mediaKind: facts?.mediaKind ?? 'document',
-          ...(facts?.pageCount ? { pageCount: facts.pageCount } : {}),
+          ...(pageCount ? { pageCount } : {}),
           revisions: anchoredRevisions,
           ...(pending ? { pending } : {}),
         },
