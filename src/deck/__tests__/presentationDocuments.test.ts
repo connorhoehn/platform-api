@@ -18,6 +18,7 @@ import {
   type PresentationDocumentRow,
 } from '../presentationDocuments';
 import { PPTX_CONTENT_TYPE } from '../renderPptx';
+import { sampleDeck } from './fixtures';
 
 interface Sent { command: unknown; input: Record<string, unknown> }
 
@@ -118,6 +119,40 @@ describe('appendRevision — a second revision', () => {
     expect(Object.keys(values[':revisionSlides'] as object)).toEqual(['v1', 'v2']);
     expect(values[':pageCount']).toBe(2);
     expect(values[':type']).toBe('presentation');
+  });
+});
+
+describe('a revision names what it stands on', () => {
+  it('derives sources from the spec’s citations, telling a transcript from a document', async () => {
+    const blobStore = new InMemoryImageBlobStore();
+    const { client } = fakeClient(() => null);
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore, now: () => new Date('2026-09-21T10:00:00.000Z') });
+    const spec = sampleDeck();
+    spec.slides[1]!.sources = [{ documentId: 'transcript:planning-sync', title: 'Planning sync' }];
+
+    const { revision } = await store.appendRevision({
+      documentId: 'doc-1', title: 'Q4 platform review', createdBy: 'user-frank',
+      pptx: Buffer.from('PKdeck'), slides, spec,
+    });
+
+    expect(revision.spec).toEqual(spec);
+    expect(revision.sources).toEqual([
+      { documentId: 'doc-sprint-review', title: 'Sprint review', kind: 'document' },
+      { documentId: 'transcript:planning-sync', title: 'Planning sync', kind: 'transcript' },
+      { documentId: 'doc-roadmap', title: 'Q4 roadmap', kind: 'document', anchor: 'h2-q4' },
+    ]);
+  });
+
+  it('takes sources the caller declares over the spec’s own', async () => {
+    const blobStore = new InMemoryImageBlobStore();
+    const { client } = fakeClient(() => null);
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore, now: () => new Date('2026-09-21T10:00:00.000Z') });
+    const { revision } = await store.appendRevision({
+      documentId: 'doc-1', title: 'T', createdBy: 'u', pptx: Buffer.from('PK'), slides,
+      spec: sampleDeck(),
+      sources: [{ documentId: 'doc-x', title: 'X', kind: 'document' }],
+    });
+    expect(revision.sources).toEqual([{ documentId: 'doc-x', title: 'X', kind: 'document' }]);
   });
 });
 

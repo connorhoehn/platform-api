@@ -105,6 +105,12 @@ export interface AppendRevisionInput {
   slides: Array<{ id: string; title: string; svg: string }>;
   /** The spec the bytes were rendered from, kept so the revision can be edited. */
   spec?: DeckSpec;
+  /**
+   * What the revision stands on. Left out, it is derived from the spec's own
+   * citations — which is what both callers do; pass it only when the sources
+   * are known from somewhere other than the deck itself.
+   */
+  sources?: RevisionSource[];
   /** A name for this revision. Defaults to its id (`v3`). */
   label?: string;
 }
@@ -222,7 +228,10 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       slideCount: slides.length,
       asset: pptxAsset,
       slides,
-      ...(input.spec ? { spec: input.spec, sources: revisionSources(input.spec) } : {}),
+      ...(input.spec ? { spec: input.spec } : {}),
+      ...(input.sources ?? (input.spec ? revisionSources(input.spec) : undefined)
+        ? { sources: input.sources ?? revisionSources(input.spec!) }
+        : {}),
     };
 
     if (!existing) {

@@ -81,6 +81,8 @@ describe('the deck step', () => {
     expect(stored.title).toBe('Q4 platform review');
     expect(stored.pptx.subarray(0, 2).toString('utf8')).toBe('PK');
     expect(stored.slides).toHaveLength(9);
+    // The spec travels with the bytes, so the revision can be reopened and edited.
+    expect(stored.spec?.title).toBe('Q4 platform review');
     expect(stored.slides[8]).toMatchObject({ id: 'sources', title: 'Sources' });
     for (const slide of stored.slides) expect(slide.svg.startsWith('<svg')).toBe(true);
   }, 30_000);
