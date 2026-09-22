@@ -95,7 +95,7 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
 documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
   if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
-  const body = (req.body ?? {}) as { spec?: unknown; label?: unknown; title?: unknown };
+  const body = (req.body ?? {}) as { spec?: unknown; label?: unknown; title?: unknown; transcriptIds?: unknown };
   if (body.spec === undefined) throw new ValidationError('spec is required');
   const outcome = previewDeckSpec(body.spec);
   if (!outcome.ok) {
@@ -105,6 +105,11 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
   const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 80) : undefined;
   const title = typeof body.title === 'string' && body.title.trim() ? body.title.trim().slice(0, 120) : outcome.spec.title;
   const createdBy = req.user?.sub ?? 'unknown';
+  // Which cited ids are transcripts, as the caller knows them. Unsaid means
+  // document: nothing here reads an id's spelling for its kind.
+  const transcriptIds = Array.isArray(body.transcriptIds)
+    ? body.transcriptIds.filter((value): value is string => typeof value === 'string' && !!value.trim()).slice(0, 20)
+    : [];
 
   const pptx = await renderPptx(outcome.spec);
   const { revision } = await getPresentationDocumentStore().appendRevision({
@@ -114,6 +119,7 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
     pptx,
     slides: outcome.preview.slides.map((slide) => ({ id: slide.id, title: slide.title, svg: slide.svg })),
     spec: outcome.spec,
+    ...(transcriptIds.length ? { transcriptIds } : {}),
     ...(label ? { label } : {}),
   });
   log.info({ documentId, revisionId: revision.id, slides: revision.slideCount, userId: createdBy }, 'deck revision saved');

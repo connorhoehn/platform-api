@@ -206,7 +206,9 @@ export async function buildDeckPreviewCard(input: ChatCommandRunInput): Promise<
     specSource: result.source,
     ...(result.reason ? { specSourceReason: result.reason } : {}),
     slideCount: preview.slides.length,
-    warnings: preview.warnings,
+    // What the slides themselves invite, then what the deck left unused.
+    warnings: [...preview.warnings, ...result.warnings],
+    transcriptIds: result.transcriptIds,
     thumbnail: { slideId: first.id, title: first.title, contentType: 'image/svg+xml', svg: first.svg },
     sources: sources.length ? sources : undefined,
     spec: result.spec,

@@ -87,6 +87,18 @@ describe('the deck step', () => {
     for (const slide of stored.slides) expect(slide.svg.startsWith('<svg')).toBe(true);
   }, 30_000);
 
+  it('marks a cited source as a transcript only when the reading step declared it', async () => {
+    const handler = createDeckStepHandler({ store });
+    const spec = sampleDeck();
+    spec.slides[0]!.sources = [{ documentId: 'active-now-planning-transcript', title: 'Planning sync' }];
+    await handler.execute(
+      node({ type: 'deck', spec }),
+      { documentId: 'doc-new', requestedBy: 'user-frank', transcriptSource: { documentId: 'active-now-planning-transcript', title: 'Planning sync' } },
+      helpers(),
+    );
+    expect(store.calls[0]!.transcriptIds).toEqual(['active-now-planning-transcript']);
+  }, 30_000);
+
   it('announces what it produced', async () => {
     const handler = createDeckStepHandler({ store });
     const help = helpers();

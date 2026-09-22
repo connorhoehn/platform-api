@@ -9,7 +9,8 @@ import type { LLMClient } from '../../pipeline/LLMClient';
 import { validateDeckSpec } from '../DeckSpec';
 import {
   FIXTURE_TITLE_PREFIX, NoFixtureMaterialError,
-  buildDeckFixture, citableSources, fixtureSpec, materialBlock, readFixtureMaterial,
+  buildDeckFixture, citableSources, fixturePrompt, fixtureSpec, materialBlock, readFixtureMaterial,
+  transcriptIdsOf, uncitedMaterialWarnings,
   type FixtureMaterial,
 } from '../deckFixture';
 
@@ -139,5 +140,49 @@ describe('buildDeckFixture', () => {
   it('refuses when nothing readable was named', async () => {
     await expect(buildDeckFixture({ recordingId: 'rec-none' }, undefined, { ...deps, llm: null }))
       .rejects.toBeInstanceOf(NoFixtureMaterialError);
+  });
+});
+
+
+describe('every provided material has to be used', () => {
+  const both = {
+    document: { documentId: 'doc-release-plan', title: 'Release plan', text: 'Ship Thursday.' },
+    transcript: { transcriptId: 'active-now-2026-09-21-planning-transcript', title: 'Planning sync', segments: [{ speaker: 'Connor', text: 'Release risks before noon.' }] },
+  } as FixtureMaterial;
+
+  it('is asked for in the prompt', () => {
+    expect(fixturePrompt(both, 'Sprint review')).toContain('EVERY source listed below must be cited');
+  });
+
+  it('warns rather than rejects when a material is never cited', async () => {
+    const onlyTranscript = {
+      title: 'Sprint review',
+      slides: [{
+        id: 'cover', layout: 'title', title: 'Sprint review',
+        sources: [{ documentId: 'active-now-2026-09-21-planning-transcript', title: 'Planning sync' }],
+      }],
+    };
+    const result = await buildDeckFixture({ documentId: 'doc-release-plan', recordingId: 'rec-1' }, 'Sprint review', {
+      ...deps, llm: scriptedModel(JSON.stringify(onlyTranscript)),
+    });
+    expect(result.source).toBe('model');
+    expect(result.warnings).toEqual(['Release plan was provided but not cited.']);
+  });
+
+  it('says nothing when every material is cited', () => {
+    const spec = fixtureSpec(both, 'Sprint review');
+    expect(uncitedMaterialWarnings(spec, both)).toEqual([]);
+  });
+});
+
+describe('a transcript is known by what read it', () => {
+  it('names the transcript id the reader gave it, whatever it is spelled like', async () => {
+    const result = await buildDeckFixture({ recordingId: 'rec-1' }, 'Planning sync', { ...deps, llm: null });
+    expect(result.transcriptIds).toEqual([RECORDING.transcriptId]);
+    expect(RECORDING.transcriptId.startsWith('transcript')).toBe(false);
+  });
+
+  it('names none when no recording was read', () => {
+    expect(transcriptIdsOf({ document: { documentId: 'd', title: 'D', text: '' } })).toEqual([]);
   });
 });

@@ -99,17 +99,21 @@ describe('POST /api/deck/fixture', () => {
     buildDeckFixture.mockResolvedValue({
       spec: sampleDeck(),
       source: 'model',
+      warnings: ['Release plan was provided but not cited.'],
+      transcriptIds: ['active-now-planning-transcript'],
       material: { document: { documentId: 'doc-release-plan', title: 'Release plan', text: 'xxx' } },
     });
     const res = await post('/api/deck/fixture', { from: { documentId: 'doc-release-plan' }, title: 'Sprint review' });
     expect(res.status).toBe(200);
     expect(res.body.source).toBe('model');
     expect((res.body.material as Record<string, unknown>).document).toMatchObject({ documentId: 'doc-release-plan', characters: 3 });
+    expect(res.body.warnings).toEqual(['Release plan was provided but not cited.']);
+    expect(res.body.transcriptIds).toEqual(['active-now-planning-transcript']);
     expect(buildDeckFixture).toHaveBeenCalledWith({ documentId: 'doc-release-plan' }, 'Sprint review', {});
   });
 
   it('passes the fallback reason through rather than hiding it', async () => {
-    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'fixture', reason: 'no model is configured on this deployment', material: {} });
+    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'fixture', reason: 'no model is configured on this deployment', warnings: [], transcriptIds: [], material: {} });
     const res = await post('/api/deck/fixture', { from: { recordingId: 'rec-1' } });
     expect(res.status).toBe(200);
     expect(res.body.source).toBe('fixture');

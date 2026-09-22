@@ -123,24 +123,38 @@ describe('appendRevision — a second revision', () => {
 });
 
 describe('a revision names what it stands on', () => {
-  it('derives sources from the spec’s citations, telling a transcript from a document', async () => {
+  it('derives sources from the spec’s citations, and calls a transcript one only when it was declared', async () => {
     const blobStore = new InMemoryImageBlobStore();
     const { client } = fakeClient(() => null);
     const store = new DdbPresentationDocumentStore({ docClient: client, blobStore, now: () => new Date('2026-09-21T10:00:00.000Z') });
     const spec = sampleDeck();
-    spec.slides[1]!.sources = [{ documentId: 'transcript:planning-sync', title: 'Planning sync' }];
+    // Spelled like any other document id — the seeded transcript is.
+    spec.slides[1]!.sources = [{ documentId: 'active-now-2026-09-21-planning-transcript', title: 'Planning sync' }];
 
     const { revision } = await store.appendRevision({
       documentId: 'doc-1', title: 'Q4 platform review', createdBy: 'user-frank',
       pptx: Buffer.from('PKdeck'), slides, spec,
+      transcriptIds: ['active-now-2026-09-21-planning-transcript'],
     });
 
     expect(revision.spec).toEqual(spec);
     expect(revision.sources).toEqual([
       { documentId: 'doc-sprint-review', title: 'Sprint review', kind: 'document' },
-      { documentId: 'transcript:planning-sync', title: 'Planning sync', kind: 'transcript' },
+      { documentId: 'active-now-2026-09-21-planning-transcript', title: 'Planning sync', kind: 'transcript' },
       { documentId: 'doc-roadmap', title: 'Q4 roadmap', kind: 'document', anchor: 'h2-q4' },
     ]);
+  });
+
+  it('calls an undeclared source a document, however it is spelled', async () => {
+    const blobStore = new InMemoryImageBlobStore();
+    const { client } = fakeClient(() => null);
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore, now: () => new Date('2026-09-21T10:00:00.000Z') });
+    const spec = sampleDeck();
+    spec.slides[0]!.sources = [{ documentId: 'transcript-of-a-meeting-that-is-a-document', title: 'Notes' }];
+    const { revision } = await store.appendRevision({
+      documentId: 'doc-1', title: 'T', createdBy: 'u', pptx: Buffer.from('PK'), slides, spec,
+    });
+    expect(revision.sources!.find((source) => source.documentId.startsWith('transcript'))!.kind).toBe('document');
   });
 
   it('takes sources the caller declares over the spec’s own', async () => {

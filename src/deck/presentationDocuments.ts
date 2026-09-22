@@ -82,12 +82,19 @@ export interface StoredRevision {
   sources?: RevisionSource[];
 }
 
-/** A transcript cites itself by a `transcript` id; everything else is a document. */
-export function revisionSources(spec: DeckSpec): RevisionSource[] {
+/**
+ * What each citation IS, from what the producer knew — never from how the id is
+ * spelled. A transcript id looks like any other document id (the seeded one is
+ * `active-now-2026-09-21-planning-transcript`, and a document could be called
+ * that too), so the step that read the material declares which ids were
+ * transcripts and an id nobody declared is a document.
+ */
+export function revisionSources(spec: DeckSpec, transcriptIds: readonly string[] = []): RevisionSource[] {
+  const transcripts = new Set(transcriptIds.filter((id) => typeof id === 'string' && id));
   return deckSources(spec).map((source) => ({
     documentId: source.documentId,
     title: source.title,
-    kind: /^transcript(?:[:-]|$)/i.test(source.documentId) ? 'transcript' : 'document',
+    kind: transcripts.has(source.documentId) ? 'transcript' : 'document',
     ...(source.anchor ? { anchor: source.anchor } : {}),
   }));
 }
@@ -122,6 +129,11 @@ export interface AppendRevisionInput {
    * are known from somewhere other than the deck itself.
    */
   sources?: RevisionSource[];
+  /**
+   * Which of the cited ids are transcripts, as the step that read them knows.
+   * Nothing is inferred from an id's spelling.
+   */
+  transcriptIds?: readonly string[];
   /** A name for this revision. Defaults to its id (`v3`). */
   label?: string;
 }
@@ -299,8 +311,8 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       asset: pptxAsset,
       slides,
       ...(input.spec ? { spec: input.spec } : {}),
-      ...(input.sources ?? (input.spec ? revisionSources(input.spec) : undefined)
-        ? { sources: input.sources ?? revisionSources(input.spec!) }
+      ...(input.sources ?? (input.spec ? revisionSources(input.spec, input.transcriptIds) : undefined)
+        ? { sources: input.sources ?? revisionSources(input.spec!, input.transcriptIds) }
         : {}),
     };
 

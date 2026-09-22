@@ -47,7 +47,30 @@ export interface DeckFixtureResult {
   source: 'model' | 'fixture';
   /** Why the model's answer was not used. Present only when `source` is 'fixture'. */
   reason?: string;
+  /** What the deck left out, said rather than refused. */
+  warnings: string[];
   material: FixtureMaterial;
+  /** Which of the cited ids are transcripts — known from what was read, not from the id. */
+  transcriptIds: string[];
+}
+
+/**
+ * Material that was handed over and never cited.
+ *
+ * Not a rejection: a deck that leans on the transcript and never opens the
+ * release plan is still a deck, and the person who named both is the one who
+ * should decide. Silence is the problem — the deck would look fully sourced.
+ */
+export function uncitedMaterialWarnings(spec: DeckSpec, material: FixtureMaterial): string[] {
+  const cited = new Set(spec.slides.flatMap((slide) => slide.sources.map((source) => source.documentId)));
+  return citableSources(material)
+    .filter((source) => !cited.has(source.documentId))
+    .map((source) => `${source.title} was provided but not cited.`);
+}
+
+/** The transcript among the material, by the id the reader gave it. */
+export function transcriptIdsOf(material: FixtureMaterial): string[] {
+  return material.transcript ? [material.transcript.transcriptId] : [];
 }
 
 export class NoFixtureMaterialError extends Error {}
@@ -180,6 +203,7 @@ export function fixturePrompt(material: FixtureMaterial, title: string, requeste
     `- 6 to 10 slides, never more than ${MAX_SLIDES}. At most ${MAX_BULLETS_PER_SLIDE} bullets a slide, each under ${MAX_BULLET_CHARS} characters.`,
     '- A slide carries only the payload its layout is named after; bullets may appear on any slide.',
     '- EVERY slide cites at least one source, using the exact documentId given below.',
+    '- EVERY source listed below must be cited by at least one slide. Material you were given and did not use is material you were asked for and ignored: if a document and a transcript are both listed, the deck draws on both.',
     '- Only state what the material says. A quote must be something a named person actually said in it. A chart\'s numbers must appear in it.',
     '- Open with a `title` slide. Speaker notes in `notes`.',
     '',
@@ -345,13 +369,24 @@ export async function buildDeckFixture(
         .flatMap((slide) => slide.sources.map((source) => source.documentId))
         .find((documentId) => !citable.has(documentId));
       if (invented) throw new Error(`the model cited '${invented}', which is not one of the sources it was given`);
-      return { spec: validation.spec, source: 'model', material };
+      return {
+        spec: validation.spec,
+        source: 'model',
+        warnings: uncitedMaterialWarnings(validation.spec, material),
+        material,
+        transcriptIds: transcriptIdsOf(material),
+      };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       log.warn({ reason }, 'deck fixture: falling back to the offline deck');
-      return { spec: fixtureSpec(material, deckTitle), source: 'fixture', reason, material };
+      const spec = fixtureSpec(material, deckTitle);
+      return { spec, source: 'fixture', reason, warnings: uncitedMaterialWarnings(spec, material), material, transcriptIds: transcriptIdsOf(material) };
     }
   }
 
-  return { spec: fixtureSpec(material, deckTitle), source: 'fixture', reason: 'no model is configured on this deployment', material };
+  const spec = fixtureSpec(material, deckTitle);
+  return {
+    spec, source: 'fixture', reason: 'no model is configured on this deployment',
+    warnings: uncitedMaterialWarnings(spec, material), material, transcriptIds: transcriptIdsOf(material),
+  };
 }

@@ -126,8 +126,12 @@ describe('/deck --preview', () => {
   beforeEach(() => buildDeckFixture.mockReset());
 
   it('answers with slide 1 as the card thumbnail and persists nothing', async () => {
-    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'model', material: {} });
+    buildDeckFixture.mockResolvedValue({
+      spec: sampleDeck(), source: 'model', material: {},
+      warnings: ['Release plan was provided but not cited.'], transcriptIds: [],
+    });
     const card = await buildDeckPreviewCard(input({ argumentText: 'the Q4 review --preview' }));
+    expect(card.warnings as string[]).toContain('Release plan was provided but not cited.');
     expect(card).toMatchObject({ kind: 'deck-preview', persisted: false, specSource: 'model', slideCount: 9 });
     const thumbnail = card.thumbnail as { slideId: string; svg: string; contentType: string };
     expect(thumbnail.slideId).toBe('cover');
@@ -142,13 +146,13 @@ describe('/deck --preview', () => {
   });
 
   it('says on the card when the deck came from the offline fixture', async () => {
-    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'fixture', reason: 'no model is configured on this deployment', material: {} });
+    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'fixture', reason: 'no model is configured on this deployment', warnings: [], transcriptIds: [], material: {} });
     const card = await buildDeckPreviewCard(input({ argumentText: 'x --preview' }));
     expect(card).toMatchObject({ specSource: 'fixture', specSourceReason: 'no model is configured on this deployment' });
   });
 
   it('reads the recording when the command asked for the transcript', async () => {
-    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'model', material: {} });
+    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'model', material: {}, warnings: [], transcriptIds: [] });
     await buildDeckPreviewCard(input({ argumentText: 'x --preview --from transcript', extra: { recordingId: 'rec-1' } }));
     expect(buildDeckFixture).toHaveBeenCalledWith({ recordingId: 'rec-1', personId: 'user-frank' }, 'x', {});
   });

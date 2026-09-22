@@ -74,6 +74,8 @@ deckRouter.post('/fixture', requireAuth, asyncHandler(async (req: Request, res: 
       spec: result.spec,
       source: result.source,
       ...(result.reason ? { reason: result.reason } : {}),
+      warnings: result.warnings,
+      transcriptIds: result.transcriptIds,
       material: {
         ...(result.material.document ? { document: { documentId: result.material.document.documentId, title: result.material.document.title, characters: result.material.document.text.length, ...(result.material.document.unreadable ? { unreadable: result.material.document.unreadable } : {}) } } : {}),
         ...(result.material.transcript ? { transcript: { transcriptId: result.material.transcript.transcriptId, title: result.material.transcript.title, segments: result.material.transcript.segments.length } } : {}),

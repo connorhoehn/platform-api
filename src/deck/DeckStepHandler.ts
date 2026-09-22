@@ -41,6 +41,13 @@ export interface DeckNodeData {
 }
 
 const SPEC_FALLBACK_PATHS = ['$.steps.draft.text', '$.steps.plan.text', '$.spec', '$.deckSpec'];
+/**
+ * Where the step that read the material said which source was a transcript.
+ * A transcript is known by the reader that fetched it, never by its id: the
+ * seeded one is `active-now-…-planning-transcript`, and a document may be named
+ * anything at all.
+ */
+const TRANSCRIPT_SOURCE_PATHS = ['$.transcriptSource.documentId', "$.steps['read-sources'].transcriptSource.documentId"];
 const DOCUMENT_FALLBACK_PATHS = ['$.documentId', '$.trigger.documentId'];
 const REQUESTER_FALLBACK_PATHS = ['$.requestedBy', '$.trigger.requestedBy'];
 
@@ -119,6 +126,10 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
         ?? firstOf(DOCUMENT_FALLBACK_PATHS, context)
         ?? newDocumentId();
       const requestedBy = firstOf(REQUESTER_FALLBACK_PATHS, context) ?? 'agent:deck';
+      const transcriptIds = [...new Set([
+        ...TRANSCRIPT_SOURCE_PATHS.map((path) => str(readPath(context, path))).filter((value): value is string => !!value),
+        ...(Array.isArray(context.transcriptIds) ? context.transcriptIds.map((value) => str(value)).filter((value): value is string => !!value) : []),
+      ])];
       const title = str(data.title) ?? spec.title;
 
       try {
@@ -134,7 +145,10 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
           };
         });
 
-        const { revision } = await store.appendRevision({ documentId, title, createdBy: requestedBy, pptx, slides, spec });
+        const { revision } = await store.appendRevision({
+          documentId, title, createdBy: requestedBy, pptx, slides, spec,
+          ...(transcriptIds.length ? { transcriptIds } : {}),
+        });
         const previewHandles = revision.slides.map((slide) => slide.previewHandle);
 
         try {
