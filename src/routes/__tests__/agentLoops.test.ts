@@ -7,7 +7,11 @@ jest.mock('../../lib/logger', () => {
   return { __esModule: true, default: l, withContext: () => l };
 });
 
-import { createAgentLoopsRouter, isMidTask, viewOf, type AgentLoopsDeps, type LoadedAgentLoop } from '../agentLoops';
+import {
+  createAgentLoopsRouter, environmentOf, isMidTask, labelOf, viewOf, workItemOf,
+  type AgentLoopsDeps, type LoadedAgentLoop,
+} from '../agentLoops';
+import { DevboxUnavailableError } from '../../pipeline/agent/DevboxAgentClient';
 import { errorHandler } from '../../middleware/error-handler';
 import { SERVICE_AUTH_HEADER, signEnvelope } from '@connorhoehn/service-runtime';
 
@@ -37,7 +41,11 @@ async function call(app: express.Express, method: string, url: string, userId: s
   const res = mockRes();
   const req = {
     method: method.toUpperCase(), url, originalUrl: url, path: url,
-    headers: { 'content-type': 'application/json' }, query: {}, body, params: {}, ip: '127.0.0.1',
+    headers: { 'content-type': 'application/json' },
+    // Express parses this itself; the hand-rolled runner has to, or every
+    // query-parameter assertion silently tests the defaults instead.
+    query: Object.fromEntries(new URL(url, 'http://test.local').searchParams),
+    body, params: {}, ip: '127.0.0.1',
     user: { sub: userId },
     on: () => undefined,
   } as unknown as Request;
@@ -68,12 +76,15 @@ function loadedRun(over: Partial<LoadedAgentLoop> = {}): LoadedAgentLoop {
     status: 'running',
     context: {
       requestedBy: 'dev-frank', chatChannel: 'room:x', model: 'opus',
+      instruction: 'create a meeting with X team',
       contextBudgetTokens: 200_000, plan: PLAN, lab: { sessionId: 'sess-1', boxId: 'box-1' },
     },
     steps: {
-      'agent:s1': { status: 'completed', output: { iterations: 3, contextTokens: 42_000, tokensIn: 40_000, tokensOut: 900, stopReason: 'complete' } },
+      'agent:s1': { status: 'completed', output: { iterations: 3, contextTokens: 42_000, tokensIn: 40_000, tokensOut: 900, stopReason: 'complete', runtime: 'devbox' } },
       'agent:s2': { status: 'pending' },
     },
+    startedAt: '2026-09-21T11:30:00.000Z',
+    costUsd: 0.04,
     ...over,
   };
 }
@@ -84,7 +95,22 @@ let shellUrl: jest.Mock;
 let deleteSession: jest.Mock;
 let cancelRun: jest.Mock;
 let isChannelViewer: jest.Mock;
+let listFiles: jest.Mock;
+let fetchFile: jest.Mock;
+let listRunsFor: jest.Mock;
 let run: LoadedAgentLoop | null;
+
+/** A fixed clock so elapsedMs is a fact, not a race. */
+const NOW = Date.parse('2026-09-21T12:00:00.000Z');
+
+/** A readable stream over one buffer, as fetch would hand it back. */
+function bodyOf(bytes: Buffer): { getReader: () => { read: () => Promise<{ done: boolean; value?: Uint8Array }>; cancel: () => Promise<void> } } {
+  let sent = false;
+  return { getReader: () => ({
+    read: async () => (sent ? { done: true } : ((sent = true), { done: false, value: new Uint8Array(bytes) })),
+    cancel: async () => undefined,
+  }) };
+}
 
 function buildApp(): express.Express {
   const app = express();
@@ -101,12 +127,17 @@ beforeEach(() => {
   deleteSession = jest.fn().mockResolvedValue(true);
   cancelRun = jest.fn().mockResolvedValue(undefined);
   isChannelViewer = jest.fn().mockResolvedValue(false);
+  listFiles = jest.fn().mockResolvedValue([]);
+  fetchFile = jest.fn();
+  listRunsFor = jest.fn().mockResolvedValue([]);
   deps = {
     loadRun: async () => run,
     isChannelViewer: (...a: unknown[]) => isChannelViewer(...a) as Promise<boolean>,
-    devbox: () => ({ startTask, shellUrl, deleteSession } as never),
+    devbox: () => ({ startTask, shellUrl, deleteSession, listFiles, fetchFile } as never),
     cancelRun: (...a: unknown[]) => cancelRun(...a) as Promise<void>,
     fetchImpl: jest.fn(),
+    listRunsFor: (...a: unknown[]) => listRunsFor(...a) as Promise<LoadedAgentLoop[]>,
+    now: () => NOW,
   };
 });
 
@@ -275,5 +306,217 @@ describe('GET /api/agent-loops/:runId/tail', () => {
   it('409s before a session exists, rather than tailing nothing', async () => {
     run = loadedRun({ context: { ...loadedRun().context, lab: undefined } });
     expect((await call(buildApp(), 'get', '/api/agent-loops/run-1/tail', 'dev-frank')).statusCode).toBe(409);
+  });
+});
+
+describe('the detail pane fields', () => {
+  it('names the box, the environment and the clock', async () => {
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect(res.body).toMatchObject({
+      label: 'box-1',                     // the boxId is the session label
+      environment: 'devbox:task',
+      startedAt: '2026-09-21T11:30:00.000Z',
+      elapsedMs: 30 * 60_000,             // 11:30 → the fixed 12:00 clock
+      costUsd: 0.04,
+    });
+  });
+
+  it('measures a finished run start-to-finish, not start-to-now', () => {
+    const view = viewOf(loadedRun({ completedAt: '2026-09-21T11:45:00.000Z', status: 'completed' }), NOW);
+    expect(view.elapsedMs).toBe(15 * 60_000);
+  });
+
+  it('falls back to pipeline · short run id when there is no box', () => {
+    expect(labelOf(loadedRun({ context: { ...loadedRun().context, lab: undefined } })))
+      .toBe('chat-agent-loop · run-1');
+  });
+
+  it('says local:agent when nothing ran in a devbox', () => {
+    const local = loadedRun({
+      context: { ...loadedRun().context, lab: undefined },
+      steps: { 'agent:s1': { status: 'completed', output: { runtime: 'local' } } },
+    });
+    expect(environmentOf(local)).toBe('local:agent');
+  });
+
+  it('omits cost entirely rather than reporting a run with none as $0', () => {
+    expect(viewOf(loadedRun({ costUsd: undefined }), NOW)).not.toHaveProperty('costUsd');
+  });
+
+  it('omits project and workItem unless the run named them', () => {
+    const bare = viewOf(loadedRun(), NOW);
+    expect(bare).not.toHaveProperty('project');
+    expect(bare).not.toHaveProperty('workItem');
+
+    const named = viewOf(loadedRun({ context: {
+      ...loadedRun().context,
+      project: 'auth-migration',
+      workItem: { key: 'ENG-412', title: 'Migrate auth', status: 'in_progress', tags: ['auth'] },
+    } }), NOW);
+    expect(named.project).toBe('auth-migration');
+    expect(named.workItem).toEqual({ key: 'ENG-412', title: 'Migrate auth', status: 'in_progress', tags: ['auth'] });
+  });
+
+  it('ignores a half-named work item rather than rendering a blank card', () => {
+    expect(workItemOf(loadedRun({ context: { ...loadedRun().context, workItem: { key: 'ENG-1' } } }))).toBeUndefined();
+  });
+});
+
+describe('artifacts on the detail pane', () => {
+  it('lists the workspace files, asking the middleware for this session', async () => {
+    listFiles.mockResolvedValue([{ id: 'f1', name: 'notes.md', sizeBytes: 812, updatedAt: '2026-09-21T11:40:00.000Z' }]);
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect(listFiles).toHaveBeenCalledWith('sess-1');
+    expect((res.body as { artifacts: unknown[] }).artifacts).toEqual([
+      { id: 'f1', name: 'notes.md', sizeBytes: 812, updatedAt: '2026-09-21T11:40:00.000Z' },
+    ]);
+    expect(res.body).not.toHaveProperty('artifactsNotice');
+  });
+
+  // An older middleware has no files route. The pane still renders; the empty
+  // list says why it is empty instead of implying the run produced nothing.
+  it('answers with an empty list and a notice when the middleware is older', async () => {
+    listFiles.mockRejectedValue(new DevboxUnavailableError('middleware has no /internal/devbox/sess-1/files'));
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ artifacts: [], artifactsNotice: expect.stringMatching(/did not answer/) });
+  });
+
+  it('says so when the run never had a workspace', async () => {
+    run = loadedRun({ context: { ...loadedRun().context, lab: undefined } });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect(res.body).toMatchObject({ artifacts: [], artifactsNotice: 'No cloud workspace for this run' });
+    expect(listFiles).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/agent-loops/:runId/files/:fileId', () => {
+  it('streams the bytes with the upstream content type', async () => {
+    fetchFile.mockResolvedValue({
+      headers: new Map([['content-type', 'text/markdown'], ['content-length', '5']]) as unknown as Headers,
+      body: bodyOf(Buffer.from('hello')),
+    });
+    // `Map` has .get, which is all the route uses.
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1/files/f1', 'dev-frank');
+    expect(fetchFile).toHaveBeenCalledWith('sess-1', 'f1');
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('413s on the declared size before reading a byte', async () => {
+    fetchFile.mockResolvedValue({
+      headers: new Map([['content-length', String(11 * 1024 * 1024)]]) as unknown as Headers,
+      body: bodyOf(Buffer.alloc(0)),
+    });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1/files/big.bin', 'dev-frank');
+    expect(res.statusCode).toBe(413);
+  });
+
+  it('503s rather than 500s when the middleware has no files route', async () => {
+    fetchFile.mockRejectedValue(new DevboxUnavailableError('middleware has no /internal/devbox/sess-1/files/f1'));
+    expect((await call(buildApp(), 'get', '/api/agent-loops/run-1/files/f1', 'dev-frank')).statusCode).toBe(503);
+  });
+
+  it('is closed to someone who cannot see the channel', async () => {
+    expect((await call(buildApp(), 'get', '/api/agent-loops/run-1/files/f1', 'dev-mallory')).statusCode).toBe(404);
+    expect(fetchFile).not.toHaveBeenCalled();
+  });
+
+  it('is open to a channel viewer', async () => {
+    isChannelViewer.mockResolvedValue(true);
+    fetchFile.mockResolvedValue({ headers: new Map() as unknown as Headers, body: bodyOf(Buffer.from('x')) });
+    expect((await call(buildApp(), 'get', '/api/agent-loops/run-1/files/f1', 'dev-grace')).statusCode).toBe(200);
+  });
+});
+
+describe('GET /api/agent-loops?person=&day=&timezone=', () => {
+  const at = (iso: string, over: Partial<LoadedAgentLoop> = {}): LoadedAgentLoop =>
+    loadedRun({ runId: `run-${iso}`, startedAt: iso, ...over });
+
+  it('keeps only the runs inside the person\'s local day', async () => {
+    listRunsFor.mockResolvedValue([
+      at('2026-09-21T04:59:00.000Z'), // 23:59 on the 20th in Chicago — out
+      at('2026-09-21T05:00:00.000Z'), // 00:00 on the 21st — in
+      at('2026-09-22T04:59:00.000Z'), // 23:59 on the 21st — in
+      at('2026-09-22T05:00:00.000Z'), // midnight rolls over — out
+    ]);
+    const res = await call(buildApp(), 'get', '/api/agent-loops?person=dev-frank&day=2026-09-21&timezone=America/Chicago', 'dev-frank');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ day: '2026-09-21', timezone: 'America/Chicago', from: '2026-09-21T05:00:00.000Z', to: '2026-09-22T05:00:00.000Z' });
+    expect((res.body as { loops: Array<{ runId: string }> }).loops.map((l) => l.runId))
+      .toEqual(['run-2026-09-22T04:59:00.000Z', 'run-2026-09-21T05:00:00.000Z']); // newest first
+  });
+
+  it('summarises a loop with what a row needs', async () => {
+    listRunsFor.mockResolvedValue([at('2026-09-21T11:30:00.000Z')]);
+    const res = await call(buildApp(), 'get', '/api/agent-loops?day=2026-09-21&timezone=UTC', 'dev-frank');
+    expect((res.body as { loops: unknown[] }).loops[0]).toMatchObject({
+      label: 'box-1', title: 'create a meeting with X team', model: 'opus',
+      environment: 'devbox:task', costUsd: 0.04, steps: 2, chatChannel: 'room:x',
+    });
+  });
+
+  it('defaults to the viewer and to today in their zone', async () => {
+    const res = await call(buildApp(), 'get', '/api/agent-loops?timezone=America/Chicago', 'dev-frank');
+    expect(listRunsFor).toHaveBeenCalledWith('dev-frank', 200);
+    // The fixed clock is 12:00Z on the 21st = 07:00 in Chicago, same day.
+    expect(res.body).toMatchObject({ person: 'dev-frank', day: '2026-09-21' });
+  });
+
+  it('shows another person\'s loop only where the viewer can see its channel', async () => {
+    listRunsFor.mockResolvedValue([
+      at('2026-09-21T11:00:00.000Z', { context: { ...loadedRun().context, chatChannel: 'room:open' } }),
+      at('2026-09-21T11:10:00.000Z', { context: { ...loadedRun().context, chatChannel: 'room:closed' } }),
+    ]);
+    isChannelViewer.mockImplementation(async (channel: string) => channel === 'room:open');
+    const res = await call(buildApp(), 'get', '/api/agent-loops?person=dev-frank&day=2026-09-21&timezone=UTC', 'dev-grace');
+    const loops = (res.body as { loops: Array<{ chatChannel: string }> }).loops;
+    expect(loops.map((l) => l.chatChannel)).toEqual(['room:open']);
+  });
+
+  it('caps the day at 50 rows', async () => {
+    listRunsFor.mockResolvedValue(Array.from({ length: 80 }, (_, i) => at(`2026-09-21T${String(i % 24).padStart(2, '0')}:00:00.000Z`, { runId: `r${i}` })));
+    const res = await call(buildApp(), 'get', '/api/agent-loops?day=2026-09-21&timezone=UTC', 'dev-frank');
+    expect((res.body as { loops: unknown[] }).loops).toHaveLength(50);
+  });
+});
+
+describe('a loop that is still being planned', () => {
+  const planning = (over: Partial<LoadedAgentLoop> = {}): LoadedAgentLoop => loadedRun({
+    status: 'pending',
+    steps: {},
+    context: {
+      requestedBy: 'dev-frank', chatChannel: 'room:x', model: 'sonnet',
+      instruction: 'book the X sync', contextBudgetTokens: 200_000,
+      plan: { source: 'pending', steps: [] },
+    },
+    ...over,
+  });
+
+  // The row says 'pending' because that is a status the pipeline machinery
+  // understands; a person is looking at a planner still thinking.
+  it('reports status planning and a pending plan, not an empty finished run', async () => {
+    run = planning();
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      status: 'planning',
+      plan: { source: 'pending', steps: [] },
+      steps: [],
+      environment: 'local:agent',
+    });
+  });
+
+  it('stops saying planning once the plan lands', () => {
+    expect(viewOf(loadedRun({ status: 'running' }), NOW).status).toBe('running');
+  });
+
+  it('does not call a loop planning once it has finished', () => {
+    expect(viewOf(planning({ status: 'failed', completedAt: '2026-09-21T11:40:00.000Z' }), NOW).status).toBe('failed');
+  });
+
+  it('cancels the EXECUTOR run, not the loop id the client polls', async () => {
+    run = loadedRun({ executorRunId: 'executor-run-1' });
+    await call(buildApp(), 'post', '/api/agent-loops/run-1/stop', 'dev-frank');
+    expect(cancelRun).toHaveBeenCalledWith('executor-run-1', 'dev-frank');
   });
 });

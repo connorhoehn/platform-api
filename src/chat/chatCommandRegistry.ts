@@ -28,6 +28,8 @@ import { randomUUID } from 'crypto';
 import { AppError } from '../middleware/error-handler';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
+import { workGraphPlanFromDefinition } from '../pipeline/workGraphPlan';
+import { workSourceAccountRepo } from '../repositories';
 import { getSystemPipeline, registerSystemPipeline } from '../pipeline/systemPipelines';
 import { postRunCardToChannel } from '../documents/chatRunCard';
 import log from '../lib/logger';
@@ -50,6 +52,13 @@ export interface ChatCommandRunInput {
   documentId?: string;
   requestedBy: string;
   requestedByName: string;
+  /**
+   * The requester's verified organization claim. Without it the run cannot be
+   * projected into their work graph at all — the source-account join that
+   * makes a run person-owned is keyed on it — so a command dispatched with no
+   * organization stays a run and is simply never shown on the graph.
+   */
+  organizationId?: string;
   /** Anything else the command's payload needs; validated by `requires.extra`. */
   extra?: Record<string, unknown>;
   /**
@@ -91,6 +100,20 @@ export interface ChatCommandPipeline {
    * the input the builders see; throw an `AppError` to refuse the command.
    */
   prepare?: (input: ChatCommandRunInput) => Promise<ChatCommandRunInput> | ChatCommandRunInput;
+  /**
+   * Answer the command WITHOUT starting its run yet, returning the id the
+   * client should poll. For a command whose definition cannot be built
+   * synchronously — `/agent` has to call a planner that takes tens of
+   * seconds, and a composer cannot hold an HTTP request open for that.
+   *
+   * Returning `null` DECLINES, and the ordinary build-and-trigger path below
+   * runs as usual. That is how `/agent` re-enters: its background planner
+   * calls back through here with the finished plan in `extra`, the hook
+   * declines the second time, and the real run is triggered by exactly the
+   * same code — organization join, work-graph projection, persistence — as
+   * every other command, rather than a second copy of it that drifts.
+   */
+  start?: (input: ChatCommandRunInput) => Promise<{ runId: string } | null>;
   /** The definition to run. May vary per input (an approver, a model); the FIRST build also registers the system pipeline. */
   buildDefinition: (input: ChatCommandRunInput) => Record<string, unknown>;
   triggerPayload: (input: ChatCommandRunInput) => Record<string, unknown>;
@@ -206,8 +229,44 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
   assertChatCommandRequires(def, baseInput);
   const input = def.prepare ? await def.prepare(baseInput) : baseInput;
 
+  // A command that answers before its run exists does so here. `null` means
+  // "not this time" and falls through to the path below unchanged.
+  const started = def.start ? await def.start(input) : null;
+  if (started) {
+    const pendingPayload = { ...def.triggerPayload(input) };
+    const pendingInstruction = instructionFor(pendingPayload, input);
+    const pendingCard: Record<string, unknown> = {
+      kind: 'agent-run', command: trigger, instruction: pendingInstruction,
+      runId: started.runId, pipelineId: def.pipelineId,
+      ...(input.documentId ? { documentId: input.documentId } : {}),
+      ...(def.card ? def.card(input) : {}),
+    };
+    if (def.postCard !== false && input.clientPostsCard !== true) {
+      const { kind: _k, command: _c, instruction: _i, runId: _r, pipelineId: _p, ...extra } = pendingCard;
+      await postRunCardToChannel({
+        channel: input.channel, runId: started.runId, pipelineId: def.pipelineId,
+        command: trigger, instruction: pendingInstruction, extra,
+      });
+    }
+    log.info({ runId: started.runId, pipelineId: def.pipelineId, trigger, channel: input.channel, userId: input.requestedBy }, 'chat command accepted; the command starts its own run');
+    return { runId: started.runId, pipelineId: def.pipelineId, card: pendingCard };
+  }
+
   const bridge = getPipelineBridge();
   if (!bridge?.trigger) throw new AppError(503, 'pipeline engine is not available');
+
+  // Same create-only join the authenticated trigger route establishes, and for
+  // the same reason: the projection consumer re-checks it before it will
+  // accept a single lifecycle event for this person. A chat command that
+  // skipped it produced runs whose events were dropped at ingest with no
+  // error anywhere — the run happened and the graph never heard of it.
+  if (input.organizationId) {
+    await workSourceAccountRepo.ensureVerifiedPrincipal({
+      source: 'pipeline', organizationId: input.organizationId, subject: input.requestedBy,
+    });
+  } else {
+    log.warn({ trigger, userId: input.requestedBy }, 'chat command run has no organization; it will not reach the work graph');
+  }
 
   const definition = def.buildDefinition(input);
   if (!getSystemPipeline(def.pipelineId)) {
@@ -231,7 +290,19 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
     triggeredBy: { userId: input.requestedBy },
   } as never));
   const runId = (out as { runId: string }).runId;
-  getRunPersistenceService()?.registerTrigger({ runId, pipelineId: def.pipelineId, userId: input.requestedBy, triggerType: 'manual', at: new Date().toISOString() });
+  // The graph shows this run as the steps the definition actually declares,
+  // hanging off the conversation the command was typed in. A planner that fell
+  // back to a single step therefore yields a single node — honestly.
+  const workGraph = workGraphPlanFromDefinition(definition, input.channel);
+  getRunPersistenceService()?.registerTrigger({
+    runId,
+    pipelineId: def.pipelineId,
+    userId: input.requestedBy,
+    triggerType: 'manual',
+    at: new Date().toISOString(),
+    ...(input.organizationId ? { organizationId: input.organizationId } : {}),
+    ...(workGraph ? { workGraph } : {}),
+  });
 
   const instruction = instructionFor(payload, input);
   const card: Record<string, unknown> = {

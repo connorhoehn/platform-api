@@ -102,6 +102,8 @@ import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { DevboxAgentClient, devboxBaseUrl, takeRunLab } from './agent/DevboxAgentClient';
+import { failOrphanedLoops } from '../chat/agentLoopRunner';
+import { CHAT_AGENT_LOOP_PIPELINE_ID } from '../chat/agentLoopPlanner';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
 import { buildChatCommandHandlers } from '../documents/chatCommandHandlers';
 import { getCustomStepHandlers, registerCustomStepHandler } from './customStepHandlers';
@@ -898,6 +900,37 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   //
   // Best-effort by design: a session that will not delete is logged, never
   // thrown. The run is already over; there is nothing left to fail.
+  // --- Agent loops orphaned by a restart ---
+  //
+  // A loop's planner runs in memory. A deploy — or a Tilt live_update, which
+  // SIGTERMs this process on every source edit — takes it with it, leaving a
+  // row that says "pending" for ever and, worse, a devbox session nobody will
+  // ever tear down. There is nothing to resume: the plan was never written
+  // and the executor never heard of the run. So the honest ending is a
+  // failure that says what happened, and the box is stopped so it stops
+  // costing money for a run that is not happening.
+  //
+  // Loops that DID reach the executor are untouched here — they are ordinary
+  // runs, and the orphan/resume machinery above already owns them.
+  if (opts.pipelineRunRepository) {
+    void failOrphanedLoops({
+      listPending: async () => {
+        const repo = opts.pipelineRunRepository!;
+        const rows = await repo.listByStatus('pending', { limit: 200 });
+        return rows.filter((r: { pipelineId: string }) => r.pipelineId === CHAT_AGENT_LOOP_PIPELINE_ID);
+      },
+      putRun: (item) => opts.pipelineRunRepository!.put(item),
+      ...(devboxBaseUrl()
+        ? { stopSession: (sessionId: string) => new DevboxAgentClient().deleteSession(sessionId) }
+        : {}),
+    }).catch((err: unknown) => {
+      bootstrapLog.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'orphaned agent-loop sweep failed',
+      );
+    });
+  }
+
   if (devboxBaseUrl()) {
     const devboxForTeardown = new DevboxAgentClient();
     const stopLabSession = async (evt: unknown): Promise<void> => {

@@ -88,8 +88,12 @@ export interface LoopStep {
 
 export interface LoopPlan {
   steps: LoopStep[];
-  /** 'fallback' means the planner did not answer usably; surfaced, never hidden. */
-  source: 'planner' | 'fallback';
+  /**
+   * 'pending' while the planner is still running (the POST answers before it
+   * finishes); 'fallback' when it did not answer usably. Both are surfaced on
+   * the card, never hidden behind an empty step list.
+   */
+  source: 'planner' | 'fallback' | 'pending';
   /** Why it fell back, in a sentence a person can read. */
   notice?: string;
 }

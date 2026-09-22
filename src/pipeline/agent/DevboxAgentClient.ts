@@ -66,6 +66,8 @@ export const MAX_TOOL_PAYLOAD_CHARS = 4_000;
 export const MAX_FRAME_CHARS = 256 * 1024;
 /** Session open / delete / shell-url are small calls; the stream is not. */
 export const CONTROL_TIMEOUT_MS = 15_000;
+/** A workspace listing is a pane's worth of rows, not a directory dump. */
+export const MAX_ARTIFACTS = 200;
 
 /**
  * What every caller gets when the middleware has no devbox router — an
@@ -107,6 +109,14 @@ export interface DevboxAgentClientOpts {
   /** Injected by tests so the loop's clock is not the wall clock. */
   now?: () => number;
   maxToolPayloadChars?: number;
+}
+
+/** One file the run left in its workspace. */
+export interface DevboxFileEntry {
+  id: string;
+  name: string;
+  sizeBytes?: number;
+  updatedAt?: string;
 }
 
 /** One frame off the re-framed stream-json SSE. Fields beyond `type` are optional by design. */
@@ -315,6 +325,62 @@ export class DevboxAgentClient implements AgentClient {
     const res = await this.post(`/${encodeURIComponent(sessionId)}/task`, body, signal);
     if (!res.ok) throw new DevboxUnavailableError(`POST /${sessionId}/task answered ${res.status}`);
     if (!res.body) throw new DevboxUnavailableError(`POST /${sessionId}/task returned no stream`);
+    return res;
+  }
+
+  /**
+   * A GET carries no body, so the envelope is signed over the payload the
+   * middleware reconstructs from the path. Getting this wrong produces a
+   * VALID signature over the WRONG payload and a 401 on every call — which
+   * is exactly what the tail did before it signed `{ boxId }`.
+   */
+  private async get(path: string, payload: Record<string, unknown>, accept: string): Promise<Response> {
+    const res = await this.fetchImpl(`${this.base()}${DEVBOX_BASE_PATH}${path}`, {
+      method: 'GET',
+      headers: {
+        accept,
+        [SERVICE_AUTH_HEADER]: signEnvelope(payload, { secret: this.secret(), serviceId: 'platform-api' }),
+      },
+      signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+    });
+    if (res.status === 404) throw new DevboxUnavailableError(`middleware has no ${DEVBOX_BASE_PATH}${path}`);
+    return res;
+  }
+
+  /**
+   * What the run left in its workspace. Bounded: a session that wrote a
+   * thousand files is a listing, not a payload, so it is capped and the
+   * caller is told the list was cut rather than shown a partial one as whole.
+   */
+  async listFiles(sessionId: string): Promise<DevboxFileEntry[]> {
+    const res = await this.get(`/${encodeURIComponent(sessionId)}/files`, { sessionId }, 'application/json');
+    if (!res.ok) throw new DevboxUnavailableError(`GET /${sessionId}/files answered ${res.status}`);
+    const json = (await res.json()) as { files?: unknown };
+    const files = Array.isArray(json.files) ? json.files : [];
+    return files.slice(0, MAX_ARTIFACTS).flatMap((raw) => {
+      if (!raw || typeof raw !== 'object') return [];
+      const f = raw as Record<string, unknown>;
+      const id = str(f.id);
+      const name = str(f.name);
+      if (!id || !name) return [];
+      return [{
+        id,
+        name: name.slice(0, 200),
+        ...(typeof f.sizeBytes === 'number' && Number.isFinite(f.sizeBytes) ? { sizeBytes: f.sizeBytes } : {}),
+        ...(str(f.updatedAt) ? { updatedAt: str(f.updatedAt) } : {}),
+      }];
+    });
+  }
+
+  /** One artifact's bytes, still as a stream — the route caps and forwards it. */
+  async fetchFile(sessionId: string, fileId: string): Promise<Response> {
+    const res = await this.get(
+      `/${encodeURIComponent(sessionId)}/files/${encodeURIComponent(fileId)}`,
+      { sessionId, fileId },
+      'application/octet-stream',
+    );
+    if (res.status === 404) throw new DevboxUnavailableError(`no file ${fileId} in session ${sessionId}`);
+    if (!res.ok) throw new DevboxUnavailableError(`GET /${sessionId}/files/${fileId} answered ${res.status}`);
     return res;
   }
 

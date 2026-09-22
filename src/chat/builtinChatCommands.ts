@@ -17,9 +17,9 @@ import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '..
 import { registerChatCommandPipeline, type ChatCommandRunInput } from './chatCommandRegistry';
 import {
   AGENT_LOOP_CARD_AGENT, CHAT_AGENT_LOOP_PIPELINE_ID, agentLoopCardLab,
-  buildAgentLoopDefinition, buildAgentLoopRequest, parseAgentLoopCommand, planAgentLoop,
-  type AgentLoopRequest, type LoopPlan,
+  buildAgentLoopDefinition, type AgentLoopRequest, type LoopPlan,
 } from './agentLoopPlanner';
+import { PENDING_PLAN, requestFromInput, startAgentLoop } from './agentLoopRunner';
 import { ClaudeCodeAgentClient } from '../pipeline/agent/ClaudeCodeAgentClient';
 import type { AgentClient } from '../pipeline/agent/types';
 
@@ -191,19 +191,23 @@ export function registerBuiltinChatCommands(): void {
     requires: { argumentText: true },
     // The card IS the anchor the conversation gets: it opens the lab.
     postCard: true,
+    // FAST. The planner is a 20-90s CLI call and must never run inside the
+    // POST — see agentLoopRunner.ts. `prepare` only parses the grammar; the
+    // plan arrives on the second pass, in `extra.agentLoop`.
     prepare: async (input) => {
-      const request = buildAgentLoopRequest(
-        parseAgentLoopCommand(input.argumentText, input.extra ?? {}),
-        {
-          chatChannel: input.channel,
-          requestedBy: input.requestedBy,
-          ...(input.requestedByName ? { requestedByName: input.requestedByName } : {}),
-          ...(input.documentId ? { references: { documentId: input.documentId } } : {}),
-        },
-      );
-      if (!request.instruction) throw new AppError(400, '/agent needs something to do');
-      const plan = await planAgentLoop(request, getAgentLoopPlannerClient());
-      return { ...input, extra: { ...input.extra, agentLoop: { request, plan } satisfies PreparedAgentLoop } };
+      const prepared = input.extra?.agentLoop as PreparedAgentLoop | undefined;
+      if (prepared?.plan) return input;   // the background pass, plan in hand
+      const request = requestFromInput(input);
+      return { ...input, extra: { ...input.extra, agentLoop: { request, plan: PENDING_PLAN } satisfies PreparedAgentLoop } };
+    },
+    // First pass: take the run, answer with a loop id, plan in the background.
+    // Second pass (the planner calling back with a plan): decline, and let the
+    // ordinary build-and-trigger path below start the real run.
+    start: async (input) => {
+      const prepared = input.extra?.agentLoop as PreparedAgentLoop | undefined;
+      if (prepared?.plan && prepared.plan.source !== 'pending') return null;
+      const { runId } = await startAgentLoop(input);
+      return { runId };
     },
     buildDefinition: (input) => {
       const { plan, request } = preparedAgentLoop(input);
