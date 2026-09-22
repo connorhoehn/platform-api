@@ -75,6 +75,25 @@ export const PLANNER_TIMEOUT_MS = 90_000;
  */
 export const PLANNER_MAX_TURNS = 4;
 
+/**
+ * One retry, because a cold pod loses the first one.
+ *
+ * Observed live: a loop started ~30 seconds after a pod restart threw
+ * `claude exited 1: (no stderr)` after 3.3s and fell back to a single step. A
+ * three-second silent non-zero exit is not a planner that disagrees with the
+ * prompt, it is a CLI that was not ready — and the second attempt succeeds.
+ *
+ * Only a SILENT failure is retried. One that came back with a reason (a bad
+ * model name, a missing credential) will fail the same way twice, and
+ * retrying it just makes a person wait twice as long for the same fallback.
+ */
+export const PLANNER_RETRY_DELAY_MS = 2_000;
+
+/** A non-zero exit that said nothing — the cold-start signature. */
+export function isSilentCliFailure(message: string): boolean {
+  return /\(no stderr\)/.test(message) || /^claude exited \d+:\s*$/.test(message.trim());
+}
+
 export const LOOP_STEP_KINDS = ['meeting', 'agenda', 'research', 'document', 'deck', 'code', 'review', 'other'] as const;
 export type LoopStepKind = (typeof LOOP_STEP_KINDS)[number];
 
@@ -394,7 +413,7 @@ interface PlannerOutcome {
  * nothing", which is both wrong and unactionable: it was the planner running
  * out of time, and the fix is a bigger cap, not a better model.
  */
-async function runPlanner(agentClient: AgentClient, prompt: string): Promise<PlannerOutcome> {
+async function runPlannerOnce(agentClient: AgentClient, prompt: string): Promise<PlannerOutcome> {
   let outcome: PlannerOutcome = { text: '', stopReason: 'no_result' };
   for await (const ev of agentClient.run(prompt, {
     model: PLANNER_MODEL,
@@ -405,6 +424,23 @@ async function runPlanner(agentClient: AgentClient, prompt: string): Promise<Pla
     if (ev.type === 'done') outcome = { text: ev.text ?? '', stopReason: ev.stopReason };
   }
   return outcome;
+}
+
+/** Once more, after a pause, when the first attempt died without saying anything. */
+async function runPlanner(
+  agentClient: AgentClient,
+  prompt: string,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<PlannerOutcome> {
+  try {
+    return await runPlannerOnce(agentClient, prompt);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!isSilentCliFailure(message)) throw err;
+    log.warn({ err: message }, 'agent loop planner failed silently; retrying once');
+    await sleep(PLANNER_RETRY_DELAY_MS);
+    return runPlannerOnce(agentClient, prompt);
+  }
 }
 
 /** The sentence a person reads on the card when the planner did not deliver. */
@@ -430,12 +466,16 @@ export function plannerStopNotice(stopReason: PlannerOutcome['stopReason']): str
  * plan carrying the reason, because a person who typed a command gets a run
  * either way and gets told what they got.
  */
-export async function planAgentLoop(request: AgentLoopRequest, agentClient: AgentClient | null | undefined): Promise<LoopPlan> {
+export async function planAgentLoop(
+  request: AgentLoopRequest,
+  agentClient: AgentClient | null | undefined,
+  sleep?: (ms: number) => Promise<void>,
+): Promise<LoopPlan> {
   if (!agentClient) return fallbackPlan(request, 'Planner unavailable · single step');
   let outcome: PlannerOutcome;
   const startedAt = Date.now();
   try {
-    outcome = await runPlanner(agentClient, plannerPrompt(request));
+    outcome = await runPlanner(agentClient, plannerPrompt(request), sleep);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     log.warn({ durationMs: Date.now() - startedAt, err: reason }, 'agent loop planner threw');

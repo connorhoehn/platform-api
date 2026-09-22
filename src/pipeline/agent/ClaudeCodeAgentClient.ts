@@ -172,6 +172,20 @@ export function buildAgentArgs(prompt: string, opts: AgentRunOptions = {}): stri
   return args;
 }
 
+/** How much of a failing CLI's stderr the error message carries. */
+export const MAX_STDERR_LINES = 8;
+export const MAX_STDERR_CHARS = 2_000;
+
+/**
+ * The tail of stderr — the last lines are the ones that say what went wrong,
+ * and an unbounded paste of a CLI's startup chatter is not an error message.
+ */
+export function lastStderrLines(stderr: string): string {
+  const lines = String(stderr ?? '').split('\n').map((l) => l.trimEnd()).filter((l) => l.trim());
+  if (!lines.length) return '';
+  return lines.slice(-MAX_STDERR_LINES).join('\n').slice(-MAX_STDERR_CHARS);
+}
+
 /** SIGTERM then SIGKILL the whole process group; never throws. */
 function killGroup(child: { pid?: number; kill: (s: NodeJS.Signals) => boolean }): void {
   const pid = child.pid;
@@ -247,6 +261,19 @@ export class ClaudeCodeAgentClient implements AgentClient {
 
         const stderrChunks: Buffer[] = [];
         child.stderr.on('data', (b: Buffer) => stderrChunks.push(b));
+        /**
+         * `exit` fires when the PROCESS ends, which is not when its output
+         * ends: stderr can still hold buffered data that has not been emitted.
+         * A fast failure — the CLI dying in three seconds on a cold pod — is
+         * exactly the case where the race is lost, and the error then reads
+         * "claude exited 1: (no stderr)" while the real reason sat unread in
+         * the buffer. So the stderr stream is drained to its end as well.
+         */
+        const stderrEnded = new Promise<void>((resolve) => {
+          child.stderr.once('end', () => resolve());
+          child.stderr.once('close', () => resolve());
+          child.stderr.once('error', () => resolve());
+        });
         const exitPromise = new Promise<{ code: number | null; sig: NodeJS.Signals | null }>(
           (resolve) => child.on('exit', (code, sig) => resolve({ code, sig })),
         );
@@ -388,8 +415,9 @@ export class ClaudeCodeAgentClient implements AgentClient {
 
           const { code } = await exitPromise;
           if (killReason === null && code !== 0) {
+            await stderrEnded;
             const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
-            throw new Error(`claude exited ${code}: ${stderr || '(no stderr)'}`);
+            throw new Error(`claude exited ${code}: ${lastStderrLines(stderr) || '(no stderr)'}`);
           }
         } finally {
           clearTimeout(timeoutTimer);

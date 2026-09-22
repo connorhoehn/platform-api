@@ -6,11 +6,12 @@ import {
   agentLoopNodeId, buildAgentLoopDefinition, buildAgentLoopRequest, extractJsonObject,
   PLANNER_MAX_TURNS, PLANNER_TIMEOUT_MS,
   fallbackPlan, parseAgentLoopCommand, planAgentLoop, plannerPrompt, plannerStopNotice,
-  validateLoopPlan, wantsDeckFixture,
+  isSilentCliFailure, validateLoopPlan, wantsDeckFixture,
   type AgentLoopRequest, type LoopPlan, type LoopStep,
 } from '../agentLoopPlanner';
 import type { AgentClient, AgentEvent, AgentStopReason } from '../../pipeline/agent/types';
 import { validateDeckSpec } from '../../deck/DeckSpec';
+import { lastStderrLines } from '../../pipeline/agent/ClaudeCodeAgentClient';
 
 /** A planner that says exactly what the test tells it to. */
 function scriptedPlanner(text: string | Error, stopReason: AgentStopReason = 'complete'): AgentClient {
@@ -408,5 +409,79 @@ describe('the [deck-fixture] dev override', () => {
     const def = buildAgentLoopDefinition(deckPlan, request({ instruction: 'deck [deck-fixture]' }));
     const spec = ((def.nodes as Array<Record<string, unknown>>).find((n) => n.id === 'deck:s1')!.data as { spec: unknown }).spec;
     expect(validateDeckSpec(spec).ok).toBe(true);
+  });
+});
+
+describe('the planner surviving a cold pod', () => {
+  /** A client whose successive runs behave differently. */
+  function sequence(...attempts: Array<string | Error>): { client: AgentClient; calls: () => number } {
+    let i = 0;
+    return {
+      calls: () => i,
+      client: {
+        provider: 'test',
+        async *run(): AsyncIterable<AgentEvent> {
+          const attempt = attempts[Math.min(i, attempts.length - 1)];
+          i += 1;
+          if (attempt instanceof Error) throw attempt;
+          yield { type: 'done', text: attempt, turns: 1, tokensIn: 0, tokensOut: 0, model: 'haiku', stopReason: 'complete', toolCalls: [] };
+        },
+      },
+    };
+  }
+
+  const PLAN_JSON = JSON.stringify({ steps: [goodStep('s1'), goodStep('s2', { dependsOn: ['s1'] })] });
+  const noSleep = async (): Promise<void> => undefined;
+
+  // Live: a loop 30s after a pod restart got `claude exited 1: (no stderr)`
+  // after 3.3s and fell back to one step. The CLI was not ready, not wrong.
+  it('retries once when the first spawn exits silently, and plans from the second', async () => {
+    const { client, calls } = sequence(new Error('claude exited 1: (no stderr)'), PLAN_JSON);
+    const plan = await planAgentLoop(request(), client, noSleep);
+
+    expect(plan.source).toBe('planner');
+    expect(plan.steps.map((s) => s.id)).toEqual(['s1', 's2']);
+    expect(plan.notice).toBeUndefined();
+    expect(calls()).toBe(2);
+  });
+
+  it('falls back honestly when the second attempt fails too', async () => {
+    const { client, calls } = sequence(new Error('claude exited 1: (no stderr)'), new Error('claude exited 1: (no stderr)'));
+    const plan = await planAgentLoop(request(), client, noSleep);
+
+    expect(plan.source).toBe('fallback');
+    expect(plan.notice).toMatch(/Planner unavailable/);
+    expect(calls()).toBe(2);
+  });
+
+  // A failure that named a reason will name it again; retrying only makes a
+  // person wait twice as long for the same fallback.
+  it('does NOT retry a failure that said what was wrong', async () => {
+    const { client, calls } = sequence(new Error('claude exited 1: unknown model "haiku-9"'), PLAN_JSON);
+    const plan = await planAgentLoop(request(), client, noSleep);
+
+    expect(plan.source).toBe('fallback');
+    expect(plan.notice).toMatch(/unknown model/);
+    expect(calls()).toBe(1);
+  });
+
+  it('knows the cold-start signature from a real error', () => {
+    expect([
+      isSilentCliFailure('claude exited 1: (no stderr)'),
+      isSilentCliFailure('claude exited 1: '),
+      isSilentCliFailure('claude exited 1: Error: ENOENT'),
+    ]).toEqual([true, true, false]);
+  });
+});
+
+describe('lastStderrLines', () => {
+  it('carries the tail, which is where the reason is', () => {
+    expect(lastStderrLines('a\nb\nc')).toBe('a\nb\nc');
+    expect(lastStderrLines(Array.from({ length: 30 }, (_, i) => `line ${i}`).join('\n')))
+      .toBe(Array.from({ length: 8 }, (_, i) => `line ${22 + i}`).join('\n'));
+  });
+
+  it('is empty for empty stderr, so the caller can say "(no stderr)" honestly', () => {
+    expect([lastStderrLines(''), lastStderrLines('  \n \n ')]).toEqual(['', '']);
   });
 });
