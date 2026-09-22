@@ -30,7 +30,9 @@ const request = (over: Partial<AgentLoopRequest> = {}): AgentLoopRequest => ({
   ...over,
 });
 
-const goodStep = (id: string, over: Partial<LoopStep> = {}): Record<string, unknown> => ({
+// Deliberately loose: several cases feed the validator a step that is NOT a
+// valid LoopStep (an unknown kind, a missing title), which is the point.
+const goodStep = (id: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
   id, title: `Step ${id}`, kind: 'research', prompt: `do ${id}`, dependsOn: [], done: `${id} is written to notes.md`, ...over,
 });
 
