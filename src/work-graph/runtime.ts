@@ -570,7 +570,7 @@ export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
   }
 }
 
-class DynamoSourceActionAdapter implements WorkSourceActionAdapter {
+export class DynamoSourceActionAdapter implements WorkSourceActionAdapter {
   constructor(readonly source: WorkSourceKind, private readonly client: Ddb) {}
 
   async exchangeAction(
@@ -582,7 +582,24 @@ class DynamoSourceActionAdapter implements WorkSourceActionAdapter {
     if (target.kind !== 'node' || target.sourceRef.source !== this.source) return { decision: 'deny' };
     const resourceId = sourceOwnedResourceId(target, this.source, target.sourceRef.resourceId);
     if (this.source === 'document' && (capability === 'view-document' || capability === 'edit-document')) {
-      const documentId = resourceId.includes(':') ? resourceId.slice(0, resourceId.lastIndexOf(':')) : resourceId;
+      // A `document` node's resourceId is the bare documentId; a `change`
+      // (revision) node's is `${documentId}:${revisionId}` — see
+      // projectEvent.js's `kind: 'change'` construction. Splitting on the
+      // LAST colon recovers the documentId in both shapes, EXCEPT when the
+      // colon sits at position 0 (no real documentId before it) — a
+      // degenerate resourceId that should never reach here validated, but
+      // `activity.ts`'s own revision-history builder already treats the same
+      // shape as untrustworthy (`separator <= 0` — see its `revisionsByDocument`
+      // loop) rather than as ordinary data. This mirrors that distrust: a
+      // route built from an empty documentId is `/documents/` — a
+      // syntactically "safe" path (isSafeWorkGraphActionPath doesn't reject
+      // it) that nonetheless names no document, and silently lands the host
+      // on the bare explorer instead of the document it asked to open. Refuse
+      // it here instead, so the caller gets an honest 404 rather than a
+      // lying 200.
+      const separator = resourceId.lastIndexOf(':');
+      const documentId = separator > 0 ? resourceId.slice(0, separator) : separator === -1 ? resourceId : '';
+      if (!documentId) return { decision: 'deny' };
       return { decision: 'allow', descriptor: { kind: 'route', capability, path: `/documents/${encodeURIComponent(documentId)}` } };
     }
     if (this.source === 'conversation' && (capability === 'message' || capability === 'join-conversation')) {
