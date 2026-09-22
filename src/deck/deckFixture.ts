@@ -82,6 +82,35 @@ function clean(value: unknown, limit: number): string | undefined {
   return trimmed.slice(0, limit);
 }
 
+/** Lobby names that are wire ids (`dm:dev-connor:dev-frank`, `room:design`), never titles. */
+const WIRE_LOBBY = /^(dm|dmg|room|doc|call|lobby|chat):/i;
+
+/**
+ * What a recording is called on a slide and in a citation. A `lobbyName` is
+ * the call's wire id, not something a person wrote — it reached slide titles,
+ * the deck subtitle and the Sources chip verbatim ("dm:dev-connor:dev-frank").
+ * The participants' display names are on the row; this uses them, the same
+ * rule the frontend's recording picker reads ("Call with Connor Hoehn & Frank
+ * Davis"). A lobby name that is not wire-shaped is kept as written.
+ */
+export function recordingTitle(recording: {
+  lobbyName?: unknown;
+  participants?: unknown;
+}): string {
+  const lobby = clean(recording.lobbyName, 160);
+  if (lobby && !WIRE_LOBBY.test(lobby)) return lobby;
+  const names = (Array.isArray(recording.participants) ? recording.participants : [])
+    .map((entry) => {
+      const person = entry as { displayName?: unknown; userId?: unknown } | null;
+      return clean(person?.displayName, 60) ?? clean(person?.userId, 60);
+    })
+    .filter((name): name is string => !!name);
+  if (names.length > 3) return `Call with ${names.slice(0, 2).join(', ')} and ${names.length - 2} others`;
+  if (names.length) return `Call with ${names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} & ${names[names.length - 1]}`}`;
+  if (lobby?.toLowerCase().startsWith('room:') && lobby.length > 5) return `Meeting in #${lobby.slice(5)}`;
+  return 'Meeting transcript';
+}
+
 /** The document's own row: its title, and its outline when it has one. */
 async function documentRow(documentId: string): Promise<{ title?: string; outline?: Array<{ title?: string }> } | null> {
   try {
@@ -127,6 +156,7 @@ export async function readFixtureMaterial(from: DeckFixtureFrom, deps: ReadMater
   if (from.recordingId) {
     const recording = await findRecording(from.recordingId) as {
       recordingId?: string; transcriptId?: string; lobbyName?: string; transcriptJson?: string;
+      participants?: Array<{ userId?: string; displayName?: string }>;
     } | null;
     if (recording?.transcriptJson) {
       let parsed: unknown;
@@ -150,7 +180,7 @@ export async function readFixtureMaterial(from: DeckFixtureFrom, deps: ReadMater
       if (segments.length) {
         material.transcript = {
           transcriptId: clean(recording.transcriptId, 200) ?? `transcript:${from.recordingId}`,
-          title: clean(recording.lobbyName, 160) ?? 'Meeting transcript',
+          title: recordingTitle(recording),
           segments,
         };
       }

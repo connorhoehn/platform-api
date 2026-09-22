@@ -7,6 +7,14 @@ jest.mock('../../deck/deckFixture', () => {
   return { ...actual, buildDeckFixture: (...args: unknown[]) => buildDeckFixture(...args) };
 });
 
+// The card must never be posted by the dispatcher for a preview: the whole point
+// of `--preview` is that nothing lands in the conversation or the store.
+const postRunCardToChannel = jest.fn();
+jest.mock('../../documents/chatRunCard', () => {
+  const actual = jest.requireActual('../../documents/chatRunCard');
+  return { ...actual, postRunCardToChannel: (...args: unknown[]) => postRunCardToChannel(...args) };
+});
+
 import { clearChatCommandPipelines, getChatCommandPipeline, runChatCommand, type ChatCommandRunInput } from '../chatCommandRegistry';
 import { buildDeckPreviewCard, deckSourcesFromInput, parseDeckCommand, registerBuiltinChatCommands } from '../builtinChatCommands';
 import { sampleDeck } from '../../deck/__tests__/fixtures';
@@ -210,6 +218,39 @@ describe('/deck --preview through runChatCommand (the real dispatch path, not ju
     } as ChatCommandRunInput);
     expect(out.card).not.toHaveProperty('documentId');
     expect(out.card).toMatchObject({ persisted: false, specSource: 'model' });
+  });
+
+  it('the recording picker path: `--from recording:<id>` and a colon-bearing title, no documentId, no # documents — previews from the transcript and posts nothing', async () => {
+    postRunCardToChannel.mockReset();
+    buildDeckFixture.mockResolvedValue({
+      spec: sampleDeck(), source: 'fixture', reason: 'claude is not authenticated in this environment',
+      material: {}, warnings: [], transcriptIds: ['planning-transcript'],
+    });
+    const argumentText = '--from recording:active-now-2026-09-22-planning-recording Frank Davis · Sep 22, 08:30 AM --preview';
+    const out = await runChatCommand({
+      trigger: '/deck',
+      channel: 'chat:dm:dev-connor:dev-frank',
+      text: `/deck ${argumentText}`,
+      argumentText,
+      requestedBy: 'user-frank',
+      requestedByName: 'Frank',
+      extra: {},
+    } as ChatCommandRunInput);
+    expect(out.runId).toMatch(/^deck-preview:/);
+    expect(buildDeckFixture).toHaveBeenCalledWith(
+      { recordingId: 'active-now-2026-09-22-planning-recording', personId: 'user-frank' },
+      'Frank Davis · Sep 22, 08:30 AM',
+      {},
+    );
+    expect(out.card).toMatchObject({
+      kind: 'deck-preview', persisted: false, from: 'transcript',
+      recordingId: 'active-now-2026-09-22-planning-recording',
+      specSource: 'fixture', specSourceReason: 'claude is not authenticated in this environment',
+      transcriptIds: ['planning-transcript'],
+    });
+    expect((out.card as { slideCount: number }).slideCount).toBeGreaterThan(0);
+    expect((out.card as { thumbnail: { svg: string } }).thumbnail.svg.startsWith('<svg')).toBe(true);
+    expect(postRunCardToChannel).not.toHaveBeenCalled();
   });
 
   it('a real (non-preview) build still needs a documentId', async () => {

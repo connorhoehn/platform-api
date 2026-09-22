@@ -9,7 +9,7 @@ import type { LLMClient } from '../../pipeline/LLMClient';
 import { validateDeckSpec } from '../DeckSpec';
 import {
   FIXTURE_TITLE_PREFIX, NoFixtureMaterialError,
-  buildDeckFixture, citableSources, fixturePrompt, fixtureSpec, materialBlock, readFixtureMaterial,
+  buildDeckFixture, citableSources, fixturePrompt, fixtureSpec, materialBlock, readFixtureMaterial, recordingTitle,
   transcriptIdsOf, uncitedMaterialWarnings,
   type FixtureMaterial,
 } from '../deckFixture';
@@ -67,6 +67,38 @@ describe('readFixtureMaterial', () => {
     const material = await readFixtureMaterial({ recordingId: 'rec-none' }, deps);
     expect(material.transcript).toBeUndefined();
     expect(citableSources(material)).toEqual([]);
+  });
+});
+
+describe('recordingTitle', () => {
+  it('never uses a wire lobby id as a title — the participants name the call', () => {
+    const row = {
+      lobbyName: 'dm:dev-connor:dev-frank',
+      participants: [{ userId: 'dev-connor', displayName: 'Connor Hoehn' }, { userId: 'dev-frank', displayName: 'Frank Davis' }],
+    };
+    expect(recordingTitle(row)).toBe('Call with Connor Hoehn & Frank Davis');
+  });
+
+  it('keeps a lobby name a person wrote, and falls back honestly when there is nothing to name', () => {
+    expect(recordingTitle({ lobbyName: 'Planning sync' })).toBe('Planning sync');
+    expect(recordingTitle({ lobbyName: 'room:design' })).toBe('Meeting in #design');
+    expect(recordingTitle({ lobbyName: 'dm:a:b' })).toBe('Meeting transcript');
+    expect(recordingTitle({})).toBe('Meeting transcript');
+    expect(recordingTitle({ lobbyName: 'dmg:abc', participants: [1, 2, 3, 4].map((n) => ({ userId: `u${n}`, displayName: `P${n}` })) }))
+      .toBe('Call with P1, P2 and 2 others');
+  });
+
+  it('reaches the transcript material, so no slide or citation carries the wire id', async () => {
+    const material = await readFixtureMaterial({ recordingId: 'rec-dm' }, {
+      ...deps,
+      findRecording: async () => ({
+        ...RECORDING,
+        lobbyName: 'dm:dev-connor:dev-frank',
+        participants: [{ userId: 'dev-connor', displayName: 'Connor Hoehn' }, { userId: 'dev-frank', displayName: 'Frank Davis' }],
+      }),
+    });
+    expect(material.transcript!.title).toBe('Call with Connor Hoehn & Frank Davis');
+    expect(JSON.stringify(fixtureSpec(material, 'Planning'))).not.toContain('dm:dev-connor');
   });
 });
 
