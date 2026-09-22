@@ -15,7 +15,7 @@
 import { VisionClient, type VisionClientLike } from './VisionClient';
 import { AnthropicVisionClient } from './AnthropicVisionClient';
 import { VisionResultRepository } from './VisionResultRepository';
-import { DdbImageBlobStore, type ImageBlobStore } from './ImageBlobStore';
+import { DdbImageBlobStore, isAssetBlobStore, type AssetBlobStore, type ImageBlobStore } from './ImageBlobStore';
 import { VolumeImageBlobStore } from './VolumeImageBlobStore';
 
 let _imageBlobStore: ImageBlobStore | null = null;
@@ -45,6 +45,21 @@ export function getImageBlobStore(): ImageBlobStore {
       : new DdbImageBlobStore();
   }
   return _imageBlobStore;
+}
+
+/**
+ * The same singleton, for callers storing bytes that are not images — the deck
+ * generator's `.pptx` and its per-slide SVG previews. Every store in
+ * ImageBlobStore.ts implements the asset half; the guard is here so a store
+ * wired in later that does not fails loudly at the call site instead of
+ * silently dropping a presentation.
+ */
+export function getAssetBlobStore(): AssetBlobStore {
+  const store = getImageBlobStore();
+  if (!isAssetBlobStore(store)) {
+    throw new Error('the configured blob store cannot hold non-image assets (no putBlob/getBlob)');
+  }
+  return store;
 }
 
 /**

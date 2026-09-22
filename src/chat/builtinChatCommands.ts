@@ -14,6 +14,7 @@ import type { DocumentTypeItem } from '../repositories';
 import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOCUMENT_AGENT_EDIT_PIPELINE_ID, DOCUMENT_TRANSFORM_PIPELINE_ID } from '../documents/documentAgentPipeline';
 import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID, DEFAULT_HISTORY_LIMIT } from '../documents/conversationSummarizePipeline';
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
+import { buildDeckGenerateDefinition, DECK_GENERATE_PIPELINE_ID, DECK_HISTORY_LIMIT } from '../documents/deckGeneratePipeline';
 import { registerChatCommandPipeline, type ChatCommandRunInput } from './chatCommandRegistry';
 import {
   AGENT_LOOP_CARD_AGENT, CHAT_AGENT_LOOP_PIPELINE_ID, agentLoopCardLab,
@@ -104,6 +105,29 @@ export async function resolveTransformTarget(input: ChatCommandRunInput, repo: P
 /** `targetFieldList` as the transform prompt interpolates it. */
 export function transformFieldList(fields: TransformTarget['fields']): string {
   return fields.length ? fields.map((f) => `- ${f.name}${f.sectionType ? ` (${f.sectionType})` : ''}`).join('\n') : '- (the type declares no fields; keep the source headings)';
+}
+
+/**
+ * The documents a `/deck` must cite: what the composer referenced with `#`
+ * (`extra.documents`, the shape `ComposedMessage.documents` already has), minus
+ * the new presentation itself. Nothing is inferred — a deck cites what the
+ * person picked.
+ */
+export function deckSourcesFromInput(input: ChatCommandRunInput): Array<{ documentId: string; title: string }> {
+  const raw = input.extra?.documents;
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ documentId: string; title: string }> = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const item = entry as { id?: unknown; documentId?: unknown; title?: unknown; name?: unknown };
+    const documentId = str(item.documentId) ?? str(item.id);
+    if (!documentId || documentId === input.documentId || seen.has(documentId)) continue;
+    seen.add(documentId);
+    out.push({ documentId, title: (str(item.title) ?? str(item.name) ?? documentId).slice(0, 160) });
+    if (out.length >= 12) break;
+  }
+  return out;
 }
 
 let registered = false;
@@ -252,5 +276,42 @@ export function registerBuiltinChatCommands(): void {
       };
     },
     card: (input) => ({ title: (str(input.extra?.title) ?? input.argumentText.trim()).slice(0, 120), agent: HAIKU_CARD_AGENT }),
+  });
+
+  // /deck <what> [#doc …] — build a real presentation, grounded in the documents
+  // the composer referenced and the conversation itself, into the fresh
+  // presentation document the client created.
+  registerChatCommandPipeline({
+    trigger: '/deck',
+    pipelineId: DECK_GENERATE_PIPELINE_ID,
+    label: 'Build a presentation',
+    hint: 'from the referenced documents',
+    description: 'Build a .pptx from the documents you reference with # and this conversation: `documentId` is the new presentation, `extra.documents` are the sources it must cite, the text after the command is what the deck is about.',
+    requires: { document: true, argumentText: true },
+    postCard: false,
+    buildDefinition: () => buildDeckGenerateDefinition(),
+    triggerPayload: (input) => {
+      const prompt = input.argumentText.trim().slice(0, 2000);
+      const title = (str(input.extra?.title) ?? prompt).slice(0, 120);
+      return {
+        documentId: input.documentId, title, prompt,
+        sources: deckSourcesFromInput(input),
+        limit: DECK_HISTORY_LIMIT,
+        chatChannel: input.channel,
+        requestedBy: input.requestedBy, requestedByName: input.requestedByName,
+        instruction: title,
+      };
+    },
+    // The card names what the deck stands on, so the thread can see the sources
+    // before the deck exists.
+    card: (input) => {
+      const sources = deckSourcesFromInput(input);
+      return {
+        title: (str(input.extra?.title) ?? input.argumentText.trim()).slice(0, 120),
+        sources,
+        sourceNames: sources.map((source) => source.title),
+        agent: HAIKU_CARD_AGENT,
+      };
+    },
   });
 }

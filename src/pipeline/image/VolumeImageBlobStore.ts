@@ -20,7 +20,7 @@
 
 import { mkdir, writeFile, readFile, access } from 'node:fs/promises';
 import { join, basename } from 'node:path';
-import type { ImageBlobStore } from './ImageBlobStore';
+import type { AssetBlobStore, BlobAsset, ImageBlobStore, PutBlobMeta } from './ImageBlobStore';
 import type { ImageMeta } from './types';
 
 /** Default base dir — override with IMAGE_BLOB_DIR env var. */
@@ -59,7 +59,7 @@ function sanitizeImageId(imageId: string): string {
   return safe;
 }
 
-export class VolumeImageBlobStore implements ImageBlobStore {
+export class VolumeImageBlobStore implements ImageBlobStore, AssetBlobStore {
   /** Largest edge that this store is willing to preserve. */
   readonly maxStoredEdge = VOLUME_MAX_STORED_EDGE;
   /** Byte ceiling for a single stored image. */
@@ -112,6 +112,47 @@ export class VolumeImageBlobStore implements ImageBlobStore {
       console.warn(
         '[VolumeImageBlobStore] get failed; returning null',
         { imageId, dir: this.dir, err: err instanceof Error ? err.message : String(err) },
+      );
+      return null;
+    }
+  }
+
+  async putBlob(key: string, body: Buffer, meta: PutBlobMeta): Promise<BlobAsset> {
+    await this.ensureDir();
+    const asset: BlobAsset = { key, contentType: meta.contentType, sizeBytes: body.byteLength };
+    await Promise.all([
+      writeFile(this.bodyPath(key), body),
+      writeFile(this.metaPath(key), JSON.stringify({
+        ...asset,
+        createdAt: new Date().toISOString(),
+        ...(meta.createdBy ? { createdBy: meta.createdBy } : {}),
+        ...(meta.label ? { label: meta.label } : {}),
+      }), 'utf8'),
+    ]);
+    return asset;
+  }
+
+  async getBlob(key: string): Promise<{ body: Buffer; asset: BlobAsset } | null> {
+    try {
+      const [body, metaRaw] = await Promise.all([
+        readFile(this.bodyPath(key)),
+        readFile(this.metaPath(key), 'utf8'),
+      ]);
+      const meta = JSON.parse(metaRaw) as Partial<BlobAsset>;
+      return {
+        body,
+        asset: {
+          key,
+          contentType: meta.contentType ?? 'application/octet-stream',
+          sizeBytes: meta.sizeBytes ?? body.byteLength,
+        },
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[VolumeImageBlobStore] getBlob failed; returning null',
+        { key, dir: this.dir, err: err instanceof Error ? err.message : String(err) },
       );
       return null;
     }

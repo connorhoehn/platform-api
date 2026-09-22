@@ -36,6 +36,45 @@ const SECONDS_PER_DAY = 24 * 60 * 60;
  */
 export const IMAGE_BLOB_SIZE_CAP_BYTES = 350 * 1024;
 
+/**
+ * Bytes that are not an image.
+ *
+ * The same stores back both: a presentation's `.pptx` and its per-slide SVG
+ * previews are files a step produced and a route later serves, which is exactly
+ * what this store already does for images — the only thing images had that a
+ * deck does not is a width and a height. So the asset methods sit beside the
+ * image ones on the same implementations rather than starting a second store
+ * with its own table, its own volume and its own failure modes.
+ */
+export interface BlobAsset {
+  /** The key it was stored under — what a revision record points at. */
+  key: string;
+  contentType: string;
+  sizeBytes: number;
+}
+
+export interface PutBlobMeta {
+  contentType: string;
+  /** Who produced it, when that is known. */
+  createdBy?: string;
+  /** A human label for operators reading the store directly. */
+  label?: string;
+}
+
+/** The non-image half of a blob store. Implemented by all three stores below. */
+export interface AssetBlobStore {
+  /** Store bytes under a key, idempotently. Throws when the store cannot hold them. */
+  putBlob(key: string, body: Buffer, meta: PutBlobMeta): Promise<BlobAsset>;
+  /** Read bytes back, or null when the key is absent or the read failed. */
+  getBlob(key: string): Promise<{ body: Buffer; asset: BlobAsset } | null>;
+}
+
+/** True when a store can hold non-image bytes — every store in this file can. */
+export function isAssetBlobStore(store: unknown): store is AssetBlobStore {
+  const candidate = store as Partial<AssetBlobStore> | null;
+  return !!candidate && typeof candidate.putBlob === 'function' && typeof candidate.getBlob === 'function';
+}
+
 export interface ImageBlobStore {
   /**
    * Optional: largest image edge (in pixels) this store is willing to
@@ -114,7 +153,7 @@ interface ImageRow {
   ttlEpoch: number;
 }
 
-export class DdbImageBlobStore implements ImageBlobStore {
+export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
   /**
    * Max stored edge for DDB-backed images: 1024px. This is the historical
    * upscale default (DEFAULT_STORE_MAX_EDGE) — the capBytes ceiling + the
@@ -201,6 +240,44 @@ export class DdbImageBlobStore implements ImageBlobStore {
     }
   }
 
+  async putBlob(key: string, body: Buffer, meta: PutBlobMeta): Promise<BlobAsset> {
+    if (body.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
+      // Said plainly, with the fix: a .pptx of any substance will not fit in a
+      // DDB item, and the operator's lever is the filesystem-backed store.
+      throw new Error(
+        `asset '${key}' is ${body.byteLength}B, over the DDB inline cap of ${IMAGE_BLOB_SIZE_CAP_BYTES}B — run with IMAGE_BLOB_STORE=fs to store assets this size`,
+      );
+    }
+    const ttlEpoch = Math.floor(this.now() / 1000) + this.ttlSeconds;
+    await this.docClient.send(new PutCommand({
+      TableName: PIPELINE_IMAGES_TABLE,
+      Item: {
+        imageId: key,
+        body,
+        mimeType: meta.contentType,
+        sizeBytes: body.byteLength,
+        // An asset has no pixel dimensions; zero says so rather than inventing one.
+        width: 0,
+        height: 0,
+        uploadedAt: new Date(this.now()).toISOString(),
+        ...(meta.createdBy ? { uploadedBy: meta.createdBy } : {}),
+        ...(meta.label ? { label: meta.label } : {}),
+        kind: 'asset',
+        ttlEpoch,
+      },
+    }));
+    return { key, contentType: meta.contentType, sizeBytes: body.byteLength };
+  }
+
+  async getBlob(key: string): Promise<{ body: Buffer; asset: BlobAsset } | null> {
+    const row = await this.get(key);
+    if (!row) return null;
+    return {
+      body: row.body,
+      asset: { key, contentType: row.meta.mimeType, sizeBytes: row.meta.sizeBytes || row.body.byteLength },
+    };
+  }
+
   async getMetadata(imageId: string): Promise<ImageMeta | null> {
     // Use a ProjectionExpression to fetch only the metadata fields,
     // skipping the `body` attribute (which can be up to 350 KB).
@@ -237,8 +314,9 @@ export class DdbImageBlobStore implements ImageBlobStore {
 // In-memory impl (tests + envs without DDB)
 // ---------------------------------------------------------------------------
 
-export class InMemoryImageBlobStore implements ImageBlobStore {
+export class InMemoryImageBlobStore implements ImageBlobStore, AssetBlobStore {
   private readonly rows = new Map<string, { body: Buffer; meta: ImageMeta }>();
+  private readonly assets = new Map<string, { body: Buffer; asset: BlobAsset }>();
 
   async put(imageId: string, body: Buffer, meta: ImageMeta): Promise<string> {
     if (body.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
@@ -258,8 +336,18 @@ export class InMemoryImageBlobStore implements ImageBlobStore {
     return this.rows.get(imageId)?.meta ?? null;
   }
 
+  async putBlob(key: string, body: Buffer, meta: PutBlobMeta): Promise<BlobAsset> {
+    this.assets.set(key, { body, asset: { key, contentType: meta.contentType, sizeBytes: body.byteLength } });
+    return { key, contentType: meta.contentType, sizeBytes: body.byteLength };
+  }
+
+  async getBlob(key: string): Promise<{ body: Buffer; asset: BlobAsset } | null> {
+    return this.assets.get(key) ?? null;
+  }
+
   /** Test helper — clear all stored rows. */
   reset(): void {
     this.rows.clear();
+    this.assets.clear();
   }
 }

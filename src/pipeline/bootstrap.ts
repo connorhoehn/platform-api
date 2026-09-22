@@ -101,6 +101,7 @@ import { buildJudgeStepHandlers } from './judge/registerJudgeHandlers';
 import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
+import { buildDeckStepHandlers } from '../deck/registerDeckHandlers';
 import { DevboxAgentClient, devboxBaseUrl, takeRunLab } from './agent/DevboxAgentClient';
 import { failOrphanedLoops } from '../chat/agentLoopRunner';
 import { CHAT_AGENT_LOOP_PIPELINE_ID } from '../chat/agentLoopPlanner';
@@ -745,6 +746,11 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   }
   // The chat's /summarize and /diagram commands (read the conversation, draw the diagram, post the card).
   for (const [key, handler] of buildChatCommandHandlers()) {
+    customStepHandlers.set(key, handler);
+  }
+  // The chat's /deck command: read the source documents, render the .pptx and
+  // its per-slide previews into a presentation document's newest revision.
+  for (const [key, handler] of buildDeckStepHandlers()) {
     customStepHandlers.set(key, handler);
   }
   // After a call: finalize the recording and transcribe it — as runs, not inline code.
