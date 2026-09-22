@@ -12,6 +12,7 @@ import {
 import type { AgentClient, AgentEvent, AgentStopReason } from '../../pipeline/agent/types';
 import { validateDeckSpec } from '../../deck/DeckSpec';
 import { lastStderrLines } from '../../pipeline/agent/ClaudeCodeAgentClient';
+import { describeClaudeCliFailure } from '../../pipeline/claudeCliErrors';
 
 /** A planner that says exactly what the test tells it to. */
 function scriptedPlanner(text: string | Error, stopReason: AgentStopReason = 'complete'): AgentClient {
@@ -463,6 +464,30 @@ describe('the planner surviving a cold pod', () => {
     expect(plan.source).toBe('fallback');
     expect(plan.notice).toMatch(/unknown model/);
     expect(calls()).toBe(1);
+  });
+
+  // The live failure: the planner reported "(no stderr)" while the deck
+  // fixture path, driving the same binary in the same minute, reported stale
+  // credentials — because the CLI says so on stdout.
+  it('does NOT retry stale credentials, and passes the actionable message through', async () => {
+    const authError = new Error(describeClaudeCliFailure({ code: 1, resultError: 'Not logged in · Please run /login' }));
+    const { client, calls } = sequence(authError, PLAN_JSON);
+    const plan = await planAgentLoop(request(), client, noSleep);
+
+    expect(plan.source).toBe('fallback');
+    expect(plan.notice).toContain('claude is not authenticated in this environment');
+    expect(plan.notice).toContain('tilt trigger claude-creds-extract');
+    // One attempt: it would fail identically the second time.
+    expect(calls()).toBe(1);
+  });
+
+  it('carries a stdout-only failure into the notice instead of "(no stderr)"', async () => {
+    const stdoutOnly = new Error(describeClaudeCliFailure({ code: 1, stderr: '', resultError: 'Error: model overloaded' }));
+    const { client } = sequence(stdoutOnly, stdoutOnly);
+    const plan = await planAgentLoop(request(), client, noSleep);
+
+    expect(plan.notice).toContain('model overloaded');
+    expect(plan.notice).not.toContain('no stderr');
   });
 
   it('knows the cold-start signature from a real error', () => {

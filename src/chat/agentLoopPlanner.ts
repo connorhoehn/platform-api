@@ -22,6 +22,7 @@
 
 import type { AgentClient, AgentStopReason } from '../pipeline/agent/types';
 import { DECK_STEP_KIND } from '../deck/DeckStepHandler';
+import { isSilentClaudeFailure } from '../pipeline/claudeCliErrors';
 import type { DeckSpec } from '../deck/DeckSpec';
 import log from '../lib/logger';
 
@@ -89,10 +90,14 @@ export const PLANNER_MAX_TURNS = 4;
  */
 export const PLANNER_RETRY_DELAY_MS = 2_000;
 
-/** A non-zero exit that said nothing — the cold-start signature. */
-export function isSilentCliFailure(message: string): boolean {
-  return /\(no stderr\)/.test(message) || /^claude exited \d+:\s*$/.test(message.trim());
-}
+/**
+ * A non-zero exit that said nothing — the cold-start signature.
+ *
+ * Shared with the CLI clients, and it deliberately excludes an auth failure:
+ * stale mounted credentials fail identically the second time, so retrying
+ * only makes a person wait twice as long for the same fallback.
+ */
+export const isSilentCliFailure = isSilentClaudeFailure;
 
 export const LOOP_STEP_KINDS = ['meeting', 'agenda', 'research', 'document', 'deck', 'code', 'review', 'other'] as const;
 export type LoopStepKind = (typeof LOOP_STEP_KINDS)[number];

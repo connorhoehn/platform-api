@@ -20,6 +20,7 @@ import { spawn } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import type { ChildProcessByStdio } from 'node:child_process';
 import { withAbort } from 'distributed-core/common';
+import { describeClaudeCliFailure } from './claudeCliErrors';
 import type { LLMClient, LLMChunk, LLMStreamOptions } from './LLMClient';
 
 const CLAUDE_BIN = process.env['CLAUDE_CLI_PATH'] ?? 'claude';
@@ -194,19 +195,15 @@ export class ClaudeCodeLLMClient implements LLMClient {
 
           const { code } = await exitPromise;
           if ((code !== 0 || resultError) && !signal?.aborted) {
-            const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
-            const detail = stderr || resultError || '(no stderr)';
-            // "Please run /login" is the CLI's own advice and it is useless
-            // here: there is no terminal in this pod to run it in, and the
-            // person reading it is looking at a failed run card in a chat.
-            // The credentials are a host-extracted snapshot mounted in, so
-            // the actionable instruction is the one that refreshes THAT.
-            const notLoggedIn = /not logged in|\/login|invalid api key|authentication_error/i.test(detail);
-            throw new Error(
-              notLoggedIn
-                ? `claude is not authenticated in this environment: ${detail} — the mounted credentials have gone stale; re-extract them (tilt trigger claude-creds-extract) and run this again`
-                : `claude exited ${code}: ${detail}`,
-            );
+            // Shared with ClaudeCodeAgentClient (src/pipeline/claudeCliErrors.ts):
+            // both clients drive the same binary, and it explains itself on
+            // stdout while exiting with an empty stderr, so both have to read
+            // the same three streams and classify them the same way.
+            throw new Error(describeClaudeCliFailure({
+              code,
+              stderr: Buffer.concat(stderrChunks).toString('utf8').trim(),
+              resultError,
+            }));
           }
         } finally {
           abortReg?.dispose();

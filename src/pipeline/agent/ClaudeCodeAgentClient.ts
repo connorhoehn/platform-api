@@ -53,6 +53,7 @@ import { spawn } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import type { ChildProcessByStdio } from 'node:child_process';
 import { withAbort } from 'distributed-core/common';
+import { describeClaudeCliFailure } from '../claudeCliErrors';
 import type {
   AgentClient,
   AgentEvent,
@@ -172,19 +173,11 @@ export function buildAgentArgs(prompt: string, opts: AgentRunOptions = {}): stri
   return args;
 }
 
-/** How much of a failing CLI's stderr the error message carries. */
-export const MAX_STDERR_LINES = 8;
-export const MAX_STDERR_CHARS = 2_000;
+/** How much raw stdout is kept for a process that never emitted an event. */
+export const MAX_STDOUT_TAIL_CHARS = 4_000;
 
-/**
- * The tail of stderr — the last lines are the ones that say what went wrong,
- * and an unbounded paste of a CLI's startup chatter is not an error message.
- */
-export function lastStderrLines(stderr: string): string {
-  const lines = String(stderr ?? '').split('\n').map((l) => l.trimEnd()).filter((l) => l.trim());
-  if (!lines.length) return '';
-  return lines.slice(-MAX_STDERR_LINES).join('\n').slice(-MAX_STDERR_CHARS);
-}
+/** Re-exported so callers of this client can reason about its errors. */
+export { lastLines as lastStderrLines } from '../claudeCliErrors';
 
 /** SIGTERM then SIGKILL the whole process group; never throws. */
 function killGroup(child: { pid?: number; kill: (s: NodeJS.Signals) => boolean }): void {
@@ -296,6 +289,13 @@ export class ClaudeCodeAgentClient implements AgentClient {
         let tokensOut = 0;
         let reportedModel = '';
         let sawResultError = false;
+        // The CLI explains its own failures HERE, on stdout, as a result
+        // event with is_error — and exits 1 with an EMPTY stderr. Without
+        // keeping it, every auth failure reads "claude exited 1: (no stderr)".
+        let resultErrorText = '';
+        // And a process that dies before emitting one parseable event leaves
+        // only raw stdout. Bounded: we keep the tail, not the stream.
+        let stdoutTail = '';
         let buffer = '';
 
         try {
@@ -407,7 +407,10 @@ export class ClaudeCodeAgentClient implements AgentClient {
                 if (typeof usage?.['output_tokens'] === 'number') tokensOut = usage['output_tokens'];
                 if (typeof evt['num_turns'] === 'number') turns = evt['num_turns'];
                 if (typeof evt['result'] === 'string') resultText = evt['result'];
-                if (evt['is_error'] === true) sawResultError = true;
+                if (evt['is_error'] === true) {
+                  sawResultError = true;
+                  if (typeof evt['result'] === 'string') resultErrorText = evt['result'];
+                }
               }
             }
             if (killReason !== null) break;
@@ -416,8 +419,12 @@ export class ClaudeCodeAgentClient implements AgentClient {
           const { code } = await exitPromise;
           if (killReason === null && code !== 0) {
             await stderrEnded;
-            const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
-            throw new Error(`claude exited ${code}: ${lastStderrLines(stderr) || '(no stderr)'}`);
+            throw new Error(describeClaudeCliFailure({
+              code,
+              stderr: Buffer.concat(stderrChunks).toString('utf8').trim(),
+              resultError: resultErrorText,
+              stdout: stdoutTail,
+            }));
           }
         } finally {
           clearTimeout(timeoutTimer);
