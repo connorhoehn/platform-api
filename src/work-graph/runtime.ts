@@ -25,6 +25,7 @@ import {
 } from '../repositories/WorkCollaborationRepository';
 import { WorkSourceAccountRepository } from '../repositories/WorkSourceAccountRepository';
 import { createWorkGraphCursorCodec } from './cursor';
+import { parsePipelineStepResourceId } from './sources/mapPipeline';
 import { DynamoWorkActivityReader } from './sources/activityReader';
 import {
   WorkGraphOrchestrator,
@@ -314,10 +315,12 @@ class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
       return { ownerValid, viewerHasDirectAccess: viewer, capabilities: ['view-document', ...(row?.createdBy === scope.viewerId ? ['edit-document' as const] : [])] };
     }
     if (this.source === 'pipeline') {
+      // A step node is addressed as `runId#stepId`; the run's own row is what
+      // decides whether the step is visible, so authorize the run.
       const rows = await scanAll(this.client, {
         TableName: PIPELINE_RUNS_TABLE,
         FilterExpression: 'runId = :run',
-        ExpressionAttributeValues: { ':run': resourceId.replace(/^run:/, '') },
+        ExpressionAttributeValues: { ':run': parsePipelineStepResourceId(resourceId).runId },
       }, 2);
       const row = rows.length === 1 ? rows[0] : undefined;
       return {
@@ -396,10 +399,12 @@ class DynamoSourceActionAdapter implements WorkSourceActionAdapter {
       return { decision: 'allow', descriptor: { kind: 'route', capability, path: `/social/chat/${encodeURIComponent(resourceId)}` } };
     }
     if (this.source === 'pipeline' && capability === 'view-run') {
+      // Opening a step opens the run it belongs to — the run page is where a
+      // step is actually readable.
       const rows = await scanAll(this.client, {
         TableName: PIPELINE_RUNS_TABLE,
         FilterExpression: 'runId = :run',
-        ExpressionAttributeValues: { ':run': resourceId.replace(/^run:/, '') },
+        ExpressionAttributeValues: { ':run': parsePipelineStepResourceId(resourceId).runId },
       }, 2);
       const row = rows.length === 1 ? rows[0] : undefined;
       if (typeof row?.pipelineId !== 'string' || typeof row.runId !== 'string') return { decision: 'deny' };

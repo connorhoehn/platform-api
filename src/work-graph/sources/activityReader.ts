@@ -18,6 +18,7 @@ import type {
   TranscriptFacts,
   WorkActivityReader,
 } from '../activity';
+import { parsePipelineStepResourceId } from './mapPipeline';
 
 const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
 const RECORDINGS_TABLE = tableName('video-call-recordings');
@@ -96,10 +97,11 @@ async function scanOne(client: DynamoDBDocumentClient, table: string, expression
 export class DynamoWorkActivityReader implements WorkActivityReader {
   constructor(private readonly client: DynamoDBDocumentClient) {}
 
-  async pipelineRun(runId: string): Promise<PipelineRunFacts | null> {
-    const id = runId.replace(/^run:/, '');
+  async pipelineRun(resource: string): Promise<PipelineRunFacts | null> {
+    const { runId: id, stepId } = parsePipelineStepResourceId(resource);
     const row = await scanOne(this.client, PIPELINE_RUNS_TABLE, 'runId = :run', { ':run': id });
     if (!row) return null;
+    if (stepId) return this.pipelineStep(id, stepId, row);
     const steps = row.stepsSummary && typeof row.stepsSummary === 'object' && !Array.isArray(row.stepsSummary)
       ? (row.stepsSummary as Row)
       : {};
@@ -134,6 +136,65 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       tools: [...new Set(tools)],
       ...(agentLabel ? { agentLabel } : {}),
       ...(text(row.error, ERROR_SUMMARY_LENGTH) ? { error: text(row.error, ERROR_SUMMARY_LENGTH) as string } : {}),
+    };
+  }
+
+  /**
+   * One step of a run, read from the run's own persisted summary. A step that
+   * the run has no record of returns `null` rather than a plausible-looking
+   * placeholder — the node keeps its projected title and says nothing more.
+   *
+   * A forked node executes more than once and is filed as `stepId`, `stepId:2`
+   * …; the newest of those is what the step node describes.
+   */
+  private async pipelineStep(runId: string, stepId: string, row: Row): Promise<PipelineRunFacts | null> {
+    const steps = row.stepsSummary && typeof row.stepsSummary === 'object' && !Array.isArray(row.stepsSummary)
+      ? (row.stepsSummary as Row)
+      : {};
+    const summary = Object.entries(steps)
+      .filter(([key]) => key === stepId || key.startsWith(`${stepId}:`))
+      .map(([, value]) => (value && typeof value === 'object' ? value as Row : undefined))
+      .filter((value): value is Row => !!value)
+      .sort((left, right) => Date.parse(iso(left.completedAt) ?? iso(left.startedAt) ?? '') - Date.parse(iso(right.completedAt) ?? iso(right.startedAt) ?? ''))
+      .pop();
+    if (!summary) return null;
+    const startedAt = iso(summary.startedAt) ?? iso(row.startedAt);
+    if (!startedAt) return null;
+    // `agent` is the live loop telemetry the run persistence writes from
+    // `pipeline:step:agent:iteration`; `output` is what the finished step
+    // returned. The finished value wins where both say something.
+    const live = summary.agent && typeof summary.agent === 'object' ? summary.agent as Row : {};
+    const output = summary.output && typeof summary.output === 'object' ? summary.output as Row : {};
+    const number = (...values: unknown[]): number | undefined => {
+      for (const value of values) {
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.round(value);
+      }
+      return undefined;
+    };
+    const step: NonNullable<PipelineRunFacts['step']> = {
+      stepId,
+      ...(text(output.model ?? live.model, 40) ? { model: text(output.model ?? live.model, 40) as string } : {}),
+      ...(number(output.iterations, live.iterations, live.iteration) !== undefined
+        ? { iterations: number(output.iterations, live.iterations, live.iteration) as number } : {}),
+      ...(number(output.contextTokens, live.contextTokens) !== undefined
+        ? { contextTokens: number(output.contextTokens, live.contextTokens) as number } : {}),
+      ...(number(output.contextBudgetTokens, live.contextBudgetTokens) !== undefined
+        ? { contextBudgetTokens: number(output.contextBudgetTokens, live.contextBudgetTokens) as number } : {}),
+      ...(text(output.runtime ?? live.runtime, 20) ? { runtime: text(output.runtime ?? live.runtime, 20) as string } : {}),
+      ...(text(output.sessionId ?? live.sessionId, 80) ? { sessionId: text(output.sessionId ?? live.sessionId, 80) as string } : {}),
+      ...(text(output.boxId ?? live.boxId, 80) ? { boxId: text(output.boxId ?? live.boxId, 80) as string } : {}),
+      ...(text(output.stopReason, 30) ? { stopReason: text(output.stopReason, 30) as string } : {}),
+    };
+    const attempts = Array.isArray(summary.attempts) ? summary.attempts.length : 1;
+    return {
+      runId,
+      status: runStatus(summary.status),
+      attempt: Math.max(1, attempts),
+      startedAt,
+      updatedAt: iso(summary.completedAt) ?? iso(row.lastEventAt) ?? startedAt,
+      tools: [],
+      step,
+      ...(text(summary.error, ERROR_SUMMARY_LENGTH) ? { error: text(summary.error, ERROR_SUMMARY_LENGTH) as string } : {}),
     };
   }
 

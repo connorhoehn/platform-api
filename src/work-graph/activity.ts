@@ -14,6 +14,7 @@ import {
   detailsForDisclosedNodes,
   freshWorkOperations,
   WORK_GRAPH_LIMITS,
+  WORK_GRAPH_V2_LIMITS,
   type ViewerWorkActivityDetail,
   type ViewerWorkNodeLink,
   type ViewerWorkOperation,
@@ -36,6 +37,27 @@ export interface PipelineRunFacts {
   tools: string[];
   /** Sanitized failure summary. Never a stack trace, path, or credential. */
   error?: string;
+  /**
+   * Present only when the node names ONE step of the run (`runId#stepId`).
+   * Every field is copied from the step's own recorded output or its live
+   * iteration events — nothing here is averaged over the run or guessed.
+   */
+  step?: {
+    stepId: string;
+    /** `sonnet`, `opus` … exactly as the step was configured. */
+    model?: string;
+    /** Turns of the agent loop this step has actually taken. */
+    iterations?: number;
+    contextTokens?: number;
+    contextBudgetTokens?: number;
+    /** `devbox` when the step ran in a cloud workspace, `local` otherwise. */
+    runtime?: string;
+    /** The devbox session the step executed in, when it had one. */
+    sessionId?: string;
+    boxId?: string;
+    /** Why the loop stopped: `complete`, `budget`, `max_turns`, `timeout`… */
+    stopReason?: string;
+  };
 }
 
 /** An authorized handle for one revision's preview bytes. */
@@ -128,9 +150,60 @@ const PROCESS_KINDS = new Set(['run', 'agent', 'terminal']);
  */
 const OPERATION_RELATIONS = new Set(['produced', 'runs-in', 'operates-on', 'works-on']);
 
+/**
+ * Work started from a conversation is anchored on that conversation. The
+ * default anchors are the containers a person already thinks in; a chat is one
+ * of them, and without it an `/agent` run would sit in the graph attached to
+ * nothing. The conversation node still comes from the conversation source —
+ * this only says which kinds may name an effort.
+ */
+const WORK_EFFORT_ANCHORS = ['project', 'task', 'meeting', 'conversation'] as const;
+
 function instant(value: string | undefined): number {
   const parsed = value === undefined ? Number.NaN : Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** `200000 → '200k'`, `146_320 → '146k'`, `900 → '900'`. Never rounded up to a lie. */
+export function formatTokens(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return '0';
+  return value >= 1_000 ? `${Math.floor(value / 1_000)}k` : String(Math.floor(value));
+}
+
+/** `sonnet` → `Sonnet`, `claude-3-5-haiku` → `Haiku`. The name a person typed. */
+function modelName(model: string): string {
+  const last = model.trim().split(/[\s/]+/).pop() ?? model;
+  const known = ['opus', 'sonnet', 'haiku'].find((name) => last.toLowerCase().includes(name));
+  const label = known ?? last;
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+/**
+ * "Sonnet · 146k / 200k · 4 iterations" — model, context against the budget it
+ * was given, and turns actually taken. Each clause appears only when the step
+ * reported it; a step that reported nothing yields no line at all.
+ */
+export function agentStepLines(step: NonNullable<PipelineRunFacts['step']>): string[] {
+  const clauses = [
+    step.model ? modelName(step.model) : undefined,
+    step.contextTokens !== undefined
+      ? (step.contextBudgetTokens !== undefined
+        ? `${formatTokens(step.contextTokens)} / ${formatTokens(step.contextBudgetTokens)}`
+        : formatTokens(step.contextTokens))
+      : undefined,
+    step.iterations !== undefined
+      ? `${step.iterations} iteration${step.iterations === 1 ? '' : 's'}`
+      : undefined,
+    // `budget` and `max_turns` are why a loop stopped short. Saying so is the
+    // difference between a finished step and one that ran out of room.
+    step.stopReason && step.stopReason !== 'complete' ? `stopped: ${step.stopReason}` : undefined,
+  ].filter((value): value is string => !!value);
+  const head = clauses.length ? clauses.join(' · ') : undefined;
+  // The workspace the step ran in, named only when the source gave us one.
+  const workspace = step.runtime === 'devbox' && step.sessionId
+    ? `Cloud workspace · ${step.sessionId}`
+    : undefined;
+  return [head, workspace].filter((value): value is string => !!value);
 }
 
 function storedNode(authorization: AuthorizedWorkGraph, nodeId: string): StoredWorkNode | undefined {
@@ -318,9 +391,14 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       const agentLine = facts?.agentLabel && tools.length
         ? `${facts.agentLabel} · ${tools.length} tool${tools.length === 1 ? '' : 's'}`
         : trim(facts?.agentLabel);
+      // A node that names ONE step reads as that step's own loop, not as the
+      // run: "Sonnet · 146k / 200k · 4 iterations", and the workspace it is
+      // running in. Every clause is dropped when the step did not report it.
+      const stepLines = facts?.step ? agentStepLines(facts.step) : [];
+      const lines = [...(agentLine ? [agentLine] : []), ...stepLines].slice(0, WORK_GRAPH_V2_LIMITS.detailLines);
       setDetail(node.id, {
         ...(summary ? { summary } : {}),
-        ...(agentLine ? { lines: [agentLine] } : {}),
+        ...(lines.length ? { lines } : {}),
         ...(tools.length ? { tools } : {}),
         ...(inputs.length ? { inputs } : {}),
         ...(freshness ? { freshness } : {}),
@@ -539,12 +617,28 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
   const efforts = deriveWorkEfforts({
     nodes,
     edges,
+    anchorKinds: WORK_EFFORT_ANCHORS,
     contextBefore: query.windowStart,
     // A work stream with no artifact is named by its anchor's own context
     // line. Only the anchor may name the effort; a member never can.
-    titleFor: (anchor, members) => (members.some((member) => member.kind === 'document')
-      ? undefined
-      : streamOf(anchor)),
+    titleFor: (anchor, members) => {
+      if (members.some((member) => member.kind === 'document')) return undefined;
+      // A conversation is a container, not a piece of work: "general" names
+      // nothing a person recognises. The run started in it does. Only a member
+      // the viewer may actually read can speak, same rule as the outcome.
+      if (anchor.kind === 'conversation') {
+        // The EARLIEST run is the one the conversation started; its steps are
+        // created after it, so newest-first would title the effort after
+        // whichever step happened to run last.
+        const run = members
+          .filter((member) => (member.kind === 'run' || member.kind === 'agent')
+            && member.disclosure !== 'existence' && !member.locked)
+          .sort((left, right) => instant(left.startedAt) - instant(right.startedAt)
+            || left.id.localeCompare(right.id))[0];
+        if (run) return run.title;
+      }
+      return streamOf(anchor);
+    },
     subtitleFor: (effort) => {
       // The subtitle describes the artifact the effort is named after, so a
       // supporting input document cannot speak for the whole frame.

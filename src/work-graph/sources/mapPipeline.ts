@@ -37,9 +37,43 @@ export interface PipelineArtifactReference {
   payload?: unknown;
 }
 
-export interface PipelineRunSourceRecord {
-  kind: 'pipeline-run';
-  run: PipelineRun | PipelineRunSnapshot;
+/**
+ * A resource the source itself says this run or step consumed. It becomes a
+ * `derived-from` relationship to an ALREADY projected node — the reducer never
+ * conjures the counterpart — which is how a run started from a chat command
+ * reaches the conversation it came from, and how a step reaches the step it
+ * depends on. Nothing here is inferred from actor, day, or adjacency.
+ */
+export interface PipelineInputReference {
+  source: 'pipeline' | 'conversation' | 'document' | 'meeting' | 'cloud-compute' | 'local-compute';
+  resourceId: string;
+}
+
+const INPUT_SOURCES = new Set<PipelineInputReference['source']>([
+  'pipeline', 'conversation', 'document', 'meeting', 'cloud-compute', 'local-compute',
+]);
+const MAX_INPUT_REFERENCES = 16;
+
+/**
+ * Separates a run from one of its steps inside a single pipeline resource id.
+ * `#` is not legal in a run id, so `runId#stepId` round-trips and an ACL can
+ * recover the run whose row actually decides the step's visibility.
+ */
+export const PIPELINE_STEP_SEPARATOR = '#';
+
+export function pipelineStepResourceId(runId: string, stepId: string): string {
+  return `${runId}${PIPELINE_STEP_SEPARATOR}${stepId}`;
+}
+
+/** `runId#stepId` → both halves; a plain run id → `{ runId }` with no step. */
+export function parsePipelineStepResourceId(resourceId: string): { runId: string; stepId?: string } {
+  const raw = resourceId.replace(/^run:/, '');
+  const separator = raw.indexOf(PIPELINE_STEP_SEPARATOR);
+  if (separator <= 0 || separator === raw.length - 1) return { runId: raw };
+  return { runId: raw.slice(0, separator), stepId: raw.slice(separator + 1) };
+}
+
+interface PipelineObservationFields {
   /**
    * Authoritative trigger subject joined from PipelineRunTrigger/PipelineRunItem.
    * Synthetic dispatch identities must not be converted into human activity.
@@ -52,6 +86,31 @@ export interface PipelineRunSourceRecord {
   /** Explicit source-approved label; pipeline definition content is not read. */
   safeLabel?: string;
   artifactRefs?: readonly PipelineArtifactReference[];
+  /** Source-declared evidence this run/step consumed. Never inferred. */
+  inputRefs?: readonly PipelineInputReference[];
+}
+
+export interface PipelineRunSourceRecord extends PipelineObservationFields {
+  kind: 'pipeline-run';
+  run: PipelineRun | PipelineRunSnapshot;
+}
+
+/**
+ * One executed node of a run, projected as its own node so a generated
+ * pipeline reads as the steps a person was shown rather than a single opaque
+ * run. It shares the run's identity and attribution — a step is never a
+ * separate run — and is addressed as `runId#stepId`.
+ */
+export interface PipelineStepSourceRecord extends PipelineObservationFields {
+  kind: 'pipeline-step';
+  /** The parent run. Its id, pipeline id and attribution govern the step. */
+  run: PipelineRun | PipelineRunSnapshot;
+  step: {
+    /** The definition node id the executor reports, for example `agent:s1`. */
+    stepId: string;
+    /** The step's own status, not the run's. */
+    status: string;
+  };
 }
 
 /** Included so definition records fail closed instead of masquerading as runs. */
@@ -61,7 +120,10 @@ export interface PipelineDefinitionSourceRecord {
   status?: string;
 }
 
-export type PipelineSourceRecord = PipelineRunSourceRecord | PipelineDefinitionSourceRecord;
+export type PipelineSourceRecord =
+  | PipelineRunSourceRecord
+  | PipelineStepSourceRecord
+  | PipelineDefinitionSourceRecord;
 export type PipelineLifecycle = 'started' | 'waiting' | 'completed' | 'failed' | 'cancelled';
 
 /** Structural equivalent of C0 AuthenticatedWorkEvent for the pipeline source. */
@@ -88,6 +150,7 @@ export interface PipelineWorkEvent {
     attempt: number;
     artifactIds?: string[];
     safeLabel?: string;
+    inputs?: PipelineInputReference[];
   };
 }
 
@@ -103,7 +166,11 @@ export type PipelineMapUnsupportedReason =
   | 'unsupported-run-status'
   | 'invalid-timestamp'
   | 'invalid-replay-attempts'
-  | 'invalid-artifact-reference';
+  | 'invalid-artifact-reference'
+  | 'missing-step-id'
+  | 'missing-step-status'
+  | 'unsupported-step-status'
+  | 'invalid-input-reference';
 
 export type PipelineMapResult =
   | { supported: true; event: PipelineWorkEvent }
@@ -161,6 +228,50 @@ function lifecycleForStatus(raw: string): PipelineLifecycle | undefined {
   }
 }
 
+/**
+ * A step's own vocabulary, which is not the run's. A step the executor has not
+ * reached yet is `waiting` — the one honest reading of "planned, not started".
+ * It is deliberately never `started`, because a plan is not a running process.
+ */
+function lifecycleForStepStatus(raw: string): PipelineLifecycle | undefined {
+  switch (raw.trim().toLowerCase()) {
+    case 'pending':
+    case 'queued':
+    case 'waiting':
+    case 'paused':
+      return 'waiting';
+    case 'running':
+    case 'started':
+    case 'resuming':
+      return 'started';
+    case 'completed':
+    case 'succeeded':
+      return 'completed';
+    case 'failed':
+    case 'error':
+      return 'failed';
+    case 'skipped':
+    case 'cancelled':
+    case 'canceled':
+      return 'cancelled';
+    default:
+      return undefined;
+  }
+}
+
+function inputsFrom(
+  refs: readonly PipelineInputReference[] | undefined,
+): PipelineInputReference[] | undefined {
+  if (!refs || refs.length === 0) return [];
+  if (refs.length > MAX_INPUT_REFERENCES) return undefined;
+  const seen = new Map<string, PipelineInputReference>();
+  for (const ref of refs) {
+    if (!INPUT_SOURCES.has(ref?.source) || !isNonEmptyString(ref?.resourceId)) return undefined;
+    seen.set(`${ref.source}:${ref.resourceId}`, { source: ref.source, resourceId: ref.resourceId });
+  }
+  return [...seen.values()];
+}
+
 function isSyntheticTrigger(subject: string): boolean {
   return subject === 'system'
     || subject.startsWith('event:')
@@ -212,6 +323,11 @@ export function mapPipeline(
   if (!isNonEmptyString(run.runId)) return unsupported('missing-run-id');
   if (!isNonEmptyString(run.pipelineId)) return unsupported('missing-pipeline-id');
   if (!isNonEmptyString(run.status)) return unsupported('missing-run-status');
+  if (record.kind === 'pipeline-step') {
+    if (!isNonEmptyString(record.step?.stepId)) return unsupported('missing-step-id');
+    if (record.step.stepId.includes(PIPELINE_STEP_SEPARATOR)) return unsupported('missing-step-id');
+    if (!isNonEmptyString(record.step?.status)) return unsupported('missing-step-status');
+  }
   if (!isNonEmptyString(record.attributedSubject)) return unsupported('missing-run-attribution');
   if (isSyntheticTrigger(record.attributedSubject)) return unsupported('synthetic-trigger-is-not-human');
   if (record.attributedSubject !== context.actor.sourceSubject) {
@@ -219,8 +335,10 @@ export function mapPipeline(
   }
   if (!isIsoTimestamp(record.occurredAt)) return unsupported('invalid-timestamp');
 
-  const lifecycle = lifecycleForStatus(run.status);
-  if (!lifecycle) return unsupported('unsupported-run-status');
+  const lifecycle = record.kind === 'pipeline-step'
+    ? lifecycleForStepStatus(record.step.status)
+    : lifecycleForStatus(run.status);
+  if (!lifecycle) return unsupported(record.kind === 'pipeline-step' ? 'unsupported-step-status' : 'unsupported-run-status');
 
   // replayAttempts is a monotonic zero-based count in the runtime snapshot.
   // The work-graph contract exposes the human-readable one-based attempt.
@@ -231,11 +349,20 @@ export function mapPipeline(
   const artifactIds = artifactIdsFrom(record.artifactRefs, run.pipelineId, run.runId);
   if (artifactIds === undefined) return unsupported('invalid-artifact-reference');
 
+  const inputs = inputsFrom(record.inputRefs);
+  if (inputs === undefined) return unsupported('invalid-input-reference');
+
+  // A step is addressed within its run, so the run's own node and each of its
+  // steps get distinct, stable identities without a second source.
+  const resourceId = record.kind === 'pipeline-step'
+    ? pipelineStepResourceId(run.runId, record.step.stepId)
+    : run.runId;
+
   const transitionKey = `${attempt}:${lifecycle}:${record.occurredAt}`;
   const sourceSequence = isNonEmptyString(record.sourceSequence)
     ? record.sourceSequence
     : transitionKey;
-  const eventId = `pipeline:run:${run.runId}:${transitionKey}`;
+  const eventId = `pipeline:run:${resourceId}:${transitionKey}`;
 
   return {
     supported: true,
@@ -251,17 +378,18 @@ export function mapPipeline(
       producer: context.producer,
       resource: {
         source: 'pipeline',
-        resourceId: `run:${run.runId}`,
+        resourceId: `run:${resourceId}`,
         resourceVersion: sourceSequence,
       },
       payload: {
         kind: 'pipeline',
         lifecycle,
         pipelineId: run.pipelineId,
-        runId: run.runId,
+        runId: resourceId,
         attempt,
         ...(artifactIds.length > 0 ? { artifactIds } : {}),
         ...(isNonEmptyString(record.safeLabel) ? { safeLabel: record.safeLabel } : {}),
+        ...(inputs.length > 0 ? { inputs } : {}),
       },
     },
   };
