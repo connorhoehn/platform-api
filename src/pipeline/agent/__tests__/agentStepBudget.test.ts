@@ -124,3 +124,60 @@ describe('a step that spends the run\'s context budget', () => {
     expect(seenLab).toEqual({ sessionId: 'sess-1', boxId: 'box-1' });
   });
 });
+
+describe('the numbers surviving persistence', () => {
+  it('mirrors the step facts into the run context, where truncation cannot reach them', async () => {
+    const handler = createAgentStepHandler({ agentClient: neverCalled, devboxAgentClient: budgetClient });
+    const outcome = await handler.execute(node(), {}, helpers()) as StepOutcome;
+    const output = outcome.output as { loopSteps: Record<string, Record<string, unknown>> };
+    expect(output.loopSteps['agent:s2']).toMatchObject({
+      iterations: 1, contextTokens: 205_000, contextBudgetTokens: 200_000,
+      stopReason: 'budget', model: 'sonnet', runtime: 'devbox', sessionId: 'sess-1', boxId: 'box-1',
+    });
+  });
+
+  it('keeps every earlier step\'s facts as the run walks forward', async () => {
+    const handler = createAgentStepHandler({ agentClient: neverCalled, devboxAgentClient: budgetClient });
+    const prior = { 'agent:s1': { iterations: 4, contextTokens: 145_800, stopReason: 'complete' } };
+    const outcome = await handler.execute(node(), { loopSteps: prior }, helpers()) as StepOutcome;
+    const output = outcome.output as { loopSteps: Record<string, unknown> };
+    expect(Object.keys(output.loopSteps)).toEqual(['agent:s1', 'agent:s2']);
+    expect(output.loopSteps['agent:s1']).toEqual(prior['agent:s1']);
+  });
+
+  it('a skipped step records its facts too, so the pane is not blank for it', async () => {
+    const handler = createAgentStepHandler({ agentClient: neverCalled, devboxAgentClient: neverCalled });
+    const outcome = await handler.execute(node(), { budgetExhausted: true }, helpers()) as StepOutcome;
+    expect((outcome.output as { loopSteps: Record<string, unknown> }).loopSteps['agent:s2'])
+      .toMatchObject({ iterations: 0, stopReason: 'budget', skipped: true });
+  });
+
+  // The whole output is replaced past 100KB, not trimmed — so the trace is
+  // what gets sacrificed, never the numbers.
+  it('drops tool payloads rather than letting the output be replaced wholesale', async () => {
+    const big = 'x'.repeat(5_000);
+    const chatty: AgentClient = {
+      provider: 'test',
+      async *run(): AsyncIterable<AgentEvent> {
+        yield {
+          type: 'done', text: 'done', turns: 1, tokensIn: 1, tokensOut: 1, model: 'sonnet',
+          stopReason: 'complete', iterations: 1, contextTokens: 10,
+          toolCalls: Array.from({ length: 30 }, (_, i) => ({
+            name: `Read${i}`, input: { file: big }, output: big, ok: true, startedAt: 'now', endedAt: 'now',
+          })),
+        };
+      },
+    };
+    const handler = createAgentStepHandler({ agentClient: neverCalled, devboxAgentClient: chatty });
+    const outcome = await handler.execute(node(), {}, helpers()) as StepOutcome;
+    const output = outcome.output as AgentStepOutput & { loopSteps: Record<string, unknown> };
+
+    expect(JSON.stringify(output).length).toBeLessThan(100 * 1024);
+    // The calls are still listed, with their names and outcomes.
+    expect(output.toolCalls).toHaveLength(30);
+    expect(output.toolCalls[0]).toMatchObject({ name: 'Read0', ok: true });
+    expect(String(output.toolCalls[0].output)).toMatch(/too large to persist/);
+    // And the numbers came through untouched.
+    expect(output.loopSteps['agent:s2']).toMatchObject({ iterations: 1, stopReason: 'complete' });
+  });
+});

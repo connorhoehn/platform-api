@@ -410,14 +410,33 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
 
   let contextTokens = 0;
   let iterations = 0;
+  let sawBudgetStop = false;
+
+  // THE NUMBERS COME FROM WHICHEVER SOURCE STILL HAS THEM.
+  //
+  // runPersistence does not trim an over-large step output, it REPLACES it
+  // with `{truncated:true,size}` — so after a run with a real tool trace, a
+  // reload found no iterations, no context and no stop reason, and the lab
+  // read `failed` for a run that had finished. The agent step therefore also
+  // mirrors those few numbers into the run context under `loopSteps`, which
+  // is small enough to survive, and they are read from there whenever the
+  // step's own output no longer carries them.
+  const facts = obj(run.context.loopSteps);
+
   const steps: AgentLoopStepView[] = plan.steps.map((step) => {
     const nodeId = agentLoopNodeId(step.id);
     const execution = run.steps[nodeId] ?? {};
-    const output = obj(execution.output);
+    const rawOutput = obj(execution.output);
+    const fallback = obj(facts[nodeId]);
+    // A truncated output keeps none of its fields; prefer it only where it
+    // actually still has the value.
+    const output: Record<string, unknown> = { ...fallback, ...rawOutput };
+    if (rawOutput.truncated === true) Object.assign(output, fallback);
     const stepIterations = num(output.iterations);
     const stepContext = num(output.contextTokens);
     iterations += stepIterations;
     if (stepContext > contextTokens) contextTokens = stepContext;
+    if (str(output.stopReason) === 'budget') sawBudgetStop = true;
     return {
       id: step.id,
       nodeId,
@@ -442,7 +461,14 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
   // The row says 'pending' because that is a status the pipeline machinery
   // understands. What a person is looking at is a planner still thinking, and
   // 'planning' is the word for that — derived here, not invented in storage.
-  const status = plan.source === 'pending' && !run.completedAt ? 'planning' : run.status;
+  //
+  // 'budget' likewise: a run whose steps stopped because the context ceiling
+  // was reached did not fail and did not simply finish — it ran out of what
+  // it was given, which is its own outcome and the one the lab renders.
+  const terminal = ['completed', 'succeeded', 'failed', 'cancelled', 'canceled', 'rejected'].includes(run.status);
+  const status = plan.source === 'pending' && !run.completedAt
+    ? 'planning'
+    : (sawBudgetStop && terminal ? 'budget' : run.status);
 
   return {
     runId: run.runId,

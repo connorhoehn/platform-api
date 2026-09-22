@@ -72,6 +72,65 @@ export interface AgentStepHandlerOpts {
 const DEFAULT_MODEL = 'sonnet';
 const DEFAULT_MAX_TOOL_PAYLOAD_CHARS = 4_000;
 
+/**
+ * Keep the whole step output comfortably under runPersistence's 100 KB cap.
+ *
+ * That cap does not trim the output — it REPLACES it with
+ * `{truncated:true,size}`. So an agent step with a real tool trace lost
+ * everything on the way to storage, and a page reload after the run showed
+ * empty `iterations`/`contextTokens`/`stopReason` and read as a failure. The
+ * trace is the expendable part; the numbers are not.
+ */
+const MAX_PERSISTED_OUTPUT_CHARS = 60_000;
+
+/**
+ * The few numbers the lab is built from, small enough that nothing will ever
+ * truncate them. Mirrored into the run CONTEXT under `loopSteps` so they
+ * survive independently of the step output — see buildOutput.
+ */
+export interface AgentLoopStepFacts {
+  iterations: number;
+  contextTokens: number;
+  contextBudgetTokens?: number;
+  stopReason: AgentStepOutput['stopReason'];
+  tokensIn: number;
+  tokensOut: number;
+  model: string;
+  runtime: 'local' | 'devbox';
+  sessionId?: string;
+  boxId?: string;
+  skipped?: boolean;
+}
+
+/** The `loopSteps` map as it stands in the run context. */
+export function loopStepsFromContext(context: Record<string, unknown>): Record<string, AgentLoopStepFacts> {
+  const raw = context.loopSteps;
+  if (!raw || typeof raw !== 'object') return {};
+  return { ...(raw as Record<string, AgentLoopStepFacts>) };
+}
+
+/**
+ * Drop the tool payloads (keeping every call's name, outcome and timing) when
+ * the output would otherwise be replaced wholesale on its way to storage.
+ */
+export function fitPersistedOutput<T extends { toolCalls: AgentToolCall[] }>(output: T): T {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(output) ?? '';
+  } catch {
+    return output;
+  }
+  if (serialized.length <= MAX_PERSISTED_OUTPUT_CHARS) return output;
+  return {
+    ...output,
+    toolCalls: output.toolCalls.map((call) => ({
+      ...call,
+      input: undefined,
+      output: '[dropped: the step output was too large to persist whole]',
+    })),
+  };
+}
+
 /** DC's own `{{ context.x }}` semantics, matched exactly (see PipelineExecutor.interpolate). */
 export function interpolateContext(
   template: string,
@@ -178,15 +237,21 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
       // steps stop before they start, saying so. No tokens, no turns, no
       // pretending the step ran.
       if (runtime === 'devbox' && context.budgetExhausted === true) {
+        const model = data.model?.trim() || defaultModel;
+        const facts: AgentLoopStepFacts = {
+          iterations: 0, contextTokens: 0, stopReason: 'budget',
+          tokensIn: 0, tokensOut: 0, model, runtime, skipped: true,
+        };
         return {
           status: 'completed',
           output: {
-            text: '', turns: 0, toolCalls: [], model: data.model?.trim() || defaultModel,
+            text: '', turns: 0, toolCalls: [], model,
             tokensIn: 0, tokensOut: 0, stopReason: 'budget' as const, toolless: false,
             iterations: 0, contextTokens: 0, runtime,
             skipped: true,
             skippedReason: 'the run reached its context budget before this step started',
-          } satisfies AgentStepOutput & { skipped: boolean; skippedReason: string },
+            loopSteps: { ...loopStepsFromContext(context), [helpers.stepId]: facts },
+          },
         };
       }
 
@@ -219,7 +284,19 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
         ? (data.contextBudgetTokens as number)
         : undefined;
 
-      const buildOutput = (): AgentStepOutput & { lab?: AgentLabSession } => ({
+      const stepFacts = (): AgentLoopStepFacts => ({
+        iterations: iterations || turns,
+        contextTokens: contextTokens || tokensIn,
+        ...(contextBudgetTokens ? { contextBudgetTokens } : {}),
+        stopReason,
+        tokensIn,
+        tokensOut,
+        model: reportedModel,
+        runtime,
+        ...(lab?.sessionId ? { sessionId: lab.sessionId, boxId: lab.boxId } : {}),
+      });
+
+      const buildOutput = (): AgentStepOutput & { lab?: AgentLabSession; loopSteps?: Record<string, AgentLoopStepFacts> } => fitPersistedOutput({
         text,
         turns,
         toolCalls: toolCalls.map((c) => ({
@@ -240,6 +317,15 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
         // Merged into the run context by the executor, so the NEXT devbox
         // step of this run reuses the same box instead of opening its own.
         ...(lab?.sessionId ? { lab } : {}),
+        // THE NUMBERS, KEPT OUT OF HARM'S WAY.
+        //
+        // Step outputs merge into the run context, and this map is a few
+        // dozen bytes per step — so it rides the persisted checkpoint whole
+        // even when the step's own output is replaced by a truncation marker
+        // on the way to storage. Without it, a reload after a run with a real
+        // tool trace showed no iterations, no context and no stop reason, and
+        // the lab read `failed` for a run that had finished.
+        loopSteps: { ...loopStepsFromContext(context), [helpers.stepId]: stepFacts() },
       });
 
       try {

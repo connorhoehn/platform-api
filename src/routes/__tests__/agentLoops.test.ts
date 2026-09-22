@@ -546,3 +546,76 @@ describe('a step that failed', () => {
       .toMatchObject({ id: 's2', stopReason: 'budget', skipped: true, iterations: 0 });
   });
 });
+
+describe('a GET after the process restarted', () => {
+  // The live defect: runPersistence REPLACES an over-large step output with
+  // `{truncated:true,size}`, so after a run with a real tool trace the reload
+  // found no iterations, no context and no stop reason — and the lab read
+  // `failed` for a run that had finished.
+  const persistedAfterRestart = (): LoadedAgentLoop => loadedRun({
+    status: 'completed',
+    completedAt: '2026-09-21T11:50:00.000Z',
+    steps: {
+      // Exactly what storage keeps when the trace blew the 100KB cap.
+      'agent:s1': { status: 'completed', output: { truncated: true, size: 812_344 } },
+      'agent:s2': { status: 'completed', output: { truncated: true, size: 402_110 } },
+    },
+    context: {
+      ...loadedRun().context,
+      // The small mirror the agent step writes into the run context.
+      loopSteps: {
+        'agent:s1': { iterations: 4, contextTokens: 145_800, stopReason: 'complete', tokensIn: 140_000, tokensOut: 5_800, model: 'opus', runtime: 'devbox', sessionId: 'sess-1', boxId: 'box-1' },
+        'agent:s2': { iterations: 1, contextTokens: 205_000, stopReason: 'budget', tokensIn: 60_000, tokensOut: 900, model: 'opus', runtime: 'devbox', sessionId: 'sess-1', boxId: 'box-1' },
+      },
+    },
+  });
+
+  it('reports the same numbers a live GET did, from the persisted run alone', async () => {
+    run = persistedAfterRestart();
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    const body = res.body as { steps: Array<Record<string, unknown>>; contextTokens: number; iterations: number; status: string };
+
+    expect(body.steps[0]).toMatchObject({ id: 's1', iterations: 4, contextTokens: 145_800, stopReason: 'complete', tokensIn: 140_000, tokensOut: 5_800 });
+    expect(body.steps[1]).toMatchObject({ id: 's2', iterations: 1, contextTokens: 205_000, stopReason: 'budget' });
+    // The run totals are the same ones the live poll showed.
+    expect({ contextTokens: body.contextTokens, iterations: body.iterations })
+      .toEqual({ contextTokens: 205_000, iterations: 5 });
+  });
+
+  it('calls that run budget, not failed — it ran out of what it was given', async () => {
+    run = persistedAfterRestart();
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect((res.body as { status: string }).status).toBe('budget');
+  });
+
+  it('prefers a real output over the mirror, so live numbers are never stale', async () => {
+    run = loadedRun({
+      steps: { 'agent:s1': { status: 'running', output: { iterations: 7, contextTokens: 190_000, stopReason: 'complete' } } },
+      context: {
+        ...loadedRun().context,
+        loopSteps: { 'agent:s1': { iterations: 2, contextTokens: 50_000, stopReason: 'complete' } },
+      },
+    });
+    const res = await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank');
+    expect((res.body as { steps: Array<Record<string, unknown>> }).steps[0])
+      .toMatchObject({ iterations: 7, contextTokens: 190_000 });
+  });
+
+  it('leaves a genuinely failed run reading failed, budget stop or not', async () => {
+    run = loadedRun({
+      status: 'failed', completedAt: '2026-09-21T11:50:00.000Z',
+      steps: { 'agent:s1': { status: 'failed', error: 'agent step stopped: timeout', output: { stopReason: 'timeout', iterations: 3 } } },
+    });
+    expect((await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank')).body)
+      .toMatchObject({ status: 'failed' });
+  });
+
+  it('does not call a still-running loop budget before it is over', async () => {
+    run = loadedRun({
+      status: 'running',
+      steps: { 'agent:s1': { status: 'completed', output: { stopReason: 'budget', iterations: 1, contextTokens: 205_000 } } },
+    });
+    expect((await call(buildApp(), 'get', '/api/agent-loops/run-1', 'dev-frank')).body)
+      .toMatchObject({ status: 'running' });
+  });
+});
