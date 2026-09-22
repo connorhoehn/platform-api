@@ -1,3 +1,4 @@
+import { describe, it, expect } from '@jest/globals';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { validateWorkGraphSnapshotV2, type WorkGraphSnapshotV2 } from '@connorhoehn/realtime-modules/work-graph';
 import { createWorkGraphCursorCodec } from '../../work-graph/cursor';
@@ -288,7 +289,9 @@ describe('work graph schemaVersion 2 route', () => {
     expect(body.efforts).toHaveLength(2);
 
     const sprint = body.efforts.find((effort) => effort.anchorNodeId === 'meeting');
-    expect(sprint?.title).toBe('Sprint review');
+    // Named LAST (activity.ts): a frame that holds a run is named by the run,
+    // "whatever the anchor is" (1681fb5) — the meeting anchor no longer wins.
+    expect(sprint?.title).toBe('Generate presentation');
     expect(sprint?.subtitle).toBe('v3 generating · v2 available');
     expect(sprint?.nodeIds.sort()).toEqual(['deck', 'deck-v1', 'deck-v2', 'meeting', 'release-plan', 'release-plan-v6', 'run', 'transcript']);
     // Work observed before the selected window is folded context, not dropped.
