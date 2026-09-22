@@ -1,8 +1,11 @@
 import type { PipelineRun, PipelineRunSnapshot } from '@connorhoehn/pipeline-runtime';
 import {
   mapPipeline,
+  parsePipelineStepResourceId,
+  pipelineStepResourceId,
   type AuthenticatedPipelineContext,
   type PipelineRunSourceRecord,
+  type PipelineStepSourceRecord,
 } from '../mapPipeline';
 
 const context: AuthenticatedPipelineContext = {
@@ -167,5 +170,126 @@ describe('mapPipeline', () => {
       .toMatchObject({ supported: false, reason: 'synthetic-trigger-is-not-human' });
     expect(mapPipeline(source('running', { attributedSubject: '' }), context))
       .toMatchObject({ supported: false, reason: 'missing-run-attribution' });
+  });
+});
+
+describe('mapPipeline step records', () => {
+  function step(
+    status: string,
+    overrides: Partial<PipelineStepSourceRecord> = {},
+  ): PipelineStepSourceRecord {
+    return {
+      kind: 'pipeline-step',
+      run: run('running'),
+      step: { stepId: 'agent:s1', status },
+      attributedSubject: 'cognito-subject-42',
+      occurredAt: '2026-09-19T12:00:01.000Z',
+      ...overrides,
+    };
+  }
+
+  it('addresses a step within its run, so the run keeps its own node', () => {
+    const event = eventOf(mapPipeline(step('running'), context));
+    expect(event.payload.runId).toBe('run-7#agent:s1');
+    expect(event.resource.resourceId).toBe('run:run-7#agent:s1');
+    expect(event.payload.pipelineId).toBe('pipeline-3');
+    expect(parsePipelineStepResourceId(event.payload.runId)).toEqual({ runId: 'run-7', stepId: 'agent:s1' });
+  });
+
+  it('calls a planned step waiting, never started', () => {
+    expect(eventOf(mapPipeline(step('pending'), context)).payload.lifecycle).toBe('waiting');
+  });
+
+  it.each([
+    ['running', 'started'],
+    ['completed', 'completed'],
+    ['failed', 'failed'],
+    ['skipped', 'cancelled'],
+    ['cancelled', 'cancelled'],
+  ])('maps step status %s to lifecycle %s', (status, lifecycle) => {
+    expect(eventOf(mapPipeline(step(status), context)).payload.lifecycle).toBe(lifecycle);
+  });
+
+  it('refuses a step status it cannot describe', () => {
+    const result = mapPipeline(step('teleporting'), context);
+    expect(result).toMatchObject({ supported: false, reason: 'unsupported-step-status' });
+  });
+
+  it('refuses a step with no id, and one whose id would forge another step', () => {
+    expect(mapPipeline(step('running', { step: { stepId: '', status: 'running' } }), context))
+      .toMatchObject({ reason: 'missing-step-id' });
+    expect(mapPipeline(step('running', { step: { stepId: 'a#b', status: 'running' } }), context))
+      .toMatchObject({ reason: 'missing-step-id' });
+  });
+
+  it('carries the source-declared title as the node label', () => {
+    const event = eventOf(mapPipeline(step('running', { safeLabel: 'Draft the agenda' }), context));
+    expect(event.payload.safeLabel).toBe('Draft the agenda');
+  });
+
+  it('declares the run and the steps it depends on, deduplicated', () => {
+    const event = eventOf(mapPipeline(step('running', {
+      inputRefs: [
+        { source: 'pipeline', resourceId: 'run-7' },
+        { source: 'pipeline', resourceId: 'run-7#agent:s0' },
+        { source: 'pipeline', resourceId: 'run-7#agent:s0' },
+      ],
+    }), context));
+    expect(event.payload.inputs).toEqual([
+      { source: 'pipeline', resourceId: 'run-7' },
+      { source: 'pipeline', resourceId: 'run-7#agent:s0' },
+    ]);
+  });
+
+  it('carries the originating conversation on the run itself', () => {
+    const event = eventOf(mapPipeline(source('running', {
+      inputRefs: [{ source: 'conversation', resourceId: 'chat:c:general' }],
+    }), context));
+    expect(event.payload.runId).toBe('run-7');
+    expect(event.payload.inputs).toEqual([{ source: 'conversation', resourceId: 'chat:c:general' }]);
+  });
+
+  it('omits inputs entirely when the source declared none', () => {
+    expect(eventOf(mapPipeline(source('running'), context)).payload.inputs).toBeUndefined();
+  });
+
+  it('refuses an input reference from a source that is not a work source', () => {
+    const result = mapPipeline(source('running', {
+      inputRefs: [{ source: 'sqs' as never, resourceId: 'queue-1' }],
+    }), context);
+    expect(result).toMatchObject({ reason: 'invalid-input-reference' });
+  });
+
+  it('refuses an input reference with no resource', () => {
+    const result = mapPipeline(source('running', {
+      inputRefs: [{ source: 'conversation', resourceId: '  ' }],
+    }), context);
+    expect(result).toMatchObject({ reason: 'invalid-input-reference' });
+  });
+
+  it('gives the same step transition the same event id on redelivery', () => {
+    const first = eventOf(mapPipeline(step('completed'), context));
+    const second = eventOf(mapPipeline(step('completed'), context));
+    expect(first.eventId).toBe(second.eventId);
+    expect(first.eventId).not.toBe(eventOf(mapPipeline(source('completed'), context)).eventId);
+  });
+
+  it('still refuses a step whose attribution is not the authenticated actor', () => {
+    expect(mapPipeline(step('running', { attributedSubject: 'someone-else' }), context))
+      .toMatchObject({ reason: 'actor-does-not-match-run-trigger' });
+  });
+
+  it('still refuses a step attributed to a synthetic trigger', () => {
+    expect(mapPipeline(step('running', { attributedSubject: 'system' }), context))
+      .toMatchObject({ reason: 'synthetic-trigger-is-not-human' });
+  });
+});
+
+describe('pipelineStepResourceId', () => {
+  it('round-trips, and reads a plain run id as a run with no step', () => {
+    expect(pipelineStepResourceId('run-7', 'agent:s1')).toBe('run-7#agent:s1');
+    expect(parsePipelineStepResourceId('run-7')).toEqual({ runId: 'run-7' });
+    expect(parsePipelineStepResourceId('run:run-7')).toEqual({ runId: 'run-7' });
+    expect(parsePipelineStepResourceId('run:run-7#agent:s2')).toEqual({ runId: 'run-7', stepId: 'agent:s2' });
   });
 });
