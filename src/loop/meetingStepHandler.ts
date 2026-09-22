@@ -31,6 +31,10 @@ export interface MeetingNodeData {
   title?: string;
   /** How far ahead the proposed time is, in minutes. Default: the next day. */
   proposeInMinutes?: number;
+  /** An explicit start (ISO), when something already decided when. */
+  startsAt?: string;
+  /** How long the meeting is meant to be. Default 30 minutes. */
+  durationMinutes?: number;
   label?: string;
 }
 
@@ -44,6 +48,7 @@ const TEAM_PATHS = ['$.team', '$.teamName'];
 const ORG_PATHS = ['$.organizationId', '$.orgId', '$.trigger.organizationId'];
 const REQUESTER_PATHS = ['$.requestedBy', '$.trigger.requestedBy'];
 const DEFAULT_PROPOSAL_MINUTES = 24 * 60;
+const DEFAULT_DURATION_MINUTES = 30;
 const MAX_ATTENDEES = 50;
 /** The org a local deployment puts everything in — the same default the rooms route uses. */
 const DEV_ORG_ID = 'default-org';
@@ -156,7 +161,14 @@ export function createMeetingStepHandler(opts: MeetingStepHandlerOpts = {}): Des
       const source = str(data.title) ?? str(data.label) ?? firstOf(TITLE_PATHS, context) ?? 'Meeting';
       const title = source.slice(0, 120);
       const teamName = str(data.team) ?? firstOf(TEAM_PATHS, context) ?? teamNameFrom(source) ?? teamNameFrom(firstOf(TITLE_PATHS, context));
-      const startsAt = proposedStart(now(), data.proposeInMinutes ?? DEFAULT_PROPOSAL_MINUTES);
+      // An explicit time wins; otherwise the proposal. Either way it is stored
+      // as a real field on the room, not as prose in its description.
+      const explicit = str(data.startsAt);
+      const given = explicit && Number.isFinite(Date.parse(explicit)) ? new Date(Date.parse(explicit)).toISOString() : undefined;
+      const startsAt = given ?? proposedStart(now(), data.proposeInMinutes ?? DEFAULT_PROPOSAL_MINUTES);
+      const durationMinutes = typeof data.durationMinutes === 'number' && data.durationMinutes > 0
+        ? Math.round(data.durationMinutes)
+        : DEFAULT_DURATION_MINUTES;
       const notices: string[] = [];
 
       if (!organization.organizationId) {
@@ -202,7 +214,9 @@ export function createMeetingStepHandler(opts: MeetingStepHandlerOpts = {}): Des
           orgId: organizationId,
           slug: meetingSlug(title, String(Date.parse(startsAt)).slice(-6)),
           name: title,
-          description: `Proposed by an agent loop · ${startsAt}`,
+          description: 'Proposed by an agent loop',
+          startsAt,
+          durationMinutes,
           visibility: 'org',
           settings: { audioOnly: false, recordingEnabled: true, softCap: 25 },
           createdBy: requestedBy,
@@ -228,6 +242,9 @@ export function createMeetingStepHandler(opts: MeetingStepHandlerOpts = {}): Des
             attendees: invited,
             attendeeCount: invited.length,
             startsAt,
+            durationMinutes,
+            // An explicit time was decided elsewhere; a proposal was not.
+            timeSource: given ? 'given' : 'proposed',
             // No calendar is wired to this deployment: the time is a proposal,
             // and saying so is the difference between a meeting and a plan.
             calendar: 'none',
@@ -237,7 +254,7 @@ export function createMeetingStepHandler(opts: MeetingStepHandlerOpts = {}): Des
             // The run declares what it made. The work graph's meeting source
             // admits attendance/recording/transcript facts, and a room nobody
             // has joined is none of them, so this is the honest projection.
-            artifacts: [{ artifactId: room.roomId, kind: 'meeting', title, startsAt }],
+            artifacts: [{ artifactId: room.roomId, kind: 'meeting', title, startsAt, durationMinutes }],
             result: { kind: 'room', roomId: room.roomId, slug: room.slug },
           },
         };

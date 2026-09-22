@@ -67,6 +67,16 @@ export interface HangoutRoom {
   lastActiveAt: string;
   archivedAt?: string;
   ttl?: number;
+  /**
+   * When the room is scheduled to be used, and for how long.
+   *
+   * A room is a place, not a booking, so these are absent for one that is
+   * simply open. They are set when something schedules it — an agent loop's
+   * meeting step, today — so a reader has a real time rather than prose in the
+   * description to parse. Nothing here books a calendar.
+   */
+  startsAt?: string;
+  durationMinutes?: number;
   /** Set when this room is a team's channel; absent for a standalone room. */
   teamId?: string;
   /** Only meaningful alongside `teamId`. */
@@ -81,6 +91,9 @@ export interface CreateHangoutRoomInput {
   visibility: HangoutRoomVisibility;
   settings: HangoutRoomSettings;
   createdBy: string;
+  /** A scheduled start (ISO) and its length, when something scheduled it. */
+  startsAt?: string;
+  durationMinutes?: number;
   teamId?: string;
   channelPrivacy?: ChannelPrivacy;
 }
@@ -170,6 +183,8 @@ export class HangoutRoomRepository extends BaseRepository {
       settings: input.settings,
       state: 'active',
       lastActiveAt: now,
+      ...(input.startsAt !== undefined ? { startsAt: input.startsAt } : {}),
+      ...(input.durationMinutes !== undefined ? { durationMinutes: input.durationMinutes } : {}),
       ...(input.teamId !== undefined ? { teamId: input.teamId } : {}),
       ...(input.channelPrivacy !== undefined ? { channelPrivacy: input.channelPrivacy } : {}),
     };

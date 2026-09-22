@@ -74,19 +74,38 @@ describe('the meeting step', () => {
     ]);
   });
 
-  it('proposes a time and says no calendar was booked', async () => {
-    const { opts } = deps();
+  it('proposes a time, stores it on the room, and says no calendar was booked', async () => {
+    const { opts, created } = deps();
     const outcome = await createMeetingStepHandler(opts).execute(node(), context, helpers);
     const output = outcome.output as Record<string, unknown>;
-    expect(output.startsAt).toBe('2026-09-23T09:00:00.000Z');
-    expect(output.calendar).toBe('none');
+    expect(output).toMatchObject({
+      startsAt: '2026-09-23T09:00:00.000Z', durationMinutes: 30, timeSource: 'proposed', calendar: 'none',
+    });
+    // A real field on the room, not prose in its description.
+    expect(created[0]).toMatchObject({ startsAt: '2026-09-23T09:00:00.000Z', durationMinutes: 30 });
+    expect(String(created[0]!.description)).not.toContain('2026-09-23');
+  });
+
+  it('keeps a time that was already decided, and its length', async () => {
+    const { opts, created } = deps();
+    const outcome = await createMeetingStepHandler(opts).execute(
+      node({ startsAt: '2026-09-24T14:30:00Z', durationMinutes: 45 }), context, helpers,
+    );
+    expect(outcome.output).toMatchObject({ startsAt: '2026-09-24T14:30:00.000Z', durationMinutes: 45, timeSource: 'given' });
+    expect(created[0]).toMatchObject({ startsAt: '2026-09-24T14:30:00.000Z', durationMinutes: 45 });
+  });
+
+  it('falls back to the proposal when the given time is not a time', async () => {
+    const { opts } = deps();
+    const outcome = await createMeetingStepHandler(opts).execute(node({ startsAt: 'next Tuesday-ish' }), context, helpers);
+    expect(outcome.output).toMatchObject({ startsAt: '2026-09-23T09:00:00.000Z', timeSource: 'proposed' });
   });
 
   it('declares the room as the run’s artifact', async () => {
     const { opts } = deps();
     const outcome = await createMeetingStepHandler(opts).execute(node({ title: 'Platform sync' }), context, helpers);
     expect((outcome.output as Record<string, unknown>).artifacts).toEqual([
-      { artifactId: 'room-1', kind: 'meeting', title: 'Platform sync', startsAt: '2026-09-23T09:00:00.000Z' },
+      { artifactId: 'room-1', kind: 'meeting', title: 'Platform sync', startsAt: '2026-09-23T09:00:00.000Z', durationMinutes: 30 },
     ]);
   });
 
