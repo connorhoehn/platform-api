@@ -25,6 +25,7 @@ import { GetCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient } fr
 import { docClient as defaultDocClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import type { AssetBlobStore, BlobAsset } from '../pipeline/image/ImageBlobStore';
+import { deckSources, type DeckSpec } from './DeckSpec';
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
 import { PPTX_CONTENT_TYPE } from './renderPptx';
 import { SVG_CONTENT_TYPE } from './renderSlideSvg';
@@ -42,6 +43,14 @@ export interface StoredSlide {
   asset: BlobAsset;
 }
 
+/** What a revision stands on, as the deck itself declared it. */
+export interface RevisionSource {
+  documentId: string;
+  title: string;
+  kind: 'document' | 'transcript';
+  anchor?: string;
+}
+
 /** One revision of a presentation: the `.pptx` and the slides rendered with it. */
 export interface StoredRevision {
   id: string;
@@ -52,6 +61,24 @@ export interface StoredRevision {
   /** The `.pptx` itself. */
   asset: BlobAsset;
   slides: StoredSlide[];
+  /**
+   * The spec this revision was rendered from. Stored so the editor can reopen a
+   * revision and change it, rather than reconstructing a deck from its pictures.
+   * Absent on revisions written before specs were kept.
+   */
+  spec?: DeckSpec;
+  /** Every document the spec cited — what the work graph reads as the inputs. */
+  sources?: RevisionSource[];
+}
+
+/** A transcript cites itself by a `transcript` id; everything else is a document. */
+export function revisionSources(spec: DeckSpec): RevisionSource[] {
+  return deckSources(spec).map((source) => ({
+    documentId: source.documentId,
+    title: source.title,
+    kind: /^transcript(?:[:-]|$)/i.test(source.documentId) ? 'transcript' : 'document',
+    ...(source.anchor ? { anchor: source.anchor } : {}),
+  }));
 }
 
 export interface PresentationDocumentRow {
@@ -76,6 +103,10 @@ export interface AppendRevisionInput {
   pptx: Buffer;
   /** One SVG per slide, in slide order, including the Sources slide. */
   slides: Array<{ id: string; title: string; svg: string }>;
+  /** The spec the bytes were rendered from, kept so the revision can be edited. */
+  spec?: DeckSpec;
+  /** A name for this revision. Defaults to its id (`v3`). */
+  label?: string;
 }
 
 export interface AppendRevisionResult {
@@ -185,12 +216,13 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
 
     const revision: StoredRevision = {
       id: revisionId,
-      label: revisionId,
+      label: input.label?.trim() ? input.label.trim().slice(0, 80) : revisionId,
       createdAt: at,
       createdBy: input.createdBy,
       slideCount: slides.length,
       asset: pptxAsset,
       slides,
+      ...(input.spec ? { spec: input.spec, sources: revisionSources(input.spec) } : {}),
     };
 
     if (!existing) {

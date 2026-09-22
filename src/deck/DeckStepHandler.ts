@@ -134,7 +134,7 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
           };
         });
 
-        const { revision } = await store.appendRevision({ documentId, title, createdBy: requestedBy, pptx, slides });
+        const { revision } = await store.appendRevision({ documentId, title, createdBy: requestedBy, pptx, slides, spec });
         const previewHandles = revision.slides.map((slide) => slide.previewHandle);
 
         try {
