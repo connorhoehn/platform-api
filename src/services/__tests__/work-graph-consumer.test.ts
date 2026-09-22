@@ -148,3 +148,38 @@ describe('work-graph authenticated HTTP ingestion', () => {
     expect(h.repository.commitEvent).not.toHaveBeenCalled();
   });
 });
+
+describe('a denied event says which one it was', () => {
+  const envelope = (payload: unknown) => ({
+    eventName: 'work-graph.pipeline.lifecycle.v1',
+    metadata: { producer: 'platform-api' },
+    payload,
+  });
+
+  it('names the source, the shape and the resource, and never the content', async () => {
+    const repository = { loadProjection: jest.fn(), commitEvent: jest.fn() };
+    const accountResolver = { resolve: jest.fn() };
+    let consume!: (input: unknown) => Promise<void>;
+    startWorkGraphConsumer({
+      transport: { subscribe: (_queue: string, handler: (input: unknown) => Promise<void>) => { consume = handler; return () => undefined; } } as never,
+      repository: repository as never,
+      accountResolver: accountResolver as never,
+    });
+    const denied = await consume(envelope({
+      schemaVersion: 1, eventId: 'e1', idempotencyKey: 'e1', source: 'pipeline', sourceSequence: '1',
+      occurredAt: '2026-09-21T18:00:00.000Z', receivedAt: '2026-09-21T18:00:00.000Z',
+      actor: { actorId: 'a', organizationId: 'o', sourceSubject: 's' },
+      producer: { serviceId: 'platform-api', organizationId: 'o', credentialId: 'c' },
+      resource: { source: 'pipeline', resourceId: 'run:run-1#agent:s1', resourceVersion: '1' },
+      // `#` is outside the contract's id grammar: this is exactly the event
+      // that published, drained and was then refused with no way to find it.
+      payload: { kind: 'pipeline', lifecycle: 'started', pipelineId: 'p', runId: 'run-1#agent:s1', attempt: 1, safeLabel: 'Draft' },
+    })).catch((error: Error) => error);
+    expect((denied as Error).message).toContain('invalid-payload');
+    expect((denied as Error).message).toContain('source=pipeline');
+    expect((denied as Error).message).toContain('kind=pipeline');
+    expect((denied as Error).message).toContain('run:run-1#agent:s1');
+    expect((denied as Error).message).toContain('fields=attempt|kind|lifecycle|pipelineId|runId|safeLabel');
+    expect((denied as Error).message).not.toContain('Draft');
+  });
+});

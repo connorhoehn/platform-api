@@ -190,8 +190,8 @@ describe('mapPipeline step records', () => {
 
   it('addresses a step within its run, so the run keeps its own node', () => {
     const event = eventOf(mapPipeline(step('running'), context));
-    expect(event.payload.runId).toBe('run-7#agent:s1');
-    expect(event.resource.resourceId).toBe('run:run-7#agent:s1');
+    expect(event.payload.runId).toBe('run-7::agent:s1');
+    expect(event.resource.resourceId).toBe('run:run-7::agent:s1');
     expect(event.payload.pipelineId).toBe('pipeline-3');
     expect(parsePipelineStepResourceId(event.payload.runId)).toEqual({ runId: 'run-7', stepId: 'agent:s1' });
   });
@@ -218,7 +218,7 @@ describe('mapPipeline step records', () => {
   it('refuses a step with no id, and one whose id would forge another step', () => {
     expect(mapPipeline(step('running', { step: { stepId: '', status: 'running' } }), context))
       .toMatchObject({ reason: 'missing-step-id' });
-    expect(mapPipeline(step('running', { step: { stepId: 'a#b', status: 'running' } }), context))
+    expect(mapPipeline(step('running', { step: { stepId: 'a::b', status: 'running' } }), context))
       .toMatchObject({ reason: 'missing-step-id' });
   });
 
@@ -231,13 +231,13 @@ describe('mapPipeline step records', () => {
     const event = eventOf(mapPipeline(step('running', {
       inputRefs: [
         { source: 'pipeline', resourceId: 'run-7' },
-        { source: 'pipeline', resourceId: 'run-7#agent:s0' },
-        { source: 'pipeline', resourceId: 'run-7#agent:s0' },
+        { source: 'pipeline', resourceId: 'run-7::agent:s0' },
+        { source: 'pipeline', resourceId: 'run-7::agent:s0' },
       ],
     }), context));
     expect(event.payload.inputs).toEqual([
       { source: 'pipeline', resourceId: 'run-7' },
-      { source: 'pipeline', resourceId: 'run-7#agent:s0' },
+      { source: 'pipeline', resourceId: 'run-7::agent:s0' },
     ]);
   });
 
@@ -287,10 +287,10 @@ describe('mapPipeline step records', () => {
 
 describe('pipelineStepResourceId', () => {
   it('round-trips, and reads a plain run id as a run with no step', () => {
-    expect(pipelineStepResourceId('run-7', 'agent:s1')).toBe('run-7#agent:s1');
+    expect(pipelineStepResourceId('run-7', 'agent:s1')).toBe('run-7::agent:s1');
     expect(parsePipelineStepResourceId('run-7')).toEqual({ runId: 'run-7' });
     expect(parsePipelineStepResourceId('run:run-7')).toEqual({ runId: 'run-7' });
-    expect(parsePipelineStepResourceId('run:run-7#agent:s2')).toEqual({ runId: 'run-7', stepId: 'agent:s2' });
+    expect(parsePipelineStepResourceId('run:run-7::agent:s2')).toEqual({ runId: 'run-7', stepId: 'agent:s2' });
   });
 });
 
@@ -351,5 +351,40 @@ describe('the platform\'s own terminal run states', () => {
 
   it('still refuses a status nobody has defined, rather than guessing', () => {
     expect(mapPipeline(source('vibing' as never), context)).toMatchObject({ reason: 'unsupported-run-status' });
+  });
+});
+
+// The contract's own id grammar is `[A-Za-z0-9][A-Za-z0-9._:-]*`. A step id
+// outside it publishes and drains perfectly and is then refused at the
+// consumer as `invalid-payload`, which is how three step nodes per run went
+// missing with nothing but a success in the producer's log.
+const WORK_GRAPH_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+describe('a step resource id is addressable by the work-graph contract', () => {
+  it('composes an id the contract accepts, from a uuid run and a colonised step', () => {
+    const id = pipelineStepResourceId('12f34cd5-41da-4ec6-b6cb-c1ed4761af9d', 'agent:s1');
+    expect(id).toMatch(WORK_GRAPH_ID);
+    expect(`run:${id}`).toMatch(WORK_GRAPH_ID);
+    expect(parsePipelineStepResourceId(id))
+      .toEqual({ runId: '12f34cd5-41da-4ec6-b6cb-c1ed4761af9d', stepId: 'agent:s1' });
+  });
+
+  it('keeps every id a step event actually carries inside that grammar', () => {
+    for (const stepId of ['agent:s1', 'deck:s2', 'summarize', 'step-3', 'a.b']) {
+      const event = eventOf(mapPipeline({
+        kind: 'pipeline-step',
+        run: run('running'),
+        step: { stepId, status: 'running' },
+        attributedSubject: 'cognito-subject-42',
+        occurredAt: '2026-09-19T12:00:01.000Z',
+      }, context));
+      expect(event.payload.runId).toMatch(WORK_GRAPH_ID);
+      expect(event.resource.resourceId).toMatch(WORK_GRAPH_ID);
+      expect(parsePipelineStepResourceId(event.payload.runId).stepId).toBe(stepId);
+    }
+  });
+
+  it('reads a run id that itself contains a colon as a run, not as a step', () => {
+    expect(parsePipelineStepResourceId('pipeline:run:7')).toEqual({ runId: 'pipeline:run:7' });
   });
 });

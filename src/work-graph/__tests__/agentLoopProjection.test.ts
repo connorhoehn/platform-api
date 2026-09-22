@@ -208,9 +208,9 @@ describe('an /agent loop in the requester\'s work graph', () => {
     expect(byKind.run?.sort()).toEqual([
       'Agent loop · create a meeting with the X team', 'Build the deck', 'Draft the agenda',
     ]);
-    const steps = Object.values(state.nodes).filter((node) => node.sourceRef.resourceId.includes('#'));
+    const steps = Object.values(state.nodes).filter((node) => node.sourceRef.resourceId.includes('::'));
     expect(steps.map((node) => node.sourceRef.resourceId).sort())
-      .toEqual([`${RUN}#agent:s1`, `${RUN}#agent:s2`]);
+      .toEqual([`${RUN}::agent:s1`, `${RUN}::agent:s2`]);
     // A planned step is waiting; the one the executor reached is running.
     expect(steps.find((node) => node.title === 'Build the deck')?.status).toBe('waiting');
     expect(steps.find((node) => node.title === 'Draft the agenda')?.status).toBe('running');
@@ -221,8 +221,8 @@ describe('an /agent loop in the requester\'s work graph', () => {
     const id = (resourceId: string) => Object.values(state.nodes)
       .find((node) => node.sourceRef.resourceId === resourceId)?.id;
     const relations = Object.values(state.edges).map((edge) => [edge.fromId, edge.toId, edge.relation]);
-    expect(relations).toContainEqual([id(`${RUN}#agent:s1`), id(RUN), 'derived-from']);
-    expect(relations).toContainEqual([id(`${RUN}#agent:s2`), id(`${RUN}#agent:s1`), 'derived-from']);
+    expect(relations).toContainEqual([id(`${RUN}::agent:s1`), id(RUN), 'derived-from']);
+    expect(relations).toContainEqual([id(`${RUN}::agent:s2`), id(`${RUN}::agent:s1`), 'derived-from']);
     expect(relations).toContainEqual([id(RUN), id(CHANNEL), 'derived-from']);
   });
 
@@ -250,7 +250,7 @@ describe('an /agent loop in the requester\'s work graph', () => {
       edges,
       authorization,
       reader: reader({
-        [`${RUN}#agent:s1`]: {
+        [`${RUN}::agent:s1`]: {
           runId: RUN,
           status: 'running',
           attempt: 1,
@@ -284,7 +284,7 @@ describe('an /agent loop in the requester\'s work graph', () => {
       runEvent('running', `${DAY}T18:00:00.000Z`),
       stepEvent('agent:s1', 'create a meeting with the X team', 'running', `${DAY}T18:00:10.000Z`),
     ]);
-    const steps = Object.values(state.nodes).filter((node) => node.sourceRef.resourceId.includes('#'));
+    const steps = Object.values(state.nodes).filter((node) => node.sourceRef.resourceId.includes('::'));
     expect(steps.map((node) => node.title)).toEqual(['create a meeting with the X team']);
   });
 
@@ -367,7 +367,7 @@ describe('a running step is a leased operation, not a status word', () => {
   ];
 
   const facts: Record<string, PipelineRunFacts> = {
-    [`${RUN}#agent:s1`]: {
+    [`${RUN}::agent:s1`]: {
       runId: RUN, status: 'running', attempt: 1,
       startedAt: `${DAY}T18:00:10.000Z`, updatedAt: `${DAY}T18:04:30.000Z`, tools: [],
       step: { stepId: 'agent:s1', model: 'sonnet', iterations: 4, contextTokens: 146_000, contextBudgetTokens: 200_000, runtime: 'devbox', sessionId: '28a319a9' },
@@ -405,7 +405,7 @@ describe('a running step is a leased operation, not a status word', () => {
     const { activity } = await activityFor([
       ...events,
       stepEvent('agent:s1', 'Draft the agenda', 'completed', `${DAY}T18:04:45.000Z`, [], { workspace: WORKSPACE }),
-    ], { [`${RUN}#agent:s1`]: { ...facts[`${RUN}#agent:s1`], status: 'completed' } });
+    ], { [`${RUN}::agent:s1`]: { ...facts[`${RUN}::agent:s1`], status: 'completed' } });
     expect(activity.operations).toHaveLength(0);
   });
 
@@ -540,4 +540,42 @@ describe('workGraphPlanFromStoredRun', () => {
     expect(workGraphPlanFromStoredRun({})).toEqual({});
     expect(workGraphPlanFromStoredRun({ checkpoint: { context: { currentStepIds: [] } } })).toEqual({});
   });
+});
+
+describe('a finished run holds no lease', () => {
+  const WORKSPACE = { resourceId: 'session-1' };
+  const running = [
+    runEvent('running', `${DAY}T18:00:00.000Z`, false),
+    stepEvent('agent:s1', 'Draft the agenda', 'running', `${DAY}T18:04:30.000Z`, [], { workspace: WORKSPACE }),
+  ];
+
+  async function activity(events: AuthenticatedWorkEvent[]) {
+    const state = project(events);
+    const { nodes, edges, authorization } = authorize(state);
+    return {
+      nodes,
+      built: await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW }),
+    };
+  }
+
+  it('is fresh and operating while it is still going', async () => {
+    const { nodes, built } = await activity(running);
+    const step = nodes.find((node) => node.title === 'Draft the agenda');
+    expect(built.details.find((detail) => detail.nodeId === step?.id)?.freshness).toBeDefined();
+    expect(built.operations).toHaveLength(1);
+  });
+
+  it.each(['budget', 'completed', 'failed', 'stopped'])(
+    'drops the lease and the operation once the run ended as %s',
+    async (status) => {
+      const { nodes, built } = await activity([
+        ...running,
+        stepEvent('agent:s1', 'Draft the agenda', 'completed', `${DAY}T18:04:40.000Z`, [], { workspace: WORKSPACE }),
+        runEvent(status, `${DAY}T18:04:50.000Z`, false),
+      ]);
+      const run = nodes.find((node) => node.title?.startsWith('Agent loop'));
+      expect(built.details.find((detail) => detail.nodeId === run?.id)?.freshness).toBeUndefined();
+      expect(built.operations).toHaveLength(0);
+    },
+  );
 });

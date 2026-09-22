@@ -56,10 +56,16 @@ const MAX_INPUT_REFERENCES = 16;
 
 /**
  * Separates a run from one of its steps inside a single pipeline resource id.
- * `#` is not legal in a run id, so `runId#stepId` round-trips and an ACL can
- * recover the run whose row actually decides the step's visibility.
+ *
+ * It must be two colons and not something tidier: the work-graph contract's
+ * own id grammar is `[A-Za-z0-9][A-Za-z0-9._:-]*`, so a `#` made every step
+ * event fail validation at the consumer as `invalid-payload` — the step
+ * events published, drained, and were then refused, which is why runs showed
+ * as one node. `::` is inside that grammar and is unambiguous against both a
+ * UUID run id and a step id like `agent:s1`, so `runId::stepId` round-trips
+ * and an ACL can recover the run whose row decides the step's visibility.
  */
-export const PIPELINE_STEP_SEPARATOR = '#';
+export const PIPELINE_STEP_SEPARATOR = '::';
 
 export function pipelineStepResourceId(runId: string, stepId: string): string {
   return `${runId}${PIPELINE_STEP_SEPARATOR}${stepId}`;
@@ -69,8 +75,11 @@ export function pipelineStepResourceId(runId: string, stepId: string): string {
 export function parsePipelineStepResourceId(resourceId: string): { runId: string; stepId?: string } {
   const raw = resourceId.replace(/^run:/, '');
   const separator = raw.indexOf(PIPELINE_STEP_SEPARATOR);
-  if (separator <= 0 || separator === raw.length - 1) return { runId: raw };
-  return { runId: raw.slice(0, separator), stepId: raw.slice(separator + 1) };
+  if (separator <= 0 || separator >= raw.length - PIPELINE_STEP_SEPARATOR.length) return { runId: raw };
+  return {
+    runId: raw.slice(0, separator),
+    stepId: raw.slice(separator + PIPELINE_STEP_SEPARATOR.length),
+  };
 }
 
 interface PipelineObservationFields {

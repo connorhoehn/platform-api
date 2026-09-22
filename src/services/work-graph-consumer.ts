@@ -43,10 +43,33 @@ interface SourceAccountResolver {
 }
 
 export class WorkGraphIngestionDeniedError extends Error {
-  constructor(readonly reason: string) {
-    super(`Work graph event denied: ${reason}`);
+  constructor(readonly reason: string, readonly detail?: string) {
+    super(`Work graph event denied: ${reason}${detail ? ` (${detail})` : ''}`);
     this.name = 'WorkGraphIngestionDeniedError';
   }
+}
+
+/**
+ * Says WHICH event was refused, without putting its content in a log.
+ *
+ * `invalid-payload` on its own is unactionable: every source publishes to the
+ * same queue, the transport only reports the reason, and a producer watching
+ * its own successful publishes has nothing to go on. Identity and shape are
+ * enough to find it — a step whose id carried a character the contract's id
+ * grammar does not allow was invisible for an entire evening behind this.
+ */
+function payloadShape(payload: unknown): string {
+  if (!payload || typeof payload !== 'object') return `not-an-object:${typeof payload}`;
+  const event = payload as Record<string, unknown>;
+  const inner = (event.payload && typeof event.payload === 'object' ? event.payload : {}) as Record<string, unknown>;
+  const id = (value: unknown): string => (typeof value === 'string' ? value : `<${typeof value}>`);
+  return [
+    `source=${id(event.source)}`,
+    `kind=${id(inner.kind)}`,
+    `lifecycle=${id(inner.lifecycle)}`,
+    `resource=${id((event.resource as Record<string, unknown> | undefined)?.resourceId)}`,
+    `fields=${Object.keys(inner).sort().join('|')}`,
+  ].join(' ');
 }
 
 function eventDay(timestamp: string): string {
@@ -58,7 +81,7 @@ function verifyEnvelope(envelope: EventEnvelope<unknown>): AuthenticatedWorkEven
     throw new WorkGraphIngestionDeniedError('payload-too-large');
   }
   const parsed = validateAuthenticatedWorkEvent(envelope.payload);
-  if (!parsed.ok) throw new WorkGraphIngestionDeniedError('invalid-payload');
+  if (!parsed.ok) throw new WorkGraphIngestionDeniedError('invalid-payload', payloadShape(envelope.payload));
   const event = parsed.value;
   const expectedProducer = PRODUCER_BY_SOURCE[event.source];
   if (envelope.eventName !== `work-graph.${event.source}.lifecycle.v1`
@@ -66,7 +89,7 @@ function verifyEnvelope(envelope: EventEnvelope<unknown>): AuthenticatedWorkEven
     || event.producer.serviceId !== expectedProducer
     || event.source !== event.payload.kind
     || event.source !== event.resource.source) {
-    throw new WorkGraphIngestionDeniedError('producer-or-source-mismatch');
+    throw new WorkGraphIngestionDeniedError('producer-or-source-mismatch', payloadShape(envelope.payload));
   }
   return event;
 }
@@ -76,7 +99,7 @@ function verifyDirectEvent(payload: unknown, authenticatedServiceId: string): Au
     throw new WorkGraphIngestionDeniedError('payload-too-large');
   }
   const parsed = validateAuthenticatedWorkEvent(payload);
-  if (!parsed.ok) throw new WorkGraphIngestionDeniedError('invalid-payload');
+  if (!parsed.ok) throw new WorkGraphIngestionDeniedError('invalid-payload', payloadShape(payload));
   const event = parsed.value;
   const expectedProducer = PRODUCER_BY_SOURCE[event.source];
   if (authenticatedServiceId !== expectedProducer

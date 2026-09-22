@@ -293,6 +293,15 @@ function clock(value: string | undefined, timezone: string): string | undefined 
   }).format(new Date(parsed));
 }
 
+/**
+ * Statuses that mean the process is over. A lease is evidence that something
+ * is WORKING, so a run that finished — including one that finished by
+ * spending the budget it was given — must not keep one just because its last
+ * event was recent. It read as still running for five minutes after it
+ * stopped.
+ */
+const SETTLED_STATUSES = new Set(['completed', 'error', 'stopped']);
+
 function lease(observedAt: string | undefined, now: string): { observedAt: string; expiresAt: string } | undefined {
   const observed = observedAt === undefined ? Number.NaN : Date.parse(observedAt);
   if (!Number.isFinite(observed)) return undefined;
@@ -469,7 +478,9 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
   ];
   const describe = async (node: ViewerWorkNode): Promise<void> => {
     const stored = storedNode(authorization, node.id);
-    const freshness = lease(stored?.updatedAt ?? node.updatedAt, now);
+    const freshness = SETTLED_STATUSES.has(node.status)
+      ? undefined
+      : lease(stored?.updatedAt ?? node.updatedAt, now);
 
     if (node.kind === 'run' || node.kind === 'agent') {
       const facts = runFacts.get(node.id);
@@ -757,6 +768,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     // is written by the save record and is not itself marked running.
     if (edge.disclosure === 'existence') continue;
     if (!OPERATION_RELATIONS.has(edge.relation) || edge.fromId !== process.id) continue;
+    if (SETTLED_STATUSES.has(process.status)) continue;
     const stored = storedNode(authorization, process.id);
     const evidence = lease(stored?.updatedAt ?? process.updatedAt, now);
     if (!evidence) continue;
