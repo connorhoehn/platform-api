@@ -31,6 +31,7 @@ import {
 } from './documentReviewRequests';
 import { documentImportExportRouter } from './documentImportExport';
 import { documentRevisionsRouter } from './documentRevisions';
+import { deckRouter } from './deck';
 import { videoSessionsRouter } from './videoSessions';
 import { recordingsRouter } from './recordings';
 import {
@@ -148,6 +149,9 @@ router.use('/documents/:documentId/work-items', workItemsRouter);
 // the deck generator files. Same reason as work-items — it must precede the
 // '/documents/:documentId' mount, which would otherwise swallow '/revisions'.
 router.use('/documents/:documentId/revisions', documentRevisionsRouter);
+// The deck editor's two stateless paths: preview a spec, and derive one from
+// real local material. Neither persists — /documents/:id/revisions does that.
+router.use('/deck', deckRouter);
 router.use('/documents/:documentId', documentImportExportRouter);
 // Ambient voice capture — authenticated PCM proxy in front of the
 // live-captions sidecar. See routes/voiceCapture.ts.

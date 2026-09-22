@@ -15,10 +15,12 @@
 
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
-import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
+import { asyncHandler, AppError, NotFoundError, ValidationError } from '../middleware/error-handler';
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
-import { PPTX_CONTENT_TYPE } from '../deck/renderPptx';
+import { PPTX_CONTENT_TYPE, renderPptx } from '../deck/renderPptx';
 import { SVG_CONTENT_TYPE } from '../deck/renderSlideSvg';
+import { previewDeckSpec } from '../deck/preview';
+import log from '../lib/logger';
 import {
   getPresentationDocumentStore,
   PRESENTATION_DOCUMENT_TYPE,
@@ -73,8 +75,83 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
       slideCount: revision.slideCount,
       contentType: revision.asset.contentType,
       sizeBytes: revision.asset.sizeBytes,
+      hasSpec: !!revision.spec,
+      ...(revision.sources ? { sources: revision.sources } : {}),
       slides: revision.slides.map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
     })),
+  });
+}));
+
+/**
+ * POST /api/documents/:documentId/revisions  { spec, label? }
+ * Renders the spec and files it as the next revision. This is the only write in
+ * this router, and the only place in the deck path that persists anything —
+ * editing is previewing until someone saves.
+ *
+ * Authorization is the document's own: `/api/documents/:documentId` is behind
+ * `requireDocumentPolicy` (app.ts), which resolves a POST to the `edit`
+ * operation and refuses a locked document, so a viewer cannot write a revision.
+ */
+documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const documentId = String(req.params.documentId ?? '');
+  if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
+  const body = (req.body ?? {}) as { spec?: unknown; label?: unknown; title?: unknown };
+  if (body.spec === undefined) throw new ValidationError('spec is required');
+  const outcome = previewDeckSpec(body.spec);
+  if (!outcome.ok) {
+    res.status(outcome.status).json({ error: outcome.errors[0], errors: outcome.errors });
+    return;
+  }
+  const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 80) : undefined;
+  const title = typeof body.title === 'string' && body.title.trim() ? body.title.trim().slice(0, 120) : outcome.spec.title;
+  const createdBy = req.user?.sub ?? 'unknown';
+
+  const pptx = await renderPptx(outcome.spec);
+  const { revision } = await getPresentationDocumentStore().appendRevision({
+    documentId,
+    title,
+    createdBy,
+    pptx,
+    slides: outcome.preview.slides.map((slide) => ({ id: slide.id, title: slide.title, svg: slide.svg })),
+    spec: outcome.spec,
+    ...(label ? { label } : {}),
+  });
+  log.info({ documentId, revisionId: revision.id, slides: revision.slideCount, userId: createdBy }, 'deck revision saved');
+  res.status(201).json({
+    documentId,
+    revision: {
+      id: revision.id,
+      label: revision.label,
+      createdAt: revision.createdAt,
+      createdBy: revision.createdBy,
+      slideCount: revision.slideCount,
+      contentType: revision.asset.contentType,
+      sizeBytes: revision.asset.sizeBytes,
+      sources: revision.sources ?? [],
+      slides: revision.slides.map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
+    },
+    warnings: outcome.preview.warnings,
+  });
+}));
+
+/**
+ * GET /api/documents/:documentId/revisions/:revisionId/spec
+ * The DeckSpec a revision was rendered from — what the editor reopens. A
+ * revision written before specs were kept says so rather than answering with a
+ * spec reconstructed from its pictures.
+ */
+documentRevisionsRouter.get('/:revisionId/spec', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const { revision } = await loadRevision(String(req.params.documentId ?? ''), String(req.params.revisionId ?? ''));
+  if (!revision.spec) {
+    throw new AppError(409, `revision ${revision.id} was written before specs were stored, so it cannot be reopened for editing`);
+  }
+  res.status(200).json({
+    revisionId: revision.id,
+    label: revision.label,
+    createdAt: revision.createdAt,
+    createdBy: revision.createdBy,
+    sources: revision.sources ?? [],
+    spec: revision.spec,
   });
 }));
 

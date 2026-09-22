@@ -32,6 +32,9 @@ import {
   type PresentationDocumentStore,
 } from '../../deck/presentationDocuments';
 import { PPTX_CONTENT_TYPE } from '../../deck/renderPptx';
+import { sampleDeck } from '../../deck/__tests__/fixtures';
+import { hidePptxNodeDetection } from '../../deck/__tests__/pptxTestEnv';
+import { MAX_SLIDES, type DeckSpec } from '../../deck/DeckSpec';
 
 const PPTX_KEY = 'deck-doc-1-v1.pptx';
 const SVG_KEY = 'deck-doc-1-v1-cover.svg';
@@ -55,10 +58,52 @@ const row: PresentationDocumentRow = {
   }],
 };
 
+const appended: Array<Record<string, unknown>> = [];
+
 const store: PresentationDocumentStore = {
   get: async (documentId: string) => (documentId === 'doc-1' ? row : null),
-  appendRevision: async () => { throw new Error('not used'); },
+  appendRevision: async (input) => {
+    appended.push(input as unknown as Record<string, unknown>);
+    return {
+      documentId: input.documentId,
+      revision: {
+        id: 'v2',
+        label: input.label ?? 'v2',
+        createdAt: '2026-09-21T11:00:00.000Z',
+        createdBy: input.createdBy,
+        slideCount: input.slides.length,
+        asset: { key: 'deck-doc-1-v2.pptx', contentType: PPTX_CONTENT_TYPE, sizeBytes: input.pptx.byteLength },
+        slides: input.slides.map((slide, index) => ({
+          id: slide.id, index: index + 1, title: slide.title,
+          previewHandle: `${input.documentId}.v2.${slide.id}`,
+          asset: { key: `deck-${input.documentId}-v2-${slide.id}.svg`, contentType: 'image/svg+xml', sizeBytes: slide.svg.length },
+        })),
+        ...(input.spec ? { spec: input.spec, sources: [{ documentId: 'doc-sprint-review', title: 'Sprint review', kind: 'document' as const }] } : {}),
+      },
+    };
+  },
 };
+
+function postJson(path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { port } = server.address() as AddressInfo;
+  const payload = Buffer.from(JSON.stringify(body), 'utf8');
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port, method: 'POST', path,
+      headers: { 'content-type': 'application/json', 'content-length': String(payload.length) },
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve({ status: res.statusCode ?? 0, body: text ? JSON.parse(text) : {} });
+      });
+    });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
 
 function request(path: string, headers: Record<string, string> = {}): Promise<{ status: number; body: Buffer; headers: http.IncomingHttpHeaders }> {
   const { port } = server.address() as AddressInfo;
@@ -74,6 +119,7 @@ function request(path: string, headers: Record<string, string> = {}): Promise<{ 
 }
 
 let server: http.Server;
+let restorePptx: () => void;
 const originalSkipAuth = process.env.SKIP_AUTH;
 
 beforeAll(async () => {
@@ -81,7 +127,9 @@ beforeAll(async () => {
   setPresentationDocumentStore(store);
   await blobStore.putBlob(PPTX_KEY, Buffer.from('PKfake'), { contentType: PPTX_CONTENT_TYPE });
   await blobStore.putBlob(SVG_KEY, Buffer.from(SVG, 'utf8'), { contentType: 'image/svg+xml' });
+  restorePptx = hidePptxNodeDetection();
   const app = express();
+  app.use(express.json({ limit: '4mb' }));
   app.use('/api/documents/:documentId/revisions', documentRevisionsRouter);
   app.use(errorHandler);
   server = http.createServer(app);
@@ -89,6 +137,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  restorePptx();
   setPresentationDocumentStore(null);
   blobStore.reset();
   if (originalSkipAuth === undefined) delete process.env.SKIP_AUTH;
@@ -158,10 +207,65 @@ describe('authorization', () => {
       const file = await request('/api/documents/doc-1/revisions/v1/file');
       const slide = await request('/api/documents/doc-1/revisions/v1/slides/cover.svg');
       const list = await request('/api/documents/doc-1/revisions');
-      expect([file.status, slide.status, list.status]).toEqual([401, 401, 401]);
+      const spec = await request('/api/documents/doc-1/revisions/v1/spec');
+      const write = await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck() });
+      expect([file.status, slide.status, list.status, spec.status, write.status]).toEqual([401, 401, 401, 401, 401]);
     } finally {
       process.env.SKIP_AUTH = 'true';
     }
+  });
+});
+
+describe('POST /api/documents/:id/revisions', () => {
+  beforeEach(() => { appended.length = 0; });
+
+  it('renders the spec and files it as the next revision', async () => {
+    const res = await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck(), label: 'Draft for the sync' });
+    expect(res.status).toBe(201);
+    const revision = res.body.revision as Record<string, unknown>;
+    expect(revision).toMatchObject({ id: 'v2', label: 'Draft for the sync', slideCount: 9, createdBy: 'dev-user' });
+    expect((revision.slides as Array<{ previewHandle: string }>)[0]!.previewHandle).toBe('doc-1.v2.cover');
+    expect(revision.sources).toEqual([{ documentId: 'doc-sprint-review', title: 'Sprint review', kind: 'document' }]);
+    expect(Array.isArray(res.body.warnings)).toBe(true);
+
+    // The bytes really were rendered, and the spec was kept with them.
+    const stored = appended[0]!;
+    expect((stored.pptx as Buffer).subarray(0, 2).toString('utf8')).toBe('PK');
+    expect((stored.spec as DeckSpec).title).toBe('Q4 platform review');
+    expect((stored.slides as Array<{ svg: string }>)).toHaveLength(9);
+  }, 30_000);
+
+  it('400s a spec with an uncited slide, and stores nothing', async () => {
+    const spec = sampleDeck();
+    spec.slides[0]!.sources = [];
+    const res = await postJson('/api/documents/doc-1/revisions', { spec });
+    expect(res.status).toBe(400);
+    expect(appended).toHaveLength(0);
+  });
+
+  it('413s a spec past the slide cap', async () => {
+    const slide = { id: 's', layout: 'bullets', title: 'T', bullets: ['b'], sources: [{ documentId: 'd', title: 'D' }] };
+    const res = await postJson('/api/documents/doc-1/revisions', {
+      spec: { title: 'Deck', slides: Array.from({ length: MAX_SLIDES + 1 }, (_v, index) => ({ ...slide, id: `s${index}` })) },
+    });
+    expect(res.status).toBe(413);
+    expect(appended).toHaveLength(0);
+  });
+
+  it('400s when no spec is given', async () => {
+    expect((await postJson('/api/documents/doc-1/revisions', {})).status).toBe(400);
+  });
+});
+
+describe('GET /api/documents/:id/revisions/:rev/spec', () => {
+  it('409s a revision written before specs were stored, rather than inventing one', async () => {
+    const res = await request('/api/documents/doc-1/revisions/v1/spec');
+    expect(res.status).toBe(409);
+    expect(JSON.parse(res.body.toString('utf8')).error).toContain('cannot be reopened');
+  });
+
+  it('404s a revision the document does not list', async () => {
+    expect((await request('/api/documents/doc-1/revisions/v9/spec')).status).toBe(404);
   });
 });
 
