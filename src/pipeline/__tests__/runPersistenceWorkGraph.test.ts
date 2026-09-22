@@ -346,3 +346,45 @@ describe('a deck the run rendered', () => {
     expect(publisher.document).not.toHaveBeenCalled();
   });
 });
+
+describe('live telemetry is not a previous execution of the step', () => {
+  beforeEach(() => {
+    publisher.pipeline.mockClear();
+    mockPresentation.mockResolvedValue({ documentId: 'deck-1' });
+  });
+
+  it('completes into the step\'s own key, not a fork-branch suffix', async () => {
+    const { emit, repository } = harness();
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
+    });
+    // The loop reports a turn first: an in-flight placeholder, not a run.
+    await emit('pipeline:step:agent:iteration', {
+      runId: RUN, stepId: 'agent:s1', at: AT, iteration: 1, model: 'sonnet',
+    });
+    await emit('pipeline:step:completed', {
+      runId: RUN, stepId: 'agent:s1', durationMs: 10, at: AT, output: { text: 'done' },
+    });
+    const written = repository.put.mock.calls
+      .map((call) => (call as unknown[])[0] as { stepsSummary?: Record<string, unknown> });
+    const steps = written[written.length - 1]?.stepsSummary ?? {};
+    expect(Object.keys(steps)).toEqual(['agent:s1']);
+    expect(steps['agent:s1']).toMatchObject({ status: 'completed', agent: { model: 'sonnet' } });
+  });
+
+  it('still separates a node that genuinely executed twice', async () => {
+    const { emit, repository } = harness();
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
+    });
+    for (const at of [AT, '2026-09-21T18:01:00.000Z']) {
+      await emit('pipeline:step:completed', { runId: RUN, stepId: 'fan:out', durationMs: 5, at, output: { branch: at } });
+    }
+    const written = repository.put.mock.calls
+      .map((call) => (call as unknown[])[0] as { stepsSummary?: Record<string, unknown> });
+    const steps = written[written.length - 1]?.stepsSummary ?? {};
+    expect(Object.keys(steps).sort()).toEqual(['fan:out', 'fan:out:2']);
+  });
+});

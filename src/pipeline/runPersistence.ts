@@ -420,10 +420,15 @@ export class RunPersistenceService {
     }
 
     // Use a unique key when the same node executes multiple times (fork branches)
+    // A FORK BRANCH is a step that already FINISHED once; an entry with no
+    // completion is the in-flight placeholder the agent loop's own iteration
+    // telemetry writes, and filing the completion beside it invented a second
+    // execution of every agent step — two summaries, a doubled tool list and
+    // a replay credit that belonged to nothing.
     let stepKey = event.stepId;
-    if (state.steps[stepKey]) {
+    if (state.steps[stepKey]?.completedAt) {
       let suffix = 2;
-      while (state.steps[`${event.stepId}:${suffix}`]) suffix++;
+      while (state.steps[`${event.stepId}:${suffix}`]?.completedAt) suffix++;
       stepKey = `${event.stepId}:${suffix}`;
     }
 
@@ -484,6 +489,10 @@ export class RunPersistenceService {
     }
 
     state.steps[stepKey] = {
+      // The loop's own turn counter is not on the completion event, so a
+      // wholesale overwrite threw away what the step reported while running.
+      ...(state.steps[stepKey]?.agent ? { agent: state.steps[stepKey].agent } : {}),
+      ...(state.steps[stepKey]?.startedAt ? { startedAt: state.steps[stepKey].startedAt } : {}),
       status: 'completed',
       output,
       durationMs: event.durationMs,
@@ -1048,9 +1057,23 @@ export class RunPersistenceService {
     const runId = text(payload.runId);
     const documentId = text(payload.documentId);
     const revisionId = text(payload.revisionId);
-    if (!runId || !documentId || !revisionId) return;
+    // Every exit below says why. A hook that fires and projects nothing looks
+    // exactly like a hook that never fired, and that cost a whole rebuild
+    // cycle to tell apart.
+    log.info({ runId, documentId, revisionId }, 'deck produced hook fired');
+    if (!runId || !documentId || !revisionId) {
+      log.warn({ runId, documentId, revisionId }, 'deck produced hook named no run, document or revision');
+      return;
+    }
     const state = this.runCache.get(runId);
-    if (!state?.organizationId || state.triggeredBy === 'system') return;
+    if (!state) {
+      log.warn({ runId, documentId }, 'deck produced for a run this service has no record of');
+      return;
+    }
+    if (!state.organizationId || state.triggeredBy === 'system') {
+      log.warn({ runId, documentId, triggeredBy: state.triggeredBy }, 'deck produced by a run with no verified organization');
+      return;
+    }
     // The platform may only describe a document its own deck store wrote; the
     // consumer checks the same thing and would deny it. Saying so here names
     // the document, which a denial at the far end cannot.
