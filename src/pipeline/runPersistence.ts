@@ -1318,7 +1318,12 @@ export class RunPersistenceService {
     if (!sessionId) return undefined;
     const boxId = live?.boxId ?? recorded?.boxId;
     return {
-      resourceId: sessionId,
+      // Addressed WITHIN its run. The pipeline ACL decides a resource from the
+      // run row that owns it, and a workspace named by a bare session id
+      // matches no run — so the node was projected and then filtered out of
+      // every viewer's graph, which looked exactly like never projecting it.
+      // One workspace per run, so every step of the run shares the node.
+      resourceId: pipelineStepResourceId(state.runId, sessionId),
       // The box is what a person recognises the session by; without one the
       // node stays a placeholder rather than repeating the opaque id.
       ...(boxId ? { safeLabel: `Cloud workspace · ${boxId}` } : {}),

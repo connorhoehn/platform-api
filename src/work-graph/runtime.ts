@@ -315,8 +315,9 @@ class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
       return { ownerValid, viewerHasDirectAccess: viewer, capabilities: ['view-document', ...(row?.createdBy === scope.viewerId ? ['edit-document' as const] : [])] };
     }
     if (this.source === 'pipeline') {
-      // A step node is addressed as `runId#stepId`; the run's own row is what
-      // decides whether the step is visible, so authorize the run.
+      // A step is addressed `runId::stepId` and a workspace `runId::sessionId`;
+      // the run's own row is what decides whether either is visible, so
+      // authorize the run. A resource the run does not own is denied.
       const rows = await scanAll(this.client, {
         TableName: PIPELINE_RUNS_TABLE,
         FilterExpression: 'runId = :run',

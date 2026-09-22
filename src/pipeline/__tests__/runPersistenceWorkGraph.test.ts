@@ -169,7 +169,8 @@ describe('a step says where it is running and what it wrote', () => {
     });
     expect(published()[0]).toMatchObject({
       step: { stepId: 'agent:s1', status: 'running' },
-      workspace: { resourceId: 'session-28a319a9', safeLabel: 'Cloud workspace · box-7' },
+      // Addressed within its run, so the pipeline ACL can authorize it.
+      workspace: { resourceId: `${RUN}::session-28a319a9`, safeLabel: 'Cloud workspace · box-7' },
     });
   });
 

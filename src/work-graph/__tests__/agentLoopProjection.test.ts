@@ -8,7 +8,7 @@
  * that a hand-written graph would look right.
  */
 import { projectWorkEvent, type AuthenticatedWorkEvent, type WorkProjectionState } from '@connorhoehn/realtime-modules/work-graph';
-import { mapPipeline, pipelineStepResourceId, type AuthenticatedPipelineContext } from '../sources/mapPipeline';
+import { mapPipeline, parsePipelineStepResourceId, pipelineStepResourceId, type AuthenticatedPipelineContext } from '../sources/mapPipeline';
 import { agentStepLines, buildWorkActivity, formatTokens, type PipelineRunFacts, type WorkActivityReader } from '../activity';
 import type { AuthorizedWorkGraph, ViewerWorkEdge, ViewerWorkNode } from '../policy';
 import { workGraphPlanFromDefinition, workGraphPlanFromStoredRun } from '../../pipeline/workGraphPlan';
@@ -716,5 +716,26 @@ describe('what a loop\'s frame is called, and what is inside it', () => {
     const homes = activity.efforts.filter((effort) => effort.nodeIds
       .some((id) => nodes.find((node) => node.id === id)?.title === 'Team deck'));
     expect(homes.length).toBeLessThanOrEqual(1);
+  });
+});
+
+describe('a workspace is addressable by the run that owns it', () => {
+  // The pipeline ACL decides every pipeline resource from the run row that
+  // owns it. A workspace named by a bare session id matches no run, so the
+  // node was projected and then filtered out of every viewer's graph — which
+  // looks exactly like never having projected it.
+  it('is one node per run, shared by every step of that run', () => {
+    const workspace = { resourceId: `${RUN}::session-1`, safeLabel: 'Cloud workspace · box-7' };
+    const state = project([
+      runEvent('running', `${DAY}T18:00:00.000Z`, false),
+      stepEvent('agent:s1', 'Draft slides', 'running', `${DAY}T18:04:30.000Z`, [], { workspace }),
+      stepEvent('deck:s1', 'Render the deck', 'running', `${DAY}T18:05:30.000Z`, [], { workspace }),
+    ]);
+    const terminals = Object.values(state.nodes).filter((node) => node.kind === 'terminal');
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0].sourceRef.resourceId).toBe(`${RUN}::session-1`);
+    // Its run is recoverable, which is what the ACL authorizes it by.
+    expect(parsePipelineStepResourceId(terminals[0].sourceRef.resourceId).runId).toBe(RUN);
+    expect(Object.values(state.edges).filter((edge) => edge.relation === 'runs-in')).toHaveLength(2);
   });
 });
