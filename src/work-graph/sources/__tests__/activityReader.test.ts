@@ -54,6 +54,9 @@ function readerFor(row: Row | undefined, blobs = new InMemoryImageBlobStore()): 
       return {};
     },
   } as unknown as DynamoDBDocumentClient;
+  // Deliberately a store with only `get` and `appendRevision`: the reader must
+  // still read the row's markup before the blob when the store is an older one
+  // that has no `slidePreview` of its own.
   return new DynamoWorkActivityReader(client, {
     presentations: () => ({
       get: async (documentId: string) => (documentId === row?.documentId ? row as unknown as PresentationDocumentRow : null),
@@ -202,6 +205,48 @@ describe('the row the deck seed leaves behind', () => {
     expect(facts?.revisions?.[0]?.slides.map((entry) => entry.id)).toEqual(['title-slide', 'sources']);
     expect((await reader.revisionPreview('active-now-2026-09-21-sprint-review', 'v1', 'title-slide'))?.body.toString('utf8'))
       .toBe(SVG);
+  });
+
+  it('serves a slide from the row\'s own markup when no blob file exists', async () => {
+    // The live row: every slide carries inline `svg`, and the blob volume is
+    // empty after a restart. The row is what survived, so the row answers.
+    const inline = {
+      ...seededRow,
+      revisions: [{
+        ...(seededRow.revisions as Row[])[0],
+        slides: [
+          { ...slide('title-slide', 1, 'Sprint review', 'deck-active-now-2026-09-21-sprint-review-v2-title-slide.svg'), svg: SVG },
+        ],
+      }],
+      revisionSlides: {},
+    };
+    const reader = readerFor(inline, new InMemoryImageBlobStore());
+    const preview = await reader.revisionPreview('active-now-2026-09-21-sprint-review', 'v1', 'title-slide');
+    expect(preview?.contentType).toBe('image/svg+xml');
+    expect(preview?.body.toString('utf8')).toBe(SVG);
+  });
+
+  it('uses the store\'s own slide lookup when it has one', async () => {
+    // The production store reads the row first and the blob second; the reader
+    // must defer to it rather than going straight to a blob key.
+    const asked: string[] = [];
+    const reader = new DynamoWorkActivityReader(
+      { async send() { return {}; } } as unknown as DynamoDBDocumentClient,
+      {
+        presentations: () => ({
+          get: async () => null,
+          appendRevision: async () => { throw new Error('not used'); },
+          slidePreview: async (_documentId: string, revisionId: string, slideId: string) => {
+            asked.push(`${revisionId}/${slideId}`);
+            return { contentType: 'image/svg+xml', body: Buffer.from(SVG, 'utf8'), from: 'inline' as const };
+          },
+        }),
+        blobs: () => { throw new Error('the blob store must not be reached'); },
+      },
+    );
+    const preview = await reader.revisionPreview('active-now-2026-09-21-sprint-review', 'v2', 'title-slide');
+    expect(preview?.body.toString('utf8')).toBe(SVG);
+    expect(asked).toEqual(['v2/title-slide']);
   });
 
   it('keeps the cover working when the slide bytes did not survive the restart', async () => {

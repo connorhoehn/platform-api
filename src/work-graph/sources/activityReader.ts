@@ -15,6 +15,7 @@ import {
   type PresentationDocumentStore,
   type StoredSlide,
 } from '../../deck/presentationDocuments';
+import { SVG_CONTENT_TYPE } from '../../deck/renderSlideSvg';
 import type { AssetBlobStore } from '../../pipeline/image/ImageBlobStore';
 import { getAssetBlobStore } from '../../pipeline/image/visionServices';
 import type {
@@ -326,37 +327,44 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
    */
   private async slidePreview(documentId: string, revisionId: string, slideId: string): Promise<RevisionPreview | null> {
     const store = (this.deps.presentations ?? getPresentationDocumentStore);
-    const row = await Promise.resolve()
-      .then(() => store().get(documentId))
-      .catch(() => null);
-    if (!row) return null;
-    // Both places the row records slides, in that order — never one or the
-    // other. `artifact()` lists anchors from whichever is populated, so a
-    // narrower lookup here would offer a slide it then could not serve.
-    const recorded = [
-      ...(row.revisions?.find((revision) => revision.id === revisionId)?.slides ?? []),
-      ...(row.revisionSlides?.[revisionId] ?? []),
-    ];
-    const slide = recorded.find((entry) => entry?.id === slideId);
-    if (!slide?.asset?.key) return null;
-    const blob = await Promise.resolve()
-      .then(() => (this.deps.blobs ?? getAssetBlobStore)().getBlob(slide.asset.key))
+    const resolved = await Promise.resolve()
+      .then(async (): Promise<{ contentType: string; body: Buffer } | null> => {
+        const presentations = store();
+        // The store reads the row's own markup first and the blob the record
+        // names second. The row is what survives a blob volume that does not,
+        // which is exactly how every slide of a seeded deck 404'd while its
+        // inline cover kept serving.
+        if (presentations.slidePreview) return presentations.slidePreview(documentId, revisionId, slideId);
+        // A store that predates the method: same two places, same order.
+        const row = await presentations.get(documentId);
+        const slide = [
+          ...(row?.revisions?.find((revision) => revision.id === revisionId)?.slides ?? []),
+          ...(row?.revisionSlides?.[revisionId] ?? []),
+        ].find((entry) => entry?.id === slideId);
+        if (!slide) return null;
+        if (slide.svg) {
+          return { contentType: slide.asset?.contentType || SVG_CONTENT_TYPE, body: Buffer.from(slide.svg, 'utf8') };
+        }
+        if (!slide.asset?.key) return null;
+        const blob = await (this.deps.blobs ?? getAssetBlobStore)().getBlob(slide.asset.key);
+        return blob ? { contentType: blob.asset?.contentType || slide.asset.contentType, body: blob.body } : null;
+      })
       .catch((error: unknown) => {
         log.warn({ documentId, revisionId, slideId, err: (error as Error)?.message }, 'work-graph: slide preview store unavailable');
         return null;
       });
-    // The record names bytes the store does not have. That is a real defect —
-    // usually a blob volume that did not survive a restart while the row did —
-    // and it is indistinguishable from an unknown slide unless it is said.
-    if (!blob) {
-      log.warn({ documentId, revisionId, slideId, key: slide.asset.key }, 'work-graph: a revision names a slide whose bytes are gone');
+    // Only now is the slide really absent: neither the row nor the blob store
+    // has it. Saying so is what turns "a volume did not survive a restart"
+    // into a log line rather than an hour of curling.
+    if (!resolved) {
+      log.warn({ documentId, revisionId, slideId }, 'work-graph: a revision names a slide whose bytes are gone');
       return null;
     }
-    const contentType = String(blob.asset?.contentType ?? slide.asset.contentType ?? '');
+    const contentType = String(resolved.contentType ?? '');
     if (!ALLOWED_PREVIEW_TYPES.has(contentType)) return null;
-    if (blob.body.byteLength === 0 || blob.body.byteLength > MAX_PREVIEW_BYTES) return null;
-    if (contentType === 'image/svg+xml' && !isInertSvg(blob.body.toString('utf8'))) return null;
-    return { contentType: contentType as RevisionPreview['contentType'], body: blob.body };
+    if (resolved.body.byteLength === 0 || resolved.body.byteLength > MAX_PREVIEW_BYTES) return null;
+    if (contentType === 'image/svg+xml' && !isInertSvg(resolved.body.toString('utf8'))) return null;
+    return { contentType: contentType as RevisionPreview['contentType'], body: resolved.body };
   }
 
   async transcript(transcriptId: string): Promise<TranscriptFacts | null> {
