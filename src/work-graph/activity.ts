@@ -561,8 +561,17 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         .map((edge) => index.byId.get(edge.toId))
         .filter((target): target is ViewerWorkNode => !!target)[0];
       // The run's own record is authoritative for its outcome; the projected
-      // node status can lag the source by one lifecycle event.
+      // node status can lag the source by one lifecycle event. That authority
+      // has to reach `node.status` itself, not just this detail's summary —
+      // otherwise a reader sees "Running" in the header chip while the body
+      // (sourced from `summary` below) says the run failed. `node` is the same
+      // object the caller also hands to the v2 snapshot builder, so correcting
+      // it here reaches the wire.
       const failed = facts?.status === 'error' || (!facts && node.status === 'error');
+      if (failed && node.status !== 'error') {
+        node.status = 'error';
+        node.endedAt ??= facts?.updatedAt ?? now;
+      }
       const summary = failed
         ? trim(facts?.error ?? 'The run failed before it produced a revision.')
         : produced ? trim(`Creating the next revision of ${produced.title}`) : undefined;

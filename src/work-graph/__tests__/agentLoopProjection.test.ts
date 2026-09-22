@@ -511,6 +511,44 @@ describe('a loop that ended on its context budget', () => {
   });
 });
 
+describe('a run whose projected status never caught up to its failure', () => {
+  it('corrects the node to error rather than leaving it "running" beside a failed summary', async () => {
+    // The projection only ever saw the 'running' lifecycle event for this run
+    // (the terminal failure event never arrived), but the run's own record —
+    // read live from the pipeline runs table — says it errored. A pane that
+    // trusted the stale projected status would show "Running" in its header
+    // chip while the body (sourced from the same run record) says it failed.
+    const state = project([
+      conversationEvent(`${DAY}T17:59:00.000Z`),
+      runEvent('running', `${DAY}T18:00:00.000Z`),
+    ]);
+    const { nodes, edges, authorization } = authorize(state);
+    const run = nodes.find((node) => node.title?.startsWith('Agent loop'));
+    expect(run?.status).toBe('running');
+    const activity = await buildWorkActivity({
+      query, nodes, edges, authorization,
+      reader: reader({
+        [RUN]: {
+          runId: RUN,
+          status: 'error',
+          attempt: 1,
+          startedAt: `${DAY}T18:00:00.000Z`,
+          updatedAt: `${DAY}T18:04:00.000Z`,
+          tools: [],
+          error: 'claude exited 1: Error: Input must be provided either through stdin or as a prompt.',
+        },
+      }),
+      now: NOW,
+    });
+    // The correction lands on the same node object the v2 snapshot builder
+    // also reads, so it reaches the wire rather than staying local to this detail.
+    expect(run?.status).toBe('error');
+    expect(run?.endedAt).toBe(`${DAY}T18:04:00.000Z`);
+    const detail = activity.details.find((entry) => entry.nodeId === run?.id);
+    expect(detail?.summary).toBe('claude exited 1: Error: Input must be provided either through stdin or as a prompt.');
+  });
+});
+
 describe('workGraphPlanFromStoredRun', () => {
   it('recovers the name, the origin and the steps from a row written at accept time', () => {
     expect(workGraphPlanFromStoredRun({
