@@ -88,6 +88,19 @@ interface PipelineObservationFields {
   artifactRefs?: readonly PipelineArtifactReference[];
   /** Source-declared evidence this run/step consumed. Never inferred. */
   inputRefs?: readonly PipelineInputReference[];
+  /**
+   * What this run/step is writing, named while it is still writing it. The
+   * document's own save record writes the same relationship once a revision
+   * exists; this is the run saying so first, so a step that is generating
+   * something reads as connected to it rather than as an isolated node.
+   */
+  producesRefs?: readonly PipelineInputReference[];
+  /**
+   * The process this run/step is executing in — the devbox session, as the
+   * runtime that opened it names it. It is what turns a running step into a
+   * leased operation: a status word cannot expire, and a lease must.
+   */
+  workspace?: { resourceId: string; safeLabel?: string };
 }
 
 export interface PipelineRunSourceRecord extends PipelineObservationFields {
@@ -151,6 +164,8 @@ export interface PipelineWorkEvent {
     artifactIds?: string[];
     safeLabel?: string;
     inputs?: PipelineInputReference[];
+    produces?: PipelineInputReference[];
+    workspace?: { resourceId: string; safeLabel?: string };
   };
 }
 
@@ -170,7 +185,8 @@ export type PipelineMapUnsupportedReason =
   | 'missing-step-id'
   | 'missing-step-status'
   | 'unsupported-step-status'
-  | 'invalid-input-reference';
+  | 'invalid-input-reference'
+  | 'invalid-workspace';
 
 export type PipelineMapResult =
   | { supported: true; event: PipelineWorkEvent }
@@ -272,6 +288,20 @@ function inputsFrom(
   return [...seen.values()];
 }
 
+/**
+ * A workspace the caller declared but cannot name is refused rather than
+ * dropped: silently projecting a run with no workspace is how a step ends up
+ * looking idle while it is in fact working.
+ */
+function workspaceFrom(
+  value: { resourceId: string; safeLabel?: string } | undefined,
+): { ok: false } | { ok: true; workspace?: { resourceId: string; safeLabel?: string } } {
+  if (value === undefined) return { ok: true };
+  if (!isNonEmptyString(value.resourceId)) return { ok: false };
+  const label = isNonEmptyString(value.safeLabel) ? value.safeLabel.trim() : undefined;
+  return { ok: true, workspace: { resourceId: value.resourceId, ...(label ? { safeLabel: label } : {}) } };
+}
+
 function isSyntheticTrigger(subject: string): boolean {
   return subject === 'system'
     || subject.startsWith('event:')
@@ -351,6 +381,10 @@ export function mapPipeline(
 
   const inputs = inputsFrom(record.inputRefs);
   if (inputs === undefined) return unsupported('invalid-input-reference');
+  const produces = inputsFrom(record.producesRefs);
+  if (produces === undefined) return unsupported('invalid-input-reference');
+  const workspace = workspaceFrom(record.workspace);
+  if (!workspace.ok) return unsupported('invalid-workspace');
 
   // A step is addressed within its run, so the run's own node and each of its
   // steps get distinct, stable identities without a second source.
@@ -390,6 +424,8 @@ export function mapPipeline(
         ...(artifactIds.length > 0 ? { artifactIds } : {}),
         ...(isNonEmptyString(record.safeLabel) ? { safeLabel: record.safeLabel } : {}),
         ...(inputs.length > 0 ? { inputs } : {}),
+        ...(produces.length > 0 ? { produces } : {}),
+        ...(workspace.workspace ? { workspace: workspace.workspace } : {}),
       },
     },
   };

@@ -293,3 +293,46 @@ describe('pipelineStepResourceId', () => {
     expect(parsePipelineStepResourceId('run:run-7#agent:s2')).toEqual({ runId: 'run-7', stepId: 'agent:s2' });
   });
 });
+
+describe('a step that says where it runs and what it writes', () => {
+  const stepRecord = (over: Partial<PipelineStepSourceRecord> = {}): PipelineStepSourceRecord => ({
+    kind: 'pipeline-step',
+    run: run('running'),
+    step: { stepId: 'agent:s1', status: 'running' },
+    attributedSubject: 'cognito-subject-42',
+    occurredAt: '2026-09-19T12:00:01.000Z',
+    ...over,
+  });
+
+  it('carries the workspace, which is what makes a running step a lease', () => {
+    const event = eventOf(mapPipeline(stepRecord({
+      workspace: { resourceId: 'session-28a319a9', safeLabel: 'Cloud workspace · box-7' },
+    }), context));
+    expect(event.payload.workspace).toEqual({ resourceId: 'session-28a319a9', safeLabel: 'Cloud workspace · box-7' });
+  });
+
+  it('accepts a workspace with no label, and refuses one with no resource', () => {
+    expect(eventOf(mapPipeline(stepRecord({ workspace: { resourceId: 's-1' } }), context)).payload.workspace)
+      .toEqual({ resourceId: 's-1' });
+    expect(mapPipeline(stepRecord({ workspace: { resourceId: '  ' } }), context))
+      .toMatchObject({ reason: 'invalid-workspace' });
+  });
+
+  it('omits the workspace entirely for a step that declared none', () => {
+    expect(eventOf(mapPipeline(stepRecord(), context)).payload.workspace).toBeUndefined();
+  });
+
+  it('carries what the step is producing, separately from what it consumed', () => {
+    const event = eventOf(mapPipeline(stepRecord({
+      inputRefs: [{ source: 'pipeline', resourceId: 'run-7' }],
+      producesRefs: [{ source: 'document', resourceId: 'doc-1' }],
+    }), context));
+    expect(event.payload.inputs).toEqual([{ source: 'pipeline', resourceId: 'run-7' }]);
+    expect(event.payload.produces).toEqual([{ source: 'document', resourceId: 'doc-1' }]);
+  });
+
+  it('refuses a produced reference that names no resource', () => {
+    expect(mapPipeline(stepRecord({ producesRefs: [{ source: 'document', resourceId: '' }] }), context))
+      .toMatchObject({ reason: 'invalid-input-reference' });
+  });
+});

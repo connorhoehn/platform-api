@@ -16,6 +16,12 @@
 export interface RunWorkGraphPlan {
   /** The conversation the run was started from, when it came from one. */
   conversationId?: string;
+  /**
+   * What the run itself is called. "Pipeline run" names nothing a person
+   * recognises, and the run has to be nameable because it is what the graph
+   * falls back to anchoring on when the conversation is not there.
+   */
+  title?: string;
   steps: Array<{
     /** The definition node id the executor reports, e.g. `agent:s1`. */
     stepId: string;
@@ -36,14 +42,16 @@ export function workGraphPlanFromDefinition(
   definition: unknown,
   conversationId?: string,
 ): RunWorkGraphPlan | undefined {
-  const source = definition as { nodes?: unknown; edges?: unknown } | null;
+  const source = definition as { nodes?: unknown; edges?: unknown; name?: unknown } | null;
+  const title = typeof source?.name === 'string' && source.name.trim() ? source.name.trim().slice(0, 80) : undefined;
   const nodes = Array.isArray(source?.nodes) ? source.nodes as Array<Record<string, unknown>> : [];
   const edges = Array.isArray(source?.edges) ? source.edges as Array<Record<string, unknown>> : [];
   const labelled = nodes.filter((node) => typeof node?.id === 'string'
     && node.type !== 'trigger'
     && typeof (node.data as Record<string, unknown> | undefined)?.label === 'string'
     && String((node.data as Record<string, unknown>).label).trim().length > 0);
-  if (labelled.length === 0) return conversationId ? { conversationId, steps: [] } : undefined;
+  const named = { ...(conversationId ? { conversationId } : {}), ...(title ? { title } : {}) };
+  if (labelled.length === 0) return conversationId || title ? { ...named, steps: [] } : undefined;
   const stepIds = new Set(labelled.map((node) => node.id as string));
   const steps = labelled.map((node) => ({
     stepId: node.id as string,
@@ -52,5 +60,5 @@ export function workGraphPlanFromDefinition(
       .filter((edge) => edge?.target === node.id && typeof edge.source === 'string' && stepIds.has(edge.source))
       .map((edge) => edge.source as string))],
   }));
-  return { ...(conversationId ? { conversationId } : {}), steps };
+  return { ...named, steps };
 }

@@ -40,6 +40,8 @@ import { withContext } from '../lib/logger';
 import { computeCost } from './llm-pricing';
 import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platformPublisher';
 import { pipelineStepResourceId } from '../work-graph/sources/mapPipeline';
+import { recallRunLab } from './agent/DevboxAgentClient';
+import { parseRunResult } from './runResult';
 import type { RunWorkGraphPlan } from './workGraphPlan';
 
 const log = withContext({ service: 'runPersistence' });
@@ -198,24 +200,33 @@ export class RunPersistenceService {
       });
     });
 
+    // A step's own start. It is the earliest honest moment to say a step is
+    // running, and unlike `step:attempt:started` it fires for every step
+    // rather than only for ones with a retry policy.
+    this.eventBus.subscribe('pipeline:step:started', async (event) => {
+      await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'running', event.payload.at);
+    });
+
     this.eventBus.subscribe('pipeline:step:completed', async (event) => {
-      await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'completed', event.payload.at);
+      // AFTER the summary is written: the step's own output is what names the
+      // document it produced, and that is not on the bus event.
       await this.handleStepCompleted(event.payload).catch((err) => {
         log.warn(
           { runId: event.payload.runId, stepId: event.payload.stepId, err: String(err) },
           'failed to persist step:completed',
         );
       });
+      await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'completed', event.payload.at);
     });
 
     this.eventBus.subscribe('pipeline:step:failed', async (event) => {
-      await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'failed', event.payload.at);
       await this.handleStepFailed(event.payload).catch((err) => {
         log.warn(
           { runId: event.payload.runId, stepId: event.payload.stepId, err: String(err) },
           'failed to persist step:failed',
         );
       });
+      await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'failed', event.payload.at);
     });
 
     this.eventBus.subscribe('pipeline:run:completed', async (event) => {
@@ -318,6 +329,16 @@ export class RunPersistenceService {
     // registerTrigger. A registerTrigger that already named it wins.
     const redriveOf = this.runCache.get(event.runId)?.redriveOf ?? redriveOfFromPayload(event.triggeredBy.payload);
     const registered = this.runCache.get(event.runId);
+    // "Agent loop · create a meeting with the X team": the pipeline's own name
+    // and the instruction the trigger carried. The instruction is what the
+    // person typed, so it is the half that identifies this run among others.
+    const instruction = typeof event.triggeredBy.payload?.instruction === 'string'
+      ? event.triggeredBy.payload.instruction.trim().replace(/\s+/g, ' ')
+      : '';
+    const planTitle = registered?.workGraph?.title;
+    const runTitle = instruction
+      ? `${planTitle ? `${planTitle} · ` : ''}${instruction}`.slice(0, 160)
+      : planTitle;
     const state: RunState = {
       pipelineId: event.pipelineId,
       runId: event.runId,
@@ -336,7 +357,9 @@ export class RunPersistenceService {
       stepLifecycleAt: {},
       lastEventAt: event.at,
       ...(registered?.organizationId ? { organizationId: registered.organizationId } : {}),
-      ...(registered?.workGraph ? { workGraph: registered.workGraph } : {}),
+      ...(registered?.workGraph
+        ? { workGraph: { ...registered.workGraph, ...(runTitle ? { title: runTitle } : {}) } }
+        : {}),
       ...(redriveOf ? { redriveOf } : {}),
     };
 
@@ -1163,6 +1186,9 @@ export class RunPersistenceService {
       ...(state.workGraph?.conversationId
         ? { inputRefs: [{ source: 'conversation' as const, resourceId: state.workGraph.conversationId }] }
         : {}),
+      // The run has to be nameable: it is what an effort anchors on when the
+      // conversation it came from is not in this person's graph.
+      ...(state.workGraph?.title ? { safeLabel: state.workGraph.title } : {}),
     }, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
     if (!result.published) {
       log.warn({ runId: state.runId, reason: result.reason }, 'work graph pipeline lifecycle was not published');
@@ -1199,6 +1225,12 @@ export class RunPersistenceService {
       occurredAt,
       sourceSequence: `${stepId}:${status}:${occurredAt}`,
       safeLabel: planned.title,
+      // Where this step is executing. The live session map is authoritative
+      // while the run is in flight; what the step itself reported is the
+      // fallback once the run's session has been torn down.
+      ...(this.workspaceFor(state, stepId) ? { workspace: this.workspaceFor(state, stepId) as { resourceId: string } } : {}),
+      // What it is writing, named while it is still writing it.
+      ...(this.producesFor(state, stepId).length ? { producesRefs: this.producesFor(state, stepId) } : {}),
       // The run it belongs to, then the steps it waits on. Both are already
       // projected pipeline resources, so the chain reads in dependsOn order.
       inputRefs: [
@@ -1212,6 +1244,37 @@ export class RunPersistenceService {
     if (!result.published) {
       log.warn({ runId: state.runId, stepId, reason: result.reason }, 'work graph pipeline step was not published');
     }
+  }
+
+  /**
+   * The cloud workspace a step is executing in. `recallRunLab` is the live
+   * map the devbox client keeps for the run; a step that already finished
+   * reports its own session on its summary, which is what survives teardown.
+   * A local step has no workspace and declares none.
+   */
+  private workspaceFor(state: RunState, stepId: string): { resourceId: string; safeLabel?: string } | undefined {
+    const live = recallRunLab(state.runId);
+    const recorded = state.steps[stepId]?.agent;
+    const sessionId = live?.sessionId ?? recorded?.sessionId;
+    if (!sessionId) return undefined;
+    const boxId = live?.boxId ?? recorded?.boxId;
+    return {
+      resourceId: sessionId,
+      // The box is what a person recognises the session by; without one the
+      // node stays a placeholder rather than repeating the opaque id.
+      ...(boxId ? { safeLabel: `Cloud workspace · ${boxId}` } : {}),
+    };
+  }
+
+  /**
+   * The documents a step said it produced, from the step's OWN result — the
+   * `{ kind: 'document', documentId }` convention every command already uses.
+   * Nothing is inferred from the run's context or from a neighbouring step.
+   */
+  private producesFor(state: RunState, stepId: string): Array<{ source: 'document'; resourceId: string }> {
+    const output = state.steps[stepId]?.output as { result?: unknown } | undefined;
+    const result = parseRunResult(output?.result);
+    return result?.kind === 'document' ? [{ source: 'document', resourceId: result.documentId }] : [];
   }
 
   /**

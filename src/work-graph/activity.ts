@@ -15,6 +15,7 @@ import {
   freshWorkOperations,
   WORK_GRAPH_LIMITS,
   WORK_GRAPH_V2_LIMITS,
+  type DeriveWorkEffortsInput,
   type ViewerWorkActivityDetail,
   type ViewerWorkNodeLink,
   type ViewerWorkOperation,
@@ -162,6 +163,19 @@ const WORK_EFFORT_ANCHORS = ['project', 'task', 'meeting', 'conversation'] as co
 function instant(value: string | undefined): number {
   const parsed = value === undefined ? Number.NaN : Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * The run a cluster of run nodes began as. Its steps are created after it, so
+ * newest-first would name an effort after whichever step happened to run last.
+ * A member the viewer may not read can never supply the name.
+ */
+function earliestRun(members: readonly ViewerWorkNode[]): ViewerWorkNode | undefined {
+  return members
+    .filter((member) => (member.kind === 'run' || member.kind === 'agent')
+      && member.disclosure !== 'existence' && !member.locked)
+    .sort((left, right) => instant(left.startedAt) - instant(right.startedAt)
+      || left.id.localeCompare(right.id))[0];
 }
 
 /** `200000 → '200k'`, `146_320 → '146k'`, `900 → '900'`. Never rounded up to a lie. */
@@ -614,10 +628,9 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     ...edges.flatMap((edge) => [edge.startedAt, edge.updatedAt]),
   ].filter((value): value is string => !!value).map((at) => ({ at }));
 
-  const efforts = deriveWorkEfforts({
+  const effortInput: DeriveWorkEffortsInput = {
     nodes,
     edges,
-    anchorKinds: WORK_EFFORT_ANCHORS,
     contextBefore: query.windowStart,
     // A work stream with no artifact is named by its anchor's own context
     // line. Only the anchor may name the effort; a member never can.
@@ -627,14 +640,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       // nothing a person recognises. The run started in it does. Only a member
       // the viewer may actually read can speak, same rule as the outcome.
       if (anchor.kind === 'conversation') {
-        // The EARLIEST run is the one the conversation started; its steps are
-        // created after it, so newest-first would title the effort after
-        // whichever step happened to run last.
-        const run = members
-          .filter((member) => (member.kind === 'run' || member.kind === 'agent')
-            && member.disclosure !== 'existence' && !member.locked)
-          .sort((left, right) => instant(left.startedAt) - instant(right.startedAt)
-            || left.id.localeCompare(right.id))[0];
+        const run = earliestRun(members);
         if (run) return run.title;
       }
       return streamOf(anchor);
@@ -661,7 +667,30 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       if (streamOf(anchor) && kind) return `${contextOf(anchor)} · ${kind}`;
       return trim(anchor.description);
     },
-  });
+  };
+  const efforts = deriveWorkEfforts({ ...effortInput, anchorKinds: WORK_EFFORT_ANCHORS });
+
+  // A run whose conversation this person has never posted in — or one started
+  // outside a conversation altogether — reaches no container anchor, and
+  // `deriveWorkEfforts` leaves it ungrouped rather than guessing. Ungrouped is
+  // honest but invisible, so a second pass anchors on the runs nothing claimed.
+  // The run names its own effort, which is why it carries a real title.
+  const claimed = new Set(efforts.flatMap((effort) => effort.nodeIds));
+  const orphanRuns = nodes.filter((node) => (node.kind === 'run' || node.kind === 'agent') && !claimed.has(node.id));
+  if (orphanRuns.length > 0) {
+    const remaining = nodes.filter((node) => !claimed.has(node.id));
+    const remainingIds = new Set(remaining.map((node) => node.id));
+    efforts.push(...deriveWorkEfforts({
+      ...effortInput,
+      nodes: remaining,
+      edges: edges.filter((edge) => remainingIds.has(edge.fromId) && remainingIds.has(edge.toId)),
+      anchorKinds: ['run', 'agent'],
+      // The anchor here is whichever run node was touched last, which for an
+      // agent loop is a STEP. The effort is the whole loop, so it is named
+      // after the run that started it — the earliest — not its latest step.
+      titleFor: (_anchor, members) => earliestRun(members)?.title,
+    }).slice(0, Math.max(0, WORK_GRAPH_V2_LIMITS.efforts - efforts.length)));
+  }
 
   // Latest-state projection cannot reconstruct a past minute, so an as-of
   // request is answered honestly as recent work rather than as replay.

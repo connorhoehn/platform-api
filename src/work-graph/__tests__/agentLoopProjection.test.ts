@@ -62,19 +62,27 @@ function conversationEvent(at: string): AuthenticatedWorkEvent {
   } as AuthenticatedWorkEvent;
 }
 
-function runEvent(status: string, at: string): AuthenticatedWorkEvent {
+function runEvent(status: string, at: string, conversation = true): AuthenticatedWorkEvent {
   const mapped = mapPipeline({
     kind: 'pipeline-run',
     run: { runId: RUN, pipelineId: 'chat-agent-loop', status, startedAt: `${DAY}T18:00:00.000Z` } as never,
     attributedSubject: SUBJECT,
     occurredAt: at,
-    inputRefs: [{ source: 'conversation', resourceId: CHANNEL }],
+    safeLabel: 'Agent loop · create a meeting with the X team',
+    ...(conversation ? { inputRefs: [{ source: 'conversation' as const, resourceId: CHANNEL }] } : {}),
   }, context);
   if (!mapped.supported) throw new Error(mapped.reason);
   return mapped.event as unknown as AuthenticatedWorkEvent;
 }
 
-function stepEvent(stepId: string, title: string, status: string, at: string, dependsOn: string[] = []): AuthenticatedWorkEvent {
+function stepEvent(
+  stepId: string,
+  title: string,
+  status: string,
+  at: string,
+  dependsOn: string[] = [],
+  extra: { workspace?: { resourceId: string; safeLabel?: string }; produces?: string } = {},
+): AuthenticatedWorkEvent {
   const mapped = mapPipeline({
     kind: 'pipeline-step',
     run: { runId: RUN, pipelineId: 'chat-agent-loop', status: 'running', startedAt: `${DAY}T18:00:00.000Z` } as never,
@@ -82,6 +90,8 @@ function stepEvent(stepId: string, title: string, status: string, at: string, de
     attributedSubject: SUBJECT,
     occurredAt: at,
     safeLabel: title,
+    ...(extra.workspace ? { workspace: extra.workspace } : {}),
+    ...(extra.produces ? { producesRefs: [{ source: 'document' as const, resourceId: extra.produces }] } : {}),
     inputRefs: [
       { source: 'pipeline', resourceId: RUN },
       ...dependsOn.map((dependency) => ({ source: 'pipeline' as const, resourceId: pipelineStepResourceId(RUN, dependency) })),
@@ -89,6 +99,25 @@ function stepEvent(stepId: string, title: string, status: string, at: string, de
   }, context);
   if (!mapped.supported) throw new Error(mapped.reason);
   return mapped.event as unknown as AuthenticatedWorkEvent;
+}
+
+/** A document the gateway already projected, so a `produced` claim can land. */
+function documentEvent(at: string): AuthenticatedWorkEvent {
+  return {
+    schemaVersion: 1,
+    eventId: `document:${at}`,
+    idempotencyKey: `document:${at}`,
+    source: 'document',
+    sourceSequence: at,
+    occurredAt: at,
+    receivedAt: at,
+    actor: { actorId: ACTOR, organizationId: ORGANIZATION, sourceSubject: SUBJECT },
+    producer: { serviceId: 'websocket-gateway', organizationId: ORGANIZATION, credentialId: 'gateway' },
+    resource: { source: 'document', resourceId: 'doc-1', resourceVersion: 'v1' },
+    payload: {
+      kind: 'document', lifecycle: 'revision-saved', documentId: 'doc-1', revisionId: 'v1', safeLabel: 'Team deck',
+    },
+  } as AuthenticatedWorkEvent;
 }
 
 function project(events: AuthenticatedWorkEvent[]): WorkProjectionState {
@@ -176,7 +205,9 @@ describe('an /agent loop in the requester\'s work graph', () => {
       return acc;
     }, {});
     expect(byKind.conversation).toEqual(['general']);
-    expect(byKind.run?.sort()).toEqual(['Build the deck', 'Draft the agenda', 'Pipeline run']);
+    expect(byKind.run?.sort()).toEqual([
+      'Agent loop · create a meeting with the X team', 'Build the deck', 'Draft the agenda',
+    ]);
     const steps = Object.values(state.nodes).filter((node) => node.sourceRef.resourceId.includes('#'));
     expect(steps.map((node) => node.sourceRef.resourceId).sort())
       .toEqual([`${RUN}#agent:s1`, `${RUN}#agent:s2`]);
@@ -207,7 +238,7 @@ describe('an /agent loop in the requester\'s work graph', () => {
     expect(anchor?.kind).toBe('conversation');
     expect(effort.nodeIds).toHaveLength(4);
     // "general" names no work; the run it started does.
-    expect(effort.title).toBe('Pipeline run');
+    expect(effort.title).toBe('Agent loop · create a meeting with the X team');
   });
 
   it('describes a running step with its own model, budget and turns', async () => {
@@ -324,5 +355,122 @@ describe('agentStepLines', () => {
     expect(agentStepLines({ stepId: 'agent:s1', runtime: 'local', sessionId: 'x' })).toEqual([]);
     expect(agentStepLines({ stepId: 'agent:s1', runtime: 'devbox', sessionId: 'x' }))
       .toEqual(['Cloud workspace · x']);
+  });
+});
+
+describe('a running step is a leased operation, not a status word', () => {
+  const WORKSPACE = { resourceId: 'session-28a319a9', safeLabel: 'Cloud workspace · box-7' };
+  const events = [
+    conversationEvent(`${DAY}T17:59:00.000Z`),
+    runEvent('running', `${DAY}T18:00:00.000Z`),
+    stepEvent('agent:s1', 'Draft the agenda', 'running', `${DAY}T18:04:30.000Z`, [], { workspace: WORKSPACE }),
+  ];
+
+  const facts: Record<string, PipelineRunFacts> = {
+    [`${RUN}#agent:s1`]: {
+      runId: RUN, status: 'running', attempt: 1,
+      startedAt: `${DAY}T18:00:10.000Z`, updatedAt: `${DAY}T18:04:30.000Z`, tools: [],
+      step: { stepId: 'agent:s1', model: 'sonnet', iterations: 4, contextTokens: 146_000, contextBudgetTokens: 200_000, runtime: 'devbox', sessionId: '28a319a9' },
+    },
+  };
+
+  async function activityFor(source: AuthenticatedWorkEvent[], factsFor = facts) {
+    const state = project(source);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader(factsFor), now: NOW });
+    return { state, nodes, edges, activity };
+  }
+
+  it('projects the devbox session as a terminal the step runs in', async () => {
+    const { nodes, edges } = await activityFor(events);
+    const terminal = nodes.find((node) => node.kind === 'terminal');
+    expect(terminal?.title).toBe('Cloud workspace · box-7');
+    const runsIn = edges.find((edge) => edge.relation === 'runs-in');
+    expect(runsIn && nodes.find((node) => node.id === runsIn.fromId)?.title).toBe('Draft the agenda');
+    expect(runsIn && nodes.find((node) => node.id === runsIn.toId)?.id).toBe(terminal?.id);
+  });
+
+  it('reports the running step as an operation with a lease that expires', async () => {
+    const { nodes, activity } = await activityFor(events);
+    const step = nodes.find((node) => node.title === 'Draft the agenda');
+    expect(activity.operations).toHaveLength(1);
+    const [operation] = activity.operations;
+    expect(operation.processNodeId).toBe(step?.id);
+    expect(operation.attemptId).toBe('attempt-1');
+    expect(Date.parse(operation.expiresAt)).toBeGreaterThan(Date.parse(NOW));
+    expect(Date.parse(operation.expiresAt)).toBeGreaterThan(Date.parse(operation.observedAt));
+  });
+
+  it('withdraws the operation when the step completes', async () => {
+    const { activity } = await activityFor([
+      ...events,
+      stepEvent('agent:s1', 'Draft the agenda', 'completed', `${DAY}T18:04:45.000Z`, [], { workspace: WORKSPACE }),
+    ], { [`${RUN}#agent:s1`]: { ...facts[`${RUN}#agent:s1`], status: 'completed' } });
+    expect(activity.operations).toHaveLength(0);
+  });
+
+  it('withdraws the operation once the lease has run out, without a new event', async () => {
+    const state = project(events);
+    const { nodes, edges, authorization } = authorize(state);
+    const stale = await buildWorkActivity({
+      query, nodes, edges, authorization, reader: reader(facts), now: `${DAY}T19:00:00.000Z`,
+    });
+    expect(stale.operations).toHaveLength(0);
+  });
+
+  it('gives the step a `produced` edge to the document it is still writing', async () => {
+    const withDocument = [
+      documentEvent(`${DAY}T18:01:00.000Z`),
+      ...events,
+      stepEvent('agent:s1', 'Draft the agenda', 'running', `${DAY}T18:04:40.000Z`, [], { workspace: WORKSPACE, produces: 'doc-1' }),
+    ];
+    const { nodes, edges, activity } = await activityFor(withDocument);
+    const produced = edges.find((edge) => edge.relation === 'produced');
+    expect(produced && nodes.find((node) => node.id === produced.fromId)?.title).toBe('Draft the agenda');
+    expect(produced && nodes.find((node) => node.id === produced.toId)?.kind).toBe('document');
+    // Two process edges now, and both belong to the same running step.
+    expect(new Set(activity.operations.map((operation) => operation.processNodeId)).size).toBe(1);
+  });
+
+  it('conjures nothing for a document this person has never been shown', async () => {
+    const { edges } = await activityFor([
+      ...events,
+      stepEvent('agent:s1', 'Draft the agenda', 'running', `${DAY}T18:04:40.000Z`, [], { workspace: WORKSPACE, produces: 'doc-unseen' }),
+    ]);
+    expect(edges.filter((edge) => edge.relation === 'produced')).toHaveLength(0);
+  });
+});
+
+describe('a run started in a channel the person has never posted in', () => {
+  // The conversation node is the gateway's to publish, and it publishes it
+  // when a message is PERSISTED. Until then there is no conversation node in
+  // this person's projection, however real the channel is.
+  const events = [
+    runEvent('running', `${DAY}T18:00:00.000Z`, false),
+    stepEvent('agent:s1', 'Draft the agenda', 'running', `${DAY}T18:04:30.000Z`),
+  ];
+
+  it('anchors the effort on the run itself rather than dropping it', async () => {
+    const state = project(events);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
+    expect(nodes.some((node) => node.kind === 'conversation')).toBe(false);
+    expect(activity.efforts).toHaveLength(1);
+    const [effort] = activity.efforts;
+    expect(nodes.find((node) => node.id === effort.anchorNodeId)?.kind).toBe('run');
+    expect(effort.title).toBe('Agent loop · create a meeting with the X team');
+    // The step travels with its run, not into an effort of its own.
+    expect(effort.nodeIds).toHaveLength(2);
+  });
+
+  it('prefers the conversation once the person has posted in it', async () => {
+    const state = project([conversationEvent(`${DAY}T17:59:00.000Z`), ...[
+      runEvent('running', `${DAY}T18:00:00.000Z`),
+      stepEvent('agent:s1', 'Draft the agenda', 'running', `${DAY}T18:04:30.000Z`),
+    ]]);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader({}), now: NOW });
+    expect(activity.efforts).toHaveLength(1);
+    expect(nodes.find((node) => node.id === activity.efforts[0].anchorNodeId)?.kind).toBe('conversation');
   });
 });
