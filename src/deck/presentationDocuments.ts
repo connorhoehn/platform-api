@@ -24,7 +24,10 @@
 import { GetCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { docClient as defaultDocClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
-import type { AssetBlobStore, BlobAsset } from '../pipeline/image/ImageBlobStore';
+import {
+  DdbImageBlobStore, IMAGE_BLOB_SIZE_CAP_BYTES,
+  type AssetBlobStore, type BlobAsset,
+} from '../pipeline/image/ImageBlobStore';
 import { deckSources, type DeckSpec } from './DeckSpec';
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
 import log from '../lib/logger';
@@ -143,12 +146,12 @@ export interface AppendRevisionResult {
   revision: StoredRevision;
 }
 
-/** One slide's bytes, whatever they had to be read from. */
+/** Stored bytes, and which of the places they could have been they came from. */
 export interface SlidePreview {
   contentType: string;
   body: Buffer;
-  /** Where the bytes came from — the row, or the blob store the row points at. */
-  from: 'inline' | 'blob';
+  /** The row itself, the configured blob store, or the durable copy of it. */
+  from: 'inline' | 'blob' | 'mirror';
 }
 
 /** The document half of the store, so a test can hand the handler a fake. */
@@ -161,6 +164,12 @@ export interface PresentationDocumentStore {
    * absent reads the blob the slide record names, which is what this does.
    */
   slidePreview?(documentId: string, revisionId: string, slideId: string): Promise<SlidePreview | null>;
+  /**
+   * A revision's `.pptx`: the configured store first, then the durable copy.
+   * Optional for the same reason `slidePreview` is — a caller that finds it
+   * absent reads the blob the revision names.
+   */
+  revisionFile?(documentId: string, revisionId: string): Promise<SlidePreview | null>;
 }
 
 /**
@@ -230,17 +239,36 @@ export function nextRevisionId(row: PresentationDocumentRow | null): string {
 export interface DdbPresentationDocumentStoreOptions {
   docClient?: DynamoDBDocumentClient;
   blobStore?: AssetBlobStore;
+  /**
+   * The second home for the `.pptx`. Defaults to the DDB blob store whenever
+   * the primary is not already DDB-backed; pass `null` to write only the
+   * primary (a deployment whose volume is durable does not need the copy).
+   */
+  mirror?: AssetBlobStore | null;
   now?: () => Date;
 }
 
 export class DdbPresentationDocumentStore implements PresentationDocumentStore {
   private readonly docClient: DynamoDBDocumentClient;
   private readonly blobStore: AssetBlobStore;
+  /**
+   * Where the `.pptx` is ALSO written.
+   *
+   * The filesystem store is a hostPath under Tilt: it goes with the node, and
+   * a pod replacement left every earlier deck's download 404ing against a row
+   * that still named the file. The slides survive that because they are on the
+   * row; the `.pptx` is too big for a row and small enough for a DDB item, so
+   * it gets the same substrate every other pipeline record already lives on.
+   */
+  private readonly mirror: AssetBlobStore | null;
   private readonly now: () => Date;
 
   constructor(opts: DdbPresentationDocumentStoreOptions = {}) {
     this.docClient = opts.docClient ?? defaultDocClient;
     this.blobStore = opts.blobStore ?? getAssetBlobStore();
+    this.mirror = opts.mirror === undefined
+      ? (this.blobStore instanceof DdbImageBlobStore ? null : new DdbImageBlobStore())
+      : opts.mirror;
     this.now = opts.now ?? (() => new Date());
     // Which store a deck's bytes land in, said out loud once. A process that
     // renders a deck without IMAGE_BLOB_DIR set writes somewhere the operator
@@ -250,6 +278,7 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       directory: (this.blobStore as { directory?: string }).directory ?? null,
       imageBlobStore: process.env.IMAGE_BLOB_STORE ?? null,
       imageBlobDir: process.env.IMAGE_BLOB_DIR ?? null,
+      mirror: this.mirror ? this.mirror.constructor?.name ?? 'unknown' : null,
     }, 'presentation blobs will be written here');
   }
 
@@ -269,11 +298,22 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     const at = this.now().toISOString();
     const revisionId = nextRevisionId(existing);
 
-    const pptxAsset = await this.blobStore.putBlob(
-      pptxBlobKey(input.documentId, revisionId),
-      input.pptx,
-      { contentType: PPTX_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId}.pptx` },
-    );
+    const pptxKey = pptxBlobKey(input.documentId, revisionId);
+    const pptxMeta = { contentType: PPTX_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId}.pptx` };
+    // The durable copy first: a revision recorded with bytes only on a volume
+    // that may not come back is the failure this whole file keeps fixing.
+    if (this.mirror) {
+      if (input.pptx.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
+        throw new Error(
+          `the rendered deck is ${input.pptx.byteLength}B, over the ${IMAGE_BLOB_SIZE_CAP_BYTES}B a durable copy can hold — `
+          + 'it would exist only on the volume, which does not survive a pod replacement. Render fewer or lighter slides, '
+          + 'or give the blob volume durable storage and pass mirror: null.',
+        );
+      }
+      // Same key, same bytes: re-rendering a revision overwrites both copies.
+      await this.mirror.putBlob(pptxKey, input.pptx, pptxMeta);
+    }
+    const pptxAsset = await this.blobStore.putBlob(pptxKey, input.pptx, pptxMeta);
 
     const slides: StoredSlide[] = [];
     for (const [index, slide] of input.slides.entries()) {
@@ -367,6 +407,27 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       },
     }));
     return { documentId: input.documentId, revision };
+  }
+
+  /**
+   * The `.pptx` of one revision: the configured store first, the durable copy
+   * second. Either is the same bytes under the same key; which one answers
+   * depends only on whether the volume outlived the row.
+   */
+  async revisionFile(documentId: string, revisionId: string): Promise<SlidePreview | null> {
+    const row = await this.get(documentId).catch(() => null);
+    const revision = row?.revisions?.find((candidate) => candidate.id === revisionId);
+    if (!revision?.asset?.key) return null;
+    const contentType = revision.asset.contentType || PPTX_CONTENT_TYPE;
+    const primary = await this.blobStore.getBlob(revision.asset.key).catch(() => null);
+    if (primary) return { contentType: primary.asset.contentType || contentType, body: primary.body, from: 'blob' };
+    const mirrored = this.mirror ? await this.mirror.getBlob(revision.asset.key).catch(() => null) : null;
+    if (mirrored) {
+      log.info({ documentId, revisionId, key: revision.asset.key }, 'presentation file served from the durable copy; the volume no longer has it');
+      return { contentType: mirrored.asset.contentType || contentType, body: mirrored.body, from: 'mirror' };
+    }
+    log.warn({ documentId, revisionId, key: revision.asset.key }, 'a revision names a .pptx that neither store holds');
+    return null;
   }
 
   /**

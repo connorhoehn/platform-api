@@ -12,7 +12,8 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GetCommand, PutCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import { InMemoryImageBlobStore } from '../../pipeline/image/ImageBlobStore';
+import { IMAGE_BLOB_SIZE_CAP_BYTES, InMemoryImageBlobStore } from '../../pipeline/image/ImageBlobStore';
+import { PPTX_CONTENT_TYPE } from '../renderPptx';
 import { VolumeImageBlobStore } from '../../pipeline/image/VolumeImageBlobStore';
 import { __resetVisionServicesForTests, getAssetBlobStore } from '../../pipeline/image/visionServices';
 import {
@@ -104,6 +105,57 @@ describe('a slide’s markup lives on the row', () => {
     const slide = { id: 'a', index: 1, title: 'A', previewHandle: 'h', asset: { key: 'k', contentType: 'image/svg+xml', sizeBytes: 5 }, svg: '12345' };
     expect(inlineSlideBytes({ documentId: 'd', revisions: [{ id: 'v1', label: 'v1', createdAt: '', createdBy: '', slideCount: 1, asset: slide.asset, slides: [slide] }], revisionSlides: { v1: [slide] } })).toBe(5);
     expect(inlineSlideBytes(null)).toBe(0);
+  });
+});
+
+describe('the .pptx has a second home', () => {
+  it('is written to both stores, and re-rendering overwrites both', async () => {
+    const primary = new InMemoryImageBlobStore();
+    const mirror = new InMemoryImageBlobStore();
+    const { client } = fakeClient();
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore: primary, mirror });
+    await store.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PKdeck'), slides });
+
+    expect((await primary.getBlob('deck-doc-1-v1.pptx'))!.body.toString('utf8')).toBe('PKdeck');
+    expect((await mirror.getBlob('deck-doc-1-v1.pptx'))!.body.toString('utf8')).toBe('PKdeck');
+  });
+
+  it('serves the file from the durable copy when the volume no longer has it', async () => {
+    const primary = new InMemoryImageBlobStore();
+    const mirror = new InMemoryImageBlobStore();
+    await mirror.putBlob('deck-doc-1-v1.pptx', Buffer.from('PKdeck'), { contentType: PPTX_CONTENT_TYPE });
+    const { client } = fakeClient();
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore: primary, mirror });
+    jest.spyOn(store, 'get').mockResolvedValue({
+      documentId: 'doc-1',
+      revisions: [{
+        id: 'v1', label: 'v1', createdAt: '', createdBy: 'u', slideCount: 1,
+        asset: { key: 'deck-doc-1-v1.pptx', contentType: PPTX_CONTENT_TYPE, sizeBytes: 6 },
+        slides: [],
+      }],
+    });
+
+    const file = await store.revisionFile('doc-1', 'v1');
+    expect(file).toMatchObject({ from: 'mirror', contentType: PPTX_CONTENT_TYPE });
+    expect(file!.body.toString('utf8')).toBe('PKdeck');
+  });
+
+  it('refuses a deck too big for a durable copy, and says why', async () => {
+    const { client } = fakeClient();
+    const store = new DdbPresentationDocumentStore({
+      docClient: client, blobStore: new InMemoryImageBlobStore(), mirror: new InMemoryImageBlobStore(),
+    });
+    await expect(store.appendRevision({
+      documentId: 'doc-1', title: 'Deck', createdBy: 'u',
+      pptx: Buffer.alloc(IMAGE_BLOB_SIZE_CAP_BYTES + 1), slides,
+    })).rejects.toThrow(/does not survive a pod replacement/);
+  });
+
+  it('keeps one copy when the primary store is already the durable one', async () => {
+    const { client } = fakeClient();
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore: new InMemoryImageBlobStore(), mirror: null });
+    const { revision } = await store.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides });
+    expect(revision.asset.key).toBe('deck-doc-1-v1.pptx');
   });
 });
 

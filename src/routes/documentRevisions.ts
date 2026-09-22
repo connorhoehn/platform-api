@@ -188,13 +188,20 @@ documentRevisionsRouter.get('/:revisionId/spec', requireAuth, asyncHandler(async
  * The presentation itself, as the file a person opens.
  */
 documentRevisionsRouter.get('/:revisionId/file', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const { row, revision } = await loadRevision(String(req.params.documentId ?? ''), String(req.params.revisionId ?? ''));
-  const stored = await getAssetBlobStore().getBlob(revision.asset.key);
+  const documentId = String(req.params.documentId ?? '');
+  const { row, revision } = await loadRevision(documentId, String(req.params.revisionId ?? ''));
+  // The configured store first, then the durable copy the store keeps for it —
+  // a deck rendered before a pod replacement is still downloadable.
+  const store = getPresentationDocumentStore();
+  const stored = store.revisionFile
+    ? await store.revisionFile(documentId, revision.id)
+    : await getAssetBlobStore().getBlob(revision.asset.key)
+      .then((blob) => (blob ? { contentType: blob.asset.contentType, body: blob.body } : null));
   if (!stored) throw new NotFoundError('Revision file not found');
   const filename = safeFilename(row.title ?? 'presentation', revision.id, 'pptx');
   res
     .status(200)
-    .setHeader('content-type', revision.asset.contentType || PPTX_CONTENT_TYPE)
+    .setHeader('content-type', stored.contentType || revision.asset.contentType || PPTX_CONTENT_TYPE)
     .setHeader('content-length', String(stored.body.byteLength))
     .setHeader('content-disposition', `attachment; filename="${filename}"`)
     .setHeader('cache-control', 'private, no-store')

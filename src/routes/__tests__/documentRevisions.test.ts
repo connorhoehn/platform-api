@@ -9,6 +9,12 @@ import { InMemoryImageBlobStore } from '../../pipeline/image/ImageBlobStore';
 import { errorHandler } from '../../middleware/error-handler';
 
 const blobStore = new InMemoryImageBlobStore();
+/**
+ * The durable copy of the .pptx. It is the ONLY place the file exists in this
+ * suite, which is the state a pod replacement leaves behind: the row and the
+ * copy survive, the volume does not.
+ */
+const mirrorStore = new InMemoryImageBlobStore();
 
 jest.mock('../../pipeline/image/visionServices', () => ({
   getAssetBlobStore: () => blobStore,
@@ -70,12 +76,14 @@ const appended: Array<Record<string, unknown>> = [];
 const realStore = new DdbPresentationDocumentStore({
   docClient: { send: async () => ({}) } as never,
   blobStore,
+  mirror: mirrorStore,
 });
 jest.spyOn(realStore, 'get').mockImplementation(async (documentId: string) => (documentId === 'doc-1' ? row : null));
 
 const store: PresentationDocumentStore = {
   get: async (documentId: string) => (documentId === 'doc-1' ? row : null),
   slidePreview: (documentId, revisionId, slideId) => realStore.slidePreview(documentId, revisionId, slideId),
+  revisionFile: (documentId, revisionId) => realStore.revisionFile(documentId, revisionId),
   appendRevision: async (input) => {
     appended.push(input as unknown as Record<string, unknown>);
     return {
@@ -154,6 +162,7 @@ afterAll(async () => {
   restorePptx();
   setPresentationDocumentStore(null);
   blobStore.reset();
+  mirrorStore.reset();
   if (originalSkipAuth === undefined) delete process.env.SKIP_AUTH;
   else process.env.SKIP_AUTH = originalSkipAuth;
   await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -175,7 +184,7 @@ describe('GET /api/documents/:id/revisions', () => {
 });
 
 describe('GET /api/documents/:id/revisions/:rev/file', () => {
-  it('serves the .pptx with the PowerPoint content type', async () => {
+  it('serves the .pptx from the durable copy when the volume no longer has it', async () => {
     const res = await request('/api/documents/doc-1/revisions/v1/file');
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toBe(PPTX_CONTENT_TYPE);
