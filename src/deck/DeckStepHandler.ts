@@ -161,6 +161,18 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
             title,
             pptxSizeBytes: revision.asset.sizeBytes,
             slides: revision.slides.map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
+            // What the run PRODUCED, declared on the step's own output: the run
+            // is the provenance of this revision, and the work-graph event
+            // carries the declaration as an artifact of the run (see
+            // src/pipeline/declaredArtifacts.ts).
+            artifacts: [{
+              artifactId: documentId,
+              kind: 'presentation',
+              revisionId: revision.id,
+              slideCount: revision.slideCount,
+              title,
+              sources: revision.sources ?? [],
+            }],
             // The run-result convention: what 'Open' on the card opens.
             result: { kind: 'document', documentId },
           },

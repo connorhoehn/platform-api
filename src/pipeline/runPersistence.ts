@@ -39,6 +39,7 @@ import {
 import { withContext } from '../lib/logger';
 import { computeCost } from './llm-pricing';
 import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platformPublisher';
+import { declaredArtifactRefs } from './declaredArtifacts';
 import { pipelineStepResourceId } from '../work-graph/sources/mapPipeline';
 import { recallRunLab } from './agent/DevboxAgentClient';
 import { parseRunResult } from './runResult';
@@ -1278,6 +1279,9 @@ export class RunPersistenceService {
       ...(this.workspaceFor(state, stepId) ? { workspace: this.workspaceFor(state, stepId) as { resourceId: string } } : {}),
       // What it is writing, named while it is still writing it.
       ...(this.producesFor(state, stepId).length ? { producesRefs: this.producesFor(state, stepId) } : {}),
+      // What it finished: an artifact the step declared on its own output, so
+      // the run is recorded as the provenance of the thing it made.
+      ...(this.artifactsFor(state, stepId).length ? { artifactRefs: this.artifactsFor(state, stepId) } : {}),
       // The run it belongs to, then the steps it waits on. Both are already
       // projected pipeline resources, so the chain reads in dependsOn order.
       inputRefs: [
@@ -1311,6 +1315,15 @@ export class RunPersistenceService {
       // node stays a placeholder rather than repeating the opaque id.
       ...(boxId ? { safeLabel: `Cloud workspace · ${boxId}` } : {}),
     };
+  }
+
+  /**
+   * The artifacts a step declared on its own output (`artifacts: [{ artifactId }]`),
+   * stamped with this run. A step that declares none contributes none — the
+   * provenance is the step's word, never the run's adjacency.
+   */
+  private artifactsFor(state: RunState, stepId: string): ReturnType<typeof declaredArtifactRefs> {
+    return declaredArtifactRefs(state.steps[stepId]?.output, { pipelineId: state.pipelineId, runId: state.runId });
   }
 
   /**
