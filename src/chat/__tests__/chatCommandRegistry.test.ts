@@ -11,8 +11,12 @@ jest.mock('../../pipeline/runPersistence', () => ({
 }));
 // The source-account join is a DDB write; the registry only has to CALL it.
 const mockEnsurePrincipal = jest.fn().mockResolvedValue(true);
+const mockEnsureSourcePrincipal = jest.fn().mockResolvedValue(true);
 jest.mock('../../repositories', () => ({
-  workSourceAccountRepo: { ensureVerifiedPrincipal: (...args: unknown[]) => mockEnsurePrincipal(...args) },
+  workSourceAccountRepo: {
+    ensureVerifiedPrincipal: (...args: unknown[]) => mockEnsurePrincipal(...args),
+    ensureVerifiedSourcePrincipal: (...args: unknown[]) => mockEnsureSourcePrincipal(...args),
+  },
 }));
 jest.mock('../../documents/chatRunCard', () => ({
   postRunCardToChannel: (...args: unknown[]) => mockPostCard(...args),
@@ -292,6 +296,18 @@ describe('the work-graph plan on the async-planning re-entry', () => {
     await runChatCommand(input());
     expect(mockEnsurePrincipal).toHaveBeenCalledWith({
       source: 'pipeline', organizationId: 'dev-org', subject: 'dev-frank',
+    });
+  });
+
+  it('joins the document source under the producer every document join lives under', async () => {
+    // A run that renders a deck publishes on the document source, and that
+    // join's producer is not part of its key — so it has to match the one the
+    // gateway already wrote or the deck is refused as unmapped.
+    setPipelineBridge(normalisingBridge());
+    await runChatCommand(input());
+    expect(mockEnsureSourcePrincipal).toHaveBeenCalledWith({
+      source: 'document', producerServiceId: 'websocket-gateway',
+      organizationId: 'dev-org', subject: 'dev-frank',
     });
   });
 

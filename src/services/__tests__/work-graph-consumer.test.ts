@@ -5,6 +5,7 @@ import {
   startWorkGraphConsumer,
   WorkGraphIngestionDeniedError,
   WORK_GRAPH_PROJECTION_QUEUE,
+  workGraphAccountProducer,
 } from '../work-graph-consumer';
 
 jest.mock('../../lib/logger', () => ({
@@ -207,6 +208,7 @@ describe('a source with two declared writers', () => {
     const accountResolver = {
       resolve: jest.fn(async () => ({ organizationId: 'dev-org', actorId: 'dev-frank' })),
     };
+
     let consume!: (input: unknown) => Promise<void>;
     startWorkGraphConsumer({
       transport: { subscribe: (_q: string, handler: (input: unknown) => Promise<void>) => { consume = handler; return () => undefined; } } as never,
@@ -259,5 +261,45 @@ describe('a source with two declared writers', () => {
       },
     }).catch((e: Error) => e);
     expect((denied as Error).message).toContain('producer-or-source-mismatch');
+  });
+});
+
+describe('the account join a second writer looks up', () => {
+  it('is the source\'s own, not the publishing service\'s', () => {
+    // The join binds a person to a source; its producer records who
+    // established it and is not part of the row's key. Both admitted writers
+    // must therefore look up the same row.
+    expect(workGraphAccountProducer('document')).toBe('websocket-gateway');
+    expect(workGraphAccountProducer('pipeline')).toBe('platform-api');
+    expect(workGraphAccountProducer('cloud-compute')).toBe('aws-agentcore');
+  });
+
+  it('is what the consumer resolves a platform-published deck against', async () => {
+    const repository = {
+      loadProjection: jest.fn(async () => ({ revision: 0 })),
+      commitEvent: jest.fn(async () => ({ revision: 1 })),
+    };
+    const resolve = jest.fn(async () => ({ organizationId: 'dev-org', actorId: 'dev-frank' }));
+    let consume!: (input: unknown) => Promise<void>;
+    startWorkGraphConsumer({
+      transport: { subscribe: (_q: string, h: (input: unknown) => Promise<void>) => { consume = h; return () => undefined; } } as never,
+      repository: repository as never,
+      accountResolver: { resolve } as never,
+      ownership: { ownsDocument: async () => true },
+    });
+    await consume({
+      eventName: 'work-graph.document.lifecycle.v1',
+      metadata: { producer: 'websocket-gateway' },
+      payload: {
+        schemaVersion: 1, eventId: 'e1', idempotencyKey: 'e1', source: 'document', sourceSequence: '1',
+        occurredAt: '2026-09-22T04:36:48.000Z', receivedAt: '2026-09-22T04:36:49.000Z',
+        actor: { actorId: 'dev-frank', organizationId: 'dev-org', sourceSubject: 'dev-frank' },
+        producer: { serviceId: 'platform-api', organizationId: 'dev-org', credentialId: 'c' },
+        resource: { source: 'document', resourceId: 'deck-1', resourceVersion: 'v1' },
+        payload: { kind: 'document', lifecycle: 'revision-saved', documentId: 'deck-1', revisionId: 'v1' },
+      },
+    });
+    expect(resolve).toHaveBeenCalledWith('document', 'websocket-gateway', 'dev-org', 'dev-frank');
+    expect(repository.commitEvent).toHaveBeenCalled();
   });
 });

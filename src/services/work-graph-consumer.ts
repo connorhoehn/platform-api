@@ -29,6 +29,21 @@ const PRODUCER_BY_SOURCE: Record<WorkSourceKind, string> = {
 };
 
 /**
+ * The service a source's ACCOUNT JOIN is recorded under.
+ *
+ * The join binds a person to a source; the producer on it records which
+ * service established the binding, and it is not part of the row's key. So a
+ * source with two admitted writers has ONE join per person — whoever wrote it
+ * first — and both writers must look it up the same way. Resolving by the
+ * publishing service instead meant a deck was refused as
+ * `source-account-unmapped` for every person whose document join the gateway
+ * had already written, which is all of them.
+ */
+export function workGraphAccountProducer(source: WorkSourceKind): string {
+  return PRODUCER_BY_SOURCE[source];
+}
+
+/**
  * Admitting a second service says who may SPEAK, never what they may say. A
  * publisher still has to own the thing it describes, checked against that
  * service's own store — platform-api writes presentations, and a CRDT page is
@@ -165,7 +180,7 @@ async function authorizeAndCommit(
   }
   const mapped = await accountResolver.resolve(
     event.source,
-    event.producer.serviceId,
+    workGraphAccountProducer(event.source),
     event.producer.organizationId,
     event.actor.sourceSubject,
   );

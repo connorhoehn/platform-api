@@ -266,9 +266,12 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
         source: 'pipeline', organizationId: input.organizationId, subject: input.requestedBy,
       }),
       // A run that renders a deck publishes it on the DOCUMENT source, and the
-      // consumer re-checks that join before it will accept one.
-      workSourceAccountRepo.ensureVerifiedPrincipal({
-        source: 'document', organizationId: input.organizationId, subject: input.requestedBy,
+      // consumer re-checks that join before it will accept one. It is recorded
+      // under the gateway, which is where every document join lives: the join
+      // binds the person to the source, not to the service publishing.
+      workSourceAccountRepo.ensureVerifiedSourcePrincipal({
+        source: 'document', producerServiceId: 'websocket-gateway',
+        organizationId: input.organizationId, subject: input.requestedBy,
       }),
     ]);
   } else {

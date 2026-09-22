@@ -12,6 +12,7 @@ import type { AuthenticatedWorkEvent, WorkSourceKind } from '@connorhoehn/realti
 import { mapMeeting, type MeetingSourceRecord } from './mapMeeting';
 import { mapPipeline, type PipelineSourceRecord } from './mapPipeline';
 import { mapDocumentRevision, type DocumentRevisionSourceRecord } from './mapDocument';
+import { workGraphAccountProducer } from '../../services/work-graph-consumer';
 
 export interface WorkGraphSourceAccountResolver {
   resolve(
@@ -85,8 +86,12 @@ export class PlatformWorkGraphSourcePublisher {
     record: DocumentRevisionSourceRecord,
     identity: { organizationId: string; sourceSubject: string },
   ): Promise<WorkGraphProducerResult> {
+    // The document source's account join is recorded under the gateway, which
+    // writes it for every authenticated viewer. It binds the PERSON to the
+    // source, not to whichever admitted service is publishing — so a second
+    // writer looks up the same one rather than demanding a join of its own.
     const mapped = await this.options.accounts.resolve(
-      'document', 'platform-api', identity.organizationId, identity.sourceSubject,
+      'document', workGraphAccountProducer('document'), identity.organizationId, identity.sourceSubject,
     );
     if (!mapped) return { published: false, reason: 'source-account-unmapped' };
     if (mapped.organizationId !== identity.organizationId) {

@@ -63,3 +63,65 @@ describe('PlatformWorkGraphSourcePublisher', () => {
     expect(publish.mock.calls[1][1].payload).not.toHaveProperty('transcriptText');
   });
 });
+
+describe('a deck published by the platform', () => {
+  const identity = { organizationId: 'dev-org', sourceSubject: 'dev-frank' };
+  const record = {
+    kind: 'document-revision' as const,
+    documentId: 'deck-1',
+    revisionId: 'v1',
+    occurredAt: '2026-09-22T04:36:48.000Z',
+    safeLabel: 'Sprint review',
+    producedByRunId: 'run-1',
+  };
+
+  function publisherWith(rows: Array<[string, string, string, string]>) {
+    const publish = jest.fn().mockResolvedValue(undefined);
+    const accounts = {
+      resolve: jest.fn(async (source: string, producerServiceId: string, org: string, subject: string) => (
+        rows.some(([s, p, o, u]) => s === source && p === producerServiceId && o === org && u === subject)
+          ? { organizationId: org, actorId: subject }
+          : null
+      )),
+    };
+    return {
+      publish,
+      accounts,
+      publisher: new PlatformWorkGraphSourcePublisher({
+        accounts: accounts as never,
+        publisher: { publish } as never,
+        credentialId: 'platform-api-runtime',
+      }),
+    };
+  }
+
+  it('looks up the join the gateway already wrote, not one of its own', async () => {
+    // The join binds the PERSON to the source. Its producer is a record of who
+    // established it and is not part of the row's key, so a second writer that
+    // insisted on its own name found nothing for every person alive.
+    const { publisher, publish, accounts } = publisherWith([
+      ['document', 'websocket-gateway', 'dev-org', 'dev-frank'],
+    ]);
+    const result = await publisher.document(record, identity);
+    expect(result.published).toBe(true);
+    expect(accounts.resolve).toHaveBeenCalledWith('document', 'websocket-gateway', 'dev-org', 'dev-frank');
+    expect(publish).toHaveBeenCalledWith('work-graph.document.lifecycle.v1', expect.objectContaining({
+      source: 'document',
+      producer: expect.objectContaining({ serviceId: 'platform-api' }),
+      payload: expect.objectContaining({ documentId: 'deck-1', producedByRunId: 'run-1' }),
+    }));
+  });
+
+  it('still refuses a person with no document join at all', async () => {
+    const { publisher, publish } = publisherWith([['pipeline', 'platform-api', 'dev-org', 'dev-frank']]);
+    expect(await publisher.document(record, identity))
+      .toEqual({ published: false, reason: 'source-account-unmapped' });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('says the platform produced it, whoever the join was recorded under', async () => {
+    const { publisher, publish } = publisherWith([['document', 'websocket-gateway', 'dev-org', 'dev-frank']]);
+    await publisher.document(record, identity);
+    expect((publish.mock.calls[0][1] as { producer: { serviceId: string } }).producer.serviceId).toBe('platform-api');
+  });
+});
