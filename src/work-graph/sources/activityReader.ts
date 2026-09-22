@@ -9,6 +9,7 @@
  */
 import { GetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { tableName } from '../../lib/ddb-table-name';
+import log from '../../lib/logger';
 import {
   getPresentationDocumentStore,
   type PresentationDocumentStore,
@@ -329,15 +330,28 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       .then(() => store().get(documentId))
       .catch(() => null);
     if (!row) return null;
-    const recorded = row.revisions?.find((revision) => revision.id === revisionId)?.slides
-      ?? row.revisionSlides?.[revisionId]
-      ?? [];
+    // Both places the row records slides, in that order — never one or the
+    // other. `artifact()` lists anchors from whichever is populated, so a
+    // narrower lookup here would offer a slide it then could not serve.
+    const recorded = [
+      ...(row.revisions?.find((revision) => revision.id === revisionId)?.slides ?? []),
+      ...(row.revisionSlides?.[revisionId] ?? []),
+    ];
     const slide = recorded.find((entry) => entry?.id === slideId);
     if (!slide?.asset?.key) return null;
     const blob = await Promise.resolve()
       .then(() => (this.deps.blobs ?? getAssetBlobStore)().getBlob(slide.asset.key))
-      .catch(() => null);
-    if (!blob) return null;
+      .catch((error: unknown) => {
+        log.warn({ documentId, revisionId, slideId, err: (error as Error)?.message }, 'work-graph: slide preview store unavailable');
+        return null;
+      });
+    // The record names bytes the store does not have. That is a real defect —
+    // usually a blob volume that did not survive a restart while the row did —
+    // and it is indistinguishable from an unknown slide unless it is said.
+    if (!blob) {
+      log.warn({ documentId, revisionId, slideId, key: slide.asset.key }, 'work-graph: a revision names a slide whose bytes are gone');
+      return null;
+    }
     const contentType = String(blob.asset?.contentType ?? slide.asset.contentType ?? '');
     if (!ALLOWED_PREVIEW_TYPES.has(contentType)) return null;
     if (blob.body.byteLength === 0 || blob.body.byteLength > MAX_PREVIEW_BYTES) return null;

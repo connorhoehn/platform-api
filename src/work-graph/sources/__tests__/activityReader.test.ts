@@ -157,6 +157,77 @@ describe('the bytes behind one slide', () => {
   });
 });
 
+// The row the `--decks` seed leaves behind: a hyphenated document id, slide ids
+// like `title-slide`, `revisions[].slides[].asset` AND `revisionSlides` both
+// populated, and one inline cover per revision.
+const seededRow: Row = {
+  documentId: 'active-now-2026-09-21-sprint-review',
+  title: 'Sprint review',
+  type: 'presentation',
+  revisions: [
+    {
+      id: 'v1',
+      label: 'v1',
+      createdAt: '2026-09-21T13:27:00.000Z',
+      createdBy: 'dev-connor',
+      slideCount: 2,
+      asset: { key: 'deck-active-now-2026-09-21-sprint-review-v1.pptx', contentType: 'application/octet-stream', sizeBytes: 10 },
+      slides: [
+        slide('title-slide', 1, 'Sprint review', 'deck-active-now-2026-09-21-sprint-review-v1-title-slide.svg'),
+        slide('sources', 2, 'Sources', 'deck-active-now-2026-09-21-sprint-review-v1-sources.svg'),
+      ],
+    },
+  ],
+  revisionSlides: {
+    v1: [
+      slide('title-slide', 1, 'Sprint review', 'deck-active-now-2026-09-21-sprint-review-v1-title-slide.svg'),
+      slide('sources', 2, 'Sources', 'deck-active-now-2026-09-21-sprint-review-v1-sources.svg'),
+    ],
+  },
+  revisionPreviews: { v1: { contentType: 'image/svg+xml', body: SVG } },
+};
+
+describe('the row the deck seed leaves behind', () => {
+  it('serves the slide the work-graph anchor names', async () => {
+    const blobs = new InMemoryImageBlobStore();
+    await blobs.putBlob(
+      'deck-active-now-2026-09-21-sprint-review-v1-title-slide.svg',
+      Buffer.from(SVG, 'utf8'),
+      { contentType: 'image/svg+xml' },
+    );
+    const reader = readerFor(seededRow, blobs);
+    // Every anchor the snapshot offers resolves to bytes or to an honest 404,
+    // never to a slide the lookup cannot even find.
+    const facts = await reader.artifact('active-now-2026-09-21-sprint-review');
+    expect(facts?.revisions?.[0]?.slides.map((entry) => entry.id)).toEqual(['title-slide', 'sources']);
+    expect((await reader.revisionPreview('active-now-2026-09-21-sprint-review', 'v1', 'title-slide'))?.body.toString('utf8'))
+      .toBe(SVG);
+  });
+
+  it('keeps the cover working when the slide bytes did not survive the restart', async () => {
+    // Exactly the live defect: the row still names every slide asset, but the
+    // blob volume is empty. The inline cover lives in the row, so it stays.
+    const reader = readerFor(seededRow, new InMemoryImageBlobStore());
+    expect(await reader.revisionPreview('active-now-2026-09-21-sprint-review', 'v1', 'title-slide')).toBeNull();
+    expect((await reader.revisionPreview('active-now-2026-09-21-sprint-review', 'v1'))?.body.toString('utf8')).toBe(SVG);
+  });
+
+  it('finds a slide the revision record omits but `revisionSlides` still has', async () => {
+    const blobs = new InMemoryImageBlobStore();
+    await blobs.putBlob(
+      'deck-active-now-2026-09-21-sprint-review-v1-sources.svg',
+      Buffer.from(SVG, 'utf8'),
+      { contentType: 'image/svg+xml' },
+    );
+    const partial = { ...seededRow, revisions: [{ ...(seededRow.revisions as Row[])[0], slides: [] }] };
+    const reader = readerFor(partial, blobs);
+    expect((await reader.artifact('active-now-2026-09-21-sprint-review'))?.revisions?.[0]?.slides.map((entry) => entry.id))
+      .toEqual(['title-slide', 'sources']);
+    expect((await reader.revisionPreview('active-now-2026-09-21-sprint-review', 'v1', 'sources'))?.body.toString('utf8'))
+      .toBe(SVG);
+  });
+});
+
 describe('which step a run is inside', () => {
   it('names the running step from the run\'s own step summaries, newest first', async () => {
     const run = {
