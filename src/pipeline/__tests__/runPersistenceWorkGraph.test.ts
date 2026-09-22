@@ -5,6 +5,10 @@
  * in-process bus, so it can reach this service before the caller that knows
  * the run's organization, origin and steps has even been handed its run id.
  */
+const mockPresentation = jest.fn(async (_documentId: string) => ({ documentId: 'deck-1' }) as unknown);
+jest.mock('../../deck/presentationDocuments', () => ({
+  getPresentationDocumentStore: () => ({ get: (id: string) => mockPresentation(id) }),
+}));
 jest.mock('../../work-graph/sources/platformPublisher', () => ({
   platformWorkGraphSourcePublisher: {
     pipeline: jest.fn(async () => ({ published: true })),
@@ -265,7 +269,12 @@ describe('replaying a stored run', () => {
 });
 
 describe('a deck the run rendered', () => {
-  beforeEach(() => { publisher.pipeline.mockClear(); publisher.document.mockClear(); });
+  beforeEach(() => {
+    publisher.pipeline.mockClear();
+    publisher.document.mockClear();
+    mockPresentation.mockClear();
+    mockPresentation.mockResolvedValue({ documentId: 'deck-1' });
+  });
 
   async function startedRun() {
     const { service, emit } = harness();
@@ -305,6 +314,26 @@ describe('a deck the run rendered', () => {
       runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
       triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
     });
+    await emit('pipeline:step:deck:produced', {
+      runId: RUN, stepId: 'deck:s1', documentId: 'deck-1', revisionId: 'v1', at: AT,
+    });
+    expect(publisher.document).not.toHaveBeenCalled();
+  });
+
+  it('says nothing for a document the deck store does not hold', async () => {
+    // The platform may only describe what it wrote. The consumer checks the
+    // same thing; refusing here names the document, which a denial cannot.
+    mockPresentation.mockResolvedValue(null);
+    const { emit } = await startedRun();
+    await emit('pipeline:step:deck:produced', {
+      runId: RUN, stepId: 'deck:s1', documentId: 'someone-elses-page', revisionId: 'v1', at: AT,
+    });
+    expect(publisher.document).not.toHaveBeenCalled();
+  });
+
+  it('says nothing when the deck store cannot be read at all', async () => {
+    mockPresentation.mockRejectedValue(new Error('store unavailable'));
+    const { emit } = await startedRun();
     await emit('pipeline:step:deck:produced', {
       runId: RUN, stepId: 'deck:s1', documentId: 'deck-1', revisionId: 'v1', at: AT,
     });

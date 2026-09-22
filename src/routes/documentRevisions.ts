@@ -139,7 +139,9 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
       occurredAt: revision.createdAt,
       safeLabel: title,
     }, { organizationId: req.user.orgId, sourceSubject: createdBy }).catch(() => null);
-    if (!projected?.published) {
+    if (projected?.published) {
+      log.info({ documentId, revisionId: revision.id, producedByRunId: null }, 'document lifecycle enqueued');
+    } else {
       log.warn({ documentId, revisionId: revision.id, reason: projected?.reason ?? 'publish-failed' }, 'deck revision was not projected');
     }
   }

@@ -1051,6 +1051,13 @@ export class RunPersistenceService {
     if (!runId || !documentId || !revisionId) return;
     const state = this.runCache.get(runId);
     if (!state?.organizationId || state.triggeredBy === 'system') return;
+    // The platform may only describe a document its own deck store wrote; the
+    // consumer checks the same thing and would deny it. Saying so here names
+    // the document, which a denial at the far end cannot.
+    if (!await this.ownsPresentation(documentId)) {
+      log.warn({ runId, documentId, revisionId }, 'produced hook fired for a document the deck store does not hold');
+      return;
+    }
     const result = await platformWorkGraphSourcePublisher.document({
       kind: 'document-revision',
       documentId,
@@ -1060,7 +1067,24 @@ export class RunPersistenceService {
       producedByRunId: runId,
     }, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
     if (!result.published) {
-      log.warn({ runId, documentId, reason: result.reason }, 'produced deck was not projected');
+      log.warn({ runId, documentId, revisionId, reason: result.reason }, 'produced deck was not projected');
+      return;
+    }
+    log.info({ documentId, revisionId, producedByRunId: runId }, 'document lifecycle enqueued');
+  }
+
+  /**
+   * Whether the presentation store holds this document. A store that cannot
+   * be read answers `false`: describing a document we cannot confirm we wrote
+   * is the one thing the second-writer allowance does not permit.
+   */
+  private async ownsPresentation(documentId: string): Promise<boolean> {
+    try {
+      const { getPresentationDocumentStore } = await import('../deck/presentationDocuments.js');
+      return !!await getPresentationDocumentStore().get(documentId);
+    } catch (err) {
+      log.warn({ documentId, err: String(err) }, 'could not confirm the deck store holds this document');
+      return false;
     }
   }
 
