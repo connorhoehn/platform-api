@@ -84,6 +84,22 @@ describe('the deck:read-sources step, with a recording', () => {
   });
 });
 
+describe('a deck cites the page this run wrote', () => {
+  it('reads the agenda an earlier step produced as a source', async () => {
+    const handler = createDeckReadSourcesHandler({
+      readDocument: async (documentId) => ({ text: `the text of ${documentId}` }),
+      readMaterial: async () => ({}),
+    });
+    const outcome = await handler.execute(node, {
+      sources: [{ documentId: 'doc-a', title: 'Doc A' }],
+      agendaDocument: { documentId: 'doc-agenda-1', title: 'Platform sync' },
+    }, helpers);
+    const output = outcome.output as Record<string, unknown>;
+    expect(output.sourceList).toContain('- Platform sync (documentId: doc-agenda-1)');
+    expect(output.sourcesBlock).toContain('the text of doc-agenda-1');
+  });
+});
+
 describe('parseSourceRefs', () => {
   it('takes ids and titles under either name, deduped and capped', () => {
     expect(parseSourceRefs([

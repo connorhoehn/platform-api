@@ -22,6 +22,8 @@
 
 import type { AgentClient, AgentStopReason } from '../pipeline/agent/types';
 import { DECK_STEP_KIND } from '../deck/DeckStepHandler';
+import { MEETING_STEP_KIND } from '../loop/meetingStepHandler';
+import { AGENDA_STEP_KIND, type Agenda } from '../loop/agendaStepHandler';
 import { isSilentClaudeFailure } from '../pipeline/claudeCliErrors';
 import type { DeckSpec } from '../deck/DeckSpec';
 import log from '../lib/logger';
@@ -516,6 +518,60 @@ export function deckLoopNodeId(stepId: string): string {
   return `${DECK_STEP_KIND}:${stepId}`;
 }
 
+/** `meeting:create:s1` / `agenda:write:s2` — the capability node a step expands into. */
+export function meetingLoopNodeId(stepId: string): string {
+  return `${MEETING_STEP_KIND}:${stepId}`;
+}
+
+export function agendaLoopNodeId(stepId: string): string {
+  return `${AGENDA_STEP_KIND}:${stepId}`;
+}
+
+export function agendaDraftTitle(step: LoopStep): string {
+  return `Draft the agenda for ${step.title}`.slice(0, 120);
+}
+
+export function agendaWriteTitle(step: LoopStep): string {
+  return `Write ${step.title} as a page`.slice(0, 120);
+}
+
+/**
+ * What the agenda's drafting agent is told. The same shape the `agenda:write`
+ * step validates, so a draft that does not fit is refused there rather than
+ * written into a page under the name of an agenda.
+ */
+export function agendaDraftPrompt(step: LoopStep, request: AgentLoopRequest): string {
+  return [
+    'You draft a meeting agenda. Answer with ONLY a JSON object, no prose, no code fence.',
+    '',
+    '{"title":"…","items":[{"text":"…","owner":"…","minutes":10}],"owners":["…"]}',
+    '',
+    'Rules:',
+    '- Between 3 and 12 items, each a single sentence under 200 characters.',
+    '- An item names an owner only when the instruction or an earlier step did. Do not assign people.',
+    '- `minutes` only when a duration was asked for.',
+    '',
+    `Meeting: ${step.title}`,
+    `Requested by: ${request.requestedByName ?? request.requestedBy}`,
+    `The instruction: ${request.instruction}`,
+    'What the steps before you produced: {{ context.steps }}',
+  ].join('\n');
+}
+
+/** A small, valid agenda, so the local loop completes this kind with no model. */
+export function agendaFixture(step: LoopStep, request: AgentLoopRequest): Agenda {
+  const topic = request.instruction.replace(DECK_FIXTURE_MARKER, '').trim().slice(0, 80) || step.title;
+  return {
+    title: `Fixture agenda — ${topic}`.slice(0, 120),
+    items: [
+      { text: 'What this loop was asked to do, read back in one sentence.' },
+      { text: 'What each step produced, and where it landed.' },
+      { text: 'What a person still has to decide.' },
+    ],
+    owners: [],
+  };
+}
+
 /** What the draft node is called; the render node is `Render <title> (.pptx)`. */
 export function deckDraftTitle(step: LoopStep): string {
   return `Draft slides for ${step.title}`.slice(0, 120);
@@ -661,6 +717,51 @@ export function buildAgentLoopDefinition(plan: LoopPlan, request: AgentLoopReque
       });
       continue;
     }
+    if (step.kind === 'meeting') {
+      // ONE node, and a real one: it creates the room and puts the named
+      // team's members on it. No drafting agent — there is nothing for a model
+      // to write, and a step that only talks about a meeting is the thing this
+      // replaces.
+      nodes.push({
+        id: meetingLoopNodeId(step.id),
+        type: MEETING_STEP_KIND,
+        position: pos(nodes.length),
+        data: {
+          type: MEETING_STEP_KIND,
+          label: step.title,
+          title: step.title,
+          loop: { kind: step.kind, stepId: step.id, ...(step.dependsOn.length ? { dependsOn: step.dependsOn } : {}) },
+          retryPolicy: LOOP_STEP_RETRY,
+        },
+      });
+      continue;
+    }
+
+    if (step.kind === 'agenda') {
+      // Draft, then write: a model writes the agenda, and the write is a real
+      // page in the Documents explorer rather than text in a run's output.
+      nodes.push(agentNode(step, nodes.length, {
+        prompt: agendaDraftPrompt(step, request),
+        label: agendaDraftTitle(step),
+        loop: { kind: step.kind, stepId: step.id, role: 'draft', ...(step.dependsOn.length ? { dependsOn: step.dependsOn } : {}) },
+      }));
+      nodes.push({
+        id: agendaLoopNodeId(step.id),
+        type: AGENDA_STEP_KIND,
+        position: pos(nodes.length),
+        data: {
+          type: AGENDA_STEP_KIND,
+          label: agendaWriteTitle(step),
+          agendaFrom: `$.steps.${agentLoopNodeId(step.id)}.text`,
+          title: step.title,
+          loop: { kind: step.kind, stepId: step.id, role: 'write' },
+          retryPolicy: LOOP_STEP_RETRY,
+          ...(fixture ? { agenda: agendaFixture(step, request) } : {}),
+        },
+      });
+      continue;
+    }
+
     nodes.push(agentNode(step, nodes.length));
   }
 

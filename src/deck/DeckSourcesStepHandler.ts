@@ -98,7 +98,13 @@ export function createDeckReadSourcesHandler(opts: DeckReadSourcesOpts = {}): De
     reads: 'sources (documentId + title) from the trigger, recordingId when the command named a meeting, and conversationText when a step before it read the chat.',
     emits: 'sourcesBlock, sourceList, which transcript was used (a recording\'s or the conversation\'s) and how many documents were readable — a document that could not be read says so in the block.',
     async execute(_node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
-      const refs = parseSourceRefs(context.sources);
+      // The documents the conversation named, plus any page an earlier step of
+      // this run wrote (an agenda, today) — a deck may cite what the run itself
+      // produced, because it was produced from the same declared material.
+      const refs = parseSourceRefs([
+        ...(Array.isArray(context.sources) ? context.sources : []),
+        ...(context.agendaDocument ? [context.agendaDocument] : []),
+      ]);
       // `/deck --from transcript` names a recording: its transcript is the
       // source, and the chat text is not a substitute for it — when the
       // recording has none, the block says so and the deck cites nothing it

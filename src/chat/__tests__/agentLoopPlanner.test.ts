@@ -176,11 +176,19 @@ describe('buildAgentLoopDefinition', () => {
     expect(def.id).toBe(CHAT_AGENT_LOOP_PIPELINE_ID);
   });
 
-  it('gives every step a node id of agent:<stepId> and the step title', () => {
-    // s3 is a deck step, so it is the draft node plus its render node.
-    expect(nodes.map((n) => n.id)).toEqual(['trigger', 'agent:s1', 'agent:s2', 'agent:s3', 'deck:s3']);
-    expect(nodes.slice(1).map((n) => (n.data as { label: string }).label))
-      .toEqual(['Book the meeting', 'Draft the agenda', 'Draft slides for Build the deck', 'Render Build the deck (.pptx)']);
+  it('gives every step its own node, and a capability step the node that does the work', () => {
+    // s1 is a meeting step (one real node), s2 an agenda step and s3 a deck
+    // step (each a draft node plus the node that produces the thing).
+    expect(nodes.map((n) => n.id)).toEqual([
+      'trigger', 'meeting:create:s1', 'agent:s2', 'agenda:write:s2', 'agent:s3', 'deck:s3',
+    ]);
+    expect(nodes.slice(1).map((n) => (n.data as { label: string }).label)).toEqual([
+      'Book the meeting',
+      'Draft the agenda for Draft the agenda',
+      'Write Draft the agenda as a page',
+      'Draft slides for Build the deck',
+      'Render Build the deck (.pptx)',
+    ]);
     expect(agentLoopNodeId('s4')).toBe('agent:s4');
   });
 
@@ -198,21 +206,41 @@ describe('buildAgentLoopDefinition', () => {
   });
 
   it('appends the acceptance sentence to the prompt, which is what ends the loop', () => {
-    expect((nodes[2].data as { prompt: string }).prompt).toBe('draft it\n\nAcceptance: agenda.md is written');
+    // An ordinary step: the ones with a capability behind them carry that
+    // capability's own prompt instead.
+    const ordinary = buildAgentLoopDefinition(
+      { source: 'planner', steps: [{ id: 's1', title: 'Send it round', kind: 'other', prompt: 'send it', dependsOn: [], done: 'everyone has it' }] } as LoopPlan,
+      request(),
+    ).nodes as Array<Record<string, unknown>>;
+    expect((ordinary[1].data as { prompt: string }).prompt).toBe('send it\n\nAcceptance: everyone has it');
   });
 
   it('gives a deck step its own drafting prompt instead of the generic one', () => {
-    expect((nodes[3].data as { prompt: string }).prompt).toContain('You draft a presentation');
+    expect((nodes[4].data as { prompt: string }).prompt).toContain('You draft a presentation');
+  });
+
+  it('gives an agenda step its own drafting prompt, and a node that writes the page', () => {
+    expect((nodes[2].data as { prompt: string }).prompt).toContain('You draft a meeting agenda');
+    expect(nodes[3].type).toBe('agenda:write');
+    expect((nodes[3].data as { agendaFrom: string }).agendaFrom).toBe('$.steps.agent:s2.text');
+  });
+
+  it('gives a meeting step the node that creates the room', () => {
+    expect(nodes[1].type).toBe('meeting:create');
+    expect((nodes[1].data as { title: string }).title).toBe('Book the meeting');
   });
 
   it('records the plan step on the node so the graph can name what it is doing', () => {
-    expect((nodes[3].data as { loop: unknown }).loop).toEqual({ kind: 'deck', stepId: 's3', role: 'draft', dependsOn: ['s1'] });
-    expect((nodes[4].data as { loop: unknown }).loop).toEqual({ kind: 'deck', stepId: 's3', role: 'render' });
+    expect((nodes[4].data as { loop: unknown }).loop).toEqual({ kind: 'deck', stepId: 's3', role: 'draft', dependsOn: ['s1'] });
+    expect((nodes[5].data as { loop: unknown }).loop).toEqual({ kind: 'deck', stepId: 's3', role: 'render' });
+    expect((nodes[1].data as { loop: unknown }).loop).toEqual({ kind: 'meeting', stepId: 's1' });
+    expect((nodes[3].data as { loop: unknown }).loop).toEqual({ kind: 'agenda', stepId: 's2', role: 'write' });
   });
 
   it('chains in topological order — s3 depends only on s1, but still runs after s2', () => {
     expect(edges.map((e) => `${e.source}->${e.target}`)).toEqual([
-      'trigger->agent:s1', 'agent:s1->agent:s2', 'agent:s2->agent:s3', 'agent:s3->deck:s3',
+      'trigger->meeting:create:s1', 'meeting:create:s1->agent:s2', 'agent:s2->agenda:write:s2',
+      'agenda:write:s2->agent:s3', 'agent:s3->deck:s3',
     ]);
     expect(edges.every((e) => e.sourceHandle === 'out' && e.targetHandle === 'in')).toBe(true);
   });
@@ -307,13 +335,14 @@ describe('the answer the real CLI gives', () => {
     expect(plan.steps[1].dependsOn).toEqual(['s1']);
   });
 
-  it('turns that plan into two agent nodes the person can see', () => {
+  it('turns that plan into the nodes the person can see', () => {
     const def = buildAgentLoopDefinition({ source: 'planner', steps: [
       { id: 's1', title: 'Schedule meeting with X team', kind: 'meeting', prompt: 'a', dependsOn: [], done: 'd' },
       { id: 's2', title: 'Create PowerPoint presentation', kind: 'deck', prompt: 'b', dependsOn: ['s1'], done: 'e' },
     ] }, request());
-    // The deck step is a draft node and a render node.
-    expect((def.nodes as Array<{ id: string }>).map((n) => n.id)).toEqual(['trigger', 'agent:s1', 'agent:s2', 'deck:s2']);
+    // The meeting step is the node that creates the room; the deck step is a
+    // draft node and a render node.
+    expect((def.nodes as Array<{ id: string }>).map((n) => n.id)).toEqual(['trigger', 'meeting:create:s1', 'agent:s2', 'deck:s2']);
   });
 });
 
