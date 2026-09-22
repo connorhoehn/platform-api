@@ -34,7 +34,6 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,200}$/;
 export function safeFilename(title: string, revisionId: string, extension: string): string {
   const base = title
     .normalize('NFKD')
-    // eslint-disable-next-line no-control-regex
     .replace(/[^\x20-\x7E]/g, '')
     .replace(/[^A-Za-z0-9 _-]/g, ' ')
     .replace(/\s+/g, ' ')
