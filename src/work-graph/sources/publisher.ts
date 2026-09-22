@@ -112,7 +112,7 @@ export class PlatformWorkGraphSourcePublisher {
     identity: { organizationId: string; sourceSubject: string },
   ): Promise<WorkGraphProducerResult> {
     const mapped = await this.options.accounts.resolve(
-      'meeting', 'platform-api', identity.organizationId, identity.sourceSubject,
+      'meeting', workGraphAccountProducer('meeting'), identity.organizationId, identity.sourceSubject,
     );
     if (!mapped) return { published: false, reason: 'source-account-unmapped' };
     if (mapped.organizationId !== identity.organizationId) {

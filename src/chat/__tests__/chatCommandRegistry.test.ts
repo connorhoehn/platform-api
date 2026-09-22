@@ -297,6 +297,10 @@ describe('the work-graph plan on the async-planning re-entry', () => {
     expect(mockEnsurePrincipal).toHaveBeenCalledWith({
       source: 'pipeline', organizationId: 'dev-org', subject: 'dev-frank',
     });
+    // A run that books a room publishes on the meeting source too.
+    expect(mockEnsurePrincipal).toHaveBeenCalledWith({
+      source: 'meeting', organizationId: 'dev-org', subject: 'dev-frank',
+    });
   });
 
   it('joins the document source under the producer every document join lives under', async () => {

@@ -38,6 +38,16 @@ interface MeetingRecordBase {
   safeLabel?: string;
 }
 
+/**
+ * A room that exists and has not started — one an agent loop created, with the
+ * people it was made for and the time it was proposed for. Everything a card
+ * shows about it is read from the room's own record by the activity reader;
+ * this says only that it exists and what it is called.
+ */
+export interface MeetingScheduledSourceRecord extends MeetingRecordBase {
+  kind: 'scheduled';
+}
+
 export interface MeetingAttendanceSourceRecord extends MeetingRecordBase {
   kind: 'attendance';
   action: Extract<CallEventAction, 'joined' | 'ended'>;
@@ -85,11 +95,13 @@ export interface MeetingTranscriptSourceRecord extends MeetingRecordBase {
 }
 
 export type MeetingSourceRecord =
+  | MeetingScheduledSourceRecord
   | MeetingAttendanceSourceRecord
   | MeetingRecordingSourceRecord
   | MeetingTranscriptSourceRecord;
 
 export type MeetingLifecycle =
+  | 'meeting-scheduled'
   | 'attendance-started'
   | 'attendance-ended'
   | 'recording-started'
@@ -175,6 +187,8 @@ function hasIdentityContext(context: AuthenticatedMeetingContext): boolean {
 
 function lifecycleFor(record: MeetingSourceRecord): MeetingLifecycle | undefined {
   switch (record.kind) {
+    case 'scheduled':
+      return 'meeting-scheduled';
     case 'attendance':
       return record.action === 'joined' ? 'attendance-started' : 'attendance-ended';
     case 'recording':
@@ -194,7 +208,9 @@ function lifecycleFor(record: MeetingSourceRecord): MeetingLifecycle | undefined
 }
 
 function resourceIdFor(record: MeetingSourceRecord): string {
-  if (record.kind === 'attendance') return `meeting:${record.meetingId}`;
+  // A scheduled room and its later attendance are the SAME meeting, so they
+  // are addressed identically. A second address would be a second meeting.
+  if (record.kind === 'scheduled' || record.kind === 'attendance') return `meeting:${record.meetingId}`;
   if (record.kind === 'recording') return `recording:${record.recordingId}`;
   return `transcript:${record.transcriptId ?? record.recordingId}`;
 }
@@ -218,7 +234,8 @@ export function mapMeeting(
   if (!isNonEmptyString(record.meetingId)) return unsupported('missing-meeting-id');
   if (!isIsoTimestamp(record.occurredAt)) return unsupported('invalid-timestamp');
 
-  if (record.kind !== 'attendance' && !isNonEmptyString(record.recordingId)) {
+  const carriesRecording = record.kind === 'recording' || record.kind === 'transcript';
+  if (carriesRecording && !isNonEmptyString(record.recordingId)) {
     return unsupported('missing-recording-id');
   }
   if (record.kind === 'recording' && !isNonEmptyString(record.recordingOwnerId)) {
@@ -264,11 +281,11 @@ export function mapMeeting(
         kind: 'meeting',
         lifecycle,
         meetingId: record.meetingId,
-        ...(record.kind !== 'attendance' ? { recordingId: record.recordingId } : {}),
+        ...(carriesRecording ? { recordingId: record.recordingId } : {}),
         ...(record.kind === 'transcript'
           ? { transcriptId: record.transcriptId ?? `recording:${record.recordingId}` }
           : {}),
-        ...(record.kind !== 'attendance' && isNonEmptyString(record.recordingOwnerId)
+        ...(carriesRecording && isNonEmptyString(record.recordingOwnerId)
           ? { recordingOwnerId: record.recordingOwnerId }
           : {}),
         ...(isNonEmptyString(record.safeLabel) ? { safeLabel: record.safeLabel } : {}),

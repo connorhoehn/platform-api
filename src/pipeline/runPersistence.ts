@@ -234,6 +234,11 @@ export class RunPersistenceService {
         );
       });
       await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'completed', event.payload.at);
+      const completed = this.runCache.get(event.payload.runId);
+      if (completed) {
+        await this.publishScheduledMeeting(completed, event.payload.stepId)
+          .catch((err) => log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to project a scheduled room'));
+      }
     });
 
     this.eventBus.subscribe('pipeline:step:failed', async (event) => {
@@ -1047,6 +1052,35 @@ export class RunPersistenceService {
   }
 
   /**
+   * A room a step just created. The platform owns the meeting source, so it
+   * says the room exists before anybody has arrived; the gateway reports
+   * attendance against the same meeting id later, and both reach one node.
+   */
+  private async publishScheduledMeeting(state: RunState, stepId: string): Promise<void> {
+    if (!state.organizationId || state.triggeredBy === 'system') return;
+    const output = state.steps[stepId]?.output as { artifacts?: unknown } | undefined;
+    for (const artifact of Array.isArray(output?.artifacts) ? output.artifacts : []) {
+      const entry = artifact as { artifactId?: unknown; kind?: unknown; title?: unknown };
+      if (entry?.kind !== 'meeting' || typeof entry.artifactId !== 'string' || !entry.artifactId.trim()) continue;
+      const result = await platformWorkGraphSourcePublisher.meeting({
+        kind: 'scheduled',
+        meetingId: entry.artifactId,
+        // The room's own organization and the person it was booked for come
+        // from the run, which is the only authenticated thing here.
+        organizationId: state.organizationId,
+        participantSubject: state.triggeredBy,
+        occurredAt: state.steps[stepId]?.completedAt ?? state.lastEventAt,
+        ...(typeof entry.title === 'string' && entry.title.trim() ? { safeLabel: entry.title.trim() } : {}),
+      } as never, { organizationId: state.organizationId, sourceSubject: state.triggeredBy });
+      if (!result.published) {
+        log.warn({ runId: state.runId, stepId, meetingId: entry.artifactId, reason: result.reason }, 'scheduled room was not projected');
+        continue;
+      }
+      log.info({ meetingId: entry.artifactId, scheduledByRunId: state.runId }, 'meeting lifecycle enqueued');
+    }
+  }
+
+  /**
    * The revision a deck step just wrote. Its provenance is the run that wrote
    * it — declared by the run, never inferred from who was busy at the time —
    * which is what draws the deck under the loop that made it.
@@ -1429,10 +1463,22 @@ export class RunPersistenceService {
    * `{ kind: 'document', documentId }` convention every command already uses.
    * Nothing is inferred from the run's context or from a neighbouring step.
    */
-  private producesFor(state: RunState, stepId: string): Array<{ source: 'document'; resourceId: string }> {
-    const output = state.steps[stepId]?.output as { result?: unknown } | undefined;
+  private producesFor(state: RunState, stepId: string): Array<{ source: 'document' | 'meeting'; resourceId: string }> {
+    const output = state.steps[stepId]?.output as { result?: unknown; artifacts?: unknown } | undefined;
+    const produced = new Map<string, { source: 'document' | 'meeting'; resourceId: string }>();
     const result = parseRunResult(output?.result);
-    return result?.kind === 'document' ? [{ source: 'document', resourceId: result.documentId }] : [];
+    if (result?.kind === 'document') produced.set(`document:${result.documentId}`, { source: 'document', resourceId: result.documentId });
+    // `artifacts[]` is the step's own declaration of what it made. A room is a
+    // meeting, not a document, and is addressed the way the meeting source
+    // addresses one so both reach the same node.
+    for (const artifact of Array.isArray(output?.artifacts) ? output.artifacts : []) {
+      const entry = artifact as { artifactId?: unknown; kind?: unknown };
+      if (typeof entry?.artifactId !== 'string' || !entry.artifactId.trim()) continue;
+      const source = entry.kind === 'meeting' ? 'meeting' as const : 'document' as const;
+      const resourceId = source === 'meeting' ? `meeting:${entry.artifactId}` : entry.artifactId;
+      produced.set(`${source}:${resourceId}`, { source, resourceId });
+    }
+    return [...produced.values()];
   }
 
   /**

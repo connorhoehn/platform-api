@@ -230,3 +230,40 @@ describe('mapMeeting', () => {
     });
   });
 });
+
+describe('a room an agent loop created', () => {
+  it('is scheduled, and addressed exactly as its attendance will be', () => {
+    const scheduled = mapMeeting({
+      kind: 'scheduled',
+      meetingId: 'room-1',
+      organizationId: context.actor.organizationId,
+      participantSubject: context.actor.sourceSubject,
+      occurredAt: '2026-09-22T05:00:00.000Z',
+      safeLabel: 'Platform team sync',
+    } as never, context);
+    expect(scheduled.supported).toBe(true);
+    if (!scheduled.supported) throw new Error(scheduled.reason);
+    expect(scheduled.event.payload).toMatchObject({
+      kind: 'meeting', lifecycle: 'meeting-scheduled', meetingId: 'room-1', safeLabel: 'Platform team sync',
+    });
+    // The same address attendance uses: a second one would be a second room.
+    expect(scheduled.event.resource.resourceId).toBe('meeting:room-1');
+    expect(scheduled.event.payload.recordingId).toBeUndefined();
+  });
+
+  it('needs no recording to exist, because it has not happened yet', () => {
+    const result = mapMeeting({
+      kind: 'scheduled', meetingId: 'room-1', occurredAt: '2026-09-22T05:00:00.000Z',
+      organizationId: context.actor.organizationId, participantSubject: context.actor.sourceSubject,
+    } as never, context);
+    expect(result.supported).toBe(true);
+  });
+
+  it('still refuses a room with no id', () => {
+    expect(mapMeeting({
+      kind: 'scheduled', meetingId: '', occurredAt: '2026-09-22T05:00:00.000Z',
+      organizationId: context.actor.organizationId, participantSubject: context.actor.sourceSubject,
+    } as never, context))
+      .toMatchObject({ supported: false, reason: 'missing-meeting-id' });
+  });
+});

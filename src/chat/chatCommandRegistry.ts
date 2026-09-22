@@ -273,6 +273,10 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
         source: 'document', producerServiceId: 'websocket-gateway',
         organizationId: input.organizationId, subject: input.requestedBy,
       }),
+      // And a run that books a room publishes on the MEETING source.
+      workSourceAccountRepo.ensureVerifiedPrincipal({
+        source: 'meeting', organizationId: input.organizationId, subject: input.requestedBy,
+      }),
     ]);
   } else {
     log.warn({ trigger, userId: input.requestedBy }, 'chat command run has no organization; it will not reach the work graph');

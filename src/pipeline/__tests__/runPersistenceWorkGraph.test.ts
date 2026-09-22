@@ -13,6 +13,7 @@ jest.mock('../../work-graph/sources/platformPublisher', () => ({
   platformWorkGraphSourcePublisher: {
     pipeline: jest.fn(async () => ({ published: true })),
     document: jest.fn(async () => ({ published: true })),
+    meeting: jest.fn(async () => ({ published: true })),
   },
 }));
 
@@ -21,7 +22,7 @@ import { RunPersistenceService } from '../runPersistence';
 import type { PipelineRunRepository } from '../../repositories/PipelineRunRepository';
 
 const publisher = (jest.requireMock('../../work-graph/sources/platformPublisher') as {
-  platformWorkGraphSourcePublisher: { pipeline: jest.Mock; document: jest.Mock };
+  platformWorkGraphSourcePublisher: { pipeline: jest.Mock; document: jest.Mock; meeting: jest.Mock };
 }).platformWorkGraphSourcePublisher;
 
 type Handler = (event: { payload: Record<string, unknown> }) => Promise<void>;
@@ -386,5 +387,84 @@ describe('live telemetry is not a previous execution of the step', () => {
       .map((call) => (call as unknown[])[0] as { stepsSummary?: Record<string, unknown> });
     const steps = written[written.length - 1]?.stepsSummary ?? {};
     expect(Object.keys(steps).sort()).toEqual(['fan:out', 'fan:out:2']);
+  });
+});
+
+describe('a room a step booked', () => {
+  beforeEach(() => {
+    publisher.pipeline.mockClear();
+    publisher.meeting.mockClear();
+    mockPresentation.mockResolvedValue({ documentId: 'deck-1' });
+  });
+
+  async function startedRun() {
+    const { service, emit } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'chat-agent-loop', userId: 'dev-frank',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan,
+    });
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: {} },
+    });
+    publisher.pipeline.mockClear();
+    return { emit };
+  }
+
+  const meetingStep = (emit: (n: string, p: Record<string, unknown>) => Promise<void>) =>
+    emit('pipeline:step:completed', {
+      runId: RUN, stepId: 'agent:s1', durationMs: 10, at: AT,
+      output: {
+        meetingId: 'room-1',
+        artifacts: [{ artifactId: 'room-1', kind: 'meeting', title: 'Platform team sync' }],
+        result: { kind: 'room', roomId: 'room-1' },
+      },
+    });
+
+  it('exists as a scheduled room before anybody has arrived', async () => {
+    const { emit } = await startedRun();
+    await meetingStep(emit);
+    expect(publisher.meeting).toHaveBeenCalledTimes(1);
+    expect(publisher.meeting.mock.calls[0][0]).toMatchObject({
+      kind: 'scheduled', meetingId: 'room-1', safeLabel: 'Platform team sync',
+      organizationId: 'dev-org', participantSubject: 'dev-frank',
+    });
+  });
+
+  it('is declared as the step\'s own output, so the run reaches it', async () => {
+    const { emit } = await startedRun();
+    await meetingStep(emit);
+    const step = publisher.pipeline.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((record) => record.kind === 'pipeline-step');
+    expect(step?.producesRefs).toEqual([{ source: 'meeting', resourceId: 'meeting:room-1' }]);
+  });
+
+  it('books nothing for a step that made no room', async () => {
+    const { emit } = await startedRun();
+    await emit('pipeline:step:completed', {
+      runId: RUN, stepId: 'agent:s1', durationMs: 10, at: AT, output: { text: 'no room here' },
+    });
+    expect(publisher.meeting).not.toHaveBeenCalled();
+  });
+
+  it('declares a deck and a room from one step without confusing them', async () => {
+    const { emit } = await startedRun();
+    await emit('pipeline:step:completed', {
+      runId: RUN, stepId: 'agent:s1', durationMs: 10, at: AT,
+      output: {
+        artifacts: [
+          { artifactId: 'room-1', kind: 'meeting', title: 'Platform team sync' },
+          { artifactId: 'deck-1', kind: 'presentation', title: 'Sprint review' },
+        ],
+      },
+    });
+    const step = publisher.pipeline.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((record) => record.kind === 'pipeline-step');
+    expect(step?.producesRefs).toEqual([
+      { source: 'meeting', resourceId: 'meeting:room-1' },
+      { source: 'document', resourceId: 'deck-1' },
+    ]);
   });
 });
