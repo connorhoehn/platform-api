@@ -269,7 +269,16 @@ export function createAgentLoopsRouter(deps: AgentLoopsDeps = defaultDeps): Rout
     const secret = devboxSecret();
     if (!base || !secret) throw new AppError(503, `${DEVBOX_UNAVAILABLE}: AGENTCORE_DEVBOX_URL is not configured`);
 
-    const body: Record<string, unknown> = { principal: { service: 'platform-api', requestedBy: req.user!.sub } };
+    // WHAT IS SIGNED HERE IS THE boxId, NOT A PRINCIPAL ENVELOPE.
+    //
+    // The envelope binds the signature to the request payload, and a GET has
+    // no body — so the middleware's internal router verifies the tail against
+    // `{ boxId }` (aws-agentcore middleware/src/routes/internal-devbox.ts:
+    // "No request body on a GET, so the signed payload is the boxId itself").
+    // Signing a principal object here instead produced a valid signature over
+    // the wrong payload and the tail answered 401 for every run. The POST and
+    // DELETE calls, which do carry a body, keep signing that body.
+    const body: Record<string, unknown> = { boxId };
     const url = `${base.replace(/\/+$/, '')}${DEVBOX_BASE_PATH}/boxes/${encodeURIComponent(boxId)}/tail`;
     const upstream = await deps.fetchImpl(url, {
       method: 'GET',

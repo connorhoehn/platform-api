@@ -20,7 +20,8 @@
 // one that decides what a person is charged 200k tokens for has to be this
 // one. `extra` is consulted only where the text said nothing.
 
-import type { AgentClient } from '../pipeline/agent/types';
+import type { AgentClient, AgentStopReason } from '../pipeline/agent/types';
+import log from '../lib/logger';
 
 export const CHAT_AGENT_LOOP_PIPELINE_ID = 'chat-agent-loop';
 
@@ -49,7 +50,28 @@ export const LOOP_STEP_RETRY = { maxAttempts: 2, backoffMs: 5_000, backoffMultip
 
 /** The planner is a small model on a short leash: it writes JSON, nothing else. */
 export const PLANNER_MODEL = 'haiku';
-export const PLANNER_TIMEOUT_MS = 30_000;
+/**
+ * MEASURED, NOT GUESSED. This was 30s, and half the live runs fell back.
+ * Timed in the deployed pod against the real prompt, three consecutive runs:
+ * 23.7s, 21.6s, 22.0s wall clock — the `claude -p --output-format stream-json`
+ * start-up dominates, not the model (the same prompt answers in ~2s once the
+ * CLI is warm). A 30s cap against a 22s median is a coin flip, and losing it
+ * killed the child mid-answer and produced an EMPTY result, which read as
+ * "the planner said nothing" rather than "the planner ran out of time".
+ *
+ * 90s is the cap that makes the common case work while still bounding the
+ * command: a person waits for one chat message, not forever.
+ */
+export const PLANNER_TIMEOUT_MS = 90_000;
+/**
+ * Not 1. The CLI emits one `assistant` event per content block, and a
+ * thinking block and its text usually share a message id — but not always.
+ * When they split, `maxTurns: 1` killed the process at the second id and
+ * yielded empty text. The planner is TOOLLESS, so it cannot loop and turns
+ * are only message boundaries; a small ceiling costs nothing and removes a
+ * failure that depended on how the model happened to chunk its answer.
+ */
+export const PLANNER_MAX_TURNS = 4;
 
 export const LOOP_STEP_KINDS = ['meeting', 'agenda', 'research', 'document', 'deck', 'code', 'review', 'other'] as const;
 export type LoopStepKind = (typeof LOOP_STEP_KINDS)[number];
@@ -294,18 +316,51 @@ export function fallbackPlan(request: AgentLoopRequest, notice: string): LoopPla
   };
 }
 
-/** Collect a toolless agent call's final text. */
-async function runPlanner(agentClient: AgentClient, prompt: string): Promise<string> {
-  let text = '';
+/** What one toolless planner call produced, and HOW it stopped. */
+interface PlannerOutcome {
+  text: string;
+  stopReason: AgentStopReason | 'no_result';
+}
+
+/**
+ * Collect a toolless agent call's final text AND its stop reason.
+ *
+ * The stop reason is not optional bookkeeping. A bounded agent client that
+ * hits its timeout or turn ceiling kills the child and still yields a `done`
+ * event — with empty text, because the answer never finished. Reading only
+ * `ev.text` turns every one of those into "the planner answered with
+ * nothing", which is both wrong and unactionable: it was the planner running
+ * out of time, and the fix is a bigger cap, not a better model.
+ */
+async function runPlanner(agentClient: AgentClient, prompt: string): Promise<PlannerOutcome> {
+  let outcome: PlannerOutcome = { text: '', stopReason: 'no_result' };
   for await (const ev of agentClient.run(prompt, {
     model: PLANNER_MODEL,
     allowedTools: [],
-    maxTurns: 1,
+    maxTurns: PLANNER_MAX_TURNS,
     timeoutMs: PLANNER_TIMEOUT_MS,
   })) {
-    if (ev.type === 'done') text = ev.text;
+    if (ev.type === 'done') outcome = { text: ev.text ?? '', stopReason: ev.stopReason };
   }
-  return text;
+  return outcome;
+}
+
+/** The sentence a person reads on the card when the planner did not deliver. */
+export function plannerStopNotice(stopReason: PlannerOutcome['stopReason']): string {
+  switch (stopReason) {
+    case 'timeout':
+      return `Planner timed out after ${Math.round(PLANNER_TIMEOUT_MS / 1000)}s · single step`;
+    case 'max_turns':
+      return 'Planner stopped at its turn ceiling before answering · single step';
+    case 'cancelled':
+      return 'Planner was cancelled · single step';
+    case 'error':
+      return 'Planner reported an error · single step';
+    case 'no_result':
+      return 'Planner exited without answering · single step';
+    default:
+      return 'Planner answered with nothing · single step';
+  }
 }
 
 /**
@@ -315,16 +370,30 @@ async function runPlanner(agentClient: AgentClient, prompt: string): Promise<str
  */
 export async function planAgentLoop(request: AgentLoopRequest, agentClient: AgentClient | null | undefined): Promise<LoopPlan> {
   if (!agentClient) return fallbackPlan(request, 'Planner unavailable · single step');
-  let text: string;
+  let outcome: PlannerOutcome;
+  const startedAt = Date.now();
   try {
-    text = await runPlanner(agentClient, plannerPrompt(request));
+    outcome = await runPlanner(agentClient, plannerPrompt(request));
   } catch (err) {
-    return fallbackPlan(request, `Planner unavailable (${err instanceof Error ? err.message : String(err)}) · single step`);
+    const reason = err instanceof Error ? err.message : String(err);
+    log.warn({ durationMs: Date.now() - startedAt, err: reason }, 'agent loop planner threw');
+    return fallbackPlan(request, `Planner unavailable (${reason}) · single step`);
   }
-  if (!text.trim()) return fallbackPlan(request, 'Planner answered with nothing · single step');
+  const durationMs = Date.now() - startedAt;
 
-  const validated = validateLoopPlan(extractJsonObject(text));
-  if (!validated.ok) return fallbackPlan(request, `Planner plan rejected: ${validated.reason} · single step`);
+  // A bounded stop is a REASON, not an empty answer. Say which one.
+  if (!outcome.text.trim()) {
+    const notice = plannerStopNotice(outcome.stopReason);
+    log.warn({ durationMs, stopReason: outcome.stopReason }, 'agent loop planner produced no text');
+    return fallbackPlan(request, notice);
+  }
+
+  const validated = validateLoopPlan(extractJsonObject(outcome.text));
+  if (!validated.ok) {
+    log.warn({ durationMs, stopReason: outcome.stopReason, reason: validated.reason }, 'agent loop planner plan rejected');
+    return fallbackPlan(request, `Planner plan rejected: ${validated.reason} · single step`);
+  }
+  log.info({ durationMs, steps: validated.steps.length }, 'agent loop planned');
   return { steps: validated.steps, source: 'planner' };
 }
 

@@ -4,21 +4,25 @@ import {
   CHAT_AGENT_LOOP_PIPELINE_ID, DEFAULT_CONTEXT_BUDGET_TOKENS, LOOP_STEP_MAX_TURNS, LOOP_STEP_TIMEOUT_MS,
   MAX_CONTEXT_BUDGET_TOKENS, MIN_CONTEXT_BUDGET_TOKENS,
   agentLoopNodeId, buildAgentLoopDefinition, buildAgentLoopRequest, extractJsonObject,
-  fallbackPlan, parseAgentLoopCommand, planAgentLoop, plannerPrompt, validateLoopPlan,
+  PLANNER_MAX_TURNS, PLANNER_TIMEOUT_MS,
+  fallbackPlan, parseAgentLoopCommand, planAgentLoop, plannerPrompt, plannerStopNotice, validateLoopPlan,
   type AgentLoopRequest, type LoopPlan, type LoopStep,
 } from '../agentLoopPlanner';
-import type { AgentClient, AgentEvent } from '../../pipeline/agent/types';
+import type { AgentClient, AgentEvent, AgentStopReason } from '../../pipeline/agent/types';
 
 /** A planner that says exactly what the test tells it to. */
-function scriptedPlanner(text: string | Error): AgentClient {
+function scriptedPlanner(text: string | Error, stopReason: AgentStopReason = 'complete'): AgentClient {
   return {
     provider: 'test',
     async *run(): AsyncIterable<AgentEvent> {
       if (text instanceof Error) throw text;
-      yield { type: 'done', text, turns: 1, tokensIn: 0, tokensOut: 0, model: 'haiku', stopReason: 'complete', toolCalls: [] };
+      yield { type: 'done', text, turns: 1, tokensIn: 0, tokensOut: 0, model: 'haiku', stopReason, toolCalls: [] };
     },
   };
 }
+
+/** A planner that yields nothing at all — the process died before `done`. */
+const silentPlanner: AgentClient = { provider: 'test', async *run(): AsyncIterable<AgentEvent> { /* no events */ } };
 
 const request = (over: Partial<AgentLoopRequest> = {}): AgentLoopRequest => ({
   instruction: 'create a meeting with the X team',
@@ -214,5 +218,90 @@ describe('buildAgentLoopRequest', () => {
   it('carries who asked and where, and omits what was not given', () => {
     const out = buildAgentLoopRequest(parseAgentLoopCommand('/deck do it 40k'), { chatChannel: 'room:y', requestedBy: 'u1' });
     expect(out).toEqual({ instruction: 'do it', hints: ['deck'], contextBudgetTokens: 40_000, model: 'sonnet', chatChannel: 'room:y', requestedBy: 'u1' });
+  });
+});
+
+
+describe('the planner\'s bounds, which live runs actually hit', () => {
+  it('asks for more than one turn and more than 30s', async () => {
+    // Measured in the deployed pod: the real prompt takes 21-24s wall clock,
+    // dominated by CLI start-up. A 30s cap lost that race about half the time.
+    expect(PLANNER_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    // maxTurns 1 killed the process when a thinking block and its text landed
+    // under different message ids. Toolless means it cannot loop anyway.
+    expect(PLANNER_MAX_TURNS).toBeGreaterThan(1);
+  });
+
+  it('passes those bounds to the client, toolless and on haiku', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const spy: AgentClient = {
+      provider: 'test',
+      async *run(_p: string, opts): AsyncIterable<AgentEvent> {
+        seen.push(opts as unknown as Record<string, unknown>);
+        yield { type: 'done', text: '{"steps":[]}', turns: 1, tokensIn: 0, tokensOut: 0, model: 'haiku', stopReason: 'complete', toolCalls: [] };
+      },
+    };
+    await planAgentLoop(request(), spy);
+    expect(seen[0]).toMatchObject({ model: 'haiku', allowedTools: [], maxTurns: PLANNER_MAX_TURNS, timeoutMs: PLANNER_TIMEOUT_MS });
+  });
+});
+
+describe('a planner that stops without answering', () => {
+  // The defect this replaces: every bounded stop read as "answered with
+  // nothing", so a timeout looked like a model that had no opinion.
+  it.each([
+    ['timeout', /timed out after \d+s/],
+    ['max_turns', /turn ceiling/],
+    ['cancelled', /cancelled/],
+    ['error', /reported an error/],
+  ])('names %s in the notice instead of "answered with nothing"', async (stopReason, expected) => {
+    const plan = await planAgentLoop(request(), scriptedPlanner('', stopReason as AgentStopReason));
+    expect(plan.source).toBe('fallback');
+    expect(plan.notice).toMatch(expected);
+    expect(plan.notice).not.toMatch(/answered with nothing/);
+  });
+
+  it('says the planner exited without answering when no done event arrives at all', async () => {
+    const plan = await planAgentLoop(request(), silentPlanner);
+    expect(plan.notice).toMatch(/exited without answering/);
+  });
+
+  it('still says "answered with nothing" only when it genuinely completed empty', async () => {
+    expect((await planAgentLoop(request(), scriptedPlanner('   ', 'complete'))).notice).toMatch(/answered with nothing/);
+    expect(plannerStopNotice('complete')).toMatch(/answered with nothing/);
+  });
+});
+
+describe('the answer the real CLI gives', () => {
+  // Captured from `claude -p --output-format stream-json --tools "" --model
+  // haiku` in the deployed pod: the JSON arrives inside a ```json fence even
+  // though the prompt says not to fence it.
+  const FENCED = [
+    '```json',
+    '{',
+    '  "steps": [',
+    '    {"id": "s1", "title": "Schedule meeting with X team", "kind": "meeting", "prompt": "Schedule a meeting with the X team", "dependsOn": [], "done": "Meeting is scheduled with X team and calendar invites sent"},',
+    '    {"id": "s2", "title": "Create PowerPoint presentation", "kind": "deck", "prompt": "Build the deck", "dependsOn": ["s1"], "done": "deck.pptx exists in the workspace"}',
+    '  ]',
+    '}',
+    '```',
+  ].join('\n');
+
+  it('parses through the fence into a real two-step plan', async () => {
+    const plan = await planAgentLoop(request(), scriptedPlanner(FENCED));
+    expect(plan.source).toBe('planner');
+    expect(plan.steps.map((s) => [s.id, s.kind, s.title])).toEqual([
+      ['s1', 'meeting', 'Schedule meeting with X team'],
+      ['s2', 'deck', 'Create PowerPoint presentation'],
+    ]);
+    expect(plan.steps[1].dependsOn).toEqual(['s1']);
+  });
+
+  it('turns that plan into two agent nodes the person can see', () => {
+    const def = buildAgentLoopDefinition({ source: 'planner', steps: [
+      { id: 's1', title: 'Schedule meeting with X team', kind: 'meeting', prompt: 'a', dependsOn: [], done: 'd' },
+      { id: 's2', title: 'Create PowerPoint presentation', kind: 'deck', prompt: 'b', dependsOn: ['s1'], done: 'e' },
+    ] }, request());
+    expect((def.nodes as Array<{ id: string }>).map((n) => n.id)).toEqual(['trigger', 'agent:s1', 'agent:s2']);
   });
 });

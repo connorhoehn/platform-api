@@ -9,11 +9,16 @@ jest.mock('../../lib/logger', () => {
 
 import { createAgentLoopsRouter, isMidTask, viewOf, type AgentLoopsDeps, type LoadedAgentLoop } from '../agentLoops';
 import { errorHandler } from '../../middleware/error-handler';
+import { SERVICE_AUTH_HEADER, signEnvelope } from '@connorhoehn/service-runtime';
 
 interface MockRes {
   statusCode: number; body: unknown; ended: boolean; finished: Promise<void>;
   status(code: number): MockRes; json(body: unknown): MockRes; send(body?: unknown): MockRes;
   setHeader(_n: string, _v: unknown): MockRes; getHeader(_n: string): unknown; end(...args: unknown[]): MockRes;
+  // Express re-parents a response onto its own prototype, so the SSE route's
+  // flushHeaders/write would reach the real implementations and their socket
+  // internals. Own properties shadow them.
+  flushHeaders(): MockRes; write(chunk: unknown): boolean;
 }
 function mockRes(): MockRes {
   let resolve!: () => void;
@@ -24,6 +29,7 @@ function mockRes(): MockRes {
     json(body) { this.body = body; this.ended = true; resolve(); return this; },
     send(body) { this.body = body; this.ended = true; resolve(); return this; },
     setHeader() { return this; }, getHeader() { return undefined; },
+    flushHeaders() { return this; }, write() { return true; },
     end() { this.ended = true; resolve(); return this; },
   };
 }
@@ -230,5 +236,44 @@ describe('isMidTask', () => {
     expect(isMidTask(loadedRun({ steps: { a: { status: 'running' } } }))).toBe(true);
     expect(isMidTask(loadedRun({ steps: { a: { status: 'completed' }, b: { status: 'pending' } } }))).toBe(false);
     expect(isMidTask(loadedRun({ steps: {} }))).toBe(false);
+  });
+});
+
+
+describe('GET /api/agent-loops/:runId/tail', () => {
+  const SECRET = 'tail-secret';
+  let fetchImpl: jest.Mock;
+
+  beforeEach(() => {
+    process.env.AGENTCORE_DEVBOX_URL = 'http://middleware.test:14030';
+    process.env.WORK_GRAPH_SERVICE_AUTH_SECRET = SECRET;
+    fetchImpl = jest.fn().mockResolvedValue({ ok: true, status: 200, body: { getReader: () => ({ read: async () => ({ done: true }), cancel: async () => undefined }) } });
+    deps = { ...deps, fetchImpl: fetchImpl as unknown as AgentLoopsDeps['fetchImpl'] };
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTCORE_DEVBOX_URL;
+    delete process.env.WORK_GRAPH_SERVICE_AUTH_SECRET;
+  });
+
+  // The envelope binds the signature to the payload, and a GET has no body,
+  // so the middleware verifies the tail against `{ boxId }`. Signing anything
+  // else is a valid signature over the wrong thing: a 401 on every run.
+  it('signs the boxId itself, not a principal envelope', async () => {
+    await call(buildApp(), 'get', '/api/agent-loops/run-1/tail', 'dev-frank');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0] as [string, { headers: Record<string, string> }];
+    expect(url).toBe('http://middleware.test:14030/internal/devbox/boxes/box-1/tail');
+    expect(init.headers[SERVICE_AUTH_HEADER]).toBe(signEnvelope({ boxId: 'box-1' }, { secret: SECRET, serviceId: 'platform-api' }));
+  });
+
+  it('says devbox runtime unavailable when the middleware has no tail for the box', async () => {
+    fetchImpl.mockResolvedValue({ ok: false, status: 404, body: null });
+    expect((await call(buildApp(), 'get', '/api/agent-loops/run-1/tail', 'dev-frank')).statusCode).toBe(503);
+  });
+
+  it('409s before a session exists, rather than tailing nothing', async () => {
+    run = loadedRun({ context: { ...loadedRun().context, lab: undefined } });
+    expect((await call(buildApp(), 'get', '/api/agent-loops/run-1/tail', 'dev-frank')).statusCode).toBe(409);
   });
 });
