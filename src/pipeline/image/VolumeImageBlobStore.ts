@@ -73,6 +73,16 @@ export class VolumeImageBlobStore implements ImageBlobStore, AssetBlobStore {
     this.dir = dir ?? (process.env['IMAGE_BLOB_DIR'] || DEFAULT_BLOB_DIR);
   }
 
+  /**
+   * Where this store actually writes. Exposed because "the bytes are not where
+   * the operator mounted the volume" is otherwise invisible: a process without
+   * IMAGE_BLOB_DIR silently uses the default path, and the row it writes looks
+   * identical either way.
+   */
+  get directory(): string {
+    return this.dir;
+  }
+
   /** Create the directory if it doesn't exist (idempotent). */
   private async ensureDir(): Promise<void> {
     if (this.ensured) return;
@@ -149,7 +159,6 @@ export class VolumeImageBlobStore implements ImageBlobStore, AssetBlobStore {
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      // eslint-disable-next-line no-console
       console.warn(
         '[VolumeImageBlobStore] getBlob failed; returning null',
         { key, dir: this.dir, err: err instanceof Error ? err.message : String(err) },

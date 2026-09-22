@@ -180,15 +180,23 @@ documentRevisionsRouter.get('/:revisionId/file', requireAuth, asyncHandler(async
  * its own: no sniffing, no framing, nothing cached anywhere shared.
  */
 documentRevisionsRouter.get('/:revisionId/slides/:slideId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const documentId = String(req.params.documentId ?? '');
   const slideId = String(req.params.slideId ?? '').replace(/\.svg$/i, '');
-  const { revision } = await loadRevision(String(req.params.documentId ?? ''), String(req.params.revisionId ?? ''));
+  const { revision } = await loadRevision(documentId, String(req.params.revisionId ?? ''));
   const slide = revision.slides.find((candidate) => candidate.id === slideId);
   if (!slide) throw new NotFoundError('Slide not found');
-  const stored = await getAssetBlobStore().getBlob(slide.asset.key);
+  // The row's own markup first, the blob second — a row outlives the volume it
+  // points at, and a preview that 404s after a pod replacement is the defect
+  // this order exists to prevent.
+  const store = getPresentationDocumentStore();
+  const stored = store.slidePreview
+    ? await store.slidePreview(documentId, revision.id, slideId)
+    : await getAssetBlobStore().getBlob(slide.asset.key)
+      .then((blob) => (blob ? { contentType: blob.asset.contentType, body: blob.body } : null));
   if (!stored) throw new NotFoundError('Slide preview not found');
   res
     .status(200)
-    .setHeader('content-type', slide.asset.contentType || SVG_CONTENT_TYPE)
+    .setHeader('content-type', stored.contentType || slide.asset.contentType || SVG_CONTENT_TYPE)
     .setHeader('content-length', String(stored.body.byteLength))
     .setHeader('cache-control', 'private, no-store')
     .setHeader('x-content-type-options', 'nosniff')

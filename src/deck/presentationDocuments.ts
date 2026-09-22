@@ -27,6 +27,7 @@ import { tableName } from '../lib/ddb-table-name';
 import type { AssetBlobStore, BlobAsset } from '../pipeline/image/ImageBlobStore';
 import { deckSources, type DeckSpec } from './DeckSpec';
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
+import log from '../lib/logger';
 import { PPTX_CONTENT_TYPE } from './renderPptx';
 import { SVG_CONTENT_TYPE } from './renderSlideSvg';
 
@@ -41,6 +42,16 @@ export interface StoredSlide {
   /** `<documentId>.<revisionId>.<slideId>` — what a preview route is handed. */
   previewHandle: string;
   asset: BlobAsset;
+  /**
+   * The slide's own markup, kept on the row beside the blob copy.
+   *
+   * A slide SVG is 1–2 KB, and a row outlives the blob volume: a pod
+   * replacement took the volume with it and left rows naming files that no
+   * longer existed, so every per-slide preview 404'd while the inlined cover
+   * kept working. The row is the durable copy; the blob is still written, and
+   * is what serves a revision whose inline markup was refused for size.
+   */
+  svg?: string;
 }
 
 /** What a revision stands on, as the deck itself declared it. */
@@ -120,10 +131,49 @@ export interface AppendRevisionResult {
   revision: StoredRevision;
 }
 
+/** One slide's bytes, whatever they had to be read from. */
+export interface SlidePreview {
+  contentType: string;
+  body: Buffer;
+  /** Where the bytes came from — the row, or the blob store the row points at. */
+  from: 'inline' | 'blob';
+}
+
 /** The document half of the store, so a test can hand the handler a fake. */
 export interface PresentationDocumentStore {
   get(documentId: string): Promise<PresentationDocumentRow | null>;
   appendRevision(input: AppendRevisionInput): Promise<AppendRevisionResult>;
+  /**
+   * One slide's bytes: the row's own markup first, the blob store second.
+   * Optional so a fake store can stay two methods; a caller that finds it
+   * absent reads the blob the slide record names, which is what this does.
+   */
+  slidePreview?(documentId: string, revisionId: string, slideId: string): Promise<SlidePreview | null>;
+}
+
+/**
+ * How much inline slide markup one document row may hold.
+ *
+ * A DDB item is capped at 400 KB and the row carries more than slides — the
+ * spec, the revision records, the cover preview. 300 KB of markup leaves room
+ * for those and still holds well over a hundred slides at 1–2 KB each.
+ */
+export const MAX_INLINE_SLIDE_BYTES = 300 * 1024;
+
+/** The inline markup a row already holds, across every revision. */
+export function inlineSlideBytes(row: PresentationDocumentRow | null): number {
+  if (!row) return 0;
+  let total = 0;
+  const counted = new Set<StoredSlide>();
+  for (const slide of [
+    ...(row.revisions ?? []).flatMap((revision) => revision.slides ?? []),
+    ...Object.values(row.revisionSlides ?? {}).flat(),
+  ]) {
+    if (!slide?.svg || counted.has(slide)) continue;
+    counted.add(slide);
+    total += Buffer.byteLength(slide.svg, 'utf8');
+  }
+  return total;
 }
 
 const HANDLE_SEPARATOR = '.';
@@ -180,6 +230,15 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     this.docClient = opts.docClient ?? defaultDocClient;
     this.blobStore = opts.blobStore ?? getAssetBlobStore();
     this.now = opts.now ?? (() => new Date());
+    // Which store a deck's bytes land in, said out loud once. A process that
+    // renders a deck without IMAGE_BLOB_DIR set writes somewhere the operator
+    // never mounted, and the row it produces looks exactly the same.
+    log.info({
+      store: this.blobStore.constructor?.name ?? 'unknown',
+      directory: (this.blobStore as { directory?: string }).directory ?? null,
+      imageBlobStore: process.env.IMAGE_BLOB_STORE ?? null,
+      imageBlobDir: process.env.IMAGE_BLOB_DIR ?? null,
+    }, 'presentation blobs will be written here');
   }
 
   async get(documentId: string): Promise<PresentationDocumentRow | null> {
@@ -217,7 +276,18 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
         title: slide.title,
         previewHandle: deckPreviewHandle(input.documentId, revisionId, slide.id),
         asset,
+        svg: slide.svg,
       });
+    }
+
+    // The row is the durable copy, and a DDB item has a ceiling. Over it, the
+    // revision is refused rather than written with its slides silently on the
+    // blob store alone — which is the failure this inlining exists to end.
+    const inlineBytes = inlineSlideBytes(existing) + slides.reduce((total, slide) => total + Buffer.byteLength(slide.svg ?? '', 'utf8'), 0);
+    if (inlineBytes > MAX_INLINE_SLIDE_BYTES) {
+      throw new Error(
+        `presentation '${input.documentId}' would hold ${inlineBytes}B of inline slide markup, over the ${MAX_INLINE_SLIDE_BYTES}B a document row may carry — render fewer slides, or keep fewer revisions`,
+      );
     }
 
     const revision: StoredRevision = {
@@ -285,6 +355,33 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       },
     }));
     return { documentId: input.documentId, revision };
+  }
+
+  /**
+   * One slide's bytes: the row's own markup first, the blob the record names
+   * second. The row is what survives a volume that does not, so it is read
+   * first; the blob still answers for a revision written before inlining, or
+   * one whose markup was too big to keep on the row.
+   */
+  async slidePreview(documentId: string, revisionId: string, slideId: string): Promise<SlidePreview | null> {
+    const row = await this.get(documentId).catch(() => null);
+    if (!row) return null;
+    const recorded = [
+      ...(row.revisions?.find((revision) => revision.id === revisionId)?.slides ?? []),
+      ...(row.revisionSlides?.[revisionId] ?? []),
+    ];
+    const slide = recorded.find((entry) => entry?.id === slideId);
+    if (!slide) return null;
+    if (slide.svg) {
+      return { contentType: slide.asset?.contentType || SVG_CONTENT_TYPE, body: Buffer.from(slide.svg, 'utf8'), from: 'inline' };
+    }
+    if (!slide.asset?.key) return null;
+    const blob = await this.blobStore.getBlob(slide.asset.key).catch(() => null);
+    if (!blob) {
+      log.warn({ documentId, revisionId, slideId, key: slide.asset.key }, 'a revision names slide bytes that are neither on the row nor in the blob store');
+      return null;
+    }
+    return { contentType: blob.asset.contentType || slide.asset.contentType, body: blob.body, from: 'blob' };
   }
 }
 

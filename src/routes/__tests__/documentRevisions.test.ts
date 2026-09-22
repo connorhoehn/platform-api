@@ -27,6 +27,7 @@ jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `tes
 // Import AFTER the mocks.
 import { documentRevisionsRouter, safeFilename } from '../documentRevisions';
 import {
+  DdbPresentationDocumentStore,
   setPresentationDocumentStore,
   type PresentationDocumentRow,
   type PresentationDocumentStore,
@@ -53,15 +54,28 @@ const row: PresentationDocumentRow = {
     asset: { key: PPTX_KEY, contentType: PPTX_CONTENT_TYPE, sizeBytes: 9 },
     slides: [
       { id: 'cover', index: 1, title: 'Cover', previewHandle: 'doc-1.v1.cover', asset: { key: SVG_KEY, contentType: 'image/svg+xml', sizeBytes: SVG.length } },
-      { id: 'sources', index: 2, title: 'Sources', previewHandle: 'doc-1.v1.sources', asset: { key: 'missing.svg', contentType: 'image/svg+xml', sizeBytes: 0 } },
+      // Its blob is gone (the volume did not survive); its markup is on the row.
+      { id: 'sources', index: 2, title: 'Sources', previewHandle: 'doc-1.v1.sources', asset: { key: 'missing.svg', contentType: 'image/svg+xml', sizeBytes: 0 }, svg: '<svg xmlns="http://www.w3.org/2000/svg">sources</svg>' },
+      // Neither on the row nor in the store.
+      { id: 'gone', index: 3, title: 'Gone', previewHandle: 'doc-1.v1.gone', asset: { key: 'gone.svg', contentType: 'image/svg+xml', sizeBytes: 0 } },
     ],
   }],
 };
 
 const appended: Array<Record<string, unknown>> = [];
 
+// The real store's own lookup (row first, blob second), over the same in-memory
+// blob store the routes read — so the route test exercises the real preference
+// rather than a fake that agrees with it.
+const realStore = new DdbPresentationDocumentStore({
+  docClient: { send: async () => ({}) } as never,
+  blobStore,
+});
+jest.spyOn(realStore, 'get').mockImplementation(async (documentId: string) => (documentId === 'doc-1' ? row : null));
+
 const store: PresentationDocumentStore = {
   get: async (documentId: string) => (documentId === 'doc-1' ? row : null),
+  slidePreview: (documentId, revisionId, slideId) => realStore.slidePreview(documentId, revisionId, slideId),
   appendRevision: async (input) => {
     appended.push(input as unknown as Record<string, unknown>);
     return {
@@ -151,7 +165,7 @@ describe('GET /api/documents/:id/revisions', () => {
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body.toString('utf8'));
     expect(body.revisions).toHaveLength(1);
-    expect(body.revisions[0].slides.map((slide: { id: string }) => slide.id)).toEqual(['cover', 'sources']);
+    expect(body.revisions[0].slides.map((slide: { id: string }) => slide.id)).toEqual(['cover', 'sources', 'gone']);
     expect(body.revisions[0].slides[0].previewHandle).toBe('doc-1.v1.cover');
   });
 
@@ -195,8 +209,15 @@ describe('GET /api/documents/:id/revisions/:rev/slides/:slide.svg', () => {
     expect((await request('/api/documents/doc-1/revisions/v1/slides/nope.svg')).status).toBe(404);
   });
 
-  it('404s when the revision points at bytes the store does not hold', async () => {
-    expect((await request('/api/documents/doc-1/revisions/v1/slides/sources.svg')).status).toBe(404);
+  it('serves the slide from the row when the blob file is gone', async () => {
+    const res = await request('/api/documents/doc-1/revisions/v1/slides/sources.svg');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('image/svg+xml');
+    expect(res.body.toString('utf8')).toContain('sources');
+  });
+
+  it('404s when the bytes are neither on the row nor in the store', async () => {
+    expect((await request('/api/documents/doc-1/revisions/v1/slides/gone.svg')).status).toBe(404);
   });
 });
 
