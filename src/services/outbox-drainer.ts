@@ -20,6 +20,10 @@ const LEASE_TTL_MS = 30_000;
 
 /** 24 hours in seconds — shortened TTL for completed/failed rows (kept briefly for debugging). */
 const TERMINAL_TTL_SECONDS = 24 * 60 * 60;
+/** Rows examined per round trip while looking for pending ones. */
+const SCAN_PAGE_SIZE = 200;
+/** A cap so one poll cycle cannot walk an arbitrarily large table. */
+const MAX_SCAN_PAGES = 20;
 
 const OWNER_ID = `${process.pid}@${hostname()}-${randomUUID()}`;
 
@@ -114,17 +118,35 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       recordOutboxLeaseAcquired();
 
       try {
-        const result = await docClient.send(
-          new ScanCommand({
-            TableName: OUTBOX_TABLE,
-            FilterExpression: '#status = :unprocessed',
-            ExpressionAttributeNames: { '#status': 'status' },
-            ExpressionAttributeValues: { ':unprocessed': 'UNPROCESSED' },
-            Limit: batchSize,
-          }),
-        );
-
-        const rows = (result.Items ?? []) as OutboxRow[];
+        // A Scan's `Limit` counts rows EXAMINED, not rows matched, and the
+        // filter is applied afterwards. Terminal rows live for a day, so as
+        // soon as more than `Limit` of them sat ahead of the pending ones in
+        // the table's own order, every poll came back empty and the drainer
+        // stopped publishing entirely — rows enqueued, nothing drained, and
+        // nothing in the log to say so. Page until the batch is full or the
+        // table is exhausted.
+        const rows: OutboxRow[] = [];
+        let startKey: Record<string, unknown> | undefined;
+        let pages = 0;
+        do {
+          const result = await docClient.send(
+            new ScanCommand({
+              TableName: OUTBOX_TABLE,
+              FilterExpression: '#status = :unprocessed',
+              ExpressionAttributeNames: { '#status': 'status' },
+              ExpressionAttributeValues: { ':unprocessed': 'UNPROCESSED' },
+              Limit: SCAN_PAGE_SIZE,
+              ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+            }),
+          );
+          rows.push(...((result.Items ?? []) as OutboxRow[]));
+          startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+          pages += 1;
+          // The lease is the budget for a whole poll cycle, and each page is
+          // a round trip; a scan that outlives it would publish as a
+          // non-leader and be refused row by row.
+        } while (startKey && rows.length < batchSize && pages < MAX_SCAN_PAGES && lock.isLeader());
+        rows.length = Math.min(rows.length, batchSize);
 
         // Approximate "oldest pending" — DDB Scan doesn't order results,
         // so the oldest in this batch is a lower bound on the true oldest

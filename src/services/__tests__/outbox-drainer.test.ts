@@ -266,3 +266,100 @@ describe('outbox-drainer — ownership contention', () => {
     expect(mockPublishDurable).toHaveBeenCalledTimes(1);
   });
 });
+
+// A Scan's `Limit` counts rows EXAMINED, not rows matched. Terminal rows live
+// for a day, so once enough of them sat ahead of the pending ones in the
+// table's own order every poll came back empty: rows enqueued, nothing
+// drained, and nothing in the log to say so.
+describe('outbox-drainer — finding pending rows behind terminal ones', () => {
+  /** Each row is published in turn, so the queue needs more than one turn. */
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 400; i += 1) await Promise.resolve();
+  };
+
+  const pending = (id: string) => ({
+    outboxId: id, status: 'UNPROCESSED', eventType: 'work-graph.pipeline.lifecycle.v1',
+    queueName: 'work-graph-projection-v1', payload: JSON.stringify({ runId: id }),
+    createdAt: '2026-09-22T03:23:39.000Z',
+  });
+
+  it('pages past pages that match nothing until it finds them', async () => {
+    const pages: Array<{ Items: unknown[]; LastEvaluatedKey?: Record<string, unknown> }> = [
+      { Items: [], LastEvaluatedKey: { outboxId: 'a' } },
+      { Items: [], LastEvaluatedKey: { outboxId: 'b' } },
+      { Items: [pending('o-1')] },
+    ];
+    let page = 0;
+    mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (cmd.constructor.name === 'ScanCommand') return pages[Math.min(page++, pages.length - 1)];
+      return {};
+    });
+    mockPublishDurable.mockResolvedValue(undefined);
+
+    const drainer = startOutboxDrainer({ pollIntervalMs: 10_000_000 });
+    await flush();
+    drainer.stop();
+    await flush();
+
+    const scans = findAllCalls(ScanCommand);
+    expect(scans).toHaveLength(3);
+    expect(scans[1].input.ExclusiveStartKey).toEqual({ outboxId: 'a' });
+    expect(scans[2].input.ExclusiveStartKey).toEqual({ outboxId: 'b' });
+    expect(mockPublishDurable).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops paging once the batch is full, rather than walking the table', async () => {
+    mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (cmd.constructor.name === 'ScanCommand') {
+        return {
+          Items: Array.from({ length: 25 }, (_, i) => pending(`o-${i}`)),
+          LastEvaluatedKey: { outboxId: 'more' },
+        };
+      }
+      return {};
+    });
+    mockPublishDurable.mockResolvedValue(undefined);
+
+    const drainer = startOutboxDrainer({ pollIntervalMs: 10_000_000, batchSize: 25 });
+    await settle();
+    drainer.stop();
+    await settle();
+
+    expect(findAllCalls(ScanCommand)).toHaveLength(1);
+    expect(mockPublishDurable).toHaveBeenCalledTimes(25);
+  });
+
+  it('never publishes more than one batch, however many pages it walked', async () => {
+    let page = 0;
+    mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (cmd.constructor.name === 'ScanCommand') {
+        page += 1;
+        return { Items: [pending(`o-${page}`), pending(`p-${page}`)], LastEvaluatedKey: { outboxId: `${page}` } };
+      }
+      return {};
+    });
+    mockPublishDurable.mockResolvedValue(undefined);
+
+    const drainer = startOutboxDrainer({ pollIntervalMs: 10_000_000, batchSize: 3 });
+    await settle();
+    drainer.stop();
+    await settle();
+
+    expect(mockPublishDurable).toHaveBeenCalledTimes(3);
+  });
+
+  it('gives up on an exhausted table instead of scanning for ever', async () => {
+    mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (cmd.constructor.name === 'ScanCommand') return { Items: [] };
+      return {};
+    });
+
+    const drainer = startOutboxDrainer({ pollIntervalMs: 10_000_000 });
+    await flush();
+    drainer.stop();
+    await flush();
+
+    expect(findAllCalls(ScanCommand)).toHaveLength(1);
+    expect(mockPublishDurable).not.toHaveBeenCalled();
+  });
+});
