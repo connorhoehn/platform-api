@@ -845,3 +845,79 @@ describe('dedupeByRecordingId', () => {
     expect(dedupeByRecordingId(rows)).toEqual(rows);
   });
 });
+
+// A projection expression is parsed as an expression, so a bare reserved word
+// (`segments`) fails the whole read — which is how every compose/transcript
+// badge on a plain `GET /api/recordings` silently became undefined.
+describe('CallRecordingRepository.listByUser — the compose/transcript join', () => {
+  const RESERVED = new Set(['segments', 'segment', 'status', 'timestamp', 'name', 'size', 'source']);
+
+  /** A DDB that refuses a bare reserved word exactly as the real one does. */
+  function strictDdb(primary: Record<string, unknown>): jest.Mock {
+    return jest.fn(async (command: unknown) => {
+      const input = (command as { input: Record<string, unknown> }).input;
+      if (input.RequestItems) {
+        const request = (input.RequestItems as Record<string, { ProjectionExpression?: string; ExpressionAttributeNames?: Record<string, string> }>)['test-video-call-recordings']!;
+        for (const token of (request.ProjectionExpression ?? '').split(',').map((part) => part.trim())) {
+          if (token.startsWith('#')) {
+            if (!request.ExpressionAttributeNames?.[token]) {
+              throw new Error(`ValidationException: no ExpressionAttributeName for ${token}`);
+            }
+            continue;
+          }
+          if (RESERVED.has(token.toLowerCase())) {
+            throw new Error(`ValidationException: Attribute name is a reserved keyword; reserved keyword: ${token}`);
+          }
+        }
+        return { Responses: { 'test-video-call-recordings': [primary] } };
+      }
+      return {
+        Items: [{
+          callId: 'c1',
+          recordingId: 'active-now-2026-09-21-planning-recording',
+          startedAt: '2026-09-21T12:30:00.000Z',
+          endedAt: '2026-09-21T13:00:00.000Z',
+          durationMs: 1_800_000,
+          channelArn: 'arn:x',
+          lobbyName: 'room:planning',
+        }],
+      };
+    });
+  }
+
+  test('reports a ready transcript instead of dropping every badge', async () => {
+    const send = strictDdb({
+      recordingId: 'active-now-2026-09-21-planning-recording',
+      composeStatus: 'completed',
+      composedUrl: 'https://example.invalid/composed.mp4',
+      transcriptStatus: 'ready',
+      summaryStatus: 'ready',
+    });
+    const repo = new CallRecordingRepository({ send } as unknown as DynamoDBDocumentClient);
+
+    const { items } = await repo.listByUser('u-frank');
+    expect(items[0]?.transcriptStatus).toBe('ready');
+    expect(items[0]?.composeStatus).toBeDefined();
+  });
+
+  test('still returns the page when the join fails, and says why', async () => {
+    const logger = require('../../lib/logger').default as { warn: (...args: unknown[]) => void };
+    const original = logger.warn;
+    const warned: unknown[][] = [];
+    logger.warn = (...args: unknown[]) => { warned.push(args); };
+    const send = jest.fn(async (command: unknown) => {
+      const input = (command as { input: Record<string, unknown> }).input;
+      if (input.RequestItems) throw new Error('ValidationException: boom');
+      return { Items: [{ callId: 'c1', recordingId: 'r1', startedAt: 'a', endedAt: 'b', durationMs: 1, channelArn: 'arn', lobbyName: 'l' }] };
+    });
+    const repo = new CallRecordingRepository({ send } as unknown as DynamoDBDocumentClient);
+
+    const { items } = await repo.listByUser('u-frank');
+    expect(items).toHaveLength(1);
+    expect(items[0]?.transcriptStatus).toBeUndefined();
+    logger.warn = original;
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.[0]).toMatchObject({ recordingIds: ['r1'] });
+    expect(String(warned[0]?.[1])).toContain('join failed');
+  });
+});

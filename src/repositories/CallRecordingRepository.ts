@@ -35,6 +35,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
+import log from '../lib/logger';
 import {
   deriveMediaDurationMs,
   reconcileParticipants,
@@ -42,6 +43,23 @@ import {
 } from '../lib/recording-truth';
 
 export const CALL_RECORDINGS_TABLE = tableName('video-call-recordings');
+
+/**
+ * What the compose/transcript join reads, every name aliased.
+ *
+ * A projection expression is parsed as an expression, so any attribute whose
+ * name happens to be one of DynamoDB's ~570 reserved words has to be a
+ * placeholder — `segments` is one, and one bare name fails the whole read.
+ * Aliasing all of them removes the judgement call from the next edit.
+ */
+const HYDRATE_ATTRIBUTES = [
+  'recordingId', 'composeStatus', 'composedUrl', 'composedSegment',
+  'segments', 'tracks', 'transcriptStatus', 'summaryStatus', 'ttl',
+] as const;
+const HYDRATE_PROJECTION = HYDRATE_ATTRIBUTES.map((name) => `#${name}`).join(', ');
+const HYDRATE_NAMES: Record<string, string> = Object.fromEntries(
+  HYDRATE_ATTRIBUTES.map((name) => [`#${name}`, name]),
+);
 export const CALL_RECORDING_PARTICIPANTS_TABLE = tableName(
   'video-call-recording-participants',
 );
@@ -1007,12 +1025,16 @@ export class CallRecordingRepository extends BaseRepository {
             RequestItems: {
               [CALL_RECORDINGS_TABLE]: {
                 Keys: chunk.map((r) => ({ callId: r.callId, recordingId: r.recordingId })),
-                // `segments`/`tracks` are reserved-word-free; composeStatus and
-                // the rest are plain attribute names. Projected narrowly so a
-                // 50-row page doesn't drag 50 full track manifests across.
-                ProjectionExpression:
-                  'recordingId, composeStatus, composedUrl, composedSegment, segments, tracks, transcriptStatus, summaryStatus, #ttl',
-                ExpressionAttributeNames: { '#ttl': 'ttl' },
+                // EVERY name is aliased. `segments` is a DynamoDB reserved
+                // word, and projecting it bare made the whole join throw — so
+                // every badge on a plain `GET /api/recordings` came back
+                // undefined, including `transcriptStatus` on a recording whose
+                // transcript was ready. Aliasing only the names that are
+                // reserved today leaves the next one to find this again.
+                // Projected narrowly so a 50-row page doesn't drag 50 full
+                // track manifests across.
+                ProjectionExpression: HYDRATE_PROJECTION,
+                ExpressionAttributeNames: HYDRATE_NAMES,
               },
             },
           }),
@@ -1020,10 +1042,19 @@ export class CallRecordingRepository extends BaseRepository {
         for (const raw of res.Responses?.[CALL_RECORDINGS_TABLE] ?? []) {
           byId.set(raw.recordingId as string, raw as never);
         }
-      } catch {
-        // A failed join costs badges, not the list. Falling through with
-        // `undefined` is the pre-existing behaviour, so this degrades to
-        // exactly what shipped before rather than to an error page.
+      } catch (err) {
+        // A failed join costs badges, not the list, so the page still returns.
+        // But it is a real failure — an unreadable join is why every status
+        // silently went missing — and it says so instead of looking like a set
+        // of recordings that simply have no compose or transcript state.
+        log.warn(
+          {
+            err: err instanceof Error ? err.message : String(err),
+            recordingIds: chunk.map((r) => r.recordingId).slice(0, 10),
+            recordings: chunk.length,
+          },
+          'recordings: compose/transcript join failed; badges will be missing for this page',
+        );
       }
     }
 
