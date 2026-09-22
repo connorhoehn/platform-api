@@ -186,9 +186,11 @@ describe('a denied event says which one it was', () => {
 });
 
 describe('a source with two declared writers', () => {
+  // Each service stamps its OWN name on the envelope it publishes, so the
+  // envelope and the payload always name the same one.
   const documentEvent = (serviceId: string, documentId = 'deck-1') => ({
     eventName: 'work-graph.document.lifecycle.v1',
-    metadata: { producer: 'websocket-gateway' },
+    metadata: { producer: serviceId },
     payload: {
       schemaVersion: 1, eventId: `e-${documentId}`, idempotencyKey: `e-${documentId}`,
       source: 'document', sourceSequence: '1',
@@ -289,7 +291,7 @@ describe('the account join a second writer looks up', () => {
     });
     await consume({
       eventName: 'work-graph.document.lifecycle.v1',
-      metadata: { producer: 'websocket-gateway' },
+      metadata: { producer: 'platform-api' },
       payload: {
         schemaVersion: 1, eventId: 'e1', idempotencyKey: 'e1', source: 'document', sourceSequence: '1',
         occurredAt: '2026-09-22T04:36:48.000Z', receivedAt: '2026-09-22T04:36:49.000Z',
@@ -301,5 +303,66 @@ describe('the account join a second writer looks up', () => {
     });
     expect(resolve).toHaveBeenCalledWith('document', 'websocket-gateway', 'dev-org', 'dev-frank');
     expect(repository.commitEvent).toHaveBeenCalled();
+  });
+});
+
+describe('the envelope and the payload must name the same publisher', () => {
+  const envelope = (metadataProducer: string, payloadProducer: string) => ({
+    eventName: 'work-graph.document.lifecycle.v1',
+    metadata: { producer: metadataProducer },
+    payload: {
+      schemaVersion: 1, eventId: 'e1', idempotencyKey: 'e1', source: 'document', sourceSequence: '1',
+      occurredAt: '2026-09-22T04:46:36.000Z', receivedAt: '2026-09-22T04:46:37.000Z',
+      actor: { actorId: 'dev-frank', organizationId: 'dev-org', sourceSubject: 'dev-frank' },
+      producer: { serviceId: payloadProducer, organizationId: 'dev-org', credentialId: 'c' },
+      resource: { source: 'document', resourceId: 'deck-1', resourceVersion: 'v1' },
+      payload: {
+        kind: 'document', lifecycle: 'revision-saved', documentId: 'deck-1',
+        revisionId: 'v1', producedByRunId: 'run-1', safeLabel: 'Sprint review',
+      },
+    },
+  });
+
+  function consumer() {
+    const repository = {
+      loadProjection: jest.fn(async () => ({ revision: 0 })),
+      commitEvent: jest.fn(async () => ({ revision: 1 })),
+    };
+    let consume!: (input: unknown) => Promise<void>;
+    startWorkGraphConsumer({
+      transport: { subscribe: (_q: string, h: (input: unknown) => Promise<void>) => { consume = h; return () => undefined; } } as never,
+      repository: repository as never,
+      accountResolver: { resolve: jest.fn(async () => ({ organizationId: 'dev-org', actorId: 'dev-frank' })) } as never,
+      ownership: { ownsDocument: async () => true },
+    });
+    return { consume, repository };
+  }
+
+  it('accepts a deck the platform published, stamped platform-api on both', async () => {
+    // Every service stamps its OWN name on the envelope. Comparing that
+    // against the source's PRIMARY writer refused every platform-published
+    // deck for telling the truth.
+    const { consume, repository } = consumer();
+    await consume(envelope('platform-api', 'platform-api'));
+    expect(repository.commitEvent).toHaveBeenCalled();
+  });
+
+  it('accepts a page the gateway published, stamped websocket-gateway on both', async () => {
+    const { consume, repository } = consumer();
+    await consume(envelope('websocket-gateway', 'websocket-gateway'));
+    expect(repository.commitEvent).toHaveBeenCalled();
+  });
+
+  it('refuses an envelope and a payload that disagree about who published', async () => {
+    const { consume, repository } = consumer();
+    const denied = await consume(envelope('websocket-gateway', 'platform-api')).catch((e: Error) => e);
+    expect((denied as Error).message).toContain('producer-or-source-mismatch');
+    expect(repository.commitEvent).not.toHaveBeenCalled();
+  });
+
+  it('refuses a service the source does not admit, however consistently stamped', async () => {
+    const { consume } = consumer();
+    const denied = await consume(envelope('aws-agentcore', 'aws-agentcore')).catch((e: Error) => e);
+    expect((denied as Error).message).toContain('producer-or-source-mismatch');
   });
 });

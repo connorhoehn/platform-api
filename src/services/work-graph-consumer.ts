@@ -116,10 +116,15 @@ function verifyEnvelope(envelope: EventEnvelope<unknown>): AuthenticatedWorkEven
   const parsed = validateAuthenticatedWorkEvent(envelope.payload);
   if (!parsed.ok) throw new WorkGraphIngestionDeniedError('invalid-payload', payloadShape(envelope.payload));
   const event = parsed.value;
+  // The envelope says which service put this on the queue — each stamps its
+  // own name — and the payload says which service observed the transition.
+  // They are the same service, and it has to be one the source admits. The
+  // envelope was compared against the source's PRIMARY writer instead, so a
+  // platform-published deck was refused for saying platform-api on both.
   const allowed = workGraphProducersFor(event.source);
   if (envelope.eventName !== `work-graph.${event.source}.lifecycle.v1`
-    || envelope.metadata.producer !== PRODUCER_BY_SOURCE[event.source]
-    || !allowed.includes(event.producer.serviceId)
+    || !allowed.includes(envelope.metadata.producer)
+    || envelope.metadata.producer !== event.producer.serviceId
     || event.source !== event.payload.kind
     || event.source !== event.resource.source) {
     throw new WorkGraphIngestionDeniedError('producer-or-source-mismatch', payloadShape(envelope.payload));
