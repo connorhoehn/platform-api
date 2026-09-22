@@ -18,7 +18,7 @@ import { buildDeckGenerateDefinition, DECK_GENERATE_PIPELINE_ID, DECK_HISTORY_LI
 import { buildDeckFixture } from '../deck/deckFixture';
 import { renderDeckPreview } from '../deck/preview';
 import { randomUUID } from 'node:crypto';
-import { registerChatCommandPipeline, type ChatCommandRunInput } from './chatCommandRegistry';
+import { registerChatCommandPipeline, ChatCommandRequiresError, type ChatCommandRunInput } from './chatCommandRegistry';
 import {
   AGENT_LOOP_CARD_AGENT, CHAT_AGENT_LOOP_PIPELINE_ID, agentLoopCardLab,
   buildAgentLoopDefinition, type AgentLoopRequest, type LoopPlan,
@@ -118,17 +118,32 @@ export interface DeckCommandArgs {
   preview: boolean;
   /** What the deck is built from, when the person said. */
   from?: 'transcript' | 'documents';
+  /**
+   * The recording, when `--from` named one directly as `recording:<id>` — the
+   * token the client's picker inserts. Set alongside `from: 'transcript'`.
+   */
+  recordingId?: string;
 }
 
 /**
- * Parses `/deck`'s own grammar. `--from #anything` and a bare `#doc` both mean
- * the referenced documents; `--from transcript` means the meeting's transcript.
- * Everything else stays in the instruction — the deck is about the words, and
- * an unrecognised flag must not silently vanish from what was asked for.
+ * Parses `/deck`'s own grammar — a MIRROR of the client's `parseDeckText`,
+ * and the one that is authoritative (LOOP-BRIEF §2: the client parses to know
+ * what to send, the server re-parses and its answer wins).
+ *
+ * `--from #anything` and a bare `#doc` both mean the referenced documents;
+ * `--from transcript` means the meeting's transcript; `--from recording:<id>`
+ * names which one directly, so a recording survives in the text itself
+ * rather than depending on `extra.recordingId` riding along separately.
+ * `--preview` and `--from` are recognised WHEREVER they land, not only
+ * trailing, so free text typed after a picked token (a title, more instructions)
+ * never swallows them. Everything else stays in the instruction — the deck is
+ * about the words, and an unrecognised flag must not silently vanish from what
+ * was asked for.
  */
 export function parseDeckCommand(argumentText: string): DeckCommandArgs {
   let preview = false;
   let from: DeckCommandArgs['from'];
+  let recordingId: string | undefined;
   const words = argumentText.trim().split(/\s+/).filter(Boolean);
   const kept: string[] = [];
   for (let index = 0; index < words.length; index += 1) {
@@ -136,19 +151,28 @@ export function parseDeckCommand(argumentText: string): DeckCommandArgs {
     const lowered = word.toLowerCase();
     if (lowered === '--preview') { preview = true; continue; }
     if (lowered === '--from' || lowered.startsWith('--from=')) {
-      const value = (lowered.startsWith('--from=') ? lowered.slice('--from='.length) : (words[index + 1] ?? '')).toLowerCase();
+      const rawValue = lowered.startsWith('--from=') ? word.slice('--from='.length) : (words[index + 1] ?? '');
+      const value = rawValue.toLowerCase();
       if (!lowered.startsWith('--from=')) index += 1;
-      if (value.startsWith('transcript') || value.startsWith('recording') || value.startsWith('meeting')) from = 'transcript';
+      const recordingMatch = /^recording:(.+)$/i.exec(rawValue);
+      if (recordingMatch) { from = 'transcript'; recordingId = recordingMatch[1]; }
+      else if (value.startsWith('transcript') || value.startsWith('recording') || value.startsWith('meeting')) from = 'transcript';
       else if (value) from = 'documents';
       continue;
     }
     kept.push(word);
   }
-  return { prompt: kept.join(' ').trim(), preview, ...(from ? { from } : {}) };
+  return { prompt: kept.join(' ').trim(), preview, ...(from ? { from } : {}), ...(recordingId ? { recordingId } : {}) };
 }
 
-/** The recording a `--from transcript` deck reads, when the client named one. */
-function deckRecordingId(input: ChatCommandRunInput): string | undefined {
+/**
+ * The recording a `--from transcript` deck reads. The text itself wins —
+ * `--from recording:<id>` names one directly and needs nothing else — with
+ * `extra.recordingId`/`extra.transcriptRecordingId` as the fallback for a
+ * client that only sends the id alongside a plain `--from transcript`.
+ */
+function deckRecordingId(input: ChatCommandRunInput, args: DeckCommandArgs): string | undefined {
+  if (args.recordingId) return args.recordingId;
   const raw = input.extra?.recordingId ?? input.extra?.transcriptRecordingId;
   return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
 }
@@ -187,7 +211,7 @@ export function deckSourcesFromInput(input: ChatCommandRunInput): Array<{ docume
 export async function buildDeckPreviewCard(input: ChatCommandRunInput): Promise<Record<string, unknown>> {
   const args = parseDeckCommand(input.argumentText ?? '');
   const sources = deckSourcesFromInput(input);
-  const recordingId = deckRecordingId(input);
+  const recordingId = deckRecordingId(input, args);
   const documentId = args.from === 'transcript' ? undefined : sources[0]?.documentId;
   if (!documentId && !recordingId) {
     throw new AppError(400, '/deck --preview needs a document (reference one with #) or a recording to build from');
@@ -393,8 +417,19 @@ export function registerBuiltinChatCommands(): void {
     label: 'Build a presentation',
     hint: 'from the referenced documents',
     description: 'Build a .pptx from the documents you reference with # and this conversation: `documentId` is the new presentation, `extra.documents` are the sources it must cite, the text after the command is what the deck is about. `--from transcript` reads the meeting recording in `extra.recordingId`; `--preview` answers with the slides and stores nothing.',
-    requires: { document: true, argumentText: true },
+    // `document` is NOT in the static `requires` below: a preview never gets
+    // one (the client creates nothing to preview), so a blanket `document:
+    // true` here would reject `/deck --preview` before `start` ever reads the
+    // flag — a 400 "needs documentId" and no card, the run never happening at
+    // all. `prepare` enforces it instead, conditioned on `--preview`.
+    requires: { argumentText: true },
     postCard: false,
+    prepare: (input) => {
+      if (!parseDeckCommand(input.argumentText ?? '').preview && !str(input.documentId)) {
+        throw new ChatCommandRequiresError(`${input.trigger} needs documentId`, { document: true });
+      }
+      return input;
+    },
     // `--preview` never reaches the pipeline: it derives a spec, renders slide 1
     // and answers with it. The id is `deck-preview:<uuid>` — not a run id, and
     // the card says `persisted: false` so nothing downstream mistakes it.
@@ -409,7 +444,7 @@ export function registerBuiltinChatCommands(): void {
       const args = parseDeckCommand(input.argumentText ?? '');
       const prompt = (args.prompt || input.argumentText.trim()).slice(0, 2000);
       const title = (str(input.extra?.title) ?? prompt).slice(0, 120);
-      const recordingId = deckRecordingId(input);
+      const recordingId = deckRecordingId(input, args);
       return {
         documentId: input.documentId, title, prompt,
         sources: deckSourcesFromInput(input),
@@ -429,7 +464,7 @@ export function registerBuiltinChatCommands(): void {
       const sources = deckSourcesFromInput(input);
       const preview = args.preview ? deckPreviewCards.get(input.requestedBy) : undefined;
       if (preview) deckPreviewCards.delete(input.requestedBy);
-      const recordingId = deckRecordingId(input);
+      const recordingId = deckRecordingId(input, args);
       return {
         title: ((str(input.extra?.title) ?? args.prompt) || input.argumentText.trim()).slice(0, 120),
         sources,

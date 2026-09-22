@@ -7,7 +7,7 @@ jest.mock('../../deck/deckFixture', () => {
   return { ...actual, buildDeckFixture: (...args: unknown[]) => buildDeckFixture(...args) };
 });
 
-import { clearChatCommandPipelines, getChatCommandPipeline, type ChatCommandRunInput } from '../chatCommandRegistry';
+import { clearChatCommandPipelines, getChatCommandPipeline, runChatCommand, type ChatCommandRunInput } from '../chatCommandRegistry';
 import { buildDeckPreviewCard, deckSourcesFromInput, parseDeckCommand, registerBuiltinChatCommands } from '../builtinChatCommands';
 import { sampleDeck } from '../../deck/__tests__/fixtures';
 import { DECK_GENERATE_PIPELINE_ID } from '../../documents/deckGeneratePipeline';
@@ -36,10 +36,14 @@ beforeAll(() => {
 });
 
 describe('/deck', () => {
-  it('is registered against the deck-generate pipeline and needs a document and a subject', () => {
+  it('is registered against the deck-generate pipeline and needs a subject', () => {
     const command = getChatCommandPipeline('/deck')!;
     expect(command.pipelineId).toBe(DECK_GENERATE_PIPELINE_ID);
-    expect(command.requires).toMatchObject({ document: true, argumentText: true });
+    // `document` is NOT a static requirement — a preview never gets one. It
+    // is enforced by `prepare`, conditioned on `--preview`; see the
+    // "runChatCommand" describe block below.
+    expect(command.requires).toMatchObject({ argumentText: true });
+    expect(command.requires).not.toHaveProperty('document');
     expect(command.postCard).toBe(false);
   });
 
@@ -109,6 +113,21 @@ describe('parseDeckCommand', () => {
   it('keeps an unrecognised flag in the instruction rather than swallowing it', () => {
     expect(parseDeckCommand('a deck --pretty').prompt).toBe('a deck --pretty');
   });
+
+  it('reads a recording id straight out of `--from recording:<id>` — the token the client picker inserts', () => {
+    expect(parseDeckCommand('x --from recording:rec-2')).toEqual({
+      prompt: 'x', preview: false, from: 'transcript', recordingId: 'rec-2',
+    });
+  });
+
+  it('the real conversation this fixes: a picked recording token, then free text with a colon, then --preview — none of it gets dropped or truncates a colon-bearing word', () => {
+    // Mirrors the reported bug: `/deck --preview --from transcript`, picked a
+    // recording, and the message that reached the server was
+    // `/deck --from recording:<id> Frank Davis · Sep 22, 08:30 AM --preview`.
+    expect(parseDeckCommand('--from recording:rec-2 Frank Davis · Sep 22, 08:30 AM --preview')).toEqual({
+      prompt: 'Frank Davis · Sep 22, 08:30 AM', preview: true, from: 'transcript', recordingId: 'rec-2',
+    });
+  });
 });
 
 describe('/deck --from transcript', () => {
@@ -159,5 +178,48 @@ describe('/deck --preview', () => {
 
   it('refuses when nothing was named to build from', async () => {
     await expect(buildDeckPreviewCard(input({ argumentText: 'x --preview', extra: {} }))).rejects.toThrow(/needs a document/);
+  });
+
+  it('reads the recording straight out of a `--from recording:<id>` token, with no `extra.recordingId` at all', async () => {
+    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'model', material: {}, warnings: [], transcriptIds: [] });
+    await buildDeckPreviewCard(input({ argumentText: 'x --preview --from recording:rec-9', extra: {} }));
+    expect(buildDeckFixture).toHaveBeenCalledWith({ recordingId: 'rec-9', personId: 'user-frank' }, 'x', {});
+  });
+});
+
+// The bug this closes: `requires: { document: true }` was checked BEFORE
+// `start` ever read `--preview`, so `/deck --preview` — which never gets a
+// documentId, because the client creates nothing to preview — was rejected
+// with a 400 and no card, through the real dispatch path
+// (`runChatCommand`), even though `buildDeckPreviewCard` alone worked fine.
+describe('/deck --preview through runChatCommand (the real dispatch path, not just buildDeckPreviewCard)', () => {
+  beforeEach(() => buildDeckFixture.mockReset());
+
+  it('runs with no documentId at all and answers with the preview card', async () => {
+    buildDeckFixture.mockResolvedValue({
+      spec: sampleDeck(), source: 'model', material: {}, warnings: [], transcriptIds: [],
+    });
+    const out = await runChatCommand({
+      trigger: '/deck',
+      channel: 'chat:room:eng',
+      text: '/deck the Q4 review --preview',
+      argumentText: 'the Q4 review --preview',
+      requestedBy: 'user-frank',
+      requestedByName: 'Frank',
+      extra: { documents: [{ id: 'doc-sprint-review', title: 'Sprint review' }] },
+    } as ChatCommandRunInput);
+    expect(out.card).not.toHaveProperty('documentId');
+    expect(out.card).toMatchObject({ persisted: false, specSource: 'model' });
+  });
+
+  it('a real (non-preview) build still needs a documentId', async () => {
+    await expect(runChatCommand({
+      trigger: '/deck',
+      channel: 'chat:room:eng',
+      text: '/deck the Q4 review',
+      argumentText: 'the Q4 review',
+      requestedBy: 'user-frank',
+      requestedByName: 'Frank',
+    } as ChatCommandRunInput)).rejects.toThrow(/needs documentId/);
   });
 });
