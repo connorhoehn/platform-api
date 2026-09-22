@@ -169,6 +169,14 @@ export interface MeetingFacts {
   transcriptAvailable: boolean;
   /** Attendees the source recorded, already resolved to display names. */
   participants?: Array<{ id: string; label: string; avatarUrl?: string }>;
+  /**
+   * When a room is EXPECTED to happen, for one that has not. It is not
+   * `startedAt`: nothing has started, and saying so would be a lie a card
+   * cannot tell apart from a meeting in progress.
+   */
+  scheduledFor?: { at: string; durationMinutes?: number };
+  /** Whether anything was actually put in a calendar. Usually nothing was. */
+  calendar?: 'none' | 'invited';
 }
 
 export interface DocumentAttentionFacts {
@@ -653,9 +661,19 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
           label: trim(person.label) as string,
           ...(person.avatarUrl && person.avatarUrl.startsWith('/') ? { avatarUrl: person.avatarUrl } : {}),
         }));
-      const lines = [span, recorded].filter((value): value is string => !!value);
+      // A room that has not happened says when it is expected and for how
+      // long — "05:00 · 30 min" — which is a different claim from a span that
+      // already ran, and must not be mistaken for one.
+      const expectedAt = clock(facts.scheduledFor?.at, query.timezone);
+      const proposed = expectedAt
+        ? `${expectedAt}${facts.scheduledFor?.durationMinutes ? ` · ${facts.scheduledFor.durationMinutes} min` : ''}`
+        : undefined;
+      // Nothing was put in anyone's calendar. Saying so is the difference
+      // between an invitation and a room somebody still has to be told about.
+      const calendar = facts.calendar === 'none' && proposed ? 'No calendar invite' : undefined;
+      const lines = [span, proposed, calendar, recorded].filter((value): value is string => !!value);
       setDetail(node.id, {
-        ...(lines.length ? { lines } : {}),
+        ...(lines.length ? { lines: lines.slice(0, WORK_GRAPH_V2_LIMITS.detailLines) } : {}),
         ...(participants.length ? { participants } : {}),
       });
       return;
@@ -947,6 +965,31 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
   }
   efforts.length = 0;
   efforts.push(...merged);
+  // An anchor that something else PRODUCED is not its own piece of work: a
+  // room a run booked belongs to that run's frame, and only anchors an effort
+  // of its own when nothing produced it. The relationship is the source's, so
+  // this never merges two efforts that merely look related.
+  for (let pass = 0; pass < 3; pass += 1) {
+    const memberOf = new Map<string, ViewerWorkEffort>();
+    for (const effort of efforts) for (const id of effort.nodeIds) memberOf.set(id, effort);
+    const folded = efforts.filter((effort) => {
+      const producers = edges
+        .filter((edge) => edge.relation === 'produced' && edge.toId === effort.anchorNodeId)
+        .map((edge) => memberOf.get(edge.fromId))
+        .filter((home): home is ViewerWorkEffort => !!home && home.id !== effort.id);
+      // Produced by exactly one effort, or it stays where it is.
+      const home = new Set(producers).size === 1 ? producers[0] : undefined;
+      if (!home) return true;
+      home.nodeIds = [...new Set([...home.nodeIds, ...effort.nodeIds])];
+      home.edgeIds = [...new Set([...home.edgeIds, ...effort.edgeIds])];
+      home.contextNodeIds = [...new Set([...home.contextNodeIds, ...effort.contextNodeIds])];
+      return false;
+    });
+    if (folded.length === efforts.length) break;
+    efforts.length = 0;
+    efforts.push(...folded);
+  }
+
   // Anything the source says belongs to a framed run, but that reached no
   // effort of its own — a step whose every relationship was dropped.
   const framed = new Set(efforts.flatMap((effort) => effort.nodeIds));

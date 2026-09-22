@@ -1477,9 +1477,11 @@ export class RunPersistenceService {
     for (const artifact of Array.isArray(output?.artifacts) ? output.artifacts : []) {
       const entry = artifact as { artifactId?: unknown; kind?: unknown };
       if (typeof entry?.artifactId !== 'string' || !entry.artifactId.trim()) continue;
+      // The id as the SOURCE projects it: a meeting node is addressed by the
+      // bare room id, and `meeting:<id>` addresses nothing, so the `produced`
+      // relationship silently resolved to no node at all.
       const source = entry.kind === 'meeting' ? 'meeting' as const : 'document' as const;
-      const resourceId = source === 'meeting' ? `meeting:${entry.artifactId}` : entry.artifactId;
-      produced.set(`${source}:${resourceId}`, { source, resourceId });
+      produced.set(`${source}:${entry.artifactId}`, { source, resourceId: entry.artifactId });
     }
     return [...produced.values()];
   }

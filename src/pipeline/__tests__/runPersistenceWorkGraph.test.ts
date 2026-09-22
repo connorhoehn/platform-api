@@ -437,7 +437,8 @@ describe('a room a step booked', () => {
     const step = publisher.pipeline.mock.calls
       .map((call) => call[0] as Record<string, unknown>)
       .find((record) => record.kind === 'pipeline-step');
-    expect(step?.producesRefs).toEqual([{ source: 'meeting', resourceId: 'meeting:room-1' }]);
+    // The bare room id, which is how the meeting source projects the node.
+    expect(step?.producesRefs).toEqual([{ source: 'meeting', resourceId: 'room-1' }]);
   });
 
   it('books nothing for a step that made no room', async () => {
@@ -463,7 +464,7 @@ describe('a room a step booked', () => {
       .map((call) => call[0] as Record<string, unknown>)
       .find((record) => record.kind === 'pipeline-step');
     expect(step?.producesRefs).toEqual([
-      { source: 'meeting', resourceId: 'meeting:room-1' },
+      { source: 'meeting', resourceId: 'room-1' },
       { source: 'document', resourceId: 'deck-1' },
     ]);
   });

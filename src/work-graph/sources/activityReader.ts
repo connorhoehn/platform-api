@@ -313,8 +313,17 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       const label = text(profile?.displayName, 80);
       return label ? { id: userId, label } : null;
     }))).filter((value): value is { id: string; label: string } => !!value);
+    const startsAt = iso(room.startsAt);
+    const duration = typeof room.durationMinutes === 'number' && Number.isFinite(room.durationMinutes)
+      && room.durationMinutes > 0
+      ? Math.round(room.durationMinutes)
+      : undefined;
     return {
       ...(participants.length ? { participants } : {}),
+      // Expected, not started. `createdAt` is when the room was MADE.
+      ...(startsAt ? { scheduledFor: { at: startsAt, ...(duration ? { durationMinutes: duration } : {}) } } : {}),
+      // Nothing was put in anyone's calendar; the room is the invitation.
+      calendar: 'none',
       recorded: false,
       transcriptAvailable: false,
     };

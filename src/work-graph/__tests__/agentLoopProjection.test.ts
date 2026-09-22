@@ -81,7 +81,7 @@ function stepEvent(
   status: string,
   at: string,
   dependsOn: string[] = [],
-  extra: { workspace?: { resourceId: string; safeLabel?: string }; produces?: string } = {},
+  extra: { workspace?: { resourceId: string; safeLabel?: string }; produces?: string; producesMeeting?: string } = {},
 ): AuthenticatedWorkEvent {
   const mapped = mapPipeline({
     kind: 'pipeline-step',
@@ -91,7 +91,10 @@ function stepEvent(
     occurredAt: at,
     safeLabel: title,
     ...(extra.workspace ? { workspace: extra.workspace } : {}),
-    ...(extra.produces ? { producesRefs: [{ source: 'document' as const, resourceId: extra.produces }] } : {}),
+    ...(extra.produces || extra.producesMeeting ? { producesRefs: [
+      ...(extra.produces ? [{ source: 'document' as const, resourceId: extra.produces }] : []),
+      ...(extra.producesMeeting ? [{ source: 'meeting' as const, resourceId: extra.producesMeeting }] : []),
+    ] } : {}),
     inputRefs: [
       { source: 'pipeline', resourceId: RUN },
       ...dependsOn.map((dependency) => ({ source: 'pipeline' as const, resourceId: pipelineStepResourceId(RUN, dependency) })),
@@ -737,5 +740,89 @@ describe('a workspace is addressable by the run that owns it', () => {
     // Its run is recoverable, which is what the ACL authorizes it by.
     expect(parsePipelineStepResourceId(terminals[0].sourceRef.resourceId).runId).toBe(RUN);
     expect(Object.values(state.edges).filter((edge) => edge.relation === 'runs-in')).toHaveLength(2);
+  });
+});
+
+describe('a room the loop booked', () => {
+  const ROOM = 'room-1';
+  const events = [
+    runEvent('running', `${DAY}T18:00:00.000Z`, false),
+    stepEvent('meeting:create:s1', 'Schedule and conduct meeting', 'completed', `${DAY}T18:04:30.000Z`),
+  ];
+
+  /** The meeting source's own node for the room the step booked. */
+  function meetingEvent(at: string): AuthenticatedWorkEvent {
+    return {
+      schemaVersion: 1,
+      eventId: `meeting:${at}`,
+      idempotencyKey: `meeting:${at}`,
+      source: 'meeting',
+      sourceSequence: at,
+      occurredAt: at,
+      receivedAt: at,
+      actor: { actorId: ACTOR, organizationId: ORGANIZATION, sourceSubject: SUBJECT },
+      producer: { serviceId: 'platform-api', organizationId: ORGANIZATION, credentialId: 'platform-api-runtime' },
+      resource: { source: 'meeting', resourceId: `meeting:${ROOM}`, resourceVersion: '1' },
+      payload: {
+        kind: 'meeting', lifecycle: 'meeting-scheduled', meetingId: ROOM, safeLabel: 'Schedule and conduct meeting',
+      },
+    } as AuthenticatedWorkEvent;
+  }
+
+  const produced = stepEvent(
+    'meeting:create:s1', 'Schedule and conduct meeting', 'completed', `${DAY}T18:04:40.000Z`, [],
+    { producesMeeting: ROOM },
+  );
+
+  async function framed(all: AuthenticatedWorkEvent[]) {
+    const state = project(all);
+    const { nodes, edges, authorization } = authorize(state);
+    return {
+      nodes,
+      activity: await buildWorkActivity({
+        query, nodes, edges, authorization, now: NOW,
+        reader: {
+          pipelineRun: async () => null,
+          artifact: async () => null,
+          revisionPreview: async () => null,
+          transcript: async () => null,
+          attention: async () => null,
+          meeting: async () => ({
+            recorded: false,
+            transcriptAvailable: false,
+            calendar: 'none' as const,
+            scheduledFor: { at: `${DAY}T22:00:00.000Z`, durationMinutes: 30 },
+            participants: [{ id: 'dev-frank', label: 'Frank Castle' }],
+          }),
+        },
+      }),
+    };
+  }
+
+  it('joins the frame of the run that booked it', async () => {
+    // A meeting may anchor an effort, so a produced room took one of its own
+    // and the loop's frame lost the room it had just made.
+    const withMeeting = [...events, meetingEvent(`${DAY}T18:04:35.000Z`), produced];
+    const { nodes, activity } = await framed(withMeeting);
+    expect(activity.efforts).toHaveLength(1);
+    const kinds = activity.efforts[0].nodeIds
+      .map((id) => nodes.find((node) => node.id === id)?.kind).sort();
+    expect(kinds).toContain('meeting');
+    expect(kinds).toContain('run');
+  });
+
+  it('still anchors its own effort when nothing produced it', async () => {
+    const { nodes, activity } = await framed([meetingEvent(`${DAY}T18:04:35.000Z`)]);
+    expect(activity.efforts).toHaveLength(1);
+    expect(nodes.find((node) => node.id === activity.efforts[0].anchorNodeId)?.kind).toBe('meeting');
+  });
+
+  it('says when it is expected, for how long, and that nobody was invited', async () => {
+    const { nodes, activity } = await framed([meetingEvent(`${DAY}T18:04:35.000Z`)]);
+    const room = nodes.find((node) => node.kind === 'meeting');
+    const detail = activity.details.find((entry) => entry.nodeId === room?.id);
+    expect(detail?.lines?.[0]).toBe('18:00 · 30 min');
+    expect(detail?.lines).toContain('No calendar invite');
+    expect(detail?.participants?.map((person) => person.label)).toEqual(['Frank Castle']);
   });
 });
