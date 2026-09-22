@@ -162,6 +162,35 @@ describe('ClaudeCodeLLMClient.stream() — pre-abort', () => {
   });
 });
 
+// A pipeline definition with a blank prompt template (or a template field the
+// run's context never populated) used to reach the CLI as `claude -p ''` and
+// die with "Input must be provided either through stdin or as a prompt" — a
+// subprocess exit code, not a message that says what a pipeline author needs
+// to fix. This should be refused before the spawn.
+describe('ClaudeCodeLLMClient.stream() — empty prompt', () => {
+  it('throws a clear error instead of spawning on an empty user prompt', async () => {
+    const client = new ClaudeCodeLLMClient();
+    await expect(async () => {
+      for await (const _ of client.stream('model', 'sys', '')) {
+        // should not reach here
+      }
+    }).rejects.toThrow(/no prompt to send/i);
+
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  it('throws the same way for a whitespace-only prompt', async () => {
+    const client = new ClaudeCodeLLMClient();
+    await expect(async () => {
+      for await (const _ of client.stream('model', 'sys', '   \n  ')) {
+        // should not reach here
+      }
+    }).rejects.toThrow(/no prompt to send/i);
+
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // stream_event parsing
 // ---------------------------------------------------------------------------

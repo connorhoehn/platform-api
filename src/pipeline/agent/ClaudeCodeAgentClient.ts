@@ -130,6 +130,18 @@ function normalizeTools(allowedTools?: string[]): string[] {
  * without spawning a process.
  */
 export function buildAgentArgs(prompt: string, opts: AgentRunOptions = {}): string[] {
+  // `claude -p ''` reaches the CLI with nothing to say and it dies with
+  // "Input must be provided either through stdin or as a prompt" — a
+  // subprocess exit code, not a message a person can act on. A step whose
+  // rendered prompt is empty is a pipeline authoring bug; refuse to build
+  // argv for it rather than spawn a process that can only fail this way.
+  if (!prompt?.trim()) {
+    throw new Error(
+      'This step has no prompt to send: the rendered prompt was empty. '
+      + 'Check the step\'s prompt template and the context fields it reads.',
+    );
+  }
+
   const tools = normalizeTools(opts.allowedTools);
 
   const args = [

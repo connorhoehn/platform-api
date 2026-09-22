@@ -72,6 +72,19 @@ export class ClaudeCodeLLMClient implements LLMClient {
           throw new DOMException('Aborted', 'AbortError');
         }
 
+        // `claude -p ''` reaches the CLI with nothing to say and it dies with
+        // "Input must be provided either through stdin or as a prompt" — a
+        // subprocess exit code, not a message a person can act on. A step
+        // whose rendered prompt is empty (a blank template, a missing
+        // context field) is a pipeline authoring bug; fail it here, before
+        // the spawn, with the sentence that actually says what's wrong.
+        if (!userPrompt?.trim()) {
+          throw new Error(
+            'This step has no prompt to send: the rendered user prompt was empty. '
+            + 'Check the step\'s prompt template and the context fields it reads.',
+          );
+        }
+
         // Drop --bare: it forces ANTHROPIC_API_KEY auth and skips the
         // OAuth keychain reads that the subscription path depends on.
         // The Tilt mount at /root/.claude/.credentials.json IS where

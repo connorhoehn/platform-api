@@ -342,6 +342,11 @@ describe('agent step — safety', () => {
     expect(argv[argv.indexOf('--allowedTools') + 1]).toBe('Bash(cat:*),Read');
   });
 
+  it('refuses to build argv for an empty prompt rather than spawn a doomed process', () => {
+    expect(() => buildAgentArgs('')).toThrow(/no prompt to send/i);
+    expect(() => buildAgentArgs('   \n  ')).toThrow(/no prompt to send/i);
+  });
+
   it('enforces timeoutMs with a real process kill, not a promise race', async () => {
     const pidFile = join(workDir, 'hang.pid');
     useStub({ mode: 'hang', pidFile });
