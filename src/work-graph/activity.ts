@@ -703,8 +703,19 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       // half of them, so they are merged and de-duplicated by revision id.
       const projected = documentId ? revisionsByDocument.get(documentId) ?? [] : [];
       const listedIds = new Set(projected.map((revision) => revision.id));
+      // When both records hold a revision, the document's own row says when
+      // it was written: the change node's time is only when a save event
+      // claimed it, and a re-emitted or backdated event disagrees with the
+      // row. Mixing the two clocks ordered a Sprint review "v3 v4 v1 v2" —
+      // v1/v2 at their events' 09:27/09:31, v3/v4 at their 04:23 row writes —
+      // so the pane called v2 "available" and "First draft" named v3's time.
       const revisions = [
-        ...projected,
+        ...projected.map((revision) => {
+          const written = storedRevisions.get(revision.id)?.createdAt;
+          return written && Number.isFinite(Date.parse(written))
+            ? { ...revision, createdAt: new Date(Date.parse(written)).toISOString() }
+            : revision;
+        }),
         ...[...storedRevisions.values()]
           .filter((revision) => !listedIds.has(revision.id) && !!revision.createdAt)
           .map((revision) => ({

@@ -624,6 +624,34 @@ describe('work graph schemaVersion 2 route', () => {
       .toEqual(['Release plan · rev 6 · 09:08']);
   });
 
+  it('dates a revision both records hold by the document row, so one clock orders the history', async () => {
+    // The live Sprint review: v1/v2 are projected change nodes stamped by the
+    // scenario's save events (13:27, 13:31), but the row wrote them at 05:07,
+    // before v3/v4 (08:23, 08:25). Taking the events' times listed
+    // "v3 v4 v1 v2" and called v2 the available revision.
+    const rewritten = reader({
+      artifact: async (documentId) => (documentId === 'doc-deck'
+        ? {
+          name: 'Sprint review',
+          mediaKind: 'presentation' as const,
+          revisions: [
+            { id: 'v1', label: 'v1', createdAt: at('05:07'), slideCount: 3, slides: deckSlides('Release readiness') },
+            { id: 'v2', label: 'v2', createdAt: at('05:08'), slideCount: 3, slides: deckSlides('Release readiness and owners') },
+            { id: 'v3', label: 'v3', createdAt: at('08:23'), slideCount: 3, slides: deckSlides('Owners') },
+            { id: 'v4', label: 'v4', createdAt: at('08:25'), slideCount: 3, slides: deckSlides('Owners and dates') },
+          ],
+        }
+        : { name: 'Release plan', mediaKind: 'document' as const }),
+    });
+    const body = (await get(setup({ activityReader: rewritten }), v2)).body as WorkGraphSnapshotV2;
+    expect(validateWorkGraphSnapshotV2(body).ok).toBe(true);
+    const deck = body.details.find((detail) => detail.nodeId === 'deck');
+    expect(deck?.artifact?.revisions.map((revision) => revision.label)).toEqual(['v1', 'v2', 'v3', 'v4']);
+    expect(deck?.artifact?.revisions[0]?.createdAt).toBe(at('05:07'));
+    expect(deck?.artifact?.pending).toMatchObject({ label: 'v5', status: 'generating' });
+    expect(deck?.summary).toBe('v5 generating · v4 available');
+  });
+
   it('serves a revision the document appended without a save event', async () => {
     const appended = reader({
       artifact: async (documentId) => (documentId === 'doc-deck'
