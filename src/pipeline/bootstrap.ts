@@ -1188,7 +1188,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     const orphanScanEveryMs = Number(process.env.PLATFORM_ORPHAN_SCAN_INTERVAL_MS) > 0
       ? Number(process.env.PLATFORM_ORPHAN_SCAN_INTERVAL_MS)
       : REPLICA_LEASE_TTL_MS;
-    // NFR #101: a row can say running/interrupted after its run finished (a
+    // NFR #103: a row can say running/interrupted after its run finished (a
     // stale write, a lost terminal put). Both scans ask for proof first and
     // write such a row terminal instead of re-running it.
     const terminalEvidence = composeTerminalEvidence(

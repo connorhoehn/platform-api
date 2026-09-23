@@ -53,7 +53,7 @@ export interface ResumeInterruptedRunsOptions {
   /** Override `now` for tests. */
   now?: () => number;
   /**
-   * NFR #101: proof the run already finished (checkpoint frontier, idempotent
+   * NFR #103: proof the run already finished (checkpoint frontier, idempotent
    * side effect, audit). Such a run is written terminal, never resumed.
    */
   terminalEvidence?: TerminalEvidenceCheck;

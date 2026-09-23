@@ -177,7 +177,7 @@ export interface PipelineRunItem {
   /** Number of times this run has been resumed after an interruption. */
   resumeCount?: number;
   /**
-   * NFR #101: set when a sweep found the row non-terminal but proof elsewhere
+   * NFR #103: set when a sweep found the row non-terminal but proof elsewhere
    * that the run had finished (see pipeline/runTerminalEvidence.ts).
    */
   finalizedFromEvidence?: { source: string; at: string; detail?: string };

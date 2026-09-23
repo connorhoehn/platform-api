@@ -28,7 +28,7 @@ const log = withContext({ service: 'scanOrphanedRuns' });
 
 export interface ScanOrphanedRunsOptions {
   /**
-   * NFR #101: proof the run already finished elsewhere (checkpoint frontier,
+   * NFR #103: proof the run already finished elsewhere (checkpoint frontier,
    * idempotent side effect, audit). A row with proof is written terminal
    * instead of `interrupted`, so the resume scan never re-runs it.
    */
@@ -49,7 +49,7 @@ export interface ScanOrphanedRunsOptions {
 }
 
 export interface ScanOrphanedRunsResult {
-  /** Rows that said `running` but whose run had already finished (NFR #101). */
+  /** Rows that said `running` but whose run had already finished (NFR #103). */
   finalized?: number;
   scanned: number;
   transitioned: number;

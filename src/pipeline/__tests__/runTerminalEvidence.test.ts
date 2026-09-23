@@ -1,4 +1,4 @@
-// NFR #101: the orphan and resume scans never re-run a run that already
+// NFR #103: the orphan and resume scans never re-run a run that already
 // finished somewhere — deck-revise 15655b83's row said `running` after it
 // completed, and the next restart resumed it.
 
