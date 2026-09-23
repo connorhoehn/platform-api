@@ -122,6 +122,7 @@ import {
   isOwnerLive,
   ownerLiveness,
   setLocalReplica,
+  setReplicaLeaseStore,
   type SweepTask,
 } from '../lib/replicaLiveness';
 import { createDDBLeaseStore } from '../lib/ddb-lease-store';
@@ -509,6 +510,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   const sweepLeaseStore = IS_TEST_ENV
     ? createMemoryLeaseStore()
     : createDDBLeaseStore({ docClient: leaseDocClient, tableName: ddbTableName('social-outbox') });
+  setReplicaLeaseStore(sweepLeaseStore);
   const replicaHeartbeat = new ReplicaHeartbeat({ store: sweepLeaseStore, nodeId, bootedAtMs });
   void replicaHeartbeat.start();
   const clusterSweepTasks: SweepTask[] = [];

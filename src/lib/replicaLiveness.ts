@@ -57,6 +57,23 @@ export function getLocalReplica(): { nodeId: string; bootedAtMs: number } | null
 /** Test-only reset. */
 export function _resetLocalReplicaForTests(): void {
   localReplica = null;
+  replicaLeaseStore = null;
+}
+
+/**
+ * The lease store the liveness leases live in — set by bootstrap beside
+ * `setLocalReplica`, read by request paths that must decide whether another
+ * replica's claim is still held by a running process (run-draft dispatch).
+ * Null until bootstrap ran (and in unit tests that do not set it).
+ */
+let replicaLeaseStore: LeaseStore | null = null;
+
+export function setReplicaLeaseStore(store: LeaseStore | null): void {
+  replicaLeaseStore = store;
+}
+
+export function getReplicaLeaseStore(): LeaseStore | null {
+  return replicaLeaseStore;
 }
 
 function incarnationOwner(nodeId: string, bootedAtMs: number): string {

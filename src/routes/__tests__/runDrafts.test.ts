@@ -11,13 +11,13 @@ jest.mock('../../middleware/auth', () => ({
 
 import { createRunDraftsRouter, dispatchIdempotencyKey, type RunDraftsDeps } from '../runDrafts';
 import { RunDraftRepository, type RunDraft } from '../../repositories/RunDraftRepository';
-import { runIdempotent, PENDING_TTL_SECONDS, type IdempotencyStore } from '../../middleware/idempotency';
+import { runIdempotent, releasePendingClaim, PENDING_TTL_SECONDS, type IdempotencyStore } from '../../middleware/idempotency';
 import { MemoryClaimStore } from '../../deck/deckReviseRequests';
 import { ValidationError } from '../../middleware/error-handler';
 import { call, DOCS, FakeTable, serve, type Replica } from './helpers/workFakes';
 import type { TriggerRunRequest } from '../pipelineTriggers';
 
-type TriggerCall = { pipelineId: string; userId: string; body: TriggerRunRequest };
+type TriggerCall = { pipelineId: string; userId: string; body: TriggerRunRequest; runId?: string };
 
 function claimStore(): IdempotencyStore {
   const claims = new MemoryClaimStore();
@@ -36,9 +36,14 @@ interface World {
   trigger: (input: TriggerCall) => Promise<{ runId: string; pipelineId: string; triggeredBy: { userId: string; triggerType: string }; at: string }>;
   signals: Array<Record<string, unknown>>;
   now: string;
+  /** pipeline-runs as the runId-index sees it. */
+  runs: Set<string>;
+  /** Replicas whose liveness lease is held. */
+  liveNodes: Set<string>;
+  ids: number;
 }
 
-function depsFor(world: World, opts: { crashOnDispatched?: boolean } = {}): RunDraftsDeps {
+function depsFor(world: World, opts: { crashOnDispatched?: boolean; node?: string } = {}): RunDraftsDeps {
   const repo = new RunDraftRepository(world.table as any, 'document-run-drafts', async () => undefined);
   const drafts: RunDraftsDeps['drafts'] = {
     get: (d, id) => repo.get(d, id),
@@ -58,6 +63,11 @@ function depsFor(world: World, opts: { crashOnDispatched?: boolean } = {}): RunD
     runIdempotent: (o, h) => runIdempotent({ ...o, store: world.store }, h),
     publishSignal: async (_c, _e, p) => { world.signals.push(p); },
     now: () => world.now,
+    findRun: async (runId) => (world.runs.has(runId) ? { runId, status: 'running' } : null),
+    isOwnerLive: async (node) => !!node && world.liveNodes.has(node),
+    localNodeId: () => opts.node,
+    releasePendingClaim: (o) => releasePendingClaim({ ...o, store: world.store }),
+    newRunId: () => `run-${++world.ids}`,
   };
 }
 
@@ -73,15 +83,21 @@ describe('run drafts', () => {
       table: new FakeTable('documentId', 'draftId'),
       store: claimStore(),
       triggers: [],
+      // The engine starts the run under the caller's id (distributed-core >= 0.46.2) and it becomes findable.
       trigger: async (input) => {
         world.triggers.push(input);
-        return { runId: `run-${world.triggers.length}`, pipelineId: input.pipelineId, triggeredBy: { userId: input.userId, triggerType: 'manual' }, at: world.now };
+        const runId = input.runId ?? `anon-${world.triggers.length}`;
+        world.runs.add(runId);
+        return { runId, pipelineId: input.pipelineId, triggeredBy: { userId: input.userId, triggerType: 'manual' }, at: world.now };
       },
       signals: [],
       now: '2026-09-23T12:00:00.000Z',
+      runs: new Set(),
+      liveNodes: new Set(['node-a', 'node-b']),
+      ids: 0,
     };
-    a = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter(depsFor(world))]]);
-    b = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter(depsFor(world))]]);
+    a = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter(depsFor(world, { node: 'node-a' }))]]);
+    b = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter(depsFor(world, { node: 'node-b' }))]]);
   });
   afterEach(async () => {
     jest.restoreAllMocks();
@@ -128,13 +144,14 @@ describe('run drafts', () => {
     const both = await Promise.all([dispatch(a, 'dev-connor', 'req-2'), dispatch(b, 'dev-connor', 'req-2')]);
     const ok = both.filter((r) => r.status === 200);
     expect(ok.length).toBeGreaterThanOrEqual(1);
-    for (const r of ok) expect(r.body.runId).toBe('run-2');
+    for (const r of ok) expect(r.body.runId).toBe(ok[0]!.body.runId);
+    expect(world.triggers[1]!.runId).toBe(ok[0]!.body.runId);
     for (const r of both.filter((x) => x.status !== 200)) expect(r.body.error).toBe('dispatch_in_progress');
     expect(world.triggers).toHaveLength(2);
   });
 
   it('replica A dies after the trigger and before recording it; the retry on B yields the same single run', async () => {
-    const crashing = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter(depsFor(world, { crashOnDispatched: true }))]]);
+    const crashing = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter(depsFor(world, { crashOnDispatched: true, node: 'node-a' }))]]);
     try {
       await put(crashing, 'dev-connor', DRAFT);
       const died = await dispatch(crashing, 'dev-connor');
@@ -153,39 +170,92 @@ describe('run drafts', () => {
     }
   });
 
-  it('a dispatcher that dies holding the claim blocks retries until the 120 s lease lapses', async () => {
-    let t = Date.parse(world.now);
-    jest.spyOn(Date, 'now').mockImplementation(() => t);
-    const hang = new Promise<never>(() => undefined);
+  // A dispatcher dying INSIDE step 2: A's request is left stuck in the trigger with the
+  // claim `pending`, exactly as a process that died there would leave it. `startsRun`
+  // says whether the run had already been created (the crash-between-trigger-and-commit case).
+  async function dieInsideTrigger(startsRun: boolean): Promise<{ abort: () => Promise<void>; draft: RunDraft }> {
     const realTrigger = world.trigger;
-    world.trigger = async (input) => { world.triggers.push(input); return hang; };
+    world.trigger = async (input) => {
+      world.triggers.push(input);
+      if (startsRun) world.runs.add(input.runId!);
+      return new Promise<never>(() => undefined);
+    };
     await put(a, 'dev-connor', DRAFT);
-    const abort = new AbortController();
-    const dying = fetch(`${a.url}/api/documents/doc-1/run-drafts/req-1/dispatch`, { method: 'POST', headers: { 'x-test-user': 'dev-connor' }, signal: abort.signal }).catch(() => null);
+    const ctl = new AbortController();
+    const dying = fetch(`${a.url}/api/documents/doc-1/run-drafts/req-1/dispatch`, { method: 'POST', headers: { 'x-test-user': 'dev-connor' }, signal: ctl.signal }).catch(() => null);
     while (world.triggers.length === 0) await new Promise((r) => setImmediate(r));
     world.trigger = realTrigger;
+    const draft = (await call(b.url, 'GET', '/api/documents/doc-1/run-drafts/req-1', 'dev-connor')).body.draft as RunDraft;
+    return { draft, abort: async () => { ctl.abort(); await dying; } };
+  }
+
+  it('the run id is chosen before the trigger, recorded on the dispatching draft, and the run is started under it', async () => {
+    const { draft, abort } = await dieInsideTrigger(false);
+    expect(draft).toMatchObject({ status: 'dispatching', pendingRunId: 'run-1', dispatchOwnerNodeId: 'node-a' });
+    expect(world.triggers[0]!.runId).toBe('run-1');
+    await abort();
+  });
+
+  it('crash between starting the run and committing the claim: a retry adopts the run at once — one run, no 120 s wait', async () => {
+    const { abort } = await dieInsideTrigger(true);
+    world.liveNodes.delete('node-a');
+    const retry = await dispatch(b, 'dev-erin');
+    expect(retry.status).toBe(200);
+    expect(retry.body).toMatchObject({ runId: 'run-1', adopted: true, replayed: true, draft: { status: 'dispatched', runId: 'run-1', dispatchedBy: 'dev-connor' } });
+    expect(world.triggers).toHaveLength(1);
+    expect((await dispatch(b, 'dev-connor')).body).toMatchObject({ runId: 'run-1', replayed: true });
+    await abort();
+  });
+
+  it('the same crash with the owner still alive also adopts, since the run exists', async () => {
+    const { abort } = await dieInsideTrigger(true);
+    const retry = await dispatch(b, 'dev-connor');
+    expect(retry.body).toMatchObject({ runId: 'run-1', adopted: true });
+    expect(world.triggers).toHaveLength(1);
+    await abort();
+  });
+
+  it('dead owner, no run yet: a retry takes over at once and starts the run under the SAME id; a live owner still blocks', async () => {
+    let t = Date.parse(world.now);
+    jest.spyOn(Date, 'now').mockImplementation(() => t);
+    const { abort } = await dieInsideTrigger(false);
 
     const blocked = await dispatch(b, 'dev-connor');
     expect(blocked.status).toBe(409);
     expect(blocked.body).toMatchObject({ error: 'dispatch_in_progress', retryAfterSeconds: 2, claimLeaseSeconds: 120 });
     expect(blocked.headers.get('retry-after')).toBe('2');
 
+    // A's liveness lease lapses (its process died): the next retry takes over at t+1 s, not t+120 s.
+    world.liveNodes.delete('node-a');
+    t += 1000;
+    const both = await Promise.all([dispatch(b, 'dev-erin'), dispatch(b, 'dev-connor')]);
+    const won = both.filter((r) => r.status === 200);
+    expect(won.length).toBeGreaterThanOrEqual(1);
+    for (const r of won) expect(r.body).toMatchObject({ runId: 'run-1', draft: { status: 'dispatched', runId: 'run-1', dispatchOwnerNodeId: 'node-b' } });
+    for (const r of both.filter((x) => x.status !== 200)) expect(r.body.error).toBe('dispatch_in_progress');
+    // Two trigger calls, ONE run id: the dead holder's (which never created the run) and the takeover's.
+    expect(world.triggers.map((c) => c.runId)).toEqual(['run-1', 'run-1']);
+    expect(world.triggers[1]!.userId).toBe('dev-connor');
+    await abort();
+  });
+
+  it('with the owner reading as alive, the 120 s claim lease still bounds the wait, and the takeover adopts a run that surfaced', async () => {
+    let t = Date.parse(world.now);
+    jest.spyOn(Date, 'now').mockImplementation(() => t);
+    const { abort } = await dieInsideTrigger(false);
     t += (PENDING_TTL_SECONDS - 1) * 1000;
     expect((await dispatch(b, 'dev-connor')).status).toBe(409);
-
-    t += 2000; // past the lease
+    world.runs.add('run-1');
+    t += 2000;
     const taken = await dispatch(b, 'dev-connor');
     expect(taken.status).toBe(200);
-    expect(taken.body.draft.status).toBe('dispatched');
-    // The dead holder's trigger had begun: the take-over starts a second run. This is the
-    // residual window (process death inside createResource) the PLAN's Retry copy must name.
-    expect(world.triggers).toHaveLength(2);
-    abort.abort();
-    await dying;
+    expect(taken.body).toMatchObject({ runId: 'run-1', draft: { status: 'dispatched' } });
+    expect(world.triggers).toHaveLength(1);
+    await abort();
   });
 
   it('a stuck dispatch reads as stale after 60 s; nothing is written by the read', async () => {
-    const crashing = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter(depsFor(world, { crashOnDispatched: true }))]]);
+    const crashing = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter(depsFor(world, { crashOnDispatched: true, node: 'node-a' }))]]);
     try {
       await put(crashing, 'dev-connor', DRAFT);
       await dispatch(crashing, 'dev-connor');
@@ -213,7 +283,7 @@ describe('run drafts', () => {
     world.trigger = realTrigger;
     const ok = await dispatch(b, 'dev-connor');
     expect(ok.status).toBe(200);
-    expect(ok.body.runId).toBe('run-1');
+    expect(ok.body.runId).toBe('run-2'); // the refused attempt's id (run-1) started nothing; a new dispatch gets a new id
   });
 
   it('after dispatch the draft is frozen: a changed PUT is refused, the same PUT replays', async () => {

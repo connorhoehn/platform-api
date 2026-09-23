@@ -22,14 +22,29 @@
 //   3. CAS  dispatching → dispatched with the runId.
 // A replica that crashed between 2 and 3 left a committed claim: any retry
 // replays the same runId and finishes 3. One that died INSIDE 2 left the claim
-// `pending`: retries answer 409 `dispatch_in_progress` until the claim's lease
-// (PENDING_TTL_SECONDS = 120 s) lapses, then take it over. A trigger refusal
-// returns the draft to `draft` with `dispatchError`, so it can be edited.
+// `pending`. Step 1 therefore also records the run's id (`pendingRunId`,
+// generated before the trigger, which starts the run under it) and the
+// dispatching replica (`dispatchOwnerNodeId`). A retry that meets the pending
+// claim:
+//   a. looks the run up by that id (pipeline-runs `runId-index`) and, if the
+//      run exists, ADOPTS it — step 3 with that id, no second run;
+//   b. else, if the owner's incarnation has lost its liveness lease
+//      (replicaLiveness), takes the dispatch over at once: a conditional CAS
+//      moves `dispatchOwnerNodeId` to itself (one taker wins), the dead
+//      holder's pending claim is released, and the run is triggered under the
+//      SAME id;
+//   c. else answers 409 `dispatch_in_progress` (the owner is alive, or its
+//      liveness cannot be read) until the owner finishes or the claim's lease
+//      (PENDING_TTL_SECONDS = 120 s) lapses.
+// A trigger taken under a lapsed claim also checks for the run first. A
+// trigger refusal returns the draft to `draft` with `dispatchError`, so it can
+// be edited.
 //
 // Auth: every route needs the `document:edit` policy (owner or editor) except
 // the GETs, which need the document to exist. Signals: `doc:run_draft_updated`
 // on `doc-work:<documentId>` — ids and enums only.
 
+import { randomUUID } from 'crypto';
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { AppError, ValidationError } from '../middleware/error-handler';
@@ -68,7 +83,7 @@ export interface RunDraftsDeps extends DocumentAccessDeps {
     replaceIf(next: RunDraft, seen: { revision: number; fromStatuses: readonly RunDraftStatus[] }): Promise<void>;
   };
   /** `triggerPipelineRun` (pipelineTriggers.ts). Throws PipelineTriggerBridgeError / AppError on refusal. */
-  trigger(input: { pipelineId: string; userId: string; organizationId?: string; body: TriggerRunRequest }): Promise<TriggerRunResponse>;
+  trigger(input: { pipelineId: string; userId: string; organizationId?: string; body: TriggerRunRequest; runId?: string }): Promise<TriggerRunResponse>;
   /** `runIdempotent` (middleware/idempotency.ts). */
   runIdempotent<T>(
     opts: { scope: string; userId: string; key: string; body: unknown },
@@ -76,6 +91,16 @@ export interface RunDraftsDeps extends DocumentAccessDeps {
   ): Promise<IdempotentOutcome<T>>;
   publishSignal(channelId: string, eventName: string, payload: Record<string, unknown>): Promise<void>;
   now(): string;
+  /** The run with this id, if pipeline-runs has it (`runId-index`). Absent → never adopts. */
+  findRun?(runId: string): Promise<{ runId: string; status?: string } | null>;
+  /** Is the replica that took the dispatch at `sinceMs` still running? Absent, or unreadable → treated as alive. */
+  isOwnerLive?(ownerNodeId: string | undefined, sinceMs: number): Promise<boolean>;
+  /** This replica's node id, stamped as the dispatch owner. */
+  localNodeId?(): string | undefined;
+  /** Drop a still-pending Idempotency-Key claim (`releasePendingClaim`). */
+  releasePendingClaim?(opts: { scope: string; userId: string; key: string }): Promise<void>;
+  /** The id a new run gets (default `randomUUID`). */
+  newRunId?(): string;
 }
 
 export interface RunDraftView extends RunDraft {
@@ -171,6 +196,11 @@ export function triggerBodyOf(draft: RunDraft): TriggerRunRequest {
       ...(draft.sources ? { sources: draft.sources } : {}),
     },
   };
+}
+
+/** The trigger's answer for a run that was already started under the draft's `pendingRunId`. */
+function adoptedResponse(draft: RunDraft, runAs: string, runId: string): TriggerRunResponse {
+  return { runId, pipelineId: draft.pipelineId, triggeredBy: { userId: runAs, triggerType: 'manual' }, at: draft.dispatchStartedAt ?? draft.updatedAt };
 }
 
 function isDraftConflict(err: unknown): boolean {
@@ -315,13 +345,18 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
         return;
       }
 
+      let tookStep1 = false;
       if (draft.status === 'draft') {
-        // Step 1: claim the dispatch.
+        // Step 1: claim the dispatch, with the run's id chosen up front.
         const now = deps.now();
+        const owner = deps.localNodeId?.();
         const next: RunDraft = {
           ...draft, status: 'dispatching', dispatchedBy: userId, dispatchStartedAt: now,
+          pendingRunId: (deps.newRunId ?? randomUUID)(),
+          ...(owner ? { dispatchOwnerNodeId: owner } : {}),
           revision: draft.revision + 1, updatedAt: now, updatedBy: userId,
         };
+        if (!owner) delete next.dispatchOwnerNodeId;
         delete next.dispatchError;
         try {
           await deps.drafts.replaceIf(next, { revision: draft.revision, fromStatuses: ['draft'] });
@@ -331,6 +366,7 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
           continue;
         }
         draft = next;
+        tookStep1 = true;
         signal(draft);
       }
 
@@ -338,19 +374,28 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
       const dispatching: RunDraft = draft;
       const runAs = dispatching.dispatchedBy ?? userId;
       const body = triggerBodyOf(dispatching);
+      const claimKey = { scope: DISPATCH_IDEMPOTENCY_SCOPE, userId: runAs, key: dispatchIdempotencyKey(draftId) };
+      const runId0 = dispatching.pendingRunId;
       let outcome: IdempotentOutcome<TriggerRunResponse>;
       try {
         outcome = await deps.runIdempotent<TriggerRunResponse>(
-          { scope: DISPATCH_IDEMPOTENCY_SCOPE, userId: runAs, key: dispatchIdempotencyKey(draftId), body },
-          async () => ({
-            status: 202,
-            body: await deps.trigger({
-              pipelineId: dispatching.pipelineId,
-              userId: runAs,
-              ...(dispatching.organizationId ? { organizationId: dispatching.organizationId } : {}),
-              body: triggerBodyOf(dispatching),
-            }),
-          }),
+          { ...claimKey, body },
+          async () => {
+            // Not the request that chose the id: the run may already exist
+            // (its dispatcher died after starting it). Adopt, never re-start.
+            const existing = !tookStep1 && runId0 ? await findRun(runId0) : null;
+            if (existing) return { status: 202, body: adoptedResponse(dispatching, runAs, existing.runId) };
+            return {
+              status: 202,
+              body: await deps.trigger({
+                pipelineId: dispatching.pipelineId,
+                userId: runAs,
+                ...(dispatching.organizationId ? { organizationId: dispatching.organizationId } : {}),
+                body: triggerBodyOf(dispatching),
+                ...(runId0 ? { runId: runId0 } : {}),
+              }),
+            };
+          },
         );
       } catch (err) {
         if ((err as { name?: string })?.name === 'IdempotencyStoreUnavailableError') {
@@ -361,6 +406,39 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
         const status = err instanceof AppError ? err.status : (err as { name?: string })?.name === 'PipelineTriggerBridgeError' ? 502 : 500;
         res.status(status).json({ error: 'trigger_failed', message: err instanceof Error ? err.message : String(err), draftId });
         return;
+      }
+      let adopted = false;
+      if (outcome.outcome === 'in_progress' && runId0) {
+        // (a) The run already exists: adopt it.
+        const existing = await findRun(runId0);
+        if (existing) {
+          outcome = { outcome: 'replayed', status: 202, body: adoptedResponse(dispatching, runAs, existing.runId) };
+          adopted = true;
+        } else if (!(await ownerLive(dispatching))) {
+          // (b) The owner's process is gone: take the dispatch over now. The CAS
+          // makes this replica the owner — exactly one concurrent taker wins;
+          // a loser re-reads and sees a live owner.
+          const now = deps.now();
+          const owner = deps.localNodeId?.();
+          const taken: RunDraft = {
+            ...dispatching, dispatchStartedAt: now, revision: dispatching.revision + 1, updatedAt: now, updatedBy: userId,
+            ...(owner ? { dispatchOwnerNodeId: owner } : {}),
+          };
+          if (!owner) delete taken.dispatchOwnerNodeId;
+          try {
+            await deps.drafts.replaceIf(taken, { revision: dispatching.revision, fromStatuses: ['dispatching'] });
+          } catch (err) {
+            if (!isDraftConflict(err)) throw err;
+            draft = await deps.drafts.get(documentId, draftId);
+            continue;
+          }
+          log.warn({ draftId, runId: runId0, deadOwner: dispatching.dispatchOwnerNodeId, owner }, 'run draft: dispatch owner is gone; taking the dispatch over');
+          await deps.releasePendingClaim?.(claimKey).catch((err: unknown) => {
+            log.warn({ draftId, err: (err as Error).message }, 'run draft: could not release the dead owner\'s claim');
+          });
+          draft = taken;
+          continue; // step 2 again, as the owner, under the same run id
+        }
       }
       if (outcome.outcome === 'in_progress') {
         res.setHeader('Retry-After', '2');
@@ -394,16 +472,40 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
         continue; // another replica finished it (→ dispatched, answered above) or it moved; re-evaluate
       }
       signal(done);
-      res.status(200).json({ draft: done, runId, replayed: outcome.outcome === 'replayed' });
+      res.status(200).json({ draft: done, runId, replayed: outcome.outcome === 'replayed', ...(adopted ? { adopted: true } : {}) });
       return;
     }
     res.status(409).json({ error: 'draft_busy', message: 'The draft kept changing under this dispatch; retry.' });
+
+    async function findRun(runId: string): Promise<{ runId: string } | null> {
+      if (!deps.findRun) return null;
+      try {
+        return await deps.findRun(runId);
+      } catch (err) {
+        // Unknown → do not adopt, and do not start a second run on this basis either:
+        // the caller falls through to the claim, which still serialises triggers.
+        log.warn({ draftId, runId, err: (err as Error).message }, 'run draft: run lookup failed');
+        return null;
+      }
+    }
+
+    async function ownerLive(d: RunDraft): Promise<boolean> {
+      if (!deps.isOwnerLive || !d.dispatchOwnerNodeId) return true;
+      const since = Date.parse(d.dispatchStartedAt ?? '');
+      try {
+        return await deps.isOwnerLive(d.dispatchOwnerNodeId, Number.isFinite(since) ? since : Number.NaN);
+      } catch {
+        return true;
+      }
+    }
 
     async function returnToDraft(d: RunDraft, err: unknown): Promise<void> {
       const now = deps.now();
       const back: RunDraft = { ...d, status: 'draft', revision: d.revision + 1, updatedAt: now, dispatchError: (err instanceof Error ? err.message : String(err)).slice(0, 500) };
       delete back.dispatchedBy;
       delete back.dispatchStartedAt;
+      delete back.pendingRunId;
+      delete back.dispatchOwnerNodeId;
       try {
         await deps.drafts.replaceIf(back, { revision: d.revision, fromStatuses: ['dispatching'] });
         signal(back);
@@ -424,6 +526,10 @@ export function defaultRunDraftsDeps(): RunDraftsDeps {
   const idem = require('../middleware/idempotency') as typeof import('../middleware/idempotency');
   const catalog = require('../lib/event-catalog') as typeof import('../lib/event-catalog');
   const logger = require('../lib/logger') as typeof import('../lib/logger');
+  const locator = require('../work-graph/sources/runRowLocator') as typeof import('../work-graph/sources/runRowLocator');
+  const liveness = require('../lib/replicaLiveness') as typeof import('../lib/replicaLiveness');
+  const awsClients = require('../lib/aws-clients') as typeof import('../lib/aws-clients');
+  const { tableName: ddbTable } = require('../lib/ddb-table-name') as typeof import('../lib/ddb-table-name');
   /* eslint-enable @typescript-eslint/no-require-imports */
   return {
     getDocumentRow: (id) => getPresentationDocumentStore().get(id),
@@ -432,17 +538,30 @@ export function defaultRunDraftsDeps(): RunDraftsDeps {
       return row ? { status: row.status, ownerId: row.ownerId } : null;
     },
     drafts: runDraftRepo,
-    trigger: async ({ pipelineId, userId, organizationId, body }) => {
+    trigger: async ({ pipelineId, userId, organizationId, body, runId }) => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { triggerPipelineRun } = require('./pipelineTriggers') as typeof import('./pipelineTriggers');
       return triggerPipelineRun({
-        pipelineId, userId, body, ...(organizationId ? { organizationId } : {}),
+        pipelineId, userId, body, ...(organizationId ? { organizationId } : {}), ...(runId ? { runId } : {}),
         reqLog: logger.withContext({ route: 'runDrafts', pipelineId, userId }),
       });
     },
     runIdempotent: (opts, handler) => idem.runIdempotent(opts, handler),
     publishSignal: (c, e, p) => catalog.publishSignal(c, e, p),
     now: () => new Date().toISOString(),
+    // The run by id through pipeline-runs' runId-index (1291b5a): one indexed read, fresh.
+    findRun: async (runId) => {
+      const rows = await locator.runRowLocator.rows(awsClients.docClient, ddbTable('pipeline-runs'), [runId]);
+      const row = rows.get(runId) as { runId?: string; status?: string } | null | undefined;
+      return row ? { runId, ...(typeof row.status === 'string' ? { status: row.status } : {}) } : null;
+    },
+    // The owner's liveness lease (a07a3f2). No store yet (before bootstrap) → alive: wait out the claim.
+    isOwnerLive: async (ownerNodeId, sinceMs) => {
+      const store = liveness.getReplicaLeaseStore();
+      return store ? liveness.isOwnerLive(store, ownerNodeId, sinceMs) : true;
+    },
+    localNodeId: () => liveness.getLocalReplica()?.nodeId,
+    releasePendingClaim: (opts) => idem.releasePendingClaim(opts),
   };
 }
 

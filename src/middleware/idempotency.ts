@@ -495,3 +495,18 @@ export async function runIdempotent<T>(
   }
   return { outcome: 'ran', status: result.status, body: result.body };
 }
+
+/**
+ * Drop the `runIdempotent` claim for (`scope`, `userId`, `key`) ONLY while it
+ * is still `pending` — never a committed answer. For a caller that has proved,
+ * by other means, that the pending holder is gone (run-draft dispatch: the
+ * holder's replica incarnation lost its liveness lease, and the caller won the
+ * conditional takeover of the draft), so it need not wait out
+ * `PENDING_TTL_SECONDS`.
+ */
+export async function releasePendingClaim(
+  opts: { scope: string; userId: string; key: string; store?: IdempotencyStore | null },
+): Promise<void> {
+  const cacheKey = `idem:${opts.scope}:${opts.userId || 'anon'}:${opts.key}`;
+  await resolveStore(opts.store).release(cacheKey);
+}

@@ -59,6 +59,15 @@ export interface RunDraft {
   dispatchedBy?: string;
   /** When draft → dispatching was taken (the "Dispatch not confirmed" clock). */
   dispatchStartedAt?: string;
+  /**
+   * The run's id, chosen when draft → dispatching is taken and BEFORE the run
+   * is triggered; the trigger starts the run under exactly this id. A retry
+   * that finds the claim held looks the run up by it (pipeline-runs
+   * `runId-index`) and adopts it rather than starting a second run.
+   */
+  pendingRunId?: string;
+  /** The replica (node id) holding the dispatch; its liveness lease decides whether a retry may take over at once. */
+  dispatchOwnerNodeId?: string;
   dispatchedAt?: string;
   /** The last dispatch refusal (trigger 4xx/5xx), kept on the draft it returned to. */
   dispatchError?: string;

@@ -310,7 +310,11 @@ export function createBridge(
   let inspector: QueueInspector<PipelineRunSnapshot> | null = null;
 
   return {
-    async trigger({ pipelineId, definition, triggerPayload, triggeredBy, breakpoints }) {
+    async trigger(args) {
+      const { pipelineId, definition, triggerPayload, triggeredBy, breakpoints } = args;
+      // A caller-chosen run id (run-draft dispatch; validated by triggerPipelineRun
+      // and again by distributed-core's createResource, ≥ v0.46.2).
+      const requestedRunId = (args as { runId?: unknown }).runId;
       const resource = await module.createResource({
         applicationData: {
           definition,
@@ -318,6 +322,7 @@ export function createBridge(
           triggeredBy,
           pipelineId,
           breakpoints,
+          ...(typeof requestedRunId === 'string' ? { runId: requestedRunId } : {}),
         },
       });
       const data = (resource.applicationData ?? {}) as Record<string, unknown>;

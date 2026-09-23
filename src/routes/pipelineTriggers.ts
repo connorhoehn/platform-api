@@ -14,7 +14,7 @@ import {
 } from '../observability/metrics';
 import { classifyPipelineError, type ErrorCategory } from '../pipeline/error-classification';
 import { auditRepo, type AuditAction, type AuditDecision } from '../pipeline/audit-repository';
-import { getPipelineBridge, type PendingApprovalRow } from '../pipeline/bridge-types';
+import { getPipelineBridge, type PendingApprovalRow, type PipelineBridge } from '../pipeline/bridge-types';
 import { getApprovalForwarder } from '../pipeline/approval-forwarder';
 import { forwardRunControl, runControlForwarder } from './runControlForwarding';
 import { getRunRollupSubscriber, lookupPipelineIdByRunId } from '../pipeline/run-rollup-subscriber';
@@ -254,21 +254,37 @@ export class PipelineTriggerBridgeError extends Error {
   }
 }
 
+/** The bridge's trigger args plus the caller-chosen run id `createBridge` forwards to `createResource`. */
+export type BridgeTriggerArgs = Parameters<NonNullable<PipelineBridge['trigger']>>[0] & { runId?: string };
+
 /**
  * The body of `POST /api/pipelines/:pipelineId/runs` after rate limiting and
  * the Idempotency-Key claim: pin the requester, resolve the definition, start
  * the run. Exported so a run draft's dispatch (routes/runDrafts.ts) starts a
  * run through exactly this code, under the same claim (`runIdempotent`).
  * Throws `PipelineTriggerBridgeError` when the bridge refuses the run.
+ *
+ * `runId` is the id the run must have, chosen by a SERVER-SIDE caller (a run
+ * draft records it before triggering, so a takeover after a crash can find
+ * the run by id and adopt it). It is not read from the HTTP body: a client
+ * must never pick a run's id. Validated here (ValidationError → 400) and again
+ * by distributed-core's `createResource` (≥ v0.46.2), which also refuses an id
+ * already running on the node.
  */
+export const CALLER_RUN_ID = /^[A-Za-z0-9_-]{8,128}$/;
+
 export async function triggerPipelineRun(input: {
   pipelineId: string;
   userId: string;
   organizationId?: string;
   body: TriggerRunRequest;
   reqLog: ReturnType<typeof withContext>;
+  runId?: string;
 }): Promise<TriggerRunResponse> {
   const { pipelineId, userId, organizationId, body, reqLog } = input;
+  if (input.runId !== undefined && !CALLER_RUN_ID.test(input.runId)) {
+    throw new ValidationError('runId must be 8–128 of [A-Za-z0-9_-]');
+  }
   // The trigger payload becomes the run's context, and step handlers act
   // AS `context.requestedBy` (the deck steps write revisions with it and
   // check edit rights against it). Here the payload is the caller's own
@@ -313,18 +329,25 @@ export async function triggerPipelineRun(input: {
       const out = await withSpan(
         'pipeline.trigger',
         { 'pipeline.id': pipelineId, 'pipeline.user_id': userId },
-        async () =>
-          Promise.resolve(
-            bridge!.trigger!({
-              pipelineId,
-              definition: resolvedDefinition,
-              triggerPayload: body.triggerPayload,
-              triggeredBy: { userId },
-              breakpoints: body.breakpoints,
-            }),
-          ),
+        async () => {
+          // `runId` rides beside the bridge contract's args (createBridge forwards it).
+          const args: BridgeTriggerArgs = {
+            pipelineId,
+            definition: resolvedDefinition,
+            triggerPayload: body.triggerPayload,
+            triggeredBy: { userId },
+            breakpoints: body.breakpoints,
+            ...(input.runId ? { runId: input.runId } : {}),
+          };
+          return Promise.resolve(bridge!.trigger!(args));
+        },
       );
       runId = out.runId;
+      if (input.runId && runId !== input.runId) {
+        // An engine that ignored the requested id (distributed-core < v0.46.2):
+        // the caller's crash recovery would look for the wrong run.
+        reqLog.error({ requested: input.runId, runId }, 'pipeline engine did not honour the requested runId');
+      }
       // Pre-populate the run cache so terminal events have a pipelineId
       // even if the framework rejects the definition before publishing
       // pipeline:run:started (e.g. "No trigger node in definition").
@@ -340,7 +363,7 @@ export async function triggerPipelineRun(input: {
       throw new PipelineTriggerBridgeError(err);
     }
   } else {
-    runId = randomUUID();
+    runId = input.runId ?? randomUUID();
     reqLog.info(
       { runId, action: 'trigger.stub' },
       'pipeline bridge not wired; synthesized runId',
