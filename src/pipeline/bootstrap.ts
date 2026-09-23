@@ -141,6 +141,8 @@ import { forgetDeadLetters, rehydrateDeadLetters, setDeadLetterStore } from './d
 import { getSystemPipeline } from './systemPipelines';
 import { getPipelineBridge } from '../routes/pipelineTriggers';
 import { describePipelineRecovery, runWalPreflight } from './WalPreflight';
+import { resolveLiveMqConfig, startPipelineEventMqRelay, type PipelineEventMqRelay } from './event-mq-relay';
+import { setDeckReviseLiveSink } from '../deck/deckReviseEvents';
 import { createShutdown } from './ShutdownOrchestrator';
 import {
   startPipelineEventRedisRelay,
@@ -923,6 +925,22 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     );
   }
 
+  // NFR #35: the same live progress onto the MQ queue the gateway consumes
+  // (`pipeline-events`), so a deployment without the Redis path still sees
+  // runs, steps and deck-revise phases. The gateway drops a copy it already
+  // had over Redis by event id. Not in tests (no queue to talk to).
+  let pipelineEventMqRelay: PipelineEventMqRelay | null = null;
+  {
+    const liveMq = resolveLiveMqConfig();
+    if (liveMq.enabled && liveMq.url && !IS_TEST_ENV) {
+      pipelineEventMqRelay = startPipelineEventMqRelay({ url: liveMq.url, eventBus });
+      const relay = pipelineEventMqRelay;
+      setDeckReviseLiveSink((event) => relay.publish(event));
+    } else {
+      bootstrapLog.info({ reason: liveMq.reason }, 'live pipeline events → MQ: off');
+    }
+  }
+
   const runQueueSubIds: string[] = [];
   // A composer edit (`deck-revise`) that dies in any step still has to tell
   // the document's channel it failed; its steps own every other event.
@@ -1390,6 +1408,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     judgeAggregatorSubscriber,
     auditSweeperStop,
     pipelineEventRelay,
+    pipelineEventMqRelay,
     moduleRegistry,
     resourceRegistry,
     hintedHandoff,

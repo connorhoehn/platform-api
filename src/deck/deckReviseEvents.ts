@@ -16,8 +16,8 @@
 //
 // They are NOT put on the platform's own EventBus: its subscribers (run
 // persistence, the durable outbox) would take a `pipeline:` event for a run.
-// Only the Redis relay path carries them; a deployment with MQ and no Redis
-// relay gets no live revise progress (the request/response still works).
+// They go to Redis and, when the deployment has a message queue, to the MQ
+// queue the gateway consumes too (NFR #35, `setDeckReviseLiveSink`).
 //
 // CONTENT: ids, the phase and the outcome only — never the instruction, the
 // summary or any slide text. The pipeline channels have no per-document
@@ -106,6 +106,16 @@ const redisPublish: DeckRevisePublish = async (channel, message) => {
 
 const NODE_ID = `platform-api:${process.env.HOSTNAME ?? 'local'}`;
 
+/**
+ * NFR #35: a second live sink (the MQ relay, `pipeline/event-mq-relay.ts`),
+ * registered at bootstrap when the deployment has a message queue. Same event,
+ * same `id`, so a gateway on both paths keeps one.
+ */
+let liveSink: ((event: DeckReviseBusEvent) => void) | null = null;
+export function setDeckReviseLiveSink(sink: ((event: DeckReviseBusEvent) => void) | null): void {
+  liveSink = sink;
+}
+
 export interface DeckReviseEmitter {
   started(): void;
   phase(phase: DeckReviseEventPhase): void;
@@ -169,6 +179,7 @@ export function createDeckReviseEmitter(init: DeckReviseEmitterInit): DeckRevise
       version: ++version,
       sourceNodeId: NODE_ID,
     };
+    try { liveSink?.(event); } catch { /* a sink never fails a revise */ }
     publish(channelForType(type), JSON.stringify(event)).catch((err: unknown) => {
       log.warn({ err: err instanceof Error ? err.message : String(err), type, documentId: init.documentId }, 'deck revise event not published');
     });

@@ -16,6 +16,7 @@ interface ShutdownDeps {
   auditSweeperStop: (() => void) | null;
   /** Live EventBus → Redis egress; null when disabled or it failed to start. */
   pipelineEventRelay: PipelineEventRedisRelay | null;
+  pipelineEventMqRelay?: { stop(): Promise<void> } | null;
   moduleRegistry: { stop(): Promise<void> };
   resourceRegistry: { stop(): Promise<void> };
   hintedHandoff: { stop(): Promise<void> } | null;
@@ -35,6 +36,7 @@ export function createShutdown(deps: ShutdownDeps): () => Promise<void> {
     judgeAggregatorSubscriber,
     auditSweeperStop,
     pipelineEventRelay,
+    pipelineEventMqRelay,
     moduleRegistry,
     resourceRegistry,
     hintedHandoff,
@@ -67,6 +69,7 @@ export function createShutdown(deps: ShutdownDeps): () => Promise<void> {
     // module drains (a run failing out, steps being abandoned) should still
     // reach the canvas rather than vanishing at the start of shutdown.
     try { if (pipelineEventRelay) await pipelineEventRelay.stop(); } catch (err) { logger.error({ err: String(err) }, 'pipelineEventRelay.stop() failed'); }
+    try { if (pipelineEventMqRelay) await pipelineEventMqRelay.stop(); } catch (err) { logger.error({ err: String(err) }, 'pipelineEventMqRelay.stop() failed'); }
     try { if (hintedHandoff) await hintedHandoff.stop(); } catch (err) { logger.error({ err: String(err) }, 'hintedHandoff.stop() failed'); }
     try { if (fdBridge) await fdBridge.stop(); } catch (err) { logger.error({ err: String(err) }, 'fdBridge.stop() failed'); }
     try {
