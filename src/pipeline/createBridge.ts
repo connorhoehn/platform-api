@@ -137,6 +137,8 @@ function summariesToStepExecutions(
       output: summary.output,
       error: summary.error,
       ...(attempts.length > 0 ? { attempts } : {}),
+      // What an agent step actually ran with (model, budget after overrides).
+      ...(summary.agent ? { agent: summary.agent } : {}),
     } as StepExecution;
   }
   return out;
@@ -191,6 +193,8 @@ function parseStoredError(stored: string): { message: string; nodeId: string; er
 export type PipelineRunListRow = PipelineRunSnapshot & {
   /** Estimated USD cost, summed across models. Absent when nothing was spent. */
   estimatedCostUsd?: number;
+  /** The trigger's model / budget overrides for the run's agent steps (runOverrides.ts). */
+  runOverrides?: PipelineRunItem['runOverrides'];
 };
 
 export function runItemToSnapshot(item: PipelineRunItem): PipelineRunListRow {
@@ -215,6 +219,7 @@ export function runItemToSnapshot(item: PipelineRunItem): PipelineRunListRow {
     // DLQ redrive lineage, both directions.
     ...(item.redriveOf ? { redriveOf: item.redriveOf } : {}),
     ...(item.redrivenBy && item.redrivenBy.length > 0 ? { redrivenBy: item.redrivenBy } : {}),
+    ...(item.runOverrides ? { runOverrides: item.runOverrides } : {}),
     // Omitted rather than zeroed when nothing was spent: a run with no LLM step
     // has no cost, which is different from a cost of zero dollars.
     ...(typeof item.estimatedCostUsd === 'number' && item.estimatedCostUsd > 0

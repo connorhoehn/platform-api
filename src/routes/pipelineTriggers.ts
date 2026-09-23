@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { getCorrelationId } from '@connorhoehn/service-runtime';
 import { withSpan } from 'distributed-core';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
-import { stampRunOverrides } from '../pipeline/runOverrides';
+import { runOverridesFrom, stampRunOverrides } from '../pipeline/runOverrides';
 import { idempotency } from '../middleware/idempotency';
 import { createRateLimiter } from '../middleware/rateLimit';
 import { withContext } from '../lib/logger';
@@ -551,6 +551,10 @@ pipelineTriggersRouter.get(
       if (persisted?.redriveOf) snap.redriveOf = persisted.redriveOf;
       if (persisted?.redrivenBy && persisted.redrivenBy.length > 0) snap.redrivenBy = persisted.redrivenBy;
       if (persisted?.review) (snap as Record<string, unknown>).review = persisted.review;
+      // What the run's agent steps were told to run with (runOverrides.ts):
+      // the row's, else the live context's stamped copy.
+      const overrides = persisted?.runOverrides ?? runOverridesFrom((snap as { context?: Record<string, unknown> }).context);
+      if (overrides) (snap as Record<string, unknown>).runOverrides = overrides;
     } catch (err) {
       reqLog.warn(
         { err: err instanceof Error ? err.message : String(err) },

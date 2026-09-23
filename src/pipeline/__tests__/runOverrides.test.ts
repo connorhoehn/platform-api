@@ -134,3 +134,17 @@ describe('run overrides — the run record and the rollup show what ran', () => 
     expect(done.recent[0]).toMatchObject({ status: 'completed', model: 'opus' });
   });
 });
+
+describe('run overrides — the run read', () => {
+  it('runItemToSnapshot (list + persisted detail) carries runOverrides and each agent step\'s effective settings', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { runItemToSnapshot } = require('../createBridge') as typeof import('../createBridge');
+    const snap = runItemToSnapshot({
+      pipelineId: 'p', runId: 'r', status: 'completed', triggeredBy: 'u', triggerType: 'manual', startedAt: 't',
+      runOverrides: { model: 'opus', contextBudgetTokens: 60_000 },
+      stepsSummary: { 'agent:a': { status: 'completed', agent: { model: 'opus', contextBudgetTokens: 60_000 } } },
+    } as unknown as PipelineRunItem);
+    expect(snap.runOverrides).toEqual({ model: 'opus', contextBudgetTokens: 60_000 });
+    expect((snap.steps as Record<string, { agent?: unknown }>)['agent:a'].agent).toEqual({ model: 'opus', contextBudgetTokens: 60_000 });
+  });
+});
