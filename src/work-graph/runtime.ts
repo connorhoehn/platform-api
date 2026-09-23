@@ -112,10 +112,57 @@ async function scanAll(
   return rows.slice(0, maximum);
 }
 
-class DynamoWorkGraphDirectory implements WorkGraphDirectory {
-  private readonly sourceAccounts: WorkSourceAccountRepository;
+/**
+ * Principals a browser request needs before it can be authorized. Each is a
+ * create-only join (`ensureVerifiedSourcePrincipal`), so once it exists it is
+ * never rewritten — which made writing all six on every read pure waste: six
+ * conditional Puts that fail their condition, then six Gets, on every graph,
+ * people, preview and ask request.
+ */
+const VIEWER_PRINCIPALS: ReadonlyArray<{
+  source: WorkSourceKind;
+  producerServiceId: 'platform-api' | 'websocket-gateway' | 'aws-agentcore';
+}> = [
+  { source: 'conversation', producerServiceId: 'websocket-gateway' },
+  { source: 'document', producerServiceId: 'websocket-gateway' },
+  { source: 'cloud-compute', producerServiceId: 'aws-agentcore' },
+  { source: 'local-compute', producerServiceId: 'aws-agentcore' },
+  // Pipeline and meeting joins were only created at the authenticated
+  // pipeline-trigger and video-session entrypoints, so a person who had
+  // never used either had their own run and recording events rejected at
+  // ingest. The bind is the same create-only one: this authenticated
+  // subject to its own same-named source subject, never another actor's.
+  { source: 'pipeline', producerServiceId: 'platform-api' },
+  { source: 'meeting', producerServiceId: 'platform-api' },
+];
 
-  constructor(private readonly client: Ddb) {
+/** How long a verified set of principals is trusted without re-reading it. */
+export const PRINCIPALS_VERIFIED_TTL_MS = 5 * 60_000;
+/**
+ * `lastSeenAt` drives the rail's "fresh" flag, which is a 5-minute window
+ * (`listPeople`), so refreshing it more than once a minute buys nothing.
+ */
+export const IDENTITY_REFRESH_MS = 60_000;
+const MAX_REMEMBERED_VIEWERS = 10_000;
+
+/** A bounded "until" map: oldest entry goes first when full. */
+function remember(map: Map<string, number>, key: string, until: number): void {
+  map.delete(key);
+  if (map.size >= MAX_REMEMBERED_VIEWERS) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, until);
+}
+
+export class DynamoWorkGraphDirectory implements WorkGraphDirectory {
+  private readonly sourceAccounts: WorkSourceAccountRepository;
+  /** `org\u0000subject` → until when its six principals are known good. */
+  private readonly principalsVerifiedUntil = new Map<string, number>();
+  /** `org\u0000subject` → until when `lastSeenAt` need not be rewritten. */
+  private readonly identityFreshUntil = new Map<string, number>();
+
+  constructor(private readonly client: Ddb, private readonly now: () => number = Date.now) {
     this.sourceAccounts = new WorkSourceAccountRepository(client);
   }
 
@@ -130,7 +177,9 @@ class DynamoWorkGraphDirectory implements WorkGraphDirectory {
   }
 
   private async registerIdentity(organizationId: string, viewerId: string): Promise<void> {
-    const now = new Date().toISOString();
+    const key = `${organizationId}\u0000${viewerId}`;
+    const nowMs = this.now();
+    if ((this.identityFreshUntil.get(key) ?? 0) > nowMs) return;
     await this.client.send(new PutCommand({
       TableName: WORK_GRAPH_TABLE,
       Item: {
@@ -139,28 +188,38 @@ class DynamoWorkGraphDirectory implements WorkGraphDirectory {
         itemKind: 'identity',
         organizationId,
         viewerId,
-        lastSeenAt: now,
+        lastSeenAt: new Date(nowMs).toISOString(),
       },
     }));
+    remember(this.identityFreshUntil, key, nowMs + IDENTITY_REFRESH_MS);
+  }
+
+  /**
+   * Read first; write only a principal that is missing. A verified set is
+   * remembered for a few minutes so steady-state reads touch no principal
+   * rows at all. A mapping that exists but names someone else still fails,
+   * exactly as the create-only write did.
+   */
+  private async ensurePrincipals(organizationId: string, subject: string): Promise<boolean> {
+    const key = `${organizationId}\u0000${subject}`;
+    if ((this.principalsVerifiedUntil.get(key) ?? 0) > this.now()) return true;
+    const joins = await Promise.all(VIEWER_PRINCIPALS.map(async ({ source, producerServiceId }) => {
+      const current = await this.sourceAccounts.resolve(source, producerServiceId, organizationId, subject);
+      if (current) return current.organizationId === organizationId && current.actorId === subject;
+      return this.sourceAccounts.ensureVerifiedSourcePrincipal({ source, producerServiceId, organizationId, subject });
+    }));
+    if (joins.some((joined) => !joined)) {
+      this.principalsVerifiedUntil.delete(key);
+      return false;
+    }
+    remember(this.principalsVerifiedUntil, key, this.now() + PRINCIPALS_VERIFIED_TTL_MS);
+    return true;
   }
 
   async resolveViewer(subject: string, organizationClaim?: string): Promise<AuthenticatedWorkGraphViewer | null> {
     if (!subject || !organizationClaim) return null;
     await this.registerIdentity(organizationClaim, subject);
-    const joins = await Promise.all([
-      this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'conversation', producerServiceId: 'websocket-gateway', organizationId: organizationClaim, subject }),
-      this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'document', producerServiceId: 'websocket-gateway', organizationId: organizationClaim, subject }),
-      this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'cloud-compute', producerServiceId: 'aws-agentcore', organizationId: organizationClaim, subject }),
-      this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'local-compute', producerServiceId: 'aws-agentcore', organizationId: organizationClaim, subject }),
-      // Pipeline and meeting joins were only created at the authenticated
-      // pipeline-trigger and video-session entrypoints, so a person who had
-      // never used either had their own run and recording events rejected at
-      // ingest. The bind is the same create-only one: this authenticated
-      // subject to its own same-named source subject, never another actor's.
-      this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'pipeline', producerServiceId: 'platform-api', organizationId: organizationClaim, subject }),
-      this.sourceAccounts.ensureVerifiedSourcePrincipal({ source: 'meeting', producerServiceId: 'platform-api', organizationId: organizationClaim, subject }),
-    ]);
-    if (joins.some((joined) => !joined)) return null;
+    if (!await this.ensurePrincipals(organizationClaim, subject)) return null;
     return {
       viewerId: subject,
       organizationId: organizationClaim,
