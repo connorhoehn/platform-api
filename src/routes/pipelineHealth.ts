@@ -31,6 +31,7 @@ import { Router } from 'express';
 import { getPipelineBridge, type PipelineBridge } from './pipelineTriggers';
 import { recordPipelineError } from '../observability/metrics';
 import { withContext } from '../lib/logger';
+import { getRunRollupSubscriber } from '../pipeline/run-rollup-subscriber';
 
 const log = withContext({ route: 'pipelineHealth' });
 
@@ -91,6 +92,31 @@ export interface PipelineHealth {
    * to the same default they always have).
    */
   probes: PipelineHealthProbes;
+  /**
+   * This replica's Pipelines-page rollup subscriber (NFR #112): what it has
+   * merged into `pipeline-run-rollups` since the process started. `null` when
+   * the subscriber is off (PIPELINE_RUN_ROLLUP_ENABLED=false or no run table).
+   * Per replica — each one only counts the events its own bus carried.
+   * `conflicts` = CAS losses that were re-read and merged (another writer got
+   * there first); `unresolved` = events for a run neither this process nor the
+   * run table knew (left to the read-side backfill); `errors` = handler throws.
+   */
+  rollupSubscriber: PipelineHealthRollupSubscriber | null;
+}
+
+export interface PipelineHealthRollupSubscriber {
+  applied: number;
+  unchanged: number;
+  duplicates: number;
+  unresolved: number;
+  conflicts: number;
+  errors: number;
+}
+
+/** Snapshot of the live rollup subscriber's counters, or null when it is not running. */
+export function readRollupSubscriberHealth(): PipelineHealthRollupSubscriber | null {
+  const subscriber = getRunRollupSubscriber();
+  return subscriber ? { ...subscriber.stats } : null;
 }
 
 /**
@@ -318,6 +344,7 @@ export function getPipelineHealthStub(): PipelineHealth {
       runsAwaitingApproval: { status: 'ok', value: 0 },
       pendingApprovals: { status: 'ok', value: 0 },
     },
+    rollupSubscriber: readRollupSubscriberHealth(),
   };
 }
 

@@ -23,6 +23,7 @@ import {
   type PipelineRunSnapshot,
   type PendingApprovalRow,
 } from '../pipelineTriggers';
+import { setRunRollupSubscriber, type RunRollupSubscriber } from '../../pipeline/run-rollup-subscriber';
 
 interface MockRes {
   statusCode: number;
@@ -238,6 +239,24 @@ describe('GET /pipelines/health', () => {
     expect(body.runsActive).toBe(0);
     expect(body.runsAwaitingApproval).toBe(0);
     expect(body.pendingApprovals).toBe(0);
+  });
+
+  test('rollupSubscriber is null when no subscriber runs, and carries its counters when one does (NFR #112)', async () => {
+    setRunRollupSubscriber(null);
+    const app = buildApp();
+    const before = await run(app, 'GET', '/pipelines/health');
+    expect((before.body as PipelineHealth).rollupSubscriber).toBeNull();
+
+    const stats = { applied: 7, unchanged: 2, duplicates: 1, unresolved: 0, conflicts: 3, errors: 0 };
+    setRunRollupSubscriber({ stats } as unknown as RunRollupSubscriber);
+    try {
+      const res = await run(app, 'GET', '/pipelines/health');
+      expect((res.body as PipelineHealth).rollupSubscriber).toEqual(stats);
+      stats.conflicts += 1; // a snapshot, not a live reference
+      expect((res.body as PipelineHealth).rollupSubscriber?.conflicts).toBe(3);
+    } finally {
+      setRunRollupSubscriber(null);
+    }
   });
 
   test('llmClientConfigured=false propagates over the wire when key is missing', async () => {
