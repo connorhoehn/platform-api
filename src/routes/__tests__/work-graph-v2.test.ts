@@ -11,6 +11,7 @@ import type { WorkSourceAclAdapter, WorkDisclosure } from '../../work-graph/poli
 import type { StoredWorkEdge, StoredWorkNode, WorkProjectionState } from '../../repositories/WorkGraphRepository';
 import type { StoredWorkGrant } from '../../repositories/WorkSharingRepository';
 import { createWorkGraphRouter } from '../work-graph';
+import { hashViewBase, serializeViewBase, viewBaseRedisKey, type ViewBaseStore } from '../../work-graph/viewBase';
 
 const DAY = '2026-09-21';
 
@@ -182,6 +183,8 @@ function setup(options: {
   summaryKinds?: StoredWorkNode['kind'][];
   /** Sees every ACL target the source is asked about. */
   onDisclosure?: (targetIds: string[]) => void;
+  /** Stands in for the shared Redis a snapshot publishes its view to (NFR #85). */
+  viewBaseStore?: ViewBaseStore | null;
   /** The source's answer to a capability check (default allow). */
   capability?: () => 'allow' | 'deny' | 'unavailable';
   /** The viewer's live grants (default: the one active grant). */
@@ -237,7 +240,9 @@ function setup(options: {
     id: () => 'generation-1',
   };
   const app = express();
-  app.use('/api/work-graph', createWorkGraphRouter(new WorkGraphOrchestrator(deps)));
+  app.use('/api/work-graph', createWorkGraphRouter(new WorkGraphOrchestrator(deps), {
+    viewBaseStore: async () => options.viewBaseStore ?? null,
+  }));
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     res.status(500).json({ error: (error as Error).message });
   });
@@ -409,6 +414,36 @@ describe('work graph schemaVersion 2 route', () => {
     expect((await get(app, `${base}&windowStart=${encodeURIComponent(at('13:30'))}`)).statusCode).toBe(400);
     expect((await get(app, `${base}&schemaVersion=2&windowStart=not-a-time`)).statusCode).toBe(400);
     expect((await get(app, `${base}&schemaVersion=2&mode=yesterday`)).statusCode).toBe(400);
+  });
+
+  it('names and publishes its view only when the reader asks, bound to the viewer and watermark (NFR #85)', async () => {
+    const stored = new Map<string, { value: string; ttl: number }>();
+    const store: ViewBaseStore = { set: async (key, value, ttl) => { stored.set(key, { value, ttl }); } };
+    const plain = await get(setup({ viewBaseStore: store }), v2);
+    expect((plain.body as Record<string, unknown>).viewHash).toBeUndefined();
+    expect(stored.size).toBe(0);
+
+    const asked = await get(setup({ viewBaseStore: store }), `${v2}&viewBase=1`);
+    expect(asked.statusCode).toBe(200);
+    const { viewHash, ...snapshot } = asked.body as WorkGraphSnapshotV2 & { viewHash: string };
+    expect(validateWorkGraphSnapshotV2(snapshot).ok).toBe(true);
+    const entry = stored.get(viewBaseRedisKey(viewHash))!;
+    expect(entry.ttl).toBe(600);
+    expect(entry.value).toBe(serializeViewBase(snapshot as WorkGraphSnapshotV2));
+    const scope = { organizationId: 'org-1', viewerId: 'frank', personId: 'connor', day: DAY, timezone: 'America/New_York', watermark: snapshot.watermark };
+    expect(hashViewBase(scope, entry.value)).toBe(viewHash);
+    // The same bytes prove nothing for another viewer or another snapshot.
+    expect(hashViewBase({ ...scope, viewerId: 'connor' }, entry.value)).not.toBe(viewHash);
+    expect(hashViewBase({ ...scope, watermark: snapshot.watermark + 1 }, entry.value)).not.toBe(viewHash);
+
+    // No store, or one that fails, leaves the snapshot exactly as before.
+    const without = await get(setup({ viewBaseStore: null }), `${v2}&viewBase=1`);
+    expect((without.body as Record<string, unknown>).viewHash).toBeUndefined();
+    const failing = await get(setup({ viewBaseStore: { set: async () => { throw new Error('down'); } } }), `${v2}&viewBase=1`);
+    expect(failing.statusCode).toBe(200);
+    expect((failing.body as Record<string, unknown>).viewHash).toBeUndefined();
+    expect((await get(setup(), `${v2}&viewBase=2`)).statusCode).toBe(400);
+    expect((await get(setup(), `${base}&viewBase=1`)).statusCode).toBe(400);
   });
 
   it('gives an unshared viewer nothing, in v2 exactly as in v1', async () => {

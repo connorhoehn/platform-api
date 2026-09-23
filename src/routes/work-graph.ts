@@ -22,6 +22,8 @@ import {
   type WorkGraphWindowInput,
   type WorkReference,
 } from '../work-graph/orchestrator';
+import { publishViewBase, type ViewBaseStore } from '../work-graph/viewBase';
+import { getRedisClient } from '../lib/redis-client';
 
 type JsonRecord = Record<string, unknown>;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -132,7 +134,7 @@ function reference(value: unknown): WorkReference | null {
   return parsed;
 }
 
-const V2_QUERY_KEYS = ['schemaVersion', 'windowStart', 'windowEnd', 'mode'] as const;
+const V2_QUERY_KEYS = ['schemaVersion', 'windowStart', 'windowEnd', 'mode', 'viewBase'] as const;
 
 /**
  * Reads the additive schemaVersion 2 parameters. A request that omits them is
@@ -157,6 +159,8 @@ function parseActivityQuery(req: Request): WorkGraphWindowInput | null {
   if (mode !== undefined && mode !== 'live' && mode !== 'as-of') {
     throw new WorkGraphInputError('Window mode must be live or as-of.');
   }
+  const viewBase = req.query['viewBase'];
+  if (viewBase !== undefined && viewBase !== '1') throw new WorkGraphInputError('viewBase must be 1.');
   const windowStart = read('windowStart');
   const windowEnd = read('windowEnd');
   return {
@@ -306,8 +310,18 @@ function sendError(error: unknown, res: Response): boolean {
   return false;
 }
 
-export function createWorkGraphRouter(orchestrator: WorkGraphOrchestrator): Router {
+/** The shared Redis every platform and gateway replica reads (NFR #85). */
+async function redisViewBaseStore(): Promise<ViewBaseStore | null> {
+  const client = await getRedisClient().catch(() => null);
+  return client ? { set: (key, value, ttlSeconds) => client.set(key, value, { EX: ttlSeconds }) } : null;
+}
+
+export function createWorkGraphRouter(
+  orchestrator: WorkGraphOrchestrator,
+  options: { viewBaseStore?: () => Promise<ViewBaseStore | null> } = {},
+): Router {
   const router = Router();
+  const viewBaseStore = options.viewBaseStore ?? redisViewBaseStore;
 
   const handler = (
     fn: (req: Request, res: Response, viewer: AuthenticatedWorkGraphViewer) => Promise<void>,
@@ -336,9 +350,22 @@ export function createWorkGraphRouter(orchestrator: WorkGraphOrchestrator): Rout
     const query = parseGraphQuery(req);
     const activity = parseActivityQuery(req);
     if (activity) {
-      res.status(200).json(await orchestrator.getGraphV2(
+      const snapshot = await orchestrator.getGraphV2(
         viewer, query.personId, query.day, query.timezone, activity, query.cursor,
-      ));
+      );
+      // NFR #85: only a reader that asked (it can seed its stream from this
+      // view) gets the extra field; the strict older validators never see it.
+      const viewHash = req.query['viewBase'] === '1'
+        ? await publishViewBase(await viewBaseStore(), {
+          organizationId: viewer.organizationId,
+          viewerId: viewer.viewerId,
+          personId: query.personId,
+          day: query.day,
+          timezone: query.timezone,
+          watermark: snapshot.watermark,
+        }, snapshot)
+        : null;
+      res.status(200).json(viewHash ? { ...snapshot, viewHash } : snapshot);
       return;
     }
     const result = await orchestrator.getGraph(viewer, query.personId, query.day, query.timezone, query.cursor);
