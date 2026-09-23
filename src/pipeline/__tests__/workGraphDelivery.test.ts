@@ -36,6 +36,13 @@ jest.mock('../../lib/aws-clients', () => ({
         case 'UpdateCommand': {
           const row = mockTable.get(input.Key.outboxId);
           const values = input.ExpressionAttributeValues ?? {};
+          if (String(input.UpdateExpression) === 'REMOVE #p') {
+            if (!row || row.status === 'UNPROCESSED') {
+              throw Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
+            }
+            delete row.pendingShard;
+            return {};
+          }
           const adopting = ':shard' in values;
           if (!row || row.status !== 'UNPROCESSED' || (adopting && row.pendingShard !== undefined)) {
             throw Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
@@ -264,5 +271,24 @@ describe('NFR 34b — every step transition reaches the projection queue exactly
     }
     expect(mockDelivered.map((entry) => entry.eventName)).toEqual(['social.room.join']);
     expect(mockTable.get('stray-1')!.pendingShard).toBeUndefined();
+  });
+
+  it('NFR #34c: terminal rows still carrying a shard do not starve the pending ones behind them', async () => {
+    // 200 PROCESSED rows that kept pendingShard (written by the new build,
+    // processed by an older one), all older than the new pending rows.
+    const { pendingFields } = jest.requireActual('../../lib/outbox-pending') as typeof import('../../lib/outbox-pending');
+    for (let i = 0; i < 200; i += 1) {
+      const id = `aaa-${String(i).padStart(4, '0')}`;
+      mockTable.set(id, { outboxId: id, ...pendingFields(id), status: 'PROCESSED', eventType: 'x', payload: '{}', createdAt: '2026-09-23T00:00:00.000Z' });
+    }
+    const drainer = startOutboxDrainer({ pollIntervalMs: 5, batchSize: 25 });
+    try {
+      await runThreeStepPipeline();
+      await until(() => [...mockTable.values()].every((row) => row.status !== 'UNPROCESSED' && row.pendingShard === undefined));
+    } finally {
+      drainer.stop();
+    }
+    expect([...mockTable.values()].filter((row) => row.status === 'UNPROCESSED')).toHaveLength(0);
+    expect([...mockTable.values()].filter((row) => row.pendingShard !== undefined)).toHaveLength(0);
   });
 });

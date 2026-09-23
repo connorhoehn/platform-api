@@ -109,6 +109,7 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
   let adoptionDone = false;
   let indexActive = false;
   let indexCheckedAt = 0;
+  let indexWaitLogged = false;
 
   async function poll(): Promise<void> {
     if (running || stopping) return;
@@ -195,7 +196,10 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       indexCheckedAt = Date.now();
       indexActive = await pendingIndexActive(ddbClient, OUTBOX_TABLE);
       if (indexActive) log.info({}, 'outbox-drainer: pending-index ACTIVE — table walk off');
-      else log.warn({}, 'outbox-drainer: pending-index not ACTIVE yet — walking the table');
+      else if (!indexWaitLogged) {
+        indexWaitLogged = true;
+        log.warn({}, 'outbox-drainer: pending-index not ACTIVE yet — walking the table');
+      }
     }
     if (!indexActive) return scanPending(lock);
     let rows: OutboxRow[];
@@ -222,11 +226,23 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         Limit: batchSize,
       }),
     )));
-    const rows = pages.flatMap((page) => (page.Items ?? []) as OutboxRow[])
-      // The index is eventually consistent: a row processed a moment ago can
-      // still be listed. Its own status says so; the conditional write would
-      // refuse it anyway, this just saves a duplicate publish.
-      .filter((row) => row.status === 'UNPROCESSED');
+    const listed = pages.flatMap((page) => (page.Items ?? []) as OutboxRow[]);
+    // A listed row that is no longer UNPROCESSED is either index lag (it was
+    // processed a moment ago) or a row that went terminal without dropping its
+    // shard (e.g. processed by an older build). Skip it, and drop the shard so
+    // it cannot sit at the head of its shard, ahead of real pending rows.
+    const stale = listed.filter((row) => row.status !== 'UNPROCESSED');
+    await Promise.all(stale.map((row) => docClient.send(new UpdateCommand({
+      TableName: OUTBOX_TABLE,
+      Key: { outboxId: row.outboxId },
+      UpdateExpression: 'REMOVE #p',
+      ConditionExpression: 'attribute_exists(outboxId) AND #status <> :unprocessed',
+      ExpressionAttributeNames: { '#status': 'status', '#p': PENDING_ATTR },
+      ExpressionAttributeValues: { ':unprocessed': 'UNPROCESSED' },
+    })).catch((err: unknown) => {
+      if ((err as { name?: string })?.name !== 'ConditionalCheckFailedException') throw err;
+    })));
+    const rows = listed.filter((row) => row.status === 'UNPROCESSED');
     rows.sort((a, b) => (a.outboxId < b.outboxId ? -1 : a.outboxId > b.outboxId ? 1 : 0));
     return rows.slice(0, batchSize);
   }
