@@ -87,6 +87,7 @@ function text(value: unknown, limit: number): string | undefined {
  * …"); the id means nothing on a pane that already names the run, so it is
  * stripped here, at read time — the stored row is left as it was.
  */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LEADING_RUN_ID = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\s*:\s*)+/i;
 export function readableError(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -243,10 +244,15 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const tools = Object.entries(steps)
       .map(([stepId, summary]) => ({
         stepId,
+        // A generated pipeline's steps are keyed by uuid; its title, when the
+        // step recorded one, is the name a reader can use.
+        name: text((summary as Row | undefined)?.title ?? (summary as Row | undefined)?.name, 60),
         startedAt: Date.parse(iso((summary as Row | undefined)?.startedAt) ?? '') || 0,
       }))
       .sort((left, right) => left.startedAt - right.startedAt || left.stepId.localeCompare(right.stepId))
-      .map((step) => text(step.stepId, 60))
+      // A bare uuid is not a tool name — live, a failed run listed
+      // "a10af720-…" under "Tools in this run".
+      .map((step) => step.name ?? (UUID.test(step.stepId) ? undefined : text(step.stepId, 60)))
       .filter((value): value is string => !!value);
     const startedAt = iso(row.startedAt);
     if (!startedAt) return null;
