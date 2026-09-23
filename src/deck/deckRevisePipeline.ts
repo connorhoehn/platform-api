@@ -1,6 +1,6 @@
 // A composer edit of a presentation, as a pipeline run: `deck-revise`.
 //
-//   trigger → load ("Read the deck") → propose ("Write the edit") → write ("Save the new revision")
+//   trigger → load ("Read the deck") → propose ("Write the edit") → check ("Check the edit") → write ("Save the new revision")
 //
 // The browser starts the run (`POST /api/deck/revise-run`) and watches it; the
 // RUN reads the deck, asks the model and files the revision. It is a
@@ -12,6 +12,16 @@
 //            fails here, before any model time is spent.
 // - propose  `reviseDeck()` — the same grounding, validation and refusals as
 //            `POST /api/deck/revise`. Writes nothing.
+// - check    measures the proposal against the countable parts of the
+//            instruction (deckConstraints.ts: "one word shorter", "three
+//            bullets", "under 40 characters", "keep the title") before and
+//            after. A violation gets the model ONE more try, told the numbers;
+//            still violated, the run fails `constraint-not-met` listing the
+//            measurements and writes nothing. The summary the run records is
+//            the model's claim with contradicted sentences dropped, plus the
+//            facts ("Title: 3 → 2 words"). The proposal it reads is `propose`'s
+//            recorded output, so a retried check never re-runs the model for a
+//            proposal that is already on the run.
 // - write    renders and appends the revision with `expectedHead = base`.
 //            Idempotent by `requestId` (recorded as `producedBy` on the
 //            revision). On a concurrent save (409), a slide- or field-scoped
@@ -31,6 +41,10 @@ import log from '../lib/logger';
 import { validateReviseTarget, type DeckReviseTarget, type DeckSlide, type DeckSpec } from './DeckSpec';
 import { DeckReviseError, reviseDeck, validateReviseInputSpec, type DeckReviseOpts, type DeckReviseSourceRef } from './deckRevise';
 import {
+  checkConstraints, factLines, parseConstraints, reconcileSummary, retryInstruction,
+  type Constraint, type ConstraintCheck,
+} from './deckConstraints';
+import {
   createDeckReviseEmitter, durableDeckRevisePublish,
   type DeckReviseDurablePublish, type DeckReviseEmitter, type DeckRevisePublish,
 } from './deckReviseEvents';
@@ -42,9 +56,9 @@ import {
 import { canEditDocument, documentRoleOf, editRefusal } from './documentEditAccess';
 
 export {
-  DECK_REVISE_PIPELINE_ID, DECK_REVISE_LOAD_KIND, DECK_REVISE_PROPOSE_KIND, DECK_REVISE_WRITE_KIND, buildDeckReviseDefinition,
+  DECK_REVISE_PIPELINE_ID, DECK_REVISE_LOAD_KIND, DECK_REVISE_PROPOSE_KIND, DECK_REVISE_CHECK_KIND, DECK_REVISE_WRITE_KIND, buildDeckReviseDefinition,
 } from './deckReviseDefinition';
-import { DECK_REVISE_PIPELINE_ID, DECK_REVISE_LOAD_KIND, DECK_REVISE_PROPOSE_KIND, DECK_REVISE_WRITE_KIND } from './deckReviseDefinition';
+import { DECK_REVISE_PIPELINE_ID, DECK_REVISE_LOAD_KIND, DECK_REVISE_PROPOSE_KIND, DECK_REVISE_CHECK_KIND, DECK_REVISE_WRITE_KIND } from './deckReviseDefinition';
 /** How many times a scoped edit may rebase onto a newer head before giving up. */
 export const MAX_REBASES = 3;
 
@@ -378,6 +392,105 @@ export function createDeckReviseProposeHandler(opts: DeckReviseStepOpts = {}): D
   };
 }
 
+export interface CheckOutput {
+  documentId: string;
+  /** The proposal the write saves: the retried one when the first missed a constraint. */
+  spec: DeckSpec;
+  /** The model's claim reconciled with the measurements. */
+  summary: string;
+  changedSlideIds: string[];
+  warnings: string[];
+  changed: boolean;
+  /** What the instruction asked in countable terms, as parsed. */
+  constraints: Constraint[];
+  /** "Title: 3 → 2 words" — before the edit → after it. */
+  facts: string[];
+  /** True when the first proposal missed a constraint and the model was asked once more. */
+  retried: boolean;
+}
+
+function constraintsFailure(check: ConstraintCheck): string {
+  const lines = check.violations.map((v) => v.message);
+  return `The edit did not do what was asked: ${lines.join(' ')} Measured: ${factLines(check.facts).join('; ')}. Nothing was saved.`;
+}
+
+export function createDeckReviseCheckHandler(opts: DeckReviseStepOpts = {}): DescribedStepHandler {
+  const revise = opts.revise ?? reviseDeck;
+  return {
+    kind: DECK_REVISE_CHECK_KIND,
+    description: 'Measures the proposed edit against the countable parts of the instruction (words, characters, bullets, slides, parts to keep or remove), asks the model once more with the numbers when it missed, and fails the run honestly when it still misses. Writes nothing.',
+    reads: 'The loaded spec, the proposal, instruction, slideId, target.',
+    emits: 'spec (the proposal to save), summary (claims reconciled with the measurements), facts, constraints, retried, changedSlideIds, warnings, changed.',
+    async execute(_node: PipelineNode, context: Record<string, unknown>, helpers: StepHandlerHelpers): Promise<StepOutcome> {
+      const request = readRunRequest(context);
+      const { runId } = helpers;
+      const loaded = stepOutput<LoadOutput>(context, 'load');
+      const proposed = stepOutput<ProposeOutput>(context, 'propose');
+      if (!loaded?.spec || !proposed?.spec) return fail(runId, request, 500, 'The edit was not made, so there was nothing to check.', 'no-edit');
+      const events = eventsForRun(runId, request).emitter;
+      events.phase('checking');
+      const scope = { slideId: request.slideId, target: request.target };
+      const constraints = parseConstraints(request.instruction, scope);
+      let spec = proposed.spec;
+      let summary = proposed.summary;
+      let changedSlideIds = proposed.changedSlideIds;
+      let warnings = proposed.warnings;
+      // The model's summary, read like an instruction, says what it claims to
+      // have done; those subjects are measured whether or not they were asked.
+      const claimsOf = (claim: string) => parseConstraints(claim, scope);
+      let check = checkConstraints(constraints, loaded.spec, spec, scope, claimsOf(summary));
+      let retried = false;
+      if (check.violations.length) {
+        retried = true;
+        log.info({ runId, documentId: request.documentId, violations: check.violations.map((v) => v.message) }, 'deck revise run: the proposal missed a constraint; asking the model once more');
+        try {
+          const again = await revise(
+            {
+              spec: loaded.spec, instruction: retryInstruction(request.instruction, check.violations),
+              ...(request.slideId ? { slideId: request.slideId } : {}),
+              ...(request.target ? { target: request.target } : {}),
+              sources: request.sources,
+            },
+            { ...opts.reviseOpts, onPhase: (phase) => events.phase(phase) },
+          );
+          const secondCheck = checkConstraints(constraints, loaded.spec, again.spec, scope, claimsOf(again.summary));
+          if (secondCheck.violations.length) {
+            const outcome = fail(runId, request, 422, constraintsFailure(secondCheck), 'constraint-not-met');
+            log.warn({ runId, documentId: request.documentId, violations: secondCheck.violations.map((v) => v.message) }, 'deck revise run: the edit still misses a constraint after a second try');
+            return outcome;
+          }
+          spec = again.spec;
+          summary = again.summary;
+          changedSlideIds = again.changedSlideIds;
+          warnings = again.warnings;
+          check = secondCheck;
+        } catch (err) {
+          if (err instanceof DeckReviseError) {
+            // The second try could not be made at all: the first one stands
+            // judged, and the run fails on the measurements, not the outage.
+            const outcome = fail(runId, request, 422, `${constraintsFailure(check)} (A second try was not possible: ${err.reason}.)`, 'constraint-not-met');
+            return outcome;
+          }
+          throw err;
+        }
+      }
+      const fallback = changedSlideIds.length ? `Changed ${changedSlideIds.length} slide${changedSlideIds.length === 1 ? '' : 's'}.` : 'No slides changed.';
+      const output: CheckOutput = {
+        documentId: request.documentId,
+        spec,
+        summary: reconcileSummary(summary, check.facts, fallback),
+        changedSlideIds,
+        warnings,
+        changed: !same(spec, loaded.spec),
+        constraints,
+        facts: factLines(check.facts),
+        retried,
+      };
+      return { status: 'completed', output: output as unknown as Record<string, unknown> };
+    },
+  };
+}
+
 export interface WriteOutput {
   documentId: string;
   written: boolean;
@@ -388,6 +501,10 @@ export interface WriteOutput {
   summary: string;
   changedSlideIds: string[];
   warnings: string[];
+  /** The check step's measurements: "Title: 3 → 2 words". */
+  facts?: string[];
+  /** True when the model was asked a second time to meet a constraint. */
+  retried?: boolean;
   artifacts?: unknown[];
   result: { kind: 'document'; documentId: string };
 }
@@ -435,7 +552,10 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
       const request = readRunRequest(context);
       const { runId } = helpers;
       const loaded = stepOutput<LoadOutput>(context, 'load');
-      const proposed = stepOutput<ProposeOutput>(context, 'propose');
+      // The checked proposal (possibly the model's second try); the raw one
+      // only on a definition without a check step.
+      const checked = stepOutput<CheckOutput>(context, 'check');
+      const proposed: CheckOutput | ProposeOutput | undefined = checked ?? stepOutput<ProposeOutput>(context, 'propose');
       if (!loaded?.spec || !proposed?.spec) return fail(runId, request, 500, 'The edit was not made, so nothing was saved.', 'no-edit');
       const events = eventsForRun(runId, request).emitter;
       const store = opts.store ?? getPresentationDocumentStore();
@@ -447,6 +567,7 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
         summary: proposed.summary,
         changedSlideIds: proposed.changedSlideIds,
         warnings: proposed.warnings,
+        ...(checked ? { facts: checked.facts, retried: checked.retried } : {}),
         result: { kind: 'document', documentId: request.documentId },
       };
       if (!proposed.changed) {
@@ -522,5 +643,5 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
 }
 
 export function buildDeckReviseStepHandlers(opts: DeckReviseStepOpts = {}): DescribedStepHandler[] {
-  return [createDeckReviseLoadHandler(opts), createDeckReviseProposeHandler(opts), createDeckReviseWriteHandler(opts)];
+  return [createDeckReviseLoadHandler(opts), createDeckReviseProposeHandler(opts), createDeckReviseCheckHandler(opts), createDeckReviseWriteHandler(opts)];
 }

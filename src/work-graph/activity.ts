@@ -372,6 +372,7 @@ export function editSummary(edit: DocumentEditFacts, stepId: string | undefined,
     return `${settled ? 'Read' : 'Reading'} ${edit.baseRevisionId}${edit.specFrom === 'request' ? ' with the editor’s unsaved changes' : ''}`;
   }
   if (stepId === 'propose') return edit.summary ?? (settled ? 'Wrote the edit' : 'Writing the edit');
+  if (stepId === 'check') return edit.summary ?? (settled ? 'Checked the edit' : 'Checking the edit');
   if (stepId === 'write' || !stepId) {
     if (edit.revisionId) {
       return `${stepId ? 'Saved' : 'Wrote'} ${edit.revisionId} of ${deck}${edit.rebasedOnto ? ` (rebased onto ${edit.rebasedOnto})` : ''}`;

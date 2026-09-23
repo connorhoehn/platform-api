@@ -88,7 +88,7 @@ describe('POST /api/deck/revise-run', () => {
     });
     const args = trigger.mock.calls[0]![0] as { pipelineId: string; triggerPayload: Record<string, unknown>; definition: { nodes: Array<{ id: string }> } };
     expect(args.pipelineId).toBe('deck-revise');
-    expect(args.definition.nodes.map((node) => node.id)).toEqual(['trigger', 'load', 'propose', 'write']);
+    expect(args.definition.nodes.map((node) => node.id)).toEqual(['trigger', 'load', 'propose', 'check', 'write']);
     expect(args.triggerPayload).toMatchObject({ documentId: 'audit-deck-1', instruction: 'Tighten', requestId: 'r-1', slideId, target: { field: 'title' }, baseRevisionId: 'v1' });
     expect(args.triggerPayload.spec).toBeUndefined();
     // The run is projected into the work graph as its steps, named after the deck.

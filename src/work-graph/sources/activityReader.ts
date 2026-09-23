@@ -168,6 +168,7 @@ export function documentEditFacts(steps: Row): DocumentEditFacts | undefined {
   if (!instruction || !documentId) return undefined;
   const load = output('load');
   const propose = output('propose');
+  const check = output('check');
   const write = output('write');
   // The slide's own title from the deck the edit was made against; its id
   // ("transcript") is an internal key a reader cannot place.
@@ -184,7 +185,12 @@ export function documentEditFacts(steps: Row): DocumentEditFacts | undefined {
     : undefined;
   const fieldLabel = field ? `${field}${index !== undefined ? ` ${index + 1}` : ''}` : undefined;
   const scope = [slideLabel ?? (fieldLabel ? undefined : 'Whole deck'), fieldLabel].filter(Boolean).join(' · ') || 'Whole deck';
-  const changed = Array.isArray(write.changedSlideIds) ? write.changedSlideIds : Array.isArray(propose.changedSlideIds) ? propose.changedSlideIds : undefined;
+  const changed = Array.isArray(write.changedSlideIds) ? write.changedSlideIds
+    : Array.isArray(check.changedSlideIds) ? check.changedSlideIds
+      : Array.isArray(propose.changedSlideIds) ? propose.changedSlideIds : undefined;
+  // The check's summary carries the measured facts; the model's own claim
+  // (propose) stands only until the check has spoken.
+  const summary = text(write.summary ?? check.summary ?? propose.summary, 220);
   const writeDone = (steps.write as Row | undefined)?.status === 'completed';
   const revisionId = write.written === true ? text(write.revisionId, 64) : undefined;
   const specFrom = load.specFrom === 'request' || load.specFrom === 'head' ? load.specFrom : undefined;
@@ -195,7 +201,7 @@ export function documentEditFacts(steps: Row): DocumentEditFacts | undefined {
     ...(text(load.title, 80) ? { title: text(load.title, 80) as string } : {}),
     ...(text(load.baseRevisionId ?? trigger.baseRevisionId, 64) ? { baseRevisionId: text(load.baseRevisionId ?? trigger.baseRevisionId, 64) as string } : {}),
     ...(specFrom ? { specFrom } : {}),
-    ...(text(write.summary ?? propose.summary, 160) ? { summary: text(write.summary ?? propose.summary, 160) as string } : {}),
+    ...(summary ? { summary } : {}),
     ...(changed ? { changedSlides: changed.length } : {}),
     ...(revisionId ? { revisionId } : {}),
     ...(revisionId && text(write.rebasedOnto, 64) ? { rebasedOnto: text(write.rebasedOnto, 64) as string } : {}),

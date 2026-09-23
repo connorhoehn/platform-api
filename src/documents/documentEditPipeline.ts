@@ -1,12 +1,15 @@
 // The shape every composer edit of a document runs as: a pipeline, so the
 // change is made by the run and not by the browser.
 //
-//   document-edit:  trigger → load → propose → write
+//   document-edit:  trigger → load → propose → [check] → write
 //
 //   load     reads the document as it is now and pins the BASE the edit is
 //            made against (a revision id, a CRDT version — whatever the kind
 //            keeps), validating the request against it.
 //   propose  asks the model for the change and checks it. Writes nothing.
+//   check    (optional) measures the change against the countable parts of
+//            the instruction — "one word shorter", "three bullets" — and may
+//            ask the model once more with the numbers. Writes nothing.
 //   write    applies the change CONDITIONED ON THE BASE, and is idempotent by
 //            the request's `requestId`: a retried write finds its own change
 //            and returns it instead of making a second one.
@@ -24,6 +27,13 @@
 export interface DocumentEditStages {
   load: { kind: string; label: string };
   propose: { kind: string; label: string };
+  /**
+   * Optional: measures the proposal against what the instruction asked in
+   * countable terms and may ask the model once more. Writes nothing. Reads
+   * the proposal from `propose`'s recorded output, so a retried check never
+   * re-runs the model for a proposal that is already on the run.
+   */
+  check?: { kind: string; label: string };
   write: { kind: string; label: string };
 }
 
@@ -39,8 +49,8 @@ export interface DocumentEditDefinitionInit {
 export const DOCUMENT_EDIT_STORE_RETRY = { maxAttempts: 3, backoffMs: 1000, backoffMultiplier: 2, retryUnknown: false } as const;
 export const DOCUMENT_EDIT_MODEL_RETRY = { maxAttempts: 2, backoffMs: 2000, backoffMultiplier: 2, retryUnknown: false } as const;
 
-/** The step ids every document-edit run reports, in order. */
-export const DOCUMENT_EDIT_STEP_IDS = ['load', 'propose', 'write'] as const;
+/** The step ids every document-edit run reports, in order (`check` only when the kind has one). */
+export const DOCUMENT_EDIT_STEP_IDS = ['load', 'propose', 'check', 'write'] as const;
 
 export function buildDocumentEditDefinition(init: DocumentEditDefinitionInit): Record<string, unknown> {
   const pos = (x: number) => ({ x, y: 0 });
@@ -57,8 +67,11 @@ export function buildDocumentEditDefinition(init: DocumentEditDefinitionInit): R
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: init.triggerLabel ?? 'Composer edit' } },
       node('load', 200, init.stages.load, DOCUMENT_EDIT_STORE_RETRY),
       node('propose', 400, init.stages.propose, DOCUMENT_EDIT_MODEL_RETRY),
-      node('write', 600, init.stages.write, DOCUMENT_EDIT_STORE_RETRY),
+      ...(init.stages.check ? [node('check', 600, init.stages.check, DOCUMENT_EDIT_MODEL_RETRY)] : []),
+      node('write', init.stages.check ? 800 : 600, init.stages.write, DOCUMENT_EDIT_STORE_RETRY),
     ],
-    edges: [edge('trigger', 'load'), edge('load', 'propose'), edge('propose', 'write')],
+    edges: init.stages.check
+      ? [edge('trigger', 'load'), edge('load', 'propose'), edge('propose', 'check'), edge('check', 'write')]
+      : [edge('trigger', 'load'), edge('load', 'propose'), edge('propose', 'write')],
   };
 }

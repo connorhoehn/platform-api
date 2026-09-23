@@ -111,7 +111,7 @@ async function run(store: FakeStore, revise: jest.Mock, trigger: Record<string, 
     llmClient: { stream: () => ({ async *[Symbol.asyncIterator]() { /* none */ } }) } as never,
     eventBus: bus,
     speedMultiplier: 0.001,
-    triggerPayload: { documentId: DOC, requestId: 'req-1', requestedBy: 'frank', instruction: 'Shorter title', sources: [], ...trigger },
+    triggerPayload: { documentId: DOC, requestId: 'req-1', requestedBy: 'frank', instruction: 'Retitle this slide', sources: [], ...trigger },
     customStepHandlers: handlers,
   });
   const result = await executor.run();
@@ -145,7 +145,7 @@ describe('deck-revise pipeline', () => {
 
   it('is a registered system pipeline whose steps pass the retry lint', () => {
     const def = getSystemPipeline(DECK_REVISE_PIPELINE_ID) as { nodes: Array<{ id: string }> } | null;
-    expect(def?.nodes.map((node) => node.id)).toEqual(['trigger', 'load', 'propose', 'write']);
+    expect(def?.nodes.map((node) => node.id)).toEqual(['trigger', 'load', 'propose', 'check', 'write']);
     expect(lintSystemPipeline(buildDeckReviseDefinition())).toEqual([]);
   });
 
@@ -175,7 +175,7 @@ describe('deck-revise pipeline', () => {
 
   it('publishes started → phases → saving → completed on the document channel, and the outcome durably', async () => {
     const result = await run(store, retitle('Tighter'), { slideId });
-    expect(kinds()).toEqual(['started', 'phase:reading-sources', 'phase:asking-model', 'phase:checking', 'phase:saving', 'completed']);
+    expect(kinds()).toEqual(['started', 'phase:reading-sources', 'phase:asking-model', 'phase:checking', 'phase:checking', 'phase:saving', 'completed']);
     for (const event of published) {
       expect(event.payload).toMatchObject({ runId: `deck-revise:${DOC}`, pipelineRunId: result.id, documentId: DOC, requestId: 'req-1', scope: 'slide', slideId });
     }
@@ -246,6 +246,78 @@ describe('deck-revise pipeline', () => {
     expect(again.status).toBe('completed');
     expect(store.appends).toBe(1);
     expect(again.steps.write?.output).toMatchObject({ replayed: true, revisionId: 'v2' });
+  });
+
+  describe('check step (constraints measured, never the model\'s word)', () => {
+    const split = deck.slides[2]!.id; // 'Shipped vs deferred': 3 words
+    /** Answers each call with the next title. */
+    const retitles = (...titles: string[]) => {
+      const fn = jest.fn(async (input: DeckReviseInput, opts?: { onPhase?: (p: 'reading-sources' | 'asking-model' | 'checking') => void }): Promise<DeckReviseResult> => {
+        opts?.onPhase?.('reading-sources');
+        opts?.onPhase?.('asking-model');
+        opts?.onPhase?.('checking');
+        const title = titles[Math.min(fn.mock.calls.length - 1, titles.length - 1)]!;
+        return {
+          spec: { ...input.spec, slides: input.spec.slides.map((slide) => (slide.id === split ? { ...slide, title } : slide)) },
+          summary: 'Made the title one word shorter.', changedSlideIds: [split], warnings: [], source: 'model',
+        };
+      });
+      return fn;
+    };
+
+    it('records the measured facts on the run and appends them to the summary when the ask is met', async () => {
+      const revise = retitles('Shipped, deferred');
+      const result = await run(store, revise, { slideId: split, baseRevisionId: 'v1', instruction: "make this slide's title one word shorter" });
+      expect(result.status).toBe('completed');
+      expect(revise).toHaveBeenCalledTimes(1);
+      expect(result.steps.check?.output).toMatchObject({ facts: ['Title: 3 → 2 words'], retried: false, constraints: [{ kind: 'delta', subject: 'title', metric: 'words', n: -1 }] });
+      expect(result.steps.write?.output).toMatchObject({
+        written: true, revisionId: 'v2', facts: ['Title: 3 → 2 words'], retried: false,
+        summary: 'Made the title one word shorter. Measured: Title: 3 → 2 words.',
+      });
+    });
+
+    it('asks the model once more with the numbers when the proposal misses, and writes the second answer', async () => {
+      const revise = retitles('Deferred vs shipped', 'Shipped, deferred');
+      const result = await run(store, revise, { slideId: split, baseRevisionId: 'v1', instruction: "make this slide's title one word shorter" });
+      expect(result.status).toBe('completed');
+      expect(revise).toHaveBeenCalledTimes(2);
+      expect(revise.mock.calls[1]![0].instruction).toContain('Title has 3 words; before it had 3. Make it 2.');
+      expect(revise.mock.calls[1]![0].spec).toEqual(deck); // against the deck as it was, not the missed proposal
+      expect(store.rows.get(DOC)!.revisions!.at(-1)!.spec!.slides[2]!.title).toBe('Shipped, deferred');
+      expect(result.steps.check?.output).toMatchObject({ retried: true, facts: ['Title: 3 → 2 words'] });
+      expect(kinds()).toEqual(['started', 'phase:reading-sources', 'phase:asking-model', 'phase:checking', 'phase:checking', 'phase:reading-sources', 'phase:asking-model', 'phase:checking', 'phase:saving', 'completed']);
+    });
+
+    it('fails constraint-not-met, writing nothing, when the second answer still misses — the claim never stands', async () => {
+      const revise = retitles('Deferred vs shipped', 'Release risk management');
+      const result = await run(store, revise, { slideId: split, baseRevisionId: 'v1', instruction: "make this slide's title one word shorter" });
+      expect(result.status).toBe('failed');
+      expect(store.appends).toBe(0);
+      expect(result.steps.write?.status ?? 'pending').not.toBe('completed');
+      expect(result.steps.check?.error).toBe('deck-revise constraint-not-met: The edit did not do what was asked: Title has 3 words; before it had 3. Make it 2. Measured: Title: 3 → 3 words. Nothing was saved.');
+      expect(published.at(-1)).toMatchObject({ type: 'pipeline:deck:revise:failed', payload: { status: 422, code: 'constraint-not-met' } });
+    });
+
+    it('an impossible ask fails honestly with the numbers', async () => {
+      const revise = retitles('Shipped', 'Done');
+      const result = await run(store, revise, { slideId: split, baseRevisionId: 'v1', instruction: 'make the title 0 words' });
+      expect(result.status).toBe('failed');
+      expect(store.appends).toBe(0);
+      expect(result.steps.check?.error).toContain('Title has 1 word; it must have exactly 0.');
+      expect(published.at(-1)).toMatchObject({ type: 'pipeline:deck:revise:failed', payload: { status: 422, code: 'constraint-not-met' } });
+    });
+
+    it('drops a claim the measurements contradict even when nothing was asked in numbers', async () => {
+      const revise = retitles('Deferred vs shipped');
+      const result = await run(store, revise, { slideId: split, baseRevisionId: 'v1', instruction: 'rename the slide' });
+      expect(result.status).toBe('completed');
+      expect(result.steps.write?.output).toMatchObject({
+        written: true,
+        summary: 'Changed 1 slide. Measured: Title: 3 → 3 words. The agent’s own note was left out where the numbers contradict it.',
+        facts: ['Title: 3 → 3 words'],
+      });
+    });
   });
 
   it('writes nothing when the edit changed nothing', async () => {
