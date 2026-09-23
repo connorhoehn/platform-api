@@ -379,14 +379,20 @@ export function liftSlideSubtitles(parsed: unknown): unknown {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
   const deck = parsed as Record<string, unknown>;
   if (!Array.isArray(deck.slides)) return parsed;
-  let subtitle = typeof deck.subtitle === 'string' && deck.subtitle.trim() ? deck.subtitle : undefined;
+  // The other slip (live 2026-09-23, twice in a row): `"subtitle": ""` on the
+  // deck itself. Spreading `deck` kept that empty string, the validator refused
+  // it ("deck.subtitle: must be a non-empty string when present") and the
+  // reader got the offline deck for a draft the model had actually written.
+  // An empty or blank deck subtitle is dropped like a missing one.
+  const { subtitle: given, ...deckRest } = deck;
+  let subtitle = typeof given === 'string' && given.trim() ? given : undefined;
   const slides = deck.slides.map((slide) => {
     if (!slide || typeof slide !== 'object' || !('subtitle' in slide)) return slide;
     const { subtitle: own, ...rest } = slide as Record<string, unknown>;
     if (!subtitle && typeof own === 'string' && own.trim()) subtitle = own.trim().slice(0, 200);
     return rest;
   });
-  return { ...deck, ...(subtitle ? { subtitle } : {}), slides };
+  return { ...deckRest, ...(subtitle ? { subtitle } : {}), slides };
 }
 
 export async function buildDeckFixture(

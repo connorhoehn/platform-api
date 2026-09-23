@@ -154,6 +154,18 @@ describe('buildDeckFixture', () => {
     expect('subtitle' in result.spec.slides[0]!).toBe(false);
   });
 
+  it('an empty deck subtitle is dropped, not kept for the validator to refuse the whole draft', async () => {
+    expect(liftSlideSubtitles({ subtitle: '', slides: [{ id: 'a' }] })).toEqual({ slides: [{ id: 'a' }] });
+    expect(liftSlideSubtitles({ subtitle: '  ', slides: [{ id: 'a', subtitle: 'Slide' }] }))
+      .toEqual({ subtitle: 'Slide', slides: [{ id: 'a' }] });
+    const blank = { ...modelDeck, subtitle: '' };
+    const result = await buildDeckFixture({ documentId: 'doc-release-plan' }, 'Sprint review', {
+      ...deps, llm: scriptedModel(JSON.stringify(blank)),
+    });
+    expect(result.source).toBe('model');
+    expect('subtitle' in result.spec).toBe(false);
+  });
+
   it('a slide subtitle never overrides the deck’s own, and other stray fields still fail', async () => {
     expect(liftSlideSubtitles({ subtitle: 'Deck', slides: [{ id: 'a', subtitle: 'Slide' }] }))
       .toEqual({ subtitle: 'Deck', slides: [{ id: 'a' }] });
