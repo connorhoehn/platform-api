@@ -177,6 +177,38 @@ describe('an older revision whose slide list moved to a manifest (NFR #36)', () 
   });
 });
 
+describe('a deck with many revisions whose older lists moved off the row', () => {
+  it('names all 25 revisions, the older 24 from their manifests, in order', async () => {
+    const blobs = new InMemoryImageBlobStore();
+    const revisions: Row[] = [];
+    for (let index = 1; index <= 25; index += 1) {
+      const key = `deck-slides-${String(index).padStart(40, '0')}.json`;
+      const slides = [slide('cover', 1, `Cover r${index}`, `deck-v${index}-cover.svg`), slide('risks', 2, 'Open risks', `deck-v${index}-risks.svg`)];
+      if (index < 25) {
+        await blobs.putBlob(key, Buffer.from(JSON.stringify(slides)), { contentType: 'application/json' });
+        revisions.push({ ...(deckRow.revisions ?? [])[0], id: `v${index}`, label: `v${index}`, slides: undefined, slidesRef: { key, contentType: 'application/json', sizeBytes: 1, sha256: key.slice(12, 52) } });
+      } else {
+        revisions.push({ ...(deckRow.revisions ?? [])[0], id: `v${index}`, label: `v${index}`, slides });
+      }
+    }
+    const row: Row = { ...deckRow, revisionSlides: undefined, revisions };
+    const client = { async send(command: unknown) { return command instanceof GetCommand ? { Item: row } : command instanceof QueryCommand ? { Count: 0 } : {}; } } as unknown as DynamoDBDocumentClient;
+    const reader = new DynamoWorkActivityReader(client, {
+      presentations: () => ({
+        get: async () => row as unknown as PresentationDocumentRow,
+        appendRevision: async () => { throw new Error('not used'); },
+        readAsset: async (asset) => (await blobs.getBlob(asset.key))?.body ?? null,
+      }),
+      blobs: () => blobs,
+    });
+    const facts = await reader.artifact('doc-deck');
+    expect(facts?.revisions?.map((revision) => revision.id)).toEqual(Array.from({ length: 25 }, (_, i) => `v${i + 1}`));
+    expect(facts?.revisions?.every((revision) => revision.slides.length === 2)).toBe(true);
+    expect(facts?.revisions?.[0]?.slides[0]?.title).toBe('Cover r1');
+    expect(facts?.revisions?.[24]?.slides[0]?.title).toBe('Cover r25');
+  });
+});
+
 describe('the bytes behind one slide', () => {
   it('serves the slide the revision record names, from the blob store', async () => {
     const blobs = new InMemoryImageBlobStore();

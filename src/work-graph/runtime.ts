@@ -547,7 +547,17 @@ export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
       const channel = typeof row?.channel === 'string' ? row.channel : undefined;
       const ownerValid = row?.createdBy === scope.personId
         || (!!channel && await this.memberOnce(batch, channel, scope.personId));
+      // A document the person created is their own to share: the grant's
+      // disclosure is the source owner's ACL, so a viewer outside its channel
+      // (or of a document that has no channel at all — every deck a pipeline
+      // writes) still reaches whatever the creator granted. Before this, a
+      // pipeline-written deck sat at `summary` for every viewer, and its pane
+      // showed no revisions that the viewer could already read by the
+      // document's own revisions route (live 2026-09-23, audit-deck-2355).
+      // A document someone else created and put in a channel still needs the
+      // viewer's own membership.
       const viewer = row?.createdBy === scope.viewerId
+        || row?.createdBy === scope.personId
         || (!!channel && await this.memberOnce(batch, channel, scope.viewerId));
       return { ownerValid, viewerHasDirectAccess: viewer, capabilities: ['view-document', ...(row?.createdBy === scope.viewerId ? ['edit-document' as const] : [])] };
     }

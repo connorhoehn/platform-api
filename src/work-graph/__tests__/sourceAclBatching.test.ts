@@ -137,6 +137,30 @@ describe('source ACL authorization reads', () => {
     expect(decisions.get('d3')?.maximumDisclosure).toBe('details');
   });
 
+  it('lets a creator share their own unchanneled document at the grant’s disclosure (audit-deck-2355)', async () => {
+    // A deck a pipeline writes has no channel. Its creator is the person whose
+    // graph is shared, so the viewer reaches `details` without a membership;
+    // someone else's unchanneled document is nobody's to share here.
+    const rows = [
+      { documentId: 'deck-pipeline', createdBy: 'dev-connor' },
+      { documentId: 'doc-theirs', createdBy: 'dev-alice' },
+    ];
+    const { client: ddb } = client(rows);
+    const targets = [
+      node('p1', 'document', 'document', 'deck-pipeline'),
+      node('p2', 'change', 'document', 'deck-pipeline:v25'),
+      node('t1', 'document', 'document', 'doc-theirs'),
+    ];
+    const asFrank: WorkGraphPolicyScope = { ...scope, personId: 'dev-connor', viewerId: 'dev-frank' };
+
+    const decisions = await new DynamoSourceAclAdapter('document', ddb).authorizeDisclosure(asFrank, targets);
+    expect(decisions.get('p1')?.maximumDisclosure).toBe('details');
+    expect(decisions.get('p2')?.maximumDisclosure).toBe('details');
+    expect(decisions.get('p1')?.capabilities).toEqual(['view-document']);
+    // Not connor's and in no channel: the owner is not valid for it, so it is denied.
+    expect(decisions.get('t1')?.decision).toBe('deny');
+  });
+
   it('authorizes a meeting, its recording and its transcript with one scan', async () => {
     const rows = [{
       callId: 'call-1',
