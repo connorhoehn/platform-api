@@ -180,11 +180,17 @@ function setup(options: {
   activityReader?: WorkActivityReader;
   /** Node kinds the sources cap at summary, whatever the grant says. */
   summaryKinds?: StoredWorkNode['kind'][];
+  /** Sees every ACL target the source is asked about. */
+  onDisclosure?: (targetIds: string[]) => void;
+  /** The source's answer to a capability check (default allow). */
+  capability?: () => 'allow' | 'deny' | 'unavailable';
+  /** The viewer's live grants (default: the one active grant). */
+  grants?: () => StoredWorkGrant[];
 } = {}): express.Express {
   const capped = new Set(options.summaryKinds ?? []);
   const source: WorkSourceAclAdapter = {
     source: 'document',
-    authorizeDisclosure: async (scope, targets) => new Map(targets.map((target) => [target.id, {
+    authorizeDisclosure: async (scope, targets) => (options.onDisclosure?.(targets.map((target) => target.id)), new Map(targets.map((target) => [target.id, {
       targetId: target.id,
       decision: 'allow' as const,
       maximumDisclosure: target.kind === 'node' && capped.has(target.node.kind)
@@ -192,8 +198,8 @@ function setup(options: {
         : options.disclosure ?? ('details' as const),
       capabilities: ['view-document' as const, 'view-transcript' as const],
       policyRevision: scope.policyRevision,
-    }])),
-    authorizeCapability: async () => 'allow' as const,
+    }]))),
+    authorizeCapability: async () => options.capability?.() ?? ('allow' as const),
   };
   const acls = new Map(
     (['document', 'meeting', 'pipeline', 'cloud-compute'] as const)
@@ -203,7 +209,7 @@ function setup(options: {
     graph: { loadProjection: async (organizationId, actorId) => (organizationId === 'org-1' && actorId === 'connor' ? projection : null) },
     sharing: {
       getGrant: async () => grant,
-      listEffectiveGrants: async (_organizationId, ownerId, viewer) => (ownerId === 'connor' && viewer.viewerId === 'frank' ? [grant] : []),
+      listEffectiveGrants: async (_organizationId, ownerId, viewer) => (ownerId === 'connor' && viewer.viewerId === 'frank' ? (options.grants?.() ?? [grant]) : []),
       putGrant: async (value) => value,
     },
     collaboration: {
@@ -240,7 +246,9 @@ function setup(options: {
 
 interface Captured { statusCode: number; body: unknown; headers: Record<string, string> }
 
-async function get(app: express.Express, url: string, sub = 'frank', method = 'GET', body?: unknown): Promise<Captured> {
+async function get(
+  app: express.Express, url: string, sub = 'frank', method = 'GET', body?: unknown, headers: Record<string, string> = {},
+): Promise<Captured> {
   const captured: Captured = { statusCode: 200, body: undefined, headers: {} };
   let settle!: () => void;
   const finished = new Promise<void>((resolve) => { settle = resolve; });
@@ -254,7 +262,7 @@ async function get(app: express.Express, url: string, sub = 'frank', method = 'G
   };
   const req = {
     method, url, originalUrl: url,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...headers },
     ...(body === undefined ? {} : { body }),
     params: {}, ip: '127.0.0.1', user: { sub, orgId: 'org-1' },
   } as unknown as Request;
@@ -454,7 +462,9 @@ describe('work graph schemaVersion 2 route', () => {
     const ok = await get(app, url('deck.v2'));
     expect(ok.statusCode).toBe(200);
     expect(ok.headers['content-type']).toBe('image/svg+xml');
-    expect(ok.headers['cache-control']).toBe('private, no-store');
+    // Immutable bytes, cached by this viewer's browser only — never a shared cache.
+    expect(ok.headers['cache-control']).toBe('private, max-age=86400, immutable');
+    expect(ok.headers['etag']).toMatch(/^"[A-Za-z0-9_-]{43}"$/);
     expect(ok.headers['x-content-type-options']).toBe('nosniff');
     expect(String(ok.body)).toContain('<svg');
 
@@ -502,6 +512,96 @@ describe('work graph schemaVersion 2 route', () => {
     expect(deck?.artifact?.pageCount).toBe(12);
     expect(deck?.artifact?.revisions[0]?.anchors).toBeUndefined();
     expect(deck?.artifact?.revisions[1]?.anchors?.map((anchor) => anchor.id)).toEqual(['slide-4']);
+  });
+
+  it('authorizes a preview against the deck it names, not the whole day', async () => {
+    const asked: string[][] = [];
+    const app = setup({ onDisclosure: (ids) => asked.push(ids) });
+    const url = `/api/work-graph/previews/deck.v2?personId=connor&day=${DAY}&timezone=America%2FNew_York`;
+    expect((await get(app, url)).statusCode).toBe(200);
+    const targets = new Set(asked.flat());
+    // The deck, the changes that edited it, the run that produced it, and the
+    // edges among them — nothing else of the day reaches a source ACL.
+    expect([...targets].sort()).toEqual(['deck', 'deck-v1', 'deck-v2', 'e-produced', 'e-v1', 'e-v2', 'run']);
+  });
+
+  it('answers a revalidation with 304 only after authorizing it again', async () => {
+    let grants = [grant];
+    const app = setup({ grants: () => grants });
+    const url = `/api/work-graph/previews/deck.v2?personId=connor&day=${DAY}&timezone=America%2FNew_York`;
+    const first = await get(app, url);
+    const etag = first.headers['etag']!;
+    const again = await get(app, url, 'frank', 'GET', undefined, { 'if-none-match': etag });
+    expect(again.statusCode).toBe(304);
+    expect(again.body).toBeUndefined();
+    // A different validator gets the bytes.
+    expect((await get(app, url, 'frank', 'GET', undefined, { 'if-none-match': '"other"' })).statusCode).toBe(200);
+    // Revoked: the validator buys nothing.
+    grants = [];
+    expect((await get(app, url, 'frank', 'GET', undefined, { 'if-none-match': etag })).statusCode).toBe(404);
+  });
+
+  it('stops serving the moment the share or the source says no', async () => {
+    let grants = [grant];
+    let capability: 'allow' | 'deny' | 'unavailable' = 'allow';
+    const app = setup({ grants: () => grants, capability: () => capability });
+    const url = `/api/work-graph/previews/deck.v1.slide-3?personId=connor&day=${DAY}&timezone=America%2FNew_York`;
+    expect((await get(app, url)).statusCode).toBe(200);
+    capability = 'deny';
+    expect((await get(app, url)).statusCode).toBe(403);
+    capability = 'unavailable';
+    expect((await get(app, url)).statusCode).toBe(503);
+    capability = 'allow';
+    grants = [{ ...grant, state: 'revoked' } as StoredWorkGrant];
+    expect((await get(app, url)).statusCode).toBe(404);
+    grants = [];
+    expect((await get(app, url)).statusCode).toBe(404);
+  });
+
+  it('serves a pane\'s previews in one batch, under one authorization pass, in request order', async () => {
+    const asked: string[][] = [];
+    const revisionPreview = jest.fn(reader().revisionPreview);
+    const artifact = jest.fn(reader().artifact);
+    const app = setup({ onDisclosure: (ids) => asked.push(ids), activityReader: reader({ revisionPreview, artifact }) });
+    const batch = (handles: unknown, sub = 'frank') => get(app, '/api/work-graph/previews/batch', sub, 'POST', {
+      personId: 'connor', day: DAY, timezone: 'America/New_York', handles,
+    });
+    const response = await batch(['deck.v1.slide-3', 'deck.v2', 'deck.v9', 'transcript.v1', 'deck.v1.slide-9']);
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['cache-control']).toBe('private, no-store');
+    const previews = (response.body as { previews: Array<Record<string, string>> }).previews;
+    expect(previews.map((item) => `${item.handle}:${item.status}`)).toEqual([
+      'deck.v1.slide-3:ok', 'deck.v2:ok', 'deck.v9:unavailable', 'transcript.v1:unavailable', 'deck.v1.slide-9:unavailable',
+    ]);
+    expect(Buffer.from(previews[0]!.body!, 'base64').toString('utf8')).toContain('id="v1-slide-3"');
+    expect(previews[1]!.contentType).toBe('image/svg+xml');
+    expect(previews[1]!.contentHash).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    // One pass: each source adapter was asked once, and never about the transcript.
+    expect(asked.length).toBeLessThanOrEqual(4);
+    expect(asked.flat()).not.toContain('transcript');
+    // Bytes are read only for handles that name a deck this viewer holds.
+    expect(revisionPreview.mock.calls.every(([documentId]) => documentId === 'doc-deck')).toBe(true);
+    // The deck is read once for the whole batch, and each slide's bytes once.
+    expect(artifact).toHaveBeenCalledTimes(1);
+    const reads = revisionPreview.mock.calls.map((call) => call.join('/'));
+    expect(new Set(reads).size).toBe(reads.length);
+
+    // No share, a bad body, and an oversized batch.
+    const refused = await batch(['deck.v2'], 'mallory');
+    expect(refused.statusCode).toBe(404);
+    expect((await batch([])).statusCode).toBe(400);
+    expect((await batch(Array.from({ length: 61 }, (_, index) => `deck.v${index}`))).statusCode).toBe(400);
+    expect((await batch('deck.v2')).statusCode).toBe(400);
+  });
+
+  it('says denied per handle when the source refuses the deck', async () => {
+    const app = setup({ capability: () => 'deny' });
+    const response = await get(app, '/api/work-graph/previews/batch', 'frank', 'POST', {
+      personId: 'connor', day: DAY, timezone: 'America/New_York', handles: ['deck.v2', 'deck.v9'],
+    });
+    const previews = (response.body as { previews: Array<Record<string, string>> }).previews;
+    expect(previews.map((item) => item.status)).toEqual(['denied', 'unavailable']);
+    expect(previews[0]!.body).toBeUndefined();
   });
 
   it('serves one slide of one revision, and only a slide the snapshot listed', async () => {

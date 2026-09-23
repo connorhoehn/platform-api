@@ -28,6 +28,7 @@ import {
 import { WorkSourceAccountRepository } from '../repositories/WorkSourceAccountRepository';
 import { createWorkGraphCursorCodec } from './cursor';
 import { parsePipelineStepResourceId } from './sources/mapPipeline';
+import { runRowLocator } from './sources/runRowLocator';
 import { DynamoWorkActivityReader } from './sources/activityReader';
 import {
   WorkGraphOrchestrator,
@@ -446,16 +447,11 @@ export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
     if (distinct.length === 0) return batch;
 
     if (this.source === 'pipeline') {
-      const runIds = new Set(distinct.map((id) => parsePipelineStepResourceId(id).runId));
-      await Promise.all(chunked([...runIds], MAX_IN_OPERANDS).map(async (chunk) => {
-        const values = Object.fromEntries(chunk.map((id, index) => [`:r${index}`, id]));
-        const rows = await scanAll(this.client, {
-          TableName: PIPELINE_RUNS_TABLE,
-          FilterExpression: `runId IN (${Object.keys(values).join(', ')})`,
-          ExpressionAttributeValues: values,
-        }, Math.max(chunk.length * 2, MIN_ACL_SCAN_ROWS));
-        indexRows(batch.runs, rows, ['runId'], new Set(chunk));
-      }));
+      // By id, through the locator: a Scan the first time a run is seen, a
+      // keyed read after. The row is always read fresh; only its key is known.
+      const runIds = [...new Set(distinct.map((id) => parsePipelineStepResourceId(id).runId))];
+      const rows = await runRowLocator.rows(this.client, PIPELINE_RUNS_TABLE, runIds);
+      for (const [runId, row] of rows) batch.runs.set(runId, row);
       return batch;
     }
 

@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import type {
   SharingAudience,
@@ -163,6 +164,25 @@ function parseActivityQuery(req: Request): WorkGraphWindowInput | null {
     ...(windowEnd ? { windowEnd } : {}),
     ...(mode ? { mode } : {}),
   };
+}
+
+/** At most this many handles in one preview batch: a deck grid's first screen. */
+export const PREVIEW_BATCH_LIMIT = 60;
+/**
+ * Per-viewer browser caching only. `immutable` because a handle names bytes
+ * that never change; a day, not a year, so a revoked viewer's own cache ages
+ * out too (the server refuses them at once regardless).
+ */
+export const PREVIEW_CACHE_CONTROL = 'private, max-age=86400, immutable';
+
+/** `authorize;dur=12, activity;dur=40, …` — phase costs a browser's network panel shows. */
+function serverTiming(timing: Record<string, number>): string {
+  return Object.entries(timing).map(([phase, ms]) => `${phase};dur=${ms}`).join(', ');
+}
+
+/** The strong validator for a preview: SHA-256 of its bytes, base64url. */
+export function previewContentHash(body: Buffer): string {
+  return createHash('sha256').update(body).digest('base64url');
 }
 
 function parseGraphQuery(req: Request): { personId: string; day: string; timezone: string; cursor?: string } {
@@ -371,23 +391,78 @@ export function createWorkGraphRouter(orchestrator: WorkGraphOrchestrator): Rout
 
   /**
    * The bytes behind one revision preview. Authorization is re-decided on
-   * every request, and the response is inert: no sniffing, no framing, and
-   * nothing cached anywhere shared.
+   * every request (node-scoped: the deck the handle names, not the day), and
+   * the response is inert: no sniffing, no framing.
+   *
+   * A handle names an immutable thing — one slide of one stored revision — so
+   * the bytes carry their content hash as a strong ETag and may be kept by
+   * THIS viewer's browser (`private`, never a shared cache, which could serve
+   * them to someone the source no longer allows). A revalidation is still
+   * authorized first and answered 304 without the body.
    */
   router.get('/previews/:handle', handler(async (req, res, viewer) => {
     if (!isId(req.params.handle)) throw new WorkGraphInputError('Preview handle is invalid.');
     const query = parseGraphQuery(req);
+    const timing: Record<string, number> = {};
     const preview = await orchestrator.getRevisionPreview(
-      viewer, query.personId, query.day, query.timezone, req.params.handle,
+      viewer, query.personId, query.day, query.timezone, req.params.handle, timing,
     );
+    res.setHeader('server-timing', serverTiming(timing));
+    const etag = `"${previewContentHash(preview.body)}"`;
+    res.setHeader('etag', etag)
+      .setHeader('cache-control', PREVIEW_CACHE_CONTROL)
+      .setHeader('vary', 'Authorization')
+      .setHeader('x-content-type-options', 'nosniff');
+    const ifNoneMatch = req.headers?.['if-none-match'];
+    if (typeof ifNoneMatch === 'string' && ifNoneMatch.split(',').map((tag) => tag.trim()).includes(etag)) {
+      res.status(304).end();
+      return;
+    }
     res.status(200)
       .setHeader('content-type', preview.contentType)
       .setHeader('content-length', String(preview.body.byteLength))
-      .setHeader('cache-control', 'private, no-store')
-      .setHeader('x-content-type-options', 'nosniff')
       .setHeader('content-disposition', 'inline')
       .setHeader('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox")
       .send(preview.body);
+  }));
+
+  /**
+   * Several previews under one authorization pass — what a deck's pane asks
+   * for when it opens (its card, then every slide of the revision on screen).
+   * Answers are per handle, in request order; the bodies are base64 so one
+   * JSON response carries all of them, each with its content hash.
+   */
+  router.post('/previews/batch', handler(async (req, res, viewer) => {
+    if (!exact(req.body, ['personId', 'day', 'timezone', 'handles'])
+      || !isId(req.body.personId)
+      || !isDay(req.body.day)
+      || !isTimezone(req.body.timezone)
+      || !Array.isArray(req.body.handles)
+      || req.body.handles.length === 0
+      || req.body.handles.length > PREVIEW_BATCH_LIMIT
+      || !req.body.handles.every((handle: unknown) => isId(handle))) {
+      throw new WorkGraphInputError('Preview batch body is invalid.');
+    }
+    const handles = [...new Set(req.body.handles as string[])];
+    const timing: Record<string, number> = {};
+    const answers = await orchestrator.getRevisionPreviews(
+      viewer, req.body.personId, req.body.day, req.body.timezone, handles, timing,
+    );
+    res.status(200)
+      .setHeader('server-timing', serverTiming(timing))
+      .setHeader('cache-control', 'private, no-store')
+      .setHeader('x-content-type-options', 'nosniff')
+      .json({
+        previews: answers.map((answer) => (answer.status === 'ok'
+          ? {
+            handle: answer.handle,
+            status: 'ok',
+            contentType: answer.preview.contentType,
+            contentHash: previewContentHash(answer.preview.body),
+            body: answer.preview.body.toString('base64'),
+          }
+          : { handle: answer.handle, status: answer.status })),
+      });
   }));
 
   router.post('/references/resolve', handler(async (req, res, viewer) => {

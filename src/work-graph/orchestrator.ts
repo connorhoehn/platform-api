@@ -23,6 +23,7 @@ import {
   type ViewerWorkEdge,
   type ViewerWorkNode,
   type WorkGraphPolicyScope,
+  type WorkPolicyDecision,
   type WorkAclTarget,
   type WorkSourceAclAdapter,
   type WorkSourceStatus,
@@ -34,6 +35,7 @@ import log from '../lib/logger';
 import {
   buildWorkActivity,
   parsePreviewHandles,
+  type ParsedPreviewHandle,
   type RevisionPreview,
   type WorkActivityReader,
 } from './activity';
@@ -339,6 +341,97 @@ function assertDuration(now: string, expiresAt: string, minimum: number, maximum
   }
 }
 
+/** One handle's answer from a preview batch, in request order. */
+export type RevisionPreviewAnswer =
+  | { handle: string; status: 'ok'; preview: RevisionPreview }
+  | { handle: string; status: 'unavailable' | 'denied' | 'authorization-unavailable' };
+
+/**
+ * The part of a day a preview authorizes: the named decks, the `change` nodes
+ * that edited them and the runs that produced them, and the edges among
+ * those. The revision list a preview is checked against is built from exactly
+ * these (a deck is an artifact only under its run), so nothing else is asked.
+ */
+export function narrowToDecks(projection: WorkProjectionState, deckIds: ReadonlySet<string>): WorkProjectionState {
+  // Only a document can have a preview; a handle naming anything else is
+  // refused without a source ever being asked about it.
+  const decks = new Set([...deckIds].filter((id) => projection.nodes[id]?.kind === 'document'));
+  const keep = new Set(decks);
+  for (const edge of Object.values(projection.edges)) {
+    if (!edge.deletedAt && (edge.relation === 'edited' || edge.relation === 'produced')
+      && decks.has(edge.toId)) keep.add(edge.fromId);
+  }
+  return {
+    ...projection,
+    nodes: Object.fromEntries(Object.entries(projection.nodes).filter(([id]) => keep.has(id))),
+    edges: Object.fromEntries(Object.entries(projection.edges)
+      .filter(([, edge]) => keep.has(edge.fromId) && keep.has(edge.toId))),
+  };
+}
+
+/**
+ * A reader that answers a repeated call from the first one's promise. Scoped
+ * to one request: it caches nothing across viewers or across time.
+ */
+function memoizedReader(reader: WorkActivityReader): WorkActivityReader {
+  const calls = new Map<string, Promise<unknown>>();
+  const once = <T>(key: string, read: () => Promise<T>): Promise<T> => {
+    let pending = calls.get(key) as Promise<T> | undefined;
+    if (!pending) {
+      pending = read();
+      calls.set(key, pending);
+      // A failed read is not remembered as an answer; the caller that needs
+      // it asks again and sees the failure itself.
+      pending.catch(() => calls.delete(key));
+    }
+    return pending;
+  };
+  const key = (method: string, args: unknown[]): string => JSON.stringify([method, ...args]);
+  return {
+    pipelineRun: (runId) => once(key('pipelineRun', [runId]), () => reader.pipelineRun(runId)),
+    ...(reader.pipelineRuns
+      // Keyed on the SET of runs: the answer is a map, so order is not part of it.
+      ? { pipelineRuns: (resources: string[]) => once(key('pipelineRuns', [[...new Set(resources)].sort()]), () => reader.pipelineRuns!(resources)) }
+      : {}),
+    artifact: (documentId) => once(key('artifact', [documentId]), () => reader.artifact(documentId)),
+    revisionPreview: (documentId, revisionId, slideId) => once(
+      key('revisionPreview', [documentId, revisionId, slideId ?? null]),
+      () => reader.revisionPreview(documentId, revisionId, slideId),
+    ),
+    transcript: (transcriptId) => once(key('transcript', [transcriptId]), () => reader.transcript(transcriptId)),
+    meeting: (meetingId) => once(key('meeting', [meetingId]), () => reader.meeting(meetingId)),
+    attention: (documentId) => once(key('attention', [documentId]), () => reader.attention(documentId)),
+  };
+}
+
+/**
+ * Starts the reads a deck's revision listing makes (`buildWorkActivity`): its
+ * producing runs in one call, the document, its attention. The argument
+ * shapes match what the listing will ask, so a memoized reader answers it
+ * from these; a different authorized set simply asks afresh.
+ */
+function prefetchDeckReads(
+  reader: WorkActivityReader,
+  narrowed: WorkProjectionState,
+  handles: ReadonlyArray<{ candidates: ParsedPreviewHandle[] }>,
+): void {
+  const nodes = Object.values(narrowed.nodes).sort((a, b) => a.id.localeCompare(b.id));
+  const runs = nodes.filter((node) => node.kind === 'run' || node.kind === 'agent').map((node) => node.sourceRef.resourceId);
+  const swallow = (pending: Promise<unknown>): void => { pending.catch(() => undefined); };
+  if (runs.length && reader.pipelineRuns) swallow(reader.pipelineRuns(runs));
+  for (const node of nodes) {
+    if (node.kind !== 'document') continue;
+    swallow(reader.artifact(node.sourceRef.resourceId));
+    swallow(reader.attention(node.sourceRef.resourceId));
+  }
+  // Each handle's most specific reading that names a deck: its bytes.
+  for (const { candidates } of handles) {
+    const first = candidates.find((candidate) => narrowed.nodes[candidate.nodeId]?.kind === 'document');
+    if (!first) continue;
+    swallow(reader.revisionPreview(narrowed.nodes[first.nodeId]!.sourceRef.resourceId, first.revisionId, first.slideId));
+  }
+}
+
 function unavailable(): WorkGraphUnavailableError {
   return new WorkGraphUnavailableError('This work item is unavailable.');
 }
@@ -452,36 +545,7 @@ export class WorkGraphOrchestrator {
       day,
       timezone,
     };
-    const sourceScope: WorkGraphPolicyScope = { ...scopeBase, policyRevision: await this.deps.policyRevision(scopeBase) };
-
-    const projection = this.deps.graph.loadProjectionForLocalDay
-      ? await this.deps.graph.loadProjectionForLocalDay(viewer.organizationId, personId, day, timezone)
-      : await this.deps.graph.loadProjection(viewer.organizationId, personId, day);
-    let grants: StoredWorkGrant[];
-    if (viewer.viewerId === personId) {
-      grants = [this.ownerGrant(viewer, projection, now, day)];
-    } else {
-      grants = (await this.deps.sharing.listEffectiveGrants(
-        viewer.organizationId,
-        personId,
-        viewer,
-        now,
-      )).filter((grant) => grantAppliesToScope(grant, { day, timezone }, now));
-      if (grants.length === 0) throw unavailable();
-    }
-
-    const empty: WorkProjectionState = projection ?? {
-      schemaVersion: 1,
-      organizationId: viewer.organizationId,
-      actorId: personId,
-      revision: 0,
-      sessions: {},
-      nodes: {},
-      edges: {},
-      sourceCheckpoints: {},
-      appliedEventIds: [],
-    };
-    const authorization = await authorizeWorkGraph(empty, sourceScope, grants, this.deps.sourceAcls, now);
+    const { empty, authorization, sourceScope } = await this.authorizeDay(viewer, personId, day, timezone, now);
     const policyRevision = workGraphAuthorizationRevision(sourceScope.policyRevision, authorization);
     const scope: WorkGraphPolicyScope = { ...scopeBase, policyRevision };
     if (previousCursor && !this.deps.cursorCodec.verify(previousCursor, scope, now)) {
@@ -516,6 +580,76 @@ export class WorkGraphOrchestrator {
       },
       authorization,
     };
+  }
+
+  /**
+   * The day's authorization pass, shared by the whole graph and by a preview.
+   *
+   * The same grants, the same source ACL adapters and the same shared
+   * `filterForViewer` decide every node either way. `narrow`, when given,
+   * picks the entities to ask about BEFORE the source ACLs are consulted: a
+   * preview names one deck, so it asks about that deck, the changes that
+   * edited it and the run that produced it — a handful of ACL targets rather
+   * than every node of the day. Each target's decision depends only on its
+   * own grants and its own source answers (`authorizeWorkGraph`), so narrowing
+   * can drop a node but never allow one the full pass would refuse.
+   */
+  private async authorizeDay(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    now: string,
+    narrow?: (projection: WorkProjectionState) => WorkProjectionState,
+    timing?: Record<string, number>,
+  ): Promise<{ empty: WorkProjectionState; authorization: AuthorizedWorkGraph; sourceScope: WorkGraphPolicyScope }> {
+    const started = Date.now();
+    const scopeBase = {
+      organizationId: viewer.organizationId,
+      viewerId: viewer.viewerId,
+      personId,
+      day,
+      timezone,
+    };
+    // Three independent reads, issued together: they were three round trips
+    // in a row on every graph and every preview.
+    const owner = viewer.viewerId === personId;
+    const [policyRevision, projection, shared] = await Promise.all([
+      this.deps.policyRevision(scopeBase),
+      this.deps.graph.loadProjectionForLocalDay
+        ? this.deps.graph.loadProjectionForLocalDay(viewer.organizationId, personId, day, timezone)
+        : this.deps.graph.loadProjection(viewer.organizationId, personId, day),
+      owner ? Promise.resolve([] as StoredWorkGrant[]) : this.deps.sharing.listEffectiveGrants(
+        viewer.organizationId,
+        personId,
+        viewer,
+        now,
+      ),
+    ]);
+    const sourceScope: WorkGraphPolicyScope = { ...scopeBase, policyRevision };
+    const grants: StoredWorkGrant[] = owner
+      ? [this.ownerGrant(viewer, projection, now, day)]
+      : shared.filter((grant) => grantAppliesToScope(grant, { day, timezone }, now));
+    if (grants.length === 0) throw unavailable();
+
+    const empty: WorkProjectionState = projection ?? {
+      schemaVersion: 1,
+      organizationId: viewer.organizationId,
+      actorId: personId,
+      revision: 0,
+      sessions: {},
+      nodes: {},
+      edges: {},
+      sourceCheckpoints: {},
+      appliedEventIds: [],
+    };
+    const loaded = Date.now();
+    if (timing) timing.load = loaded - started;
+    const authorization = await authorizeWorkGraph(
+      narrow ? narrow(empty) : empty, sourceScope, grants, this.deps.sourceAcls, now,
+    );
+    if (timing) timing.acl = Date.now() - loaded;
+    return { empty, authorization, sourceScope };
   }
 
   /**
@@ -805,8 +939,8 @@ export class WorkGraphOrchestrator {
    *
    * The handle names a node and a revision the viewer was already given, and
    * nothing more: it is not a capability. Access is re-decided here against
-   * the live graph and the source's own ACL, so a handle kept from an earlier
-   * session stops working the moment the share does.
+   * the live projection and the source's own ACL, so a handle kept from an
+   * earlier session stops working the moment the share does.
    */
   async getRevisionPreview(
     viewer: AuthenticatedWorkGraphViewer,
@@ -814,67 +948,139 @@ export class WorkGraphOrchestrator {
     day: string,
     timezone: string,
     handle: string,
+    timing?: Record<string, number>,
   ): Promise<RevisionPreview> {
-    const reader = this.deps.activityReader;
-    if (!reader) throw new WorkGraphInputError('Revision previews are not available on this deployment.');
-    const candidates = parsePreviewHandles(handle);
-    if (candidates.length === 0) throw unavailable();
-
-    const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone);
-    // A handle reads as a slide or as a revision; only the ones naming an
-    // artifact node this viewer already holds at full disclosure survive.
-    const named = candidates.filter((candidate) => {
-      const node = snapshot.nodes.find((item) => item.id === candidate.nodeId);
-      return !!node && node.kind === 'document' && !node.locked && node.disclosure === 'details';
-    });
-    if (named.length === 0) throw unavailable();
-
-    // The revision — and the slide, when the handle names one — has to be one
-    // this same snapshot listed. A handle naming a revision the viewer was
-    // never shown is indistinguishable from absent.
-    //
-    // Only the named deck, its revision (`change` → `edited`) nodes and the
-    // run that produced it (a deck is an artifact only under its run): the
-    // revision list is built from exactly those. Building the WHOLE day's
-    // activity per preview read every run row and every artifact for each
-    // handle — ~3 s each, and a card grid asks for dozens, so the one on
-    // screen queued behind the rest of the browser's six connections.
-    const keep = new Set(named.map((candidate) => candidate.nodeId));
-    for (const edge of snapshot.edges) {
-      if ((edge.relation === 'edited' || edge.relation === 'produced') && keep.has(edge.toId)) keep.add(edge.fromId);
+    const [answer] = await this.getRevisionPreviews(viewer, personId, day, timezone, [handle], timing);
+    if (answer?.status === 'ok') return answer.preview;
+    if (answer?.status === 'authorization-unavailable') {
+      throw new WorkGraphAuthorizationUnavailableError('Preview authorization is unavailable.');
     }
-    const activity = await buildWorkActivity({
-      query: this.resolveWindow(personId, day, timezone, {}, this.deps.now()),
-      nodes: snapshot.nodes.filter((node) => keep.has(node.id)),
-      edges: snapshot.edges.filter((edge) => keep.has(edge.fromId) && keep.has(edge.toId)),
-      authorization,
-      reader,
-      now: this.deps.now(),
-    });
-    const parsed = named.find((candidate) => {
+    if (answer?.status === 'denied') throw new WorkGraphCapabilityDeniedError('Viewing this revision is not permitted.');
+    throw unavailable();
+  }
+
+  /**
+   * Serves several revision previews under ONE authorization pass.
+   *
+   * Node-scoped: the pass asks the source ACLs about the decks the handles
+   * name, the changes that edited them and the runs that produced them — not
+   * every node of the day (`authorizeDay` with a narrowing). The contract is
+   * the graph's own and is never weaker: the same grants, the same adapters,
+   * the same `filterForViewer`, a node must come back at `details` and
+   * unlocked, the revision (and slide) must be one the activity layer lists
+   * for it, and `view-document` is re-checked on the source per deck.
+   *
+   * Answers are per handle and in request order. A handle that names nothing
+   * this viewer holds is `unavailable`, indistinguishable from absent.
+   */
+  async getRevisionPreviews(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    handles: readonly string[],
+    /** Filled with phase durations in ms (`authorize`, `activity`, `bytes`) for a `Server-Timing` header. */
+    timing?: Record<string, number>,
+  ): Promise<RevisionPreviewAnswer[]> {
+    const clock = Date.now();
+    const mark = (phase: string, since: number): number => {
+      const at = Date.now();
+      if (timing) timing[phase] = at - since;
+      return at;
+    };
+    const source = this.deps.activityReader;
+    if (!source) throw new WorkGraphInputError('Revision previews are not available on this deployment.');
+    // Per request only: the same read asked twice is answered once.
+    const reader = memoizedReader(source);
+    const parsedHandles = handles.map((handle) => ({ handle, candidates: parsePreviewHandles(handle) }));
+    const named = new Set(parsedHandles.flatMap(({ candidates }) => candidates.map((candidate) => candidate.nodeId)));
+    const none = (status: 'unavailable'): RevisionPreviewAnswer[] => handles.map((handle) => ({ handle, status }));
+    if (named.size === 0) return none('unavailable');
+
+    const now = this.deps.now();
+    const [member, { authorization, sourceScope }] = await Promise.all([
+      this.deps.directory.personBelongsToOrganization(viewer.organizationId, personId),
+      this.authorizeDay(viewer, personId, day, timezone, now, (projection) => {
+        const narrowed = narrowToDecks(projection, named);
+        // The source ACLs and these reads do not depend on each other, so the
+        // reads the revision listing is about to need start now instead of
+        // after the pass. Nothing read here is used unless the pass allows it.
+        prefetchDeckReads(reader, narrowed, parsedHandles);
+        return narrowed;
+      }, timing),
+    ]);
+    if (!member) throw unavailable();
+    const authorized = mark('authorize', clock);
+
+    // Only artifact nodes this viewer holds at full disclosure can serve bytes.
+    const decks = new Map(authorization.nodes
+      .filter((node) => named.has(node.id) && node.kind === 'document' && !node.locked && node.disclosure === 'details')
+      .map((node) => [node.id, node]));
+    if (decks.size === 0) return none('unavailable');
+
+    const scope = {
+      ...sourceScope,
+      policyRevision: workGraphAuthorizationRevision(sourceScope.policyRevision, authorization),
+    };
+    // Bytes come through the memoized reader, so the ones prefetched during
+    // the pass are not read twice. They are served only if the revision
+    // listing and the capability check below then agree.
+    const bytes = (candidate: ParsedPreviewHandle): Promise<RevisionPreview | null> => {
+      const target = authorization.targets.get(candidate.nodeId);
+      if (!target || target.kind !== 'node') return Promise.resolve(null);
+      return reader.revisionPreview(target.sourceRef.resourceId, candidate.revisionId, candidate.slideId)
+        .catch(() => null);
+    };
+
+    const allowed = new Set(decks.keys());
+    for (const edge of authorization.edges) {
+      if ((edge.relation === 'edited' || edge.relation === 'produced') && decks.has(edge.toId)) allowed.add(edge.fromId);
+    }
+    const [activity, capabilities] = await Promise.all([
+      buildWorkActivity({
+        query: this.resolveWindow(personId, day, timezone, {}, now),
+        nodes: authorization.nodes.filter((node) => allowed.has(node.id)),
+        edges: authorization.edges.filter((edge) => allowed.has(edge.fromId) && allowed.has(edge.toId)),
+        authorization,
+        reader,
+        now,
+      }),
+      Promise.all([...decks.keys()].map(async (nodeId) => {
+        const target = authorization.targets.get(nodeId);
+        if (!target || target.kind !== 'node') return [nodeId, 'deny'] as const;
+        return [nodeId, await authorizeWorkCapability(
+          { ...scope, organizationId: viewer.organizationId, viewerId: viewer.viewerId },
+          target,
+          'view-document',
+          this.deps.sourceAcls,
+        )] as const;
+      })).then((entries) => new Map<string, WorkPolicyDecision>(entries)),
+    ]);
+
+    const listedAt = mark('activity', authorized);
+    // A revision — and the slide, when the handle names one — has to be one
+    // this viewer's activity layer lists. A handle naming a revision the
+    // viewer was never shown is indistinguishable from absent.
+    const listed = (candidate: ParsedPreviewHandle): boolean => {
       const revision = activity.details
         .find((detail) => detail.nodeId === candidate.nodeId)?.artifact?.revisions
         .find((item) => item.id === candidate.revisionId);
       if (!revision) return false;
       return candidate.slideId === undefined
         || (revision.anchors ?? []).some((anchor) => anchor.id === candidate.slideId);
-    });
-    if (!parsed) throw unavailable();
+    };
 
-    const target = authorization.targets.get(parsed.nodeId);
-    if (!target || target.kind !== 'node') throw unavailable();
-    const decision = await authorizeWorkCapability(
-      { ...snapshot.scope, organizationId: viewer.organizationId, viewerId: viewer.viewerId },
-      target,
-      'view-document',
-      this.deps.sourceAcls,
-    );
-    if (decision === 'unavailable') throw new WorkGraphAuthorizationUnavailableError('Preview authorization is unavailable.');
-    if (decision !== 'allow') throw new WorkGraphCapabilityDeniedError('Viewing this revision is not permitted.');
-
-    const preview = await reader.revisionPreview(target.sourceRef.resourceId, parsed.revisionId, parsed.slideId);
-    if (!preview) throw unavailable();
-    return preview;
+    const answers = await Promise.all(parsedHandles.map(async ({ handle, candidates }): Promise<RevisionPreviewAnswer> => {
+      const parsed = candidates.find((candidate) => decks.has(candidate.nodeId) && listed(candidate));
+      if (!parsed) return { handle, status: 'unavailable' };
+      const decision = capabilities.get(parsed.nodeId);
+      if (decision === 'unavailable') return { handle, status: 'authorization-unavailable' };
+      if (decision !== 'allow') return { handle, status: 'denied' };
+      const preview = await bytes(parsed);
+      return preview ? { handle, status: 'ok', preview } : { handle, status: 'unavailable' };
+    }));
+    mark('bytes', listedAt);
+    return answers;
   }
 
   /**
