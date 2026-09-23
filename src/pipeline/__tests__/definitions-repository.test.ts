@@ -20,6 +20,19 @@ jest.mock('../../lib/aws-clients', () => ({
   docClient: { send: jest.fn() },
 }));
 
+// The repository builds its logger at import time, which is before this
+// `const` initializes under jest.mock hoisting — so the factory must reach
+// `mockWarn` lazily, per call, not capture it.
+const mockWarn = jest.fn();
+jest.mock('../../lib/logger', () => ({
+  withContext: () => ({
+    warn: (...args: unknown[]) => mockWarn(...args),
+    info: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn(),
+  }),
+}));
+
 function def(overrides: Partial<PipelineDefinition> = {}): PipelineDefinition {
   return { id: 'pipeline-1', name: 'My Pipeline', ...overrides };
 }
@@ -30,6 +43,7 @@ function item(userId: string, definition: PipelineDefinition) {
 
 beforeEach(() => {
   mockSend.mockReset();
+  mockWarn.mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -95,6 +109,45 @@ describe('DefinitionsRepository — list', () => {
     const repo = new DefinitionsRepository(mockDocClient);
     const result = await repo.list('user-1');
     expect(result).toEqual([]);
+  });
+
+  // The table is also written by realtime-examples' Active Now seed, whose
+  // 2026-09-21 row for `active-now-presentation-agent` was the flat
+  // `{ name, description, steps }` shape with no `definition`. list() handed
+  // it back as `undefined`, the route read `.id` on it, and every
+  // GET /api/pipelines for that person was a 500 (NFR #109).
+  it('leaves out a row with no definition object, names it in the log, and still returns the rest', async () => {
+    const good = def({ id: 'p-1', name: 'Pipeline A' });
+    mockSend.mockResolvedValue({
+      Items: [
+        { userId: 'dev-connor', pipelineId: 'active-now-presentation-agent', name: 'Presentation agent', steps: [], updatedAt: '2026-09-21T13:33:00.000Z' },
+        item('dev-connor', good),
+        { userId: 'dev-connor', pipelineId: 'stringly', definition: 'not-an-object' },
+      ],
+    });
+    const repo = new DefinitionsRepository(mockDocClient);
+    const result = await repo.list('dev-connor');
+
+    expect(result).toEqual([good]);
+    expect(mockWarn).toHaveBeenCalledTimes(2);
+    expect(mockWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'list', userId: 'dev-connor', pipelineId: 'active-now-presentation-agent', keys: expect.arrayContaining(['name', 'steps']) }),
+      expect.stringContaining('no definition object'),
+    );
+    expect(mockWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'list', pipelineId: 'stringly' }),
+      expect.any(String),
+    );
+  });
+
+  it('get() answers null for such a row instead of an undefined definition', async () => {
+    mockSend.mockResolvedValue({ Item: { userId: 'dev-connor', pipelineId: 'active-now-presentation-agent', name: 'Presentation agent' } });
+    const repo = new DefinitionsRepository(mockDocClient);
+    await expect(repo.get('dev-connor', 'active-now-presentation-agent')).resolves.toBeNull();
+    expect(mockWarn).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'get', pipelineId: 'active-now-presentation-agent' }),
+      expect.any(String),
+    );
   });
 });
 

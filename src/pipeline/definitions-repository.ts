@@ -35,6 +35,9 @@ import {
 import { BaseRepository } from '../repositories/BaseRepository';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
+import { withContext } from '../lib/logger';
+
+const log = withContext({ module: 'definitionsRepository' });
 
 /**
  * Structural minimum of a pipeline definition. Mirrors the route file's
@@ -55,6 +58,35 @@ export interface PipelineDefinitionItem {
 
 const PIPELINE_DEFINITIONS_TABLE = tableName('pipeline-definitions');
 
+/**
+ * The definition carried by a stored row, or null when the row has none.
+ *
+ * Every read goes through here because the table is not written only by this
+ * repository: realtime-examples' Active Now seed puts a row for
+ * `active-now-presentation-agent` directly, and the row it wrote on 2026-09-21
+ * was the flat `{ name, description, steps }` shape with no `definition`.
+ * `list()` used to hand that row back as `undefined` typed as a definition,
+ * and the definitions route dereferenced `.id` on it — every `GET
+ * /api/pipelines` for that person answered 500 `failed to list definitions`,
+ * which took the pipeline picker, the page editor and the Activity pane's
+ * pipeline names down with it (NFR #109). A row this repository cannot read
+ * is named in the log and left out; the rows it can read are still returned.
+ */
+function readDefinition(
+  it: Partial<PipelineDefinitionItem> | null | undefined,
+  action: 'get' | 'list' | 'listAll',
+): PipelineDefinition | null {
+  const definition = it?.definition;
+  if (definition && typeof definition === 'object') return definition;
+  if (it) {
+    log.warn(
+      { action, userId: it.userId, pipelineId: it.pipelineId, keys: Object.keys(it) },
+      'pipeline-definitions row has no definition object; skipped',
+    );
+  }
+  return null;
+}
+
 export class DefinitionsRepository {
   private store: BaseRepository;
 
@@ -71,7 +103,7 @@ export class DefinitionsRepository {
       userId,
       pipelineId,
     });
-    return item ? item.definition : null;
+    return readDefinition(item, 'get');
   }
 
   /**
@@ -86,8 +118,13 @@ export class DefinitionsRepository {
         ExpressionAttributeValues: { ':uid': userId },
       }),
     );
-    const items = (result.Items ?? []) as PipelineDefinitionItem[];
-    return items.map((it) => it.definition);
+    const items = (result.Items ?? []) as Partial<PipelineDefinitionItem>[];
+    const out: PipelineDefinition[] = [];
+    for (const it of items) {
+      const definition = readDefinition(it, 'list');
+      if (definition) out.push(definition);
+    }
+    return out;
   }
 
   /**
@@ -121,9 +158,10 @@ export class DefinitionsRepository {
           ExclusiveStartKey: lastKey,
         }),
       );
-      const items = (result.Items ?? []) as PipelineDefinitionItem[];
+      const items = (result.Items ?? []) as Partial<PipelineDefinitionItem>[];
       for (const it of items) {
-        if (it && it.definition) out.push(it.definition);
+        const definition = readDefinition(it, 'listAll');
+        if (definition) out.push(definition);
       }
       lastKey = result.LastEvaluatedKey as
         | Record<string, unknown>
