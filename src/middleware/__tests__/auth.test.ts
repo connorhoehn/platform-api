@@ -22,7 +22,7 @@ jest.mock('jwks-rsa', () => () => ({
 process.env.COGNITO_REGION = 'us-east-1';
 process.env.COGNITO_USER_POOL_ID = 'us-east-1_TestPool';
 
-import { requireAuth, optionalAuth } from '../auth';
+import { requireAuth, optionalAuth, requirePrincipal } from '../auth';
 
 interface TestRes {
   statusCode: number;
@@ -161,5 +161,47 @@ describe('optionalAuth', () => {
     await optionalAuth(req, mockRes() as unknown as Response, next);
     expect(next).toHaveBeenCalled();
     expect(req.user).toEqual({ sub: 'user-42', email: 'a@b.com' });
+  });
+});
+
+describe('requirePrincipal (no silent dev-user)', () => {
+  it('refuses a request that has no principal', () => {
+    const res = mockRes();
+    const next = jest.fn();
+    requirePrincipal({ method: 'GET', baseUrl: '/api/v2', path: '/pipelines/x/runs' } as unknown as Request, res as unknown as Response, next as NextFunction);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('passes a request requireAuth attributed', () => {
+    const res = mockRes();
+    const next = jest.fn();
+    requirePrincipal({ user: { sub: 'dev-connor' } } as unknown as Request, res as unknown as Response, next as NextFunction);
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('without SKIP_AUTH an anonymous request is 401, never dev-user', async () => {
+    const prev = process.env.SKIP_AUTH;
+    delete process.env.SKIP_AUTH;
+    const req = { headers: {}, method: 'GET', path: '/pipelines/defs/x' } as unknown as Request;
+    const res = mockRes();
+    const next = jest.fn();
+    await requireAuth(req, res as unknown as Response, next as NextFunction);
+    expect(res.statusCode).toBe(401);
+    expect((req as Request & { user?: unknown }).user).toBeUndefined();
+    process.env.SKIP_AUTH = prev;
+  });
+
+  it('SKIP_AUTH in production still refuses (the fallback is dev-only)', async () => {
+    const prevSkip = process.env.SKIP_AUTH;
+    const prevEnv = process.env.NODE_ENV;
+    process.env.SKIP_AUTH = 'true';
+    process.env.NODE_ENV = 'production';
+    const req = { headers: {}, method: 'GET', path: '/pipelines/defs/x' } as unknown as Request;
+    const res = mockRes();
+    await requireAuth(req, res as unknown as Response, jest.fn() as NextFunction);
+    expect(res.statusCode).toBe(401);
+    process.env.SKIP_AUTH = prevSkip;
+    process.env.NODE_ENV = prevEnv;
   });
 });

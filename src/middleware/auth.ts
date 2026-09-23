@@ -24,6 +24,19 @@ export function devUserFallback(req: Request): { sub: string; email: string } {
   return { sub: 'dev-user', email: 'dev@local' };
 }
 
+/**
+ * Refuses a request that reached a handler with no principal. `requireAuth`
+ * always sets one (a verified Cognito user, or — only with SKIP_AUTH=true
+ * outside production — the logged `dev-user` fallback), so this fires only
+ * when a route is mounted outside it. Handlers behind it read `req.user.sub`
+ * directly instead of defaulting to `'dev-user'` silently.
+ */
+export function requirePrincipal(req: Request, res: Response, next: NextFunction): void {
+  if (req.user?.sub) { next(); return; }
+  authLog.warn({ route: `${req.method} ${(req.baseUrl || '') + (req.path || '')}` }, 'request reached a handler with no principal; refused');
+  res.status(401).json({ error: 'Authorization required' });
+}
+
 const region = process.env.COGNITO_REGION!;
 const userPoolId = process.env.COGNITO_USER_POOL_ID!;
 const issuer = `https://cognito-idp.${region}.amazonaws.com/${userPoolId}`;

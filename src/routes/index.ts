@@ -21,7 +21,7 @@ import { documentAutomationsRouter } from './documentAutomations';
 import { chatCommandsRouter } from './chatCommands';
 import { chatPanelsRouter } from './chatPanels';
 import { agentLoopsRouter } from './agentLoops';
-import { requireAuth } from '../middleware/auth';
+import { requireAuth, requirePrincipal } from '../middleware/auth';
 import { callLogRouter } from './callLog';
 import { workItemsRouter } from './workItems';
 import { documentWorkRouter, documentWorkListRouter } from './documentWork';
@@ -282,13 +282,11 @@ router.get('/pipelines/:pipelineId', (req, res, next) => { req.url = `/${encodeU
 // ---------------------------------------------------------------------------
 router.use(
   '/v2',
+  // No silent 'dev-user': the principal is whatever requireAuth set (Cognito,
+  // or its logged SKIP_AUTH fallback); a request without one is refused.
+  requirePrincipal,
   createPipelineRouter({
-    // Cognito-backed when present; falls through to dev-user when SKIP_AUTH
-    // is on and no token was attached (matches the legacy handler's posture).
-    getAuthContext: (req: Request): AuthContext => {
-      const u = (req as Request & { user?: { sub?: string } }).user;
-      return { userId: u?.sub ?? 'dev-user' };
-    },
+    getAuthContext: (req: Request): AuthContext => ({ userId: req.user!.sub }),
     getDefinition: async (userId, pipelineId) =>
       definitionsRepo.get(userId, pipelineId),
     trigger: async (args) => {
