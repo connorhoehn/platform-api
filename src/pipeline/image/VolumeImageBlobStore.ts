@@ -18,9 +18,9 @@
 //
 // No cloud SDKs. Uses node:fs/promises only.
 
-import { mkdir, writeFile, readFile, access } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, access, readdir, stat, unlink } from 'node:fs/promises';
 import { join, basename } from 'node:path';
-import type { AssetBlobStore, BlobAsset, ImageBlobStore, PutBlobMeta } from './ImageBlobStore';
+import type { AssetBlobStore, BlobAsset, ImageBlobStore, PutBlobMeta, StoredAssetEntry, SweepableAssetStore } from './ImageBlobStore';
 import type { ImageMeta } from './types';
 
 /** Default base dir — override with IMAGE_BLOB_DIR env var. */
@@ -59,7 +59,7 @@ function sanitizeImageId(imageId: string): string {
   return safe;
 }
 
-export class VolumeImageBlobStore implements ImageBlobStore, AssetBlobStore {
+export class VolumeImageBlobStore implements ImageBlobStore, AssetBlobStore, SweepableAssetStore {
   /** Largest edge that this store is willing to preserve. */
   readonly maxStoredEdge = VOLUME_MAX_STORED_EDGE;
   /** Byte ceiling for a single stored image. */
@@ -165,6 +165,44 @@ export class VolumeImageBlobStore implements ImageBlobStore, AssetBlobStore {
       );
       return null;
     }
+  }
+
+  /** Last write of an asset = the body file's mtime (every putBlob rewrites it). */
+  async *listAssets(prefix: string): AsyncIterable<StoredAssetEntry> {
+    let names: string[];
+    try {
+      names = await readdir(this.dir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw err;
+    }
+    for (const name of names) {
+      if (!name.startsWith(prefix) || name.endsWith('.meta.json')) continue;
+      try {
+        yield { key: name, touchedAtMs: (await stat(join(this.dir, name))).mtimeMs };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+    }
+  }
+
+  /**
+   * Re-stats right before unlinking, so a save that rewrote the key since it was
+   * listed keeps it. A filesystem has no conditional delete, so a write landing
+   * between the stat and the unlink is not caught here — the DDB copy's
+   * conditional delete is, and reads fall back to it.
+   */
+  async deleteAssetIfUntouched(key: string, touchedAtMs: number): Promise<boolean> {
+    const body = this.bodyPath(key);
+    try {
+      if ((await stat(body)).mtimeMs !== touchedAtMs) return false;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw err;
+    }
+    await unlink(body).catch((err: NodeJS.ErrnoException) => { if (err.code !== 'ENOENT') throw err; });
+    await unlink(this.metaPath(key)).catch((err: NodeJS.ErrnoException) => { if (err.code !== 'ENOENT') throw err; });
+    return true;
   }
 
   async getMetadata(imageId: string): Promise<ImageMeta | null> {

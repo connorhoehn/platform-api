@@ -17,9 +17,11 @@
 // Code parity with platform-api/src/pipeline/judge/RawTextStore.ts.
 
 import {
+  DeleteCommand,
   DynamoDBDocumentClient,
   GetCommand,
   PutCommand,
+  ScanCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { docClient as defaultDocClient } from '../../lib/aws-clients';
 import { tableName } from '../../lib/ddb-table-name';
@@ -67,6 +69,32 @@ export interface AssetBlobStore {
   putBlob(key: string, body: Buffer, meta: PutBlobMeta): Promise<BlobAsset>;
   /** Read bytes back, or null when the key is absent or the read failed. */
   getBlob(key: string): Promise<{ body: Buffer; asset: BlobAsset } | null>;
+}
+
+/** One stored asset, as a sweeper sees it: its key and when it was last written. */
+export interface StoredAssetEntry {
+  key: string;
+  /** Last write, ms since epoch. Every `putBlob` of the key refreshes it. */
+  touchedAtMs: number;
+}
+
+/**
+ * The half of an asset store a reference-aware sweeper needs (NFR #48). There
+ * is deliberately no unconditional delete: a presentation's slide and spec
+ * blobs are shared by content across revisions and decks, so the only safe
+ * delete is "this key, if nobody has written it since I looked" — the caller
+ * decides it is unreferenced, the store refuses if a save touched it meanwhile.
+ */
+export interface SweepableAssetStore {
+  /** Every asset whose key starts with `prefix`, with its last-write time. */
+  listAssets(prefix: string): AsyncIterable<StoredAssetEntry>;
+  /** Delete `key` only if its last write is still `touchedAtMs`. True when deleted. */
+  deleteAssetIfUntouched(key: string, touchedAtMs: number): Promise<boolean>;
+}
+
+export function isSweepableAssetStore(store: unknown): store is SweepableAssetStore {
+  const candidate = store as Partial<SweepableAssetStore> | null;
+  return !!candidate && typeof candidate.listAssets === 'function' && typeof candidate.deleteAssetIfUntouched === 'function';
 }
 
 /** True when a store can hold non-image bytes — every store in this file can. */
@@ -134,9 +162,12 @@ export interface DdbImageBlobStoreOptions {
   /** Override for tests. Defaults to the shared docClient. */
   docClient?: DynamoDBDocumentClient;
   /**
-   * Override retention. Defaults to 30 days (shorter than judgments — images are transient).
-   * `null` keeps assets for good: a presentation's slides and specs are the
-   * document's own content, referenced by its row, and must not expire under it.
+   * Override image retention. Defaults to 30 days (shorter than judgments — images are transient).
+   * Applies to `put()` (images) only: `putBlob()` assets never carry a TTL
+   * (NFR #48) — a presentation's `.pptx`, slides and specs are referenced by
+   * its row, and a content-addressed slide is shared by every deck with that
+   * markup, so no per-item expiry can know when one is free. The deck blob
+   * sweeper (src/deck/blobSweeper.ts) removes them by reference instead.
    */
   ttlDays?: number | null;
   /** Override wall-clock for tests. Returns ms-since-epoch. */
@@ -157,7 +188,7 @@ interface ImageRow {
   ttlEpoch: number;
 }
 
-export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
+export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore, SweepableAssetStore {
   /**
    * Max stored edge for DDB-backed images: 1024px. This is the historical
    * upscale default (DEFAULT_STORE_MAX_EDGE) — the capBytes ceiling + the
@@ -252,7 +283,9 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
         `asset '${key}' is ${body.byteLength}B, over the DDB inline cap of ${IMAGE_BLOB_SIZE_CAP_BYTES}B — run with IMAGE_BLOB_STORE=fs to store assets this size`,
       );
     }
-    const ttlEpoch = this.ttlSeconds === null ? undefined : Math.floor(this.now() / 1000) + this.ttlSeconds;
+    // No ttlEpoch, whatever `ttlDays` says: see DdbImageBlobStoreOptions. A
+    // PutCommand replaces the item, so rewriting a shared blob also clears any
+    // ttl an older build left on it.
     await this.docClient.send(new PutCommand({
       TableName: PIPELINE_IMAGES_TABLE,
       Item: {
@@ -267,10 +300,47 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
         ...(meta.createdBy ? { uploadedBy: meta.createdBy } : {}),
         ...(meta.label ? { label: meta.label } : {}),
         kind: 'asset',
-        ...(ttlEpoch !== undefined ? { ttlEpoch } : {}),
       },
     }));
     return { key, contentType: meta.contentType, sizeBytes: body.byteLength };
+  }
+
+  async *listAssets(prefix: string): AsyncIterable<StoredAssetEntry> {
+    let startKey: Record<string, unknown> | undefined;
+    do {
+      const page = await this.docClient.send(new ScanCommand({
+        TableName: PIPELINE_IMAGES_TABLE,
+        FilterExpression: '#kind = :asset AND begins_with(imageId, :prefix)',
+        ProjectionExpression: 'imageId, uploadedAt',
+        ExpressionAttributeNames: { '#kind': 'kind' },
+        ExpressionAttributeValues: { ':asset': 'asset', ':prefix': prefix },
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }));
+      for (const item of page.Items ?? []) {
+        const touchedAtMs = Date.parse(String(item.uploadedAt ?? ''));
+        // No parseable write time → never a candidate (it cannot be proven old).
+        if (typeof item.imageId === 'string' && Number.isFinite(touchedAtMs)) yield { key: item.imageId, touchedAtMs };
+      }
+      startKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (startKey);
+  }
+
+  async deleteAssetIfUntouched(key: string, touchedAtMs: number): Promise<boolean> {
+    try {
+      await this.docClient.send(new DeleteCommand({
+        TableName: PIPELINE_IMAGES_TABLE,
+        Key: { imageId: key },
+        // A save that rewrote the key since the sweeper listed it moved
+        // uploadedAt; the delete then does nothing.
+        ConditionExpression: '#kind = :asset AND uploadedAt = :seen',
+        ExpressionAttributeNames: { '#kind': 'kind' },
+        ExpressionAttributeValues: { ':asset': 'asset', ':seen': new Date(touchedAtMs).toISOString() },
+      }));
+      return true;
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return false;
+      throw err;
+    }
   }
 
   async getBlob(key: string): Promise<{ body: Buffer; asset: BlobAsset } | null> {
@@ -318,9 +388,14 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
 // In-memory impl (tests + envs without DDB)
 // ---------------------------------------------------------------------------
 
-export class InMemoryImageBlobStore implements ImageBlobStore, AssetBlobStore {
+export class InMemoryImageBlobStore implements ImageBlobStore, AssetBlobStore, SweepableAssetStore {
   private readonly rows = new Map<string, { body: Buffer; meta: ImageMeta }>();
-  private readonly assets = new Map<string, { body: Buffer; asset: BlobAsset }>();
+  private readonly assets = new Map<string, { body: Buffer; asset: BlobAsset; touchedAtMs: number }>();
+  private readonly now: () => number;
+
+  constructor(opts: { now?: () => number } = {}) {
+    this.now = opts.now ?? (() => Date.now());
+  }
 
   async put(imageId: string, body: Buffer, meta: ImageMeta): Promise<string> {
     if (body.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
@@ -341,12 +416,26 @@ export class InMemoryImageBlobStore implements ImageBlobStore, AssetBlobStore {
   }
 
   async putBlob(key: string, body: Buffer, meta: PutBlobMeta): Promise<BlobAsset> {
-    this.assets.set(key, { body, asset: { key, contentType: meta.contentType, sizeBytes: body.byteLength } });
+    this.assets.set(key, { body, asset: { key, contentType: meta.contentType, sizeBytes: body.byteLength }, touchedAtMs: this.now() });
     return { key, contentType: meta.contentType, sizeBytes: body.byteLength };
   }
 
   async getBlob(key: string): Promise<{ body: Buffer; asset: BlobAsset } | null> {
-    return this.assets.get(key) ?? null;
+    const entry = this.assets.get(key);
+    return entry ? { body: entry.body, asset: entry.asset } : null;
+  }
+
+  async *listAssets(prefix: string): AsyncIterable<StoredAssetEntry> {
+    for (const [key, entry] of [...this.assets.entries()]) {
+      if (key.startsWith(prefix)) yield { key, touchedAtMs: entry.touchedAtMs };
+    }
+  }
+
+  async deleteAssetIfUntouched(key: string, touchedAtMs: number): Promise<boolean> {
+    const entry = this.assets.get(key);
+    if (!entry || entry.touchedAtMs !== touchedAtMs) return false;
+    this.assets.delete(key);
+    return true;
   }
 
   /** Test helper — clear all stored rows. */

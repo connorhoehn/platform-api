@@ -485,20 +485,17 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
 
     const pptxKey = pptxBlobKey(input.documentId, revisionId, writeId);
     const pptxMeta = { contentType: PPTX_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId}.pptx` };
-    // The durable copy first: a revision recorded with bytes only on a volume
-    // that may not come back is the failure this whole file keeps fixing.
-    if (this.mirror) {
-      if (input.pptx.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
-        throw new Error(
-          `the rendered deck is ${input.pptx.byteLength}B, over the ${IMAGE_BLOB_SIZE_CAP_BYTES}B a durable copy can hold — `
-          + 'it would exist only on the volume, which does not survive a pod replacement. Render fewer or lighter slides, '
-          + 'or give the blob volume durable storage and pass mirror: null.',
-        );
-      }
-      // Same key, same bytes: re-rendering a revision overwrites both copies.
-      await this.mirror.putBlob(pptxKey, input.pptx, pptxMeta);
+    if (this.mirror && input.pptx.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
+      throw new Error(
+        `the rendered deck is ${input.pptx.byteLength}B, over the ${IMAGE_BLOB_SIZE_CAP_BYTES}B a durable copy can hold — `
+        + 'it would exist only on the volume, which does not survive a pod replacement. Render fewer or lighter slides, '
+        + 'or give the blob volume durable storage and pass mirror: null.',
+      );
     }
-    const pptxAsset = await this.blobStore.putBlob(pptxKey, input.pptx, pptxMeta);
+    // What the store will record (every store returns exactly this). Planned
+    // here and written only after the row-size guard below, so a refused save
+    // leaves no `.pptx` behind (NFR #48).
+    const pptxAsset: BlobAsset = { key: pptxKey, contentType: PPTX_CONTENT_TYPE, sizeBytes: input.pptx.byteLength };
 
     // Slides by content (NFR #4). A slide the deck already stored — an
     // unchanged slide of any earlier revision — is the same blob; only new
@@ -578,7 +575,15 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     });
     if (estimated > MAX_ROW_BYTES) throw new PresentationRowTooLargeError(input.documentId, estimated);
 
-    // New content only, durable copy first (see the .pptx above), in parallel.
+    // The durable copy first: a revision recorded with bytes only on a volume
+    // that may not come back is the failure this whole file keeps fixing.
+    // The key is unique to this attempt; if the row write below loses a race
+    // (or fails), nothing references it and the deck blob sweeper removes it
+    // once it is past the grace period (src/deck/blobSweeper.ts).
+    if (this.mirror) await this.mirror.putBlob(pptxKey, input.pptx, pptxMeta);
+    await this.blobStore.putBlob(pptxKey, input.pptx, pptxMeta);
+
+    // New content only, durable copy first, in parallel.
     await Promise.all([...pending.values()].map(async (blob) => {
       if (this.mirror) await this.mirror.putBlob(blob.key, blob.body, blob.meta);
       await this.blobStore.putBlob(blob.key, blob.body, blob.meta);

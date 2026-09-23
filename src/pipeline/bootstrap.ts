@@ -103,6 +103,7 @@ import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDeckStepHandlers } from '../deck/registerDeckHandlers';
 import { attachDeckReviseRunEvents } from '../deck/deckRevisePipeline';
+import { createDeckBlobSweepTask } from '../deck/blobSweeper';
 import { buildLoopStepHandlers } from '../loop/registerLoopHandlers';
 import { DevboxAgentClient, devboxBaseUrl, takeRunLab } from './agent/DevboxAgentClient';
 import { failOrphanedLoops } from '../chat/agentLoopRunner';
@@ -1194,6 +1195,17 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       .catch((err) => {
         bootstrapLog.warn({ err: String(err) }, 'orphan-scan/boot-resume failed at bootstrap');
       }) });
+  }
+
+  // NFR #12/#48: presentation blobs no live row names, past a 24 h grace
+  // (mark-and-sweep — slide/spec blobs are shared by content across decks).
+  if (!IS_TEST_ENV && process.env.DECK_BLOB_SWEEP !== 'off') {
+    try {
+      const deckBlobSweep = createDeckBlobSweepTask();
+      if (deckBlobSweep) clusterSweepTasks.push(deckBlobSweep);
+    } catch (err) {
+      bootstrapLog.warn({ err: String(err) }, 'deck blob sweep not scheduled');
+    }
   }
 
   // NFR #26: one replica sweeps, every interval, cluster-wide.
