@@ -44,6 +44,7 @@ import {
 } from '../pipeline/image/ImageBlobStore';
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
 import { DOCUMENTS_TABLE, PRESENTATION_DOCUMENT_TYPE, isSlideListKey } from './presentationDocuments';
+import { ChunkedBlobStore } from './chunkedBlobStore';
 
 /** Every key a presentation stores starts with this; nothing else does. */
 export const DECK_BLOB_PREFIX = 'deck-';
@@ -239,8 +240,9 @@ export function createDeckBlobSweepTask(opts: {
   if (!stores) {
     const primary = getAssetBlobStore();
     // Mirrors DdbPresentationDocumentStore's default wiring.
-    const mirror = primary instanceof DdbImageBlobStore ? null : new DdbImageBlobStore();
-    const all: unknown[] = [mirror, primary].filter((store) => store !== null);
+    // Chunked (NFR #61): listing hides a large blob's parts; deleting its head deletes them.
+    const mirror = primary instanceof DdbImageBlobStore ? null : new ChunkedBlobStore(new DdbImageBlobStore());
+    const all: unknown[] = [mirror, primary instanceof DdbImageBlobStore ? new ChunkedBlobStore(primary) : primary].filter((store) => store !== null);
     if (!all.every(isSweepableAssetStore)) return null;
     stores = all.filter(isSweepableAssetStore);
   }

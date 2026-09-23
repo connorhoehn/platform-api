@@ -35,6 +35,7 @@ import log from '../lib/logger';
 import { AppError } from '../middleware/error-handler';
 import { PPTX_CONTENT_TYPE } from './renderPptx';
 import { SVG_CONTENT_TYPE } from './renderSlideSvg';
+import { ChunkedBlobStore, assertChunkedBlobFits } from './chunkedBlobStore';
 
 export const DOCUMENTS_TABLE = tableName(process.env.DYNAMODB_DOCUMENTS_TABLE || 'crdt-documents');
 export const PRESENTATION_DOCUMENT_TYPE = 'presentation';
@@ -454,12 +455,17 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
 
   constructor(opts: DdbPresentationDocumentStoreOptions = {}) {
     this.docClient = opts.docClient ?? defaultDocClient;
-    this.blobStore = opts.blobStore ?? getAssetBlobStore();
+    // NFR #61: a DynamoDB-backed store holds a body over one item's cap as
+    // several items (chunkedBlobStore.ts), so a large `.pptx` keeps its
+    // durable copy instead of failing the save.
+    const primary = opts.blobStore ?? getAssetBlobStore();
+    this.blobStore = primary instanceof DdbImageBlobStore ? new ChunkedBlobStore(primary) : primary;
     this.mirror = opts.mirror === undefined
       // Kept for good: the row now points at these blobs instead of carrying
       // the markup, so a 30-day TTL would expire a deck's slides under it.
-      ? (this.blobStore instanceof DdbImageBlobStore ? null : new DdbImageBlobStore({ ttlDays: null }))
-      : opts.mirror;
+      ? (primary instanceof DdbImageBlobStore ? null : new ChunkedBlobStore(new DdbImageBlobStore({ ttlDays: null })))
+      // A raw DDB store passed in is chunked too: unwrapped it throws mid-save.
+      : (opts.mirror instanceof DdbImageBlobStore ? new ChunkedBlobStore(opts.mirror) : opts.mirror);
     this.now = opts.now ?? (() => new Date());
     // Which store a deck's bytes land in, said out loud once. A process that
     // renders a deck without IMAGE_BLOB_DIR set writes somewhere the operator
@@ -516,12 +522,10 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
 
     const pptxKey = pptxBlobKey(input.documentId, revisionId, writeId);
     const pptxMeta = { contentType: PPTX_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId}.pptx` };
-    if (this.mirror && input.pptx.byteLength > IMAGE_BLOB_SIZE_CAP_BYTES) {
-      throw new Error(
-        `the rendered deck is ${input.pptx.byteLength}B, over the ${IMAGE_BLOB_SIZE_CAP_BYTES}B a durable copy can hold — `
-        + 'it would exist only on the volume, which does not survive a pod replacement. Render fewer or lighter slides, '
-        + 'or give the blob volume durable storage and pass mirror: null.',
-      );
+    // NFR #61: over one DynamoDB item the durable copy is chunked; over the
+    // chunked limit the save is refused with a 413 before any blob is written.
+    if (this.mirror || this.blobStore instanceof ChunkedBlobStore) {
+      assertChunkedBlobFits(pptxKey, input.pptx.byteLength, 'rendered deck (.pptx)');
     }
     // What the store will record (every store returns exactly this). Planned
     // here and written only after the row-size guard below, so a refused save

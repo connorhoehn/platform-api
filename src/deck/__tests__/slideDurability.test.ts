@@ -22,6 +22,7 @@ import {
   type PresentationDocumentRow,
 } from '../presentationDocuments';
 import { sampleDeck } from './fixtures';
+import { MAX_CHUNKED_BLOB_BYTES } from '../chunkedBlobStore';
 
 const slides = [
   { id: 'cover', title: 'Cover', svg: '<svg xmlns="http://www.w3.org/2000/svg">cover</svg>' },
@@ -213,7 +214,7 @@ describe('the .pptx has a second home', () => {
     expect(file!.body.toString('utf8')).toBe('PKdeck');
   });
 
-  it('refuses a deck too big for a durable copy, and says why', async () => {
+  it('refuses a deck too big for the durable copy with a 413 that says why (NFR #61: over one item is chunked, not refused)', async () => {
     const { client } = fakeClient();
     const store = new DdbPresentationDocumentStore({
       docClient: client, blobStore: new InMemoryImageBlobStore(), mirror: new InMemoryImageBlobStore(),
@@ -221,7 +222,11 @@ describe('the .pptx has a second home', () => {
     await expect(store.appendRevision({
       documentId: 'doc-1', title: 'Deck', createdBy: 'u',
       pptx: Buffer.alloc(IMAGE_BLOB_SIZE_CAP_BYTES + 1), slides,
-    })).rejects.toThrow(/does not survive a pod replacement/);
+    })).resolves.toMatchObject({ documentId: 'doc-1' });
+    await expect(store.appendRevision({
+      documentId: 'doc-1', title: 'Deck', createdBy: 'u',
+      pptx: Buffer.alloc(MAX_CHUNKED_BLOB_BYTES + 1), slides,
+    })).rejects.toMatchObject({ status: 413, message: expect.stringMatching(/nothing was saved/) });
   });
 
   it('keeps one copy when the primary store is already the durable one', async () => {
