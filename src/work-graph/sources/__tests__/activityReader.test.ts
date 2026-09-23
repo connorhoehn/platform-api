@@ -5,6 +5,13 @@
 jest.mock('../../../lib/ddb-table-name', () => ({ tableName: (name: string) => `test-${name}` }));
 
 import { GetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+
+/** pipeline-runs' `runId-index` GSI over a mock's rows; undefined for any other command. */
+function runIndexItems(command: unknown, rows: Array<Record<string, unknown>>): { Items: Array<Record<string, unknown>> } | undefined {
+  if (!(command instanceof QueryCommand) || command.input.IndexName !== 'runId-index') return undefined;
+  const runId = command.input.ExpressionAttributeValues?.[':r'];
+  return { Items: rows.filter((row) => row.runId === runId) };
+}
 import { InMemoryImageBlobStore } from '../../../pipeline/image/ImageBlobStore';
 import type { PresentationDocumentRow, StoredSlide } from '../../../deck/presentationDocuments';
 import { DynamoWorkActivityReader } from '../activityReader';
@@ -292,21 +299,23 @@ describe('reading a day of runs', () => {
     stepsSummary: steps,
   });
 
-  function scanningReader(rows: Row[]): { reader: DynamoWorkActivityReader; scans: number } {
-    const counter = { scans: 0 };
+  function scanningReader(rows: Row[]): { reader: DynamoWorkActivityReader; scans: number; queries: number } {
+    const counter = { scans: 0, queries: 0 };
     const client = {
       async send(command: unknown) {
         if (command instanceof ScanCommand) {
           counter.scans += 1;
           return { Items: rows };
         }
+        const byRunId = runIndexItems(command, rows);
+        if (byRunId) { counter.queries += 1; return byRunId; }
         return {};
       },
     } as unknown as DynamoDBDocumentClient;
-    return { reader: new DynamoWorkActivityReader(client), get scans() { return counter.scans; } };
+    return { reader: new DynamoWorkActivityReader(client), get scans() { return counter.scans; }, get queries() { return counter.queries; } };
   }
 
-  it('reads every run and every step of them in one scan', async () => {
+  it('reads every run and every step of them with one indexed read per run, never a scan', async () => {
     // The shape that made frank's graph crawl: one run with many step nodes,
     // each of which used to scan `pipeline-runs` for the very same row.
     const rows = [
@@ -317,7 +326,8 @@ describe('reading a day of runs', () => {
     const resources = ['run-9', 'run-9::sources', 'run-9::deck', 'run-12', 'run-12::deck', 'run-9'];
 
     const facts = await harness.reader.pipelineRuns(resources);
-    expect(harness.scans).toBe(1);
+    expect(harness.scans).toBe(0);
+    expect(harness.queries).toBe(2);
     expect([...facts.keys()].sort()).toEqual(['run-12', 'run-12::deck', 'run-9', 'run-9::deck', 'run-9::sources']);
     expect(facts.get('run-9')?.runningStep).toEqual({ stepId: 'deck' });
     expect(facts.get('run-9::deck')?.step?.stepId).toBe('deck');
@@ -334,6 +344,7 @@ describe('reading a day of runs', () => {
     const harness = scanningReader([]);
     expect((await harness.reader.pipelineRuns([])).size).toBe(0);
     expect(harness.scans).toBe(0);
+    expect(harness.queries).toBe(0);
   });
 });
 
@@ -355,7 +366,7 @@ describe('which step a run is inside', () => {
     const client = {
       async send(command: unknown) {
         if (command instanceof ScanCommand) return { Items: [run] };
-        return {};
+        return runIndexItems(command, [run]) ?? {};
       },
     } as unknown as DynamoDBDocumentClient;
     const facts = await new DynamoWorkActivityReader(client).pipelineRun('run-9');
@@ -366,24 +377,21 @@ describe('which step a run is inside', () => {
   it('names no running step when every step the run recorded has finished', async () => {
     const client = {
       async send(command: unknown) {
-        if (command instanceof ScanCommand) {
-          return {
-            Items: [{
-              runId: 'run-9',
-              status: 'completed',
-              startedAt: '2026-09-21T13:33:00.000Z',
-              stepsSummary: { deck: { status: 'completed', startedAt: '2026-09-21T13:40:00.000Z' } },
-            }],
-          };
-        }
-        return {};
+        const items = [{
+          runId: 'run-9',
+          status: 'completed',
+          startedAt: '2026-09-21T13:33:00.000Z',
+          stepsSummary: { deck: { status: 'completed', startedAt: '2026-09-21T13:40:00.000Z' } },
+        }];
+        if (command instanceof ScanCommand) return { Items: items };
+        return runIndexItems(command, items) ?? {};
       },
     } as unknown as DynamoDBDocumentClient;
     expect((await new DynamoWorkActivityReader(client).pipelineRun('run-9'))?.runningStep).toBeUndefined();
   });
 });
 
-describe('runs past the first page of the scan', () => {
+describe('runs past the first page of the scan (a table without the runId index)', () => {
   it('pages the run scan, so a run in the second 1 MB page still has facts', async () => {
     // DynamoDB stops a Scan page at 1 MB READ, before the filter; with every
     // run row carrying its checkpoint, 114 of 122 rows fit in the first page.
@@ -391,6 +399,11 @@ describe('runs past the first page of the scan', () => {
     let calls = 0;
     const client = {
       async send(command: unknown) {
+        if (command instanceof QueryCommand && command.input.IndexName === 'runId-index') {
+          const err = new Error('The table does not have the specified index: runId-index');
+          err.name = 'ValidationException';
+          throw err;
+        }
         if (!(command instanceof ScanCommand)) return {};
         calls += 1;
         return (command.input as { ExclusiveStartKey?: unknown }).ExclusiveStartKey
@@ -416,7 +429,7 @@ describe('what a composer edit did, from its own step outputs', () => {
 
   function readerOf(row: Row): DynamoWorkActivityReader {
     const client = {
-      async send(command: unknown) { return command instanceof ScanCommand ? { Items: [row] } : {}; },
+      async send(command: unknown) { return command instanceof ScanCommand ? { Items: [row] } : runIndexItems(command, [row]) ?? {}; },
     } as unknown as DynamoDBDocumentClient;
     return new DynamoWorkActivityReader(client);
   }

@@ -1,42 +1,55 @@
 /**
  * Finds `pipeline-runs` rows by run id alone.
  *
- * The table is keyed `(pipelineId, runId)` and has no index on `runId`, so the
- * work graph — which names a run only by its id — found every run with a
- * filtered Scan of the whole table. A revision preview did that TWICE (once
- * for the source ACL, once for the revision listing), and the table is past
- * 1 MB, so every preview paid several Scan pages for one row.
+ * The table is keyed `(pipelineId, runId)`; the work graph names a run only by
+ * its id. Lookups Query the `runId-index` GSI (hash `runId`, projection ALL):
+ * one indexed read per run, the same on every replica, with no per-process
+ * memory to warm or to disagree (NFR #43 follow-up — this replaced a
+ * per-process runId → pipelineId map that each replica learned from Scans).
  *
- * A run's `pipelineId` never changes once written, so the id → key mapping is
- * safe to remember: after a run has been found once, it is read by its key
- * (`BatchGetItem`). This remembers only that immutable mapping — never a row,
- * never a decision — so every read still returns the row as it is now, and
- * authorization is decided from it exactly as before.
+ * A table without the index (an environment provisioned before it was
+ * declared) falls back to the filtered, paged Scan, logs that once, and looks
+ * for the index again after `INDEX_RECHECK_MS` — so adding the GSI to a live
+ * table takes effect without a restart.
  *
- * With two or more platform replicas each process learns its own mapping; a
- * miss (a fresh replica, an evicted id, a row that is gone) falls back to the
- * Scan, so a replica never needs another one's memory to be correct. The
- * proper fix is a `runId` GSI on the table (NFR #43); this is the bridge.
+ * Every read returns the row as it is now; nothing is cached. More than one
+ * row claiming an id resolves to null (ambiguous provenance discloses nothing).
  */
-import { BatchGetCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import log from '../../lib/logger';
 
 type Row = Record<string, unknown>;
 
+/** The GSI on `pipeline-runs` by `runId` (infra/dynamodb-schemas.json, k8s init-dynamodb.sh). */
+export const PIPELINE_RUNS_RUN_ID_INDEX = 'runId-index';
+
 /** DynamoDB's cap on `IN (…)` operands per expression, less headroom. */
 const MAX_IN_OPERANDS = 90;
-/** `BatchGetItem` takes at most 100 keys. */
-const MAX_BATCH_KEYS = 100;
 /** Stop a Scan after this many rows read, whatever it found. */
 const MAX_SCANNED_ROWS = 20_000;
+/** Index Queries in flight at once for one call. */
+const QUERY_CONCURRENCY = 16;
+/** How long a table found without the index is scanned before the index is tried again. */
+const INDEX_RECHECK_MS = 5 * 60_000;
+
+/** DynamoDB's answer when the named index does not exist on the table. */
+export function isMissingIndexError(err: unknown): boolean {
+  const e = err as { name?: string; message?: string } | null;
+  return !!e && (e.name === 'ValidationException' || e.name === 'ResourceNotFoundException')
+    && /index/i.test(e.message ?? '');
+}
 
 export class RunRowLocator {
-  private readonly pipelineIds = new Map<string, string>();
+  /** Tables seen without the index, and when — scanned until the recheck. */
+  private readonly missingIndexAt = new Map<string, number>();
+  private readonly warned = new Set<string>();
 
-  constructor(private readonly capacity = 10_000) {}
+  constructor(private readonly now: () => number = Date.now) {}
 
-  /** For tests: how many run ids this process can read by key. */
-  get known(): number {
-    return this.pipelineIds.size;
+  /** For tests and logs: is this table currently served by the index? */
+  usesIndex(table: string): boolean {
+    const at = this.missingIndexAt.get(table);
+    return at === undefined || this.now() - at >= INDEX_RECHECK_MS;
   }
 
   /**
@@ -45,29 +58,55 @@ export class RunRowLocator {
    */
   async rows(client: DynamoDBDocumentClient, table: string, runIds: readonly string[]): Promise<Map<string, Row | null>> {
     const wanted = [...new Set(runIds)].filter(Boolean);
-    const found = new Map<string, Row | null>();
-    const byKey = wanted.filter((id) => this.pipelineIds.has(id));
-    const unknown = new Set(wanted.filter((id) => !this.pipelineIds.has(id)));
-
-    for (let index = 0; index < byKey.length; index += MAX_BATCH_KEYS) {
-      const chunk = byKey.slice(index, index + MAX_BATCH_KEYS);
-      const response = await client.send(new BatchGetCommand({
-        RequestItems: { [table]: { Keys: chunk.map((runId) => ({ pipelineId: this.pipelineIds.get(runId), runId })) } },
-      }));
-      for (const row of (response?.Responses?.[table] ?? []) as Row[]) {
-        if (typeof row.runId === 'string' && chunk.includes(row.runId)) found.set(row.runId, row);
-      }
-      // Not returned (gone, or left unprocessed): forget the key and look again.
-      for (const runId of chunk) {
-        if (found.has(runId)) continue;
-        this.pipelineIds.delete(runId);
-        unknown.add(runId);
+    if (!wanted.length) return new Map();
+    if (this.usesIndex(table)) {
+      try {
+        const found = await this.viaIndex(client, table, wanted);
+        this.missingIndexAt.delete(table);
+        return found;
+      } catch (err) {
+        if (!isMissingIndexError(err)) throw err;
+        this.missingIndexAt.set(table, this.now());
+        if (!this.warned.has(table)) {
+          this.warned.add(table);
+          log.warn({ table, index: PIPELINE_RUNS_RUN_ID_INDEX, err: (err as Error).message },
+            'pipeline-runs has no runId index: run lookups fall back to a filtered Scan (add the GSI; see infra/dynamodb-schemas.json)');
+        }
       }
     }
+    return this.viaScan(client, table, wanted);
+  }
 
-    const scan = [...unknown];
-    for (let index = 0; index < scan.length; index += MAX_IN_OPERANDS) {
-      const chunk = scan.slice(index, index + MAX_IN_OPERANDS);
+  private async viaIndex(client: DynamoDBDocumentClient, table: string, wanted: string[]): Promise<Map<string, Row | null>> {
+    const found = new Map<string, Row | null>();
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < wanted.length) {
+        const runId = wanted[next++]!;
+        const matches: Row[] = [];
+        let startKey: Record<string, unknown> | undefined;
+        do {
+          const result = await client.send(new QueryCommand({
+            TableName: table,
+            IndexName: PIPELINE_RUNS_RUN_ID_INDEX,
+            KeyConditionExpression: 'runId = :r',
+            ExpressionAttributeValues: { ':r': runId },
+            ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+          }));
+          matches.push(...((result?.Items ?? []) as Row[]).filter((item) => item.runId === runId));
+          startKey = result?.LastEvaluatedKey as Record<string, unknown> | undefined;
+        } while (startKey && matches.length < 2);
+        found.set(runId, matches.length === 1 ? matches[0]! : null);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(QUERY_CONCURRENCY, wanted.length) }, worker));
+    return found;
+  }
+
+  private async viaScan(client: DynamoDBDocumentClient, table: string, wanted: string[]): Promise<Map<string, Row | null>> {
+    const found = new Map<string, Row | null>();
+    for (let index = 0; index < wanted.length; index += MAX_IN_OPERANDS) {
+      const chunk = wanted.slice(index, index + MAX_IN_OPERANDS);
       const values = Object.fromEntries(chunk.map((id, position) => [`:r${position}`, id]));
       const matches = new Map<string, Row | null>();
       let startKey: Record<string, unknown> | undefined;
@@ -88,26 +127,11 @@ export class RunRowLocator {
         scanned += result?.ScannedCount ?? 0;
         startKey = result?.LastEvaluatedKey as Record<string, unknown> | undefined;
       } while (startKey && scanned < MAX_SCANNED_ROWS);
-      for (const id of chunk) {
-        const row = matches.get(id) ?? null;
-        found.set(id, row);
-        if (row && typeof row.pipelineId === 'string') this.remember(id, row.pipelineId);
-      }
+      for (const id of chunk) found.set(id, matches.get(id) ?? null);
     }
-    for (const id of wanted) if (!found.has(id)) found.set(id, null);
     return found;
-  }
-
-  private remember(runId: string, pipelineId: string): void {
-    this.pipelineIds.delete(runId);
-    this.pipelineIds.set(runId, pipelineId);
-    while (this.pipelineIds.size > this.capacity) {
-      const oldest = this.pipelineIds.keys().next().value;
-      if (oldest === undefined) break;
-      this.pipelineIds.delete(oldest);
-    }
   }
 }
 
-/** One per process: the mapping it holds is immutable, so sharing it is safe. */
+/** One per process: it holds no rows, only whether each table has the index. */
 export const runRowLocator = new RunRowLocator();

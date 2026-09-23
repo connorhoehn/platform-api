@@ -8,7 +8,7 @@
 
 jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `test-${name}` }));
 
-import { BatchGetCommand, ScanCommand, GetCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { BatchGetCommand, ScanCommand, GetCommand, QueryCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { DynamoSourceAclAdapter } from '../runtime';
 import type { WorkAclTarget, WorkGraphPolicyScope } from '../policy';
 import type { StoredWorkNode } from '../../repositories/WorkGraphRepository';
@@ -45,11 +45,17 @@ function node(id: string, kind: StoredWorkNode['kind'], source: StoredWorkNode['
   } as unknown as WorkAclTarget;
 }
 
-interface Counts { scan: number; batchGet: number; get: number }
+interface Counts { scan: number; batchGet: number; get: number; query: number }
 
 function client(rows: Record<string, unknown>[]): { client: DynamoDBDocumentClient; counts: Counts } {
-  const counts: Counts = { scan: 0, batchGet: 0, get: 0 };
+  const counts: Counts = { scan: 0, batchGet: 0, get: 0, query: 0 };
   const send = async (command: unknown) => {
+    if (command instanceof QueryCommand && command.input.IndexName === 'runId-index') {
+      // pipeline-runs' runId GSI: one indexed read per run.
+      counts.query += 1;
+      const runId = command.input.ExpressionAttributeValues?.[':r'];
+      return { Items: rows.filter((row) => row.runId === runId) };
+    }
     if (command instanceof ScanCommand) {
       counts.scan += 1;
       return { Items: rows };
@@ -88,7 +94,9 @@ describe('source ACL authorization reads', () => {
     ];
 
     const decisions = await new DynamoSourceAclAdapter('pipeline', ddb).authorizeDisclosure(scope, targets);
-    expect(counts.scan).toBe(1);
+    // One indexed read per distinct run (run-9, run-12), no table Scan.
+    expect(counts.scan).toBe(0);
+    expect(counts.query).toBe(2);
     expect([...decisions.values()].every((decision) => decision.decision === 'allow')).toBe(true);
     expect(decisions.get('n3')?.maximumDisclosure).toBe('details');
   });
