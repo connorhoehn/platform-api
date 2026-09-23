@@ -140,7 +140,7 @@ import { attachFailedRunDeadLetters, isRunRetrigger, retriggerFromDeadLetter, ty
 import { forgetDeadLetters, rehydrateDeadLetters, setDeadLetterStore } from './deadLetterStore';
 import { getSystemPipeline } from './systemPipelines';
 import { getPipelineBridge } from '../routes/pipelineTriggers';
-import { runWalPreflight } from './WalPreflight';
+import { describePipelineRecovery, runWalPreflight } from './WalPreflight';
 import { createShutdown } from './ShutdownOrchestrator';
 import {
   startPipelineEventRedisRelay,
@@ -485,6 +485,9 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
 
   // --- Pre-flight: writability + identity ---
   await runWalPreflight({ walFilePath, registryWalFilePath, registryMode, raftDataDir });
+  // NFR #55: stat the WAL before the bus opens it, so the boot log can say
+  // whether this is a fresh pod or a process restart inside the same one.
+  const pipelineRecovery = describePipelineRecovery(walFilePath);
   const { nodeId, persistentNodeId } = await resolveStableNodeId(identityFilePath);
 
   // NFR #26: this incarnation's liveness lease + the store the cluster-wide
@@ -588,7 +591,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
 
   // WAL decision logging.
   if (walFilePath) {
-    logger.info(`WAL enabled at ${walFilePath} — pipeline state will survive restart`);
+    logger.info(`WAL enabled at ${walFilePath} — bus history survives a process restart in this pod, not a pod replacement`);
   } else if (walExplicitlyDisabled) {
     logger.warn(
       'WAL explicitly disabled via PIPELINE_WAL_PATH=disabled — pipeline state is in-memory only and will be lost on restart',
@@ -596,6 +599,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   } else {
     logger.warn('WAL disabled — pipeline state is in-memory only');
   }
+  logger.info(pipelineRecovery.message, { walState: pipelineRecovery.walState, walBytes: pipelineRecovery.walBytes });
   // Registry-mode decision logging + downgrade warnings produced by
   // buildAppLayerRegistries (notably the ResourceRegistry-can't-host-Raft
   // downgrade documented in config/registries.ts).

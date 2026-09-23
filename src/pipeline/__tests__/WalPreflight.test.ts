@@ -160,3 +160,21 @@ describe('runWalPreflight — multiple flags set', () => {
     expect(mockAccessSync).toHaveBeenCalledWith('/data/raft', 2);
   });
 });
+
+describe('describePipelineRecovery (NFR #55)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { describePipelineRecovery } = require('../WalPreflight') as typeof import('../WalPreflight');
+  it('says a missing WAL is a fresh pod and names the DynamoDB checkpoint as the run recovery source', () => {
+    const r = describePipelineRecovery('/tmp/x.log', () => undefined);
+    expect(r.walState).toBe('fresh');
+    expect(r.message).toMatch(/DynamoDB run checkpoint/);
+    expect(r.message).toMatch(/history from before this boot is gone/);
+  });
+  it('says a non-empty WAL carried over from a restart in the same pod', () => {
+    const r = describePipelineRecovery('/tmp/x.log', () => 941549);
+    expect(r).toMatchObject({ walState: 'carried', walBytes: 941549 });
+  });
+  it('says so when the WAL is disabled', () => {
+    expect(describePipelineRecovery(undefined).walState).toBe('disabled');
+  });
+});
