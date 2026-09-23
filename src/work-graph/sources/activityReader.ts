@@ -226,6 +226,39 @@ export function documentEditFacts(steps: Row): DocumentEditFacts | undefined {
   };
 }
 
+/**
+ * Node id → the label a person gave it, from the run's definition
+ * (`definition.nodes[].data.label`) and, for an /agent loop's own row, from the
+ * plan it checkpointed (`checkpoint.context.plan.steps[].title`, filed as
+ * `agent:<id>`, `deck:<id>`, … — matched on the plan step id after the colon).
+ */
+export function stepLabelsOf(definition: unknown, row: Row): Map<string, string> {
+  const labels = new Map<string, string>();
+  const nodes = (definition as { nodes?: unknown } | undefined)?.nodes;
+  if (Array.isArray(nodes)) {
+    for (const node of nodes as Row[]) {
+      const label = typeof (node?.data as Row | undefined)?.label === 'string' ? (node.data as Row).label as string : undefined;
+      if (typeof node?.id === 'string' && label?.trim()) labels.set(node.id, label.trim());
+    }
+  }
+  const plan = ((row.checkpoint as Row | undefined)?.context as Row | undefined)?.plan as Row | undefined;
+  const planSteps = Array.isArray(plan?.steps) ? (plan!.steps as Row[]) : [];
+  const titles = new Map<string, string>();
+  for (const step of planSteps) {
+    if (typeof step?.id === 'string' && typeof step.title === 'string' && step.title.trim()) titles.set(step.id, step.title.trim());
+  }
+  if (titles.size > 0) {
+    const steps = row.stepsSummary && typeof row.stepsSummary === 'object' ? Object.keys(row.stepsSummary as Row) : [];
+    for (const key of steps) {
+      if (labels.has(key)) continue;
+      const planId = key.split(':')[1];
+      const title = planId ? titles.get(planId) : undefined;
+      if (title) labels.set(key, title);
+    }
+  }
+  return labels;
+}
+
 export class DynamoWorkActivityReader implements WorkActivityReader {
   constructor(
     private readonly client: DynamoDBDocumentClient,
@@ -266,13 +299,26 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const steps = row.stepsSummary && typeof row.stepsSummary === 'object' && !Array.isArray(row.stepsSummary)
       ? (row.stepsSummary as Row)
       : {};
+    // The definition's own name, so the card says "Presentation agent" rather
+    // than an internal pipeline id.
+    // The definitions table is keyed (userId, pipelineId): the owner is the
+    // person who triggered this run, which is the same person the graph is of.
+    const definition = await this.client.send(new GetCommand({
+      TableName: PIPELINE_DEFINITIONS_TABLE,
+      Key: { userId: String(row.triggeredBy ?? ''), pipelineId: String(row.pipelineId ?? '') },
+    })).catch(() => undefined);
+    // A step's name is the label its plan gave it — the definition's node
+    // label, or for an /agent loop's own row the plan step's title — never the
+    // node id the engine files it under (`agent:s1` meant nothing to a reader).
+    const stepLabels = stepLabelsOf((definition?.Item as Row | undefined)?.definition, row);
     // The tools are the steps this run actually recorded, in execution order.
     const tools = Object.entries(steps)
       .map(([stepId, summary]) => ({
         stepId,
         // A generated pipeline's steps are keyed by uuid; its title, when the
         // step recorded one, is the name a reader can use.
-        name: text((summary as Row | undefined)?.title ?? (summary as Row | undefined)?.name, 60),
+        name: text((summary as Row | undefined)?.title ?? (summary as Row | undefined)?.name, 60)
+          ?? text(stepLabels.get(stepId) ?? stepLabels.get(stepId.replace(/:\d+$/, '')), 60),
         startedAt: Date.parse(iso((summary as Row | undefined)?.startedAt) ?? '') || 0,
       }))
       .sort((left, right) => left.startedAt - right.startedAt || left.stepId.localeCompare(right.stepId))
@@ -283,14 +329,6 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const startedAt = iso(row.startedAt);
     if (!startedAt) return null;
     const edit = documentEditFacts(steps);
-    // The definition's own name, so the card says "Presentation agent" rather
-    // than an internal pipeline id.
-    // The definitions table is keyed (userId, pipelineId): the owner is the
-    // person who triggered this run, which is the same person the graph is of.
-    const definition = await this.client.send(new GetCommand({
-      TableName: PIPELINE_DEFINITIONS_TABLE,
-      Key: { userId: String(row.triggeredBy ?? ''), pipelineId: String(row.pipelineId ?? '') },
-    })).catch(() => undefined);
     const agentLabel = text((definition?.Item as Row | undefined)?.name, 80);
     const attempts = Object.values(steps)
       .map((summary) => (Array.isArray((summary as Row | undefined)?.attempts) ? ((summary as Row).attempts as unknown[]).length : 1));

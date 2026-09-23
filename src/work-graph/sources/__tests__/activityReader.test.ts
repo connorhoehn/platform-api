@@ -14,7 +14,7 @@ function runIndexItems(command: unknown, rows: Array<Record<string, unknown>>): 
 }
 import { InMemoryImageBlobStore } from '../../../pipeline/image/ImageBlobStore';
 import type { PresentationDocumentRow, StoredSlide } from '../../../deck/presentationDocuments';
-import { DynamoWorkActivityReader } from '../activityReader';
+import { DynamoWorkActivityReader, stepLabelsOf } from '../activityReader';
 
 type Row = Record<string, unknown>;
 
@@ -569,5 +569,26 @@ describe('why a paused run waits (NFR #126)', () => {
     expect((await read({ status: 'running', pause: { reason: 'paused_at_breakpoint', stepId: 'write' } }))?.pause).toBeUndefined();
     expect((await read({ status: 'completed', pause: { reason: 'awaiting_approval', stepId: 'approve' } }))?.pause).toBeUndefined();
     expect((await read({ status: 'awaiting_approval', pause: { reason: 'paused_at_breakpoint', stepId: 'write' } }))?.pause).toEqual({ reason: 'awaiting_approval' });
+  });
+});
+
+describe('stepLabelsOf — a run lists its steps by the names its plan gave them', () => {
+  it('takes a definition node label, and a fork of that node gets the same', () => {
+    const labels = stepLabelsOf(
+      { nodes: [{ id: 'agent:s1', data: { label: 'Compare the plan with the deck' } }, { id: 'trigger', data: {} }] },
+      { stepsSummary: { 'agent:s1': {} } },
+    );
+    expect(labels.get('agent:s1')).toBe('Compare the plan with the deck');
+    expect(labels.has('trigger')).toBe(false);
+  });
+
+  it('falls back to an /agent loop row’s checkpointed plan titles', () => {
+    const labels = stepLabelsOf(undefined, {
+      stepsSummary: { 'agent:s1': {}, 'deck:s2': {}, 'agent:s9': {} },
+      checkpoint: { context: { plan: { steps: [{ id: 's1', title: 'Read the release plan' }, { id: 's2', title: 'Draft slides' }] } } },
+    });
+    expect(labels.get('agent:s1')).toBe('Read the release plan');
+    expect(labels.get('deck:s2')).toBe('Draft slides');
+    expect(labels.has('agent:s9')).toBe(false);
   });
 });
