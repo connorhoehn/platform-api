@@ -23,7 +23,7 @@ import {
   type WorkReference,
 } from '../work-graph/orchestrator';
 import { publishViewBase, type ViewBaseStore } from '../work-graph/viewBase';
-import { getRedisClient } from '../lib/redis-client';
+import { getRedisCacheClient } from '../lib/redis-client';
 
 type JsonRecord = Record<string, unknown>;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -310,9 +310,9 @@ function sendError(error: unknown, res: Response): boolean {
   return false;
 }
 
-/** The shared Redis every platform and gateway replica reads (NFR #85). */
+/** The shared cache Redis every platform and gateway replica reads (NFR #85, #88). */
 async function redisViewBaseStore(): Promise<ViewBaseStore | null> {
-  const client = await getRedisClient().catch(() => null);
+  const client = await getRedisCacheClient().catch(() => null);
   return client ? { set: (key, value, ttlSeconds) => client.set(key, value, { EX: ttlSeconds }) } : null;
 }
 

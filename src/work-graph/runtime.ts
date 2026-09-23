@@ -1236,7 +1236,7 @@ export async function replayGatewayWorkGraph(
     // One view per answer, not one per batch plus one more: the gateway
     // attaches it to every batch it forwards, exactly as before.
     const view = await gatewayWorkGraphView(viewer, query, requestedView);
-    const encoded = feedViewCache.encode({
+    const encoded = await feedViewCache.encode({
       organizationId, viewerId, ...query,
       windowStart: requestedView.windowStart, windowEnd: requestedView.windowEnd, mode: requestedView.mode,
     }, view, request.baseViewId);

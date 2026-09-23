@@ -23,8 +23,9 @@ import type { WorkGraphSnapshotV2 } from '@connorhoehn/realtime-modules/work-gra
 /**
  * The base is needed from the snapshot answer to the subscribe (~1–2 s; a
  * reconnect fetches a fresh snapshot). Two minutes covers a slow client
- * without holding a 50–75 KB view per snapshot for long in a Redis that has
- * no maxmemory yet (NFR #88). Identical snapshots share one key.
+ * without holding a 50–75 KB view per snapshot for long. Identical snapshots
+ * share one key. The key lives in the cache Redis (`allkeys-lru`, NFR #88), so
+ * memory pressure evicts a base — a whole first frame — never coordination.
  */
 export const VIEW_BASE_TTL_SECONDS = 120;
 const PUBLISH_TIMEOUT_MS = 150;
