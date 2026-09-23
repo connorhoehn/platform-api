@@ -12,6 +12,9 @@ import { tableName } from '../../lib/ddb-table-name';
 import log from '../../lib/logger';
 import {
   getPresentationDocumentStore,
+  resolveRevisionSlides,
+  withRevisionSlides,
+  type PresentationDocumentRow,
   type PresentationDocumentStore,
   type StoredSlide,
 } from '../../deck/presentationDocuments';
@@ -436,7 +439,12 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const pageCount = typeof row.pageCount === 'number' && Number.isSafeInteger(row.pageCount) && row.pageCount > 0
       ? row.pageCount
       : anchors.length || undefined;
-    const revisions = storedRevisionFacts(row);
+    // An older revision's slide list is a manifest off the row (NFR #36); put
+    // it back in place so each revision still names its own slides.
+    const hydrated = await Promise.resolve()
+      .then(() => withRevisionSlides((this.deps.presentations ?? getPresentationDocumentStore)(), row as unknown as PresentationDocumentRow))
+      .catch(() => row as unknown as PresentationDocumentRow);
+    const revisions = storedRevisionFacts(hydrated as unknown as Row);
     return {
       ...(text(row.title, 120) ? { name: text(row.title, 120) as string } : {}),
       mediaKind,
@@ -499,8 +507,9 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
         if (presentations.slidePreview) return presentations.slidePreview(documentId, revisionId, slideId);
         // A store that predates the method: same two places, same order.
         const row = await presentations.get(documentId);
+        const revision = row?.revisions?.find((candidate) => candidate.id === revisionId);
         const slide = [
-          ...(row?.revisions?.find((revision) => revision.id === revisionId)?.slides ?? []),
+          ...(revision ? (await resolveRevisionSlides(presentations, revision)) ?? [] : []),
           ...(row?.revisionSlides?.[revisionId] ?? []),
         ].find((entry) => entry?.id === slideId);
         if (!slide) return null;

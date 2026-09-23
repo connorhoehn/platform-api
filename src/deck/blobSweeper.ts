@@ -19,6 +19,12 @@
 // step 3, which starts after step 1. The grace period covers the window
 // between a save's blob write and its row write (and a slow save generally).
 //
+// A revision that is no longer the head keeps its slide list in a manifest
+// blob (`deck-slides-<hash>.json`, NFR #36), so the mark step opens every
+// manifest a row names and marks the slides inside it as well. A manifest it
+// cannot read makes the whole sweep delete nothing: the slides it names are
+// unknown, and an unknown reference has to be treated as a live one.
+//
 // What it cleans up: blobs of a deleted deck no other deck shares, `.pptx`
 // files a raced or failed save wrote under its attempt-unique key, and content
 // blobs a losing attempt wrote that nobody adopted.
@@ -32,11 +38,12 @@ import { docClient as defaultDocClient } from '../lib/aws-clients';
 import log from '../lib/logger';
 import {
   DdbImageBlobStore,
+  isAssetBlobStore,
   isSweepableAssetStore,
   type SweepableAssetStore,
 } from '../pipeline/image/ImageBlobStore';
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
-import { DOCUMENTS_TABLE, PRESENTATION_DOCUMENT_TYPE } from './presentationDocuments';
+import { DOCUMENTS_TABLE, PRESENTATION_DOCUMENT_TYPE, isSlideListKey } from './presentationDocuments';
 
 /** Every key a presentation stores starts with this; nothing else does. */
 export const DECK_BLOB_PREFIX = 'deck-';
@@ -51,7 +58,8 @@ export function isDeckBlobKey(value: unknown): value is string {
 
 /**
  * Every deck blob key a row names, wherever it names it: `revisions[].asset`,
- * `revisions[].slides[].asset`, `revisions[].specRef`, legacy
+ * `revisions[].slides[].asset`, `revisions[].specRef`, `revisions[].slidesRef`
+ * (whose manifest `sweepDeckBlobs` then opens), legacy
  * `revisionSlides`, and any field a later build adds. Walking every string is
  * deliberately over-inclusive — a false "referenced" only keeps a blob.
  */
@@ -97,6 +105,12 @@ export interface DeckBlobSweepOptions {
   now?: () => number;
   /** Cap on deletes per sweep, so one pass cannot run away. */
   maxDeletes?: number;
+  /**
+   * Reads a slide-list manifest a row names. Defaults to the first of `stores`
+   * that can read blobs and holds the key. Null (or a throw) means unreadable,
+   * and an unreadable manifest stops the sweep from deleting anything.
+   */
+  readBlob?: (key: string) => Promise<Buffer | null>;
 }
 
 export interface DeckBlobSweepResult {
@@ -107,8 +121,21 @@ export interface DeckBlobSweepResult {
   deleted: number;
   /** Candidates a store refused because a save touched them since listing. */
   refused: number;
+  /** Slide-list manifests opened and marked through (NFR #36). */
+  manifestsRead?: number;
   /** Set when the sweep deliberately deleted nothing. */
   skipped?: string;
+}
+
+function defaultBlobReader(stores: SweepableAssetStore[]): (key: string) => Promise<Buffer | null> {
+  return async (key) => {
+    for (const store of stores) {
+      if (!isAssetBlobStore(store)) continue;
+      const blob = await store.getBlob(key).catch(() => null);
+      if (blob) return blob.body;
+    }
+    return null;
+  };
 }
 
 export async function sweepDeckBlobs(opts: DeckBlobSweepOptions): Promise<DeckBlobSweepResult> {
@@ -141,6 +168,29 @@ export async function sweepDeckBlobs(opts: DeckBlobSweepOptions): Promise<DeckBl
     result.rowsScanned += 1;
     collectBlobReferences(row, referenced);
   }
+  // 3b. A moved slide list protects its slides: open every manifest named and
+  // mark what it names. Any manifest that will not read → delete nothing.
+  const readBlob = opts.readBlob ?? defaultBlobReader(opts.stores);
+  const opened = new Set<string>();
+  for (;;) {
+    const next = [...referenced].filter((key) => isSlideListKey(key) && !opened.has(key));
+    if (!next.length) break;
+    for (const key of next) {
+      opened.add(key);
+      const body = await readBlob(key).catch(() => null);
+      let parsed: unknown;
+      try { parsed = body ? JSON.parse(body.toString('utf8')) : undefined; } catch { parsed = undefined; }
+      if (!Array.isArray(parsed)) {
+        result.referenced = referenced.size;
+        result.manifestsRead = opened.size - 1;
+        result.skipped = `slide-list manifest ${key} could not be read; refusing to delete while the slides it names are unknown`;
+        log.warn({ key, candidates: candidates.length }, `deck blob sweep: ${result.skipped}`);
+        return result;
+      }
+      collectBlobReferences(parsed, referenced);
+    }
+  }
+  result.manifestsRead = opened.size;
   result.referenced = referenced.size;
   if (result.rowsScanned === 0) {
     // Old deck blobs and not one presentation row is far likelier to be a

@@ -17,7 +17,7 @@ import { DeckReviseError, type DeckReviseInput, type DeckReviseResult } from '..
 import type { DeckSpec } from '../DeckSpec';
 import {
   deckPreviewHandle, PresentationRevisionConflictError,
-  type AppendRevisionInput, type AppendRevisionResult, type PresentationDocumentRow, type PresentationDocumentStore, type StoredRevision,
+  type AppendRevisionInput, type AppendRevisionResult, type PresentationDocumentRow, type PresentationDocumentStore, type StoredRevision, type HeadRevision,
 } from '../presentationDocuments';
 import { lintSystemPipeline } from '../../pipeline/systemPipelineLint';
 import { getSystemPipeline } from '../../pipeline/systemPipelines';
@@ -63,7 +63,7 @@ class FakeStore implements PresentationDocumentStore {
       throw new PresentationRevisionConflictError(input.documentId, head, row.revisions?.length ?? 0);
     }
     this.appends += 1;
-    return { documentId: input.documentId, revision: this.push(input) };
+    return { documentId: input.documentId, revision: this.push(input) as HeadRevision };
   }
 }
 

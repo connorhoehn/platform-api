@@ -27,7 +27,9 @@ import log from '../lib/logger';
 import { canEditDocument, documentRoleOf, editRefusal } from '../deck/documentEditAccess';
 import {
   getPresentationDocumentStore,
+  resolveRevisionSlides,
   resolveRevisionSpec,
+  withRevisionSlides,
   PRESENTATION_DOCUMENT_TYPE,
   PresentationRevisionConflictError,
   type PresentationDocumentRow,
@@ -67,8 +69,11 @@ async function loadRevision(documentId: string, revisionId: string): Promise<{ r
 documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
   if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
-  const row = await getPresentationDocumentStore().get(documentId);
-  if (!row) throw new NotFoundError('Document not found');
+  const store = getPresentationDocumentStore();
+  const stored = await store.get(documentId);
+  if (!stored) throw new NotFoundError('Document not found');
+  // Older revisions' slide lists live in manifests off the row (NFR #36).
+  const row = await withRevisionSlides(store, stored);
   res.status(200).json({
     documentId,
     title: row.title ?? 'Untitled',
@@ -85,7 +90,7 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
       ...(revision.sources ? { sources: revision.sources } : {}),
       // A composer edit's revision names the run that wrote it.
       ...(revision.producedBy ? { producedBy: revision.producedBy } : {}),
-      slides: revision.slides.map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
+      slides: (revision.slides ?? []).map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
     })),
   });
 }));
@@ -201,7 +206,7 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
       contentType: revision.asset.contentType,
       sizeBytes: revision.asset.sizeBytes,
       sources: revision.sources ?? [],
-      slides: revision.slides.map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
+      slides: (revision.slides ?? []).map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
     },
     warnings: outcome.preview.warnings,
   });
@@ -269,12 +274,15 @@ documentRevisionsRouter.get('/:revisionId/slides/:slideId', requireAuth, asyncHa
   const documentId = String(req.params.documentId ?? '');
   const slideId = String(req.params.slideId ?? '').replace(/\.svg$/i, '');
   const { revision } = await loadRevision(documentId, String(req.params.revisionId ?? ''));
-  const slide = revision.slides.find((candidate) => candidate.id === slideId);
+  const store = getPresentationDocumentStore();
+  // Inline on the head; an older revision's list is a manifest in the blob store (NFR #36).
+  const revisionSlides = await resolveRevisionSlides(store, revision);
+  if (!revisionSlides) throw new NotFoundError('Slide preview not found');
+  const slide = revisionSlides.find((candidate) => candidate.id === slideId);
   if (!slide) throw new NotFoundError('Slide not found');
   // The row's own markup first, the blob second — a row outlives the volume it
   // points at, and a preview that 404s after a pod replacement is the defect
   // this order exists to prevent.
-  const store = getPresentationDocumentStore();
   const stored = store.slidePreview
     ? await store.slidePreview(documentId, revision.id, slideId)
     : await getAssetBlobStore().getBlob(slide.asset.key)

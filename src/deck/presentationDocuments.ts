@@ -71,6 +71,16 @@ export interface StoredSpecRef extends BlobAsset {
   sha256: string;
 }
 
+/**
+ * Where a revision's slide list went when it stopped being the head (NFR #36):
+ * a content-addressed JSON manifest (`deck-slides-<hash>.json`) holding the
+ * same `StoredSlide[]` the row used to carry. Read it back with
+ * `resolveRevisionSlides`.
+ */
+export interface StoredSlidesRef extends BlobAsset {
+  sha256: string;
+}
+
 /** What a revision stands on, as the deck itself declared it. */
 export interface RevisionSource {
   documentId: string;
@@ -88,7 +98,15 @@ export interface StoredRevision {
   slideCount: number;
   /** The `.pptx` itself. */
   asset: BlobAsset;
-  slides: StoredSlide[];
+  /**
+   * The slides rendered with it. Only the head keeps its list inline; once a
+   * newer revision lands, the older one's list moves to the blob store and
+   * `slidesRef` names it (NFR #36) — read either with `resolveRevisionSlides`.
+   * Rows written before then carry the list inline on every revision, and
+   * are read as they are until their next save moves the old lists out.
+   */
+  slides?: StoredSlide[];
+  slidesRef?: StoredSlidesRef;
   /**
    * The spec this revision was rendered from. Stored so the editor can reopen a
    * revision and change it, rather than reconstructing a deck from its pictures.
@@ -220,9 +238,12 @@ function headOf(row: PresentationDocumentRow | null): StoredRevision | null {
   return revisions.length ? revisions[revisions.length - 1]! : null;
 }
 
+/** A revision as just written: the head, so its slide list is always inline. */
+export type HeadRevision = StoredRevision & { slides: StoredSlide[] };
+
 export interface AppendRevisionResult {
   documentId: string;
-  revision: StoredRevision;
+  revision: HeadRevision;
 }
 
 /** Stored bytes, and which of the places they could have been they came from. */
@@ -330,6 +351,16 @@ export function slideContentKey(sha256: string): string {
 
 export function specContentKey(sha256: string): string {
   return `deck-spec-${sha256.slice(0, 40)}.json`;
+}
+
+/** A moved slide list's blob key, from its content: an unchanged list is one blob. */
+export function slideListContentKey(sha256: string): string {
+  return `deck-slides-${sha256.slice(0, 40)}.json`;
+}
+
+/** True for a key `slideListContentKey` produced — what the blob sweeper opens to mark. */
+export function isSlideListKey(key: unknown): key is string {
+  return typeof key === 'string' && /^deck-slides-[A-Za-z0-9]+\.json$/.test(key);
 }
 
 /** The inline markup a row already holds, across every revision. */
@@ -524,20 +555,33 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       };
     });
 
-    // Only the head keeps its spec inline; every earlier one moves to a
-    // content-addressed blob the revision names. Lossless — the blob is
-    // written (durably) before the row stops carrying the spec.
+    // Only the head keeps its spec and its slide list inline; every earlier
+    // one moves each to a content-addressed blob the revision names (specs:
+    // NFR #4, slide lists: NFR #36). Lossless — the blob is written (durably)
+    // before the row stops carrying it. A row saved before either move is
+    // migrated here, lazily, one save at a time; nothing rewrites rows in bulk.
     const earlier = (existing?.revisions ?? []).map((revision) => {
-      if (!revision.spec) return revision;
-      const body = Buffer.from(JSON.stringify(revision.spec), 'utf8');
-      const sha256 = contentHash(body);
-      const key = specContentKey(sha256);
-      if (!pending.has(key)) pending.set(key, { key, body, meta: { contentType: 'application/json', createdBy: input.createdBy, label: `${input.title} ${revision.id} spec` } });
-      const { spec: _moved, ...rest } = revision;
-      return { ...rest, specRef: { key, contentType: 'application/json', sizeBytes: body.byteLength, sha256 } };
+      let moved: StoredRevision = revision;
+      if (moved.spec) {
+        const body = Buffer.from(JSON.stringify(moved.spec), 'utf8');
+        const sha256 = contentHash(body);
+        const key = specContentKey(sha256);
+        if (!pending.has(key)) pending.set(key, { key, body, meta: { contentType: 'application/json', createdBy: input.createdBy, label: `${input.title} ${revision.id} spec` } });
+        const { spec: _spec, ...rest } = moved;
+        moved = { ...rest, specRef: { key, contentType: 'application/json', sizeBytes: body.byteLength, sha256 } };
+      }
+      if (Array.isArray(moved.slides) && moved.slides.length) {
+        const body = Buffer.from(JSON.stringify(moved.slides), 'utf8');
+        const sha256 = contentHash(body);
+        const key = slideListContentKey(sha256);
+        if (!pending.has(key)) pending.set(key, { key, body, meta: { contentType: 'application/json', createdBy: input.createdBy, label: `${input.title} ${revision.id} slides` } });
+        const { slides: _slides, ...rest } = moved;
+        moved = { ...rest, slidesRef: { key, contentType: 'application/json', sizeBytes: body.byteLength, sha256 } };
+      }
+      return moved;
     });
 
-    const revision: StoredRevision = {
+    const revision: HeadRevision = {
       id: revisionId,
       label: input.label?.trim() ? input.label.trim().slice(0, 80) : revisionId,
       createdAt: at,
@@ -679,8 +723,9 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
   async slidePreview(documentId: string, revisionId: string, slideId: string): Promise<SlidePreview | null> {
     const row = await this.get(documentId).catch(() => null);
     if (!row) return null;
+    const revision = row.revisions?.find((candidate) => candidate.id === revisionId);
     const recorded = [
-      ...(row.revisions?.find((revision) => revision.id === revisionId)?.slides ?? []),
+      ...(revision ? (await resolveRevisionSlides(this, revision)) ?? [] : []),
       ...(row.revisionSlides?.[revisionId] ?? []),
     ];
     const slide = recorded.find((entry) => entry?.id === slideId);
@@ -740,6 +785,43 @@ export async function resolveRevisionSpec(store: PresentationDocumentStore, revi
     return null;
   }
   try { return JSON.parse(body.toString('utf8')) as DeckSpec; } catch { return null; }
+}
+
+/**
+ * A revision's slide records wherever they are: inline (the head, or any
+ * revision of a row saved before NFR #36), or the manifest its `slidesRef`
+ * names — the configured store first, then the durable copy. `[]` for a
+ * revision that records neither; null only when a manifest is named but
+ * cannot be read, so a caller can tell "no slides" from "slides unreadable".
+ */
+export async function resolveRevisionSlides(store: PresentationDocumentStore, revision: StoredRevision): Promise<StoredSlide[] | null> {
+  if (Array.isArray(revision.slides) && (revision.slides.length || !revision.slidesRef?.key)) return revision.slides;
+  if (!revision.slidesRef?.key) return [];
+  const body = store.readAsset
+    ? await store.readAsset(revision.slidesRef).catch(() => null)
+    : await getAssetBlobStore().getBlob(revision.slidesRef.key).then((blob) => blob?.body ?? null).catch(() => null);
+  if (!body) {
+    log.warn({ revisionId: revision.id, key: revision.slidesRef.key }, 'a revision names a slide list neither blob store holds');
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(body.toString('utf8')) as unknown;
+    return Array.isArray(parsed) ? parsed as StoredSlide[] : null;
+  } catch { return null; }
+}
+
+/**
+ * The row with every revision's slide list in place (`slides` filled from its
+ * manifest where one moved off the row; `[]` where it cannot be read). For
+ * readers that list every revision's slides at once. Manifests are read in
+ * parallel; the row itself is not changed.
+ */
+export async function withRevisionSlides(store: PresentationDocumentStore, row: PresentationDocumentRow): Promise<PresentationDocumentRow> {
+  if (!row.revisions?.some((revision) => !Array.isArray(revision.slides) && revision.slidesRef?.key)) return row;
+  const revisions = await Promise.all(row.revisions.map(async (revision) => (
+    Array.isArray(revision.slides) ? revision : { ...revision, slides: (await resolveRevisionSlides(store, revision)) ?? [] }
+  )));
+  return { ...row, revisions };
 }
 
 let store: PresentationDocumentStore | null = null;

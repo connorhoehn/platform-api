@@ -16,6 +16,7 @@ import {
   DdbPresentationDocumentStore, PresentationRevisionConflictError, PresentationRowTooLargeError,
   contentHash, slideContentKey, type PresentationDocumentRow,
 } from '../presentationDocuments';
+import { isSlideListKey } from '../presentationDocuments';
 import {
   DEFAULT_DECK_BLOB_GRACE_MS, collectBlobReferences, createDeckBlobSweepTask, sweepDeckBlobs, type LiveRowSource,
 } from '../blobSweeper';
@@ -183,6 +184,65 @@ describe('sweepDeckBlobs — mark and sweep over live rows', () => {
   });
 });
 
+describe('a slide list moved off the row still protects its slides (NFR #36)', () => {
+  async function twoRevisions() {
+    const ctx = setup();
+    const v1 = await ctx.store.appendRevision({ documentId: 'deck-a', title: 'A', createdBy: 'u', pptx: Buffer.from('PK-1'),
+      slides: [shared, { id: 'only-v1', title: 'Only v1', svg: '<svg>only in v1</svg>' }] });
+    await ctx.store.appendRevision({ documentId: 'deck-a', title: 'A', createdBy: 'u', pptx: Buffer.from('PK-2'), slides: [shared] });
+    const row = ctx.docs.rows.get('deck-a') as unknown as PresentationDocumentRow;
+    const manifest = row.revisions![0]!.slidesRef!.key;
+    const onlyV1 = v1.revision.slides[1]!.asset.key;
+    return { ...ctx, row, manifest, onlyV1 };
+  }
+
+  it('a slide named only through a manifest, and the manifest itself, survive a sweep', async () => {
+    const { clock, primary, mirror, sweep, row, manifest, onlyV1 } = await twoRevisions();
+    expect(isSlideListKey(manifest)).toBe(true);
+    // The row no longer names v1's own slide anywhere — only the manifest does.
+    expect(collectBlobReferences(row).has(onlyV1)).toBe(false);
+
+    clock.advance(DEFAULT_DECK_BLOB_GRACE_MS + HOUR);
+    const result = await sweep();
+    expect(result).toMatchObject({ deleted: 0, manifestsRead: 1 });
+    expect(result.skipped).toBeUndefined();
+    for (const blobs of [primary, mirror]) {
+      expect(await blobs.getBlob(onlyV1)).not.toBeNull();
+      expect(await blobs.getBlob(manifest)).not.toBeNull();
+    }
+  });
+
+  it('reads the manifest from the durable copy when the volume lost it', async () => {
+    const { clock, primary, mirror, docs, sweep, manifest, onlyV1 } = await twoRevisions();
+    // Only the mirror still has the manifest; an orphan proves the sweep ran.
+    const lost = new InMemoryImageBlobStore({ now: clock.now });
+    for await (const entry of primary.listAssets('deck-')) {
+      if (entry.key !== manifest) { const blob = (await primary.getBlob(entry.key))!; await lost.putBlob(entry.key, blob.body, { contentType: blob.asset.contentType }); }
+    }
+    await mirror.putBlob('deck-svg-orphan.svg', Buffer.from('<svg/>'), { contentType: 'image/svg+xml' });
+    clock.advance(DEFAULT_DECK_BLOB_GRACE_MS + HOUR);
+    const result = await sweepDeckBlobs({ stores: [mirror, lost], rows: docs.liveRows, now: clock.now });
+    expect(result).toMatchObject({ deleted: 1, manifestsRead: 1 });
+    expect(await mirror.getBlob(onlyV1)).not.toBeNull();
+    expect(await mirror.getBlob(manifest)).not.toBeNull();
+    void primary;
+  });
+
+  it('an unreadable manifest aborts deletion: nothing is removed, not even a true orphan', async () => {
+    const { clock, primary, mirror, docs, manifest, onlyV1 } = await twoRevisions();
+    await primary.putBlob('deck-svg-orphan.svg', Buffer.from('<svg/>'), { contentType: 'image/svg+xml' });
+    clock.advance(DEFAULT_DECK_BLOB_GRACE_MS + HOUR);
+    for (const readBlob of [async () => null, async () => Buffer.from('not json'), async () => { throw new Error('volume offline'); }]) {
+      const result = await sweepDeckBlobs({ stores: [mirror, primary], rows: docs.liveRows, now: clock.now, readBlob });
+      expect(result.deleted).toBe(0);
+      expect(result.skipped).toMatch(/could not be read/);
+    }
+    expect(await primary.getBlob('deck-svg-orphan.svg')).not.toBeNull();
+    expect(await primary.getBlob(onlyV1)).not.toBeNull();
+    expect(await primary.getBlob(manifest)).not.toBeNull();
+  });
+});
+
 describe('refused and raced saves leave no .pptx behind', () => {
   it('a save refused by the row-size guard (NFR #4) writes no .pptx at all', async () => {
     const { primary, mirror, store } = setup();
@@ -205,7 +265,9 @@ describe('refused and raced saves leave no .pptx behind', () => {
 
     clock.advance(DEFAULT_DECK_BLOB_GRACE_MS + 1);
     const result = await sweep();
-    expect(result.deleted).toBe(2); // the losing .pptx and its unadopted slide
+    // The losing .pptx, its unadopted slide, and the manifest it wrote for v1's
+    // list (NFR #36) — which the winning row still carries inline.
+    expect(result.deleted).toBe(3);
     for (const blobs of [primary, mirror]) {
       expect(await keys(blobs)).toEqual([sharedKey, winner.revision.asset.key].sort());
     }

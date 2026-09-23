@@ -11,6 +11,7 @@ import { InMemoryImageBlobStore } from '../../pipeline/image/ImageBlobStore';
 import {
   DdbPresentationDocumentStore,
   PresentationRevisionConflictError,
+  resolveRevisionSlides,
   type PresentationDocumentRow,
 } from '../presentationDocuments';
 
@@ -93,8 +94,10 @@ describe('two saves of the same presentation at once', () => {
     for (const [result, who] of [[a, 'connor'], [b, 'frank']] as const) {
       const recorded = table.current()!.revisions!.find((revision) => revision.id === result.revision.id)!;
       expect((await blobStore.getBlob(recorded.asset.key))!.body.toString('utf8')).toBe(`PK-${who}`);
-      expect(recorded.slides[0]!.svg).toBeUndefined();
-      expect((await blobStore.getBlob(recorded.slides[0]!.asset.key))!.body.toString('utf8')).toBe(`<svg>${who} cover</svg>`);
+      // v5 is no longer the head: its slide list is read back from its manifest (NFR #36).
+      const recordedSlides = (await resolveRevisionSlides(store, recorded))!;
+      expect(recordedSlides[0]!.svg).toBeUndefined();
+      expect((await blobStore.getBlob(recordedSlides[0]!.asset.key))!.body.toString('utf8')).toBe(`<svg>${who} cover</svg>`);
     }
   });
 

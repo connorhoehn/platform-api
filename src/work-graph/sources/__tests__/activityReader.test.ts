@@ -135,6 +135,40 @@ describe('artifact facts from a presentation row', () => {
   });
 });
 
+describe('an older revision whose slide list moved to a manifest (NFR #36)', () => {
+  const MANIFEST = 'deck-slides-00000000000000000000000000000000000000aa.json';
+  const moved: Row = {
+    ...deckRow,
+    revisionSlides: undefined,
+    revisions: [
+      { ...(deckRow.revisions ?? [])[0], slides: undefined, slidesRef: { key: MANIFEST, contentType: 'application/json', sizeBytes: 1, sha256: '00000000000000000000000000000000000000aa' } },
+      { ...(deckRow.revisions ?? [])[0], id: 'v2', slides: [slide('cover', 1, 'Head cover', 'deck-v1-cover.svg')] },
+    ],
+  };
+  function readerWithAssets(blobs: InMemoryImageBlobStore): DynamoWorkActivityReader {
+    const client = { async send(command: unknown) { return command instanceof GetCommand ? { Item: moved } : command instanceof QueryCommand ? { Count: 0 } : {}; } } as unknown as DynamoDBDocumentClient;
+    return new DynamoWorkActivityReader(client, {
+      presentations: () => ({
+        get: async () => moved as unknown as PresentationDocumentRow,
+        appendRevision: async () => { throw new Error('not used'); },
+        readAsset: async (asset) => (await blobs.getBlob(asset.key))?.body ?? null,
+      }),
+      blobs: () => blobs,
+    });
+  }
+
+  it('names each revision’s own slides, reading the older list from its manifest, and serves its slide', async () => {
+    const blobs = new InMemoryImageBlobStore();
+    await blobs.putBlob(MANIFEST, Buffer.from(JSON.stringify(deckRow.revisions![0]!.slides)), { contentType: 'application/json' });
+    await blobs.putBlob('deck-v1-risks.svg', Buffer.from(SVG), { contentType: 'image/svg+xml' });
+    const reader = readerWithAssets(blobs);
+    const facts = await reader.artifact('doc-deck');
+    expect(facts?.revisions?.map((revision) => revision.slides.map((entry) => entry.title)))
+      .toEqual([['Sprint review', 'Open risks'], ['Head cover']]);
+    expect((await reader.revisionPreview('doc-deck', 'v1', 'risks'))?.body.toString('utf8')).toBe(SVG);
+  });
+});
+
 describe('the bytes behind one slide', () => {
   it('serves the slide the revision record names, from the blob store', async () => {
     const blobs = new InMemoryImageBlobStore();

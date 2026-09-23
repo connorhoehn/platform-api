@@ -71,6 +71,22 @@ const row: PresentationDocumentRow = {
   }],
 };
 
+// NFR #36: v1's slide list moved to a manifest (only in the durable copy
+// here); v2 is the head and keeps its list inline.
+const MOVED_SLIDES = [{ id: 'cover', index: 1, title: 'Moved cover', previewHandle: 'doc-moved.v1.cover', asset: { key: SVG_KEY, contentType: 'image/svg+xml', sizeBytes: SVG.length } }];
+const MOVED_KEY = 'deck-slides-0123456789abcdef0123456789abcdef01234567.json';
+const movedRow: PresentationDocumentRow = {
+  documentId: 'doc-moved',
+  title: 'Moved',
+  type: 'presentation',
+  createdBy: 'dev-user',
+  revisions: [
+    { ...row.revisions![0]!, slides: undefined, slidesRef: { key: MOVED_KEY, contentType: 'application/json', sizeBytes: 1, sha256: '0123456789abcdef0123456789abcdef01234567' } },
+    { ...row.revisions![0]!, id: 'v2', label: 'v2', slides: [{ ...MOVED_SLIDES[0]!, title: 'Head cover', previewHandle: 'doc-moved.v2.cover' }] },
+  ],
+};
+const rowFor = (documentId: string) => (documentId === 'doc-1' ? row : documentId === 'doc-moved' ? movedRow : null);
+
 const appended: Array<Record<string, unknown>> = [];
 
 // The real store's own lookup (row first, blob second), over the same in-memory
@@ -81,10 +97,11 @@ const realStore = new DdbPresentationDocumentStore({
   blobStore,
   mirror: mirrorStore,
 });
-jest.spyOn(realStore, 'get').mockImplementation(async (documentId: string) => (documentId === 'doc-1' ? row : null));
+jest.spyOn(realStore, 'get').mockImplementation(async (documentId: string) => rowFor(documentId));
 
 const store: PresentationDocumentStore = {
-  get: async (documentId: string) => (documentId === 'doc-1' ? row : null),
+  get: async (documentId: string) => rowFor(documentId),
+  readAsset: (asset) => realStore.readAsset(asset),
   slidePreview: (documentId, revisionId, slideId) => realStore.slidePreview(documentId, revisionId, slideId),
   revisionFile: (documentId, revisionId) => realStore.revisionFile(documentId, revisionId),
   appendRevision: async (input) => {
@@ -192,6 +209,19 @@ describe('GET /api/documents/:id/revisions', () => {
 
   it('404s an unknown document', async () => {
     expect((await request('/api/documents/nope/revisions')).status).toBe(404);
+  });
+
+  it('lists an older revision’s slides from its manifest (NFR #36), read from the durable copy', async () => {
+    await mirrorStore.putBlob(MOVED_KEY, Buffer.from(JSON.stringify(MOVED_SLIDES)), { contentType: 'application/json' });
+    const res = await request('/api/documents/doc-moved/revisions');
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body.toString('utf8'));
+    expect(body.revisions.map((revision: { slides: Array<{ title: string }> }) => revision.slides.map((slide) => slide.title)))
+      .toEqual([['Moved cover'], ['Head cover']]);
+    const slide = await request('/api/documents/doc-moved/revisions/v1/slides/cover.svg');
+    expect(slide.status).toBe(200);
+    expect(slide.body.toString('utf8')).toBe(SVG);
+    expect((await request('/api/documents/doc-moved/revisions/v1/slides/nope.svg')).status).toBe(404);
   });
 });
 
