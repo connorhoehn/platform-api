@@ -84,6 +84,21 @@ describe('the run reaches the graph even when its trigger is registered late', (
     expect(records.slice(1).map((record) => record.safeLabel)).toEqual(['Draft the agenda', 'Build the deck']);
   });
 
+  it('names a run once when its instruction is the pipeline’s own name', async () => {
+    // A probe triggered with instruction "Agent loop" on the "Agent loop"
+    // pipeline was titled "Agent loop · Agent loop" on every card and pane.
+    const { service, emit } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'chat-agent-loop', userId: 'dev-frank',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan,
+    });
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'chat-agent-loop', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-frank', payload: { instruction: ' agent loop ' } },
+    });
+    expect(published()[0]).toMatchObject({ kind: 'pipeline-run', safeLabel: 'Agent loop' });
+  });
+
   it('projects them just the same when `run:started` arrives FIRST', async () => {
     const { service, emit } = harness();
     // This is the real order for a chat command: the executor emits on an

@@ -65,6 +65,9 @@ function runTitle(state: { workGraph?: RunWorkGraphPlan; instruction?: string })
   const name = state.workGraph?.title;
   const instruction = state.instruction?.trim();
   if (!instruction) return name;
+  // A probe whose instruction IS the pipeline's name ("audit nfr72 probe")
+  // was titled "audit nfr72 probe · audit nfr72 probe" — once is the title.
+  if (name && name.trim().toLowerCase() === instruction.toLowerCase()) return name;
   return `${name ? `${name} · ` : ''}${instruction}`.slice(0, 160);
 }
 
