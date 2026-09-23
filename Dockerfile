@@ -21,7 +21,7 @@
 # whole flow is gone — install happens straight from github: pins.
 
 # Stage 1: Build TypeScript
-FROM node:20-alpine AS build
+FROM node:20-alpine AS deps
 RUN apk add --no-cache git openssh-client python3 make g++ \
     && mkdir -p -m 0700 /root/.ssh \
     && ssh-keyscan github.com >> /root/.ssh/known_hosts
@@ -46,6 +46,18 @@ WORKDIR /app
 # npm-10/file-peer workaround does not apply to the current service-runtime pin.
 COPY platform-api/package.json platform-api/package-lock.json ./
 RUN --mount=type=ssh npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
+
+# The runtime's node_modules are THIS install pruned to production, not a
+# second `npm ci --omit=dev` (realtime-examples NFR #99). BuildKit runs the two
+# stages at once, and every github: dep with a build/prepare script makes npm
+# spawn a nested full `npm install` (devDependencies included; --ignore-scripts
+# does not stop pacote preparing git deps). Two concurrent installs of a pin
+# bump took ~7 GB of the 12 GB colima VM and the kernel OOM-killed pods. Depends
+# only on the install layer, so a source-only change reuses it from cache.
+FROM deps AS prod-deps
+RUN npm prune --omit=dev --legacy-peer-deps --ignore-scripts --no-audit --no-fund
+
+FROM deps AS build
 COPY platform-api/tsconfig.json platform-api/tsconfig.build.json ./
 COPY platform-api/src/ ./src/
 RUN npm run build && test -f dist/index.js
@@ -69,7 +81,7 @@ RUN npm install -g typescript@~5.6.3
 RUN addgroup -g 1001 -S nodejs && adduser -S platformapi -u 1001 -G nodejs
 WORKDIR /app
 COPY platform-api/package.json platform-api/package-lock.json platform-api/tsconfig.json platform-api/tsconfig.build.json ./
-RUN --mount=type=ssh npm ci --omit=dev --legacy-peer-deps --ignore-scripts --no-audit --no-fund && npm cache clean --force
+COPY --from=prod-deps /app/node_modules ./node_modules/
 COPY --from=build /app/dist ./dist/
 COPY platform-api/src/ ./src/
 # NFR #65: record which source dist/ was compiled from. Tilt's live_update
