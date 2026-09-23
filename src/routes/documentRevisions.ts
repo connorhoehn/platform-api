@@ -25,7 +25,7 @@ import { SVG_CONTENT_TYPE } from '../deck/renderSlideSvg';
 import { previewDeckSpec } from '../deck/preview';
 import { healCitationTitles } from '../deck/citationTitles';
 import log from '../lib/logger';
-import { canEditDocument, documentRoleOf, editRefusal } from '../deck/documentEditAccess';
+import { canEditDocument, canReadDocument, documentRoleOf, editRefusal } from '../deck/documentEditAccess';
 import {
   getPresentationDocumentStore,
   resolveRevisionSlides,
@@ -55,11 +55,29 @@ export function safeFilename(title: string, revisionId: string, extension: strin
   return `${base} ${revisionId}.${extension}`.replace(/ /g, '-');
 }
 
-async function loadRevision(documentId: string, revisionId: string): Promise<{ row: PresentationDocumentRow; revision: StoredRevision }> {
+/**
+ * The reader check every GET here makes, once per request (NFR #135): the
+ * `document:read` policy — owner, editor, viewer or a member of the document's
+ * channel. A scoped document grant was already checked for `read` by the
+ * document-policy middleware. A request with no bearer at all is 401 even under
+ * SKIP_AUTH's `dev-user` fallback; a caller without read access gets the same
+ * 404 as a document that does not exist, before any revision id is looked at.
+ */
+async function assertCanReadDocument(req: Request, row: PresentationDocumentRow, documentId: string): Promise<void> {
+  if (req.documentGrant) return;
+  if (!req.headers.authorization?.startsWith('Bearer ')) throw new AppError(401, 'Authorization required');
+  const decision = await canReadDocument(row, req.user, documentId);
+  if (decision.allow) return;
+  log.warn({ documentId, userId: req.user?.sub ?? '', orgId: req.user?.orgId, route: req.path }, 'deck revision read refused: the caller may not read this document');
+  throw new NotFoundError('Document not found');
+}
+
+async function loadRevision(req: Request, documentId: string, revisionId: string): Promise<{ row: PresentationDocumentRow; revision: StoredRevision }> {
   if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
   if (!ID.test(revisionId)) throw new ValidationError('revisionId is invalid');
   const row = await getPresentationDocumentStore().get(documentId);
   if (!row) throw new NotFoundError('Document not found');
+  await assertCanReadDocument(req, row, documentId);
   const revision = (row.revisions ?? []).find((candidate) => candidate.id === revisionId);
   if (!revision) throw new NotFoundError('Revision not found');
   return { row, revision };
@@ -75,6 +93,7 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
   const store = getPresentationDocumentStore();
   const stored = await store.get(documentId);
   if (!stored) throw new NotFoundError('Document not found');
+  await assertCanReadDocument(req, stored, documentId);
   // Older revisions' slide lists live in manifests off the row (NFR #36).
   const row = await withRevisionSlides(store, stored);
   res.status(200).json({
@@ -224,7 +243,7 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
  * spec reconstructed from its pictures.
  */
 documentRevisionsRouter.get('/:revisionId/spec', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const { revision } = await loadRevision(String(req.params.documentId ?? ''), String(req.params.revisionId ?? ''));
+  const { revision } = await loadRevision(req, String(req.params.documentId ?? ''), String(req.params.revisionId ?? ''));
   if (!revision.spec && !revision.specRef) {
     throw new AppError(409, `revision ${revision.id} was written before specs were stored, so it cannot be reopened for editing`);
   }
@@ -250,7 +269,7 @@ documentRevisionsRouter.get('/:revisionId/spec', requireAuth, asyncHandler(async
  */
 documentRevisionsRouter.get('/:revisionId/file', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
-  const { row, revision } = await loadRevision(documentId, String(req.params.revisionId ?? ''));
+  const { row, revision } = await loadRevision(req, documentId, String(req.params.revisionId ?? ''));
   // The configured store first, then the durable copy the store keeps for it —
   // a deck rendered before a pod replacement is still downloadable.
   const store = getPresentationDocumentStore();
@@ -288,7 +307,7 @@ documentRevisionsRouter.get('/:revisionId/file', requireAuth, asyncHandler(async
 documentRevisionsRouter.get('/:revisionId/slides', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const started = Date.now();
   const documentId = String(req.params.documentId ?? '');
-  const { row, revision } = await loadRevision(documentId, String(req.params.revisionId ?? ''));
+  const { row, revision } = await loadRevision(req, documentId, String(req.params.revisionId ?? ''));
   const loadedAt = Date.now();
   const store = getPresentationDocumentStore();
   const recorded: StoredSlide[] = [
@@ -345,7 +364,7 @@ documentRevisionsRouter.get('/:revisionId/slides', requireAuth, asyncHandler(asy
 documentRevisionsRouter.get('/:revisionId/slides/:slideId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
   const slideId = String(req.params.slideId ?? '').replace(/\.svg$/i, '');
-  const { revision } = await loadRevision(documentId, String(req.params.revisionId ?? ''));
+  const { revision } = await loadRevision(req, documentId, String(req.params.revisionId ?? ''));
   const store = getPresentationDocumentStore();
   // Inline on the head; an older revision's list is a manifest in the blob store (NFR #36).
   const revisionSlides = await resolveRevisionSlides(store, revision);

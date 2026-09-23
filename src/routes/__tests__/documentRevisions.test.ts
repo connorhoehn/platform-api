@@ -31,6 +31,7 @@ jest.mock('../../lib/aws-clients', () => ({
 jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `test-${name}` }));
 
 // Import AFTER the mocks.
+import { docClient } from '../../lib/aws-clients';
 import { documentRevisionsRouter, safeFilename } from '../documentRevisions';
 import {
   DdbPresentationDocumentStore,
@@ -86,7 +87,9 @@ const movedRow: PresentationDocumentRow = {
     { ...row.revisions![0]!, id: 'v2', label: 'v2', slides: [{ ...MOVED_SLIDES[0]!, title: 'Head cover', previewHandle: 'doc-moved.v2.cover' }] },
   ],
 };
-const rowFor = (documentId: string) => (documentId === 'doc-1' ? row : documentId === 'doc-moved' ? movedRow : null);
+// NFR #135: shared with a named viewer and into a chat.
+const sharedRow: PresentationDocumentRow & { channel: string } = { ...row, documentId: 'doc-shared', viewers: ['user-viewer'], channel: 'chan-deck' };
+const rowFor = (documentId: string) => (documentId === 'doc-1' ? row : documentId === 'doc-moved' ? movedRow : documentId === 'doc-shared' ? sharedRow : null);
 
 const appended: Array<Record<string, unknown>> = [];
 
@@ -157,7 +160,15 @@ function postJson(path: string, body: unknown, user?: string): Promise<{ status:
   });
 }
 
-function request(path: string, headers: Record<string, string> = {}): Promise<{ status: number; body: Buffer; headers: http.IncomingHttpHeaders }> {
+/** A dev token SKIP_AUTH decodes (never verifies) to name who is asking. */
+function devToken(sub: string, orgId?: string): string {
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  return `Bearer ${part({ alg: 'none', typ: 'JWT' })}.${part({ sub, ...(orgId ? { 'custom:org_id': orgId } : {}) })}.x`;
+}
+
+/** A GET as the documents' owner (`dev-user`) unless `headers` names someone else; `null` sends no bearer. */
+function request(path: string, headers: Record<string, string> | null = {}): Promise<{ status: number; body: Buffer; headers: http.IncomingHttpHeaders }> {
+  headers = headers === null ? {} : { authorization: devToken('dev-user'), ...headers };
   const { port } = server.address() as AddressInfo;
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, method: 'GET', path, headers }, (res) => {
@@ -296,17 +307,74 @@ describe('authorization', () => {
   it('refuses an unauthenticated request', async () => {
     delete process.env.SKIP_AUTH;
     try {
-      const file = await request('/api/documents/doc-1/revisions/v1/file');
-      const slide = await request('/api/documents/doc-1/revisions/v1/slides/cover.svg');
-      const batch = await request('/api/documents/doc-1/revisions/v1/slides');
+      const file = await request('/api/documents/doc-1/revisions/v1/file', null);
+      const slide = await request('/api/documents/doc-1/revisions/v1/slides/cover.svg', null);
+      const batch = await request('/api/documents/doc-1/revisions/v1/slides', null);
       expect(batch.status).toBe(401);
-      const list = await request('/api/documents/doc-1/revisions');
-      const spec = await request('/api/documents/doc-1/revisions/v1/spec');
+      const list = await request('/api/documents/doc-1/revisions', null);
+      const spec = await request('/api/documents/doc-1/revisions/v1/spec', null);
       const write = await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck() });
       expect([file.status, slide.status, list.status, spec.status, write.status]).toEqual([401, 401, 401, 401, 401]);
     } finally {
       process.env.SKIP_AUTH = 'true';
     }
+  });
+});
+
+
+describe('who may read a revision (NFR #135)', () => {
+  // Allowed = past the reader check. v1 predates stored specs, so an allowed
+  // spec read is its own 409, never the refusal's 404.
+  const ROUTES = [
+    ['list', '/revisions', 200],
+    ['spec', '/revisions/v1/spec', 409],
+    ['file', '/revisions/v1/file', 200],
+    ['batch', '/revisions/v1/slides', 200],
+    ['slide', '/revisions/v1/slides/cover.svg', 200],
+  ] as const;
+  // The spec route heals citation titles; keep it off the network.
+  beforeAll(() => { jest.spyOn(citationTitles, 'healCitationTitles').mockImplementation(async (spec, sources) => ({ spec, sources } as never)); });
+  afterAll(() => { jest.mocked(citationTitles.healCitationTitles).mockRestore?.(); });
+  const send = jest.mocked(docClient.send as jest.Mock);
+  afterEach(() => send.mockReset());
+
+  describe.each(ROUTES)('%s', (_name, suffix, allowed) => {
+    const docPath = (id: string) => `/api/documents/${id}${suffix}`;
+    it('owner → allowed', async () => {
+      expect((await request(docPath('doc-1'))).status).toBe(allowed);
+    });
+    it('another user → 404', async () => {
+      expect((await request(docPath('doc-1'), { authorization: devToken('user-mallory') })).status).toBe(404);
+    });
+    it('another org → 404', async () => {
+      expect((await request(docPath('doc-1'), { authorization: devToken('user-eve', 'org-other') })).status).toBe(404);
+    });
+    it('anonymous (SKIP_AUTH dev-user fallback, no bearer) → 401', async () => {
+      expect((await request(docPath('doc-1'), null)).status).toBe(401);
+    });
+    it('a named viewer → allowed', async () => {
+      expect((await request(docPath('doc-shared'), { authorization: devToken('user-viewer') })).status).toBe(allowed);
+    });
+    it('a member of the chat it was shared into → allowed; a removed member → 404', async () => {
+      send.mockResolvedValueOnce({ Item: { channel: 'chan-deck', userId: 'user-member' } });
+      expect((await request(docPath('doc-shared'), { authorization: devToken('user-member') })).status).toBe(allowed);
+      send.mockResolvedValueOnce({ Item: { channel: 'chan-deck', userId: 'user-member', removedAt: '2026-09-01T00:00:00Z' } });
+      expect((await request(docPath('doc-shared'), { authorization: devToken('user-member') })).status).toBe(404);
+    });
+  });
+
+  it('the owner costs no membership read, and the batch decides once for every slide', async () => {
+    expect((await request('/api/documents/doc-shared/revisions/v1/slides')).status).toBe(200);
+    expect(send).not.toHaveBeenCalled();
+    send.mockResolvedValue({ Item: { channel: 'chan-deck', userId: 'user-member' } });
+    expect((await request('/api/documents/doc-shared/revisions/v1/slides', { authorization: devToken('user-member') })).status).toBe(200);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('a stranger cannot tell a missing revision from a hidden document', async () => {
+    const hidden = await request('/api/documents/doc-1/revisions/v9/slides', { authorization: devToken('user-mallory') });
+    expect(hidden.status).toBe(404);
+    expect(JSON.parse(hidden.body.toString('utf8')).error ?? JSON.parse(hidden.body.toString('utf8')).message).toMatch(/Document not found/);
   });
 });
 

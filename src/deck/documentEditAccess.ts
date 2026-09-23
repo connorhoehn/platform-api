@@ -10,8 +10,11 @@
 // The rule itself is the `document:edit` policy in lib/authorize.ts: the
 // row's owner (`createdBy`) or a user the row names in `editors`.
 
+import { GetCommand } from '@aws-sdk/lib-dynamodb';
 import { authorize, principalOf, type Decision } from '../lib/authorize';
 import { tenantOf } from '../lib/tenant';
+import { docClient } from '../lib/aws-clients';
+import { tableName } from '../lib/ddb-table-name';
 import { ForbiddenError } from '../middleware/error-handler';
 
 /** What the check reads off a document row. Any row shape with these fields. */
@@ -19,6 +22,8 @@ export interface EditableDocumentRow {
   createdBy?: unknown;
   editors?: unknown;
   viewers?: unknown;
+  /** The chat the document was shared into, when it was. */
+  channel?: unknown;
 }
 
 export type DocumentRole = 'owner' | 'editor' | 'viewer' | 'stranger';
@@ -89,4 +94,54 @@ export async function assertCanEditDocument(
   if (decision.allow) return;
   const userId = user?.sub ?? '';
   throw new DocumentEditForbiddenError(editRefusal(row, userId), documentId, documentRoleOf(row, userId));
+}
+
+const CHAT_MEMBERS_TABLE = tableName(process.env.DYNAMODB_CHAT_MEMBERS_TABLE || 'chat-members');
+
+/** Is `userId` a current member of `channel`? Fails closed: an unreadable table is not permission. */
+export type ChannelMemberLookup = (channel: string, userId: string) => Promise<boolean>;
+
+export const isChannelMember: ChannelMemberLookup = async (channel, userId) => {
+  if (!channel || !userId) return false;
+  try {
+    const res = await docClient.send(new GetCommand({ TableName: CHAT_MEMBERS_TABLE, Key: { channel, userId } }));
+    return !!res.Item && res.Item.removedAt === undefined;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * May `user` read this document — its revision list, slides, spec and file
+ * (NFR #135)? The `document:read` policy in lib/authorize.ts: owner, editor,
+ * viewer, or a member of the channel the row names. A missing row is the
+ * route's own 404. The membership table is read only when nothing on the row
+ * already decides it, so the owner's read costs no extra lookup.
+ */
+export async function canReadDocument(
+  row: EditableDocumentRow,
+  user: { sub?: string; orgId?: string } | undefined,
+  documentId: string,
+  memberLookup: ChannelMemberLookup = isChannelMember,
+): Promise<Decision> {
+  let tenant;
+  try { tenant = tenantOf(user?.orgId); } catch { return { allow: false, reason: 'document not found', status: 404 }; }
+  const userId = user?.sub ?? '';
+  const channel = typeof row.channel === 'string' ? row.channel : '';
+  const role = documentRoleOf(row, userId);
+  const member = role === 'stranger' && !!channel && !!userId ? await memberLookup(channel, userId) : false;
+  return authorize({
+    principal: principalOf(user, tenant),
+    action: 'document:read',
+    resource: {
+      type: 'document',
+      id: documentId,
+      attrs: {
+        ownerId: typeof row.createdBy === 'string' ? row.createdBy : undefined,
+        editorIds: ids(row.editors),
+        viewerIds: ids(row.viewers),
+        isChannelMember: member,
+      },
+    },
+  });
 }

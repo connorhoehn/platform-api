@@ -243,6 +243,28 @@ registerPolicy('document:edit', (req) => {
   return deny("only the document's owner or an editor can change it");
 });
 
+/**
+ * `document:read` — may this principal read this document (its revisions,
+ * slides, spec and file)?
+ *
+ * The owner (`createdBy`), anyone the row names in `editors` or `viewers`, and
+ * a member of the channel the document was shared into. Everyone else gets
+ * 404, not 403: a stranger learns nothing about whether the document exists.
+ * An owner that cannot be read off the row denies, as `document:edit` does.
+ */
+registerPolicy('document:read', (req) => {
+  const attrs = req.resource.attrs ?? {};
+  const ownerId = attrs.ownerId;
+  if (typeof ownerId !== 'string' || !ownerId) return deny('document not found', 404);
+  const userId = req.principal.userId;
+  if (ownerId === userId) return ALLOW;
+  for (const list of [attrs.editorIds, attrs.viewerIds]) {
+    if (Array.isArray(list) && list.includes(userId)) return ALLOW;
+  }
+  if (attrs.isChannelMember === true) return ALLOW;
+  return deny('document not found', 404);
+});
+
 /** Build a Principal from an authenticated request's user. */
 export function principalOf(
   user: { sub?: string; orgId?: string } | undefined,
