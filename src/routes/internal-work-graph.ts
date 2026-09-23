@@ -101,14 +101,20 @@ type ReplayBody = {
   schemaVersion?: 2;
   view?: GatewayWorkGraphViewRequest;
   fromPolicyRevision?: string;
+  /** The gateway's live feed: access + replay in one call, view as a patch (see replayGatewayWorkGraph). */
+  feed?: 1;
+  baseViewId?: string;
 };
 
 function replayBody(value: unknown): value is ReplayBody {
   return base(value)
     && Object.keys(value).every((key) => [
       'organizationId', 'viewerId', 'query', 'afterWatermark', 'throughWatermark', 'since', 'limit',
-      'schemaVersion', 'view', 'fromPolicyRevision',
+      'schemaVersion', 'view', 'fromPolicyRevision', 'feed', 'baseViewId',
     ].includes(key))
+    && (value.feed === undefined || value.feed === 1)
+    && (value.baseViewId === undefined
+      || (value.feed === 1 && typeof value.baseViewId === 'string' && ID.test(value.baseViewId)))
     && (value.fromPolicyRevision === undefined
       || (typeof value.fromPolicyRevision === 'string' && value.fromPolicyRevision.length > 0 && value.fromPolicyRevision.length <= 256))
     && requestedView(value) !== false
@@ -157,6 +163,8 @@ router.post('/replay', async (req, res, next) => {
         since: req.body.since,
         limit: Number(req.body.limit),
         ...(typeof req.body.fromPolicyRevision === 'string' ? { fromPolicyRevision: req.body.fromPolicyRevision } : {}),
+        ...(req.body.feed === 1 ? { feed: true as const } : {}),
+        ...(typeof req.body.baseViewId === 'string' ? { baseViewId: req.body.baseViewId } : {}),
       },
       (requestedView(req.body as Record<string, unknown>) || undefined) as GatewayWorkGraphViewRequest | undefined,
     ));

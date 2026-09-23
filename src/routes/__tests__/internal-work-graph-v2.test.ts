@@ -137,6 +137,22 @@ describe('internal work graph routes, schemaVersion 2', () => {
     expect(replay).not.toHaveBeenCalled();
   });
 
+  it('passes the live-feed flag and base view id through, and rejects a base without the feed', async () => {
+    await post('/internal/work-graph/replay', { ...replayBody, schemaVersion: 2, view, feed: 1, baseViewId: 'view-1' });
+    expect(replay.mock.calls[0][3]).toEqual(expect.objectContaining({ feed: true, baseViewId: 'view-1' }));
+    await post('/internal/work-graph/replay', { ...replayBody, schemaVersion: 2, view, feed: 1 });
+    expect(replay.mock.calls[1][3]).toEqual(expect.objectContaining({ feed: true }));
+    expect(replay.mock.calls[1][3].baseViewId).toBeUndefined();
+    for (const body of [
+      { ...replayBody, baseViewId: 'view-1' },
+      { ...replayBody, feed: true },
+      { ...replayBody, feed: 1, baseViewId: 'not a valid id!' },
+    ]) {
+      expect((await post('/internal/work-graph/replay', body)).statusCode).toBe(400);
+    }
+    expect(replay).toHaveBeenCalledTimes(2);
+  });
+
   it('still requires a verified service credential for a v2 request', async () => {
     const body = { organizationId: 'org-1', viewerId: 'frank', query, schemaVersion: 2, view };
     // Signed with one secret, verified against another: the v2 fields do not

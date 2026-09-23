@@ -9,7 +9,8 @@ import {
   type DynamoDBDocumentClient,
 } from '@aws-sdk/lib-dynamodb';
 import { SERVICE_AUTH_HEADER, signEnvelope } from '@connorhoehn/service-runtime';
-import { projectWorkEvent } from '@connorhoehn/realtime-modules/work-graph';
+import { projectWorkEvent, type WorkGraphViewPatchV2 } from '@connorhoehn/realtime-modules/work-graph';
+import { feedViewCache } from './feedView';
 import type {
   WorkGraphDeltaOperation,
   WorkGraphQueryV2,
@@ -998,6 +999,36 @@ async function gatewayWorkGraphView(
   };
 }
 
+/** The allow answer for a graph the orchestrator just produced for this viewer. */
+async function allowedAccess(
+  organizationId: string,
+  viewerId: string,
+  viewer: AuthenticatedWorkGraphViewer,
+  query: GatewayWorkGraphQuery,
+  snapshot: { watermark: number; scope: { policyRevision: string } },
+): Promise<GatewayWorkGraphAccess> {
+  let expiresAt: string | undefined;
+  if (viewerId !== query.personId) {
+    const grants = (await sharingRepository.listEffectiveGrants(
+      organizationId,
+      query.personId,
+      viewer,
+      new Date().toISOString(),
+    )).filter((grant) => !('dayFrom' in grant)
+      || (grant.dayFrom <= query.day && query.day <= grant.dayThrough));
+    expiresAt = grants.map((grant) => grant.expiresAt).sort()[0];
+  }
+  return {
+    decision: 'allow',
+    policyRevision: snapshot.scope.policyRevision,
+    grantState: 'active',
+    ...(expiresAt ? { expiresAt } : {}),
+    watermark: snapshot.watermark,
+  };
+}
+
+const DENIED: GatewayWorkGraphAccess = { decision: 'deny', policyRevision: 'unavailable', grantState: 'missing', watermark: 0 };
+
 /**
  * Re-resolves the gateway's verified identity against platform-owned account
  * and membership rows. No membership or policy revision supplied by a socket
@@ -1022,23 +1053,8 @@ export async function authorizeGatewayWorkGraph(
     const view = requestedView
       ? await gatewayWorkGraphView(viewer, query, requestedView)
       : undefined;
-    let expiresAt: string | undefined;
-    if (viewerId !== query.personId) {
-      const grants = (await sharingRepository.listEffectiveGrants(
-        organizationId,
-        query.personId,
-        viewer,
-        new Date().toISOString(),
-      )).filter((grant) => !('dayFrom' in grant)
-        || (grant.dayFrom <= query.day && query.day <= grant.dayThrough));
-      expiresAt = grants.map((grant) => grant.expiresAt).sort()[0];
-    }
     return {
-      decision: 'allow',
-      policyRevision: result.snapshot.scope.policyRevision,
-      grantState: 'active',
-      ...(expiresAt ? { expiresAt } : {}),
-      watermark: result.snapshot.watermark,
+      ...(await allowedAccess(organizationId, viewerId, viewer, query, result.snapshot)),
       ...(view ? { schemaVersion: 2 as const, view } : {}),
     };
   } catch (error) {
@@ -1065,6 +1081,15 @@ export async function replayGatewayWorkGraph(
      * whole difference (NFR #22); otherwise `policyChanged`.
      */
     fromPolicyRevision?: string;
+    /**
+     * The gateway's live feed (one call per change, NFR #75 + item 70): the
+     * replay runs through the current watermark, answers with the access
+     * decision it was produced under (so no separate /authorize), leaves the
+     * view off the batches, and sends it once — as a patch against
+     * `baseViewId` when this process still holds that view.
+     */
+    feed?: true;
+    baseViewId?: string;
   },
   requestedView?: GatewayWorkGraphViewRequest,
 ): Promise<{
@@ -1087,25 +1112,46 @@ export async function replayGatewayWorkGraph(
   /** Echoed only for a schemaVersion 2 request, with the refreshed view. */
   schemaVersion?: 2;
   view?: GatewayWorkGraphViewV2;
+  /** Feed only: the decision this answer was produced under. */
+  access?: GatewayWorkGraphAccess;
+  /** Feed only: the id of the view this answer describes, and the one it patches. */
+  viewId?: string;
+  baseViewId?: string;
+  viewPatch?: WorkGraphViewPatchV2;
 }> {
   // A non-UTC local day spans two UTC projection partitions; its watermark
   // packs both partitions' revisions, and `listLocalDayDeltas` replays each
   // partition from its own cursor and merges them (NFR #22). A cursor it
   // cannot split (issued before the packing) answers incomplete: one reset.
+  const feed = request.feed === true;
   const viewer = await directory.resolveViewerById(organizationId, viewerId);
-  if (!viewer) return { batches: [], complete: false };
-  const current = await workGraphOrchestrator.getGraph(
-    viewer,
-    query.personId,
-    query.day,
-    query.timezone,
-  );
+  if (!viewer) return feed ? { batches: [], complete: true, access: DENIED } : { batches: [], complete: false };
+  let current: Awaited<ReturnType<typeof workGraphOrchestrator.getGraph>>;
+  try {
+    current = await workGraphOrchestrator.getGraph(
+      viewer,
+      query.personId,
+      query.day,
+      query.timezone,
+    );
+  } catch (error) {
+    // Same mapping as /authorize: "not visible" is a denial; anything else
+    // (DynamoDB, a source adapter) is a failure the gateway retries.
+    if (feed && error instanceof WorkGraphUnavailableError) return { batches: [], complete: true, access: DENIED };
+    throw error;
+  }
   if (request.throughWatermark > current.snapshot.watermark) return { batches: [], complete: false };
+  const access = feed ? await allowedAccess(organizationId, viewerId, viewer, query, current.snapshot) : undefined;
   const currentRevision = current.snapshot.scope.policyRevision;
   const advancing = request.fromPolicyRevision !== undefined && request.fromPolicyRevision !== currentRevision;
   // Proving an advance needs every entity created up to the state the current
-  // revision describes, so it replays through the current watermark.
-  const throughWatermark = advancing ? current.snapshot.watermark : request.throughWatermark;
+  // revision describes, so it replays through the current watermark; so does
+  // a feed call, which no longer asks /authorize for the watermark first.
+  const throughWatermark = advancing || feed ? current.snapshot.watermark : request.throughWatermark;
+  if (feed && !advancing && throughWatermark <= request.afterWatermark) {
+    // Nothing moved: no view is built for a signal about someone else's change.
+    return { batches: [], complete: true, policyRevision: currentRevision, access };
+  }
   const stored = await graphRepository.listLocalDayDeltas(
     organizationId,
     query.personId,
@@ -1170,16 +1216,38 @@ export async function replayGatewayWorkGraph(
     // the state it describes and the entities created on the way account for
     // every bit of the difference. Anything else is a real permission change.
     const reachesCurrent = safe && (mapped.at(-1)?.watermark ?? request.afterWatermark) === current.snapshot.watermark;
-    if (!reachesCurrent) return { batches: [], complete: false };
+    if (!reachesCurrent) return { batches: [], complete: false, ...(access ? { access } : {}) };
     if (!revisionExplainedByAdditions(request.fromPolicyRevision!, currentRevision, created)) {
-      return { batches: [], complete: false, policyChanged: true };
+      return { batches: [], complete: false, policyChanged: true, ...(access ? { access } : {}) };
     }
   }
   const batches = advancing
     ? mapped.map((batch) => ({ ...batch, policyAdvancedFrom: request.fromPolicyRevision! }))
     : mapped;
   if (!requestedView) {
-    return { batches, complete: safe, ...(request.fromPolicyRevision !== undefined ? { policyRevision: currentRevision } : {}) };
+    return {
+      batches,
+      complete: safe,
+      ...(request.fromPolicyRevision !== undefined ? { policyRevision: currentRevision } : {}),
+      ...(access ? { access } : {}),
+    };
+  }
+  if (feed) {
+    // One view per answer, not one per batch plus one more: the gateway
+    // attaches it to every batch it forwards, exactly as before.
+    const view = await gatewayWorkGraphView(viewer, query, requestedView);
+    const encoded = feedViewCache.encode({
+      organizationId, viewerId, ...query,
+      windowStart: requestedView.windowStart, windowEnd: requestedView.windowEnd, mode: requestedView.mode,
+    }, view, request.baseViewId);
+    return {
+      batches,
+      complete: safe,
+      policyRevision: currentRevision,
+      schemaVersion: 2 as const,
+      access,
+      ...encoded,
+    };
   }
   // The activity layer is derived, not delta-encoded: every batch carries the
   // whole refreshed view, so effort membership can never drift away from the
