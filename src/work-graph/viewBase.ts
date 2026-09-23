@@ -79,7 +79,14 @@ export async function publishViewBase(
   try {
     await Promise.race([
       store.set(viewBaseRedisKey(hash), serialized, VIEW_BASE_TTL_SECONDS),
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), PUBLISH_TIMEOUT_MS); }),
+      // NFR #95: on a CPU-starved process the event loop can be blocked past
+      // the deadline while Redis's reply already waits in the socket; the
+      // timers phase runs before I/O, so the timer used to win and a stored
+      // base went out without its hash (one whole first frame in ten at 10
+      // subscribers). The deadline is only decided after this loop turn's I/O.
+      new Promise((_, reject) => {
+        timer = setTimeout(() => setImmediate(() => reject(new Error('timeout'))), PUBLISH_TIMEOUT_MS);
+      }),
     ]);
     return hash;
   } catch {

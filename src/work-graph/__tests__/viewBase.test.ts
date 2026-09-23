@@ -9,6 +9,15 @@ describe('view base hash (NFR #85)', () => {
     }, '{"efforts":[]}')).toBe('D8Nh9fdeLnkp3gCYOGuD_RHZJDVI_yfxvTWRnbxtkMA');
   });
 
+  it('a reply that arrived while the loop was blocked past the deadline still counts (NFR #95)', async () => {
+    const pending = publishViewBase({ set: () => new Promise((resolve) => setImmediate(resolve)) }, {
+      organizationId: 'o', viewerId: 'v', personId: 'p', day: '2026-09-23', timezone: 'UTC', watermark: 1,
+    }, { query: {}, temporal: {}, efforts: [], details: [], operations: [], eventBuckets: [] } as never);
+    const blockedUntil = Date.now() + 200;
+    while (Date.now() < blockedUntil) { /* a busy event loop */ }
+    expect(await pending).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+
   it('gives up on a store that does not answer in time instead of holding the snapshot', async () => {
     const started = Date.now();
     const hash = await publishViewBase({ set: () => new Promise(() => undefined) }, {
