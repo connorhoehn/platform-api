@@ -68,17 +68,20 @@ function conditionFailed(error: unknown): boolean {
   return (error as { name?: string })?.name === 'ConditionalCheckFailedException';
 }
 
-let tableReady: Promise<void> | null = null;
+const tablesReady = new Map<string, Promise<void>>();
 
-/** Idempotent: create the claims table (pk `claimKey`) and its TTL on first use. */
-export async function ensureDeckReviseClaimsTable(client: DynamoDBClient = ddbClient): Promise<void> {
+/** Idempotent: create a claims table (pk `claimKey`) and its TTL on first use. Default: the deck's. */
+export async function ensureDeckReviseClaimsTable(
+  client: DynamoDBClient = ddbClient,
+  table: string = DECK_REVISE_CLAIMS_TABLE,
+): Promise<void> {
   try {
-    await client.send(new DescribeTableCommand({ TableName: DECK_REVISE_CLAIMS_TABLE }));
+    await client.send(new DescribeTableCommand({ TableName: table }));
   } catch (error) {
     if ((error as { name?: string })?.name !== 'ResourceNotFoundException') throw error;
     try {
       await client.send(new CreateTableCommand({
-        TableName: DECK_REVISE_CLAIMS_TABLE,
+        TableName: table,
         BillingMode: 'PAY_PER_REQUEST',
         AttributeDefinitions: [{ AttributeName: 'claimKey', AttributeType: 'S' }],
         KeySchema: [{ AttributeName: 'claimKey', KeyType: 'HASH' }],
@@ -86,27 +89,42 @@ export async function ensureDeckReviseClaimsTable(client: DynamoDBClient = ddbCl
     } catch (createError) {
       if ((createError as { name?: string })?.name !== 'ResourceInUseException') throw createError;
     }
-    await waitUntilTableExists({ client, maxWaitTime: 60 }, { TableName: DECK_REVISE_CLAIMS_TABLE });
+    await waitUntilTableExists({ client, maxWaitTime: 60 }, { TableName: table });
   }
-  const ttl = await client.send(new DescribeTimeToLiveCommand({ TableName: DECK_REVISE_CLAIMS_TABLE }));
+  const ttl = await client.send(new DescribeTimeToLiveCommand({ TableName: table }));
   const status = ttl.TimeToLiveDescription?.TimeToLiveStatus;
   if (status !== 'ENABLED' && status !== 'ENABLING') {
     await client.send(new UpdateTimeToLiveCommand({
-      TableName: DECK_REVISE_CLAIMS_TABLE,
+      TableName: table,
       TimeToLiveSpecification: { Enabled: true, AttributeName: 'expiresAt' },
     }));
   }
 }
 
-/** Conditional writes against `deck-revise-claims`; reads are strongly consistent. */
+/** One table-ready promise per table; a failed attempt is retried on the next call. */
+function tableReadyOnce(table: string): Promise<void> {
+  let ready = tablesReady.get(table);
+  if (!ready) {
+    ready = ensureDeckReviseClaimsTable(ddbClient, table).catch((error) => { tablesReady.delete(table); throw error; });
+    tablesReady.set(table, ready);
+  }
+  return ready;
+}
+
+/**
+ * Conditional writes against a claims table (the deck's by default; the
+ * idempotency middleware runs one on `idempotency-claims`, NFR #97); reads
+ * are strongly consistent.
+ */
 export class DynamoClaimStore implements ClaimStore {
+  private readonly ready: () => Promise<void>;
   constructor(
     private readonly client: DynamoDBDocumentClient = docClient,
-    private readonly ready: () => Promise<void> = () => {
-      tableReady ??= ensureDeckReviseClaimsTable().catch((error) => { tableReady = null; throw error; });
-      return tableReady;
-    },
-  ) {}
+    ready?: () => Promise<void>,
+    private readonly table: string = DECK_REVISE_CLAIMS_TABLE,
+  ) {
+    this.ready = ready ?? (() => tableReadyOnce(this.table));
+  }
 
   private now(): number { return Math.floor(Date.now() / 1000); }
 
@@ -115,7 +133,7 @@ export class DynamoClaimStore implements ClaimStore {
     const now = this.now();
     try {
       await this.client.send(new PutCommand({
-        TableName: DECK_REVISE_CLAIMS_TABLE,
+        TableName: this.table,
         Item: { claimKey: key, value, expiresAt: now + ttlSeconds },
         ConditionExpression: 'attribute_not_exists(claimKey) OR expiresAt < :now',
         ExpressionAttributeValues: { ':now': now },
@@ -129,7 +147,7 @@ export class DynamoClaimStore implements ClaimStore {
 
   async get(key: string): Promise<string | null> {
     await this.ready();
-    const out = await this.client.send(new GetCommand({ TableName: DECK_REVISE_CLAIMS_TABLE, Key: { claimKey: key }, ConsistentRead: true }));
+    const out = await this.client.send(new GetCommand({ TableName: this.table, Key: { claimKey: key }, ConsistentRead: true }));
     const item = out.Item as { value?: unknown; expiresAt?: unknown } | undefined;
     if (!item || typeof item.value !== 'string') return null;
     if (typeof item.expiresAt === 'number' && item.expiresAt < this.now()) return null;
@@ -140,7 +158,7 @@ export class DynamoClaimStore implements ClaimStore {
     await this.ready();
     try {
       await this.client.send(new UpdateCommand({
-        TableName: DECK_REVISE_CLAIMS_TABLE,
+        TableName: this.table,
         Key: { claimKey: key },
         UpdateExpression: 'SET #v = :run, expiresAt = :exp',
         ConditionExpression: '#v = :pending',
@@ -157,7 +175,7 @@ export class DynamoClaimStore implements ClaimStore {
     await this.ready();
     try {
       await this.client.send(new DeleteCommand({
-        TableName: DECK_REVISE_CLAIMS_TABLE,
+        TableName: this.table,
         Key: { claimKey: key },
         ConditionExpression: '#v = :pending',
         ExpressionAttributeNames: { '#v': 'value' },

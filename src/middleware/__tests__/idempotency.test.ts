@@ -20,18 +20,20 @@ import type { NextFunction, Request, Response } from 'express';
 // store override, but the 'no header' / passthrough path still calls
 // resolveStore() which would touch Redis (and log warnings for unavailable
 // hosts). Stub the module so it never tries.
-jest.mock('../../lib/redis-client', () => ({
-  getRedisClient: async () => null,
-}));
+jest.mock('../../lib/aws-clients', () => ({ docClient: { send: jest.fn() }, ddbClient: { send: jest.fn() } }));
+jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `test-${name}` }));
 
 import {
   _resetIdempotencyMemFallback,
   createIdempotencyCache,
   hashBody,
   idempotency,
+  PENDING_TTL_SECONDS,
+  setIdempotencyStore,
   type CachedResponse,
   type IdempotencyStore,
 } from '../idempotency';
+import { DynamoClaimStore } from '../../deck/deckReviseRequests';
 
 // ---------------------------------------------------------------------------
 // Test rig — minimal Express-shaped req/res that captures status/body/headers
@@ -137,14 +139,30 @@ async function runMiddleware(
 // Fake store — full control over Redis-side timing for deterministic tests.
 // ---------------------------------------------------------------------------
 
-function fakeStore(): IdempotencyStore & { dump(): Map<string, string>; clear(): void } {
+function fakeStore(): IdempotencyStore & {
+  dump(): Map<string, string>;
+  clear(): void;
+  ttls: Map<string, number>;
+} {
   const map = new Map<string, string>();
+  const ttls = new Map<string, number>();
   return {
     async get(key) {
       return map.get(key) ?? null;
     },
-    async set(key, value, _opts) {
+    async claim(key, ttlSeconds) {
+      if (map.has(key)) return false;
+      map.set(key, 'pending');
+      ttls.set(key, ttlSeconds);
+      return true;
+    },
+    async commit(key, value, ttlSeconds) {
+      if (map.get(key) !== 'pending') return;
       map.set(key, value);
+      ttls.set(key, ttlSeconds);
+    },
+    async release(key) {
+      if (map.get(key) === 'pending') map.delete(key);
     },
     dump() {
       return new Map(map);
@@ -152,6 +170,7 @@ function fakeStore(): IdempotencyStore & { dump(): Map<string, string>; clear():
     clear() {
       map.clear();
     },
+    ttls,
   };
 }
 
@@ -326,41 +345,135 @@ describe('idempotency middleware — cache hit/miss', () => {
     expect(r2.body).toEqual({ user: 'bob' });
   });
 
-  test('ttlSeconds is forwarded as EX option (24h default)', async () => {
-    const seen: Array<{ key: string; opts: { EX: number } }> = [];
-    const store: IdempotencyStore = {
-      async get() {
-        return null;
-      },
-      async set(key, _value, opts) {
-        seen.push({ key, opts });
-      },
-    };
+  test('a committed claim carries the 24h default TTL; the pending claim the short one', async () => {
+    const store = fakeStore();
     const mw = idempotency({ scope: 'test', store });
-    await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k5' }), (_req, r) =>
-      r.json({ ok: true }),
-    );
+    let pendingTtl: number | undefined;
+    await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k5' }), (_req, r) => {
+      pendingTtl = store.ttls.get('idem:test:user-1:k5');
+      r.json({ ok: true });
+    });
     await new Promise((r) => setImmediate(r));
-    expect(seen).toHaveLength(1);
-    expect(seen[0].opts.EX).toBe(60 * 60 * 24);
+    expect(pendingTtl).toBe(PENDING_TTL_SECONDS);
+    expect(store.ttls.get('idem:test:user-1:k5')).toBe(60 * 60 * 24);
   });
 
-  test('explicit ttlSeconds overrides default', async () => {
-    const seen: Array<{ key: string; opts: { EX: number } }> = [];
-    const store: IdempotencyStore = {
-      async get() {
-        return null;
-      },
-      async set(key, _value, opts) {
-        seen.push({ key, opts });
-      },
-    };
+  test('explicit ttlSeconds overrides the committed TTL', async () => {
+    const store = fakeStore();
     const mw = idempotency({ scope: 'test', store, ttlSeconds: 1234 });
     await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k8' }), (_req, r) =>
       r.json({ ok: true }),
     );
     await new Promise((r) => setImmediate(r));
-    expect(seen[0].opts.EX).toBe(1234);
+    expect(store.ttls.get('idem:test:user-1:k8')).toBe(1234);
+  });
+
+  test('a pending claim (first request still running) → 409 in_progress with Retry-After', async () => {
+    const store = fakeStore();
+    let calls = 0;
+    const mw = idempotency({ scope: 'test', store });
+    let finishFirst: () => void = () => {};
+    const first = runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k9' }), (_req, r) => {
+      calls += 1;
+      return new Promise<void>((resolve) => { finishFirst = () => { r.status(202).json({ runId: 'r9' }); resolve(); }; });
+    });
+    await new Promise((r) => setImmediate(r));
+    expect(store.dump().get('idem:test:user-1:k9')).toBe('pending');
+
+    const r2 = await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k9' }), (_req, r) => {
+      calls += 1;
+      r.status(202).json({ runId: 'second' });
+    });
+    expect(r2.statusCode).toBe(409);
+    expect((r2.body as { error: string }).error).toBe('idempotency_in_progress');
+    expect(r2.headers['Retry-After']).toBe('2');
+    expect(calls).toBe(1);
+
+    finishFirst();
+    await first;
+    await new Promise((r) => setImmediate(r));
+    const r3 = await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k9' }), (_req, r) => {
+      calls += 1;
+      r.status(202).json({ runId: 'third' });
+    });
+    expect(r3.statusCode).toBe(202);
+    expect(r3.body).toEqual({ runId: 'r9' });
+    expect(r3.headers['X-Idempotent-Replay']).toBe('true');
+    expect(calls).toBe(1);
+  });
+
+  test('a non-2xx releases the pending claim so a retry runs the handler again', async () => {
+    const store = fakeStore();
+    let calls = 0;
+    const mw = idempotency({ scope: 'test', store });
+    const r1 = await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k10' }), (_req, r) => {
+      calls += 1;
+      r.status(503).json({ error: 'engine-busy' });
+    });
+    expect(r1.statusCode).toBe(503);
+    await new Promise((r) => setImmediate(r));
+    expect(store.dump().has('idem:test:user-1:k10')).toBe(false);
+
+    const r2 = await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k10' }), (_req, r) => {
+      calls += 1;
+      r.status(202).json({ runId: 'r10' });
+    });
+    expect(r2.statusCode).toBe(202);
+    expect(calls).toBe(2);
+    expect(store.dump().get('idem:test:user-1:k10')).toContain('"runId":"r10"');
+  });
+
+  test('a lost claim store (Redis flush) would double-run; the claim store keeps the row → replay, one side effect', async () => {
+    // Before #97 the record lived in a volatile cache: cleared between the two
+    // POSTs, the retry ran the handler again. The claim store is the durable
+    // one; a volatile cache cleared alongside changes nothing.
+    const volatile = new Map<string, string>();
+    const store = fakeStore();
+    let calls = 0;
+    const mw = idempotency({ scope: 'pipeline-trigger', store });
+    const handler = (_req: Request, r: Response): void => {
+      calls += 1;
+      volatile.set('idem:pipeline-trigger:user-1:k11', 'cached-in-redis');
+      r.status(202).json({ runId: `run-${calls}` });
+    };
+    const r1 = await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k11' }), handler);
+    expect(r1.body).toEqual({ runId: 'run-1' });
+    await new Promise((r) => setImmediate(r));
+
+    volatile.clear(); // the "Redis restart"
+    const r2 = await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k11' }), handler);
+    expect(r2.statusCode).toBe(202);
+    expect(r2.body).toEqual({ runId: 'run-1' });
+    expect(r2.headers['X-Idempotent-Replay']).toBe('true');
+    expect(calls).toBe(1);
+  });
+
+  test('claim store unreachable → 503 idempotency-store-unavailable, handler never runs', async () => {
+    const store: IdempotencyStore = {
+      async get() { throw new Error('ECONNREFUSED dynamodb'); },
+      async claim() { throw new Error('unreachable'); },
+      async commit() {},
+      async release() {},
+    };
+    let calls = 0;
+    const mw = idempotency({ scope: 'test', store });
+    const res = await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k12' }), () => { calls += 1; });
+    expect(res.statusCode).toBe(503);
+    expect((res.body as { error: string }).error).toBe('idempotency-store-unavailable');
+    expect(calls).toBe(0);
+  });
+
+  test('setIdempotencyStore overrides the process-wide store; null restores it', async () => {
+    const store = fakeStore();
+    setIdempotencyStore(store);
+    try {
+      const mw = idempotency({ scope: 'test' });
+      await runMiddleware(mw, mockReq({ body: { x: 1 }, idempotencyKey: 'k13' }), (_req, r) => r.json({ ok: 1 }));
+      await new Promise((r) => setImmediate(r));
+      expect(store.dump().size).toBe(1);
+    } finally {
+      setIdempotencyStore(null);
+    }
   });
 
   test('cached payload contains body hash + status + headers', async () => {
@@ -417,6 +530,25 @@ describe('createIdempotencyCache (legacy in-memory)', () => {
       expect(cache.get('b')).toBeNull();
     } finally {
       jest.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DynamoClaimStore on the idempotency table (NFR #97): the table is a parameter.
+// ---------------------------------------------------------------------------
+
+describe('DynamoClaimStore table parameter', () => {
+  test('writes go to the table it was given, not the deck one', async () => {
+    const send = jest.fn(async () => ({}));
+    const store = new DynamoClaimStore({ send } as never, async () => undefined, 'test-idempotency-claims');
+    expect(await store.create('idem:a', 'pending', 120)).toBe(true);
+    await store.commit('idem:a', '{"status":202}', 86400);
+    await store.release('idem:a');
+    await store.get('idem:a');
+    expect(send).toHaveBeenCalledTimes(4);
+    for (const call of send.mock.calls as unknown as Array<[{ input: { TableName: string } }]>) {
+      expect(call[0].input.TableName).toBe('test-idempotency-claims');
     }
   });
 });
