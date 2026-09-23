@@ -15,7 +15,7 @@ import {
   pendingShardFor,
 } from '../lib/outbox-pending';
 import log from '../lib/logger';
-import { localTtlSweepEnabled, sweepExpiredProcessedRows } from '../lib/localTtlSweep';
+import { localTtlSweepEnabled, sweepExpiredProcessedRows, sweepExpiredWorkGraphRows } from '../lib/localTtlSweep';
 import {
   recordOutboxLeaseAcquired,
   recordOutboxOldestPendingSeconds,
@@ -24,6 +24,7 @@ import {
 } from '../observability/metrics';
 
 const OUTBOX_TABLE = tableName('social-outbox');
+const WORK_GRAPH_TABLE = tableName('work-graph');
 const LOCK_KEY = 'OUTBOX_LOCK#drainer';
 const LEASE_TTL_MS = 30_000;
 
@@ -512,6 +513,9 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       try {
         const swept = await sweepExpiredProcessedRows({ docClient, tableName: OUTBOX_TABLE, keyAttr: 'outboxId' });
         log.info({ table: OUTBOX_TABLE, ...swept, ms: Date.now() - startedAt }, 'outbox-drainer: local TTL sweep (expired PROCESSED rows deleted)');
+        const wgStartedAt = Date.now();
+        const wg = await sweepExpiredWorkGraphRows({ docClient, tableName: WORK_GRAPH_TABLE });
+        log.info({ table: WORK_GRAPH_TABLE, ...wg, ms: Date.now() - wgStartedAt }, 'outbox-drainer: local TTL sweep (expired work-graph WG# rows deleted)');
       } catch (err: unknown) {
         log.warn({ errMessage: (err as { message?: string })?.message }, 'outbox-drainer: local TTL sweep failed');
       } finally {
