@@ -21,6 +21,25 @@ jest.mock('../../lib/redis-client', () => ({
   getRedisClient: async () => null,
 }));
 
+// NFR #115: the list joins the rollup rows (the shared source) with the local
+// queue. No rollup subscriber in the process → local queue only.
+let rollupSubscriberInstalled = false;
+jest.mock('../../pipeline/run-rollup-subscriber', () => ({
+  getRunRollupSubscriber: () => (rollupSubscriberInstalled ? { resolvePipelineId: async () => null } : null),
+  lookupPipelineIdByRunId: async () => null,
+}));
+const mockListWithOpenApprovals = jest.fn(async (): Promise<unknown[]> => []);
+jest.mock('../../repositories/PipelineRunRollupRepository', () => ({
+  pipelineRunRollupRepo: { get: async () => null, listWithOpenApprovals: () => mockListWithOpenApprovals() },
+}));
+const mockRunRepoGet = jest.fn(async (_pipelineId: string, _runId: string): Promise<unknown> => null);
+jest.mock('../../repositories/PipelineRunRepository', () => ({
+  PipelineRunRepository: jest.fn().mockImplementation(() => ({ get: mockRunRepoGet })),
+  // `runItemToSnapshot` (the remote run's enrichment) reads attempts through it.
+  readAttempts: (summary: { attempts?: unknown[] }) => summary.attempts ?? [],
+}));
+jest.mock('../../lib/ddb-client', () => ({ getDynamoClient: () => ({}) }));
+
 import { errorHandler } from '../../middleware/error-handler';
 import {
   pipelinePendingApprovalsRouter,
@@ -174,6 +193,91 @@ function buildApp(opts: { authStub?: boolean } = { authStub: true }): express.Ex
 afterEach(() => {
   setPipelineBridge(null);
   stubRunStore.__resetForTests();
+  rollupSubscriberInstalled = false;
+  mockListWithOpenApprovals.mockReset();
+  mockListWithOpenApprovals.mockResolvedValue([]);
+  mockRunRepoGet.mockReset();
+  mockRunRepoGet.mockResolvedValue(null);
+});
+
+// ---------------------------------------------------------------------------
+// NFR #115: the shared source — gates on the rollup rows, whichever replica
+// owns the run.
+// ---------------------------------------------------------------------------
+
+describe('GET /pipelines/approvals — joined with the rollup rows (NFR #115)', () => {
+  const remoteRun = {
+    pipelineId: 'deck-revise', runId: 'run-b', status: 'running', ownerNodeId: 'node-b',
+    triggeredBy: 'bob', triggerType: 'manual', startedAt: '2026-09-23T16:00:00.000Z',
+    stepsSummary: { review: { status: 'completed', output: { verdict: 'big edit' } } },
+    definitionSnapshot: {
+      name: 'Deck revise',
+      nodes: [
+        { id: 'review', type: 'llm', data: { type: 'llm', label: 'Review' } },
+        { id: 'gate', type: 'approval', data: { type: 'approval', label: 'Approve a big edit', approvers: [{ type: 'user', value: 'alice' }], requiredCount: 1, message: 'A big edit waits.' } },
+      ],
+      edges: [{ id: 'e1', source: 'review', sourceHandle: 'out', target: 'gate', targetHandle: 'in' }],
+    },
+  };
+
+  test('a gate on a run another replica owns is listed from the rollup row + run table, with approvers and upstream output', async () => {
+    rollupSubscriberInstalled = true;
+    mockListWithOpenApprovals.mockResolvedValue([
+      { pipelineId: 'deck-revise', recent: [{ runId: 'run-b' }], approvals: [{ runId: 'run-b', stepId: 'gate', at: '2026-09-23T16:00:05.000Z' }], pendingApprovals: 1 },
+    ]);
+    mockRunRepoGet.mockResolvedValue(remoteRun);
+    setPipelineBridge(makeBridge({ getPendingApprovals: async () => [], getRun: async () => null }));
+
+    const res = await run(buildApp(), 'GET', '/pipelines/approvals');
+    expect(res.statusCode).toBe(200);
+    const { approvals } = res.body as { approvals: Array<Record<string, unknown>> };
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]).toMatchObject({
+      runId: 'run-b', stepId: 'gate', pipelineId: 'deck-revise',
+      approvers: [{ type: 'user', value: 'alice' }], message: 'A big edit waits.', requestedAt: '2026-09-23T16:00:05.000Z',
+      pipelineName: 'Deck revise', stepName: 'Approve a big edit', requestedBy: 'bob',
+      upstream: [expect.objectContaining({ stepId: 'review', output: { verdict: 'big edit' } })],
+    });
+    expect(mockRunRepoGet).toHaveBeenCalledWith('deck-revise', 'run-b');
+    // `?userId=` filters the shared rows too.
+    const filtered = await run(buildApp(), 'GET', '/pipelines/approvals?userId=carol');
+    expect((filtered.body as { approvals: unknown[] }).approvals).toEqual([]);
+  });
+
+  test('the local queue wins for a gate this replica holds; a row unknown to the run table is listed without approvers', async () => {
+    rollupSubscriberInstalled = true;
+    mockListWithOpenApprovals.mockResolvedValue([
+      { pipelineId: 'deck-revise', recent: [], approvals: [
+        { runId: 'run-a', stepId: 'gate', at: '2026-09-23T16:00:01.000Z' },
+        { runId: 'run-gone', stepId: 'gate', at: '2026-09-23T16:00:02.000Z' },
+      ], pendingApprovals: 2 },
+    ]);
+    const localRow = { runId: 'run-a', stepId: 'gate', pipelineId: 'deck-revise', approvers: [{ type: 'user' as const, value: 'alice' }], message: 'local', requestedAt: '2026-09-23T16:00:01.500Z' };
+    setPipelineBridge(makeBridge({ getPendingApprovals: async () => [localRow], getRun: async () => null }));
+
+    const res = await run(buildApp(), 'GET', '/pipelines/approvals');
+    expect(res.statusCode).toBe(200);
+    const { approvals } = res.body as { approvals: Array<Record<string, unknown>> };
+    expect(approvals.map((a) => a.runId)).toEqual(['run-a', 'run-gone']);
+    expect(approvals[0]).toMatchObject({ message: 'local', requestedAt: '2026-09-23T16:00:01.500Z' });
+    expect(approvals[1]).toMatchObject({ runId: 'run-gone', approvers: [], requestedAt: '2026-09-23T16:00:02.000Z' });
+  });
+
+  test('rollup rows unavailable → the local queue alone, still 200', async () => {
+    rollupSubscriberInstalled = true;
+    mockListWithOpenApprovals.mockRejectedValue(new Error('ddb down'));
+    setPipelineBridge(makeBridge({ getPendingApprovals: async () => SAMPLE_ROWS }));
+    const res = await run(buildApp(), 'GET', '/pipelines/approvals');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ approvals: SAMPLE_ROWS });
+  });
+
+  test('no rollup subscriber in the process → the rows are never read', async () => {
+    setPipelineBridge(makeBridge({ getPendingApprovals: async () => SAMPLE_ROWS }));
+    const res = await run(buildApp(), 'GET', '/pipelines/approvals');
+    expect(res.statusCode).toBe(200);
+    expect(mockListWithOpenApprovals).not.toHaveBeenCalled();
+  });
 });
 
 // Sample row used across the bridge-wired tests.

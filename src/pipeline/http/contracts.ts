@@ -91,8 +91,32 @@ export interface PipelineApprovalResolveRequest {
   comment?: string;
 }
 
-/** 204 No Content on success. No structured response body. */
-export type PipelineApprovalResolveResponse = void;
+/**
+ * 204 No Content when this replica's executor held the gate and resolved it.
+ *
+ * 202 Accepted when the gate is held by another replica (NFR #115): the
+ * decision was recorded on the pipeline's rollup row and forwarded to the
+ * run's owner over the cluster pubsub; the run proceeds within the pubsub's
+ * delivery time. A dead owner's decision is applied when the run is resumed.
+ * Retrying with the same `Idempotency-Key` reuses the same `decisionId`.
+ *
+ * Never a 204 for a run this replica does not hold: 404 `run-not-found`,
+ * 409 `run-not-awaiting-approval` / `gate-not-pending`, or 503
+ * `approval-forwarding-unavailable` (the decision reached neither the row
+ * nor the wire — retry with the same key).
+ */
+export type PipelineApprovalResolveResponse = void | PipelineApprovalForwardedResponse;
+
+export interface PipelineApprovalForwardedResponse {
+  decisionId: string;
+  runId: string;
+  stepId: string;
+  decision: 'approve' | 'reject';
+  pipelineId: string;
+  /** The replica that owns the run, per its run row; null when the row has none. */
+  ownerNodeId: string | null;
+  forwarded: true;
+}
 
 // ---------------------------------------------------------------------------
 // Listings — GET /api/pipelines/:pipelineId/runs

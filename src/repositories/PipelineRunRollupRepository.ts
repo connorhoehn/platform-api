@@ -19,6 +19,7 @@ import {
   BatchGetCommand,
   GetCommand,
   PutCommand,
+  ScanCommand,
   type DynamoDBDocumentClient,
 } from '@aws-sdk/lib-dynamodb';
 import {
@@ -125,6 +126,32 @@ export class PipelineRunRollupRepository {
    * yet). Throws RollupVersionConflict when it is not, so the caller can
    * re-read and merge again.
    */
+  /**
+   * Every row with an approval gate still waiting or a decision not yet
+   * applied — the shared source behind `GET /api/pipelines/approvals`
+   * (NFR #115). One row per pipeline, so a filtered Scan is the whole table
+   * once and small; paged to the end.
+   */
+  async listWithOpenApprovals(): Promise<PipelineRunRollup[]> {
+    await this.tableReady();
+    const rows: PipelineRunRollup[] = [];
+    let startKey: Record<string, unknown> | undefined;
+    do {
+      const out = await this.client.send(new ScanCommand({
+        TableName: this.table,
+        FilterExpression: 'pendingApprovals > :zero OR size(decisions) > :zero',
+        ExpressionAttributeValues: { ':zero': 0 },
+        ConsistentRead: true,
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }));
+      for (const row of (out.Items ?? []) as PipelineRunRollup[]) {
+        if (typeof row.pipelineId === 'string') rows.push(row);
+      }
+      startKey = out.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (startKey);
+    return rows;
+  }
+
   async putIfUnchanged(next: PipelineRunRollup, seen: PipelineRunRollup | null): Promise<void> {
     await this.tableReady();
     try {

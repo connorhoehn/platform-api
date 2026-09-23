@@ -81,6 +81,7 @@ import type { DeadLetterQueue, Envelope } from 'distributed-core/messaging-queue
 import { createLLMClient } from './factories/LLMClientFactory';
 import { ExecutorAuditSubscriber } from './executor-audit-subscriber';
 import { startRunRollupSubscriber } from './run-rollup-subscriber';
+import { startApprovalForwarder } from './approval-forwarder';
 import { auditRepo } from './audit-repository';
 import { setupFailureDetectorBridge } from './config/failureDetectorBridge';
 import {
@@ -1385,7 +1386,11 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     logger.info('executor audit subscriber DISABLED via PIPELINE_AUDIT_LIFECYCLE_ENABLED=false');
   }
   // The pipelines page's last-run rollup, fed by the same lifecycle events (run-rollup-subscriber.ts).
-  startRunRollupSubscriber({ eventBus, enabled: opts.pipelineRunRepository !== undefined });
+  const runRollupSubscriber = startRunRollupSubscriber({ eventBus, enabled: opts.pipelineRunRepository !== undefined });
+  // NFR #115: an approval decision taken on a replica that does not own the
+  // run reaches the owner over the cluster pubsub (and the rollup row, for a
+  // dead owner's resume). Always on: with one replica it costs one subscription.
+  const approvalForwarder = startApprovalForwarder({ nodeId, pubsub, runs: module, eventBus, rollup: runRollupSubscriber });
 
   // ── Judge aggregator subscriber ───────────────────────────────────────
   //
@@ -1477,6 +1482,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // sweep and sees this incarnation as gone without waiting out the TTL.
   const shutdownWithLeases = async (): Promise<void> => {
     clusterSweeperStopped = true;
+    approvalForwarder.stop();
     await clusterSweeper.stop().catch(() => undefined);
     await replicaHeartbeat.stop().catch(() => undefined);
     await shutdown();

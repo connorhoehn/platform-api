@@ -18,6 +18,12 @@
 //     non-live status for the run drops all of its keys. `pendingApprovals` is
 //     its size — the count every replica answers alike, instead of the
 //     executor's in-memory queue on whichever replica took the request.
+//   - `decisions` is the set of approval decisions taken on a replica that
+//     does not own the run, keyed (runId, stepId, decisionId) — the shared
+//     record the owner (or, when the owner is dead, whoever resumes the run)
+//     applies to its executor (NFR #115). A `recorded` for the gate, or a
+//     terminal status for the run, releases them; `interrupted` / `stuck` do
+//     NOT, because that is exactly the run the resume path will re-ask.
 
 export type RollupRunStatus =
   | 'pending' | 'running' | 'awaiting_approval' | 'paused_at_breakpoint'
@@ -65,6 +71,24 @@ export interface RollupPendingApproval {
   at: string;
 }
 
+/**
+ * One approval decision taken on a replica that does not own the run, kept
+ * on the row until the owner's executor records it (NFR #115).
+ */
+export interface RollupApprovalDecision {
+  decisionId: string;
+  runId: string;
+  stepId: string;
+  userId: string;
+  decision: 'approve' | 'reject';
+  comment?: string;
+  /** When it was taken. */
+  at: string;
+}
+
+/** Decisions kept per row; the oldest go first when a row would exceed it. */
+export const MAX_DECISIONS = 100;
+
 export interface PipelineRunRollup {
   pipelineId: string;
   /** '' when the pipeline has never run (the sentinel row that stops the backfill probe). */
@@ -87,7 +111,13 @@ export interface PipelineRunRollup {
   approvals?: RollupPendingApproval[];
   /** `approvals.length` — shared across replicas because it lives on this row. */
   pendingApprovals: number;
-  /** The newest event time the row absorbed. */
+  /** Decisions waiting for the run's owner to apply them. Absent on rows written before it existed. */
+  decisions?: RollupApprovalDecision[];
+  /**
+   * The newest event time the row absorbed — or one millisecond past the
+   * previous value when a change carried no newer time, so every write moves
+   * the version the repository's conditional put compares against.
+   */
   updatedAt: string;
 }
 
@@ -102,6 +132,12 @@ export interface RunRollupEvent {
   completedAt?: string;
   /** An approval gate on this run: `pending: true` = requested, `false` = recorded. */
   approval?: { stepId: string; pending: boolean };
+  /**
+   * A decision taken on a replica that does not own the run. A decision-only
+   * event touches `decisions` and nothing else: it never inserts or moves the
+   * run's `recent` entry (the owner's lifecycle events do that).
+   */
+  decision?: RollupApprovalDecision;
 }
 
 function byStartedAtDesc(a: RollupRecentRun, b: RollupRecentRun): number {
@@ -109,7 +145,7 @@ function byStartedAtDesc(a: RollupRecentRun, b: RollupRecentRun): number {
   return a.startedAt < b.startedAt ? 1 : -1;
 }
 
-function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number, updatedAt: string, approvals: RollupPendingApproval[] = []): PipelineRunRollup {
+function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number, updatedAt: string, approvals: RollupPendingApproval[] = [], decisions: RollupApprovalDecision[] = []): PipelineRunRollup {
   const sorted = [...recent].sort(byStartedAtDesc).slice(0, RECENT_LIMIT);
   const newest = sorted[0];
   return {
@@ -123,8 +159,43 @@ function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number,
     runCount,
     approvals,
     pendingApprovals: approvals.length,
+    ...(decisions.length > 0 ? { decisions } : {}),
     updatedAt,
   };
+}
+
+/** The decisions still waiting for a run's gate, oldest first. */
+export function decisionsFor(row: PipelineRunRollup | null, runId: string, stepId: string): RollupApprovalDecision[] {
+  return (row?.decisions ?? []).filter((d) => d.runId === runId && d.stepId === stepId);
+}
+
+/**
+ * The decision set after one event. Returns the SAME array when nothing
+ * changes. A `recorded` gate releases the decisions taken for it; a terminal
+ * run releases all of its decisions; a decision event adds one unless its
+ * decisionId is already there. `interrupted` / `stuck` keep them: the run
+ * that resumes will ask for the gate again and pick them up.
+ */
+function nextDecisions(list: RollupApprovalDecision[], event: RunRollupEvent, runEnded: boolean): RollupApprovalDecision[] {
+  if (runEnded || TERMINAL.has(event.status)) {
+    const kept = list.filter((d) => d.runId !== event.runId);
+    return kept.length === list.length ? list : kept;
+  }
+  if (event.approval && !event.approval.pending) {
+    const kept = list.filter((d) => !(d.runId === event.runId && d.stepId === event.approval!.stepId));
+    return kept.length === list.length ? list : kept;
+  }
+  const taken = event.decision;
+  if (!taken) return list;
+  if (list.some((d) => d.decisionId === taken.decisionId)) return list;
+  const next = [...list, taken];
+  return next.length > MAX_DECISIONS ? next.slice(next.length - MAX_DECISIONS) : next;
+}
+
+/** One millisecond past `iso`, so a changed row always carries a new version. */
+function plusOneMs(iso: string): string {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? new Date(ms + 1).toISOString() : iso;
 }
 
 /**
@@ -159,23 +230,43 @@ export function emptyRollup(pipelineId: string, at: string): PipelineRunRollup {
 export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRollupEvent): PipelineRunRollup {
   const base = existing ?? emptyRollup(event.pipelineId, event.at);
   const approvalsBefore = base.approvals ?? [];
+  const decisionsBefore = base.decisions ?? [];
   const idx = base.recent.findIndex((r) => r.runId === event.runId);
   const recent = base.recent.slice();
   let runCount = base.runCount;
   const cur = idx >= 0 ? recent[idx] : undefined;
+  // A version that always moves: the newest event time, or one past the
+  // previous value when this event is not newer but still changes the row.
+  const stamp = () => {
+    const at = maxIso(base.updatedAt, event.at);
+    return existing && at === existing.updatedAt ? plusOneMs(at) : at;
+  };
+
+  // A decision taken elsewhere: recorded on the row, nothing else moves. A
+  // run that already ended takes none (its owner cannot apply it).
+  if (event.decision) {
+    if (cur !== undefined && TERMINAL.has(cur.status)) return existing ?? base;
+    const decisions = nextDecisions(decisionsBefore, event, false);
+    if (decisions === decisionsBefore) return existing ?? base;
+    return derive(base.pipelineId, recent, runCount, stamp(), approvalsBefore, decisions);
+  }
+
   // A replayed `requested` that lands after its `recorded` is older than the
   // entry and must not re-open the gate; a release (non-live status) always
   // applies.
   const older = cur !== undefined && event.at < cur.at;
   const approvals = older && LIVE.has(event.status) ? approvalsBefore : nextApprovals(approvalsBefore, event);
   const approvalsChanged = approvals !== approvalsBefore;
+  const decisions = older && LIVE.has(event.status) ? decisionsBefore : nextDecisions(decisionsBefore, event, false);
+  const decisionsChanged = decisions !== decisionsBefore;
+  const sideChanged = approvalsChanged || decisionsChanged;
   // One gate recorded while another on the same run still waits: the run is
   // still awaiting approval.
   const status: RollupRunStatus =
     event.approval && !event.approval.pending && approvals.some((a) => a.runId === event.runId)
       ? 'awaiting_approval'
       : event.status;
-  const touched = () => derive(base.pipelineId, recent, runCount, maxIso(base.updatedAt, event.at), approvals);
+  const touched = () => derive(base.pipelineId, recent, runCount, stamp(), approvals, decisions);
 
   if (cur !== undefined) {
     // Terminal is final: a late `running`, `interrupted` or `stuck` for a run
@@ -188,7 +279,7 @@ export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRoll
         recent[idx] = { ...cur, startedAt: event.startedAt };
         return touched();
       }
-      return approvalsChanged ? touched() : existing ?? base;
+      return sideChanged ? touched() : existing ?? base;
     }
     recent[idx] = {
       ...cur,
@@ -202,7 +293,7 @@ export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRoll
     // A run older than everything we keep, arriving after the window is full,
     // is history: it must not evict a newer run.
     if (recent.length >= RECENT_LIMIT && startedAt < recent[recent.length - 1].startedAt) {
-      return approvalsChanged ? touched() : existing ?? base;
+      return sideChanged ? touched() : existing ?? base;
     }
     recent.push({
       runId: event.runId,

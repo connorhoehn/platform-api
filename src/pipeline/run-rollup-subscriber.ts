@@ -208,6 +208,11 @@ export class RunRollupSubscriber {
     return true;
   }
 
+  /** The pipeline a run belongs to: this process's index first, then the run table. */
+  async resolvePipelineId(runId: string): Promise<string | null> {
+    return (await this.resolve(runId))?.pipelineId ?? null;
+  }
+
   private async resolve(runId: string): Promise<{ pipelineId: string; startedAt?: string } | null> {
     const known = this.runIndex.get(runId);
     if (known) return known;

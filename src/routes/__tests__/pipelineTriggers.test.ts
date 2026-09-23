@@ -23,6 +23,20 @@ jest.mock('../../repositories/PipelineRunRepository', () => ({
 }));
 jest.mock('../../lib/ddb-client', () => ({ getDynamoClient: () => ({}) }));
 
+// NFR #115: the approvals POST consults the rollup subscriber (pipelineId
+// for a run this process never saw), the rollup row (is the gate on it) and
+// the forwarder (does this replica hold the gate). Each is a seam here.
+const mockResolvePipelineId = jest.fn(async (_runId: string): Promise<string | null> => null);
+const mockLookupPipelineIdByRunId = jest.fn(async (_runId: string): Promise<string | null> => null);
+jest.mock('../../pipeline/run-rollup-subscriber', () => ({
+  getRunRollupSubscriber: () => ({ resolvePipelineId: mockResolvePipelineId }),
+  lookupPipelineIdByRunId: (runId: string) => mockLookupPipelineIdByRunId(runId),
+}));
+const mockRollupGet = jest.fn(async (_pipelineId: string): Promise<unknown> => null);
+jest.mock('../../repositories/PipelineRunRollupRepository', () => ({
+  pipelineRunRollupRepo: { get: (pipelineId: string) => mockRollupGet(pipelineId), listWithOpenApprovals: async () => [] },
+}));
+
 // The run-detail GET overlays per-step `attempts` from the persistence
 // service, and the trigger POST registers the trigger on it. Those are the
 // only two methods the routes under test call; `getRunPersistenceService` is
@@ -47,6 +61,7 @@ jest.mock('../../lib/aws-clients', () => ({
 }));
 
 import { errorHandler } from '../../middleware/error-handler';
+import { setApprovalForwarder, type ApprovalForwarder } from '../../pipeline/approval-forwarder';
 import {
   pipelineTriggersRouter,
   pipelineApprovalsRouter,
@@ -526,6 +541,105 @@ describe('POST /pipelines/:runId/approvals (resolveApproval)', () => {
       error: 'downstream bus unavailable',
       action: 'resolveApproval',
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/pipelines/:runId/approvals — NFR #115: a gate held elsewhere
+// ---------------------------------------------------------------------------
+
+describe('POST /pipelines/:runId/approvals — gate held by another replica (NFR #115)', () => {
+  const forward = jest.fn(async (d: { decisionId: string }) => ({ ...d, v: 1, fromNodeId: 'node-b' }));
+  const holdsGate = jest.fn((_runId: string, _stepId: string) => false);
+  const resolveApproval = jest.fn(async () => {});
+
+  beforeEach(() => {
+    forward.mockClear();
+    holdsGate.mockReset();
+    holdsGate.mockReturnValue(false);
+    resolveApproval.mockClear();
+    mockRunRepoGet.mockReset();
+    mockRollupGet.mockReset();
+    mockRollupGet.mockResolvedValue(null);
+    mockResolvePipelineId.mockReset();
+    mockResolvePipelineId.mockResolvedValue('deck-revise');
+    setApprovalForwarder({ forward, holdsGate } as unknown as ApprovalForwarder);
+    setPipelineBridge({ getRun: async () => null, getHistory: async () => [], resolveApproval });
+  });
+  afterEach(() => setApprovalForwarder(null));
+
+  const liveRow = { pipelineId: 'deck-revise', runId: 'run-1', status: 'running', ownerNodeId: 'node-a', triggeredBy: 'alice', triggerType: 'manual', startedAt: '2026-09-23T16:00:00.000Z' };
+
+  test('202 with the decision id: the decision is forwarded, the local bridge is never asked', async () => {
+    mockRunRepoGet.mockResolvedValue(liveRow);
+    mockRollupGet.mockResolvedValue({ pipelineId: 'deck-revise', recent: [{ runId: 'run-1' }], approvals: [{ runId: 'run-1', stepId: 'gate', at: '2026-09-23T16:00:01.000Z' }] });
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/approvals', {
+      body: { stepId: 'gate', decision: 'approve', comment: 'ship' },
+      userId: 'alice',
+      headers: { 'Idempotency-Key': 'key-1' },
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ decisionId: 'key-1', runId: 'run-1', stepId: 'gate', decision: 'approve', pipelineId: 'deck-revise', ownerNodeId: 'node-a', forwarded: true });
+    expect(forward).toHaveBeenCalledWith(expect.objectContaining({ decisionId: 'key-1', pipelineId: 'deck-revise', runId: 'run-1', stepId: 'gate', userId: 'alice', decision: 'approve', comment: 'ship' }));
+    expect(resolveApproval).not.toHaveBeenCalled();
+  });
+
+  test('202 mints a decision id when the request carries no Idempotency-Key', async () => {
+    mockRunRepoGet.mockResolvedValue(liveRow);
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/approvals', { body: { stepId: 'gate', decision: 'reject' } });
+    expect(res.statusCode).toBe(202);
+    expect(typeof (res.body as { decisionId: string }).decisionId).toBe('string');
+    expect((res.body as { decisionId: string }).decisionId.length).toBeGreaterThan(20);
+  });
+
+  test('204 and the local bridge when this replica holds the gate', async () => {
+    holdsGate.mockReturnValue(true);
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/approvals', { body: { stepId: 'gate', decision: 'approve' }, userId: 'alice' });
+    expect(res.statusCode).toBe(204);
+    expect(resolveApproval).toHaveBeenCalledWith('run-1', 'gate', 'alice', 'approve', undefined);
+    expect(forward).not.toHaveBeenCalled();
+  });
+
+  test('404 run-not-found when no replica and no run row knows the run — never a silent 204', async () => {
+    mockResolvePipelineId.mockResolvedValue(null);
+    const res = await run(buildApp(), 'POST', '/pipelines/run-x/approvals', { body: { stepId: 'gate', decision: 'approve' } });
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toMatchObject({ error: 'run-not-found' });
+    expect(forward).not.toHaveBeenCalled();
+    expect(resolveApproval).not.toHaveBeenCalled();
+  });
+
+  test('409 run-not-awaiting-approval when the run row is terminal', async () => {
+    mockRunRepoGet.mockResolvedValue({ ...liveRow, status: 'completed' });
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/approvals', { body: { stepId: 'gate', decision: 'approve' } });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ error: 'run-not-awaiting-approval', status: 'completed' });
+    expect(forward).not.toHaveBeenCalled();
+  });
+
+  test('409 gate-not-pending when the rollup row knows the run but holds no such gate', async () => {
+    mockRunRepoGet.mockResolvedValue(liveRow);
+    mockRollupGet.mockResolvedValue({ pipelineId: 'deck-revise', recent: [{ runId: 'run-1' }], approvals: [] });
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/approvals', { body: { stepId: 'other-step', decision: 'approve' } });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ error: 'gate-not-pending' });
+    expect(forward).not.toHaveBeenCalled();
+  });
+
+  test('202 for an interrupted run (owner dead): the decision waits on the row for the resume', async () => {
+    mockRunRepoGet.mockResolvedValue({ ...liveRow, status: 'interrupted' });
+    mockRollupGet.mockResolvedValue({ pipelineId: 'deck-revise', recent: [{ runId: 'run-1' }], approvals: [] });
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/approvals', { body: { stepId: 'gate', decision: 'approve' } });
+    expect(res.statusCode).toBe(202);
+    expect(forward).toHaveBeenCalledTimes(1);
+  });
+
+  test('503 approval-forwarding-unavailable when neither the row nor the wire took the decision', async () => {
+    mockRunRepoGet.mockResolvedValue(liveRow);
+    forward.mockRejectedValueOnce(new Error('redis down'));
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/approvals', { body: { stepId: 'gate', decision: 'approve' }, headers: { 'Idempotency-Key': 'key-2' } });
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toMatchObject({ error: 'approval-forwarding-unavailable', decisionId: 'key-2' });
   });
 });
 

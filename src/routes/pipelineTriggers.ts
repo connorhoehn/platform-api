@@ -15,6 +15,10 @@ import {
 import { classifyPipelineError, type ErrorCategory } from '../pipeline/error-classification';
 import { auditRepo, type AuditAction, type AuditDecision } from '../pipeline/audit-repository';
 import { getPipelineBridge, type PendingApprovalRow } from '../pipeline/bridge-types';
+import { getApprovalForwarder } from '../pipeline/approval-forwarder';
+import { getRunRollupSubscriber, lookupPipelineIdByRunId } from '../pipeline/run-rollup-subscriber';
+import { isLiveRollupStatus, isTerminalRollupStatus, normalizeRunStatus as normalizeRollupStatus } from '../pipeline/run-rollup';
+import { pipelineRunRollupRepo } from '../repositories/PipelineRunRollupRepository';
 import type { InlinePipelineDefinition } from '../pipeline/http/contracts';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { pinRequester } from '../pipeline/pinRequester';
@@ -24,7 +28,7 @@ import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { getLiveCaptionsProgress } from '../recordings/liveCaptions';
 import { stubRunStore } from '../pipeline/stub-run-store';
 import { runItemToSnapshot } from '../pipeline/createBridge';
-import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
+import { PipelineRunRepository, type PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { getDynamoClient } from '../lib/ddb-client';
 import { pipelineRunReviewRouter } from './pipelineRunReview';
 import { workSourceAccountRepo } from '../repositories';
@@ -887,30 +891,39 @@ pipelinePendingApprovalsRouter.get(
       });
 
       const bridge = getPipelineBridge();
-      if (!bridge || !bridge.getPendingApprovals) {
-        res.json({ approvals: [] });
-        return;
+
+      // This replica's own executors: full fidelity for the runs owned here.
+      let localRows: PendingApprovalRow[] = [];
+      if (bridge?.getPendingApprovals) {
+        try {
+          localRows = await withSpan(
+            'pipeline.getPendingApprovals',
+            { 'pipeline.user_id': userId },
+            async () => Promise.resolve(bridge.getPendingApprovals!()),
+          );
+        } catch (err) {
+          respondBridgeError({
+            res: res as unknown as {
+              status(code: number): { json(body: BridgeErrorBody): unknown };
+            },
+            reqLog,
+            err,
+            action: 'getPendingApprovals',
+            auditAction: 'pipeline.approve',
+            actorUserId: userId,
+            pipelineId: '*',
+          });
+          return;
+        }
       }
 
-      let rows: PendingApprovalRow[];
-      try {
-        rows = await withSpan(
-          'pipeline.getPendingApprovals',
-          { 'pipeline.user_id': userId },
-          async () => Promise.resolve(bridge!.getPendingApprovals!()),
-        );
-      } catch (err) {
-        respondBridgeError({
-          res: res as unknown as {
-            status(code: number): { json(body: BridgeErrorBody): unknown };
-          },
-          reqLog,
-          err,
-          action: 'getPendingApprovals',
-          auditAction: 'pipeline.approve',
-          actorUserId: userId,
-          pipelineId: '*',
-        });
+      // NFR #115: the shared source. Every gate on every rollup row — the
+      // runs the other replica owns — joined with the local queue, so both
+      // replicas answer the same list (and the badge). Rows for runs owned
+      // elsewhere are built from the run table.
+      const { rows, remoteRuns } = await withSharedApprovals(localRows, reqLog);
+      if (rows.length === 0) {
+        res.json({ approvals: [] });
         return;
       }
 
@@ -927,10 +940,17 @@ pipelinePendingApprovalsRouter.get(
       // the approval card has the upstream LLM response inline. De-dupe by
       // runId so a single queue read doing the rare N approvals on N
       // distinct runs only does N getRun calls (and fan-in approvals on the
-      // same runId only do 1).
+      // same runId only do 1). A run owned elsewhere is read off its row.
       const approvals: PendingApprovalRowWithContext[] = await enrichWithRunContext(
         filtered,
-        bridge,
+        {
+          getRun: async (runId) => {
+            const local = bridge ? await Promise.resolve(bridge.getRun(runId)) : null;
+            if (local) return local;
+            const item = remoteRuns.get(runId);
+            return item ? remoteRunSnapshot(item) : null;
+          },
+        },
         reqLog,
       );
 
@@ -938,6 +958,79 @@ pipelinePendingApprovalsRouter.get(
     },
   ),
 );
+
+/** The rollup rows' gates joined with this replica's queue, keyed (runId, stepId). */
+async function withSharedApprovals(
+  localRows: PendingApprovalRow[],
+  reqLog: { warn: (obj: Record<string, unknown>, msg: string) => void },
+): Promise<{ rows: PendingApprovalRow[]; remoteRuns: Map<string, PipelineRunItem> }> {
+  const remoteRuns = new Map<string, PipelineRunItem>();
+  // No rollup subscriber → no rollup rows in this process (tests, rollups
+  // disabled): the local queue is all there is.
+  if (!getRunRollupSubscriber()) return { rows: localRows, remoteRuns };
+  let rollups;
+  try {
+    rollups = await pipelineRunRollupRepo.listWithOpenApprovals();
+  } catch (err) {
+    reqLog.warn({ err: err instanceof Error ? err.message : String(err) }, 'rollup rows unavailable; approvals list is this replica\'s queue only');
+    return { rows: localRows, remoteRuns };
+  }
+  const key = (runId: string, stepId: string) => `${runId}\u0000${stepId}`;
+  const have = new Set(localRows.map((r) => key(r.runId, r.stepId)));
+  const rows = [...localRows];
+  for (const rollup of rollups) {
+    for (const gate of rollup.approvals ?? []) {
+      if (have.has(key(gate.runId, gate.stepId))) continue;
+      let item = remoteRuns.get(gate.runId) ?? null;
+      if (!item) {
+        try {
+          item = await getRunRepo().get(rollup.pipelineId, gate.runId);
+        } catch (err) {
+          reqLog.warn({ runId: gate.runId, err: err instanceof Error ? err.message : String(err) }, 'run row unavailable; gate listed without approvers');
+        }
+        if (item) remoteRuns.set(gate.runId, item);
+      }
+      const node = item ? approvalNodeOf(item.definitionSnapshot, gate.stepId) : null;
+      have.add(key(gate.runId, gate.stepId));
+      rows.push({
+        runId: gate.runId,
+        stepId: gate.stepId,
+        pipelineId: rollup.pipelineId,
+        approvers: node?.approvers ?? [],
+        ...(node?.message ? { message: node.message } : {}),
+        requestedAt: gate.at,
+      });
+    }
+  }
+  return { rows, remoteRuns };
+}
+
+interface ApprovalNodeView {
+  approvers: PendingApprovalRow['approvers'];
+  message?: string;
+}
+
+/** The approval node's data off a run's definition snapshot, or null. */
+function approvalNodeOf(definition: unknown, stepId: string): ApprovalNodeView | null {
+  const nodes = (definition as { nodes?: Array<{ id?: unknown; data?: unknown }> } | undefined)?.nodes;
+  if (!Array.isArray(nodes)) return null;
+  const node = nodes.find((n) => n && n.id === stepId);
+  const data = (node?.data ?? null) as { approvers?: unknown; message?: unknown } | null;
+  if (!data) return null;
+  return {
+    approvers: Array.isArray(data.approvers) ? (data.approvers as PendingApprovalRow['approvers']) : [],
+    ...(typeof data.message === 'string' ? { message: data.message } : {}),
+  };
+}
+
+/** A run owned by another replica, shaped like the executor's snapshot for the enrichment pass. */
+function remoteRunSnapshot(item: PipelineRunItem): Record<string, unknown> {
+  return {
+    ...runItemToSnapshot(item),
+    ...(item.definitionSnapshot !== undefined ? { pipelineDefinitionSnapshot: item.definitionSnapshot } : {}),
+    ...(item.checkpoint?.context !== undefined ? { context: item.checkpoint.context } : {}),
+  };
+}
 
 /** What one `getRun` yields for the queue-enrichment pass. */
 interface ApprovalRunSnapshotView {
@@ -966,7 +1059,7 @@ interface ApprovalRunSnapshotView {
  */
 async function enrichWithRunContext(
   rows: PendingApprovalRow[],
-  bridge: NonNullable<ReturnType<typeof getPipelineBridge>>,
+  bridge: { getRun(runId: string): Promise<unknown> | unknown },
   reqLog: { warn: (obj: Record<string, unknown>, msg: string) => void },
 ): Promise<PendingApprovalRowWithContext[]> {
   if (rows.length === 0) return [];
@@ -1121,6 +1214,89 @@ pipelineApprovalsRouter.post(
           'getRun for approval audit-context lookup failed; continuing',
         );
       }
+    }
+
+    // NFR #115: a gate this replica's executor does not hold belongs to the
+    // run's owner (or to nobody, when the owner died). Before this the call
+    // fell through to `bridge.resolveApproval`, a silent no-op for a run the
+    // executor never saw, and answered 204. Now the decision is recorded on
+    // the rollup row and forwarded over the cluster pubsub, and the answer
+    // is 202 with the decision id — or 404 / 409 / 503 with a reason.
+    const forwarder = getApprovalForwarder();
+    if (forwarder && !forwarder.holdsGate(runId, body.stepId)) {
+      const pipelineId =
+        pipelineIdForAudit !== '*'
+          ? pipelineIdForAudit
+          : (await getRunRollupSubscriber()?.resolvePipelineId(runId)) ?? (await lookupPipelineIdByRunId(runId));
+      const item = pipelineId ? await getRunRepo().get(pipelineId, runId).catch((err: unknown) => {
+        reqLog.warn({ runId, err: err instanceof Error ? err.message : String(err) }, 'run row read failed for a forwarded approval');
+        return null;
+      }) : null;
+      if (!pipelineId || !item) {
+        res.status(404).json({ error: 'run-not-found', message: `run ${runId} is not on this replica and has no row in the run table` });
+        return;
+      }
+      const runStatus = normalizeRollupStatus(item.status) ?? 'running';
+      if (isTerminalRollupStatus(runStatus)) {
+        res.status(409).json({ error: 'run-not-awaiting-approval', status: runStatus, message: `run ${runId} is ${runStatus}; there is no gate to resolve` });
+        return;
+      }
+      // The gate must be on the row when the row knows the run. A live run
+      // whose gate has not reached the row yet (or one older than the row
+      // keeps) is accepted: the owner applies it when the gate is requested.
+      let rollup = null;
+      try { rollup = await pipelineRunRollupRepo.get(pipelineId); } catch (err) {
+        reqLog.warn({ runId, err: err instanceof Error ? err.message : String(err) }, 'rollup row read failed for a forwarded approval; gate not verified');
+      }
+      const onRow = rollup?.recent.some((r) => r.runId === runId) ?? false;
+      const gateOnRow = rollup?.approvals?.some((a) => a.runId === runId && a.stepId === body.stepId) ?? false;
+      if (onRow && !gateOnRow && isLiveRollupStatus(runStatus)) {
+        res.status(409).json({ error: 'gate-not-pending', status: runStatus, message: `run ${runId} has no approval gate waiting on step ${body.stepId}` });
+        return;
+      }
+      // Authorization, from the run's own definition snapshot (the same rule
+      // the local path applies from the executor's queue).
+      if (process.env.SKIP_AUTH !== 'true') {
+        const node = approvalNodeOf(item.definitionSnapshot, body.stepId);
+        const userApprovers = (node?.approvers ?? []).filter((a) => a.type === 'user');
+        if (userApprovers.length > 0 && !userApprovers.some((a) => a.value === userId || a.userId === userId)) {
+          reqLog.warn({ runId, stepId: body.stepId, action: 'approval.authz.denied' }, 'user not in approvers list — 403');
+          res.status(403).json({ error: 'not authorized to resolve this approval step' });
+          return;
+        }
+      }
+      const headerKey = req.get('Idempotency-Key');
+      const decisionId = headerKey && headerKey.length <= 200 ? headerKey : randomUUID();
+      const at = new Date().toISOString();
+      try {
+        await withSpan(
+          'pipeline.forwardApproval',
+          { 'pipeline.run_id': runId, 'pipeline.step_id': body.stepId, 'pipeline.decision': body.decision },
+          async () => forwarder.forward({
+            decisionId, pipelineId, runId, stepId: body.stepId, userId, decision: body.decision,
+            ...(body.comment !== undefined ? { comment: body.comment } : {}), at,
+          }),
+        );
+      } catch (err) {
+        reqLog.error({ runId, stepId: body.stepId, decisionId, err: err instanceof Error ? err.message : String(err) }, 'approval decision could not be forwarded');
+        res.status(503).json({ error: 'approval-forwarding-unavailable', decisionId, message: 'the decision reached neither the rollup row nor the cluster pubsub; retry with the same Idempotency-Key' });
+        return;
+      }
+      recordPipelineApproval();
+      fireAndForgetAudit({
+        action: body.decision === 'approve' ? 'pipeline.approve' : 'pipeline.reject',
+        actorUserId: userId,
+        pipelineId,
+        runId,
+        decision: body.decision === 'approve' ? 'approved' : 'rejected',
+        details: { stepId: body.stepId, forwarded: true, decisionId, ownerNodeId: item.ownerNodeId ?? null, ...(body.comment ? { comment: body.comment } : {}) },
+      });
+      reqLog.info({ runId, stepId: body.stepId, decision: body.decision, decisionId, ownerNodeId: item.ownerNodeId ?? null, action: 'approval.forwarded' }, 'approval decision forwarded to the run owner');
+      res.status(202).json({
+        decisionId, runId, stepId: body.stepId, decision: body.decision, pipelineId,
+        ownerNodeId: item.ownerNodeId ?? null, forwarded: true,
+      });
+      return;
     }
 
     // Authorization: if bridge exposes getPendingApprovals, verify the

@@ -325,6 +325,20 @@ describe('GET /observability/dashboard', () => {
     expect(body.nodes).toHaveLength(3);
     expect(body.alerts).toEqual([]);
   });
+
+  test('`?include=pendingApprovals` is ignored: still 200 with the same stub body (the list lives at GET /pipelines/approvals)', async () => {
+    // The pending-approvals hook labels its console error with this URL while
+    // fetching /api/pipelines/approvals; this route never answers anything but
+    // the stub, so a 500 seen under that label is the other route (or the
+    // dev proxy while the pod restarts), never this one.
+    const app = buildApp();
+    const res = await run(app, 'GET', '/observability/dashboard?include=pendingApprovals');
+    expect(res.statusCode).toBe(200);
+    const body = res.body as ReturnType<typeof getObservabilityDashboardStub> & { pendingApprovals?: unknown };
+    expect(body.cluster.healthy).toBe(3);
+    expect(body.pipelines.awaitingApproval).toEqual(expect.any(Number));
+    expect(body.pendingApprovals).toBeUndefined();
+  });
 });
 
 describe('GET /observability/metrics', () => {
