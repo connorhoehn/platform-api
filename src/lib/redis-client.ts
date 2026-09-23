@@ -13,6 +13,11 @@ import { createClient, RedisClientType } from 'redis';
 import log from './logger';
 
 const REDIS_URL = `redis://${process.env.REDIS_ENDPOINT ?? 'redis'}:${process.env.REDIS_PORT ?? '6379'}`;
+
+/** The Redis the shared client talks to — what the gateway's relays listen on. */
+export function sharedRedisUrl(): string {
+  return REDIS_URL;
+}
 const RETRY_INTERVAL_MS = 5_000;
 
 let client: RedisClientType | null = null;

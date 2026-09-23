@@ -367,18 +367,30 @@ export class RunPersistenceService {
     log.info('run persistence service stopped');
   }
 
-  /** Bounded memory of handled BusEvent ids (NFR #34 at-least-once dedupe). */
-  private readonly seenEventIds = new Set<string>();
+  /** Bounded memory of handled BusEvent ids → when first seen (NFR #34 at-least-once dedupe). */
+  private readonly seenEventIds = new Map<string, number>();
   private static readonly SEEN_EVENT_CAP = 10_000;
+  /** How many deliveries the dedupe dropped — should stay 0 (NFR #38). */
+  duplicateDeliveries = 0;
 
-  private seenEvent(event: { id?: unknown } | null | undefined): boolean {
+  private seenEvent(event: { id?: unknown; type?: unknown } | null | undefined): boolean {
     const id = event && typeof event.id === 'string' ? event.id : '';
     if (!id) return false;
-    if (this.seenEventIds.has(id)) return true;
-    this.seenEventIds.add(id);
+    const first = this.seenEventIds.get(id);
+    if (first !== undefined) {
+      this.duplicateDeliveries += 1;
+      // Said out loud (sampled): a duplicate here means some path delivers a
+      // bus event twice, which is a defect to find, not just to absorb.
+      if (this.duplicateDeliveries <= 20 || this.duplicateDeliveries % 100 === 0) {
+        log.warn({ type: event?.type, eventId: id, sinceFirstMs: Date.now() - first, total: this.duplicateDeliveries },
+          'run persistence: a bus event was delivered twice; dropped');
+      }
+      return true;
+    }
+    this.seenEventIds.set(id, Date.now());
     if (this.seenEventIds.size > RunPersistenceService.SEEN_EVENT_CAP) {
-      // Sets iterate in insertion order: drop the oldest.
-      const oldest = this.seenEventIds.values().next().value;
+      // Maps iterate in insertion order: drop the oldest.
+      const oldest = this.seenEventIds.keys().next().value;
       if (oldest !== undefined) this.seenEventIds.delete(oldest);
     }
     return false;

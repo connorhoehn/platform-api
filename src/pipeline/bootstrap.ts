@@ -143,9 +143,11 @@ import { runWalPreflight } from './WalPreflight';
 import { createShutdown } from './ShutdownOrchestrator';
 import {
   startPipelineEventRedisRelay,
+  sameRedisTarget,
   type PipelineEventRedisRelay,
 } from './event-redis-relay';
 import log, { withContext } from '../lib/logger';
+import { sharedRedisUrl } from '../lib/redis-client';
 import { publishDurable, catalog } from '../lib/event-catalog';
 import { createValidatingPublisher } from '@connorhoehn/event-catalog';
 
@@ -900,7 +902,13 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // no egress of any kind. See event-redis-relay.ts for the wire contract.
   let pipelineEventRelay: PipelineEventRedisRelay | null = null;
   try {
-    pipelineEventRelay = await startPipelineEventRedisRelay({ eventBus });
+    // NFR #38: with Redis pubsub the bus's own channel
+    // (`dcore:topic:pipeline.events.<nodeId>`) already matches the gateway's
+    // pattern, so the relay would be a second copy of every event.
+    pipelineEventRelay = await startPipelineEventRedisRelay({
+      eventBus,
+      busReachesGateway: pubsubMode === 'redis' && sameRedisTarget(redisUrl, sharedRedisUrl()),
+    });
   } catch (err) {
     // startPipelineEventRedisRelay swallows its own failures; this is a belt-
     // and-braces guard so a relay problem can never abort pipeline bootstrap.

@@ -51,6 +51,27 @@ interface StartOpts {
     subscribeAll(handler: (event: BusEvent) => Promise<void>): string;
     unsubscribe(subscriptionId: string): void;
   };
+  /**
+   * The EventBus's own transport already publishes every BusEvent on a
+   * channel the gateway's pattern matches: Redis pubsub, topic
+   * `pipeline.events.<nodeId>` → `dcore:topic:pipeline.events.<nodeId>`, on
+   * the same Redis. Relaying as well delivered every event to the gateway
+   * twice (NFR #38), so the relay stands down. `PIPELINE_EVENT_RELAY=1`
+   * forces it on anyway.
+   */
+  busReachesGateway?: boolean;
+}
+
+/** Same Redis server? Compares host and port only (auth/db do not change which PUBLISH the gateway hears). */
+export function sameRedisTarget(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    return left.hostname === right.hostname && (left.port || '6379') === (right.port || '6379');
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -68,10 +89,17 @@ export function channelForType(type: string): string {
  * be wired at all, so the caller can treat "no relay" as a normal state.
  */
 export async function startPipelineEventRedisRelay(
-  { eventBus }: StartOpts,
+  { eventBus, busReachesGateway = false }: StartOpts,
 ): Promise<PipelineEventRedisRelay | null> {
   if (process.env.PIPELINE_EVENT_RELAY === '0') {
     relayLog.info('pipeline event Redis relay DISABLED (PIPELINE_EVENT_RELAY=0)');
+    return null;
+  }
+  if (busReachesGateway && process.env.PIPELINE_EVENT_RELAY !== '1') {
+    relayLog.info(
+      `pipeline event Redis relay not started: the EventBus already publishes to ${CHANNEL_PREFIX}<nodeId> on the gateway's Redis, `
+      + 'and relaying too delivered every event twice (NFR #38). PIPELINE_EVENT_RELAY=1 forces it on.',
+    );
     return null;
   }
 
