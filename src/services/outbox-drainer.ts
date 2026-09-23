@@ -2,7 +2,7 @@ import { QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { randomUUID } from 'crypto';
 import { hostname } from 'os';
 import { LeasedKVLock } from 'distributed-core';
-import { docClient } from '../lib/aws-clients';
+import { ddbClient, docClient } from '../lib/aws-clients';
 import { catalog } from '../lib/event-catalog';
 import { tableName } from '../lib/ddb-table-name';
 import { createDDBLeaseStore } from '../lib/ddb-lease-store';
@@ -11,6 +11,7 @@ import {
   PENDING_INDEX,
   PENDING_SHARDS,
   isPendingIndexUnavailable,
+  pendingIndexActive,
   pendingShardFor,
 } from '../lib/outbox-pending';
 import log from '../lib/logger';
@@ -31,6 +32,8 @@ const TERMINAL_TTL_SECONDS = 24 * 60 * 60;
 const SCAN_PAGE_SIZE = 200;
 /** A cap so one poll cycle cannot walk an arbitrarily large table. */
 const MAX_SCAN_PAGES = 20;
+/** How often, while pending-index is not ACTIVE, to ask whether it is. */
+const INDEX_RECHECK_MS = 15_000;
 
 const OWNER_ID = `${process.pid}@${hostname()}-${randomUUID()}`;
 
@@ -104,7 +107,8 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
   let adoptCursor: Record<string, unknown> | undefined;
   let strayCount = 0;
   let adoptionDone = false;
-  let indexUnavailableLogged = false;
+  let indexActive = false;
+  let indexCheckedAt = 0;
 
   async function poll(): Promise<void> {
     if (running || stopping) return;
@@ -184,20 +188,23 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
    * still backfilling.
    */
   async function findPending(lock: LeasedKVLock): Promise<OutboxRow[]> {
+    // Until the index is ACTIVE (created at boot, then backfilled) a Query
+    // fails — and DynamoDB Local answers it with a bare InternalFailure —
+    // so ask the table, at most every INDEX_RECHECK_MS, and walk meanwhile.
+    if (!indexActive && Date.now() - indexCheckedAt >= INDEX_RECHECK_MS) {
+      indexCheckedAt = Date.now();
+      indexActive = await pendingIndexActive(ddbClient, OUTBOX_TABLE);
+      if (indexActive) log.info({}, 'outbox-drainer: pending-index ACTIVE — table walk off');
+      else log.warn({}, 'outbox-drainer: pending-index not ACTIVE yet — walking the table');
+    }
+    if (!indexActive) return scanPending(lock);
     let rows: OutboxRow[];
     try {
       rows = await queryPendingIndex();
     } catch (err: unknown) {
       if (!isPendingIndexUnavailable(err)) throw err;
-      if (!indexUnavailableLogged) {
-        indexUnavailableLogged = true;
-        log.warn({}, 'outbox-drainer: pending-index unavailable — walking the table');
-      }
+      indexActive = false;
       return scanPending(lock);
-    }
-    if (indexUnavailableLogged) {
-      indexUnavailableLogged = false;
-      log.info({}, 'outbox-drainer: pending-index available — table walk off');
     }
     if (rows.length < batchSize && !adoptionDone) await adoptStrays(lock);
     return rows;

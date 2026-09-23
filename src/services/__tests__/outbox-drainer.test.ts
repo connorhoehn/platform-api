@@ -23,6 +23,7 @@ import {
 
 const mockSend = jest.fn();
 jest.mock('../../lib/aws-clients', () => ({
+  ddbClient: { send: async () => ({ Table: { GlobalSecondaryIndexes: [{ IndexName: 'pending-index', IndexStatus: 'ACTIVE' }] } }) },
   docClient: { send: (...args: unknown[]) => mockSend(...args) },
 }));
 jest.mock('../../lib/ddb-table-name', () => ({

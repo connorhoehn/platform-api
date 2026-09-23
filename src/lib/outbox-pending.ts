@@ -43,6 +43,17 @@ export function isPendingIndexUnavailable(err: unknown): boolean {
   return e?.name === 'ValidationException' && /index/i.test(e?.message ?? '');
 }
 
+/** Whether `pending-index` exists and is ACTIVE (backfill finished). */
+export async function pendingIndexActive(client: DynamoDBClient, table: string): Promise<boolean> {
+  try {
+    const desc = await client.send(new DescribeTableCommand({ TableName: table }));
+    const index = (desc.Table?.GlobalSecondaryIndexes ?? []).find((g) => g.IndexName === PENDING_INDEX);
+    return index?.IndexStatus === 'ACTIVE';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Add `pending-index` to an existing outbox table if it is not there. One
  * UpdateTable (additive; DynamoDB backfills it online). Never drops or

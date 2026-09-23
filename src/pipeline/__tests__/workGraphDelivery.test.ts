@@ -22,6 +22,7 @@ const mockReads = { scanned: 0, queried: 0, scanEnds: 0 };
 
 jest.mock('../../lib/ddb-table-name', () => ({ tableName: (base: string) => base }));
 jest.mock('../../lib/aws-clients', () => ({
+  ddbClient: { send: async () => ({ Table: { GlobalSecondaryIndexes: [{ IndexName: 'pending-index', IndexStatus: 'ACTIVE' }] } }) },
   docClient: {
     send: async (cmd: { constructor: { name: string }; input: Record<string, any> }) => {
       const input = cmd.input;
