@@ -21,6 +21,7 @@ import { tableName } from '../lib/ddb-table-name';
 import { WorkGraphRepository, type WorkSourceKind } from '../repositories/WorkGraphRepository';
 import { authorizationEntityDigest, revisionExplainedByAdditions } from './authorizationRevision';
 import { publishProjectionChangedSignal } from '../services/work-graph-outbox-drainer';
+import { withAccessChangedSignal } from '../services/work-graph-access-signal';
 import { WorkSharingRepository, type SharingAudience } from '../repositories/WorkSharingRepository';
 import {
   WorkCollaborationRepository,
@@ -880,7 +881,8 @@ function cursorSecret(): string {
 
 export const workGraphOrchestrator = new WorkGraphOrchestrator({
   graph: graphRepository,
-  sharing: sharingRepository,
+  // NFR #21: every committed grant write signals the gateways (this replica commits, this replica publishes).
+  sharing: withAccessChangedSignal(sharingRepository),
   collaboration: collaborationRepository,
   directory,
   locator: { locate: (organizationId, target) => graphRepository.locateTarget(organizationId, target) },
