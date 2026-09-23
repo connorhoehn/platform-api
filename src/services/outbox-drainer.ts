@@ -15,6 +15,7 @@ import {
   pendingShardFor,
 } from '../lib/outbox-pending';
 import log from '../lib/logger';
+import { localTtlSweepEnabled, sweepExpiredProcessedRows } from '../lib/localTtlSweep';
 import {
   recordOutboxLeaseAcquired,
   recordOutboxOldestPendingSeconds,
@@ -34,6 +35,9 @@ const SCAN_PAGE_SIZE = 200;
 const MAX_SCAN_PAGES = 20;
 /** How often, while pending-index is not ACTIVE, to ask whether it is. */
 const INDEX_RECHECK_MS = 15_000;
+
+/** Dev-only TTL stand-in cadence (DynamoDB Local never expires rows; NFR #73). */
+const LOCAL_TTL_SWEEP_EVERY_MS = 10 * 60_000;
 
 const OWNER_ID = `${process.pid}@${hostname()}-${randomUUID()}`;
 
@@ -493,11 +497,41 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
     void poll();
   }, pollIntervalMs);
 
+  // Dev only: reap PROCESSED rows past their ttl, as AWS's TTL would. On its
+  // own timer, NOT inside poll(): the first live pass took 10.8 s for 2,000
+  // deletes, and inside the drain cycle that would have held every pending
+  // event back as long. No lease — each delete re-checks status + ttl in its
+  // condition, so two replicas sweeping at once only report `skipped`.
+  let sweepTimer: ReturnType<typeof setInterval> | null = null;
+  if (localTtlSweepEnabled()) {
+    let sweeping = false;
+    const sweep = async (): Promise<void> => {
+      if (sweeping || stopping) return;
+      sweeping = true;
+      const startedAt = Date.now();
+      try {
+        const swept = await sweepExpiredProcessedRows({ docClient, tableName: OUTBOX_TABLE, keyAttr: 'outboxId' });
+        log.info({ table: OUTBOX_TABLE, ...swept, ms: Date.now() - startedAt }, 'outbox-drainer: local TTL sweep (expired PROCESSED rows deleted)');
+      } catch (err: unknown) {
+        log.warn({ errMessage: (err as { message?: string })?.message }, 'outbox-drainer: local TTL sweep failed');
+      } finally {
+        sweeping = false;
+      }
+    };
+    sweepTimer = setInterval(() => { void sweep(); }, LOCAL_TTL_SWEEP_EVERY_MS);
+    sweepTimer.unref?.();
+    setTimeout(() => { void sweep(); }, 60_000).unref?.();
+  }
+
   void poll();
 
   return {
     stop: () => {
       stopping = true;
+      if (sweepTimer) {
+        clearInterval(sweepTimer);
+        sweepTimer = null;
+      }
       if (timer) {
         clearInterval(timer);
         timer = null;
