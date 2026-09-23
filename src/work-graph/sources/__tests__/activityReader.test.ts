@@ -459,3 +459,15 @@ describe('what a composer edit did, from its own step outputs', () => {
     expect((await readerOf(other).pipelineRuns(['r2'])).get('r2')?.edit).toBeUndefined();
   });
 });
+
+describe('readableError — a stored failure as the pane shows it', () => {
+  it('drops a leading run id, however many times it was prefixed, and leaves the rest', () => {
+    const { readableError } = jest.requireActual('../activityReader') as typeof import('../activityReader');
+    expect(readableError('a10af720-facc-4643-9dae-d4046a5b8509: claude exited 1: Error: Input must be provided'))
+      .toBe('claude exited 1: Error: Input must be provided');
+    expect(readableError('A10AF720-FACC-4643-9DAE-D4046A5B8509:a76da4dd-f53d-45fa-bc80-831f46a17ac1 : boom')).toBe('boom');
+    expect(readableError('Deck not found: 6cdfcbaf-95f6-4205-933a-b0a98f497ea1')).toBe('Deck not found: 6cdfcbaf-95f6-4205-933a-b0a98f497ea1');
+    expect(readableError('a10af720-facc-4643-9dae-d4046a5b8509: ')).toBeUndefined();
+    expect(readableError(undefined)).toBeUndefined();
+  });
+});

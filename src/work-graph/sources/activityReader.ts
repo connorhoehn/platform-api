@@ -81,6 +81,18 @@ function text(value: unknown, limit: number): string | undefined {
   return trimmed.length <= limit ? trimmed : `${trimmed.slice(0, limit - 1)}…`;
 }
 
+/**
+ * A stored failure as a reader should see it. Older runs stored the agent
+ * runner's message with the run id in front ("a10af720-…: claude exited 1:
+ * …"); the id means nothing on a pane that already names the run, so it is
+ * stripped here, at read time — the stored row is left as it was.
+ */
+const LEADING_RUN_ID = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\s*:\s*)+/i;
+export function readableError(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  return text(value.trim().replace(LEADING_RUN_ID, ''), ERROR_SUMMARY_LENGTH);
+}
+
 function iso(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const parsed = Date.parse(value);
@@ -268,7 +280,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       tools: [...new Set(tools)],
       ...(running && text(running.stepId, 60) ? { runningStep: { stepId: text(running.stepId, 60) as string } } : {}),
       ...(agentLabel ? { agentLabel } : {}),
-      ...(text(row.error, ERROR_SUMMARY_LENGTH) ? { error: text(row.error, ERROR_SUMMARY_LENGTH) as string } : {}),
+      ...(readableError(row.error) ? { error: readableError(row.error) as string } : {}),
       ...(edit ? { edit } : {}),
     };
   }
@@ -329,7 +341,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       updatedAt: iso(summary.completedAt) ?? iso(row.lastEventAt) ?? startedAt,
       tools: [],
       step,
-      ...(text(summary.error, ERROR_SUMMARY_LENGTH) ? { error: text(summary.error, ERROR_SUMMARY_LENGTH) as string } : {}),
+      ...(readableError(summary.error) ? { error: readableError(summary.error) as string } : {}),
       ...(edit ? { edit } : {}),
     };
   }
