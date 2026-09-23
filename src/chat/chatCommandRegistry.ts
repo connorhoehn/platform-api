@@ -117,8 +117,13 @@ export interface ChatCommandPipeline {
   /** The definition to run. May vary per input (an approver, a model); the FIRST build also registers the system pipeline. */
   buildDefinition: (input: ChatCommandRunInput) => Record<string, unknown>;
   triggerPayload: (input: ChatCommandRunInput) => Record<string, unknown>;
-  /** Metadata for the chat card, merged with `{ kind: 'agent-run', command, instruction, runId, pipelineId }`. */
-  card?: (input: ChatCommandRunInput) => Record<string, unknown>;
+  /**
+   * Metadata for the chat card, merged with `{ kind: 'agent-run', command, instruction, runId, pipelineId }`.
+   * `run.runId` is THIS invocation's id (the one `start` returned, or the
+   * triggered run's) — the only key that tells two concurrent invocations by
+   * the same person apart, so anything `start` hands to `card` is keyed by it.
+   */
+  card?: (input: ChatCommandRunInput, run: { runId: string }) => Record<string, unknown>;
   /**
    * Post the card into the command's channel when the run starts. Default
    * true — an embedder's command gets its card for free. False means the
@@ -239,7 +244,7 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
       kind: 'agent-run', command: trigger, instruction: pendingInstruction,
       runId: started.runId, pipelineId: def.pipelineId,
       ...(input.documentId ? { documentId: input.documentId } : {}),
-      ...(def.card ? def.card(input) : {}),
+      ...(def.card ? def.card(input, { runId: started.runId }) : {}),
     };
     if (def.postCard !== false && input.clientPostsCard !== true) {
       const { kind: _k, command: _c, instruction: _i, runId: _r, pipelineId: _p, ...extra } = pendingCard;
@@ -327,7 +332,7 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
   const card: Record<string, unknown> = {
     kind: 'agent-run', command: trigger, instruction, runId, pipelineId: def.pipelineId,
     ...(input.documentId ? { documentId: input.documentId } : {}),
-    ...(def.card ? def.card(input) : {}),
+    ...(def.card ? def.card(input, { runId }) : {}),
   };
   // The client that posts the card itself gets the metadata and no duplicate from here.
   if (def.postCard !== false && input.clientPostsCard !== true) {

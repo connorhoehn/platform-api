@@ -243,8 +243,11 @@ export async function buildDeckPreviewCard(input: ChatCommandRunInput): Promise<
 /**
  * The preview a `--preview` run rendered, handed from `start` to `card` — the
  * registry calls them in that order for the same input, and this is the only
- * seam between them. Keyed by requester and taken out on read, so a preview is
- * never shown to a second person or a second time.
+ * seam between them. Keyed by the invocation's own `deck-preview:<uuid>` run id
+ * (the registry passes it to `card`) and taken out on read, so a preview is
+ * never shown to a second person, a second time, or on a concurrent preview by
+ * the same person. It used to be keyed by requester, and two previews started
+ * together could each answer with the other's deck.
  */
 const deckPreviewCards = new Map<string, Record<string, unknown>>();
 
@@ -436,8 +439,9 @@ export function registerBuiltinChatCommands(): void {
     start: async (input) => {
       if (!parseDeckCommand(input.argumentText ?? '').preview) return null;
       const card = await buildDeckPreviewCard(input);
-      deckPreviewCards.set(input.requestedBy, card);
-      return { runId: `deck-preview:${randomUUID()}` };
+      const runId = `deck-preview:${randomUUID()}`;
+      deckPreviewCards.set(runId, card);
+      return { runId };
     },
     buildDefinition: () => buildDeckGenerateDefinition(),
     triggerPayload: (input) => {
@@ -459,11 +463,11 @@ export function registerBuiltinChatCommands(): void {
     // The card names what the deck stands on, so the thread can see the sources
     // before the deck exists — and carries the rendered preview when the
     // command asked for one.
-    card: (input) => {
+    card: (input, run) => {
       const args = parseDeckCommand(input.argumentText ?? '');
       const sources = deckSourcesFromInput(input);
-      const preview = args.preview ? deckPreviewCards.get(input.requestedBy) : undefined;
-      if (preview) deckPreviewCards.delete(input.requestedBy);
+      const preview = args.preview && run ? deckPreviewCards.get(run.runId) : undefined;
+      if (preview) deckPreviewCards.delete(run.runId);
       const recordingId = deckRecordingId(input, args);
       return {
         title: ((str(input.extra?.title) ?? args.prompt) || input.argumentText.trim()).slice(0, 120),

@@ -72,7 +72,7 @@ describe('/deck', () => {
 
   it('names the sources on the card', () => {
     const command = getChatCommandPipeline('/deck')!;
-    const card = command.card!(input()) as Record<string, unknown>;
+    const card = command.card!(input(), { runId: 'run-1' }) as Record<string, unknown>;
     expect(card.sourceNames).toEqual(['Sprint review', 'Q4 roadmap']);
   });
 
@@ -252,6 +252,46 @@ describe('/deck --preview through runChatCommand (the real dispatch path, not ju
     expect((out.card as { thumbnail: { svg: string } }).thumbnail.svg.startsWith('<svg')).toBe(true);
     expect(postRunCardToChannel).not.toHaveBeenCalled();
   });
+
+  // Two previews by the same person at the same moment. The card used to be
+  // handed from `start` to `card` through a map keyed by requester, so the
+  // second preview's `start` could overwrite the first's entry before the
+  // first's `card` read it: each answer carried the OTHER deck. Both orders of
+  // completion are driven, since which one crossed depended on timing.
+  it.each(['first', 'second'] as const)(
+    'two concurrent previews by one person each get their own card (%s finishes first)',
+    async (firstDone) => {
+      const pending = new Map<string, () => void>();
+      buildDeckFixture.mockImplementation((from: { recordingId: string }) => new Promise((resolve) => {
+        pending.set(from.recordingId, () => resolve({
+          spec: { ...sampleDeck(), title: `Deck from ${from.recordingId}` },
+          source: 'model', material: {}, warnings: [], transcriptIds: [from.recordingId],
+        }));
+      }));
+      const run = (recordingId: string) => runChatCommand({
+        trigger: '/deck',
+        channel: 'chat:room:eng',
+        text: `/deck --from recording:${recordingId} --preview`,
+        argumentText: `--from recording:${recordingId} --preview`,
+        requestedBy: 'user-frank',
+        requestedByName: 'Frank',
+        extra: {},
+      } as ChatCommandRunInput);
+      const a = run('rec-first');
+      const b = run('rec-second');
+      await new Promise((resolve) => setImmediate(resolve));
+      const order = firstDone === 'first' ? ['rec-first', 'rec-second'] : ['rec-second', 'rec-first'];
+      for (const id of order) pending.get(id)!();
+      const [outA, outB] = await Promise.all([a, b]);
+      for (const [out, id] of [[outA, 'rec-first'], [outB, 'rec-second']] as const) {
+        expect(out.card).toMatchObject({
+          kind: 'deck-preview', recordingId: id, title: `Deck from ${id}`, transcriptIds: [id],
+        });
+        expect((out.card as { spec: { title: string } }).spec.title).toBe(`Deck from ${id}`);
+      }
+      expect(outA.runId).not.toBe(outB.runId);
+    },
+  );
 
   it('a real (non-preview) build still needs a documentId', async () => {
     await expect(runChatCommand({

@@ -167,7 +167,7 @@ describe('registration', () => {
     expect(def.postCard).toBe(false);
     const input = { trigger: '/search', channel: 'room:pipeline-live', text: '/search find me all kubernetes experts', argumentText: 'find me all kubernetes experts', requestedBy: 'dev-grace', requestedByName: 'Grace' };
     expect(def.triggerPayload(input)).toEqual({ query: 'find me all kubernetes experts', chatChannel: 'room:pipeline-live', requestedBy: 'dev-grace', requestedByName: 'Grace' });
-    expect(def.card!(input)).toEqual({ query: 'find me all kubernetes experts', opens: 'panel', panelKind: 'graph' });
+    expect(def.card!(input, { runId: 'run-1' })).toEqual({ query: 'find me all kubernetes experts', opens: 'panel', panelKind: 'graph' });
     expect(peopleSearchCommand.buildDefinition(input)).toEqual(buildPeopleSearchDefinition());
   });
 });
