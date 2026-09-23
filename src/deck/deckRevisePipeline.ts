@@ -349,7 +349,8 @@ export function createDeckReviseProposeHandler(opts: DeckReviseStepOpts = {}): D
         if (err instanceof DeckReviseError) {
           // A model that could not be reached is worth one more try; the
           // executor retries a failure whose message reads as transient.
-          const transient = err.status === 503 ? ' (model unavailable)' : '';
+          // Not when the model's credentials are the problem: another try is the same answer.
+          const transient = err.status === 503 && !/authenticat|log ?in|credential|forbidden|permission/i.test(err.reason) ? ' (model unavailable)' : '';
           const outcome = fail(runId, request, err.status, err.message, `model-${err.status === 400 ? 'refused' : 'failed'}`);
           log.warn({ runId, status: err.status, reason: err.reason, documentId: request.documentId }, 'deck revise run: the model step failed');
           return { status: 'failed', error: `${(outcome as { error: string }).error} — ${err.reason}${transient}` };

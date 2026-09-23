@@ -351,12 +351,14 @@ deckRouter.post('/revise-run', requireAuth, asyncHandler(async (req: Request, re
       triggeredBy: { userId },
     } as never));
     const runId = (out as { runId: string }).runId;
-    await claim.commit(runId);
+    // The plan first: the run's first step is fast, and a step that finishes
+    // before the plan is registered is never projected.
     getRunPersistenceService()?.registerTrigger({
       runId, pipelineId: DECK_REVISE_PIPELINE_ID, userId, triggerType: 'manual', at: new Date().toISOString(),
       ...(organizationId ? { organizationId } : {}),
       ...(workGraph ? { workGraph } : {}),
     });
+    await claim.commit(runId);
     log.info({ runId, documentId, requestId, userId, scope: target ? 'field' : slideId ? 'slide' : 'deck' }, 'deck revise run started');
     answer(runId, false);
   } catch (err) {
