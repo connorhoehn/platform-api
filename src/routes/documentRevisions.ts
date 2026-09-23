@@ -24,6 +24,7 @@ import { SVG_CONTENT_TYPE } from '../deck/renderSlideSvg';
 import { previewDeckSpec } from '../deck/preview';
 import { healCitationTitles } from '../deck/citationTitles';
 import log from '../lib/logger';
+import { canEditDocument, documentRoleOf, editRefusal } from '../deck/documentEditAccess';
 import {
   getPresentationDocumentStore,
   PRESENTATION_DOCUMENT_TYPE,
@@ -103,6 +104,18 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
   if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
   const body = (req.body ?? {}) as { spec?: unknown; label?: unknown; title?: unknown; transcriptIds?: unknown; baseRevisionId?: unknown };
   if (body.spec === undefined) throw new ValidationError('spec is required');
+  // Only the owner or an editor saves a revision. A scoped document grant was
+  // already checked for 'edit' by the document-policy middleware.
+  if (!req.documentGrant) {
+    const existing = await getPresentationDocumentStore().get(documentId);
+    const decision = await canEditDocument(existing, req.user, documentId);
+    if (!decision.allow) {
+      const userId = req.user?.sub ?? '';
+      log.warn({ documentId, userId, role: documentRoleOf(existing, userId) }, 'deck revision refused: the caller may not edit this document');
+      res.status(403).json({ error: editRefusal(existing, userId), code: 'forbidden', documentId });
+      return;
+    }
+  }
   // The newest revision the editor knew about. Sent, a save that would land on
   // top of a revision the person never saw answers 409 instead; left out (an
   // older client), it appends as before, but still never shares an id.

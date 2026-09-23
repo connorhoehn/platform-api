@@ -223,6 +223,26 @@ registerPolicy('recording:read', (req) => {
     : deny('recording not found', 404);
 });
 
+/**
+ * `document:edit` — may this principal change this document's content?
+ *
+ * The owner (the row's `createdBy`) and anyone the row names in `editors`.
+ * A viewer (`viewers`) and everyone else are refused with 403: the document is
+ * discoverable (the work graph shows it to people who share a chat with its
+ * owner), the caller simply may not write it. An owner that cannot be read
+ * off the row denies — an unestablished owner is never "anyone may edit".
+ * A scoped document grant is checked by its own middleware and never reaches
+ * here.
+ */
+registerPolicy('document:edit', (req) => {
+  const ownerId = req.resource.attrs?.ownerId;
+  if (typeof ownerId !== 'string' || !ownerId) return deny('the owner of this document could not be established');
+  if (ownerId === req.principal.userId) return ALLOW;
+  const editorIds = req.resource.attrs?.editorIds;
+  if (Array.isArray(editorIds) && editorIds.includes(req.principal.userId)) return ALLOW;
+  return deny("only the document's owner or an editor can change it");
+});
+
 /** Build a Principal from an authenticated request's user. */
 export function principalOf(
   user: { sub?: string; orgId?: string } | undefined,

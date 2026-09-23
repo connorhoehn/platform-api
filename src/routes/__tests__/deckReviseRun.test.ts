@@ -24,11 +24,19 @@ const deck = sampleDeck();
 const rows = new Map<string, PresentationDocumentRow>();
 const trigger = jest.fn(async (_args: Record<string, unknown>) => ({ runId: `run-${trigger.mock.calls.length}` }));
 
-function post(body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
+/** A dev token (SKIP_AUTH decodes, never verifies) naming who is asking. */
+function as(sub: string): string {
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  return `Bearer ${part({ alg: 'none', typ: 'JWT' })}.${part({ sub })}.x`;
+}
+
+function post(body: unknown, user?: string): Promise<{ status: number; body: Record<string, unknown> }> {
   const { port } = server.address() as AddressInfo;
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/api/deck/revise-run', headers: { 'content-type': 'application/json', 'content-length': String(payload.length) } }, (res) => {
+    const headers: Record<string, string> = { 'content-type': 'application/json', 'content-length': String(payload.length) };
+    if (user) headers.authorization = as(user);
+    const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/api/deck/revise-run', headers }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (chunk: Buffer) => chunks.push(chunk));
       res.on('end', () => { const text = Buffer.concat(chunks).toString('utf8'); resolve({ status: res.statusCode ?? 0, body: text ? JSON.parse(text) : {} }); });
@@ -66,7 +74,7 @@ beforeEach(() => {
   registerTrigger.mockClear();
   setClaimStore(null);
   rows.clear();
-  rows.set('audit-deck-1', { documentId: 'audit-deck-1', type: 'presentation', revisions: [{ id: 'v1', label: 'v1', spec: deck } as never] });
+  rows.set('audit-deck-1', { documentId: 'audit-deck-1', type: 'presentation', createdBy: 'dev-user', revisions: [{ id: 'v1', label: 'v1', spec: deck } as never] });
 });
 
 describe('POST /api/deck/revise-run', () => {
@@ -102,10 +110,43 @@ describe('POST /api/deck/revise-run', () => {
   it('refuses before starting anything: unknown deck 404, bad slide 400, no spec anywhere 400', async () => {
     expect((await post({ documentId: 'audit-nope', instruction: 'x' })).status).toBe(404);
     expect((await post({ documentId: 'audit-deck-1', instruction: 'x', slideId: 'nope' })).status).toBe(400);
-    rows.set('audit-empty', { documentId: 'audit-empty', type: 'presentation', revisions: [] });
+    rows.set('audit-empty', { documentId: 'audit-empty', type: 'presentation', createdBy: 'dev-user', revisions: [] });
     expect((await post({ documentId: 'audit-empty', instruction: 'x' })).status).toBe(400);
     expect((await post({ documentId: 'audit-empty', instruction: 'x', spec: deck, baseRevisionId: null })).status).toBe(202);
     expect(trigger).toHaveBeenCalledTimes(1);
+  });
+
+  describe('who may start an edit (NFR #41)', () => {
+    beforeEach(() => {
+      rows.set('audit-connor', {
+        documentId: 'audit-connor', type: 'presentation', createdBy: 'dev-connor',
+        editors: ['dev-erin'], viewers: ['dev-frank'], revisions: [{ id: 'v1', label: 'v1', spec: deck } as never],
+      } as never);
+    });
+
+    it.each([
+      ['owner', 'dev-connor', 202],
+      ['editor', 'dev-erin', 202],
+      ['viewer', 'dev-frank', 403],
+      ['stranger', 'dev-mallory', 403],
+    ])('%s → %i', async (_role, user, status) => {
+      const res = await post({ documentId: 'audit-connor', instruction: 'Tighten', requestId: `r-${user}` }, user);
+      expect(res.status).toBe(status);
+      if (status === 403) {
+        expect(res.body).toMatchObject({ code: 'forbidden', documentId: 'audit-connor' });
+        // Refused before a run exists: nothing triggered, nothing registered, no claim held.
+        expect(trigger).not.toHaveBeenCalled();
+        expect(registerTrigger).not.toHaveBeenCalled();
+      } else {
+        expect(trigger).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it('a row with no owner is nobody\'s to edit (fails closed)', async () => {
+      rows.set('audit-orphan', { documentId: 'audit-orphan', type: 'presentation', revisions: [{ id: 'v1', label: 'v1', spec: deck } as never] });
+      expect((await post({ documentId: 'audit-orphan', instruction: 'x' })).status).toBe(403);
+      expect(trigger).not.toHaveBeenCalled();
+    });
   });
 
   it('releases the claim when the engine refuses, so a retry can start the run', async () => {

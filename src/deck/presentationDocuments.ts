@@ -120,7 +120,12 @@ export interface PresentationDocumentRow {
   documentId: string;
   title?: string;
   type?: string;
+  /** The owner: the only person, with `editors`, who may add a revision (documentEditAccess.ts). */
   createdBy?: string;
+  /** Users the owner lets change the document. Absent = the owner alone. */
+  editors?: string[];
+  /** Users who may read it but not change it — named so a refusal can say so. */
+  viewers?: string[];
   createdAt?: string;
   updatedAt?: string;
   outline?: Array<{ id: string; title: string }>;

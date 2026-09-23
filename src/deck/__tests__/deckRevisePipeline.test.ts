@@ -34,7 +34,7 @@ class FakeStore implements PresentationDocumentStore {
   async get(documentId: string) { return this.rows.get(documentId) ?? null; }
 
   seed(spec: DeckSpec, revisions = 1): void {
-    const row: PresentationDocumentRow = { documentId: DOC, title: 'Audit deck', type: 'presentation', revisions: [] };
+    const row: PresentationDocumentRow = { documentId: DOC, title: 'Audit deck', type: 'presentation', createdBy: 'frank', revisions: [] };
     this.rows.set(DOC, row);
     for (let i = 0; i < revisions; i += 1) this.push({ documentId: DOC, title: 'Audit deck', createdBy: 'frank', pptx: Buffer.from('x'), slides: [], spec });
   }
@@ -263,6 +263,44 @@ describe('deck-revise pipeline', () => {
     expect(refuse).toHaveBeenCalledTimes(1);
     expect(store.appends).toBe(0);
     expect(published.at(-1)).toMatchObject({ type: 'pipeline:deck:revise:failed', payload: { status: 502, code: 'model-failed' } });
+  });
+
+  it('fails at load, before any model time, when the requester may not edit the deck (NFR #41)', async () => {
+    const row = store.rows.get(DOC)!;
+    row.createdBy = 'connor';
+    row.viewers = ['frank'];
+    const revise = retitle('Tighter');
+    const result = await run(store, revise, { slideId });
+    expect(result.status).toBe('failed');
+    expect(revise).not.toHaveBeenCalled();
+    expect(store.appends).toBe(0);
+    expect(published.at(-1)).toMatchObject({ type: 'pipeline:deck:revise:failed', payload: { status: 403, code: 'forbidden' } });
+  });
+
+  it('re-checks at write time: access revoked while the model was thinking writes nothing (NFR #41)', async () => {
+    const row = store.rows.get(DOC)!;
+    row.createdBy = 'connor';
+    row.editors = ['frank'];
+    const inner = retitle('Tighter');
+    const revise = jest.fn(async (...args: Parameters<typeof inner>) => {
+      row.editors = [];
+      return inner(...args);
+    });
+    const result = await run(store, revise as never, { slideId });
+    expect(result.status).toBe('failed');
+    expect(revise).toHaveBeenCalledTimes(1);
+    expect(store.appends).toBe(0);
+    expect(row.revisions).toHaveLength(1);
+    expect(published.at(-1)).toMatchObject({ type: 'pipeline:deck:revise:failed', payload: { status: 403, code: 'forbidden' } });
+  });
+
+  it('lets an editor the owner named write the revision', async () => {
+    const row = store.rows.get(DOC)!;
+    row.createdBy = 'connor';
+    row.editors = ['frank'];
+    const result = await run(store, retitle('Tighter'), { slideId });
+    expect(result.status).toBe('completed');
+    expect(store.appends).toBe(1);
   });
 
   it('fails at load on a document that is not a presentation', async () => {

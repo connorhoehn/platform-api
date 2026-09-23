@@ -32,6 +32,7 @@ import { buildDeckReviseDefinition, DECK_REVISE_PIPELINE_ID } from '../deck/deck
 import { claimDeckReviseRequest } from '../deck/deckReviseRequests';
 import { deckReviseChannelKey } from '../deck/deckReviseEvents';
 import { getPresentationDocumentStore, PRESENTATION_DOCUMENT_TYPE } from '../deck/presentationDocuments';
+import { canEditDocument, documentRoleOf, editRefusal } from '../deck/documentEditAccess';
 import type { DeckSpec } from '../deck/DeckSpec';
 
 export const deckRouter = Router();
@@ -174,6 +175,16 @@ deckRouter.post('/revise', requireAuth, asyncHandler(async (req: Request, res: R
   if (body.documentId !== undefined && body.documentId !== null) {
     if (typeof body.documentId !== 'string' || !DOCUMENT_ID.test(body.documentId)) throw new ValidationError('documentId is invalid');
     documentId = body.documentId;
+    // Progress for this edit is published on the document's channel as this
+    // person, so the same rule as a save applies: owner or editor only.
+    const row = await getPresentationDocumentStore().get(documentId);
+    const decision = await canEditDocument(row, req.user, documentId);
+    if (!decision.allow) {
+      const userId = req.user?.sub ?? '';
+      log.warn({ documentId, userId, role: documentRoleOf(row, userId) }, 'deck revise refused: the caller may not edit this document');
+      res.status(403).json({ error: editRefusal(row, userId), code: 'forbidden', documentId });
+      return;
+    }
   }
   let requestId: string = randomUUID();
   if (body.requestId !== undefined && body.requestId !== null) {
@@ -263,6 +274,18 @@ deckRouter.post('/revise-run', requireAuth, asyncHandler(async (req: Request, re
   if (!row || (row.type && row.type !== PRESENTATION_DOCUMENT_TYPE)) {
     res.status(404).json({ error: 'That presentation does not exist.', documentId });
     return;
+  }
+  // The run writes a revision as this person, so only the owner or an editor
+  // may start one: refused here, before a run exists. The run's write step
+  // checks again at write time (deckRevisePipeline.ts).
+  {
+    const decision = await canEditDocument(row, req.user, documentId);
+    if (!decision.allow) {
+      const userId = req.user?.sub ?? '';
+      log.warn({ documentId, userId, role: documentRoleOf(row, userId) }, 'deck revise run refused: the caller may not edit this document');
+      res.status(403).json({ error: editRefusal(row, userId), code: 'forbidden', documentId });
+      return;
+    }
   }
 
   // The spec the edit is made on: the editor's unsaved one, or the head's.

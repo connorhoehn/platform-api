@@ -36,6 +36,9 @@ jest.mock('../../deck/deckRevise', () => {
 import { deckRouter } from '../deck';
 import { DeckReviseError } from '../../deck/deckRevise';
 import { NoFixtureMaterialError } from '../../deck/deckFixture';
+import { setPresentationDocumentStore, type PresentationDocumentRow } from '../../deck/presentationDocuments';
+
+const deckRows = new Map<string, PresentationDocumentRow>();
 
 function post(path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
   const { port } = server.address() as AddressInfo;
@@ -63,6 +66,7 @@ const originalSkipAuth = process.env.SKIP_AUTH;
 
 beforeAll(async () => {
   process.env.SKIP_AUTH = 'true';
+  setPresentationDocumentStore({ get: async (id: string) => deckRows.get(id) ?? null, appendRevision: jest.fn() } as never);
   const app = express();
   app.use(express.json({ limit: '4mb' }));
   app.use('/api/deck', deckRouter);
@@ -74,6 +78,7 @@ beforeAll(async () => {
 afterAll(async () => {
   if (originalSkipAuth === undefined) delete process.env.SKIP_AUTH;
   else process.env.SKIP_AUTH = originalSkipAuth;
+  setPresentationDocumentStore(null);
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
@@ -272,6 +277,19 @@ describe('POST /api/deck/revise — live progress', () => {
     expect(last.type).toBe('pipeline:deck:revise:failed');
     expect(last.payload).toMatchObject({ phase: 'failed', status: 503, reason: 'The agent could not answer, so nothing was changed.', scope: 'deck', requestId: res.body.requestId });
     expect(JSON.stringify(last)).not.toContain('the deck text');
+  });
+
+  it('403s an edit of someone else\'s document, before the model is asked or anything is published (NFR #41)', async () => {
+    deckRows.set('doc-connor', { documentId: 'doc-connor', type: 'presentation', createdBy: 'dev-connor', viewers: ['dev-user'] } as never);
+    try {
+      const res = await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x', documentId: 'doc-connor' });
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ code: 'forbidden', documentId: 'doc-connor' });
+      expect(String(res.body.error)).toMatch(/view this document but not change it/);
+      await settle();
+      expect(reviseDeck).not.toHaveBeenCalled();
+      expect(published).toHaveLength(0);
+    } finally { deckRows.delete('doc-connor'); }
   });
 
   it('publishes nothing without a documentId, and 400s a bad documentId or requestId', async () => {

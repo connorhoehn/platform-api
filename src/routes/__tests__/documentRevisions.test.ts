@@ -53,6 +53,7 @@ const row: PresentationDocumentRow = {
   documentId: 'doc-1',
   title: 'Q4 platform review',
   type: 'presentation',
+  createdBy: 'dev-user',
   revisions: [{
     id: 'v1',
     label: 'v1',
@@ -111,13 +112,19 @@ const store: PresentationDocumentStore = {
   },
 };
 
-function postJson(path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
+function postJson(path: string, body: unknown, user?: string): Promise<{ status: number; body: Record<string, unknown> }> {
   const { port } = server.address() as AddressInfo;
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
+  const headers: Record<string, string> = { 'content-type': 'application/json', 'content-length': String(payload.length) };
+  // A dev token: SKIP_AUTH decodes it (never verifies) to name who is asking.
+  if (user) {
+    const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+    headers.authorization = `Bearer ${part({ alg: 'none', typ: 'JWT' })}.${part({ sub: user })}.x`;
+  }
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: '127.0.0.1', port, method: 'POST', path,
-      headers: { 'content-type': 'application/json', 'content-length': String(payload.length) },
+      headers,
     }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -253,6 +260,30 @@ describe('authorization', () => {
 
 describe('POST /api/documents/:id/revisions', () => {
   beforeEach(() => { appended.length = 0; });
+
+  describe('who may save (NFR #41)', () => {
+    beforeEach(() => { row.editors = ['dev-erin']; row.viewers = ['dev-frank']; });
+    afterEach(() => { delete row.editors; delete row.viewers; });
+    it.each([
+      ['owner', 'dev-user', 201],
+      ['editor', 'dev-erin', 201],
+      ['viewer', 'dev-frank', 403],
+      ['stranger', 'dev-mallory', 403],
+    ])('%s → %i', async (_role, user, status) => {
+      const res = await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck() }, user);
+      expect(res.status).toBe(status);
+      if (status === 403) {
+        expect(res.body).toMatchObject({ code: 'forbidden', documentId: 'doc-1' });
+        expect(appended).toHaveLength(0);
+      } else {
+        expect(appended).toHaveLength(1);
+      }
+    });
+    it('a document that does not exist yet is the caller\'s to create', async () => {
+      const res = await postJson('/api/documents/doc-new/revisions', { spec: sampleDeck() }, 'dev-mallory');
+      expect(res.status).toBe(201);
+    });
+  });
 
   it('renders the spec and files it as the next revision', async () => {
     const res = await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck(), label: 'Draft for the sync' });

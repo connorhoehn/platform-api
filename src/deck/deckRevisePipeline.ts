@@ -37,8 +37,9 @@ import {
 import { renderDeckFiles } from './DeckStepHandler';
 import {
   getPresentationDocumentStore, PresentationRevisionConflictError, PRESENTATION_DOCUMENT_TYPE,
-  type PresentationDocumentStore, type StoredRevision,
+  type PresentationDocumentRow, type PresentationDocumentStore, type StoredRevision,
 } from './presentationDocuments';
+import { canEditDocument, documentRoleOf, editRefusal } from './documentEditAccess';
 
 export {
   DECK_REVISE_PIPELINE_ID, DECK_REVISE_LOAD_KIND, DECK_REVISE_PROPOSE_KIND, DECK_REVISE_WRITE_KIND, buildDeckReviseDefinition,
@@ -254,6 +255,20 @@ export interface ProposeOutput {
   changed: boolean;
 }
 
+/**
+ * A run writes a revision as the person who asked for it, so that person must
+ * be the document's owner or an editor — at load (before the model is paid for)
+ * and again at write. A missing row is the load step's 404, not this.
+ */
+async function refuseNonEditor(runId: string, request: DeckReviseRunRequest, row: PresentationDocumentRow | null): Promise<StepOutcome | null> {
+  if (!row) return null;
+  const decision = await canEditDocument(row, { sub: request.requestedBy === 'unknown' ? '' : request.requestedBy }, request.documentId);
+  if (decision.allow) return null;
+  log.warn({ runId, documentId: request.documentId, requestedBy: request.requestedBy, role: documentRoleOf(row, request.requestedBy) },
+    'deck revise run refused: the requester may not edit this document');
+  return fail(runId, request, 403, editRefusal(row, request.requestedBy), 'forbidden');
+}
+
 export interface DeckReviseStepOpts {
   store?: PresentationDocumentStore;
   revise?: typeof reviseDeck;
@@ -282,6 +297,8 @@ export function createDeckReviseLoadHandler(opts: DeckReviseStepOpts = {}): Desc
       if (!row || (row.type && row.type !== PRESENTATION_DOCUMENT_TYPE)) {
         return fail(runId, request, 404, 'That presentation does not exist.', 'not-found');
       }
+      const denied = await refuseNonEditor(runId, request, row);
+      if (denied) return denied;
       const head = headOf(row.revisions);
       const headId = head?.id ?? null;
       if (request.baseRevisionId !== undefined && request.baseRevisionId !== headId) {
@@ -440,6 +457,10 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
       // Idempotent: a write that already landed for this request (a retried
       // step, a run resumed after the pod died) is returned, not repeated.
       const row = await store.get(request.documentId);
+      // Checked again at write time, with the person who asked: access can be
+      // revoked while the run waits on the model.
+      const denied = await refuseNonEditor(runId, request, row);
+      if (denied) return denied;
       const already = row?.revisions?.find((revision) => revision.producedBy?.requestId === request.requestId);
       if (already) {
         await announceProduced(helpers, request.documentId, already.id, already.slideCount, loaded.title, already.createdAt);
