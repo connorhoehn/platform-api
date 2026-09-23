@@ -371,6 +371,29 @@ describe('GET /pipelines/:pipelineId/runs/:runId (snapshot)', () => {
     expect(body.status).toBe('completed');
   });
 
+  // NFR #136: an /agent loop's accept-time row points at its executor run and
+  // stays 'pending' for ever; the chat card polled it indefinitely.
+  test("follows an /agent loop's accept-time row to the executor's settled run", async () => {
+    mockRunRepoGet
+      .mockResolvedValueOnce({
+        runId: 'loop-1', pipelineId: 'chat-agent-loop', status: 'pending', agentLoopRunId: 'exec-1',
+        startedAt: '2026-09-22T02:48:55.000Z', triggeredBy: 'user-1', triggerType: 'manual',
+      })
+      .mockResolvedValueOnce({
+        runId: 'exec-1', pipelineId: 'chat-agent-loop', status: 'completed',
+        startedAt: '2026-09-22T02:48:56.000Z', completedAt: '2026-09-22T02:49:23.000Z',
+        stepsSummary: {}, triggeredBy: 'user-1', triggerType: 'manual',
+      });
+    setPipelineBridge({
+      getRun: async () => null,
+      getHistory: async () => [],
+      resolveApproval: async () => {},
+    });
+    const res = await run(buildApp(), 'GET', '/pipelines/chat-agent-loop/runs/loop-1');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ runId: 'loop-1', executorRunId: 'exec-1', status: 'completed' });
+  });
+
   test('still 404s when neither the bridge nor the repository has the run', async () => {
     mockRunRepoGet.mockResolvedValueOnce(null);
     setPipelineBridge({

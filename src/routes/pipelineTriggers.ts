@@ -30,6 +30,7 @@ import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { getLiveCaptionsProgress } from '../recordings/liveCaptions';
 import { stubRunStore } from '../pipeline/stub-run-store';
 import { runItemToSnapshot } from '../pipeline/createBridge';
+import { resolveStoredRun } from '../pipeline/storedRunLookup';
 import { PipelineRunRepository, type PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { getDynamoClient } from '../lib/ddb-client';
 import { pipelineRunReviewRouter } from './pipelineRunReview';
@@ -536,6 +537,21 @@ pipelineTriggersRouter.get(
         );
       }
       if (persisted) {
+        // An /agent loop's accept-time row is a pointer at the run that
+        // executes it (`agentLoopRunId`) and says `pending` for ever; the chat
+        // card asking about the loop id polled it indefinitely (realtime-
+        // examples NFR #136). Answer with the executor's state instead, under
+        // the asked id, naming the executor for its `pipeline:run:<id>` frames.
+        if (persisted.agentLoopRunId && persisted.agentLoopRunId !== runId) {
+          const followed = await resolveStoredRun(pipelineId, runId, {
+            get: async (p, r) => (r === runId ? persisted : getRunRepo().get(p, r)),
+            live: async (id) => ((await Promise.resolve(bridge!.getRun(id))) as Record<string, unknown> | null) ?? null,
+          }).catch(() => null);
+          if (followed) {
+            res.json(followed);
+            return;
+          }
+        }
         // The verdict on the run's suggestions lives on the row only (written after the run was terminal).
         res.json({ ...runItemToSnapshot(persisted), ...(persisted.review ? { review: persisted.review } : {}) });
         return;
