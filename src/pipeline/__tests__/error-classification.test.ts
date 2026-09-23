@@ -1,7 +1,7 @@
 // social-api/src/pipeline/__tests__/error-classification.test.ts
 
 import { describe, it, expect } from '@jest/globals';
-import { classifyPipelineError, classifyRetryability } from '../error-classification';
+import { classifyPipelineError, classifyRetryability, refusalCodeOf } from '../error-classification';
 
 describe('classifyPipelineError()', () => {
   it('returns NetworkError for connection-refused messages', () => {
@@ -92,5 +92,31 @@ describe('classifyRetryability()', () => {
     expect(classifyRetryability('LLMError', 'Permission denied')).toBe('terminal');
     expect(classifyRetryability('LLMError', '403 Forbidden')).toBe('terminal');
     expect(classifyRetryability('LLMError', '401 Unauthorized')).toBe('terminal');
+  });
+});
+
+describe('refusals (a step said no; the same inputs decide the same way)', () => {
+  it('classifies each refusal code as Refused, terminal — before the keyword scans', () => {
+    const cases: Array<[string, string]> = [
+      ['deck-revise constraint-not-met: The edit did not do what was asked: Title has 2 words; it must have exactly 0. Measured: Title: 2 → 2 words. Nothing was saved.', 'constraint-not-met'],
+      ['deck-revise forbidden: Only the owner and editors can edit this deck.', 'forbidden'],
+      ['deck-revise revision-conflict: The deck moved to v8 while this edit was based on v7.', 'revision-conflict'],
+      ['deck-revise invalid-request: The edit is missing its document, request id or instruction.', 'invalid-request'],
+    ];
+    for (const [message, code] of cases) {
+      expect(refusalCodeOf(message)).toBe(code);
+      expect(classifyPipelineError(message)).toBe('Refused');
+      expect(classifyRetryability('Refused', message)).toBe('terminal');
+      // The run row stores `<nodeId>: <message>`; the classification is the same.
+      expect(classifyPipelineError(`check: ${message}`)).toBe('Refused');
+    }
+  });
+
+  it('is not fooled by the code words mid-sentence', () => {
+    expect(refusalCodeOf('anthropic API returned 403 Forbidden')).toBeNull();
+    expect(classifyPipelineError('anthropic API returned 403 Forbidden')).toBe('LLMError');
+    expect(refusalCodeOf('registry version mismatch: revision-conflict seen')).toBeNull();
+    expect(classifyPipelineError('deck-revise cancelled: The edit was stopped, so nothing was changed.')).toBe('UnknownError');
+    expect(classifyPipelineError('deck-revise failed: model unavailable (503)')).not.toBe('Refused');
   });
 });

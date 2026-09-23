@@ -151,7 +151,7 @@ export function recordPipelineCancel(): void {
 /**
  * Record a pipeline error with category label for operator triage.
  * Expected categories: NetworkError, TimeoutError, ValidationError, LLMError,
- * RegistryConflict, UnknownError (from classifyPipelineError).
+ * RegistryConflict, Refused, UnknownError (from classifyPipelineError).
  */
 export function recordPipelineError(errorCategory = 'UnknownError'): void {
   registry.counter('pipeline_errors_total', { ...BASE_LABELS, error_category: errorCategory }).inc();

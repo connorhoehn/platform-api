@@ -21,6 +21,7 @@
 import { Router } from 'express';
 import { trace, SpanStatusCode } from '@opentelemetry/api';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
+import { runRefusal } from './pipelineResume';
 import { idempotency } from '../middleware/idempotency';
 import { withContext } from '../lib/logger';
 import { recordPipelineTrigger, recordPipelineError } from '../observability/metrics';
@@ -107,6 +108,18 @@ pipelineRetryRouter.post(
     if (!isTerminalRunStatus(originalRun.status)) {
       throw new ValidationError(
         `Cannot retry from run ${runId} with status '${originalRun.status}'. Only terminal runs can be retried.`,
+      );
+    }
+
+    // A refused run (constraint-not-met, forbidden, revision-conflict,
+    // invalid-request) is a decision about the inputs it already had; a
+    // retry over the same trigger payload decides the same way. See
+    // pipelineResume's `runRefusal`.
+    const refusal = runRefusal(originalRun);
+    if (refusal) {
+      throw new ValidationError(
+        `Run ${runId} was refused (${refusal.code}) and cannot be retried: ${refusal.message} ` +
+          'Change the request and start a new run.',
       );
     }
 

@@ -54,7 +54,7 @@ jest.mock('../pipelineTriggers', () => ({
   getPipelineBridge: jest.fn().mockReturnValue(null),
 }));
 
-import { pipelineResumeRouter } from '../pipelineResume';
+import { pipelineResumeRouter, runRefusal } from '../pipelineResume';
 import { errorHandler } from '../../middleware/error-handler';
 import { getPipelineBridge } from '../pipelineTriggers';
 
@@ -247,6 +247,30 @@ describe('POST /pipelines/:pipelineId/runs/:runId/resume', () => {
     expect(res.statusCode).toBe(400);
     const body = res.body as { error: string };
     expect(body.error).toMatch(/running/);
+  });
+
+  test('400, with the refusal verbatim, when the run was refused — resuming would decide the same way', async () => {
+    mockRunRepoGet.mockResolvedValueOnce({
+      ...failedRun,
+      error: 'node-B: deck-revise constraint-not-met: The edit did not do what was asked: Title has 2 words; it must have exactly 0. Nothing was saved.',
+    });
+    const res = await dispatch(app, 'POST', '/pipelines/p1/runs/r1/resume?fromNodeId=node-B');
+    expect(res.statusCode).toBe(400);
+    const body = res.body as { error: string };
+    expect(body.error).toMatch(/refused \(constraint-not-met\) and cannot be resumed/);
+    expect(body.error).toContain('deck-revise constraint-not-met: The edit did not do what was asked: Title has 2 words; it must have exactly 0. Nothing was saved.');
+    expect(body.error).toMatch(/start a new run/);
+    expect((getPipelineBridge as jest.Mock)).not.toHaveBeenCalled();
+  });
+
+  test('runRefusal reads the stored row and an executor error object alike; a plain failure is not one', () => {
+    expect(runRefusal({ error: 'node-B: deck-revise forbidden: Only the owner may edit.' }))
+      .toEqual({ code: 'forbidden', message: 'deck-revise forbidden: Only the owner may edit.' });
+    expect(runRefusal({ error: { message: 'deck-revise revision-conflict: v7 moved to v8.' } }))
+      .toEqual({ code: 'revision-conflict', message: 'deck-revise revision-conflict: v7 moved to v8.' });
+    expect(runRefusal({ error: 'node-B: synthetic failure' })).toBeNull();
+    expect(runRefusal({ error: 'node-B: connect ECONNREFUSED' })).toBeNull();
+    expect(runRefusal({})).toBeNull();
   });
 
   test('400 when the run is succeeded and allowCompleted is not set', async () => {

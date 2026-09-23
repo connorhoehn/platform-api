@@ -4,6 +4,7 @@ export type ErrorCategory =
   | 'ValidationError'
   | 'LLMError'
   | 'RegistryConflict'
+  | 'Refused'
   | 'UnknownError';
 
 export type Retryability = 'retryable' | 'terminal' | 'unknown';
@@ -13,9 +14,35 @@ const CATEGORY_RETRYABILITY: Record<ErrorCategory, Retryability> = {
   TimeoutError:     'retryable',
   ValidationError:  'terminal',
   RegistryConflict: 'terminal',
+  Refused:          'terminal',
   LLMError:         'retryable',  // refined by classifyRetryability for 4xx auth
   UnknownError:     'unknown',
 };
+
+/**
+ * The codes a step uses to say it looked at the request and said no — the
+ * edit did not do what was asked, the requester may not edit, the base
+ * revision moved, the request is malformed. A refusal is a decision about
+ * the inputs the run already has; running the same step again over the same
+ * recorded inputs decides the same way. So it is terminal: no retry, no
+ * resume — the person changes the ask (or the sharing, or the base) and
+ * starts a new run.
+ */
+export const REFUSAL_CODES = ['constraint-not-met', 'forbidden', 'revision-conflict', 'invalid-request'] as const;
+export type RefusalCode = (typeof REFUSAL_CODES)[number];
+
+// A refusal is spelled `<step> <code>: <reason>` by the step that refuses
+// (`deck-revise constraint-not-met: Title has 2 words; …`), optionally
+// behind the `<nodeId>: ` prefix the run row stores. The code word is
+// matched only in that position: a model's "403 Forbidden" mid-sentence is
+// an LLMError, not a refusal.
+const REFUSAL_RE = new RegExp(`(?:^|: )[a-z][\\w-]* (${REFUSAL_CODES.join('|')}): `, 'i');
+
+/** The refusal code a step failed with, or null when the failure is not a refusal. */
+export function refusalCodeOf(message: string): RefusalCode | null {
+  const m = REFUSAL_RE.exec(message);
+  return m ? (m[1].toLowerCase() as RefusalCode) : null;
+}
 
 /**
  * Returns whether an error with the given category and message is safe to
@@ -41,6 +68,10 @@ export function classifyRetryability(category: ErrorCategory, message: string): 
 }
 
 export function classifyPipelineError(message: string, stack?: string): ErrorCategory {
+  // Before the keyword scans: `revision-conflict` reads as a conflict,
+  // `invalid-request` as a validation error, and the other two as unknown.
+  if (refusalCodeOf(message)) return 'Refused';
+
   const lowerMsg = message.toLowerCase();
   const lowerStack = (stack || '').toLowerCase();
   const combined = lowerMsg + ' ' + lowerStack;

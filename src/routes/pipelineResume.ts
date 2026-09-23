@@ -25,6 +25,7 @@
 import { Router } from 'express';
 import { trace, SpanStatusCode } from '@opentelemetry/api';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
+import { refusalCodeOf, type RefusalCode } from '../pipeline/error-classification';
 import { idempotency } from '../middleware/idempotency';
 import { withContext } from '../lib/logger';
 import { recordPipelineTrigger, recordPipelineError } from '../observability/metrics';
@@ -125,6 +126,19 @@ pipelineResumeRouter.post(
         `Cannot resume run ${runId} with status '${originalRun.status}'. ` +
           `Expected one of: ${allowedStatuses.join(', ')}.` +
           (allowCompleted ? '' : " Pass `allowCompleted: true` to resume a completed run."),
+      );
+    }
+
+    // 2b. A run that REFUSED (constraint-not-met, forbidden, revision-conflict,
+    //     invalid-request) is a decision about inputs the run already holds:
+    //     resuming re-enters the same step over the same recorded proposal
+    //     and refuses the same way. The person changes the ask and starts a
+    //     new run; the message says so and repeats the refusal verbatim.
+    const refusal = runRefusal(originalRun);
+    if (refusal) {
+      throw new ValidationError(
+        `Run ${runId} was refused (${refusal.code}) and cannot be resumed: ${refusal.message} ` +
+          'Change the request and start a new run.',
       );
     }
 
@@ -237,6 +251,27 @@ pipelineResumeRouter.post(
 );
 
 /** Best-effort extract of the original failure point. */
+/**
+ * The refusal a stored run failed with, if it failed with one. The row keeps
+ * the error as `<nodeId>: <step> <code>: <reason>`; the message returned is
+ * the part after the node id, verbatim.
+ */
+export function runRefusal(run: unknown): { code: RefusalCode; message: string } | null {
+  if (!run || typeof run !== 'object') return null;
+  const stored = (run as Record<string, unknown>)['error'];
+  const text = typeof stored === 'string'
+    ? stored
+    : stored && typeof stored === 'object' && typeof (stored as Record<string, unknown>)['message'] === 'string'
+      ? ((stored as Record<string, unknown>)['message'] as string)
+      : null;
+  if (!text) return null;
+  const code = refusalCodeOf(text);
+  if (!code) return null;
+  const colonIdx = text.indexOf(': ');
+  const afterNode = colonIdx > 0 && !/^[a-z][\w-]* [a-z-]+$/i.test(text.slice(0, colonIdx)) ? text.slice(colonIdx + 2) : text;
+  return { code, message: afterNode };
+}
+
 function pickOriginalFailedStepId(run: unknown): string | undefined {
   if (!run || typeof run !== 'object') return undefined;
   const r = run as Record<string, unknown>;

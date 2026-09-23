@@ -380,6 +380,20 @@ describe('POST /pipelines/:pipelineId/runs/:runId/retry/:nodeId', () => {
     expect(body.error).toMatch(/not found/i);
   });
 
+  test('400, with the refusal verbatim, when the original run was refused', async () => {
+    mockRunRepoGet.mockResolvedValueOnce({
+      ...baseRun,
+      error: 'node-B: deck-revise constraint-not-met: Title has 2 words; it must have exactly 0. Nothing was saved.',
+    });
+
+    const res = await run(retryApp, 'POST', '/pipelines/p1/runs/r1/retry/node-B');
+
+    expect(res.statusCode).toBe(400);
+    const body = res.body as { error: string };
+    expect(body.error).toMatch(/refused \(constraint-not-met\) and cannot be retried/);
+    expect(body.error).toContain('Title has 2 words; it must have exactly 0. Nothing was saved.');
+  });
+
   test('400 when run is not in a terminal state', async () => {
     mockRunRepoGet.mockResolvedValueOnce({ ...baseRun, status: 'running' });
 
