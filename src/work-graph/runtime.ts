@@ -1034,7 +1034,33 @@ const DENIED: GatewayWorkGraphAccess = { decision: 'deny', policyRevision: 'unav
  * and membership rows. No membership or policy revision supplied by a socket
  * is trusted at this boundary.
  */
-export async function authorizeGatewayWorkGraph(
+/**
+ * NFR #94: identical access checks that overlap share one pass. Every open
+ * stream is re-checked each second, and each pass loads and authorizes the
+ * whole day; gateway replicas (or a gateway that has not deduplicated) asking
+ * the same question at the same moment get the same answer from one pass.
+ * Nothing is kept once the pass settles, so a revoked grant is seen by the
+ * next check exactly as before.
+ */
+const authorizeInFlight = new Map<string, Promise<GatewayWorkGraphAccess>>();
+
+export function authorizeGatewayWorkGraph(
+  organizationId: string,
+  viewerId: string,
+  query: GatewayWorkGraphQuery,
+  requestedView?: GatewayWorkGraphViewRequest,
+): Promise<GatewayWorkGraphAccess> {
+  if (requestedView) return authorizeGatewayWorkGraphOnce(organizationId, viewerId, query, requestedView);
+  const key = JSON.stringify([organizationId, viewerId, query.personId, query.day, query.timezone]);
+  const pending = authorizeInFlight.get(key);
+  if (pending) return pending;
+  const pass = authorizeGatewayWorkGraphOnce(organizationId, viewerId, query)
+    .finally(() => { authorizeInFlight.delete(key); });
+  authorizeInFlight.set(key, pass);
+  return pass;
+}
+
+async function authorizeGatewayWorkGraphOnce(
   organizationId: string,
   viewerId: string,
   query: GatewayWorkGraphQuery,
