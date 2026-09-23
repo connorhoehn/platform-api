@@ -72,6 +72,10 @@ COPY platform-api/package.json platform-api/package-lock.json platform-api/tscon
 RUN --mount=type=ssh npm ci --omit=dev --legacy-peer-deps --ignore-scripts --no-audit --no-fund && npm cache clean --force
 COPY --from=build /app/dist ./dist/
 COPY platform-api/src/ ./src/
+# NFR #65: record which source dist/ was compiled from. Tilt's live_update
+# rewrites this after each in-container tsc; at boot, dev pods compare it with
+# the host checkout (PLATFORM_HOST_SRC_DIR) and hold cluster leases while stale.
+RUN node dist/lib/buildFreshness.js src /app/.build-src-fingerprint
 RUN chown -R platformapi:nodejs /app
 USER platformapi
 EXPOSE 3001

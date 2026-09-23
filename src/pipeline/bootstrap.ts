@@ -66,6 +66,7 @@
 // routes the six bridge surfaces (getRun, getHistory, listActiveRuns,
 // getMetrics, getPendingApprovals, pipeline.run.reassigned) into WebSockets.
 
+import { whenBuildFresh } from '../lib/buildFreshness';
 import { sign as jwtSign } from 'jsonwebtoken';
 import { Cluster, IS_TEST_ENV } from 'distributed-core';
 import { PipelineModule } from 'distributed-core/applications/pipeline';
@@ -1248,7 +1249,13 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       ? Number(process.env.PLATFORM_CLUSTER_SWEEP_INTERVAL_MS)
       : 60_000,
   });
-  clusterSweeper.start();
+  // NFR #65: a pod replaced under Tilt boots the last BUILT image until the
+  // live_update replay restarts it; it must not win sweep leadership (and
+  // resume runs) with that stale code.
+  let clusterSweeperStopped = false;
+  void whenBuildFresh(bootstrapLog).then(() => {
+    if (!clusterSweeperStopped) clusterSweeper.start();
+  });
 
   // T9 (lib-expansion-3): construct the bus-event DLQ and assign into the
   // dlqRef captured by the handler above. RedriveSink re-publishes via the
@@ -1430,6 +1437,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // NFR #26: release both leases first, so the other replica takes over the
   // sweep and sees this incarnation as gone without waiting out the TTL.
   const shutdownWithLeases = async (): Promise<void> => {
+    clusterSweeperStopped = true;
     await clusterSweeper.stop().catch(() => undefined);
     await replicaHeartbeat.stop().catch(() => undefined);
     await shutdown();

@@ -26,6 +26,7 @@ import { catalog, connectCatalog, disconnectCatalog, publishDurable } from './li
 import { ensureOutboxTTL, ensureVideoSessionsTTL, ensurePipelineRunsTTL } from './lib/dynamo-setup';
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
+import { whenBuildFresh } from './lib/buildFreshness';
 import { startActivityConsumer } from './services/activity-consumer';
 import { startSummaryProjector } from './services/summary-projector';
 import { startCallReactionConsumer } from './services/call-reaction-consumer';
@@ -128,8 +129,15 @@ const server = app.listen(Number(port), () => {
 // independent of the catalog connection.
 // ---------------------------------------------------------------------------
 
-const drainer = startOutboxDrainer();
-log.info('outbox-drainer started');
+// NFR #65: the drainer lease waits until this process runs the host's source
+// (dev only; `PLATFORM_HOST_SRC_DIR` unset means fresh at once).
+let drainer: { stop: () => void } | null = null;
+let drainerStopped = false;
+void whenBuildFresh(log).then(() => {
+  if (drainerStopped) return;
+  drainer = startOutboxDrainer();
+  log.info('outbox-drainer started');
+});
 
 // DDB TTL provisioning. In prod (or DDB_TTL_REQUIRED=true) we refuse to boot
 // if TTL can't be configured on the outbox / video-sessions tables — silent
@@ -506,7 +514,7 @@ sd.register('work-graph', async () => {
   workGraphOutboxDrainer?.stop();
   if (workGraphConsumer) await workGraphConsumer.stop();
 });
-sd.register('outbox-drainer', () => { drainer.stop(); });
+sd.register('outbox-drainer', () => { drainerStopped = true; drainer?.stop(); });
 sd.register('pipeline', async () => {
   if (pipelineShutdown) await pipelineShutdown();
 });
