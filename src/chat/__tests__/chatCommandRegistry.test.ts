@@ -152,7 +152,7 @@ describe('runChatCommand — the fake /search through a stubbed bridge', () => {
     expect(typeof args.triggerPayload.requestId).toBe('string');
     expect(mockRegisterTrigger).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1', pipelineId: 'embedder-search', userId: 'u-grace', triggerType: 'manual' }));
     // Default: the card goes into the command's channel, carrying the command's own metadata.
-    expect(mockPostCard).toHaveBeenCalledWith({ channel: 'room:platform', runId: 'run-1', pipelineId: 'embedder-search', command: '/search', instruction: 'Search: k8s experts', extra: { query: 'k8s experts', opens: 'panel' } });
+    expect(mockPostCard).toHaveBeenCalledWith({ channel: 'room:platform', runId: 'run-1', pipelineId: 'embedder-search', command: '/search', instruction: 'Search: k8s experts', extra: { query: 'k8s experts', opens: 'panel' }, requester: expect.objectContaining({ userId: expect.any(String) }) });
     // The first run registered the pipeline as a system pipeline, so it lists with its steps named.
     expect(getSystemPipeline('embedder-search')).toMatchObject({ id: 'embedder-search', system: true });
   });

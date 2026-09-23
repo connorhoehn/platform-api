@@ -141,35 +141,14 @@ export interface ChatHistoryMessage {
 }
 
 /**
- * Post a message into a chat channel as a service identity, through the chat
- * service (so it is persisted and fanned out like any message). Join first —
- * the service refuses a send from a client that has not joined.
- */
-export async function postChatMessage(input: { channel: string; message: string; metadata?: Record<string, unknown>; identity?: ServiceIdentity; gatewayUrl?: string }): Promise<void> {
-  const client = new GatewayServiceClient(input.identity ?? PIPELINE_IDENTITY, input.gatewayUrl);
-  await client.connect();
-  try {
-    client.send({ service: 'chat', action: 'join', channel: input.channel });
-    // The joined ack (or the join's history replay) is the signal the subscription is in place.
-    await client.waitFor((f) => isChatFrame(f, 'joined', input.channel) || isChatFrame(f, 'history', input.channel), 2000);
-    client.send({ service: 'chat', action: 'send', channel: input.channel, message: input.message, metadata: input.metadata ?? {} });
-    // The service acks the sender with `sent`; the fan-out `message` frame nests the record.
-    await client.waitFor((f) => isChatFrame(f, 'sent', input.channel)
-      || (isChatFrame(f, 'message', input.channel) && (f.message === input.message || (f.message as ChatHistoryMessage | undefined)?.message === input.message)), 2000);
-  } finally {
-    await client.close();
-  }
-}
-
-/**
  * A chat-service refusal: the gateway answered, and the answer was no (not a
  * member of a direct-message channel, a closed channel, a bad request). It is
  * the gateway's own reason, not a timeout, so a caller can tell "you may not
  * read this" apart from "the gateway did not answer" and must not retry it.
  */
 export class ChatRefusedError extends Error {
-  constructor(readonly channel: string, readonly code: string | undefined, reason: string) {
-    super(`the chat service refused to read ${channel}: ${reason}${code ? ` (${code})` : ''}`);
+  constructor(readonly channel: string, readonly code: string | undefined, readonly reason: string, verb = 'read') {
+    super(`the chat service refused to ${verb} ${channel}: ${reason}${code ? ` (${code})` : ''}`);
     this.name = 'ChatRefusedError';
   }
 }
@@ -189,9 +168,52 @@ function chatErrorOf(frame: GatewayFrame): { code?: string; message: string } | 
 
 type HistoryClientFactory = (identity: ServiceIdentity, gatewayUrl?: string) => GatewayServiceClient;
 let historyClientFactory: HistoryClientFactory = (identity, url) => new GatewayServiceClient(identity, url);
-/** Tests swap the socket for a fake. */
+/** Tests swap the socket for a fake (history reads and posts share it). */
 export function _setHistoryClientFactory(f: HistoryClientFactory | null): void {
   historyClientFactory = f ?? ((identity, url) => new GatewayServiceClient(identity, url));
+}
+export const _setChatClientFactory = _setHistoryClientFactory;
+
+/**
+ * Post a message into a chat channel through the chat service (so it is
+ * persisted and fanned out like any message), AS the identity given. Join
+ * first — the service refuses a send from a client that has not joined.
+ *
+ * On a member-addressed direct message (`chat:dm:a:b`) the gateway admits only
+ * its two members (`ChatService._checkDmMembership`, no service bypass), so a
+ * caller posting there passes the person the post is for (see
+ * `documents/chatRunCard.ts`). A refusal is the answer, not a slow reply: the
+ * dm gate's error frame has no channel, so ANY chat error on this
+ * single-purpose socket throws `ChatRefusedError` with the gateway's reason at
+ * once. No join ack or no `sent` ack within the timeout throws too — this
+ * used to return normally after two silent 2 s waits, and a refused card
+ * read as posted.
+ */
+export async function postChatMessage(input: { channel: string; message: string; metadata?: Record<string, unknown>; identity?: ServiceIdentity; gatewayUrl?: string; timeoutMs?: number }): Promise<void> {
+  const client = historyClientFactory(input.identity ?? PIPELINE_IDENTITY, input.gatewayUrl);
+  const timeoutMs = input.timeoutMs ?? 2000;
+  try {
+    await client.connect();
+  } catch (err) {
+    throw new Error(`gateway connection failed: ${describeError(err)}`);
+  }
+  try {
+    const refusedOrThrow = (reply: GatewayFrame | null, what: string): void => {
+      if (!reply) throw new Error(`the chat service did not answer the ${what} for ${input.channel} (timeout after ${timeoutMs}ms)`);
+      const refused = chatErrorOf(reply);
+      if (refused) throw new ChatRefusedError(input.channel, refused.code, refused.message, 'post to');
+    };
+    client.send({ service: 'chat', action: 'join', channel: input.channel });
+    // The joined ack (or the join's history replay) is the signal the subscription is in place.
+    refusedOrThrow(await client.waitFor((f) => isChatFrame(f, 'joined', input.channel) || isChatFrame(f, 'history', input.channel) || !!chatErrorOf(f), timeoutMs), 'join');
+    client.send({ service: 'chat', action: 'send', channel: input.channel, message: input.message, metadata: input.metadata ?? {} });
+    // The service acks the sender with `sent`; the fan-out `message` frame nests the record.
+    refusedOrThrow(await client.waitFor((f) => isChatFrame(f, 'sent', input.channel)
+      || (isChatFrame(f, 'message', input.channel) && (f.message === input.message || (f.message as ChatHistoryMessage | undefined)?.message === input.message))
+      || !!chatErrorOf(f), timeoutMs), 'send');
+  } finally {
+    await client.close();
+  }
 }
 
 /**

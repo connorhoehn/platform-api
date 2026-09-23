@@ -1,4 +1,4 @@
-import { ChatRefusedError, _setHistoryClientFactory, readChatHistory, type GatewayFrame, type GatewayServiceClient, type ServiceIdentity } from '../GatewayServiceClient';
+import { ChatRefusedError, _setHistoryClientFactory, postChatMessage, readChatHistory, type GatewayFrame, type GatewayServiceClient, type ServiceIdentity } from '../GatewayServiceClient';
 
 /** A gateway socket that answers each frame with `reply(frame)` (or nothing). */
 function fakeGateway(reply: (frame: GatewayFrame) => GatewayFrame | null) {
@@ -69,5 +69,43 @@ describe('readChatHistory', () => {
       return client as unknown as GatewayServiceClient;
     });
     await expect(readChatHistory({ channel: DM })).rejects.toThrow(/^gateway connection failed/);
+  });
+});
+
+// NFR #42: a post the gateway refuses fails at once with its reason, never as a silent timeout.
+describe('postChatMessage', () => {
+  const person: ServiceIdentity = { userId: 'dev-connor', displayName: 'Connor', kind: 'person' };
+
+  test('joins, sends and resolves on the sent ack, as the identity given', async () => {
+    const gw = fakeGateway((f) => (f.action === 'join' ? { type: 'chat', action: 'joined', channel: DM }
+      : f.action === 'send' ? { type: 'chat', action: 'sent', channel: DM } : null));
+    _setHistoryClientFactory(gw.make);
+    await postChatMessage({ channel: DM, message: '/summarize x', metadata: { kind: 'agent-run' }, identity: person });
+    expect(gw.identities).toEqual([person]);
+    expect(gw.sent.map((f) => f.action)).toEqual(['join', 'send']);
+  });
+
+  test('a DM refusal (error frame with no channel) throws ChatRefusedError in well under 100 ms', async () => {
+    const gw = fakeGateway(() => ({ type: 'error', service: 'chat', error: { code: 'CHAT_DM_FORBIDDEN', message: 'You are not a member of this direct-message channel' } }));
+    _setHistoryClientFactory(gw.make);
+    const t0 = Date.now();
+    const err = await postChatMessage({ channel: DM, message: 'x' }).catch((e: unknown) => e);
+    expect(Date.now() - t0).toBeLessThan(100);
+    expect(err).toBeInstanceOf(ChatRefusedError);
+    expect((err as ChatRefusedError).code).toBe('CHAT_DM_FORBIDDEN');
+    expect((err as Error).message).toMatch(/refused to post to chat:dm:dev-connor:dev-frank: You are not a member/);
+    expect(gw.sent.map((f) => f.action)).toEqual(['join']);
+  });
+
+  test('a send refused after the join is also thrown', async () => {
+    const gw = fakeGateway((f) => (f.action === 'join' ? { type: 'chat', action: 'joined', channel: 'room:r' }
+      : { type: 'error', service: 'chat', error: { code: 'CHANNEL_CLOSED', message: 'closed' } }));
+    _setHistoryClientFactory(gw.make);
+    await expect(postChatMessage({ channel: 'room:r', message: 'x' })).rejects.toThrow(/refused to post to room:r: closed \(CHANNEL_CLOSED\)/);
+  });
+
+  test('no ack is a timeout error, not a silent success', async () => {
+    _setHistoryClientFactory(fakeGateway(() => null).make);
+    await expect(postChatMessage({ channel: 'room:r', message: 'x', timeoutMs: 20 })).rejects.toThrow(/did not answer the join .*timeout after 20ms/);
   });
 });

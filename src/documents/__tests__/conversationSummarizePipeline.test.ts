@@ -110,4 +110,13 @@ describe('the publish step', () => {
     // The run context rides along so the post can step down when the client posted the card.
     expect((postCard.mock.calls[0] as unknown[])[0]).toMatchObject({ context: { chatChannel: 'room:x' } });
   });
+
+  it('a refused card (NFR #42) is on the step output as cardError; the run still completes with its page', async () => {
+    const postCard = jest.fn(async () => ({ posted: false, as: 'person' as const, code: 'CHAT_DM_FORBIDDEN', error: 'the chat service refused to post to chat:dm:a:b: not a member (CHAT_DM_FORBIDDEN)' }));
+    const h = createSummarizePublishHandler({ postCard });
+    const out = await h.execute({ id: 'publish', type: SUMMARIZE_PUBLISH_KIND, data: {} } as never,
+      { chatChannel: 'chat:dm:a:b', documentId: 'doc-1', messageCount: 2, requestedBy: 'a', steps: { apply: { title: 'T', applied: 1 } } },
+      { runId: 'run-9', emit: async () => undefined } as never);
+    expect(out).toMatchObject({ status: 'completed', output: { posted: false, cardErrorCode: 'CHAT_DM_FORBIDDEN', cardError: expect.stringMatching(/refused to post/), result: { kind: 'document', documentId: 'doc-1' } } });
+  });
 });

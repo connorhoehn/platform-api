@@ -251,6 +251,7 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
       await postRunCardToChannel({
         channel: input.channel, runId: started.runId, pipelineId: def.pipelineId,
         command: trigger, instruction: pendingInstruction, extra,
+        requester: { userId: input.requestedBy, displayName: input.requestedByName },
       });
     }
     log.info({ runId: started.runId, pipelineId: def.pipelineId, trigger, channel: input.channel, userId: input.requestedBy }, 'chat command accepted; the command starts its own run');
@@ -337,7 +338,8 @@ export async function runChatCommand(rawInput: ChatCommandRunInput): Promise<Cha
   // The client that posts the card itself gets the metadata and no duplicate from here.
   if (def.postCard !== false && input.clientPostsCard !== true) {
     const { kind: _k, command: _c, instruction: _i, runId: _r, pipelineId: _p, ...extra } = card;
-    await postRunCardToChannel({ channel: input.channel, runId, pipelineId: def.pipelineId, command: trigger, instruction, extra });
+    // On a DM the card goes in as the requester (the gateway admits only the DM's members); a refusal is logged at error level.
+    await postRunCardToChannel({ channel: input.channel, runId, pipelineId: def.pipelineId, command: trigger, instruction, extra, requester: { userId: input.requestedBy, displayName: input.requestedByName } });
   }
   log.info({ runId, pipelineId: def.pipelineId, trigger, channel: input.channel, userId: input.requestedBy }, 'chat command run triggered');
   return { runId, pipelineId: def.pipelineId, card };

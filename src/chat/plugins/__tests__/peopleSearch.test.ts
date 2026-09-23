@@ -9,7 +9,9 @@ jest.mock('../../../repositories', () => ({
   profileRepo: { listProfiles: (...a: unknown[]) => mockListProfiles(...a) },
 }));
 jest.mock('../../../documents/chatRunCard', () => ({
-  postRunCardToChannel: (...args: unknown[]) => mockPostCard(...args),
+  postRunCard: (...args: unknown[]) => mockPostCard(...args),
+  runCardOutcomeOf: jest.requireActual('../../../documents/chatRunCard').runCardOutcomeOf,
+  runCardOutputOf: jest.requireActual('../../../documents/chatRunCard').runCardOutputOf,
   runCardMetadata: (i: { runId: string; command: string; extra?: Record<string, unknown> }) => ({ kind: 'agent-run', runId: i.runId, command: i.command, ...(i.extra ?? {}) }),
   str: (v: unknown) => (typeof v === 'string' && v ? v : undefined),
 }));

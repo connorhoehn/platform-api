@@ -13,7 +13,7 @@ import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { readChatHistory, type ChatHistoryMessage } from '../gateway/GatewayServiceClient';
 import { DOCUMENT_APPLY_KIND } from './documentAgentPipeline';
-import { postRunCardToChannel, runCardMetadata, str } from './chatRunCard';
+import { postRunCard, runCardMetadata, runCardOutcomeOf, runCardOutputOf, str, type RunCardInput, type RunCardPostOutcome } from './chatRunCard';
 
 export const CONVERSATION_SUMMARIZE_PIPELINE_ID = 'conversation-summarize';
 export const CHAT_READ_HISTORY_KIND = 'chat:read-history';
@@ -122,8 +122,8 @@ export function createChatReadHistoryHandler(deps: { readHistory?: typeof readCh
 }
 
 /** Last step: the card in the thread — `/summarize <title> — <n> messages` — carrying the page's id. */
-export function createSummarizePublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): DescribedStepHandler {
-  const post = deps.postCard ?? postRunCardToChannel;
+export function createSummarizePublishHandler(deps: { postCard?: (input: RunCardInput) => Promise<boolean | RunCardPostOutcome> } = {}): DescribedStepHandler {
+  const post = deps.postCard ?? postRunCard;
   return {
     kind: SUMMARIZE_PUBLISH_KIND,
     description:
@@ -144,11 +144,12 @@ export function createSummarizePublishHandler(deps: { postCard?: typeof postRunC
         extra: { documentId: ctx.documentId, title, messageCount: count, applied },
         context: ctx,
       };
-      const posted = await post(cardInput);
+      // A refused post (a DM that would not admit the sender) is on the step's output as `cardError`, not swallowed.
+      const cardOutcome = runCardOutcomeOf(await post(cardInput));
       // The card's 'Open' target — the run-result convention (src/pipeline/runResult.ts).
       const resultDocumentId = typeof ctx.documentId === 'string' && ctx.documentId ? ctx.documentId : undefined;
       const result = resultDocumentId ? { kind: 'document' as const, documentId: resultDocumentId } : undefined;
-      return { status: 'completed', output: { posted, card: runCardMetadata(cardInput), title, messageCount: count, applied, ...(result ? { result } : {}) } };
+      return { status: 'completed', output: { ...runCardOutputOf(cardOutcome), card: runCardMetadata(cardInput), title, messageCount: count, applied, ...(result ? { result } : {}) } };
     },
   };
 }

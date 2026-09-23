@@ -27,7 +27,7 @@ import type { DescribedStepHandler } from '../../pipeline/customStepHandlers';
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import type { ProfileItem } from '../../repositories';
 import { profileRepo } from '../../repositories';
-import { postRunCardToChannel, runCardMetadata, str } from '../../documents/chatRunCard';
+import { postRunCard, runCardMetadata, runCardOutcomeOf, runCardOutputOf, str, type RunCardInput, type RunCardPostOutcome } from '../../documents/chatRunCard';
 import { registerChatCommandPipeline, type ChatCommandPipeline } from '../chatCommandRegistry';
 import type { ChatCommandPlugin } from '../chatCommandPlugin';
 
@@ -167,8 +167,8 @@ export function createPeopleSearchHandler(deps: { source?: PeopleSource } = {}):
 }
 
 /** Step 2: the card in the thread — `/search 3 people match "kubernetes"` — carrying the panel to open. */
-export function createPeoplePublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): DescribedStepHandler {
-  const post = deps.postCard ?? postRunCardToChannel;
+export function createPeoplePublishHandler(deps: { postCard?: (input: RunCardInput) => Promise<boolean | RunCardPostOutcome> } = {}): DescribedStepHandler {
+  const post = deps.postCard ?? postRunCard;
   return {
     kind: PEOPLE_PUBLISH_KIND,
     description:
@@ -191,8 +191,9 @@ export function createPeoplePublishHandler(deps: { postCard?: typeof postRunCard
         extra: { result, query: str(ctx.query) ?? '', terms, matched: n },
         context: ctx,
       };
-      const posted = await post(cardInput);
-      return { status: 'completed', output: { posted, card: runCardMetadata(cardInput), matched: n, instruction, result } };
+      // A refused post (a DM that would not admit the sender) is on the step's output as `cardError`, not swallowed.
+      const cardOutcome = runCardOutcomeOf(await post(cardInput));
+      return { status: 'completed', output: { ...runCardOutputOf(cardOutcome), card: runCardMetadata(cardInput), matched: n, instruction, result } };
     },
   };
 }

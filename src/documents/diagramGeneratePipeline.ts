@@ -21,7 +21,7 @@ const Y = require('yjs') as typeof YT;
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
 import { CANVAS_META_KEY } from './documentAgentOps';
-import { postRunCardToChannel, runCardMetadata, str } from './chatRunCard';
+import { postRunCard, runCardMetadata, runCardOutcomeOf, runCardOutputOf, str, type RunCardInput, type RunCardPostOutcome } from './chatRunCard';
 import log from '../lib/logger';
 
 export const DIAGRAM_GENERATE_PIPELINE_ID = 'diagram-generate';
@@ -351,8 +351,8 @@ export function createDiagramApplyHandler(): DescribedStepHandler {
 }
 
 /** Last step: the card in the thread — `/diagram <title>` — carrying the document's id. */
-export function createDiagramPublishHandler(deps: { postCard?: typeof postRunCardToChannel } = {}): DescribedStepHandler {
-  const post = deps.postCard ?? postRunCardToChannel;
+export function createDiagramPublishHandler(deps: { postCard?: (input: RunCardInput) => Promise<boolean | RunCardPostOutcome> } = {}): DescribedStepHandler {
+  const post = deps.postCard ?? postRunCard;
   return {
     kind: DIAGRAM_PUBLISH_KIND,
     description:
@@ -371,10 +371,11 @@ export function createDiagramPublishHandler(deps: { postCard?: typeof postRunCar
         extra: { documentId: ctx.documentId, title, elements },
         context: ctx,
       };
-      const posted = await post(cardInput);
+      // A refused post (a DM that would not admit the sender) is on the step's output as `cardError`, not swallowed.
+      const cardOutcome = runCardOutcomeOf(await post(cardInput));
       const resultDocumentId = typeof ctx.documentId === 'string' && ctx.documentId ? ctx.documentId : undefined;
       const result = resultDocumentId ? { kind: 'document' as const, documentId: resultDocumentId } : undefined;
-      return { status: 'completed', output: { posted, card: runCardMetadata(cardInput), title, elements, ...(result ? { result } : {}) } };
+      return { status: 'completed', output: { ...runCardOutputOf(cardOutcome), card: runCardMetadata(cardInput), title, elements, ...(result ? { result } : {}) } };
     },
   };
 }
