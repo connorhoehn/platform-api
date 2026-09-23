@@ -560,7 +560,15 @@ export class WorkGraphOrchestrator {
       issuedAt: now,
       expiresAt: new Date(Date.parse(now) + CURSOR_LIFETIME_MS).toISOString(),
     });
-    const nodes = authorization.nodes.slice().sort((a, b) => a.id.localeCompare(b.id)).slice(0, 250);
+    // The contract holds 250 nodes and a day can authorize more (connor's
+    // 2026-09-23 had 159 revisions and 78 runs by 17:00 UTC). The cut used to
+    // be by id, which is a hash, so the run a reader was watching for was
+    // dropped by chance while a seeded revision from the morning was kept
+    // (NFR #128). Newest work first, with the id as the tiebreak so two
+    // replicas answer the same snapshot for the same authorization.
+    const nodes = authorization.nodes.slice()
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
+      .slice(0, 250);
     const nodeIds = new Set(nodes.map((node) => node.id));
     const edges = authorization.edges.slice()
       .sort((a, b) => a.id.localeCompare(b.id))

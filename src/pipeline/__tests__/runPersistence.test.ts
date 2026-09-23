@@ -573,7 +573,7 @@ describe('RunPersistenceService — event paths not yet covered', () => {
     // (13 events — DC-25 added pipeline:run:checkpoint, and the agent loop
     // added pipeline:step:started, pipeline:step:agent:iteration and
     // pipeline:step:deck:produced)
-    expect(bus.subscribe.mock.calls.length).toBe(14);
+    expect(bus.subscribe.mock.calls.length).toBe(18);
   });
 
   it('getStaleRunIds returns runs whose lastEventAt is before the cutoff', async () => {

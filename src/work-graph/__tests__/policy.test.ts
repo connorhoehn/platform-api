@@ -83,4 +83,89 @@ describe('work graph policy', () => {
     );
     expect(result.nodes).toEqual([expect.objectContaining({ id: 'node-1', title: 'Private document' })]);
   });
+
+  describe('work on a shared document after the grant named it (NFR #125)', () => {
+    const t = (id: string, kind: 'document' | 'change' | 'run' | 'conversation', source: 'document' | 'pipeline' | 'conversation', resourceId: string) => ({
+      id, organizationId: 'org-1', actorId: 'owner-1', kind, sourceRef: { source, resourceId },
+      policyRef: `${source}:${resourceId}`, title: id, status: 'running' as const, updatedAt: now, sourceEventId: `event-${id}`, revision: 1,
+    });
+    const e = (id: string, fromId: string, toId: string, relation: 'edited' | 'produced' | 'derived-from' | 'runs-in') => ({
+      id, organizationId: 'org-1', actorId: 'owner-1', fromId, toId, relation, policyRef: `edge:${id}`,
+      status: 'running' as const, updatedAt: now, sourceEventId: `event-${id}`, provenance: 'source-event' as const, revision: 1,
+    });
+    // The deck the grant named, then a run that edited it this morning: the
+    // run, its two steps, the revision the write step saved, and the chat the
+    // run was asked in — none of which the grant could have listed.
+    const later: WorkProjectionState = {
+      ...projection,
+      nodes: {
+        deck: t('deck', 'document', 'document', 'deck-1'),
+        rev: t('rev', 'change', 'document', 'deck-1:v2'),
+        run: t('run', 'run', 'pipeline', 'run-9'),
+        load: t('load', 'run', 'pipeline', 'run-9::load'),
+        write: t('write', 'run', 'pipeline', 'run-9::write'),
+        chat: t('chat', 'conversation', 'conversation', 'dm-1'),
+        other: t('other', 'document', 'document', 'deck-2'),
+        otherRun: t('otherRun', 'run', 'pipeline', 'run-8'),
+      },
+      edges: {
+        edited: e('edited', 'rev', 'deck', 'edited'),
+        produced: e('produced', 'write', 'deck', 'produced'),
+        runProduced: e('runProduced', 'run', 'deck', 'produced'),
+        loadOf: e('loadOf', 'load', 'run', 'derived-from'),
+        writeOf: e('writeOf', 'write', 'run', 'derived-from'),
+        writeAfterLoad: e('writeAfterLoad', 'write', 'load', 'derived-from'),
+        askedIn: e('askedIn', 'run', 'chat', 'derived-from'),
+        otherProduced: e('otherProduced', 'otherRun', 'other', 'produced'),
+      },
+    };
+    const allow = (source: 'document' | 'pipeline' | 'conversation'): WorkSourceAclAdapter => ({ ...adapter, source });
+    const adapters = new Map<'document' | 'pipeline' | 'conversation', WorkSourceAclAdapter>([
+      ['document', allow('document')], ['pipeline', allow('pipeline')], ['conversation', allow('conversation')],
+    ]);
+    const ids = (items: Array<{ id: string }>) => items.map((item) => item.id).sort();
+
+    it('discloses the run, its steps and the revision to the grant\'s audience, at the grant\'s disclosure', async () => {
+      const result = await authorizeWorkGraph(
+        later, scope, [grant({ selection: { nodeIds: ['deck'], edgeIds: [], disclosure: 'summary' } })], adapters, now,
+      );
+      expect(ids(result.nodes)).toEqual(['deck', 'load', 'rev', 'run', 'write']);
+      expect(ids(result.edges)).toEqual(['edited', 'loadOf', 'produced', 'runProduced', 'writeAfterLoad', 'writeOf']);
+      expect(new Set(result.nodes.map((node) => node.disclosure))).toEqual(new Set(['summary']));
+    });
+
+    it('widens to nothing the grant did not touch: not the chat the run read, not another deck', async () => {
+      const result = await authorizeWorkGraph(
+        later, scope, [grant({ selection: { nodeIds: ['deck'], edgeIds: [], disclosure: 'details' } })], adapters, now,
+      );
+      expect(ids(result.nodes)).not.toEqual(expect.arrayContaining(['chat', 'other', 'otherRun']));
+      expect(ids(result.edges)).not.toContain('askedIn');
+      const named = await authorizeWorkGraph(
+        later, scope, [grant({ selection: { nodeIds: ['chat', 'run'], edgeIds: [], disclosure: 'details' } })], adapters, now,
+      );
+      // A grant on a run or a conversation derives nothing: only a document
+      // carries the work done to it.
+      expect(ids(named.nodes)).toEqual(['chat', 'run']);
+    });
+
+    it('still answers a source that denies the derived work, and a viewer with no grant sees nothing', async () => {
+      const denyPipeline: WorkSourceAclAdapter = {
+        ...adapter,
+        source: 'pipeline',
+        async authorizeDisclosure(currentScope, targets) {
+          return new Map(targets.map((target) => [target.id, {
+            targetId: target.id, decision: 'deny' as const, policyRevision: currentScope.policyRevision,
+          }]));
+        },
+      };
+      const denied = await authorizeWorkGraph(
+        later, scope, [grant({ selection: { nodeIds: ['deck'], edgeIds: [], disclosure: 'details' } })],
+        new Map([['document', allow('document')], ['pipeline', denyPipeline]]), now,
+      );
+      expect(ids(denied.nodes)).toEqual(['deck', 'rev']);
+      const stranger = await authorizeWorkGraph(later, scope, [], adapters, now);
+      expect(stranger.nodes).toEqual([]);
+      expect(stranger.edges).toEqual([]);
+    });
+  });
 });

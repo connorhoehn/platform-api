@@ -11,6 +11,7 @@ import type {
 } from '../repositories/WorkSharingRepository';
 import type { WorkCollaborationCapability } from '../repositories/WorkCollaborationRepository';
 import { filterForViewer } from '@connorhoehn/realtime-modules/work-graph';
+import { parsePipelineStepResourceId } from './sources/mapPipeline';
 
 export type WorkDisclosure = 'existence' | 'summary' | 'details';
 export type WorkPolicyDecision = 'allow' | 'deny' | 'unavailable';
@@ -144,12 +145,61 @@ export function sourcesForWorkTarget(target: WorkAclTarget): WorkSourceKind[] {
   return [...new Set(target.endpointRefs.map((ref) => ref.source))];
 }
 
+function ownNode(projection: WorkProjectionState, node: StoredWorkNode | undefined): node is StoredWorkNode {
+  return !!node
+    && !node.deletedAt
+    && node.organizationId === projection.organizationId
+    && node.actorId === projection.actorId;
+}
+
+/**
+ * The work that changed a shared document after the grant named it.
+ *
+ * A grant selects node ids, and ids are minted when work happens: a run that
+ * edits a deck the owner shared this morning has a node id no grant could
+ * have listed, so a reader watching "Connor's activity" saw the deck and not
+ * the edit happening to it (NFR #125). The rule lives here, in the
+ * projection's disclosure, and in no client: a grant on a document covers
+ * what changes that document — the revisions written to it (`edited` into
+ * it), the run that wrote them (`produced` it, from the run or from one of
+ * its steps) and that run's other steps — at the grant's own disclosure and
+ * still subject to every source's own ACL. Nothing else widens: not what
+ * the run read, not the workspace it ran in, not another document it wrote.
+ * A grant that names no document derives nothing.
+ */
+function derivedNodeIds(projection: WorkProjectionState, selectedNodes: ReadonlySet<string>): Set<string> {
+  const derived = new Set<string>();
+  const runIds = new Set<string>();
+  for (const edge of Object.values(projection.edges)) {
+    if (edge.deletedAt
+      || edge.organizationId !== projection.organizationId
+      || edge.actorId !== projection.actorId
+      || !selectedNodes.has(edge.toId)) continue;
+    const document = projection.nodes[edge.toId];
+    const from = projection.nodes[edge.fromId];
+    if (!ownNode(projection, document) || document.kind !== 'document' || !ownNode(projection, from)) continue;
+    if (edge.relation === 'edited' && from.kind === 'change' && from.sourceRef.source === 'document') {
+      derived.add(from.id);
+    } else if (edge.relation === 'produced' && from.kind === 'run' && from.sourceRef.source === 'pipeline') {
+      runIds.add(parsePipelineStepResourceId(from.sourceRef.resourceId).runId);
+    }
+  }
+  if (runIds.size === 0) return derived;
+  for (const node of Object.values(projection.nodes)) {
+    if (!ownNode(projection, node) || node.kind !== 'run' || node.sourceRef.source !== 'pipeline') continue;
+    if (runIds.has(parsePipelineStepResourceId(node.sourceRef.resourceId).runId)) derived.add(node.id);
+  }
+  return derived;
+}
+
 function selectedTargets(
   projection: WorkProjectionState,
   selection: SharingSelection,
 ): Map<string, WorkAclTarget> {
   const targets = new Map<string, WorkAclTarget>();
-  const selectedNodes = new Set(selection.nodeIds);
+  const named = new Set(selection.nodeIds);
+  const derived = derivedNodeIds(projection, named);
+  const selectedNodes = new Set([...named, ...derived]);
   const selectedEdges = new Set(selection.edgeIds);
 
   for (const node of Object.values(projection.nodes)) {
@@ -167,10 +217,13 @@ function selectedTargets(
   }
 
   for (const edge of Object.values(projection.edges)) {
-    if (!selectedEdges.has(edge.id)
-      || edge.deletedAt
+    if (edge.deletedAt
       || edge.organizationId !== projection.organizationId
       || edge.actorId !== projection.actorId) continue;
+    // A derived node's relationships were never in the grant's list either:
+    // an edge is in when the grant named it, or when it touches derived work
+    // and stays inside the widened set.
+    if (!selectedEdges.has(edge.id) && !(derived.has(edge.fromId) || derived.has(edge.toId))) continue;
     const from = projection.nodes[edge.fromId];
     const to = projection.nodes[edge.toId];
     // Missing, deleted, or unselected endpoints fail closed before any ACL call.

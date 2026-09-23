@@ -61,6 +61,9 @@ const WORK_GRAPH_STEP_REFRESH_MS = 60_000;
  * it. "Pipeline run" names nothing and is never what this returns when there
  * is anything better to say.
  */
+/** The statuses a pause or a resume may move between; anything else has ended. */
+const LIVE_RUN_STATUSES: ReadonlySet<string> = new Set(['pending', 'running', 'awaiting_approval', 'paused_at_breakpoint']);
+
 function runTitle(state: { workGraph?: RunWorkGraphPlan; instruction?: string }): string | undefined {
   const name = state.workGraph?.title;
   const instruction = state.instruction?.trim();
@@ -329,6 +332,27 @@ export class RunPersistenceService {
       await this.handleAgentIteration(event.payload).catch((err) => {
         log.warn({ err: String(err) }, 'failed to record step:agent:iteration');
       });
+    });
+
+    // NFR #126: a run that stops to wait is not running. Nothing projected
+    // these before, so the run node kept its `started` lifecycle from the
+    // start until the end, and a run paused at a breakpoint read "Running"
+    // for as long as it sat there. The pause and the resume are lifecycle
+    // transitions like any other: the row and the graph both follow them.
+    dedupedBus.subscribe('pipeline:step:breakpoint', async (event) => {
+      await this.markRunLifecycle(event.payload.runId, 'paused_at_breakpoint', event.payload.at);
+    });
+    dedupedBus.subscribe('pipeline:approval:requested', async (event) => {
+      await this.markRunLifecycle(event.payload.runId, 'awaiting_approval', event.payload.at);
+    });
+    dedupedBus.subscribe('pipeline:approval:recorded', async (event) => {
+      // A rejection ends the run through `pipeline:run:completed` (status
+      // `rejected`); only an approval puts it back to work.
+      if (event.payload.decision !== 'approve') return;
+      await this.markRunLifecycle(event.payload.runId, 'running', event.payload.at);
+    });
+    dedupedBus.subscribe('pipeline:run:resumed', async (event) => {
+      await this.markRunLifecycle(event.payload.runId, 'running', event.payload.at);
     });
 
     // LLM cost tracking — correlate prompt (has model) with response (has tokens)
@@ -1440,6 +1464,9 @@ export class RunPersistenceService {
       ...(state.workGraph?.conversationId
         ? { inputRefs: [{ source: 'conversation' as const, resourceId: state.workGraph.conversationId }] }
         : {}),
+      // What the run is writing, declared by the command that started it, so
+      // the run is joined to its document before a revision exists.
+      ...(state.workGraph?.produces?.length ? { producesRefs: state.workGraph.produces } : {}),
       // The run has to be nameable: it is what an effort anchors on when the
       // conversation it came from is not in this person's graph.
       ...(safeLabel ? { safeLabel } : {}),
@@ -1645,6 +1672,30 @@ export class RunPersistenceService {
    * again — but no more than once a minute, since the lease outlives that by
    * five.
    */
+  /**
+   * The run paused (a breakpoint, an approval gate) or picked up again. Only
+   * an in-flight run moves: a terminal state is never reopened by a late
+   * delivery, and a run this replica does not hold is left to its holder,
+   * whose own persistence sees the same bus event.
+   */
+  private async markRunLifecycle(
+    runId: string,
+    status: 'paused_at_breakpoint' | 'awaiting_approval' | 'running',
+    occurredAt: string,
+  ): Promise<void> {
+    const state = this.runCache.get(runId);
+    if (!state) return;
+    if (!LIVE_RUN_STATUSES.has(state.status) || state.status === status) return;
+    // The step that started after the pause is the resume seen from the
+    // step's side; a `running` that is older than the pause is a late copy.
+    if (status === 'running' && !(Date.parse(occurredAt) >= Date.parse(state.lastEventAt ?? ''))) return;
+    state.status = status;
+    this.touchLastEvent(runId, occurredAt);
+    await this.persistRun(state);
+    await this.publishWorkGraphLifecycle(state, occurredAt)
+      .catch((err) => log.warn({ runId, status, err: String(err) }, 'run projection failed'));
+  }
+
   private async markWorkGraphStep(
     runId: string,
     stepId: string,
@@ -1653,6 +1704,10 @@ export class RunPersistenceService {
   ): Promise<void> {
     const state = this.runCache.get(runId);
     if (!state || !state.workGraph) return;
+    // A step starting is the run working again, whichever wait it was in.
+    if (status === 'running' && (state.status === 'paused_at_breakpoint' || state.status === 'awaiting_approval')) {
+      await this.markRunLifecycle(runId, 'running', occurredAt);
+    }
     const previous = state.stepLifecycle[stepId];
     // NFR #34: a `running` that is not newer than the step's terminal state is
     // a late or repeated delivery, not a re-run — never regress a finished step.

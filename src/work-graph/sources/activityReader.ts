@@ -109,13 +109,17 @@ function runStatus(value: unknown): PipelineRunFacts['status'] {
     case 'running':
     case 'resuming':
       return 'running';
+    // NFR #126: a run stopped at a breakpoint or an approval gate is waiting
+    // on a person, which is neither running nor stopped.
     case 'waiting':
     case 'paused':
     case 'pending':
+    case 'paused_at_breakpoint':
+    case 'awaiting_approval':
       return 'waiting';
+    // Spending the budget is how a bounded run finishes, not how it fails.
     case 'completed':
     case 'succeeded':
-    // Spending the budget is how a bounded run finishes, not how it fails.
     case 'budget':
       return 'completed';
     case 'failed':

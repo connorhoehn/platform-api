@@ -378,7 +378,14 @@ deckRouter.post('/revise-run', requireAuth, asyncHandler(async (req: Request, re
     const definition = buildDeckReviseDefinition();
     const plan = workGraphPlanFromDefinition(definition);
     // Named after the deck; the projection appends the instruction itself.
-    const workGraph = plan ? { ...plan, title: `Edit ${(row.title ?? 'presentation').replace(/\s+/g, ' ').slice(0, 70)}` } : undefined;
+    const workGraph = plan
+      ? {
+        ...plan,
+        title: `Edit ${(row.title ?? 'presentation').replace(/\s+/g, ' ').slice(0, 70)}`,
+        // The deck this run edits, from the start (NFR #125).
+        produces: [{ source: 'document' as const, resourceId: documentId }],
+      }
+      : undefined;
     const requestedByName = typeof body.requestedByName === 'string' && body.requestedByName.trim() ? body.requestedByName.trim().slice(0, 80) : userId;
     const out = await Promise.resolve(bridge.trigger({
       pipelineId: DECK_REVISE_PIPELINE_ID,

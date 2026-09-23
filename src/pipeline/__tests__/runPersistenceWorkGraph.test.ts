@@ -233,6 +233,79 @@ describe('a step says where it is running and what it wrote', () => {
   });
 });
 
+describe('a run that edits a document is joined to it from its first announcement (NFR #125)', () => {
+  beforeEach(() => { publisher.pipeline.mockClear(); });
+
+  it('carries the plan\'s `produces` on every run record, and never on a plan that names none', async () => {
+    const { service, emit } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'deck-revise', userId: 'dev-connor', triggerType: 'manual', at: AT, organizationId: 'dev-org',
+      workGraph: { ...plan, produces: [{ source: 'document', resourceId: 'deck-1' }] },
+    });
+    await emit('pipeline:run:started', { runId: RUN, pipelineId: 'deck-revise', at: AT, triggeredBy: { triggerType: 'manual', userId: 'dev-connor' } });
+    await emit('pipeline:step:breakpoint', { runId: RUN, stepId: 'agent:s2', at: '2026-09-21T18:01:00.000Z' });
+    const runs = published().filter((record) => record.kind === 'pipeline-run');
+    expect(runs).toHaveLength(2);
+    for (const record of runs) expect(record.producesRefs).toEqual([{ source: 'document', resourceId: 'deck-1' }]);
+    publisher.pipeline.mockClear();
+    const other = harness();
+    other.service.registerTrigger({ runId: 'plain-run', pipelineId: 'chat-agent-loop', userId: 'dev-connor', triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan });
+    await other.emit('pipeline:run:started', { runId: 'plain-run', pipelineId: 'chat-agent-loop', at: AT, triggeredBy: { triggerType: 'manual', userId: 'dev-connor' } });
+    expect(published().find((record) => record.kind === 'pipeline-run')).not.toHaveProperty('producesRefs');
+  });
+});
+
+describe('a run that stops to wait is not running (NFR #126)', () => {
+  beforeEach(() => { publisher.pipeline.mockClear(); });
+
+  async function startedRun() {
+    const { service, emit, repository } = harness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'deck-revise', userId: 'dev-connor',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan,
+    });
+    await emit('pipeline:run:started', {
+      runId: RUN, pipelineId: 'deck-revise', at: AT,
+      triggeredBy: { triggerType: 'manual', userId: 'dev-connor', payload: { instruction: 'shorten the title' } },
+    });
+    publisher.pipeline.mockClear();
+    repository.put.mockClear();
+    return { emit, repository };
+  }
+  const runRecords = () => published().filter((record) => record.kind === 'pipeline-run')
+    .map((record) => (record.run as { status: string }).status);
+
+  it('projects a breakpoint as the run waiting, and the next step starting as it running again', async () => {
+    const { emit, repository } = await startedRun();
+    await emit('pipeline:step:breakpoint', { runId: RUN, stepId: 'agent:s2', at: '2026-09-21T18:01:00.000Z' });
+    expect(runRecords()).toEqual(['paused_at_breakpoint']);
+    // The row says the same, so a replica that reloads the run agrees.
+    expect((repository.put.mock.calls.at(-1)?.[0] as { status: string }).status).toBe('paused_at_breakpoint');
+    await emit('pipeline:step:started', { runId: RUN, stepId: 'agent:s2', at: '2026-09-21T18:02:00.000Z' });
+    expect(runRecords()).toEqual(['paused_at_breakpoint', 'running']);
+  });
+
+  it('projects an approval gate as waiting until the approval is recorded; a rejection is not a resume', async () => {
+    const { emit } = await startedRun();
+    await emit('pipeline:approval:requested', { runId: RUN, stepId: 'agent:s1', approvers: [], at: '2026-09-21T18:01:00.000Z' });
+    await emit('pipeline:approval:recorded', { runId: RUN, stepId: 'agent:s1', userId: 'dev-frank', decision: 'reject', at: '2026-09-21T18:01:30.000Z' });
+    expect(runRecords()).toEqual(['awaiting_approval']);
+    await emit('pipeline:approval:recorded', { runId: RUN, stepId: 'agent:s1', userId: 'dev-frank', decision: 'approve', at: '2026-09-21T18:02:00.000Z' });
+    expect(runRecords()).toEqual(['awaiting_approval', 'running']);
+  });
+
+  it('ignores a resume older than the pause, a repeated pause, and a run it does not hold', async () => {
+    const { emit } = await startedRun();
+    await emit('pipeline:step:breakpoint', { runId: RUN, stepId: 'agent:s2', at: '2026-09-21T18:01:00.000Z' });
+    await emit('pipeline:step:breakpoint', { runId: RUN, stepId: 'agent:s2', at: '2026-09-21T18:01:00.000Z' });
+    await emit('pipeline:run:resumed', { runId: RUN, pipelineId: 'deck-revise', frontier: [], at: '2026-09-21T18:00:30.000Z' });
+    await emit('pipeline:step:breakpoint', { runId: 'someone-elses-run', stepId: 'agent:s2', at: '2026-09-21T18:01:00.000Z' });
+    expect(runRecords()).toEqual(['paused_at_breakpoint']);
+    await emit('pipeline:run:resumed', { runId: RUN, pipelineId: 'deck-revise', frontier: [], at: '2026-09-21T18:03:00.000Z' });
+    expect(runRecords()).toEqual(['paused_at_breakpoint', 'running']);
+  });
+});
+
 describe('a run that fails before it has a plan or an instruction to be named after', () => {
   beforeEach(() => { publisher.pipeline.mockClear(); });
 

@@ -22,6 +22,15 @@ export interface RunWorkGraphPlan {
    * falls back to anchoring on when the conversation is not there.
    */
   title?: string;
+  /**
+   * What the run is there to write, named before any step has written it —
+   * the deck a composer edit is editing. The run's `produced` relationship to
+   * that document exists from its first announcement, so a reader who was
+   * shown the document is shown the edit happening to it (NFR #125); until
+   * now that relationship only appeared once a revision was saved, and a run
+   * paused before its write step was connected to nothing.
+   */
+  produces?: Array<{ source: 'document'; resourceId: string }>;
   steps: Array<{
     /** The definition node id the executor reports, e.g. `agent:s1`. */
     stepId: string;
