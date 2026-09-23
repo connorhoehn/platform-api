@@ -211,4 +211,32 @@ describe('NFR #59 — resume follows the owner\'s lease, not the sweep interval'
       jest.useRealTimers();
     }
   });
+
+  it('NFR #71: an everyMs task re-runs alone on the leader, so a sitting leader notices a peer\'s death without waiting for the interval', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = createMemoryLeaseStore();
+      const runs: string[] = [];
+      const tasks = [
+        { name: 'orphan-scan-and-resume', everyMs: 9_000, run: async () => { runs.push('orphan'); } },
+        { name: 'deck-blob-sweep', run: async () => { runs.push('deck'); } },
+      ];
+      const leader = new ClusterSweeper({ store, ownerId: 'A', tasks, intervalMs: 60_000, ttlMs: 9_000 });
+      const follower = new ClusterSweeper({ store, ownerId: 'B', tasks: [{ name: 'orphan-scan-and-resume', everyMs: 9_000, run: async () => { runs.push('B'); } }], intervalMs: 60_000, ttlMs: 9_000 });
+      leader.start();
+      await jest.advanceTimersByTimeAsync(0);
+      follower.start();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(runs).toEqual(['orphan', 'deck']);
+      await jest.advanceTimersByTimeAsync(28_000);
+      // Three extra orphan scans on the leader, no deck sweep, nothing on the follower.
+      expect(runs).toEqual(['orphan', 'deck', 'orphan', 'orphan', 'orphan']);
+      await leader.stop();
+      await follower.stop();
+      await jest.advanceTimersByTimeAsync(20_000);
+      expect(runs).toHaveLength(5); // stopped: the cadence timers are gone too
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });

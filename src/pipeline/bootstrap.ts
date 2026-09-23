@@ -110,6 +110,7 @@ import { DevboxAgentClient, devboxBaseUrl, takeRunLab } from './agent/DevboxAgen
 import { failOrphanedLoops } from '../chat/agentLoopRunner';
 import {
   ClusterSweeper,
+  REPLICA_LEASE_TTL_MS,
   ReplicaHeartbeat,
   createMemoryLeaseStore,
   isOwnerLive,
@@ -1178,7 +1179,13 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     // interrupts — and then re-executes — the other pod's in-flight runs.
     let resumeRanOnce = false;
     let nextOwnerExpiry = Infinity;
-    clusterSweepTasks.push({ name: 'orphan-scan-and-resume', run: () => scanOrphanedRuns({
+    // NFR #71: the leader re-scans every lease TTL (one status-GSI query), so
+    // a peer that dies while this replica already leads is noticed within
+    // ~TTL of its lease lapsing, not at the next 60 s sweep.
+    const orphanScanEveryMs = Number(process.env.PLATFORM_ORPHAN_SCAN_INTERVAL_MS) > 0
+      ? Number(process.env.PLATFORM_ORPHAN_SCAN_INTERVAL_MS)
+      : REPLICA_LEASE_TTL_MS;
+    clusterSweepTasks.push({ name: 'orphan-scan-and-resume', everyMs: orphanScanEveryMs, run: () => scanOrphanedRuns({
       repository: pipelineRunRepository,
       ...(Number.isFinite(resumeWindowMs) && (resumeWindowMs ?? 0) >= 0
         ? { resumeWindowMs: resumeWindowMs as number }

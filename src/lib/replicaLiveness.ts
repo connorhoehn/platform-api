@@ -176,6 +176,14 @@ export async function ownerLiveness(
 export interface SweepTask {
   name: string;
   run: () => Promise<void>;
+  /**
+   * Also run this task alone every `everyMs` while leader. For the orphan scan
+   * (NFR #71): with 2+ replicas the survivor is usually ALREADY the leader
+   * when a peer dies, so it neither re-claims (and scans) nor has a wake for a
+   * run it never saw; without this, resume waited for the next full sweep
+   * interval (measured 61.7 s on 2 replicas).
+   */
+  everyMs?: number;
 }
 
 /**
@@ -187,6 +195,7 @@ export class ClusterSweeper {
   private readonly lock: LeasedKVLock;
   private timer: NodeJS.Timeout | null = null;
   private claimTimer: NodeJS.Timeout | null = null;
+  private taskTimers: NodeJS.Timeout[] = [];
   private wake: { atMs: number; timer: NodeJS.Timeout } | null = null;
   private started = false;
   private running = false;
@@ -285,12 +294,22 @@ export class ClusterSweeper {
       if (!this.lock.isLeader()) void this.tick();
     }, Math.max(1_000, Math.floor((this.opts.ttlMs ?? REPLICA_LEASE_TTL_MS) / 3)));
     this.claimTimer.unref?.();
+    for (const task of this.opts.tasks) {
+      if (!(task.everyMs && task.everyMs > 0)) continue;
+      const timer = setInterval(() => {
+        if (this.lock.isLeader()) this.wakeAt(Date.now(), task.name);
+      }, task.everyMs);
+      timer.unref?.();
+      this.taskTimers.push(timer);
+    }
   }
 
   async stop(): Promise<void> {
     this.started = false;
     if (this.timer) clearInterval(this.timer);
     if (this.claimTimer) clearInterval(this.claimTimer);
+    for (const timer of this.taskTimers) clearInterval(timer);
+    this.taskTimers = [];
     if (this.wake) clearTimeout(this.wake.timer);
     this.wake = null;
     this.claimTimer = null;
