@@ -230,6 +230,22 @@ describe('deck-revise pipeline', () => {
     expect(published.at(-1)).toMatchObject({ type: 'pipeline:deck:revise:failed', payload: { status: 409, code: 'revision-conflict' } });
   });
 
+  it('rebases onto a head whose unchanged slide was stored in a different key order', () => {
+    // The head as DynamoDB hands it back: same content, keys in another order.
+    const reordered = (value: unknown): unknown => (Array.isArray(value)
+      ? value.map(reordered)
+      : value && typeof value === 'object'
+        ? Object.fromEntries(Object.entries(value as Record<string, unknown>).reverse().map(([k, v]) => [k, reordered(v)]))
+        : value);
+    const otherSlide = deck.slides.find((slide) => slide.id !== slideId)!;
+    const head = reordered({ ...deck, slides: deck.slides.map((slide) => (slide.id === otherSlide.id ? { ...slide, title: 'Theirs' } : slide)) }) as typeof deck;
+    const edited = { ...deck, slides: deck.slides.map((slide) => (slide.id === slideId ? { ...slide, title: 'Mine' } : slide)) };
+    const rebased = rebaseScopedEdit(deck, edited, head, slideId, undefined);
+    expect(rebased).not.toBeNull();
+    expect(rebased!.slides.find((slide) => slide.id === slideId)!.title).toBe('Mine');
+    expect(rebased!.slides.find((slide) => slide.id === otherSlide.id)!.title).toBe('Theirs');
+  });
+
   it('never rebases a deck-scoped edit', () => {
     const head = { ...deck, title: 'Someone else' };
     expect(rebaseScopedEdit(deck, { ...deck, title: 'Mine' }, head, undefined, undefined)).toBeNull();

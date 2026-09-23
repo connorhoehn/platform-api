@@ -221,7 +221,26 @@ function subscribeTerminalEvents(): void {
 // Rebase
 // ---------------------------------------------------------------------------
 
-const same = (a: unknown, b: unknown): boolean => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+/** A value with its object keys sorted, so two equal specs compare equal whatever their key order. */
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value as Record<string, unknown>).sort()
+      .filter((key) => (value as Record<string, unknown>)[key] !== undefined)
+      .map((key) => [key, canonical((value as Record<string, unknown>)[key])]));
+  }
+  return value;
+}
+
+/**
+ * Deep equality by content. Key order is NOT content: the load step's spec has
+ * the validator's key order, a head read back from DynamoDB has the order it
+ * was stored in, so a key-order-sensitive compare called every unchanged slide
+ * "changed" and no scoped edit ever rebased (live 2026-09-23, NFR loop 25: two
+ * runs on different slides of one deck, the second refused as "changed the same
+ * part"). Undefined-valued keys are absent, as they are once stored.
+ */
+export const same = (a: unknown, b: unknown): boolean => JSON.stringify(canonical(a ?? null)) === JSON.stringify(canonical(b ?? null));
 
 /**
  * The edit re-applied to a newer head, or null when it cannot be applied
