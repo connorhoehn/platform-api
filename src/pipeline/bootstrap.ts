@@ -82,6 +82,7 @@ import { createLLMClient } from './factories/LLMClientFactory';
 import { ExecutorAuditSubscriber } from './executor-audit-subscriber';
 import { startRunRollupSubscriber } from './run-rollup-subscriber';
 import { startApprovalForwarder } from './approval-forwarder';
+import { startRunControlForwarder } from './run-control-forwarder';
 import { auditRepo } from './audit-repository';
 import { setupFailureDetectorBridge } from './config/failureDetectorBridge';
 import {
@@ -1391,6 +1392,9 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // run reaches the owner over the cluster pubsub (and the rollup row, for a
   // dead owner's resume). Always on: with one replica it costs one subscription.
   const approvalForwarder = startApprovalForwarder({ nodeId, pubsub, runs: module, eventBus, rollup: runRollupSubscriber });
+  // NFR #120: cancel, breakpoint resolve and resume-from-step reach the replica
+  // that holds the run the same way (topic `pipeline.controls`, `controls` on the row).
+  const runControlForwarder = startRunControlForwarder({ nodeId, pubsub, runs: module, eventBus, rollup: runRollupSubscriber });
 
   // ── Judge aggregator subscriber ───────────────────────────────────────
   //
@@ -1483,6 +1487,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   const shutdownWithLeases = async (): Promise<void> => {
     clusterSweeperStopped = true;
     approvalForwarder.stop();
+    runControlForwarder.stop();
     await clusterSweeper.stop().catch(() => undefined);
     await replicaHeartbeat.stop().catch(() => undefined);
     await shutdown();

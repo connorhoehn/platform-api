@@ -89,6 +89,26 @@ export interface RollupApprovalDecision {
 /** Decisions kept per row; the oldest go first when a row would exceed it. */
 export const MAX_DECISIONS = 100;
 
+/**
+ * One run control (cancel, breakpoint resolve, resume-from-step) taken on a
+ * replica that does not own the run, kept on the row until the replica that
+ * holds the run applies it and releases it — or the run ends (NFR #120).
+ */
+export type RollupRunControl = {
+  controlId: string;
+  runId: string;
+  userId: string;
+  /** When it was taken. */
+  at: string;
+} & (
+  | { kind: 'cancel'; reason?: string }
+  | { kind: 'breakpoint'; stepId: string; action: 'continue' | 'step_over' | 'resume_all' }
+  | { kind: 'resume-from-step'; fromNodeId: string; breakpoints?: string[]; allowCompleted?: boolean }
+);
+
+/** Controls kept per row; the oldest go first when a row would exceed it. */
+export const MAX_CONTROLS = 100;
+
 export interface PipelineRunRollup {
   pipelineId: string;
   /** '' when the pipeline has never run (the sentinel row that stops the backfill probe). */
@@ -113,6 +133,8 @@ export interface PipelineRunRollup {
   pendingApprovals: number;
   /** Decisions waiting for the run's owner to apply them. Absent on rows written before it existed. */
   decisions?: RollupApprovalDecision[];
+  /** Run controls waiting for the replica that holds the run to apply them. Absent on rows written before it existed. */
+  controls?: RollupRunControl[];
   /**
    * The newest event time the row absorbed — or one millisecond past the
    * previous value when a change carried no newer time, so every write moves
@@ -138,6 +160,13 @@ export interface RunRollupEvent {
    * run's `recent` entry (the owner's lifecycle events do that).
    */
   decision?: RollupApprovalDecision;
+  /**
+   * A run control taken on a replica that does not hold the run. Like a
+   * decision, a control-only event touches `controls` and nothing else.
+   */
+  control?: RollupRunControl;
+  /** The holder applied (or refused) a control: release it from the row. */
+  controlReleased?: { controlId: string };
 }
 
 function byStartedAtDesc(a: RollupRecentRun, b: RollupRecentRun): number {
@@ -145,7 +174,7 @@ function byStartedAtDesc(a: RollupRecentRun, b: RollupRecentRun): number {
   return a.startedAt < b.startedAt ? 1 : -1;
 }
 
-function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number, updatedAt: string, approvals: RollupPendingApproval[] = [], decisions: RollupApprovalDecision[] = []): PipelineRunRollup {
+function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number, updatedAt: string, approvals: RollupPendingApproval[] = [], decisions: RollupApprovalDecision[] = [], controls: RollupRunControl[] = []): PipelineRunRollup {
   const sorted = [...recent].sort(byStartedAtDesc).slice(0, RECENT_LIMIT);
   const newest = sorted[0];
   return {
@@ -160,8 +189,37 @@ function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number,
     approvals,
     pendingApprovals: approvals.length,
     ...(decisions.length > 0 ? { decisions } : {}),
+    ...(controls.length > 0 ? { controls } : {}),
     updatedAt,
   };
+}
+
+/** The controls still waiting for a run, oldest first. */
+export function controlsFor(row: PipelineRunRollup | null, runId: string): RollupRunControl[] {
+  return (row?.controls ?? []).filter((c) => c.runId === runId);
+}
+
+/**
+ * The control set after one event. Returns the SAME array when nothing
+ * changes. A terminal run releases all of its controls; a release event
+ * removes one; a control event adds one unless its controlId is already
+ * there. `interrupted` / `stuck` keep them: the replica that resumes the run
+ * reads the row and applies them.
+ */
+function nextControls(list: RollupRunControl[], event: RunRollupEvent): RollupRunControl[] {
+  if (TERMINAL.has(event.status) && !event.control && !event.controlReleased) {
+    const kept = list.filter((c) => c.runId !== event.runId);
+    return kept.length === list.length ? list : kept;
+  }
+  if (event.controlReleased) {
+    const kept = list.filter((c) => c.controlId !== event.controlReleased!.controlId);
+    return kept.length === list.length ? list : kept;
+  }
+  const taken = event.control;
+  if (!taken) return list;
+  if (list.some((c) => c.controlId === taken.controlId)) return list;
+  const next = [...list, taken];
+  return next.length > MAX_CONTROLS ? next.slice(next.length - MAX_CONTROLS) : next;
 }
 
 /** The decisions still waiting for a run's gate, oldest first. */
@@ -231,6 +289,7 @@ export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRoll
   const base = existing ?? emptyRollup(event.pipelineId, event.at);
   const approvalsBefore = base.approvals ?? [];
   const decisionsBefore = base.decisions ?? [];
+  const controlsBefore = base.controls ?? [];
   const idx = base.recent.findIndex((r) => r.runId === event.runId);
   const recent = base.recent.slice();
   let runCount = base.runCount;
@@ -248,7 +307,16 @@ export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRoll
     if (cur !== undefined && TERMINAL.has(cur.status)) return existing ?? base;
     const decisions = nextDecisions(decisionsBefore, event, false);
     if (decisions === decisionsBefore) return existing ?? base;
-    return derive(base.pipelineId, recent, runCount, stamp(), approvalsBefore, decisions);
+    return derive(base.pipelineId, recent, runCount, stamp(), approvalsBefore, decisions, controlsBefore);
+  }
+  // A run control taken elsewhere, or released by its holder: the row's
+  // `controls` move, nothing else. A run that already ended takes none.
+  if (event.control || event.controlReleased) {
+    // (A resume-from-step is for a run that ended: it is the one control a terminal run takes.)
+    if (event.control && event.control.kind !== 'resume-from-step' && cur !== undefined && TERMINAL.has(cur.status)) return existing ?? base;
+    const controls = nextControls(controlsBefore, event);
+    if (controls === controlsBefore) return existing ?? base;
+    return derive(base.pipelineId, recent, runCount, stamp(), approvalsBefore, decisionsBefore, controls);
   }
 
   // A replayed `requested` that lands after its `recorded` is older than the
@@ -259,14 +327,16 @@ export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRoll
   const approvalsChanged = approvals !== approvalsBefore;
   const decisions = older && LIVE.has(event.status) ? decisionsBefore : nextDecisions(decisionsBefore, event, false);
   const decisionsChanged = decisions !== decisionsBefore;
-  const sideChanged = approvalsChanged || decisionsChanged;
+  const controls = older && LIVE.has(event.status) ? controlsBefore : nextControls(controlsBefore, event);
+  const controlsChanged = controls !== controlsBefore;
+  const sideChanged = approvalsChanged || decisionsChanged || controlsChanged;
   // One gate recorded while another on the same run still waits: the run is
   // still awaiting approval.
   const status: RollupRunStatus =
     event.approval && !event.approval.pending && approvals.some((a) => a.runId === event.runId)
       ? 'awaiting_approval'
       : event.status;
-  const touched = () => derive(base.pipelineId, recent, runCount, stamp(), approvals, decisions);
+  const touched = () => derive(base.pipelineId, recent, runCount, stamp(), approvals, decisions, controls);
 
   if (cur !== undefined) {
     // Terminal is final: a late `running`, `interrupted` or `stuck` for a run

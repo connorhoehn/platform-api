@@ -30,6 +30,7 @@ import { idempotency } from '../middleware/idempotency';
 import { withContext } from '../lib/logger';
 import { recordPipelineTrigger, recordPipelineError } from '../observability/metrics';
 import { getPipelineBridge } from './pipelineTriggers';
+import { forwardRunControl, runControlForwarder } from './runControlForwarding';
 import { normalizeRunStatus } from '@connorhoehn/pipeline-runtime';
 import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
 import { getSystemPipeline } from '../pipeline/systemPipelines';
@@ -174,6 +175,32 @@ pipelineResumeRouter.post(
       return;
     }
 
+    // NFR #120: only the executor that ran the failed run can rewind it. When
+    // that is another replica the control is forwarded there and answered 202
+    // once it acknowledges; when no replica has it any more, 409 run-not-resumable.
+    const controls = runControlForwarder();
+    if (controls) {
+      const handled = await forwardRunControl({
+        req, res, reqLog, forwarder: controls, runId, userId, pipelineId, allowTerminal: true, awaitAppliedMs: 5000,
+        control: ({ controlId, at }) => ({
+          kind: 'resume-from-step', controlId, runId, userId, at, fromNodeId,
+          ...(body.breakpoints !== undefined ? { breakpoints: body.breakpoints } : {}),
+          ...(allowCompleted ? { allowCompleted: true } : {}),
+        }),
+        onForwarded: ({ controlId, applied, appliedBy }) => {
+          recordPipelineTrigger();
+          fireAndForgetAudit({
+            action: 'pipeline.run.resumed-from-step',
+            actorUserId: userId,
+            pipelineId,
+            runId,
+            outcome: 'success',
+            details: { fromNodeId, forwarded: true, controlId, applied, appliedBy, ...(originalFailedStepId ? { originalFailedStepId } : {}), ...(allowCompleted ? { allowCompleted: true } : {}) },
+          });
+        },
+      });
+      if (handled) return;
+    }
     const span = tracer.startSpan('pipeline.resume_from_step', {
       attributes: {
         'pipeline.id': pipelineId,

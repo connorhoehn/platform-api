@@ -328,6 +328,16 @@ deckRouter.post('/revise-run', requireAuth, asyncHandler(async (req: Request, re
       sources.push({ kind: entry.kind, id: entry.id });
     }
   }
+  // Pause the run at these steps — the trigger route's own option, here so a
+  // paused deck-revise run can be looked at (and stopped) from Active Now.
+  let breakpoints: string[] | undefined;
+  const rawBreakpoints = (body as { breakpoints?: unknown }).breakpoints;
+  if (rawBreakpoints !== undefined) {
+    if (!Array.isArray(rawBreakpoints) || rawBreakpoints.length > 20 || !rawBreakpoints.every((b) => typeof b === 'string' && /^[a-z][a-z0-9_-]{0,40}$/i.test(b))) {
+      throw new ValidationError('breakpoints must be an array of step ids');
+    }
+    breakpoints = rawBreakpoints as string[];
+  }
 
   const userId = req.user!.sub;
   const channels = { document: `pipeline:run:${deckReviseChannelKey(documentId)}`, run: '' };
@@ -380,6 +390,7 @@ deckRouter.post('/revise-run', requireAuth, asyncHandler(async (req: Request, re
         ...(baseRevisionId !== undefined ? { baseRevisionId } : {}),
       },
       triggeredBy: { userId },
+      ...(breakpoints ? { breakpoints } : {}),
     } as never));
     const runId = (out as { runId: string }).runId;
     // The plan first: the run's first step is fast, and a step that finishes

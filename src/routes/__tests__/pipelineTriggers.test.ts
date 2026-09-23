@@ -62,6 +62,7 @@ jest.mock('../../lib/aws-clients', () => ({
 
 import { errorHandler } from '../../middleware/error-handler';
 import { setApprovalForwarder, type ApprovalForwarder } from '../../pipeline/approval-forwarder';
+import { setRunControlForwarder, type RunControlForwarder } from '../../pipeline/run-control-forwarder';
 import {
   pipelineTriggersRouter,
   pipelineApprovalsRouter,
@@ -1138,6 +1139,93 @@ describe('POST /pipelines/:pipelineId/runs/:runId/breakpoint/:stepId/resolve', (
       { body: { action: 'invalid-action' } },
     );
     expect(res.statusCode).toBe(400);
+    expect(resolveBreakpoint).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NFR #120 — cancel / breakpoint resolve on the replica that does not hold the run
+// ---------------------------------------------------------------------------
+describe('run controls on the replica that does not hold the run (NFR #120)', () => {
+  const forward = jest.fn(async (c: { controlId: string; kind: string }) => ({ message: { ...c, v: 1, type: 'control', fromReplica: 'node-b' }, applied: { v: 1, type: 'applied', controlId: c.controlId, runId: 'run-1', kind: c.kind, nodeId: 'node-a', ok: true, at: 'now' }, appliedInMs: 12, recorded: true }));
+  const canApply = jest.fn((_c: { kind: string; runId: string }) => false);
+  const release = jest.fn(async () => {});
+  const cancelRun = jest.fn();
+  const resolveBreakpoint = jest.fn();
+  const liveRow = { pipelineId: 'deck-revise', runId: 'run-1', status: 'running', ownerNodeId: 'node-a', triggeredBy: 'alice', triggerType: 'manual', startedAt: '2026-09-23T17:00:00.000Z' };
+
+  beforeEach(() => {
+    forward.mockClear();
+    canApply.mockReset();
+    canApply.mockReturnValue(false);
+    release.mockClear();
+    cancelRun.mockClear();
+    resolveBreakpoint.mockClear();
+    mockRunRepoGet.mockReset();
+    mockResolvePipelineId.mockReset();
+    mockResolvePipelineId.mockResolvedValue('deck-revise');
+    setRunControlForwarder({ forward, canApply, release } as unknown as RunControlForwarder);
+    setPipelineBridge({ getRun: async () => null, getHistory: async () => [], cancelRun, resolveBreakpoint });
+  });
+  afterEach(() => setRunControlForwarder(null));
+
+  test('cancel: 202 applied by the holder; the local bridge is never asked', async () => {
+    mockRunRepoGet.mockResolvedValue(liveRow);
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/cancel', { body: { reason: 'operator' }, userId: 'alice', headers: { 'Idempotency-Key': 'ctl-1' } });
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ controlId: 'ctl-1', kind: 'cancel', runId: 'run-1', pipelineId: 'deck-revise', ownerNodeId: 'node-a', forwarded: true, applied: true, appliedBy: 'node-a', appliedInMs: 12 });
+    expect(forward).toHaveBeenCalledWith(expect.objectContaining({ kind: 'cancel', controlId: 'ctl-1', runId: 'run-1', userId: 'alice', reason: 'operator', pipelineId: 'deck-revise' }), expect.anything());
+    expect(cancelRun).not.toHaveBeenCalled();
+  });
+
+  test('cancel: 202 recorded-not-applied when no replica acknowledges (owner dead: the resume path applies it)', async () => {
+    mockRunRepoGet.mockResolvedValue({ ...liveRow, status: 'interrupted' });
+    forward.mockResolvedValueOnce({ message: {}, applied: null, appliedInMs: null, recorded: true } as never);
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/cancel', { body: {}, userId: 'alice' });
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ kind: 'cancel', forwarded: true, recorded: true, applied: false, appliedBy: null, status: 'interrupted' });
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  test('cancel: 404 when no replica and no row know the run; 409 when the run already ended', async () => {
+    mockRunRepoGet.mockResolvedValue(null);
+    const missing = await run(buildApp(), 'POST', '/pipelines/run-1/cancel', { body: {}, userId: 'alice' });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.body).toMatchObject({ error: 'run-not-found', kind: 'cancel' });
+    mockRunRepoGet.mockResolvedValue({ ...liveRow, status: 'completed' });
+    const ended = await run(buildApp(), 'POST', '/pipelines/run-1/cancel', { body: {}, userId: 'alice' });
+    expect(ended.statusCode).toBe(409);
+    expect(ended.body).toMatchObject({ error: 'run-already-ended', status: 'completed' });
+    expect(forward).not.toHaveBeenCalled();
+  });
+
+  test('cancel: 503 when neither the row nor the wire took it; 409 when the holder refused', async () => {
+    mockRunRepoGet.mockResolvedValue(liveRow);
+    forward.mockRejectedValueOnce(new Error('redis down'));
+    const down = await run(buildApp(), 'POST', '/pipelines/run-1/cancel', { body: {}, userId: 'alice' });
+    expect(down.statusCode).toBe(503);
+    expect(down.body).toMatchObject({ error: 'run-control-forwarding-unavailable', kind: 'cancel' });
+    forward.mockResolvedValueOnce({ message: {}, applied: { ok: false, nodeId: 'node-a', error: 'InvalidRunStateError' }, appliedInMs: 3, recorded: true } as never);
+    const refused = await run(buildApp(), 'POST', '/pipelines/run-1/cancel', { body: {}, userId: 'alice' });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.body).toMatchObject({ error: 'run-control-refused', ownerNodeId: 'node-a', message: 'InvalidRunStateError' });
+  });
+
+  test('cancel: the local path is untouched when this replica holds the run', async () => {
+    canApply.mockReturnValue(true);
+    setPipelineBridge({ getRun: async () => ({ runId: 'run-1', pipelineId: 'deck-revise', status: 'cancelled' }) as never, getHistory: async () => [], cancelRun, resolveBreakpoint });
+    const res = await run(buildApp(), 'POST', '/pipelines/run-1/cancel', { body: {}, userId: 'alice' });
+    expect(res.statusCode).toBe(200);
+    expect(cancelRun).toHaveBeenCalledWith('run-1', 'alice');
+    expect(forward).not.toHaveBeenCalled();
+  });
+
+  test('breakpoint resolve: 202 forwarded with the step and action; the local bridge is never asked', async () => {
+    mockRunRepoGet.mockResolvedValue({ ...liveRow, status: 'paused_at_breakpoint' });
+    const res = await run(buildApp(), 'POST', '/pipelines/deck-revise/runs/run-1/breakpoint/write/resolve', { body: { action: 'step_over' }, userId: 'alice' });
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ kind: 'breakpoint', runId: 'run-1', pipelineId: 'deck-revise', forwarded: true, applied: true });
+    expect(forward).toHaveBeenCalledWith(expect.objectContaining({ kind: 'breakpoint', stepId: 'write', action: 'step_over', pipelineId: 'deck-revise' }), expect.anything());
     expect(resolveBreakpoint).not.toHaveBeenCalled();
   });
 });

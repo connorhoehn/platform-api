@@ -16,6 +16,7 @@ import { classifyPipelineError, type ErrorCategory } from '../pipeline/error-cla
 import { auditRepo, type AuditAction, type AuditDecision } from '../pipeline/audit-repository';
 import { getPipelineBridge, type PendingApprovalRow } from '../pipeline/bridge-types';
 import { getApprovalForwarder } from '../pipeline/approval-forwarder';
+import { forwardRunControl, runControlForwarder } from './runControlForwarding';
 import { getRunRollupSubscriber, lookupPipelineIdByRunId } from '../pipeline/run-rollup-subscriber';
 import { isLiveRollupStatus, isTerminalRollupStatus, normalizeRunStatus as normalizeRollupStatus } from '../pipeline/run-rollup';
 import { pipelineRunRollupRepo } from '../repositories/PipelineRunRollupRepository';
@@ -653,6 +654,30 @@ pipelineCancelRouter.post(
     }
 
     const bridge = getPipelineBridge();
+    // NFR #120: a run this replica's executor does not hold is cancelled by the
+    // replica that does — the control is recorded on the rollup row, published on
+    // the cluster pubsub, and answered 202 with whether it was applied (or 404 /
+    // 409 / 503 with a reason). Before, `module.cancelRun` ignored the unknown
+    // runId and the route answered 404 "run not found" for a run that exists.
+    const controls = runControlForwarder();
+    if (bridge?.cancelRun && controls) {
+      const handled = await forwardRunControl({
+        req, res, reqLog, forwarder: controls, runId, userId,
+        control: ({ controlId, at }) => ({ kind: 'cancel', controlId, runId, userId, at, ...(body.reason !== undefined ? { reason: body.reason } : {}) }),
+        onForwarded: ({ controlId, pipelineId, item, applied, appliedBy }) => {
+          recordPipelineCancel();
+          fireAndForgetAudit({
+            action: 'pipeline.cancel',
+            actorUserId: userId,
+            pipelineId,
+            runId,
+            decision: 'cancelled',
+            details: { forwarded: true, controlId, applied, appliedBy, ownerNodeId: item.ownerNodeId ?? null, ...(body.reason ? { reason: body.reason } : {}) },
+          });
+        },
+      });
+      if (handled) return;
+    }
     if (bridge?.cancelRun) {
       // Best-effort pipelineId derivation for audit/metrics: if the bridge
       // can hand us the snapshot we read it AFTER the cancel so we know
@@ -1450,6 +1475,24 @@ pipelineBreakpointRouter.post(
       return;
     }
 
+    // NFR #120: a run paused on another replica is resumed by that replica; a
+    // dead owner's recorded resolve is applied when the resumed run pauses again.
+    const controls = runControlForwarder();
+    if (controls) {
+      const handled = await forwardRunControl({
+        req, res, reqLog, forwarder: controls, runId, userId, pipelineId,
+        control: ({ controlId, at }) => ({ kind: 'breakpoint', controlId, runId, userId, at, stepId, action }),
+        onForwarded: ({ controlId, applied, appliedBy }) => fireAndForgetAudit({
+          action: 'pipeline.breakpoint.resolve',
+          actorUserId: userId,
+          pipelineId,
+          runId,
+          outcome: 'success',
+          details: { stepId, breakpointAction: action, forwarded: true, controlId, applied, appliedBy },
+        }),
+      });
+      if (handled) return;
+    }
     try {
       bridge.resolveBreakpoint(runId, stepId, action);
     } catch (err) {
