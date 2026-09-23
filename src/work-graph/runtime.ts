@@ -18,6 +18,7 @@ import type {
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { WorkGraphRepository, type WorkSourceKind } from '../repositories/WorkGraphRepository';
+import { publishProjectionChangedSignal } from '../services/work-graph-outbox-drainer';
 import { WorkSharingRepository, type SharingAudience } from '../repositories/WorkSharingRepository';
 import {
   WorkCollaborationRepository,
@@ -856,7 +857,11 @@ async function closeComputeSessions(
   } while (exclusiveStartKey);
 }
 
-const graphRepository = new WorkGraphRepository(docClient, projectWorkEvent);
+// The commit nudges gateways straight away over pub/sub; the outbox drainer's
+// copy of the same signal is the catch-up for a nudge that was lost.
+const graphRepository = new WorkGraphRepository(docClient, projectWorkEvent, (committed) => {
+  void publishProjectionChangedSignal(committed).catch(() => undefined);
+});
 const sharingRepository = new WorkSharingRepository(docClient);
 const collaborationRepository = new WorkCollaborationRepository(docClient);
 const directory = new DynamoWorkGraphDirectory(docClient);

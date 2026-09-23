@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 import { hostname } from 'os';
 import { docClient } from '../lib/aws-clients';
 import { catalog } from '../lib/event-catalog';
+import { getRedisClient } from '../lib/redis-client';
 import { WORK_GRAPH_TABLE } from '../lib/work-graph-dynamo';
 import log from '../lib/logger';
 
@@ -34,6 +35,43 @@ interface DrainerClient {
   send(command: ScanCommand | UpdateCommand | DeleteCommand): Promise<{ Items?: Record<string, unknown>[]; LastEvaluatedKey?: Record<string, unknown> }>;
 }
 
+/**
+ * distributed-core `RedisPubSubManager` topic the gateway listens on. The
+ * durable event above goes to the message queue, which hands each event to ONE
+ * consumer; a gateway replica holding a viewer's stream may not be it. This
+ * signal fans out to every replica so each can replay the streams it holds
+ * when — and only when — their person's projection moved, instead of polling.
+ */
+export const PROJECTION_CHANGED_SIGNAL_TOPIC = 'work-graph.projection.changed';
+/**
+ * The gateway runs its RedisPubSubManager with `channelPrefix: ''` (so its
+ * `websocket:*` channels keep their names), so the Redis channel IS the topic.
+ */
+const PUBSUB_CHANNEL_PREFIX = '';
+
+/**
+ * Best-effort. The payload names the person and the org, nothing about the
+ * work; a lost signal costs latency (the gateway's safety poll picks it up),
+ * never correctness, so a failure is logged and dropped.
+ */
+export async function publishProjectionChangedSignal(change: Pick<WorkGraphProjectionChanged, 'organizationId' | 'actorId' | 'day' | 'revision'>): Promise<void> {
+  const client = await getRedisClient();
+  if (!client) return;
+  // The wire shape RedisPubSubManager.publish produces, so its subscribers
+  // accept it (they drop anything without metadata.messageId).
+  const wire = {
+    topic: PROJECTION_CHANGED_SIGNAL_TOPIC,
+    payload: { organizationId: change.organizationId, actorId: change.actorId, day: change.day, revision: change.revision },
+    metadata: {
+      messageId: `pub-platform-api-${Date.now()}-${randomUUID()}`,
+      publisherNodeId: `platform-api@${hostname()}`,
+      timestamp: Date.now(),
+      topic: PROJECTION_CHANGED_SIGNAL_TOPIC,
+    },
+  };
+  await client.publish(PUBSUB_CHANNEL_PREFIX + PROJECTION_CHANGED_SIGNAL_TOPIC, JSON.stringify(wire));
+}
+
 function isConditionalFailure(error: unknown): boolean {
   return (error as { name?: string })?.name === 'ConditionalCheckFailedException';
 }
@@ -54,6 +92,8 @@ function parseRow(value: unknown): OutboxRow | null {
 export function createWorkGraphOutboxDrainer(options: {
   client?: DynamoDBDocumentClient;
   publish?: (eventName: string, payload: WorkGraphProjectionChanged) => Promise<void>;
+  /** The fan-out signal to gateway replicas; `null` turns it off. */
+  signal?: ((payload: WorkGraphProjectionChanged) => Promise<void>) | null;
   owner?: string;
   leaseMs?: number;
   batchSize?: number;
@@ -61,6 +101,7 @@ export function createWorkGraphOutboxDrainer(options: {
 } = {}) {
   const client = (options.client ?? docClient) as unknown as DrainerClient;
   const publish = options.publish ?? ((eventName, payload) => catalog.publish(eventName, payload));
+  const signal = options.signal === undefined ? publishProjectionChangedSignal : options.signal;
   const owner = options.owner ?? OWNER;
   const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   const batchSize = options.batchSize ?? 25;
@@ -119,6 +160,12 @@ export function createWorkGraphOutboxDrainer(options: {
           ExpressionAttributeValues: { ':outbox': 'outbox', ':owner': owner },
         }));
         published += 1;
+        if (signal) {
+          await signal(payload).catch((error: unknown) => log.warn(
+            { errMessage: error instanceof Error ? error.message : String(error), sourceEventId: row.sourceEventId },
+            'work-graph projection signal not sent; gateways will catch up on their safety poll',
+          ));
+        }
       } catch (error) {
         log.error(
           { errMessage: error instanceof Error ? error.message : String(error), sourceEventId: row.sourceEventId },

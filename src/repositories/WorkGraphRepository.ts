@@ -433,10 +433,24 @@ function revisionKey(revision: number): string {
  * DynamoDB-backed implementation of realtime-modules' frozen
  * WorkGraphRepository interface.
  */
+/** A projection revision that just committed — who, which day, which revision. */
+export interface WorkGraphCommitted {
+  organizationId: string;
+  actorId: string;
+  day: string;
+  revision: number;
+}
+
 export class WorkGraphRepository {
   constructor(
     private readonly docClient: DynamoDBDocumentClient,
     private readonly reduceEvent: WorkGraphReducer,
+    /**
+     * Told after each commit, fire-and-forget. The outbox row in the same
+     * transaction stays the durable record; this is the low-latency nudge,
+     * so live viewers do not wait for the outbox drainer's next scan.
+     */
+    private readonly onCommitted?: (committed: WorkGraphCommitted) => void,
   ) {}
 
   async loadProjection(
@@ -656,6 +670,11 @@ export class WorkGraphRepository {
 
     try {
       await this.docClient.send(new TransactWriteCommand({ TransactItems: writes }));
+      try {
+        this.onCommitted?.({ organizationId: next.organizationId, actorId: next.actorId, day, revision: next.revision });
+      } catch {
+        // A nudge that throws must never fail a commit that already landed.
+      }
       return next;
     } catch (error) {
       if (!isConditionalFailure(error)) throw error;

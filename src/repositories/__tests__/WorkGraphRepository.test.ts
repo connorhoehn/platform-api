@@ -279,6 +279,31 @@ describe('WorkGraphRepository', () => {
     expect(send.mock.calls.some(([command]) => command instanceof TransactWriteCommand)).toBe(false);
   });
 
+  it('nudges live viewers after a commit, and not after a failed one', async () => {
+    const committed = jest.fn();
+    const ok: Send = jest.fn(async (command: unknown) => {
+      if (command instanceof QueryCommand) return { Items: [] };
+      return {};
+    });
+    await new WorkGraphRepository(client(ok), reducer, committed).commitEvent(event, 0);
+    expect(committed).toHaveBeenCalledWith(expect.objectContaining({ revision: 1, day: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/) }));
+
+    const failing: Send = jest.fn(async (command: unknown) => {
+      if (command instanceof QueryCommand) return { Items: [] };
+      if (command instanceof TransactWriteCommand) throw new Error('throttled');
+      return {};
+    });
+    committed.mockClear();
+    await expect(new WorkGraphRepository(client(failing), reducer, committed).commitEvent(event, 0)).rejects.toThrow('throttled');
+    expect(committed).not.toHaveBeenCalled();
+  });
+
+  it('a nudge that throws does not fail the commit', async () => {
+    const send: Send = jest.fn(async (command: unknown) => (command instanceof QueryCommand ? { Items: [] } : {}));
+    const repository = new WorkGraphRepository(client(send), reducer, () => { throw new Error('redis gone'); });
+    await expect(repository.commitEvent(event, 0)).resolves.toMatchObject({ revision: 1 });
+  });
+
   it('converts a failed expected-revision transaction into a typed conflict', async () => {
     let getCount = 0;
     const send: Send = jest.fn(async (command: unknown) => {

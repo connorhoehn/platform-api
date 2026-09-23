@@ -2,6 +2,7 @@ import { DeleteCommand, DynamoDBDocumentClient, ScanCommand, UpdateCommand } fro
 import { createWorkGraphOutboxDrainer } from '../work-graph-outbox-drainer';
 
 jest.mock('../../lib/work-graph-dynamo', () => ({ WORK_GRAPH_TABLE: 'work-graph-test' }));
+jest.mock('../../lib/redis-client', () => ({ getRedisClient: async () => null }));
 jest.mock('../../lib/logger', () => ({
   __esModule: true,
   default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
@@ -108,5 +109,28 @@ describe('work-graph outbox drainer', () => {
     });
     await expect(drainer.drainOnce()).resolves.toBe(0);
     expect(send.mock.calls.some(([command]) => command instanceof DeleteCommand)).toBe(false);
+  });
+
+  it('signals every gateway after a durable publish, and a failed signal does not fail the drain', async () => {
+    const send = jest.fn(async (command: unknown) => command instanceof ScanCommand ? { Items: [row] } : {});
+    const publish = jest.fn().mockResolvedValue(undefined);
+    const signal = jest.fn().mockRejectedValue(new Error('redis down'));
+    const drainer = createWorkGraphOutboxDrainer({ client: { send } as unknown as DynamoDBDocumentClient, publish, signal });
+    await expect(drainer.drainOnce()).resolves.toBe(1);
+    expect(signal).toHaveBeenCalledWith(expect.objectContaining({ organizationId: 'org-1', actorId: 'actor-1', day: '2026-09-19', revision: 1 }));
+    // The row was still deleted: the durable event is what counts.
+    expect(send.mock.calls.some(([command]) => command instanceof DeleteCommand)).toBe(true);
+  });
+
+  it('sends no signal when the durable publish fails', async () => {
+    const send = jest.fn(async (command: unknown) => command instanceof ScanCommand ? { Items: [row] } : {});
+    const signal = jest.fn().mockResolvedValue(undefined);
+    const drainer = createWorkGraphOutboxDrainer({
+      client: { send } as unknown as DynamoDBDocumentClient,
+      publish: jest.fn().mockRejectedValue(new Error('mq down')),
+      signal,
+    });
+    await expect(drainer.drainOnce()).resolves.toBe(0);
+    expect(signal).not.toHaveBeenCalled();
   });
 });

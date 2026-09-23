@@ -87,7 +87,7 @@ realDescribe('work graph real DynamoDB integration', () => {
     ]);
 
     const publish = jest.fn().mockResolvedValue(undefined);
-    const outbox = createWorkGraphOutboxDrainer({ client: docClient, publish, batchSize: 100 });
+    const outbox = createWorkGraphOutboxDrainer({ client: docClient, publish, signal: null, batchSize: 100 });
     // This isolated local namespace is reusable across integration runs, so a
     // prior process may have left valid durable outbox rows. Drain bounded
     // batches until empty before checking this run's unique actor row.
