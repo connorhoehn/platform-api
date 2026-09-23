@@ -501,6 +501,8 @@ describe('work graph schemaVersion 2 route', () => {
     });
     const body = (await get(setup({ activityReader: renamed }), v2)).body as WorkGraphSnapshotV2;
     expect(body.nodes.find((node) => node.id === 'deck')?.title).toBe('audit-e2e-1790150600');
+    // Its revision nodes follow the document's name.
+    expect(body.nodes.find((node) => node.id === 'release-plan-v6')?.title).toBe('Release plan · revision');
   });
 
   it('keeps a document whose source records no per-revision slides exactly as it was', async () => {

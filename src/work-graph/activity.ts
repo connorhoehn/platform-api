@@ -555,6 +555,9 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
   // one projected `change` node per revision, so a revision the viewer may not
   // see never reaches the revision list.
   const revisionsByDocument = new Map<string, Array<{ id: string; label: string; createdAt: string }>>();
+  // A revision node is titled "<deck> · revision" from its event; renamed with
+  // its document below, so the two never disagree about what the deck is called.
+  const changeNodesByDocument = new Map<string, Array<{ title: string }>>();
   for (const node of detailed) {
     if (node.kind !== 'change') continue;
     const stored = storedNode(authorization, node.id);
@@ -562,6 +565,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     const separator = resourceId.lastIndexOf(':');
     if (stored?.sourceRef.source !== 'document' || separator <= 0) continue;
     const documentId = resourceId.slice(0, separator);
+    changeNodesByDocument.set(documentId, [...(changeNodesByDocument.get(documentId) ?? []), node]);
     const revisionId = resourceId.slice(separator + 1);
     const at = node.startedAt ?? node.updatedAt;
     revisionsByDocument.set(documentId, [
@@ -809,6 +813,11 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       // store's title wins wherever the store has one.
       const storedName = trim(facts?.name);
       if (storedName && storedName !== node.title) node.title = storedName;
+      if (storedName && documentId) {
+        for (const change of changeNodesByDocument.get(documentId) ?? []) {
+          if (change.title.endsWith(' · revision')) change.title = `${storedName} · revision`;
+        }
+      }
       const run = producingRun(index, node.id);
       const attention = documentId ? await reader.attention(documentId) : null;
       // What each revision is actually made of, as its own source recorded it.
