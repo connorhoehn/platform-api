@@ -22,6 +22,7 @@ import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platform
 import { workSourceAccountRepo } from '../repositories';
 import { SVG_CONTENT_TYPE } from '../deck/renderSlideSvg';
 import { previewDeckSpec } from '../deck/preview';
+import { healCitationTitles } from '../deck/citationTitles';
 import log from '../lib/logger';
 import {
   getPresentationDocumentStore,
@@ -173,13 +174,16 @@ documentRevisionsRouter.get('/:revisionId/spec', requireAuth, asyncHandler(async
   if (!revision.spec) {
     throw new AppError(409, `revision ${revision.id} was written before specs were stored, so it cannot be reopened for editing`);
   }
+  // Specs drafted before f100e61 cite a transcript by its call's wire id; the
+  // editor gets the human title, and its next save stores it.
+  const healed = await healCitationTitles(revision.spec, revision.sources ?? []);
   res.status(200).json({
     revisionId: revision.id,
     label: revision.label,
     createdAt: revision.createdAt,
     createdBy: revision.createdBy,
-    sources: revision.sources ?? [],
-    spec: revision.spec,
+    sources: healed.sources,
+    spec: healed.spec,
   });
 }));
 

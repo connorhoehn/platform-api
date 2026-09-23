@@ -42,6 +42,7 @@ import { PPTX_CONTENT_TYPE } from '../../deck/renderPptx';
 import { sampleDeck } from '../../deck/__tests__/fixtures';
 import { hidePptxNodeDetection } from '../../deck/__tests__/pptxTestEnv';
 import { MAX_SLIDES, type DeckSpec } from '../../deck/DeckSpec';
+import * as citationTitles from '../../deck/citationTitles';
 
 const PPTX_KEY = 'deck-doc-1-v1.pptx';
 const SVG_KEY = 'deck-doc-1-v1-cover.svg';
@@ -296,6 +297,32 @@ describe('GET /api/documents/:id/revisions/:rev/spec', () => {
 
   it('404s a revision the document does not list', async () => {
     expect((await request('/api/documents/doc-1/revisions/v9/spec')).status).toBe(404);
+  });
+
+  it('names a citation stored with a call wire id from its recording', async () => {
+    const lookup = jest.spyOn(citationTitles, 'lookupTranscriptTitle')
+      .mockImplementation(async (id: string) => (id === 'tr-planning' ? 'Call with Connor Hoehn & Frank Davis' : null));
+    const spec = sampleDeck();
+    spec.slides = spec.slides.map((slide) => ({ ...slide, sources: [{ documentId: 'tr-planning', title: 'dm:dev-connor:dev-frank' }] }));
+    const revisions = row.revisions!;
+    revisions.push({
+      ...revisions[0]!,
+      id: 'v-legacy',
+      label: 'v-legacy',
+      spec,
+      sources: [{ documentId: 'tr-planning', title: 'dm:dev-connor:dev-frank', kind: 'document' }],
+    });
+    try {
+      const res = await request('/api/documents/doc-1/revisions/v-legacy/spec');
+      expect(res.status).toBe(200);
+      const body = JSON.parse(res.body.toString('utf8')) as { spec: DeckSpec; sources: Array<{ title: string }> };
+      expect(new Set(body.spec.slides.flatMap((slide) => slide.sources.map((source) => source.title))))
+        .toEqual(new Set(['Call with Connor Hoehn & Frank Davis']));
+      expect(body.sources.map((source) => source.title)).toEqual(['Call with Connor Hoehn & Frank Davis']);
+    } finally {
+      revisions.pop();
+      lookup.mockRestore();
+    }
   });
 });
 

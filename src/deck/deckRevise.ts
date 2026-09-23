@@ -29,7 +29,7 @@ import {
   type DeckSlide, type DeckSource, type DeckSpec,
 } from './DeckSpec';
 import {
-  askModel, materialBlock, readFixtureMaterial,
+  WIRE_LOBBY, askModel, materialBlock, readFixtureMaterial,
   type FixtureMaterial, type ReadMaterialDeps,
 } from './deckFixture';
 
@@ -165,6 +165,7 @@ function rules(): string[] {
     '- A slide carries only the payload its layout is named after; bullets may appear on any slide. Omit fields you do not use.',
     '- EVERY slide cites at least one source, using the exact documentId listed below and nothing else.',
     '- Only state what the material says. Anything you add must come from the material; if the material does not support the instruction, change as little as possible and say so in "summary".',
+    '- When the instruction asks you to add something, add information the deck does not already state: an owner, a date, a number, a decision, a risk and its mitigation — taken from the material. Never add a rewording of a bullet or quote the deck already has. If the material holds nothing new for it, add nothing and say so in "summary".',
     '- Change only what the instruction asks for. Leave everything else exactly as it is.',
     '- "summary" is one short sentence saying what you changed, written for the person who asked.',
   ];
@@ -209,10 +210,49 @@ export function revisePrompt(input: DeckReviseInput, sources: ReadSource[]): str
   ].join('\n');
 }
 
+const STOPWORDS = new Set(['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'any', 'can', 'had', 'has', 'have', 'her', 'his', 'its', 'our', 'out', 'was', 'were', 'will', 'with', 'this', 'that', 'then', 'than', 'them', 'they', 'from', 'into', 'must', 'need', 'needs', 'should', 'would', 'could', 'been', 'being', 'what', 'when', 'which', 'who', 'about', 'there', 'their']);
+
+/** The content words of a line, with a leading "Speaker:" label dropped. */
+function contentWords(line: string): Set<string> {
+  const body = line.replace(/^\s*[A-Z][\w .'-]{0,40}:\s+/, '');
+  return new Set(body.toLowerCase().match(/[a-z0-9]+/g)?.filter((word) => word.length >= 3 && !STOPWORDS.has(word)) ?? []);
+}
+
+/**
+ * Bullets the edit added that say again what the deck already said — the
+ * words of the shorter line nearly all inside the longer one. The prompt asks
+ * for new information; this is how a person finds out when it was not given.
+ */
+export function restatedBullets(before: DeckSpec, after: DeckSpec): string[] {
+  const existing = before.slides.flatMap((slide) => [
+    ...(slide.bullets ?? []),
+    ...(slide.columns ?? []).flat(),
+    ...(slide.quote ? [slide.quote.text] : []),
+  ]);
+  const had = new Set(existing);
+  const olds = existing.map(contentWords).filter((words) => words.size >= 2);
+  const added = after.slides.flatMap((slide) => slide.bullets ?? []).filter((bullet) => !had.has(bullet));
+  return added.filter((bullet) => {
+    const words = contentWords(bullet);
+    if (words.size < 2) return false;
+    return olds.some((old) => {
+      let shared = 0;
+      for (const word of words) if (old.has(word)) shared += 1;
+      return shared / Math.min(words.size, old.size) >= 0.8;
+    });
+  });
+}
+
 /** Slides whose content differs, plus slides that are new. */
 export function changedSlides(before: DeckSpec, after: DeckSpec): string[] {
-  const old = new Map(before.slides.map((slide) => [slide.id, JSON.stringify(slide)]));
-  return after.slides.filter((slide) => old.get(slide.id) !== JSON.stringify(slide)).map((slide) => slide.id);
+  // A citation's title is a label, not content: renaming a wire-titled
+  // citation must not mark every slide as edited.
+  const key = (slide: DeckSlide) => JSON.stringify({
+    ...slide,
+    sources: slide.sources.map((source) => `${source.documentId}#${source.anchor ?? ''}`),
+  });
+  const old = new Map(before.slides.map((slide) => [slide.id, key(slide)]));
+  return after.slides.filter((slide) => old.get(slide.id) !== key(slide)).map((slide) => slide.id);
 }
 
 /**
@@ -243,7 +283,11 @@ export function validateReviseInputSpec(spec: unknown): { ok: true; spec: DeckSp
 
 export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = {}): Promise<DeckReviseResult> {
   const cited = deckSources(input.spec);
-  const titleOf = new Map(cited.map((source) => [source.documentId, source.title]));
+  // A citation still titled with a call's wire id (decks drafted before
+  // f100e61) is renamed from the source as read, like a new draft would be.
+  const titleOf = new Map(cited
+    .filter((source) => !WIRE_LOBBY.test(source.title.trim()))
+    .map((source) => [source.documentId, source.title]));
   const refs: DeckReviseSourceRef[] = [];
   const seen = new Set<string>();
   // The deck's own citations first: an edit is grounded in what the deck
@@ -335,6 +379,8 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
   if (removed.length) warnings.push(`Removed ${removed.length === 1 ? 'slide' : 'slides'}: ${removed.map((slide) => slide.title).join(', ')}.`);
   const titleChanged = spec.title !== input.spec.title || spec.subtitle !== input.spec.subtitle || spec.theme !== input.spec.theme;
   if (!changedSlideIds.length && !removed.length && !titleChanged) warnings.push('The agent returned the deck unchanged.');
+  const restated = restatedBullets(input.spec, spec);
+  if (restated.length) warnings.push(`${restated.map((bullet) => `"${bullet}"`).join(', ')} repeats what the deck already says.`);
 
   const summary = typeof parsed.summary === 'string' && parsed.summary.trim()
     ? parsed.summary.replace(/\s+/g, ' ').trim().slice(0, MAX_SUMMARY_CHARS)

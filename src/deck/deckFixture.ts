@@ -83,7 +83,7 @@ function clean(value: unknown, limit: number): string | undefined {
 }
 
 /** Lobby names that are wire ids (`dm:dev-connor:dev-frank`, `room:design`), never titles. */
-const WIRE_LOBBY = /^(dm|dmg|room|doc|call|lobby|chat):/i;
+export const WIRE_LOBBY = /^(dm|dmg|room|doc|call|lobby|chat):/i;
 
 /**
  * What a recording is called on a slide and in a citation. A `lobbyName` is

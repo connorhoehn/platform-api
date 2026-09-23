@@ -8,7 +8,7 @@ jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `tes
 
 import type { LLMClient } from '../../pipeline/LLMClient';
 import type { DeckSpec } from '../DeckSpec';
-import { DeckReviseError, changedSlides, reviseDeck, validateReviseInputSpec } from '../deckRevise';
+import { DeckReviseError, changedSlides, restatedBullets, reviseDeck, validateReviseInputSpec } from '../deckRevise';
 
 const TRANSCRIPT_ID = 'active-now-2026-09-22-planning-transcript';
 const RECORDING = {
@@ -150,5 +150,63 @@ describe('helpers', () => {
     const next = deck();
     next.slides[1] = { ...next.slides[1]!, bullets: ['Ship Friday'] };
     expect(changedSlides(deck(), next)).toEqual(['transcript']);
+  });
+});
+
+describe('reviseDeck — citations titled with a wire id (decks drafted before f100e61)', () => {
+  function legacy(): DeckSpec {
+    const spec = deck();
+    spec.slides = spec.slides.map((slide) => ({
+      ...slide,
+      sources: [{ documentId: TRANSCRIPT_ID, title: 'dm:dev-connor:dev-frank' }],
+    }));
+    return spec;
+  }
+
+  it('renames them from the transcript as read, without marking untouched slides as edited', async () => {
+    const answer = JSON.stringify({
+      summary: 'Added the rollback owner.',
+      slide: {
+        id: 'transcript', layout: 'bullets', title: 'What the planning call decided about the release',
+        bullets: ['Ship Thursday', 'Frank owns the gateway rollback plan'],
+        sources: [{ documentId: TRANSCRIPT_ID, title: 'dm:dev-connor:dev-frank' }],
+      },
+    });
+    const result = await reviseDeck(
+      { spec: legacy(), instruction: 'add who owns the rollback', slideId: 'transcript' },
+      { ...deps, llm: scripted(answer) },
+    );
+    expect(result.changedSlideIds).toEqual(['transcript']);
+    expect(result.spec.slides.flatMap((slide) => slide.sources.map((source) => source.title)))
+      .toEqual(['Call with Connor Hoehn & Frank Davis', 'Call with Connor Hoehn & Frank Davis']);
+  });
+});
+
+describe('reviseDeck — adding information, not rewording it', () => {
+  it('asks the model for new information and never a rewording', async () => {
+    const prompts: string[] = [];
+    const answer = JSON.stringify({ summary: 'x', slide: { ...deck().slides[1], title: 'Decisions' } });
+    await reviseDeck({ spec: deck(), instruction: 'shorter title', slideId: 'transcript' }, { ...deps, llm: scripted(answer, prompts) });
+    expect(prompts[0]).toMatch(/add information the deck does not already state/);
+    expect(prompts[0]).toMatch(/Never add a rewording/);
+  });
+
+  it('warns when an added bullet only restates a line already on the deck', async () => {
+    const before = deck();
+    before.slides[1] = { ...before.slides[1]!, bullets: ['Ship Thursday', 'Connor: Release risks before noon.'] };
+    const answer = JSON.stringify({
+      summary: 'Added a release-risk bullet.',
+      slide: { ...before.slides[1], bullets: [...before.slides[1]!.bullets!, 'Release risks must be identified before noon.'] },
+    });
+    const result = await reviseDeck({ spec: before, instruction: 'add a bullet about release risks', slideId: 'transcript' }, { ...deps, llm: scripted(answer) });
+    expect(result.warnings.join(' ')).toMatch(/"Release risks must be identified before noon\." repeats what the deck already says/);
+  });
+
+  it('does not flag a bullet that adds an owner or a fact', () => {
+    const before = deck();
+    before.slides[1] = { ...before.slides[1]!, bullets: ['Connor: Release risks before noon.'] };
+    const after = deck();
+    after.slides[1] = { ...before.slides[1]!, bullets: ['Connor: Release risks before noon.', 'Frank owns the gateway rollback plan'] };
+    expect(restatedBullets(before, after)).toEqual([]);
   });
 });
