@@ -1,7 +1,11 @@
-import { DeleteCommand, DynamoDBDocumentClient, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DeleteCommand, DynamoDBDocumentClient, QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { createWorkGraphOutboxDrainer } from '../work-graph-outbox-drainer';
 
-jest.mock('../../lib/work-graph-dynamo', () => ({ WORK_GRAPH_TABLE: 'work-graph-test' }));
+jest.mock('../../lib/work-graph-dynamo', () => ({
+  WORK_GRAPH_TABLE: 'work-graph-test',
+  WORK_GRAPH_OUTBOX_SHARDS: 4,
+  workGraphOutboxPartition: (shard: number) => `OUTBOX#${shard}`,
+}));
 jest.mock('../../lib/redis-client', () => ({ getRedisClient: async () => null }));
 jest.mock('../../lib/logger', () => ({
   __esModule: true,
@@ -53,7 +57,8 @@ describe('work-graph outbox drainer', () => {
     await drainer.drainOnce();
     await expect(drainer.drainOnce()).rejects.toThrow('DynamoDB unavailable');
     await expect(drainer.drainOnce()).resolves.toBe(1);
-    expect((send.mock.calls[2][0] as ScanCommand).input.ExclusiveStartKey).toEqual(key);
+    const scanCalls = send.mock.calls.map(([c]) => c).filter((c): c is ScanCommand => c instanceof ScanCommand);
+    expect(scanCalls[2].input.ExclusiveStartKey).toEqual(key);
   });
 
   it('coalesces overlapping timer and manual drains so the scan cursor cannot race', async () => {
@@ -65,6 +70,8 @@ describe('work-graph outbox drainer', () => {
     const drainer = createWorkGraphOutboxDrainer({ client: { send } as unknown as DynamoDBDocumentClient, publish });
     const first = drainer.drainOnce();
     const second = drainer.drainOnce();
+    // The shard Queries run first; wait until the legacy Scan is in flight.
+    while (!finish) await new Promise((resolve) => setImmediate(resolve));
     finish({ Items: [row] });
     await expect(Promise.all([first, second])).resolves.toEqual([1, 1]);
     expect(send.mock.calls.filter(([command]) => command instanceof ScanCommand)).toHaveLength(1);
@@ -81,11 +88,13 @@ describe('work-graph outbox drainer', () => {
       now: () => 1_000,
     });
     await expect(drainer.drainOnce()).resolves.toBe(1);
-    expect(send.mock.calls[1][0]).toBeInstanceOf(UpdateCommand);
+    // After the four (empty) shard Queries: Scan, claim, delete.
+    const writes = send.mock.calls.map(([c]) => c).filter((c) => !(c instanceof QueryCommand));
+    expect(writes[1]).toBeInstanceOf(UpdateCommand);
     expect(publish).toHaveBeenCalledWith('work-graph.projection.changed.v1', {
       organizationId: 'org-1', actorId: 'actor-1', day: '2026-09-19', revision: 1, sourceEventId: 'event-1',
     });
-    const removal = send.mock.calls[2][0] as DeleteCommand;
+    const removal = writes[2] as DeleteCommand;
     expect(removal.input.ConditionExpression).toContain('outboxLeaseOwner = :owner');
   });
 
@@ -132,5 +141,32 @@ describe('work-graph outbox drainer', () => {
     });
     await expect(drainer.drainOnce()).resolves.toBe(0);
     expect(signal).not.toHaveBeenCalled();
+  });
+});
+
+describe('NFR #27 — outbox shards are queried, the table scan retires', () => {
+  const shardRow = { ...row, PK: 'OUTBOX#2', SK: 'OUTBOX#2026-09-19T20:00:00.000Z#000000000001#event-1#WG#org-1#actor-1#2026-09-19' };
+
+  it('publishes a row from its shard with one Query per shard, whatever the table size', async () => {
+    const send = jest.fn(async (command: unknown) => {
+      if (command instanceof QueryCommand) return command.input.ExpressionAttributeValues?.[':pk'] === 'OUTBOX#2' ? { Items: [shardRow] } : { Items: [] };
+      if (command instanceof ScanCommand) return { Items: [] };
+      return {};
+    });
+    const publish = jest.fn().mockResolvedValue(undefined);
+    const drainer = createWorkGraphOutboxDrainer({ client: { send } as unknown as DynamoDBDocumentClient, publish });
+    await expect(drainer.drainOnce()).resolves.toBe(1);
+    const queries = send.mock.calls.filter(([c]) => c instanceof QueryCommand);
+    expect(queries).toHaveLength(4);
+    expect(publish).toHaveBeenCalledWith('work-graph.projection.changed.v1', expect.objectContaining({ sourceEventId: 'event-1' }));
+    expect(send.mock.calls.some(([c]) => c instanceof DeleteCommand && c.input.Key?.PK === 'OUTBOX#2')).toBe(true);
+  });
+
+  it('stops scanning after one full pass finds no legacy rows', async () => {
+    const send = jest.fn(async (command: unknown) => (command instanceof QueryCommand || command instanceof ScanCommand) ? { Items: [] } : {});
+    const drainer = createWorkGraphOutboxDrainer({ client: { send } as unknown as DynamoDBDocumentClient, publish: jest.fn() });
+    for (let i = 0; i < 3; i++) await drainer.drainOnce();
+    expect(send.mock.calls.filter(([c]) => c instanceof ScanCommand)).toHaveLength(1);
+    expect(send.mock.calls.filter(([c]) => c instanceof QueryCommand)).toHaveLength(12);
   });
 });

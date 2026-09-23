@@ -101,9 +101,13 @@ describe('WorkGraphRepository', () => {
       'NODE#node-1',
       'EVENT#pipeline#evt-1',
       'DELTA#000000000001',
-      'OUTBOX#000000000001#evt-1',
+      'OUTBOX#2026-09-20T03:30:01.000Z#000000000001#evt-1#WG#org-1#actor-1#2026-09-20',
       'META',
     ]);
+    // NFR #27: the outbox row lives in a drainer partition, pointing back.
+    const outbox = writes.find((write) => write.Put?.Item?.['itemKind'] === 'outbox')!.Put!.Item!;
+    expect(outbox['PK']).toMatch(/^OUTBOX#[0-3]$/);
+    expect(outbox['projectionPK']).toBe('WG#org-1#actor-1#2026-09-20');
     const eventPut = writes[1].Put!;
     expect(eventPut.ConditionExpression).toBe('attribute_not_exists(PK)');
     expect(eventPut.Item?.['ttl']).toBe(

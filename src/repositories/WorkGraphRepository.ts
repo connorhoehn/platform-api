@@ -7,6 +7,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { intervalOverlapsWorkDay, workDayWindow } from '@connorhoehn/realtime-modules/work-graph';
 import { tableName } from '../lib/ddb-table-name';
+import { workGraphOutboxPartition, workGraphOutboxShardFor } from '../lib/work-graph-dynamo';
 
 /**
  * These dependency-free shapes intentionally mirror realtime-modules'
@@ -621,8 +622,12 @@ export class WorkGraphRepository {
         Put: {
           TableName: WORK_GRAPH_TABLE,
           Item: {
-            PK: pk,
-            SK: `OUTBOX#${String(next.revision).padStart(12, '0')}#${event.eventId}`,
+            // NFR #27: a drainer partition, not the projection's — see
+            // workGraphOutboxPartition. The SK keeps FIFO order by receipt and
+            // stays unique per projection.
+            PK: workGraphOutboxPartition(workGraphOutboxShardFor(pk)),
+            SK: `OUTBOX#${event.receivedAt}#${String(next.revision).padStart(12, '0')}#${event.eventId}#${pk}`,
+            projectionPK: pk,
             itemKind: 'outbox',
             eventType: 'work-graph.projection.changed.v1',
             organizationId: next.organizationId,

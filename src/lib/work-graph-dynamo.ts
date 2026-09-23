@@ -11,6 +11,22 @@ import {
 import { tableName } from './ddb-table-name';
 
 export const WORK_GRAPH_TABLE = tableName('work-graph');
+
+/**
+ * NFR #27: outbox rows live in a few well-known partitions instead of beside
+ * their projection, so the drainer finds a new row with one Query per shard
+ * rather than a Scan of the whole table (2,191 items locally → a new row
+ * waited ~5 minutes). Sharded so a burst does not pin one hot partition.
+ */
+export const WORK_GRAPH_OUTBOX_SHARDS = 4;
+export function workGraphOutboxPartition(shard: number): string {
+  return `OUTBOX#${shard}`;
+}
+export function workGraphOutboxShardFor(projectionPk: string): number {
+  let h = 0;
+  for (let i = 0; i < projectionPk.length; i++) h = (h * 31 + projectionPk.charCodeAt(i)) | 0;
+  return Math.abs(h) % WORK_GRAPH_OUTBOX_SHARDS;
+}
 export const WORK_GRAPH_GRANT_LOOKUP_INDEX = 'work-graph-grant-lookup';
 export const WORK_GRAPH_COLLABORATION_LOOKUP_INDEX = 'work-graph-collaboration-lookup';
 export const WORK_GRAPH_TARGET_LOOKUP_INDEX = 'work-graph-target-lookup';

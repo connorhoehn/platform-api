@@ -1,6 +1,7 @@
 import {
   DeleteCommand,
   DynamoDBDocumentClient,
+  QueryCommand,
   ScanCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
@@ -9,7 +10,7 @@ import { hostname } from 'os';
 import { docClient } from '../lib/aws-clients';
 import { catalog } from '../lib/event-catalog';
 import { getRedisClient } from '../lib/redis-client';
-import { WORK_GRAPH_TABLE } from '../lib/work-graph-dynamo';
+import { WORK_GRAPH_OUTBOX_SHARDS, WORK_GRAPH_TABLE, workGraphOutboxPartition } from '../lib/work-graph-dynamo';
 import log from '../lib/logger';
 
 const OWNER = `${process.pid}@${hostname()}-${randomUUID()}`;
@@ -32,7 +33,7 @@ interface OutboxRow extends WorkGraphProjectionChanged {
 }
 
 interface DrainerClient {
-  send(command: ScanCommand | UpdateCommand | DeleteCommand): Promise<{ Items?: Record<string, unknown>[]; LastEvaluatedKey?: Record<string, unknown> }>;
+  send(command: QueryCommand | ScanCommand | UpdateCommand | DeleteCommand): Promise<{ Items?: Record<string, unknown>[]; LastEvaluatedKey?: Record<string, unknown> }>;
 }
 
 /**
@@ -132,7 +133,39 @@ export function createWorkGraphOutboxDrainer(options: {
     }
   }
 
-  async function drainPage(): Promise<number> {
+  // NFR #27: new rows are found by one Query per outbox shard. The Scan is
+  // kept only to drain rows written beside their projection by older code: it
+  // walks the table until one full pass finds none, then switches off.
+  let legacyActive = true;
+  let legacyFoundThisPass = 0;
+
+  async function drainShards(): Promise<number> {
+    let published = 0;
+    for (let shard = 0; shard < WORK_GRAPH_OUTBOX_SHARDS; shard += 1) {
+      const items: Record<string, unknown>[] = [];
+      let startKey: Record<string, unknown> | undefined;
+      let pages = 0;
+      do {
+        const result = await client.send(new QueryCommand({
+          TableName: WORK_GRAPH_TABLE,
+          KeyConditionExpression: 'PK = :pk',
+          // Skip rows another replica holds; a lapsed lease is retried.
+          FilterExpression: 'attribute_not_exists(outboxLeaseUntil) OR outboxLeaseUntil < :now',
+          ExpressionAttributeValues: { ':pk': workGraphOutboxPartition(shard), ':now': now() },
+          Limit: batchSize,
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }));
+        items.push(...(result.Items ?? []));
+        startKey = result.LastEvaluatedKey;
+        pages += 1;
+      } while (startKey && items.length < batchSize && pages < 4);
+      published += await publishRows(items.slice(0, batchSize));
+    }
+    return published;
+  }
+
+  async function drainLegacyPage(): Promise<number> {
+    if (!legacyActive) return 0;
     const result = await client.send(new ScanCommand({
       TableName: WORK_GRAPH_TABLE,
       FilterExpression: 'itemKind = :outbox',
@@ -140,8 +173,31 @@ export function createWorkGraphOutboxDrainer(options: {
       Limit: batchSize,
       ...(scanCursor ? { ExclusiveStartKey: scanCursor } : {}),
     }));
+    // Rows already in a shard partition are the Query's; count only strays.
+    const legacy = (result.Items ?? []).filter((item) => !/^OUTBOX#\d+$/.test(String(item.PK)));
+    // A row that will never parse would keep the scan on for ever; skip it.
+    legacyFoundThisPass += legacy.filter((item) => parseRow(item) !== null).length;
+    const published = await publishRows(legacy);
+    // Advance only after processing this bounded page. A scan/claim outage
+    // retries the page; failed publications stay leased for the next sweep.
+    scanCursor = result.LastEvaluatedKey;
+    if (!scanCursor) {
+      if (legacyFoundThisPass === 0) {
+        legacyActive = false;
+        log.info('work-graph outbox: no rows left outside the outbox partitions; table scan off');
+      }
+      legacyFoundThisPass = 0;
+    }
+    return published;
+  }
+
+  async function drainPage(): Promise<number> {
+    return (await drainShards()) + (await drainLegacyPage());
+  }
+
+  async function publishRows(values: Record<string, unknown>[]): Promise<number> {
     let published = 0;
-    for (const value of result.Items ?? []) {
+    for (const value of values) {
       const row = parseRow(value);
       if (!row || !(await claim(row))) continue;
       const payload: WorkGraphProjectionChanged = {
@@ -173,9 +229,6 @@ export function createWorkGraphOutboxDrainer(options: {
         );
       }
     }
-    // Advance only after processing this bounded page. A scan/claim outage
-    // retries the page; failed publications stay leased for the next sweep.
-    scanCursor = result.LastEvaluatedKey;
     return published;
   }
 
