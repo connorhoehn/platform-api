@@ -103,7 +103,10 @@ import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDeckStepHandlers } from '../deck/registerDeckHandlers';
-import { attachDeckReviseRunEvents } from '../deck/deckRevisePipeline';
+import { attachDeckReviseRunEvents, readRunRequest as readDeckReviseRequest } from '../deck/deckRevisePipeline';
+import { DECK_REVISE_PIPELINE_ID } from '../deck/deckReviseDefinition';
+import { getPresentationDocumentStore } from '../deck/presentationDocuments';
+import { auditEvidence, composeTerminalEvidence, deckReviseEvidence } from './runTerminalEvidence';
 import { createDeckBlobSweepTask } from '../deck/blobSweeper';
 import { buildLoopStepHandlers } from '../loop/registerLoopHandlers';
 import { DevboxAgentClient, devboxBaseUrl, takeRunLab } from './agent/DevboxAgentClient';
@@ -1185,8 +1188,27 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     const orphanScanEveryMs = Number(process.env.PLATFORM_ORPHAN_SCAN_INTERVAL_MS) > 0
       ? Number(process.env.PLATFORM_ORPHAN_SCAN_INTERVAL_MS)
       : REPLICA_LEASE_TTL_MS;
+    // NFR #101: a row can say running/interrupted after its run finished (a
+    // stale write, a lost terminal put). Both scans ask for proof first and
+    // write such a row terminal instead of re-running it.
+    const terminalEvidence = composeTerminalEvidence(
+      deckReviseEvidence({
+        pipelineId: DECK_REVISE_PIPELINE_ID,
+        readRequest: readDeckReviseRequest,
+        findRevisionForRequest: async (documentId, requestId) => {
+          const row = await getPresentationDocumentStore().get(documentId);
+          const hit = row?.revisions?.find((revision) => revision.producedBy?.requestId === requestId);
+          return hit ? { id: hit.id, ...(hit.createdAt ? { createdAt: hit.createdAt } : {}) } : null;
+        },
+      }),
+      auditEvidence(async (runId) => (await auditRepo.listByRun(runId, {
+        limit: 50,
+        actions: ['pipeline.run.completed', 'pipeline.run.failed', 'pipeline.run.cancelled'],
+      })).items),
+    );
     clusterSweepTasks.push({ name: 'orphan-scan-and-resume', everyMs: orphanScanEveryMs, run: () => scanOrphanedRuns({
       repository: pipelineRunRepository,
+      terminalEvidence,
       ...(Number.isFinite(resumeWindowMs) && (resumeWindowMs ?? 0) >= 0
         ? { resumeWindowMs: resumeWindowMs as number }
         : {}),
@@ -1220,6 +1242,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
           runPersistence: runPersistenceRef,
           definitionsRepo,
           nodeId,
+          terminalEvidence,
           ...(Number.isFinite(resumeWindowMs) && (resumeWindowMs ?? 0) >= 0
             ? { resumeWindowMs: resumeWindowMs as number }
             : {}),
@@ -1227,7 +1250,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
         if (resumeResult.scanned > 0) {
           logger.info(
             `boot resume: ${resumeResult.resumed} resumed / ${resumeResult.scanned} interrupted ` +
-              `(noCheckpoint=${resumeResult.skippedNoCheckpoint}, noDefinition=${resumeResult.skippedNoDefinition}, ` +
+              `(finished=${resumeResult.skippedFinished}, noCheckpoint=${resumeResult.skippedNoCheckpoint}, noDefinition=${resumeResult.skippedNoDefinition}, ` +
               `outsideWindow=${resumeResult.skippedOutsideWindow}, claimLost=${resumeResult.claimLost}, failed=${resumeResult.failed})`,
           );
         }

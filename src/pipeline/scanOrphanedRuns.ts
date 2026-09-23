@@ -22,9 +22,17 @@
 import type { PipelineRunRepository, PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { withContext } from '../lib/logger';
 
+import { finalizedRow, type TerminalEvidenceCheck } from './runTerminalEvidence';
+
 const log = withContext({ service: 'scanOrphanedRuns' });
 
 export interface ScanOrphanedRunsOptions {
+  /**
+   * NFR #101: proof the run already finished elsewhere (checkpoint frontier,
+   * idempotent side effect, audit). A row with proof is written terminal
+   * instead of `interrupted`, so the resume scan never re-runs it.
+   */
+  terminalEvidence?: TerminalEvidenceCheck;
   repository: PipelineRunRepository;
   /** Only transition runs whose `startedAt` is within this window. Default: 4h. */
   resumeWindowMs?: number;
@@ -41,6 +49,8 @@ export interface ScanOrphanedRunsOptions {
 }
 
 export interface ScanOrphanedRunsResult {
+  /** Rows that said `running` but whose run had already finished (NFR #101). */
+  finalized?: number;
   scanned: number;
   transitioned: number;
   skippedOutsideWindow: number;
@@ -79,6 +89,7 @@ export async function scanOrphanedRuns(
   let transitioned = 0;
   let skippedOutsideWindow = 0;
   let skippedLive = 0;
+  let finalized = 0;
 
   for (const item of running) {
     const startedAtMs = Date.parse(item.startedAt);
@@ -92,6 +103,21 @@ export async function scanOrphanedRuns(
     }
     if (options.isOwnerLive && (await options.isOwnerLive(item))) {
       skippedLive++;
+      continue;
+    }
+
+    const evidence = options.terminalEvidence ? await options.terminalEvidence(item) : null;
+    if (evidence) {
+      try {
+        await repository.put(finalizedRow(item, evidence, new Date(nowMs).toISOString()));
+        finalized++;
+        log.info(
+          { runId: item.runId, pipelineId: item.pipelineId, status: evidence.status, source: evidence.source, detail: evidence.detail },
+          'orphan-scan: row said running but the run had finished — written terminal, not interrupted',
+        );
+      } catch (err) {
+        log.warn({ runId: item.runId, err: String(err) }, 'orphan-scan: failed to finalize run');
+      }
       continue;
     }
 
@@ -117,9 +143,9 @@ export async function scanOrphanedRuns(
   }
 
   // Periodic now (NFR #26 cluster sweeper): stay quiet when nothing moved.
-  if (transitioned > 0 || skippedLive > 0) {
+  if (transitioned > 0 || skippedLive > 0 || finalized > 0) {
     log.info(
-      { scanned: running.length, transitioned, skippedOutsideWindow, skippedLive, resumeWindowMs },
+      { scanned: running.length, transitioned, finalized, skippedOutsideWindow, skippedLive, resumeWindowMs },
       'orphan-scan complete',
     );
   }
@@ -129,5 +155,6 @@ export async function scanOrphanedRuns(
     transitioned,
     skippedOutsideWindow,
     ...(options.isOwnerLive ? { skippedLive } : {}),
+    ...(options.terminalEvidence ? { finalized } : {}),
   };
 }

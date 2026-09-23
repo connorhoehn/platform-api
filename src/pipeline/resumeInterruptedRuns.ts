@@ -34,6 +34,8 @@ import type {
 import type { RunPersistenceService } from './runPersistence';
 import { withContext } from '../lib/logger';
 
+import { finalizedRow, type TerminalEvidenceCheck } from './runTerminalEvidence';
+
 const log = withContext({ service: 'resumeInterruptedRuns' });
 
 export interface ResumeInterruptedRunsOptions {
@@ -50,9 +52,16 @@ export interface ResumeInterruptedRunsOptions {
   resumeWindowMs?: number;
   /** Override `now` for tests. */
   now?: () => number;
+  /**
+   * NFR #101: proof the run already finished (checkpoint frontier, idempotent
+   * side effect, audit). Such a run is written terminal, never resumed.
+   */
+  terminalEvidence?: TerminalEvidenceCheck;
 }
 
 export interface ResumeInterruptedRunsResult {
+  /** Interrupted rows whose run had already finished — finalized, not resumed. */
+  skippedFinished: number;
   scanned: number;
   resumed: number;
   skippedNoCheckpoint: number;
@@ -79,6 +88,7 @@ export async function resumeInterruptedRuns(
   const result: ResumeInterruptedRunsResult = {
     scanned: 0,
     resumed: 0,
+    skippedFinished: 0,
     skippedNoCheckpoint: 0,
     skippedNoDefinition: 0,
     skippedOutsideWindow: 0,
@@ -102,6 +112,22 @@ export async function resumeInterruptedRuns(
     const markedAtMs = Date.parse(item.interruptedAt ?? item.startedAt);
     if (!Number.isFinite(markedAtMs) || markedAtMs < cutoffMs) {
       result.skippedOutsideWindow++;
+      continue;
+    }
+
+    const evidence = options.terminalEvidence ? await options.terminalEvidence(item) : null;
+    if (evidence) {
+      try {
+        await repository.put(finalizedRow(item, evidence, new Date(nowMs).toISOString()));
+        result.skippedFinished++;
+        log.info(
+          { runId: item.runId, pipelineId: item.pipelineId, status: evidence.status, source: evidence.source, detail: evidence.detail },
+          'resume-scan: run already finished — finalized, not resumed',
+        );
+      } catch (err) {
+        result.failed++;
+        log.warn({ runId: item.runId, err: String(err) }, 'resume-scan: failed to finalize finished run');
+      }
       continue;
     }
 

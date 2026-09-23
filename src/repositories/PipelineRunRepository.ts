@@ -176,6 +176,11 @@ export interface PipelineRunItem {
   resumedAt?: string;
   /** Number of times this run has been resumed after an interruption. */
   resumeCount?: number;
+  /**
+   * NFR #101: set when a sweep found the row non-terminal but proof elsewhere
+   * that the run had finished (see pipeline/runTerminalEvidence.ts).
+   */
+  finalizedFromEvidence?: { source: string; at: string; detail?: string };
   /** Node id that claimed the interrupted run for resume (double-resume guard). */
   resumeClaimedBy?: string;
   /**
