@@ -115,4 +115,9 @@ export class ChunkedBlobStore implements AssetBlobStore, SweepableAssetStore {
     }
     return true;
   }
+
+  /** The head's expiry; parts are written with none (they postdate NFR #48). */
+  async clearExpiry(key: string): Promise<boolean> {
+    return this.inner.clearExpiry ? this.inner.clearExpiry(key) : false;
+  }
 }

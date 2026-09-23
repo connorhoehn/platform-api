@@ -21,6 +21,8 @@ import {
   DEFAULT_DECK_BLOB_GRACE_MS, collectBlobReferences, createDeckBlobSweepTask, sweepDeckBlobs, type LiveRowSource,
 } from '../blobSweeper';
 import { sampleDeck } from './fixtures';
+import { ChunkedBlobStore } from '../chunkedBlobStore';
+import { scanPresentationRows, unknownReferenceShape } from '../blobSweeper';
 
 const HOUR = 60 * 60 * 1000;
 const T0 = Date.parse('2026-09-20T00:00:00.000Z');
@@ -327,5 +329,145 @@ describe('store halves the sweeper stands on', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// Incident 2026-09-23 (NFR #70): every shape a row can name a blob in has to
+// survive a sweep, a shape the sweeper does not know turns every delete off,
+// and a referenced DDB copy still carrying the pre-#48 ttl stops expiring.
+describe('every reference shape survives a sweep; unknown shapes fail closed (NFR #70)', () => {
+  const svg = (label: string) => Buffer.from(`<svg>${label}</svg>`);
+  async function seedBoth(ctx: ReturnType<typeof setup>, key: string, body = svg(key)) {
+    await ctx.primary.putBlob(key, body, { contentType: 'image/svg+xml' });
+    await ctx.mirror.putBlob(key, body, { contentType: 'image/svg+xml' });
+  }
+  function rowsOf(...rows: Array<Record<string, unknown>>): LiveRowSource {
+    return async function* () { for (const row of rows) yield row; };
+  }
+  async function sweepRows(ctx: ReturnType<typeof setup>, ...rows: Array<Record<string, unknown>>) {
+    ctx.clock.advance(DEFAULT_DECK_BLOB_GRACE_MS + HOUR);
+    return sweepDeckBlobs({ stores: [ctx.mirror, ctx.primary], rows: rowsOf(...rows), now: ctx.clock.now });
+  }
+
+  const shapes: Array<[string, string, Record<string, unknown>]> = [
+    ['legacy per-deck slide key with an inline svg copy', 'deck-legacy-v1-cover.svg',
+      { documentId: 'legacy', type: 'presentation', revisions: [{ id: 'v1', asset: { key: 'deck-legacy-v1.pptx' },
+        slides: [{ id: 'cover', svg: '<svg/>', asset: { key: 'deck-legacy-v1-cover.svg', contentType: 'image/svg+xml' } }] }] }],
+    ['legacy revisionSlides map', 'deck-legacy-v2-risks.svg',
+      { documentId: 'legacy2', type: 'presentation', revisionSlides: { v2: [{ id: 'risks', asset: { key: 'deck-legacy-v2-risks.svg' } }] } }],
+    ['seeded row of another type with no revisions', 'deck-seeded-v1.pptx',
+      { documentId: 'active-now-x-sprint-review', type: 'custom', revisionPreviews: { v1: { body: '<svg/>', contentType: 'image/svg+xml' } },
+        download: { asset: { key: 'deck-seeded-v1.pptx' } } }],
+    ['preview pointer naming a slide blob', 'deck-svg-preview.svg',
+      { documentId: 'p', type: 'presentation', revisionPreviews: { v1: { slideId: 'cover', asset: { key: 'deck-svg-preview.svg' } } } }],
+    ['older spec moved to a blob', 'deck-spec-old.json',
+      { documentId: 's', type: 'presentation', revisions: [{ id: 'v1', specRef: { key: 'deck-spec-old.json', contentType: 'application/json', sha256: 'x' } }] }],
+    ['a key embedded in a URL', 'deck-svg-in-url.svg',
+      { documentId: 'u', type: 'presentation', thumbnailUrl: '/api/blobs/deck-svg-in-url.svg?v=2' }],
+  ];
+
+  it.each(shapes)('%s', async (_label, key, row) => {
+    const ctx = setup();
+    await seedBoth(ctx, key);
+    await seedBoth(ctx, 'deck-svg-true-orphan.svg');
+    const result = await sweepRows(ctx, row);
+    expect(result.skipped).toBeUndefined();
+    for (const blobs of [ctx.primary, ctx.mirror]) {
+      expect(await blobs.getBlob(key)).not.toBeNull();
+      expect(await blobs.getBlob('deck-svg-true-orphan.svg')).toBeNull();
+    }
+  });
+
+  it('a moved slide list (slidesRef manifest) protects the slides inside it', async () => {
+    const ctx = setup();
+    await seedBoth(ctx, 'deck-svg-in-manifest.svg');
+    await seedBoth(ctx, 'deck-slides-m.json', Buffer.from(JSON.stringify([{ id: 'a', asset: { key: 'deck-svg-in-manifest.svg' } }])));
+    await seedBoth(ctx, 'deck-svg-true-orphan.svg');
+    const result = await sweepRows(ctx, { documentId: 'm', type: 'presentation', revisions: [{ id: 'v1', slidesRef: { key: 'deck-slides-m.json' } }] });
+    expect(result).toMatchObject({ deleted: 1, manifestsRead: 1 });
+    expect(await ctx.mirror.getBlob('deck-svg-in-manifest.svg')).not.toBeNull();
+    expect(await ctx.mirror.getBlob('deck-slides-m.json')).not.toBeNull();
+  });
+
+  it('a large .pptx split into parts keeps its head and every part', async () => {
+    const ctx = setup();
+    const chunked = new ChunkedBlobStore(ctx.mirror, 8, 8);
+    const body = Buffer.from('PK'.repeat(20));
+    await chunked.putBlob('deck-big-v1.pptx', body, { contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
+    ctx.clock.advance(DEFAULT_DECK_BLOB_GRACE_MS + HOUR);
+    const result = await sweepDeckBlobs({ stores: [chunked], now: ctx.clock.now,
+      rows: rowsOf({ documentId: 'big', type: 'presentation', revisions: [{ id: 'v1', asset: { key: 'deck-big-v1.pptx' } }] }) });
+    expect(result.deleted).toBe(0);
+    expect((await chunked.getBlob('deck-big-v1.pptx'))!.body.equals(body)).toBe(true);
+  });
+
+  it.each([
+    ['a specRef that is not a key', { revisions: [{ id: 'v1', specRef: { bucket: 'b', path: 'deck-spec-x' } }] }],
+    ['a slidesRef that is not a key', { revisions: [{ id: 'v1', slidesRef: { key: 'slides/v1' } }] }],
+    ['an asset with no key', { revisions: [{ id: 'v1', asset: { href: 'deck-x.pptx' } }] }],
+    ['an asset key in an unknown deck format', { revisions: [{ id: 'v1', asset: { key: 'deck-x.webp' } }] }],
+    ['revisions that are not a list', { revisions: { v1: {} } }],
+    ['revisionSlides that are not lists', { revisionSlides: { v1: 'deck-x' } }],
+  ])('fails closed on %s: not even a true orphan is deleted', async (_label, shape) => {
+    const ctx = setup();
+    await seedBoth(ctx, 'deck-svg-true-orphan.svg');
+    const result = await sweepRows(ctx, { documentId: 'odd', type: 'presentation', ...shape });
+    expect(result.deleted).toBe(0);
+    expect(result.skipped).toMatch(/shape this build does not know/);
+    expect(await ctx.mirror.getBlob('deck-svg-true-orphan.svg')).not.toBeNull();
+    expect(unknownReferenceShape({ documentId: 'odd', ...shape })).not.toBeNull();
+  });
+
+  it('an unknown shape inside a moved slide list fails closed too', async () => {
+    const ctx = setup();
+    await seedBoth(ctx, 'deck-slides-odd.json', Buffer.from(JSON.stringify([{ id: 'a', asset: { url: 'x' } }])));
+    await seedBoth(ctx, 'deck-svg-true-orphan.svg');
+    const result = await sweepRows(ctx, { documentId: 'm', revisions: [{ id: 'v1', slidesRef: { key: 'deck-slides-odd.json' } }] });
+    expect(result.deleted).toBe(0);
+    expect(result.skipped).toMatch(/deck-slides-odd\.json\[0\]\.asset has no key/);
+  });
+
+  it('clears the legacy expiry on every referenced copy, and only those, even when it deletes nothing', async () => {
+    const ctx = setup();
+    await seedBoth(ctx, 'deck-old-v1.pptx');
+    await seedBoth(ctx, 'deck-svg-unnamed.svg');
+    ctx.mirror.setExpiry('deck-old-v1.pptx', T0 + 30 * 24 * HOUR);
+    ctx.mirror.setExpiry('deck-svg-unnamed.svg', T0 + 30 * 24 * HOUR);
+    // Young: no candidates at all, but the expiry is still cleared.
+    const result = await sweepDeckBlobs({ stores: [ctx.mirror, ctx.primary], now: ctx.clock.now,
+      rows: rowsOf({ documentId: 'old', type: 'presentation', revisions: [{ id: 'v1', asset: { key: 'deck-old-v1.pptx' } }] }) });
+    expect(result).toMatchObject({ candidates: 0, deleted: 0, expiryCleared: 1 });
+    const expiries = new Map<string, number | undefined>();
+    for await (const entry of ctx.mirror.listAssets('deck-')) expiries.set(entry.key, entry.expiresAtMs);
+    expect(expiries.get('deck-old-v1.pptx')).toBeUndefined();
+    expect(expiries.get('deck-svg-unnamed.svg')).toBe(T0 + 30 * 24 * HOUR);
+  });
+
+  it('the DDB store lists an item’s ttl and clears it with a REMOVE that touches nothing else', async () => {
+    const sent: Array<{ command: unknown; input: Record<string, any> }> = [];
+    const client = {
+      async send(command: any) {
+        sent.push({ command, input: command.input });
+        if (command instanceof ScanCommand) return { Items: [{ imageId: 'deck-a.pptx', uploadedAt: new Date(T0).toISOString(), ttlEpoch: 1_800_000_000 }] };
+        return {};
+      },
+    } as unknown as DynamoDBDocumentClient;
+    const store = new DdbImageBlobStore({ docClient: client, now: () => T0 });
+    const listed = [];
+    for await (const entry of store.listAssets('deck-')) listed.push(entry);
+    expect(listed).toEqual([{ key: 'deck-a.pptx', touchedAtMs: T0, expiresAtMs: 1_800_000_000_000 }]);
+    expect(await store.clearExpiry('deck-a.pptx')).toBe(true);
+    const update = sent.find((entry) => entry.command instanceof UpdateCommand)!;
+    expect(update.input.UpdateExpression).toBe('REMOVE ttlEpoch');
+    expect(update.input.ConditionExpression).toBe('attribute_exists(ttlEpoch)');
+  });
+
+  it('the row scan reads every document row, unfiltered', async () => {
+    const sent: Array<Record<string, any>> = [];
+    const client = { async send(command: any) { sent.push(command.input); return { Items: [{ documentId: 'a' }] }; } } as unknown as DynamoDBDocumentClient;
+    const rows = [];
+    for await (const row of scanPresentationRows(client)()) rows.push(row);
+    expect(rows).toHaveLength(1);
+    expect(sent[0]!.FilterExpression).toBeUndefined();
   });
 });

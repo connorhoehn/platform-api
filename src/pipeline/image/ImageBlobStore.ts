@@ -22,6 +22,7 @@ import {
   GetCommand,
   PutCommand,
   ScanCommand,
+  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { docClient as defaultDocClient } from '../../lib/aws-clients';
 import { tableName } from '../../lib/ddb-table-name';
@@ -76,6 +77,12 @@ export interface StoredAssetEntry {
   key: string;
   /** Last write, ms since epoch. Every `putBlob` of the key refreshes it. */
   touchedAtMs: number;
+  /**
+   * Set when the store will expire this key on its own (a DynamoDB item still
+   * carrying the pre-NFR #48 30-day `ttlEpoch`). The sweeper clears it on
+   * every key a live row names, so a referenced blob never ages out.
+   */
+  expiresAtMs?: number;
 }
 
 /**
@@ -90,6 +97,12 @@ export interface SweepableAssetStore {
   listAssets(prefix: string): AsyncIterable<StoredAssetEntry>;
   /** Delete `key` only if its last write is still `touchedAtMs`. True when deleted. */
   deleteAssetIfUntouched(key: string, touchedAtMs: number): Promise<boolean>;
+  /**
+   * Remove the store's own expiry from `key`, leaving its bytes and write time
+   * untouched. True when an expiry was cleared. Optional: a store that never
+   * expires anything has nothing to clear.
+   */
+  clearExpiry?(key: string): Promise<boolean>;
 }
 
 export function isSweepableAssetStore(store: unknown): store is SweepableAssetStore {
@@ -311,7 +324,7 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore, Sweepa
       const page = await this.docClient.send(new ScanCommand({
         TableName: PIPELINE_IMAGES_TABLE,
         FilterExpression: '#kind = :asset AND begins_with(imageId, :prefix)',
-        ProjectionExpression: 'imageId, uploadedAt',
+        ProjectionExpression: 'imageId, uploadedAt, ttlEpoch',
         ExpressionAttributeNames: { '#kind': 'kind' },
         ExpressionAttributeValues: { ':asset': 'asset', ':prefix': prefix },
         ...(startKey ? { ExclusiveStartKey: startKey } : {}),
@@ -319,7 +332,10 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore, Sweepa
       for (const item of page.Items ?? []) {
         const touchedAtMs = Date.parse(String(item.uploadedAt ?? ''));
         // No parseable write time → never a candidate (it cannot be proven old).
-        if (typeof item.imageId === 'string' && Number.isFinite(touchedAtMs)) yield { key: item.imageId, touchedAtMs };
+        const expiresAtMs = typeof item.ttlEpoch === 'number' ? item.ttlEpoch * 1000 : undefined;
+        if (typeof item.imageId === 'string' && Number.isFinite(touchedAtMs)) {
+          yield { key: item.imageId, touchedAtMs, ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) };
+        }
       }
       startKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
     } while (startKey);
@@ -335,6 +351,27 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore, Sweepa
         ConditionExpression: '#kind = :asset AND uploadedAt = :seen',
         ExpressionAttributeNames: { '#kind': 'kind' },
         ExpressionAttributeValues: { ':asset': 'asset', ':seen': new Date(touchedAtMs).toISOString() },
+      }));
+      return true;
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return false;
+      throw err;
+    }
+  }
+
+  /**
+   * Items written before NFR #48 carry a 30-day `ttlEpoch`, which DynamoDB
+   * honours whether or not a presentation still names the key. REMOVE only
+   * the ttl — body, uploadedAt and every other attribute stay as they are, so
+   * this cannot race a save into losing bytes or a sweep into a wrong delete.
+   */
+  async clearExpiry(key: string): Promise<boolean> {
+    try {
+      await this.docClient.send(new UpdateCommand({
+        TableName: PIPELINE_IMAGES_TABLE,
+        Key: { imageId: key },
+        UpdateExpression: 'REMOVE ttlEpoch',
+        ConditionExpression: 'attribute_exists(ttlEpoch)',
       }));
       return true;
     } catch (err) {
@@ -390,7 +427,7 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore, Sweepa
 
 export class InMemoryImageBlobStore implements ImageBlobStore, AssetBlobStore, SweepableAssetStore {
   private readonly rows = new Map<string, { body: Buffer; meta: ImageMeta }>();
-  private readonly assets = new Map<string, { body: Buffer; asset: BlobAsset; touchedAtMs: number }>();
+  private readonly assets = new Map<string, { body: Buffer; asset: BlobAsset; touchedAtMs: number; expiresAtMs?: number }>();
   private readonly now: () => number;
 
   constructor(opts: { now?: () => number } = {}) {
@@ -427,7 +464,9 @@ export class InMemoryImageBlobStore implements ImageBlobStore, AssetBlobStore, S
 
   async *listAssets(prefix: string): AsyncIterable<StoredAssetEntry> {
     for (const [key, entry] of [...this.assets.entries()]) {
-      if (key.startsWith(prefix)) yield { key, touchedAtMs: entry.touchedAtMs };
+      if (key.startsWith(prefix)) {
+        yield { key, touchedAtMs: entry.touchedAtMs, ...(entry.expiresAtMs !== undefined ? { expiresAtMs: entry.expiresAtMs } : {}) };
+      }
     }
   }
 
@@ -436,6 +475,19 @@ export class InMemoryImageBlobStore implements ImageBlobStore, AssetBlobStore, S
     if (!entry || entry.touchedAtMs !== touchedAtMs) return false;
     this.assets.delete(key);
     return true;
+  }
+
+  async clearExpiry(key: string): Promise<boolean> {
+    const entry = this.assets.get(key);
+    if (!entry || entry.expiresAtMs === undefined) return false;
+    delete entry.expiresAtMs;
+    return true;
+  }
+
+  /** Test helper — give a stored asset a store-side expiry, as a pre-NFR #48 DDB item has. */
+  setExpiry(key: string, expiresAtMs: number): void {
+    const entry = this.assets.get(key);
+    if (entry) entry.expiresAtMs = expiresAtMs;
   }
 
   /** Test helper — clear all stored rows. */
