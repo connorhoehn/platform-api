@@ -91,6 +91,8 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
   let activeLock: LeasedKVLock | null = null;
   let running = false;
   let stopping = false;
+  /** Where the next poll's table walk resumes (undefined = the top). NFR 34b. */
+  let scanCursor: Record<string, unknown> | undefined;
 
   async function poll(): Promise<void> {
     if (running || stopping) return;
@@ -125,10 +127,22 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         // stopped publishing entirely — rows enqueued, nothing drained, and
         // nothing in the log to say so. Page until the batch is full or the
         // table is exhausted.
+        //
+        // NFR 34b: and every poll started that walk from the top of the table,
+        // so with more than MAX_SCAN_PAGES × SCAN_PAGE_SIZE rows (≈ one day of
+        // terminal rows under the TTL) a row whose key hashed past that point
+        // was never examined by anyone — it sat UNPROCESSED for ever. Which
+        // rows were stranded depended only on their ulid's hash, so one run's
+        // work-graph steps arrived at random: "load" never, "write" started
+        // but never completed. The walk now RESUMES where the last poll
+        // stopped and wraps at the end, so every row is examined within
+        // ceil(table / (MAX_SCAN_PAGES × SCAN_PAGE_SIZE)) polls.
         const rows: OutboxRow[] = [];
-        let startKey: Record<string, unknown> | undefined;
+        let cursor = scanCursor;
+        let wrapped = cursor === undefined;
         let pages = 0;
-        do {
+        for (;;) {
+          const pageStart = cursor;
           const result = await docClient.send(
             new ScanCommand({
               TableName: OUTBOX_TABLE,
@@ -136,16 +150,30 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
               ExpressionAttributeNames: { '#status': 'status' },
               ExpressionAttributeValues: { ':unprocessed': 'UNPROCESSED' },
               Limit: SCAN_PAGE_SIZE,
-              ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+              ...(pageStart ? { ExclusiveStartKey: pageStart } : {}),
             }),
           );
           rows.push(...((result.Items ?? []) as OutboxRow[]));
-          startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
           pages += 1;
+          if (rows.length > batchSize) {
+            // This page is only partly taken: read it again next poll (the
+            // rows published from it will be PROCESSED by then).
+            cursor = pageStart;
+            break;
+          }
+          cursor = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+          if (rows.length === batchSize) break;
+          if (!cursor) {
+            // The end of the table: go round once more from the top.
+            if (wrapped) break;
+            wrapped = true;
+          }
           // The lease is the budget for a whole poll cycle, and each page is
           // a round trip; a scan that outlives it would publish as a
           // non-leader and be refused row by row.
-        } while (startKey && rows.length < batchSize && pages < MAX_SCAN_PAGES && lock.isLeader());
+          if (pages >= MAX_SCAN_PAGES || !lock.isLeader()) break;
+        }
+        scanCursor = cursor;
         rows.length = Math.min(rows.length, batchSize);
 
         // Approximate "oldest pending" — DDB Scan doesn't order results,
