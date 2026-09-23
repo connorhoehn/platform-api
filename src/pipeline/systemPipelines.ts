@@ -9,6 +9,7 @@ import { buildLiveCaptionsDefinition, LIVE_CAPTIONS_PIPELINE_ID } from '../recor
 import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID } from '../documents/conversationSummarizePipeline';
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
 import { buildMediaCatalogDefinition, MEDIA_CATALOG_PIPELINE_ID } from '../media/mediaCatalogPipeline';
+import { buildDeckReviseDefinition, DECK_REVISE_PIPELINE_ID } from '../deck/deckReviseDefinition';
 import { assertSystemPipelinesLint } from './systemPipelineLint';
 
 export interface SystemPipelineEntry {
@@ -26,6 +27,7 @@ const REGISTRY: SystemPipelineEntry[] = [
   { id: CONVERSATION_SUMMARIZE_PIPELINE_ID, build: () => buildConversationSummarizeDefinition() },
   { id: DIAGRAM_GENERATE_PIPELINE_ID, build: () => buildDiagramGenerateDefinition() },
   { id: MEDIA_CATALOG_PIPELINE_ID, build: () => buildMediaCatalogDefinition() },
+  { id: DECK_REVISE_PIPELINE_ID, build: () => buildDeckReviseDefinition() },
 ];
 
 // Retries and approvers are platform properties: a definition that forgets

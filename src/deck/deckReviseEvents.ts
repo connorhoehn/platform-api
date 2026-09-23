@@ -23,14 +23,24 @@
 // summary or any slide text. The pipeline channels have no per-document
 // authorization at the gateway, so nothing here may say what the deck says.
 //
+// Since composer edits run as the `deck-revise` pipeline (deckRevisePipeline.ts),
+// the run's own steps emit these — `pipelineRunId` names the run — and the
+// terminal event is ALSO written durably (outbox → message queue) as
+// `pipeline.deck.revise.completed|failed`, so a consumer on the MQ path learns
+// the outcome even with no Redis relay. The phases stay live-only.
+//
 // Failure policy, as the relay's: publishing never fails a revise.
 
 import { randomUUID } from 'crypto';
 import { getRedisClient } from '../lib/redis-client';
 import log from '../lib/logger';
 import { channelForType } from '../pipeline/event-redis-relay';
+import { publishDurable } from '../lib/event-catalog';
 import type { DeckReviseTarget } from './DeckSpec';
 import type { DeckRevisePhase } from './deckRevise';
+
+/** A revise's phases, plus the run's own last one: writing the revision. */
+export type DeckReviseEventPhase = DeckRevisePhase | 'saving';
 
 export type DeckReviseEventKind = 'started' | 'phase' | 'completed' | 'failed';
 
@@ -58,7 +68,15 @@ export interface DeckReviseEventPayload {
   slideId?: string;
   target?: DeckReviseTarget;
   /** On `phase` (and `started`, as 'started'): where the revise is. */
-  phase: 'started' | DeckRevisePhase | 'completed' | 'failed';
+  phase: 'started' | DeckReviseEventPhase | 'completed' | 'failed';
+  /** The `deck-revise` pipeline run doing the edit (absent on the old `/revise` path). */
+  pipelineRunId?: string;
+  /** On `completed`: the revision the run wrote; null when the edit changed nothing. */
+  revisionId?: string | null;
+  /** On `completed`: the head the edit was rebased onto after a concurrent save. */
+  rebasedOnto?: string;
+  /** On `failed`: a machine-readable cause, e.g. 'revision-conflict'. */
+  code?: string;
   /** On `completed`: the slides the edit changed. */
   changedSlideIds?: string[];
   /** On `failed`: the HTTP status the request answered with (400/502/503/500). */
@@ -90,10 +108,18 @@ const NODE_ID = `platform-api:${process.env.HOSTNAME ?? 'local'}`;
 
 export interface DeckReviseEmitter {
   started(): void;
-  phase(phase: DeckRevisePhase): void;
-  completed(changedSlideIds: string[]): void;
-  failed(status: number, reason: string): void;
+  phase(phase: DeckReviseEventPhase): void;
+  completed(changedSlideIds: string[], outcome?: { revisionId?: string | null; rebasedOnto?: string }): void;
+  failed(status: number, reason: string, code?: string): void;
+  /** True once a terminal event was sent. */
+  readonly ended: boolean;
 }
+
+/** Where a terminal event is written durably. `publishDurable` for a run. */
+export type DeckReviseDurablePublish = (eventName: string, payload: Record<string, unknown>) => Promise<void>;
+
+/** The outbox → message-queue path. */
+export const durableDeckRevisePublish: DeckReviseDurablePublish = (eventName, payload) => publishDurable(eventName, payload);
 
 export interface DeckReviseEmitterInit {
   documentId: string;
@@ -101,7 +127,11 @@ export interface DeckReviseEmitterInit {
   userId: string;
   slideId?: string;
   target?: DeckReviseTarget;
+  /** The pipeline run doing the edit. */
+  pipelineRunId?: string;
   publish?: DeckRevisePublish;
+  /** Also write the terminal event durably (MQ path). Off for the old `/revise`. */
+  durable?: DeckReviseDurablePublish;
   now?: () => number;
 }
 
@@ -131,6 +161,7 @@ export function createDeckReviseEmitter(init: DeckReviseEmitterInit): DeckRevise
         scope: init.slideId ? 'slide' : 'deck',
         ...(init.slideId ? { slideId: init.slideId } : {}),
         ...(init.target ? { target: init.target } : {}),
+        ...(init.pipelineRunId ? { pipelineRunId: init.pipelineRunId } : {}),
         ...extra,
         occurredAt: new Date(at).toISOString(),
       },
@@ -141,17 +172,28 @@ export function createDeckReviseEmitter(init: DeckReviseEmitterInit): DeckRevise
     publish(channelForType(type), JSON.stringify(event)).catch((err: unknown) => {
       log.warn({ err: err instanceof Error ? err.message : String(err), type, documentId: init.documentId }, 'deck revise event not published');
     });
+    if (ended && init.durable) {
+      const name = type.replace(/:/g, '.');
+      init.durable(name, { ...event.payload, eventId: event.id }).catch((err: unknown) => {
+        log.warn({ err: err instanceof Error ? err.message : String(err), type, documentId: init.documentId }, 'deck revise outcome not written durably');
+      });
+    }
   };
 
   return {
     started: () => send('started', { phase: 'started' }),
     phase: (phase) => send('phase', { phase }),
-    completed: (changedSlideIds) => send('completed', { phase: 'completed', changedSlideIds }),
-    failed: (status, reason) => send('failed', { phase: 'failed', status, reason: reason.slice(0, 300) }),
+    completed: (changedSlideIds, outcome) => send('completed', {
+      phase: 'completed', changedSlideIds,
+      ...(outcome && 'revisionId' in outcome ? { revisionId: outcome.revisionId ?? null } : {}),
+      ...(outcome?.rebasedOnto ? { rebasedOnto: outcome.rebasedOnto } : {}),
+    }),
+    failed: (status, reason, code) => send('failed', { phase: 'failed', status, reason: reason.slice(0, 300), ...(code ? { code } : {}) }),
+    get ended() { return ended; },
   };
 }
 
 /** Does nothing: a revise with no documentId has no channel to report on. */
 export const NOOP_DECK_REVISE_EMITTER: DeckReviseEmitter = {
-  started: () => undefined, phase: () => undefined, completed: () => undefined, failed: () => undefined,
+  started: () => undefined, phase: () => undefined, completed: () => undefined, failed: () => undefined, ended: false,
 };

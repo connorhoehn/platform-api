@@ -93,6 +93,21 @@ export function resolveSpecSource(data: DeckNodeData, context: Record<string, un
   return undefined;
 }
 
+/**
+ * The files a revision is made of: the .pptx and one SVG per slide, Sources
+ * last. Shared by this step and the composer's `deck:revise-write` step.
+ */
+export async function renderDeckFiles(spec: DeckSpec): Promise<{ pptx: Buffer; slides: Array<{ id: string; title: string; svg: string }> }> {
+  const pptx = await renderPptx(spec);
+  const svgs = renderAllSlideSvgs(spec);
+  // The renderers agree on slide order: the deck's own slides, then Sources.
+  const slides = svgs.map((svg, index) => {
+    const slide = spec.slides[index];
+    return { id: slide?.id ?? SOURCES_SLIDE_ID, title: slide?.title ?? SOURCES_SLIDE_TITLE, svg };
+  });
+  return { pptx, slides };
+}
+
 export interface DeckStepHandlerOpts {
   store?: PresentationDocumentStore;
   newDocumentId?: () => string;
@@ -152,17 +167,7 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
       const title = str(data.title) ?? spec.title;
 
       try {
-        const pptx = await renderPptx(spec);
-        const svgs = renderAllSlideSvgs(spec);
-        // The renderers agree on slide order: the deck's own slides, then Sources.
-        const slides = svgs.map((svg, index) => {
-          const slide = spec.slides[index];
-          return {
-            id: slide?.id ?? SOURCES_SLIDE_ID,
-            title: slide?.title ?? SOURCES_SLIDE_TITLE,
-            svg,
-          };
-        });
+        const { pptx, slides } = await renderDeckFiles(spec);
 
         const { revision } = await store.appendRevision({
           documentId, title, createdBy: requestedBy, pptx, slides, spec,

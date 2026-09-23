@@ -438,6 +438,35 @@ catalog.declare({
   },
 });
 
+// A composer edit's outcome (the `deck-revise` pipeline, src/deck/deckRevisePipeline.ts).
+// The live phases ride the Redis relay only; the outcome is also durable so an
+// MQ consumer learns it. Ids only — never the instruction or any slide text.
+for (const [name, description] of [
+  ['pipeline.deck.revise.completed', 'A composer edit of a presentation finished (revisionId null when nothing changed)'],
+  ['pipeline.deck.revise.failed', 'A composer edit of a presentation failed; nothing was written'],
+] as const) {
+  catalog.declare({
+    name,
+    transport: 'durable',
+    producer: 'platform-api',
+    description,
+    schema: {
+      type: 'object',
+      properties: {
+        runId: { type: 'string' },
+        pipelineRunId: { type: 'string' },
+        documentId: { type: 'string' },
+        requestId: { type: 'string' },
+        userId: { type: 'string' },
+        revisionId: { type: ['string', 'null'] },
+        status: { type: 'number' },
+        code: { type: 'string' },
+      },
+      required: ['documentId', 'requestId'],
+    },
+  });
+}
+
 // Hangout transcription pipeline — `transcription:job.queued` is the durable
 // handoff from platform-api's lvsWebhooks (recording.completed receipt) to the
 // transcription-worker container. Payload carries the recordingId + per-peer

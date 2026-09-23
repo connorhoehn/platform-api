@@ -84,6 +84,19 @@ export interface StoredRevision {
   spec?: DeckSpec;
   /** Every document the spec cited — what the work graph reads as the inputs. */
   sources?: RevisionSource[];
+  /**
+   * The pipeline run that wrote this revision, when one did (a composer edit).
+   * `requestId` is what makes the run's write idempotent: a retried write step
+   * finds its own revision here instead of filing a second one.
+   */
+  producedBy?: RevisionProducer;
+}
+
+/** Which run, and which composer request, wrote a revision. */
+export interface RevisionProducer {
+  pipelineId: string;
+  runId: string;
+  requestId: string;
 }
 
 /**
@@ -149,6 +162,8 @@ export interface AppendRevisionInput {
    * pushes this one to the next id.
    */
   expectedHead?: string | null;
+  /** The run that is writing this revision, recorded on it (see `StoredRevision.producedBy`). */
+  producedBy?: RevisionProducer;
 }
 
 /** Someone else's revision landed first. Carries the head the caller did not see. */
@@ -419,6 +434,7 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       asset: pptxAsset,
       slides,
       ...(input.spec ? { spec: input.spec } : {}),
+      ...(input.producedBy ? { producedBy: input.producedBy } : {}),
       ...(input.sources ?? (input.spec ? revisionSources(input.spec, input.transcriptIds) : undefined)
         ? { sources: input.sources ?? revisionSources(input.spec!, input.transcriptIds) }
         : {}),

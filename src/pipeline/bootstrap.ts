@@ -102,9 +102,21 @@ import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDeckStepHandlers } from '../deck/registerDeckHandlers';
+import { attachDeckReviseRunEvents } from '../deck/deckRevisePipeline';
 import { buildLoopStepHandlers } from '../loop/registerLoopHandlers';
 import { DevboxAgentClient, devboxBaseUrl, takeRunLab } from './agent/DevboxAgentClient';
 import { failOrphanedLoops } from '../chat/agentLoopRunner';
+import {
+  ClusterSweeper,
+  ReplicaHeartbeat,
+  createMemoryLeaseStore,
+  isOwnerLive,
+  setLocalReplica,
+  type SweepTask,
+} from '../lib/replicaLiveness';
+import { createDDBLeaseStore } from '../lib/ddb-lease-store';
+import { docClient as leaseDocClient } from '../lib/aws-clients';
+import { tableName as ddbTableName } from '../lib/ddb-table-name';
 import { CHAT_AGENT_LOOP_PIPELINE_ID } from '../chat/agentLoopPlanner';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
 import { buildChatCommandHandlers } from '../documents/chatCommandHandlers';
@@ -471,6 +483,18 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // --- Pre-flight: writability + identity ---
   await runWalPreflight({ walFilePath, registryWalFilePath, registryMode, raftDataDir });
   const { nodeId, persistentNodeId } = await resolveStableNodeId(identityFilePath);
+
+  // NFR #26: this incarnation's liveness lease + the store the cluster-wide
+  // sweep leader leases against. Jest has no DDB → a process-local store
+  // (every sweep then behaves exactly as the single-process code did).
+  const bootedAtMs = Date.now();
+  setLocalReplica(nodeId, bootedAtMs);
+  const sweepLeaseStore = IS_TEST_ENV
+    ? createMemoryLeaseStore()
+    : createDDBLeaseStore({ docClient: leaseDocClient, tableName: ddbTableName('social-outbox') });
+  const replicaHeartbeat = new ReplicaHeartbeat({ store: sweepLeaseStore, nodeId, bootedAtMs });
+  void replicaHeartbeat.start();
+  const clusterSweepTasks: SweepTask[] = [];
 
   // Hold the Node event loop open during cluster setup. Every internal cluster
   // timer is `.unref()`'d, so without this hold a one-shot script (no HTTP
@@ -887,6 +911,9 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   }
 
   const runQueueSubIds: string[] = [];
+  // A composer edit (`deck-revise`) that dies in any step still has to tell
+  // the document's channel it failed; its steps own every other event.
+  attachDeckReviseRunEvents(eventBus as never);
   runQueueSubIds.push(eventBus.subscribe('pipeline:run:started', async () => {
     runQueueMetrics.recordEnqueued();
   }));
@@ -924,8 +951,12 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   //
   // Loops that DID reach the executor are untouched here — they are ordinary
   // runs, and the orphan/resume machinery above already owns them.
+  //
+  // NFR #26: this used to fire once per replica at boot. It is now a task of
+  // the cluster sweeper (one replica, every interval) and skips loops whose
+  // planner replica still holds its liveness lease.
   if (opts.pipelineRunRepository) {
-    void failOrphanedLoops({
+    clusterSweepTasks.push({ name: 'orphaned-agent-loops', run: () => failOrphanedLoops({
       listPending: async () => {
         const repo = opts.pipelineRunRepository!;
         const rows = await repo.listByStatus('pending', { limit: 200 });
@@ -935,12 +966,8 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       ...(devboxBaseUrl()
         ? { stopSession: (sessionId: string) => new DevboxAgentClient().deleteSession(sessionId) }
         : {}),
-    }).catch((err: unknown) => {
-      bootstrapLog.error(
-        { err: err instanceof Error ? err.message : String(err) },
-        'orphaned agent-loop sweep failed',
-      );
-    });
+      isPlannerLive: (owner, startedAtMs) => isOwnerLive(sweepLeaseStore, owner, startedAtMs),
+    }).then(() => undefined) });
   }
 
   if (devboxBaseUrl()) {
@@ -1113,13 +1140,23 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       (process.env.PIPELINE_RESUME_ON_BOOT ?? 'true').trim().toLowerCase() !== 'false';
     const pipelineRunRepository = opts.pipelineRunRepository;
     const runPersistenceRef = runPersistence;
-    void scanOrphanedRuns({
+    // NFR #26: a cluster-sweeper task, not a per-boot fire-and-forget. Rows
+    // whose owner replica is alive are skipped, so a rolling restart no longer
+    // interrupts — and then re-executes — the other pod's in-flight runs.
+    let resumeRanOnce = false;
+    clusterSweepTasks.push({ name: 'orphan-scan-and-resume', run: () => scanOrphanedRuns({
       repository: pipelineRunRepository,
       ...(Number.isFinite(resumeWindowMs) && (resumeWindowMs ?? 0) >= 0
         ? { resumeWindowMs: resumeWindowMs as number }
         : {}),
+      isOwnerLive: (item) =>
+        isOwnerLive(sweepLeaseStore, item.ownerNodeId, Date.parse(item.resumedAt ?? item.startedAt)),
     })
       .then(async (scan) => {
+        // Resume runs this pass interrupted, plus one pass after taking
+        // leadership (rows a dead leader interrupted but never resumed).
+        if (scan.transitioned === 0 && resumeRanOnce) return;
+        resumeRanOnce = true;
         if (!resumeOnBoot) {
           if (scan.transitioned > 0) {
             logger.info(
@@ -1148,8 +1185,18 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       })
       .catch((err) => {
         bootstrapLog.warn({ err: String(err) }, 'orphan-scan/boot-resume failed at bootstrap');
-      });
+      }) });
   }
+
+  // NFR #26: one replica sweeps, every interval, cluster-wide.
+  const clusterSweeper = new ClusterSweeper({
+    store: sweepLeaseStore,
+    tasks: clusterSweepTasks,
+    intervalMs: Number(process.env.PLATFORM_CLUSTER_SWEEP_INTERVAL_MS) > 0
+      ? Number(process.env.PLATFORM_CLUSTER_SWEEP_INTERVAL_MS)
+      : 60_000,
+  });
+  clusterSweeper.start();
 
   // T9 (lib-expansion-3): construct the bus-event DLQ and assign into the
   // dlqRef captured by the handler above. RedriveSink re-publishes via the
@@ -1288,6 +1335,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       return Number.isFinite(n) && n > 0 ? n : 1000;
     })();
     const handle: NodeJS.Timeout = setInterval(() => {
+      if (!clusterSweeper.isLeader()) return; // NFR #26: one replica sweeps
       auditRepo
         .sweepExpired(maxItemsPerRun)
         .then((deleted) => {
@@ -1326,5 +1374,12 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     logger: bootstrapLog,
   });
 
-  return { module, nodeId, dlq, shutdown };
+  // NFR #26: release both leases first, so the other replica takes over the
+  // sweep and sees this incarnation as gone without waiting out the TTL.
+  const shutdownWithLeases = async (): Promise<void> => {
+    await clusterSweeper.stop().catch(() => undefined);
+    await replicaHeartbeat.stop().catch(() => undefined);
+    await shutdown();
+  };
+  return { module, nodeId, dlq, shutdown: shutdownWithLeases };
 }

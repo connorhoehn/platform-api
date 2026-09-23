@@ -81,6 +81,8 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
       sizeBytes: revision.asset.sizeBytes,
       hasSpec: !!revision.spec,
       ...(revision.sources ? { sources: revision.sources } : {}),
+      // A composer edit's revision names the run that wrote it.
+      ...(revision.producedBy ? { producedBy: revision.producedBy } : {}),
       slides: revision.slides.map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
     })),
   });
