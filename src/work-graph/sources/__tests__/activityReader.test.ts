@@ -141,6 +141,14 @@ describe('the bytes behind one slide', () => {
     expect((await readerFor(deckRow, blobs).revisionPreview('doc-deck', 'v2', 'owners'))?.body.toString('utf8')).toBe(SVG);
   });
 
+  it('serves a revision cover that names its slide (NFR #4 row diet) from that slide\'s blob', async () => {
+    const blobs = new InMemoryImageBlobStore();
+    await blobs.putBlob('deck-v1-risks.svg', Buffer.from(SVG, 'utf8'), { contentType: 'image/svg+xml' });
+    const row = { ...deckRow, revisionPreviews: { v1: { contentType: 'image/svg+xml', slideId: 'risks' } } };
+    const cover = await readerFor(row, blobs).revisionPreview('doc-deck', 'v1');
+    expect(cover?.body.toString('utf8')).toBe(SVG);
+  });
+
   it('is absent for a slide the record does not name, or whose bytes are gone', async () => {
     const blobs = new InMemoryImageBlobStore();
     expect(await readerFor(deckRow, blobs).revisionPreview('doc-deck', 'v1', 'nowhere')).toBeNull();

@@ -133,8 +133,12 @@ export interface ImageBlobStore {
 export interface DdbImageBlobStoreOptions {
   /** Override for tests. Defaults to the shared docClient. */
   docClient?: DynamoDBDocumentClient;
-  /** Override retention. Defaults to 30 days (shorter than judgments — images are transient). */
-  ttlDays?: number;
+  /**
+   * Override retention. Defaults to 30 days (shorter than judgments — images are transient).
+   * `null` keeps assets for good: a presentation's slides and specs are the
+   * document's own content, referenced by its row, and must not expire under it.
+   */
+  ttlDays?: number | null;
   /** Override wall-clock for tests. Returns ms-since-epoch. */
   now?: () => number;
 }
@@ -167,12 +171,12 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
   readonly capBytes = IMAGE_BLOB_SIZE_CAP_BYTES;
 
   private readonly docClient: DynamoDBDocumentClient;
-  private readonly ttlSeconds: number;
+  private readonly ttlSeconds: number | null;
   private readonly now: () => number;
 
   constructor(opts: DdbImageBlobStoreOptions = {}) {
     this.docClient = opts.docClient ?? defaultDocClient;
-    this.ttlSeconds = (opts.ttlDays ?? DEFAULT_TTL_DAYS) * SECONDS_PER_DAY;
+    this.ttlSeconds = opts.ttlDays === null ? null : (opts.ttlDays ?? DEFAULT_TTL_DAYS) * SECONDS_PER_DAY;
     this.now = opts.now ?? (() => Date.now());
   }
 
@@ -182,7 +186,7 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
         `image body ${body.byteLength}B exceeds DDB inline cap ${IMAGE_BLOB_SIZE_CAP_BYTES}B — resize before upload`,
       );
     }
-    const ttlEpoch = Math.floor(this.now() / 1000) + this.ttlSeconds;
+    const ttlEpoch = Math.floor(this.now() / 1000) + (this.ttlSeconds ?? DEFAULT_TTL_DAYS * SECONDS_PER_DAY);
     const item: ImageRow = {
       imageId,
       body,
@@ -248,7 +252,7 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
         `asset '${key}' is ${body.byteLength}B, over the DDB inline cap of ${IMAGE_BLOB_SIZE_CAP_BYTES}B — run with IMAGE_BLOB_STORE=fs to store assets this size`,
       );
     }
-    const ttlEpoch = Math.floor(this.now() / 1000) + this.ttlSeconds;
+    const ttlEpoch = this.ttlSeconds === null ? undefined : Math.floor(this.now() / 1000) + this.ttlSeconds;
     await this.docClient.send(new PutCommand({
       TableName: PIPELINE_IMAGES_TABLE,
       Item: {
@@ -263,7 +267,7 @@ export class DdbImageBlobStore implements ImageBlobStore, AssetBlobStore {
         ...(meta.createdBy ? { uploadedBy: meta.createdBy } : {}),
         ...(meta.label ? { label: meta.label } : {}),
         kind: 'asset',
-        ttlEpoch,
+        ...(ttlEpoch !== undefined ? { ttlEpoch } : {}),
       },
     }));
     return { key, contentType: meta.contentType, sizeBytes: body.byteLength };

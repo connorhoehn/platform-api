@@ -27,6 +27,7 @@ import log from '../lib/logger';
 import { canEditDocument, documentRoleOf, editRefusal } from '../deck/documentEditAccess';
 import {
   getPresentationDocumentStore,
+  resolveRevisionSpec,
   PRESENTATION_DOCUMENT_TYPE,
   PresentationRevisionConflictError,
   type PresentationDocumentRow,
@@ -80,7 +81,7 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
       slideCount: revision.slideCount,
       contentType: revision.asset.contentType,
       sizeBytes: revision.asset.sizeBytes,
-      hasSpec: !!revision.spec,
+      hasSpec: !!(revision.spec || revision.specRef),
       ...(revision.sources ? { sources: revision.sources } : {}),
       // A composer edit's revision names the run that wrote it.
       ...(revision.producedBy ? { producedBy: revision.producedBy } : {}),
@@ -214,12 +215,15 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
  */
 documentRevisionsRouter.get('/:revisionId/spec', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { revision } = await loadRevision(String(req.params.documentId ?? ''), String(req.params.revisionId ?? ''));
-  if (!revision.spec) {
+  if (!revision.spec && !revision.specRef) {
     throw new AppError(409, `revision ${revision.id} was written before specs were stored, so it cannot be reopened for editing`);
   }
+  // Inline on the head; an older revision's spec is in the blob store (NFR #4).
+  const spec = await resolveRevisionSpec(getPresentationDocumentStore(), revision);
+  if (!spec) throw new NotFoundError(`the spec of revision ${revision.id} is no longer stored`);
   // Specs drafted before f100e61 cite a transcript by its call's wire id; the
   // editor gets the human title, and its next save stores it.
-  const healed = await healCitationTitles(revision.spec, revision.sources ?? []);
+  const healed = await healCitationTitles(spec, revision.sources ?? []);
   res.status(200).json({
     revisionId: revision.id,
     label: revision.label,
@@ -276,11 +280,21 @@ documentRevisionsRouter.get('/:revisionId/slides/:slideId', requireAuth, asyncHa
     : await getAssetBlobStore().getBlob(slide.asset.key)
       .then((blob) => (blob ? { contentType: blob.asset.contentType, body: blob.body } : null));
   if (!stored) throw new NotFoundError('Slide preview not found');
+  // A revision's slide never changes: the URL names (document, revision,
+  // slide) and a revision is immutable once written. So the browser may keep
+  // it for good (privately — it is someone's document), and a slide stored by
+  // content answers a revalidation by its hash.
+  const sha256 = (stored as { sha256?: string }).sha256 ?? slide.sha256;
+  if (sha256) {
+    const etag = `"${sha256.slice(0, 40)}"`;
+    res.setHeader('etag', etag);
+    if (req.headers['if-none-match'] === etag) { res.status(304).setHeader('cache-control', 'private, max-age=31536000, immutable').end(); return; }
+  }
   res
     .status(200)
     .setHeader('content-type', stored.contentType || slide.asset.contentType || SVG_CONTENT_TYPE)
     .setHeader('content-length', String(stored.body.byteLength))
-    .setHeader('cache-control', 'private, no-store')
+    .setHeader('cache-control', 'private, max-age=31536000, immutable')
     .setHeader('x-content-type-options', 'nosniff')
     .setHeader('content-disposition', 'inline')
     .setHeader('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox")

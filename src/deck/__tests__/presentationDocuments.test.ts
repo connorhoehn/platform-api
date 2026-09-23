@@ -71,15 +71,18 @@ describe('appendRevision — the first revision', () => {
     expect(item.outline).toEqual([{ id: 'cover', title: 'Cover' }, { id: 'sources', title: 'Sources' }]);
     // `revisionPreviews[revisionId]` is what the existing preview route serves:
     // one image per revision, which for a deck is its cover slide.
-    expect(item.revisionPreviews).toEqual({ v1: { contentType: 'image/svg+xml', body: '<svg>cover</svg>', encoding: 'utf8' } });
-    expect((item.revisionSlides as Record<string, unknown[]>).v1).toHaveLength(2);
+    // Since the row diet (NFR #4) it names the cover slide; the bytes are that slide's blob.
+    expect(item.revisionPreviews).toEqual({ v1: { contentType: 'image/svg+xml', slideId: 'cover' } });
+    // `revisionSlides` repeated `revisions[].slides` and is no longer written.
+    expect(item.revisionSlides).toBeUndefined();
 
     expect(revision).toMatchObject({ id: 'v1', label: 'v1', slideCount: 2, createdBy: 'user-frank' });
     // Keys carry a per-write suffix so a racing save cannot overwrite them.
     expect(revision.asset).toEqual({ key: expect.stringMatching(/^deck-doc-1-v1-[A-Za-z0-9]{8}\.pptx$/), contentType: PPTX_CONTENT_TYPE, sizeBytes: 6 });
     expect(revision.slides[0]).toMatchObject({
       id: 'cover', index: 1, title: 'Cover', previewHandle: 'doc-1.v1.cover',
-      asset: { key: expect.stringMatching(/^deck-doc-1-v1-[A-Za-z0-9]{8}-cover\.svg$/), contentType: 'image/svg+xml' },
+      // A slide's key is its content hash: a racing save with the same markup writes the same bytes.
+      asset: { key: expect.stringMatching(/^deck-svg-[0-9a-f]{40}\.svg$/), contentType: 'image/svg+xml' },
     });
     expect(put.input.ConditionExpression).toBe('attribute_not_exists(documentId)');
 
@@ -118,7 +121,8 @@ describe('appendRevision — a second revision', () => {
     expect((values[':revisions'] as unknown[]).map((entry) => (entry as { id: string }).id)).toEqual(['v1', 'v2']);
     expect(Object.keys(values[':revisionPreviews'] as object)).toEqual(['v1', 'v2']);
     expect((values[':revisionPreviews'] as Record<string, { body: string }>).v1.body).toBe('<svg>old</svg>');
-    expect(Object.keys(values[':revisionSlides'] as object)).toEqual(['v1', 'v2']);
+    // Old rows keep their `revisionSlides`; a new revision does not add to it.
+    expect(values[':revisionSlides']).toBeUndefined();
     expect(values[':pageCount']).toBe(2);
     expect(values[':type']).toBe('presentation');
   });

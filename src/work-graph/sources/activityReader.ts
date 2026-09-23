@@ -476,6 +476,11 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const previews = row?.revisionPreviews;
     if (!previews || typeof previews !== 'object' || Array.isArray(previews)) return null;
     const entry = (previews as Row)[revisionId] as Row | undefined;
+    // Since the row diet (NFR #4) a revision's cover names its slide rather
+    // than carrying a copy of the markup; the slide's own blob answers.
+    if (entry && typeof entry.body !== 'string' && typeof entry.slideId === 'string' && entry.slideId) {
+      return this.slidePreview(documentId, revisionId, entry.slideId);
+    }
     if (!entry || typeof entry.body !== 'string') return null;
     const contentType = String(entry.contentType ?? '');
     if (!ALLOWED_PREVIEW_TYPES.has(contentType)) return null;

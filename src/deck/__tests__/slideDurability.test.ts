@@ -11,15 +11,17 @@ jest.mock('../../lib/aws-clients', () => ({ docClient: { send: jest.fn(async () 
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { GetCommand, PutCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { GetCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { IMAGE_BLOB_SIZE_CAP_BYTES, InMemoryImageBlobStore } from '../../pipeline/image/ImageBlobStore';
 import { PPTX_CONTENT_TYPE } from '../renderPptx';
 import { VolumeImageBlobStore } from '../../pipeline/image/VolumeImageBlobStore';
 import { __resetVisionServicesForTests, getAssetBlobStore } from '../../pipeline/image/visionServices';
 import {
-  DdbPresentationDocumentStore, MAX_INLINE_SLIDE_BYTES, inlineSlideBytes,
+  DdbPresentationDocumentStore, MAX_ROW_BYTES, PresentationRowTooLargeError, contentHash, estimateItemBytes,
+  inlineSlideBytes, resolveRevisionSpec, slideContentKey,
   type PresentationDocumentRow,
 } from '../presentationDocuments';
+import { sampleDeck } from './fixtures';
 
 const slides = [
   { id: 'cover', title: 'Cover', svg: '<svg xmlns="http://www.w3.org/2000/svg">cover</svg>' },
@@ -34,22 +36,84 @@ function fakeClient(): { client: DynamoDBDocumentClient; written: () => Presenta
       if (command instanceof PutCommand) {
         row = (command as unknown as { input: { Item: PresentationDocumentRow } }).input.Item;
       }
+      if (command instanceof UpdateCommand && row) {
+        // The store's one update: SET each `name = :name`. Round-trip through
+        // JSON the way DynamoDB would hand it back.
+        const values = (command as unknown as { input: { ExpressionAttributeValues: Record<string, unknown> } }).input.ExpressionAttributeValues;
+        const next: Record<string, unknown> = { ...row };
+        for (const [key, value] of Object.entries(values)) if (key !== ':expectedCount') next[key.slice(1)] = value;
+        row = JSON.parse(JSON.stringify(next));
+      }
       return {};
     },
   } as unknown as DynamoDBDocumentClient;
   return { client, written: () => row };
 }
 
-describe('a slide’s markup lives on the row', () => {
-  it('is written inline beside the blob copy', async () => {
+describe('a slide’s markup lives in the blob store, by content (NFR #4)', () => {
+  it('is written to the volume and the durable copy under its hash; the row keeps only the record', async () => {
     const blobStore = new InMemoryImageBlobStore();
+    const mirror = new InMemoryImageBlobStore();
     const { client, written } = fakeClient();
-    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore, now: () => new Date('2026-09-21T10:00:00.000Z') });
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore, mirror, now: () => new Date('2026-09-21T10:00:00.000Z') });
     const { revision } = await store.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides });
 
-    expect(revision.slides[0]!.svg).toBe(slides[0]!.svg);
-    expect(written()!.revisionSlides!.v1![0]!.svg).toBe(slides[0]!.svg);
-    expect((await blobStore.getBlob(revision.slides[0]!.asset.key))!.body.toString('utf8')).toBe(slides[0]!.svg);
+    const sha = contentHash(slides[0]!.svg);
+    expect(revision.slides[0]).toMatchObject({ sha256: sha, asset: { key: slideContentKey(sha), sizeBytes: Buffer.byteLength(slides[0]!.svg) } });
+    expect(revision.slides[0]!.svg).toBeUndefined();
+    expect(written()!.revisionSlides).toBeUndefined();
+    // The cover preview names its slide instead of carrying a third copy.
+    expect(written()!.revisionPreviews).toEqual({ v1: { contentType: 'image/svg+xml', slideId: 'cover' } });
+    for (const place of [blobStore, mirror]) {
+      expect((await place.getBlob(slideContentKey(sha)))!.body.toString('utf8')).toBe(slides[0]!.svg);
+    }
+    expect(await store.slidePreview('doc-1', 'v1', 'cover')).toMatchObject({ from: 'blob', sha256: sha });
+  });
+
+  it('serves a slide from the durable copy when the volume lost it', async () => {
+    const blobStore = new InMemoryImageBlobStore();
+    const mirror = new InMemoryImageBlobStore();
+    const { client } = fakeClient();
+    const writer = new DdbPresentationDocumentStore({ docClient: client, blobStore, mirror });
+    await writer.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides });
+    // A pod replacement: the row and the durable copy survive, the volume does not.
+    const reader = new DdbPresentationDocumentStore({ docClient: client, blobStore: new InMemoryImageBlobStore(), mirror });
+    const preview = await reader.slidePreview('doc-1', 'v1', 'sources');
+    expect(preview).toMatchObject({ from: 'mirror', contentType: 'image/svg+xml' });
+    expect(preview!.body.toString('utf8')).toBe(slides[1]!.svg);
+  });
+
+  it('20 revisions of a 6-slide deck: unchanged slides are one blob, old specs move off the row, the row stays small', async () => {
+    const blobStore = new InMemoryImageBlobStore();
+    const mirror = new InMemoryImageBlobStore();
+    const puts = jest.spyOn(mirror, 'putBlob');
+    const { client, written } = fakeClient();
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore, mirror });
+    const deck = sampleDeck();
+    const six = Array.from({ length: 6 }, (_v, index) => ({ id: `s${index}`, title: `Slide ${index}`, svg: `<svg xmlns="http://www.w3.org/2000/svg">${'p'.repeat(2400)}${index}</svg>` }));
+    const sizes: number[] = [];
+    for (let rev = 1; rev <= 20; rev += 1) {
+      // Each save changes one slide (the one a composer edit touched).
+      const edited = six.map((slide, index) => (index === rev % 6 ? { ...slide, svg: slide.svg.replace('</svg>', `r${rev}</svg>`) } : slide));
+      six.splice(0, 6, ...edited);
+      const spec = { ...deck, title: `Deck r${rev}` };
+      await store.appendRevision({ documentId: 'audit-row-diet', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides: six, spec });
+      sizes.push(estimateItemBytes(written() as never));
+    }
+    const row = written()!;
+    expect(row.revisions).toHaveLength(20);
+    expect(sizes[19]!).toBeLessThan(150 * 1024);
+    // Growth per revision is the record, not the markup (~15 KB of SVG per save here).
+    expect((sizes[19]! - sizes[9]!) / 10).toBeLessThan(3 * 1024);
+    // 6 slides + 19 edited slides + 19 moved specs + 20 .pptx — never a slide twice.
+    const svgPuts = puts.mock.calls.filter(([key]) => String(key).startsWith('deck-svg-')).length;
+    expect(svgPuts).toBe(6 + 19);
+    // Only the head carries its spec; every earlier one reads back from the blob.
+    expect(row.revisions!.filter((revision) => revision.spec)).toHaveLength(1);
+    expect(row.revisions![19]!.spec!.title).toBe('Deck r20');
+    expect((await resolveRevisionSpec(store, row.revisions![0]!))!.title).toBe('Deck r1');
+    // And an old revision's slides still render.
+    expect((await store.slidePreview('audit-row-diet', 'v1', 's0'))!.body.toString('utf8')).toContain('p');
   });
 
   it('serves the slide from the row when the blob file is gone', async () => {
@@ -91,14 +155,23 @@ describe('a slide’s markup lives on the row', () => {
     expect(preview!.body.toString('utf8')).toBe('<svg>old</svg>');
   });
 
-  it('refuses a revision that would put more markup on the row than it can hold', async () => {
-    const { client } = fakeClient();
-    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore: new InMemoryImageBlobStore() });
-    const huge = Array.from({ length: 40 }, (_v, index) => ({
-      id: `s${index}`, title: `S${index}`, svg: `<svg>${'x'.repeat(10_000)}</svg>`,
-    }));
-    await expect(store.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides: huge }))
-      .rejects.toThrow(new RegExp(`over the ${MAX_INLINE_SLIDE_BYTES}B`));
+  it('refuses a row that would pass the item limit with its own message, before any slide is stored', async () => {
+    const { client, written } = fakeClient();
+    const blobStore = new InMemoryImageBlobStore();
+    const puts = jest.spyOn(blobStore, 'putBlob');
+    const store = new DdbPresentationDocumentStore({ docClient: client, blobStore, mirror: null });
+    const spec = { ...sampleDeck(), slides: sampleDeck().slides.map((slide) => ({ ...slide, notes: 'n'.repeat(60_000) })) };
+    const attempt = store.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides, spec });
+    await expect(attempt).rejects.toBeInstanceOf(PresentationRowTooLargeError);
+    await expect(attempt).rejects.toThrow(new RegExp(`over the ${MAX_ROW_BYTES / 1024} KB a document row may hold`));
+    expect(written()).toBeNull();
+    expect(puts.mock.calls.filter(([key]) => String(key).startsWith('deck-svg-'))).toHaveLength(0);
+  });
+
+  it('estimates an item the way DynamoDB counts it', () => {
+    expect(estimateItemBytes({ a: 'xyz' })).toBe(4);
+    expect(estimateItemBytes({ list: ['ab', 'c'] })).toBe(4 + 3 + 3 + 2);
+    expect(estimateItemBytes({ m: { k: 'v' } })).toBe(1 + 3 + 1 + 1 + 1);
   });
 
   it('counts what a row already holds, without double-counting the two places it records slides', () => {
