@@ -1122,6 +1122,13 @@ export async function replayGatewayWorkGraph(
   // Digests of disclosed entities first created inside this replay: the only
   // difference an advance may explain.
   const created: bigint[] = [];
+  // With a revision to check against, the answer is only ever returned when
+  // the visible set at the stream's revision is contained in the current one
+  // (equal, or grown by proven additions). A node the viewer cannot see now
+  // was then never visible to this stream, so its change or removal is
+  // skipped instead of forcing a refetch — a private document edited on a
+  // shared day was a reset for every non-owner viewer.
+  const setChecked = request.fromPolicyRevision !== undefined;
   let safe = stored.complete;
   const mapped = stored.batches.map((batch) => {
     if (Date.parse(batch.committedAt) < Date.parse(request.since)) safe = false;
@@ -1131,11 +1138,14 @@ export async function replayGatewayWorkGraph(
         const publicId = current.authorization.publicTargetIds.get(operation.node.id);
         const node = publicId ? visibleNodes.get(publicId) : undefined;
         if (node) operations.push({ kind: 'upsert-node', node });
-        else safe = false; // an opaque prior node id cannot be safely removed
+        else if (!setChecked) safe = false; // an opaque prior node id cannot be safely removed
         const authorized = publicId ? authorizedNodes.get(publicId) : undefined;
         if (operation.created && authorized) created.push(authorizationEntityDigest('node', authorized));
       } else if (operation.kind === 'remove-node') {
-        safe = false; // disclosure may have used a reader-scoped opaque id
+        // Disclosure may have used a reader-scoped opaque id. Only the set
+        // check can say the viewer never held it (a held node that went away
+        // changes the revision non-additively, and the stream is invalidated).
+        if (!setChecked) safe = false;
       } else if (operation.kind === 'upsert-edge') {
         const edge = visibleEdges.get(operation.edge.id);
         operations.push(edge
