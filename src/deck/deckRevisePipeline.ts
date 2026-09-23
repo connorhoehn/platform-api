@@ -375,6 +375,39 @@ export interface WriteOutput {
   result: { kind: 'document'; documentId: string };
 }
 
+/**
+ * Tell run persistence the revision this run wrote, on the same hook the
+ * `/deck` render step uses (`pipeline:step:deck:produced`). That is what
+ * projects the revision into the work graph as a document revision with the
+ * run as its producer — without it the revision a composer edit saved never
+ * reached Active Now, the run had no `produced` edge, and its pane could not
+ * open the deck at the revision it wrote. Emitted on the run's owning replica
+ * (the only one holding its run state); the projection is idempotent per
+ * (document, revision), so a resumed run that re-announces is harmless.
+ */
+async function announceProduced(
+  helpers: StepHandlerHelpers,
+  documentId: string,
+  revisionId: string,
+  slideCount: number | undefined,
+  title: string | undefined,
+  at: string | undefined,
+): Promise<void> {
+  try {
+    await (helpers.emit as unknown as (event: string, payload: unknown) => Promise<void>)('pipeline:step:deck:produced', {
+      runId: helpers.runId,
+      stepId: helpers.stepId,
+      documentId,
+      revisionId,
+      ...(slideCount !== undefined ? { slideCount } : {}),
+      ...(title ? { title } : {}),
+      at: at ?? new Date().toISOString(),
+    });
+  } catch {
+    // a bad subscriber never fails the write
+  }
+}
+
 export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): DescribedStepHandler {
   return {
     kind: DECK_REVISE_WRITE_KIND,
@@ -409,6 +442,7 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
       const row = await store.get(request.documentId);
       const already = row?.revisions?.find((revision) => revision.producedBy?.requestId === request.requestId);
       if (already) {
+        await announceProduced(helpers, request.documentId, already.id, already.slideCount, loaded.title, already.createdAt);
         events.completed(proposed.changedSlideIds, { revisionId: already.id });
         return { status: 'completed', output: { ...base, written: true, revisionId: already.id, replayed: true } as unknown as Record<string, unknown> };
       }
@@ -429,6 +463,7 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
             producedBy: { pipelineId: DECK_REVISE_PIPELINE_ID, runId, requestId: request.requestId },
             ...(loaded.transcriptIds.length ? { transcriptIds: loaded.transcriptIds } : {}),
           });
+          await announceProduced(helpers, request.documentId, revision.id, revision.slideCount, loaded.title, revision.createdAt);
           events.completed(proposed.changedSlideIds, { revisionId: revision.id, ...(rebasedOnto ? { rebasedOnto } : {}) });
           log.info({ runId, documentId: request.documentId, revisionId: revision.id, rebasedOnto, requestId: request.requestId }, 'deck revise run saved a revision');
           const output: WriteOutput = {

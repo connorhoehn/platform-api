@@ -28,6 +28,30 @@ import type { StoredWorkNode } from '../repositories/WorkGraphRepository';
 import { parsePipelineStepResourceId } from './sources/mapPipeline';
 import type { AuthorizedWorkGraph, ViewerWorkEdge, ViewerWorkNode } from './policy';
 
+/** A composer edit, as its run recorded it. Every field is the run's own. */
+export interface DocumentEditFacts {
+  /** The instruction the person typed, verbatim (trimmed to a label). */
+  instruction: string;
+  /** Where it applied: "Whole deck", "Slide “Risks”", "Slide “Risks” · title". */
+  scope: string;
+  documentId: string;
+  /** The presentation's title, as the load step read it. */
+  title?: string;
+  /** The revision the edit was made against. */
+  baseRevisionId?: string;
+  /** `request`: the editor's unsaved deck; `head`: the newest saved revision. */
+  specFrom?: 'request' | 'head';
+  /** The model's own one-line account of the change. */
+  summary?: string;
+  changedSlides?: number;
+  /** The revision the write step saved; absent when nothing was saved. */
+  revisionId?: string;
+  /** Set when the write rebased a scoped edit onto a newer head. */
+  rebasedOnto?: string;
+  /** The write step finished and saved nothing because nothing changed. */
+  unchanged?: boolean;
+}
+
 /** Source facts, already read from the owning service's own record. */
 export interface PipelineRunFacts {
   runId: string;
@@ -47,6 +71,13 @@ export interface PipelineRunFacts {
    * which of its steps is actually doing the work.
    */
   runningStep?: { stepId: string };
+  /**
+   * What a document-edit run (a composer edit, `deck-revise`) was asked to do
+   * and what it wrote, copied from the run's own step outputs: the trigger's
+   * instruction and scope, the load step's base revision, the propose step's
+   * summary, the write step's revision. Absent for every other run.
+   */
+  edit?: DocumentEditFacts;
   /**
    * Present only when the node names ONE step of the run (`runId#stepId`).
    * Every field is copied from the step's own recorded output or its live
@@ -315,6 +346,54 @@ export function agentStepLines(step: NonNullable<PipelineRunFacts['step']>): str
   return [head, workspace].filter((value): value is string => !!value);
 }
 
+/**
+ * A failed edit, in the words of its cause. The run's error is
+ * `<step>: deck-revise <code>: <reason>`; a reader needs the reason, and for
+ * a conflict the word "conflict" — the step id and the pipeline id are ours.
+ */
+export function editFailure(error: string | undefined): string {
+  if (!error) return 'The edit failed before it saved anything.';
+  const parsed = /^(?:[A-Za-z0-9_:-]+: )?[a-z]+-(?:revise|edit) ([a-z-]+): ([\s\S]+)$/.exec(error.trim());
+  if (!parsed) return error;
+  const [, code, reason] = parsed;
+  if (code === 'revision-conflict') return `Conflict: ${reason}`;
+  return reason!;
+}
+
+/** The one line that says what an edit (or one step of it) did. */
+export function editSummary(edit: DocumentEditFacts, stepId: string | undefined, status: string): string | undefined {
+  const deck = edit.title ?? 'the presentation';
+  const settled = status === 'completed';
+  if (stepId === 'load') {
+    if (!edit.baseRevisionId) return settled ? `Read ${deck}` : `Reading ${deck}`;
+    return `${settled ? 'Read' : 'Reading'} ${edit.baseRevisionId}${edit.specFrom === 'request' ? ' with the editor’s unsaved changes' : ''}`;
+  }
+  if (stepId === 'propose') return edit.summary ?? (settled ? 'Wrote the edit' : 'Writing the edit');
+  if (stepId === 'write' || !stepId) {
+    if (edit.revisionId) {
+      return `${stepId ? 'Saved' : 'Wrote'} ${edit.revisionId} of ${deck}${edit.rebasedOnto ? ` (rebased onto ${edit.rebasedOnto})` : ''}`;
+    }
+    if (edit.unchanged) return `Nothing changed — ${deck} was left as it was`;
+    return settled ? undefined : `Editing ${deck}`;
+  }
+  return undefined;
+}
+
+/** Scope, and the revision it started from → the revision it wrote. */
+export function editLines(edit: DocumentEditFacts, stepId: string | undefined): string[] {
+  const from = edit.baseRevisionId;
+  const revision = edit.revisionId
+    ? (from ? `${from} → ${edit.revisionId}` : edit.revisionId)
+    : (from ? `From ${from}` : undefined);
+  const changed = edit.changedSlides !== undefined && edit.changedSlides > 0 && (!stepId || stepId !== 'load')
+    ? `${edit.changedSlides} slide${edit.changedSlides === 1 ? '' : 's'} changed`
+    : undefined;
+  const lines = [edit.scope, stepId === 'load' ? undefined : revision, changed];
+  // The run's pane also says what the model said it did; a step's own summary already is that.
+  if (!stepId && edit.summary && edit.revisionId) lines.push(edit.summary);
+  return lines.filter((line): line is string => !!line);
+}
+
 function storedNode(authorization: AuthorizedWorkGraph, nodeId: string): StoredWorkNode | undefined {
   const target = authorization.targets.get(nodeId);
   return target && target.kind === 'node' ? target.node : undefined;
@@ -572,9 +651,21 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         node.status = 'error';
         node.endedAt ??= facts?.updatedAt ?? now;
       }
+      const edit = facts?.edit;
+      const stepId = facts?.step?.stepId;
       const summary = failed
-        ? trim(facts?.error ?? 'The run failed before it produced a revision.')
-        : produced ? trim(`Creating the next revision of ${produced.title}`) : undefined;
+        ? trim(edit ? editFailure(facts?.error) : (facts?.error ?? 'The run failed before it produced a revision.'))
+        : edit ? trim(editSummary(edit, stepId, node.status))
+          : produced ? trim(`Creating the next revision of ${produced.title}`) : undefined;
+      // The presentation the edit wrote into, when the viewer can see it: the
+      // run's own `produced` edge, else the document node its source
+      // addresses by the id the run recorded. `meta` is the revision it
+      // wrote, so a pane can open the deck AT that revision, not at the head.
+      const editTarget = edit
+        ? (produced ?? nodes.find((candidate) => candidate.kind === 'document'
+          && storedNode(authorization, candidate.id)?.sourceRef.resourceId === edit.documentId))
+        : undefined;
+      const workItem = edit && editTarget ? link(editTarget, edit.revisionId) : undefined;
       const tools = facts?.tools.slice(0, 16) ?? [];
       // "Presentation agent · 3 tools": the definition's own name and the
       // number of steps this run actually recorded.
@@ -585,10 +676,18 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       // run: "Sonnet · 146k / 200k · 4 iterations", and the workspace it is
       // running in. Every clause is dropped when the step did not report it.
       const stepLines = facts?.step ? agentStepLines(facts.step) : [];
-      const lines = [...(agentLine ? [agentLine] : []), ...stepLines].slice(0, WORK_GRAPH_V2_LIMITS.detailLines);
+      const lines = [
+        ...(edit ? editLines(edit, stepId) : []),
+        ...(agentLine && !edit ? [agentLine] : []),
+        ...stepLines,
+      ].map((line) => trim(line)).filter((line): line is string => !!line).slice(0, WORK_GRAPH_V2_LIMITS.detailLines);
       setDetail(node.id, {
         ...(summary ? { summary } : {}),
         ...(lines.length ? { lines } : {}),
+        // What the person asked for, verbatim — on the run and on each step,
+        // so any node of the edit says what was being edited.
+        ...(edit ? { excerpt: trim(edit.instruction) as string } : {}),
+        ...(workItem ? { workItem } : {}),
         ...(tools.length ? { tools } : {}),
         ...(inputs.length ? { inputs } : {}),
         ...(freshness ? { freshness } : {}),

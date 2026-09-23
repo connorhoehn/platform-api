@@ -19,6 +19,7 @@ import { SVG_CONTENT_TYPE } from '../../deck/renderSlideSvg';
 import type { AssetBlobStore } from '../../pipeline/image/ImageBlobStore';
 import { getAssetBlobStore } from '../../pipeline/image/visionServices';
 import type {
+  DocumentEditFacts,
   ArtifactFacts,
   ArtifactRevisionFacts,
   RevisionPreview,
@@ -114,15 +115,78 @@ function runStatus(value: unknown): PipelineRunFacts['status'] {
 }
 
 async function scanOne(client: DynamoDBDocumentClient, table: string, expression: string, values: Row): Promise<Row | undefined> {
-  const result = await client.send(new ScanCommand({
-    TableName: table,
-    FilterExpression: expression,
-    ExpressionAttributeValues: values,
-    Limit: 200,
-  }));
-  const rows = (result.Items ?? []) as Row[];
+  // Paged: `Limit` counts rows READ before the filter, and a page also stops
+  // at 1 MB, so a single call found a row only if it happened to sit in the
+  // table's first page — a run past it had no pane facts at all.
+  const rows: Row[] = [];
+  let startKey: Record<string, unknown> | undefined;
+  let pages = 0;
+  do {
+    const result = await client.send(new ScanCommand({
+      TableName: table,
+      FilterExpression: expression,
+      ExpressionAttributeValues: values,
+      ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+    }));
+    rows.push(...((result.Items ?? []) as Row[]));
+    startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+    pages += 1;
+  } while (startKey && rows.length < 2 && pages < 50);
   // More than one match is ambiguous provenance, so nothing is disclosed.
   return rows.length === 1 ? rows[0] : undefined;
+}
+
+/**
+ * A composer edit's facts, from the run's own step outputs. Recognised by
+ * shape, not by pipeline id: a trigger that names a document and carries an
+ * instruction, as `deck-revise` (and any later document-edit pipeline) does.
+ * Nothing is taken from the run's live context or guessed from a neighbour.
+ */
+export function documentEditFacts(steps: Row): DocumentEditFacts | undefined {
+  const output = (stepId: string): Row => {
+    const summary = steps[stepId];
+    const out = summary && typeof summary === 'object' ? (summary as Row).output : undefined;
+    return out && typeof out === 'object' && !Array.isArray(out) ? out as Row : {};
+  };
+  const trigger = output('trigger');
+  const instruction = text(trigger.instruction, 160);
+  const documentId = text(trigger.documentId, 128);
+  if (!instruction || !documentId) return undefined;
+  const load = output('load');
+  const propose = output('propose');
+  const write = output('write');
+  // The slide's own title from the deck the edit was made against; its id
+  // ("transcript") is an internal key a reader cannot place.
+  const slideId = text(trigger.slideId, 64);
+  const spec = load.spec && typeof load.spec === 'object' ? load.spec as Row : undefined;
+  const slides = Array.isArray(spec?.slides) ? spec!.slides as Row[] : [];
+  const slideIndex = slideId ? slides.findIndex((slide) => slide?.id === slideId) : -1;
+  const slideTitle = slideIndex >= 0 ? text(slides[slideIndex]!.title, 60) : undefined;
+  const target = trigger.target && typeof trigger.target === 'object' ? trigger.target as Row : undefined;
+  const field = text(target?.field, 24);
+  const index = typeof target?.index === 'number' && Number.isInteger(target.index) ? target.index : undefined;
+  const slideLabel = slideId
+    ? `Slide${slideIndex >= 0 ? ` ${slideIndex + 1}` : ''} “${slideTitle ?? slideId}”`
+    : undefined;
+  const fieldLabel = field ? `${field}${index !== undefined ? ` ${index + 1}` : ''}` : undefined;
+  const scope = [slideLabel ?? (fieldLabel ? undefined : 'Whole deck'), fieldLabel].filter(Boolean).join(' · ') || 'Whole deck';
+  const changed = Array.isArray(write.changedSlideIds) ? write.changedSlideIds : Array.isArray(propose.changedSlideIds) ? propose.changedSlideIds : undefined;
+  const writeDone = (steps.write as Row | undefined)?.status === 'completed';
+  const revisionId = write.written === true ? text(write.revisionId, 64) : undefined;
+  const specFrom = load.specFrom === 'request' || load.specFrom === 'head' ? load.specFrom : undefined;
+  return {
+    instruction,
+    scope,
+    documentId,
+    ...(text(load.title, 80) ? { title: text(load.title, 80) as string } : {}),
+    ...(text(load.baseRevisionId ?? trigger.baseRevisionId, 64) ? { baseRevisionId: text(load.baseRevisionId ?? trigger.baseRevisionId, 64) as string } : {}),
+    ...(specFrom ? { specFrom } : {}),
+    ...(text(write.summary ?? propose.summary, 160) ? { summary: text(write.summary ?? propose.summary, 160) as string } : {}),
+    ...(changed ? { changedSlides: changed.length } : {}),
+    ...(revisionId ? { revisionId } : {}),
+    ...(revisionId && text(write.rebasedOnto, 64) ? { rebasedOnto: text(write.rebasedOnto, 64) as string } : {}),
+    ...(writeDone && write.written === false ? { unchanged: true } : {}),
+  };
 }
 
 export class DynamoWorkActivityReader implements WorkActivityReader {
@@ -155,19 +219,29 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     for (let index = 0; index < runIds.length; index += MAX_IN_OPERANDS) {
       const chunk = runIds.slice(index, index + MAX_IN_OPERANDS);
       const values = Object.fromEntries(chunk.map((id, position) => [`:r${position}`, id]));
-      const result = await this.client.send(new ScanCommand({
-        TableName: PIPELINE_RUNS_TABLE,
-        FilterExpression: `runId IN (${Object.keys(values).join(', ')})`,
-        ExpressionAttributeValues: values,
-        Limit: MAX_RUN_SCAN_ROWS,
-      }));
-      for (const item of (result.Items ?? []) as Row[]) {
-        const id = typeof item.runId === 'string' ? item.runId : undefined;
-        if (!id || !chunk.includes(id)) continue;
-        // Two rows claiming one run id is ambiguous provenance: it discloses
-        // nothing, exactly as the single-run lookup already refused to.
-        rows.set(id, rows.has(id) ? null : item);
-      }
+      // Paged. One Scan call stops at 1 MB of rows READ, before the filter —
+      // and a run row carries its checkpoint and every step's output, so the
+      // first page held 114 of 122 rows and the runs past it had no facts at
+      // all: their panes showed a title and nothing else.
+      let startKey: Record<string, unknown> | undefined;
+      let scanned = 0;
+      do {
+        const result = await this.client.send(new ScanCommand({
+          TableName: PIPELINE_RUNS_TABLE,
+          FilterExpression: `runId IN (${Object.keys(values).join(', ')})`,
+          ExpressionAttributeValues: values,
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }));
+        for (const item of (result.Items ?? []) as Row[]) {
+          const id = typeof item.runId === 'string' ? item.runId : undefined;
+          if (!id || !chunk.includes(id)) continue;
+          // Two rows claiming one run id is ambiguous provenance: it discloses
+          // nothing, exactly as the single-run lookup already refused to.
+          rows.set(id, rows.has(id) ? null : item);
+        }
+        scanned += result.ScannedCount ?? 0;
+        startKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+      } while (startKey && scanned < MAX_RUN_SCAN_ROWS * 20);
     }
     await Promise.all(distinct.map(async (resource) => {
       const row = rows.get(parsePipelineStepResourceId(resource).runId);
@@ -195,6 +269,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       .filter((value): value is string => !!value);
     const startedAt = iso(row.startedAt);
     if (!startedAt) return null;
+    const edit = documentEditFacts(steps);
     // The definition's own name, so the card says "Presentation agent" rather
     // than an internal pipeline id.
     // The definitions table is keyed (userId, pipelineId): the owner is the
@@ -225,6 +300,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       ...(running && text(running.stepId, 60) ? { runningStep: { stepId: text(running.stepId, 60) as string } } : {}),
       ...(agentLabel ? { agentLabel } : {}),
       ...(text(row.error, ERROR_SUMMARY_LENGTH) ? { error: text(row.error, ERROR_SUMMARY_LENGTH) as string } : {}),
+      ...(edit ? { edit } : {}),
     };
   }
 
@@ -275,6 +351,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       ...(text(output.stopReason, 30) ? { stopReason: text(output.stopReason, 30) as string } : {}),
     };
     const attempts = Array.isArray(summary.attempts) ? summary.attempts.length : 1;
+    const edit = documentEditFacts(steps);
     return {
       runId,
       status: runStatus(summary.status),
@@ -284,6 +361,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       tools: [],
       step,
       ...(text(summary.error, ERROR_SUMMARY_LENGTH) ? { error: text(summary.error, ERROR_SUMMARY_LENGTH) as string } : {}),
+      ...(edit ? { edit } : {}),
     };
   }
 

@@ -921,3 +921,65 @@ describe('what names a frame that holds a run', () => {
     expect(activity.efforts[0].title).toBe('Schedule and run platform team meeting');
   });
 });
+
+describe('a composer edit (deck-revise) says what it edited and what it wrote', () => {
+  const edit = {
+    instruction: 'Make the title name what the transcript decided',
+    scope: 'Slide 2 “Transcript” · title',
+    documentId: 'doc-1',
+    title: 'Team deck',
+    baseRevisionId: 'v1',
+    specFrom: 'head' as const,
+    summary: 'Changed title to reflect the key decision.',
+    changedSlides: 1,
+    revisionId: 'v2',
+  };
+  const base = { runId: RUN, attempt: 1, startedAt: `${DAY}T18:00:00.000Z`, updatedAt: `${DAY}T18:00:30.000Z`, tools: [] };
+  const events = [
+    documentEvent(`${DAY}T17:59:00.000Z`),
+    runEvent('completed', `${DAY}T18:00:00.000Z`, false),
+    stepEvent('load', 'Read the deck', 'completed', `${DAY}T18:00:02.000Z`),
+    stepEvent('write', 'Save the new revision', 'completed', `${DAY}T18:00:30.000Z`, ['load'], { produces: 'doc-1' }),
+  ];
+
+  async function detailsFor(facts: Record<string, PipelineRunFacts>) {
+    const state = project(events);
+    const { nodes, edges, authorization } = authorize(state);
+    const activity = await buildWorkActivity({ query, nodes, edges, authorization, reader: reader(facts), now: NOW });
+    const byTitle = (title: string) => nodes.find((node) => node.title === title)!;
+    const detail = (title: string) => activity.details.find((item) => item.nodeId === byTitle(title).id)!;
+    return { detail, byTitle };
+  }
+
+  it('the run: instruction verbatim, scope, v1 → v2, and the deck it wrote linked AT that revision', async () => {
+    const { detail, byTitle } = await detailsFor({ [RUN]: { ...base, status: 'completed', edit } });
+    const run = detail('Agent loop · create a meeting with the X team');
+    expect(run.summary).toBe('Wrote v2 of Team deck');
+    expect(run.excerpt).toBe('Make the title name what the transcript decided');
+    expect(run.lines).toEqual(['Slide 2 “Transcript” · title', 'v1 → v2', '1 slide changed', 'Changed title to reflect the key decision.']);
+    expect(run.workItem).toEqual({ nodeId: byTitle('Team deck').id, label: 'Team deck', meta: 'v2' });
+  });
+
+  it('each step says its own part: what it read, and the revision it saved', async () => {
+    const { detail } = await detailsFor({
+      [`${RUN}::load`]: { ...base, status: 'completed', step: { stepId: 'load' }, edit },
+      [`${RUN}::write`]: { ...base, status: 'completed', step: { stepId: 'write' }, edit },
+    });
+    expect(detail('Read the deck').summary).toBe('Read v1');
+    expect(detail('Read the deck').lines).toEqual(['Slide 2 “Transcript” · title']);
+    expect(detail('Save the new revision').summary).toBe('Saved v2 of Team deck');
+    expect(detail('Save the new revision').excerpt).toBe('Make the title name what the transcript decided');
+  });
+
+  it('a conflict reads as a conflict, in the source’s own words, with no step or pipeline ids', async () => {
+    const failed = { instruction: 'Shorter title', scope: 'Whole deck', documentId: 'doc-1' };
+    const { detail } = await detailsFor({
+      [RUN]: { ...base, status: 'error', error: 'load: deck-revise revision-conflict: v6 was saved after the one this edit started from, so nothing was changed.', edit: failed },
+    });
+    const run = detail('Agent loop · create a meeting with the X team');
+    expect(run.summary).toBe('Conflict: v6 was saved after the one this edit started from, so nothing was changed.');
+    expect(run.lines).toEqual(['Whole deck']);
+    // Nothing was written, so the deck is linked with no revision to open.
+    expect(run.workItem?.meta).toBeUndefined();
+  });
+});

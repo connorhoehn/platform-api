@@ -374,3 +374,67 @@ describe('which step a run is inside', () => {
     expect((await new DynamoWorkActivityReader(client).pipelineRun('run-9'))?.runningStep).toBeUndefined();
   });
 });
+
+describe('runs past the first page of the scan', () => {
+  it('pages the run scan, so a run in the second 1 MB page still has facts', async () => {
+    // DynamoDB stops a Scan page at 1 MB READ, before the filter; with every
+    // run row carrying its checkpoint, 114 of 122 rows fit in the first page.
+    const later = { runId: 'run-late', pipelineId: 'deck-revise', status: 'completed', startedAt: '2026-09-23T02:59:16.000Z', triggeredBy: 'dev-frank', stepsSummary: {} };
+    let calls = 0;
+    const client = {
+      async send(command: unknown) {
+        if (!(command instanceof ScanCommand)) return {};
+        calls += 1;
+        return (command.input as { ExclusiveStartKey?: unknown }).ExclusiveStartKey
+          ? { Items: [later], ScannedCount: 8 }
+          : { Items: [], ScannedCount: 114, LastEvaluatedKey: { pipelineId: 'x', runId: 'y' } };
+      },
+    } as unknown as DynamoDBDocumentClient;
+    const reader = new DynamoWorkActivityReader(client);
+    expect((await reader.pipelineRuns(['run-late'])).get('run-late')?.status).toBe('completed');
+    expect(calls).toBe(2);
+    calls = 0;
+    expect((await reader.pipelineRun('run-late'))?.status).toBe('completed');
+    expect(calls).toBe(2);
+  });
+});
+
+describe('what a composer edit did, from its own step outputs', () => {
+  const spec = { slides: [{ id: 'cover', title: 'audit-deck-2355' }, { id: 'transcript', title: 'Transcript' }] };
+  const trigger = { status: 'completed', output: { instruction: 'Make the title name what the transcript decided', documentId: 'deck-1', slideId: 'transcript', target: { field: 'title' }, baseRevisionId: 'v6' } };
+  const load = { status: 'completed', startedAt: '2026-09-23T02:59:17.000Z', output: { spec, baseRevisionId: 'v6', specFrom: 'head', title: 'audit-deck-2355' } };
+  const propose = { status: 'completed', startedAt: '2026-09-23T02:59:18.000Z', output: { summary: 'Changed title to reflect the key decision.', changedSlideIds: ['transcript'] } };
+  const write = { status: 'completed', startedAt: '2026-09-23T02:59:30.000Z', output: { written: true, revisionId: 'v7', baseRevisionId: 'v6', summary: 'Changed title to reflect the key decision.', changedSlideIds: ['transcript'] } };
+
+  function readerOf(row: Row): DynamoWorkActivityReader {
+    const client = {
+      async send(command: unknown) { return command instanceof ScanCommand ? { Items: [row] } : {}; },
+    } as unknown as DynamoDBDocumentClient;
+    return new DynamoWorkActivityReader(client);
+  }
+
+  it('names the instruction, the scope as a reader sees it, and the revision the write saved', async () => {
+    const row = { runId: 'ee808930', pipelineId: 'deck-revise', status: 'completed', startedAt: '2026-09-23T02:59:16.000Z', triggeredBy: 'dev-frank', stepsSummary: { trigger, load, propose, write } };
+    const facts = await readerOf(row).pipelineRuns(['ee808930', 'ee808930::write']);
+    expect(facts.get('ee808930')?.edit).toEqual({
+      instruction: 'Make the title name what the transcript decided',
+      scope: 'Slide 2 “Transcript” · title',
+      documentId: 'deck-1',
+      title: 'audit-deck-2355',
+      baseRevisionId: 'v6',
+      specFrom: 'head',
+      summary: 'Changed title to reflect the key decision.',
+      changedSlides: 1,
+      revisionId: 'v7',
+    });
+    expect(facts.get('ee808930::write')?.edit?.revisionId).toBe('v7');
+  });
+
+  it('carries no revision for an edit whose write never ran, and nothing for a run that is not an edit', async () => {
+    const failed = { runId: 'c1caab64', pipelineId: 'deck-revise', status: 'failed', startedAt: '2026-09-23T02:58:27.000Z', triggeredBy: 'dev-frank', error: 'load: deck-revise revision-conflict: v6 was saved after the one this edit started from, so nothing was changed.', stepsSummary: { trigger: { status: 'completed', output: { instruction: 'Shorter title', documentId: 'deck-1' } }, load: { status: 'failed', startedAt: '2026-09-23T02:58:28.000Z' } } };
+    const facts = await readerOf(failed).pipelineRuns(['c1caab64']);
+    expect(facts.get('c1caab64')?.edit).toEqual({ instruction: 'Shorter title', scope: 'Whole deck', documentId: 'deck-1' });
+    const other = { runId: 'r2', pipelineId: 'x', status: 'completed', startedAt: '2026-09-23T02:58:27.000Z', triggeredBy: 'dev-frank', stepsSummary: { trigger: { status: 'completed', output: { prompt: 'hi' } } } };
+    expect((await readerOf(other).pipelineRuns(['r2'])).get('r2')?.edit).toBeUndefined();
+  });
+});

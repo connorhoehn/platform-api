@@ -95,6 +95,7 @@ function retitle(title: string) {
 
 const published: Array<{ type: string; payload: Record<string, unknown> }> = [];
 const durable: Array<{ name: string; payload: Record<string, unknown> }> = [];
+const produced: Array<Record<string, unknown>> = [];
 
 async function run(store: FakeStore, revise: jest.Mock, trigger: Record<string, unknown>) {
   const handlers = new Map<string, StepHandler>();
@@ -102,6 +103,8 @@ async function run(store: FakeStore, revise: jest.Mock, trigger: Record<string, 
   const bus = makeBus();
   await bus.start();
   attachDeckReviseRunEvents(bus as never);
+  await (bus as unknown as { subscribe: (type: string, h: (event: { payload: Record<string, unknown> }) => void) => Promise<unknown> })
+    .subscribe('pipeline:step:deck:produced', (event) => { produced.push(event.payload); });
   const executor = new PipelineExecutor({
     definition: buildDeckReviseDefinition() as unknown as PipelineDefinition,
     ownerNodeId: 'test-node',
@@ -130,6 +133,7 @@ describe('deck-revise pipeline', () => {
   beforeEach(() => {
     published.length = 0;
     durable.length = 0;
+    produced.length = 0;
     resetDeckReviseRuns();
     setDeckReviseRunEventDeps({
       publish: async (_channel, message) => { const event = JSON.parse(message); published.push({ type: event.type, payload: event.payload }); },
@@ -157,6 +161,16 @@ describe('deck-revise pipeline', () => {
     expect(head.producedBy).toEqual({ pipelineId: 'deck-revise', runId: result.id, requestId: 'req-1' });
     expect(result.steps.write?.output).toMatchObject({ written: true, revisionId: 'v2', baseRevisionId: 'v1', changedSlideIds: [slideId], summary: `Retitled ${slideId}.` });
     expect(revise.mock.calls[0]![0].slideId).toBe(slideId);
+  });
+
+  it('announces the revision it wrote, so the work graph draws it under the run that made it', async () => {
+    const result = await run(store, retitle('Tighter'), { slideId, baseRevisionId: 'v1' });
+    expect(produced).toEqual([expect.objectContaining({ runId: result.id, stepId: 'write', documentId: DOC, revisionId: 'v2' })]);
+  });
+
+  it('announces nothing when the edit failed or changed nothing', async () => {
+    await run(store, retitle('Tighter'), { slideId, baseRevisionId: 'v0' });
+    expect(produced).toEqual([]);
   });
 
   it('publishes started → phases → saving → completed on the document channel, and the outcome durably', async () => {
