@@ -203,6 +203,14 @@ describe('reviseDeck — adding information, not rewording it', () => {
     expect(result.warnings.join(' ')).toMatch(/"Release risks must be identified before noon\." repeats what the deck already says/);
   });
 
+  it('does not flag a bullet that replaces the line it rewords ("tighten the bullets")', () => {
+    const before = deck();
+    before.slides[1] = { ...before.slides[1]!, bullets: ['Frank Davis assigned as rollback owner for gateway change'] };
+    const after = deck();
+    after.slides[1] = { ...before.slides[1]!, bullets: ['Frank Davis: rollback owner'] };
+    expect(restatedBullets(before, after)).toEqual([]);
+  });
+
   it('does not flag a bullet that adds an owner or a fact', () => {
     const before = deck();
     before.slides[1] = { ...before.slides[1]!, bullets: ['Connor: Release risks before noon.'] };

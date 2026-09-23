@@ -225,13 +225,17 @@ function contentWords(line: string): Set<string> {
  * for new information; this is how a person finds out when it was not given.
  */
 export function restatedBullets(before: DeckSpec, after: DeckSpec): string[] {
-  const existing = before.slides.flatMap((slide) => [
+  const lines = (spec: DeckSpec) => spec.slides.flatMap((slide) => [
     ...(slide.bullets ?? []),
     ...(slide.columns ?? []).flat(),
     ...(slide.quote ? [slide.quote.text] : []),
   ]);
+  const existing = lines(before);
   const had = new Set(existing);
-  const olds = existing.map(contentWords).filter((words) => words.size >= 2);
+  // Only lines the edit KEPT count: "tighten the bullets" replaces a line with
+  // a shorter one, which is a rewrite, not a repeat.
+  const kept = new Set(lines(after));
+  const olds = existing.filter((line) => kept.has(line)).map(contentWords).filter((words) => words.size >= 2);
   const added = after.slides.flatMap((slide) => slide.bullets ?? []).filter((bullet) => !had.has(bullet));
   return added.filter((bullet) => {
     const words = contentWords(bullet);
