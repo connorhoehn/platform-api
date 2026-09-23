@@ -505,6 +505,9 @@ export class WorkGraphRepository {
     private readonly onCommitted?: (committed: WorkGraphCommitted) => void,
   ) {}
 
+  /** Read-path projections by partition, least recently used first (see loadProjectionAtRevision). */
+  private readonly heldProjections = new Map<string, WorkProjectionState>();
+
   async loadProjection(
     organizationId: string,
     actorId: string,
@@ -530,6 +533,47 @@ export class WorkGraphRepository {
   }
 
   /**
+   * NFR #94: the read path's partition load, answered from this process when
+   * the partition has not moved. Every open Active Now stream is re-checked
+   * each second and each check used to query and hydrate the whole partition
+   * (DynamoDB parsing + GC were about half the platform's busy CPU under 25
+   * subscriptions). A projection is fully determined by its META revision —
+   * the fenced read above relies on exactly that — so one strongly consistent
+   * META read proves a held copy current; any other answer reads afresh.
+   * Only the read path uses it: writers still load their own mutable copy.
+   * Per process on purpose: correctness comes from the DynamoDB META check,
+   * so replicas never need to agree about what they hold.
+   */
+  private async loadProjectionAtRevision(
+    organizationId: string,
+    actorId: string,
+    day: string,
+  ): Promise<WorkProjectionState | null> {
+    const pk = partitionKey(organizationId, actorId, day);
+    const held = this.heldProjections.get(pk);
+    if (held) {
+      const meta = await this.readMeta(pk);
+      if (meta && meta.erasing !== true && meta.revision === held.revision
+        && meta.organizationId === organizationId && meta.actorId === actorId) {
+        this.heldProjections.delete(pk);
+        this.heldProjections.set(pk, held);
+        return held;
+      }
+      this.heldProjections.delete(pk);
+      if (!meta || meta.erasing === true) return null;
+    }
+    const fresh = await this.loadProjection(organizationId, actorId, day);
+    if (fresh) {
+      if (process.env.JEST_WORKER_ID) deepFreeze(fresh); // a reader that mutates a shared copy fails its tests
+      this.heldProjections.set(pk, fresh);
+      while (this.heldProjections.size > HELD_PROJECTIONS_MAX) {
+        this.heldProjections.delete(this.heldProjections.keys().next().value as string);
+      }
+    }
+    return fresh;
+  }
+
+  /**
    * A local calendar day can cross two UTC partitions. The source projection
    * remains UTC-sharded for durable ingestion; this bounded read joins only
    * the UTC days touched by the requested IANA day and filters by the shared
@@ -543,7 +587,7 @@ export class WorkGraphRepository {
   ): Promise<WorkProjectionState | null> {
     const window = workDayWindow(day, timezone);
     const utcDays = utcPartitionsForLocalDay(day, timezone);
-    const loaded = await Promise.all(utcDays.map((utcDay) => this.loadProjection(
+    const loaded = await Promise.all(utcDays.map((utcDay) => this.loadProjectionAtRevision(
       organizationId,
       actorId,
       utcDay,
@@ -1055,4 +1099,14 @@ export class WorkGraphRepository {
     }
     return state;
   }
+}
+
+const HELD_PROJECTIONS_MAX = 256;
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  }
+  return value;
 }

@@ -267,6 +267,37 @@ describe('WorkGraphRepository', () => {
     expect(decodeLocalDayWatermark(state!.revision)).toEqual([2, 3]);
   });
 
+  it('re-reads an unmoved partition as one META read, and a moved one in full (NFR #94)', async () => {
+    const node = (id: string, updatedAt: string) => ({
+      PK: 'WG#org-1#actor-1#2026-09-20', SK: `NODE#${id}`, itemKind: 'node',
+      organizationId: 'org-1', actorId: 'actor-1', id, updatedAt,
+    });
+    let revision = 2;
+    let items: Array<Record<string, unknown>> = [node('first', '2026-09-20T12:00:00.000Z')];
+    const send: Send = jest.fn(async (command: unknown) => {
+      const head = { ...meta(revision), PK: 'WG#org-1#actor-1#2026-09-20' };
+      if (command instanceof GetCommand) return { Item: head };
+      if (command instanceof QueryCommand) return { Items: [head, ...items] };
+      return {};
+    });
+    const repository = new WorkGraphRepository(client(send), reducer);
+    const load = () => repository.loadProjectionForLocalDay('org-1', 'actor-1', '2026-09-20', 'UTC');
+    const queries = () => send.mock.calls.filter(([command]) => command instanceof QueryCommand).length;
+
+    expect(Object.keys((await load())!.nodes)).toEqual(['first']);
+    expect(queries()).toBe(1);
+    send.mockClear();
+    expect(Object.keys((await load())!.nodes)).toEqual(['first']);
+    expect(queries()).toBe(0);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    revision = 3;
+    items = [...items, node('second', '2026-09-20T13:00:00.000Z')];
+    send.mockClear();
+    expect(Object.keys((await load())!.nodes).sort()).toEqual(['first', 'second']);
+    expect(queries()).toBe(1);
+  });
+
   describe('local-day replay (NFR #22)', () => {
     const delta = (watermark: number, committedAt: string, id: string) => ({
       itemKind: 'delta',
