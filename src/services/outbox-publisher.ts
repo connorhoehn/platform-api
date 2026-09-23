@@ -23,6 +23,7 @@ import { ulid } from 'ulid';
 import { docClient } from '../lib/aws-clients';
 import { ConflictError } from '../middleware/error-handler';
 import { tableName } from '../lib/ddb-table-name';
+import { pendingFields } from '../lib/outbox-pending';
 
 const OUTBOX_TABLE = tableName('social-outbox');
 
@@ -68,6 +69,7 @@ export async function publishWithOutbox(params: PublishWithOutboxParams): Promis
   const outboxItem: Record<string, unknown> = {
     outboxId,
     status: 'UNPROCESSED',
+    ...pendingFields(outboxId),
     eventType,
     queueName,
     payload: JSON.stringify({ ...eventPayload, timestamp: now }),

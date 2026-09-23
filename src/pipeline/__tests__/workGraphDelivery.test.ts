@@ -17,6 +17,8 @@ type Row = Record<string, unknown> & { outboxId: string };
 
 const mockTable = new Map<string, Row>();
 const mockDelivered: Array<{ eventName: string; payload: Record<string, unknown> }> = [];
+/** Items each read path returned/examined — the cost of finding pending rows. */
+const mockReads = { scanned: 0, queried: 0, scanEnds: 0 };
 
 jest.mock('../../lib/ddb-table-name', () => ({ tableName: (base: string) => base }));
 jest.mock('../../lib/aws-clients', () => ({
@@ -32,10 +34,14 @@ jest.mock('../../lib/aws-clients', () => ({
           return {};
         case 'UpdateCommand': {
           const row = mockTable.get(input.Key.outboxId);
-          if (!row || row.status !== 'UNPROCESSED') {
+          const values = input.ExpressionAttributeValues ?? {};
+          const adopting = ':shard' in values;
+          if (!row || row.status !== 'UNPROCESSED' || (adopting && row.pendingShard !== undefined)) {
             throw Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
           }
-          row.status = input.ExpressionAttributeValues[':processed'] ?? row.status;
+          if (adopting) row.pendingShard = values[':shard'];
+          row.status = values[':processed'] ?? values[':failed'] ?? row.status;
+          if (String(input.UpdateExpression).includes('REMOVE #p')) delete row.pendingShard;
           return {};
         }
         case 'ScanCommand': {
@@ -46,10 +52,25 @@ jest.mock('../../lib/aws-clients', () => ({
             : 0;
           const page = all.slice(start, start + input.Limit);
           const more = start + input.Limit < all.length;
+          const unsharded = String(input.FilterExpression).includes('attribute_not_exists(#p)');
+          mockReads.scanned += page.length;
+          if (!more) mockReads.scanEnds += 1;
           return {
-            Items: page.filter((row) => row.status === 'UNPROCESSED').map((row) => ({ ...row })),
+            Items: page
+              .filter((row) => row.status === 'UNPROCESSED' && (!unsharded || row.pendingShard === undefined))
+              .map((row) => ({ ...row })),
             ...(more ? { LastEvaluatedKey: { outboxId: page[page.length - 1].outboxId } } : {}),
           };
+        }
+        case 'QueryCommand': {
+          // pending-index: only rows carrying the shard, in ulid order.
+          const shard = input.ExpressionAttributeValues[':shard'];
+          const items = [...mockTable.values()]
+            .filter((row) => row.pendingShard === shard)
+            .sort((a, b) => (a.outboxId < b.outboxId ? -1 : 1))
+            .slice(0, input.Limit);
+          mockReads.queried += items.length;
+          return { Items: items.map((row) => ({ ...row })) };
         }
         default:
           return {};
@@ -64,12 +85,14 @@ jest.mock('../../lib/event-catalog', () => {
     // The real helper's row, written through the (fake) table.
     publishDurable: async (eventType: string, payload: Record<string, unknown>) => {
       const { docClient } = jest.requireMock('../../lib/aws-clients') as { docClient: { send: (c: unknown) => Promise<unknown> } };
+      const { pendingFields } = jest.requireActual('../../lib/outbox-pending') as typeof import('../../lib/outbox-pending');
       sequence += 1;
+      const outboxId = `new-${String(sequence).padStart(4, '0')}`;
       await docClient.send({
         constructor: { name: 'PutCommand' },
         input: {
           Item: {
-            outboxId: `new-${String(sequence).padStart(4, '0')}`,
+            outboxId, ...pendingFields(outboxId),
             status: 'UNPROCESSED', eventType, queueName: 'platform-events',
             payload: JSON.stringify(payload), createdAt: new Date().toISOString(),
           },
@@ -153,6 +176,7 @@ describe('NFR 34b — every step transition reaches the projection queue exactly
   beforeEach(() => {
     mockTable.clear();
     mockDelivered.length = 0;
+    Object.assign(mockReads, { scanned: 0, queried: 0, scanEnds: 0 });
   });
 
   it('a 3-step run on an outbox holding a day of terminal rows delivers started and completed for every step', async () => {
@@ -189,5 +213,55 @@ describe('NFR 34b — every step transition reaches the projection queue exactly
     }
     expect(ids.filter((id) => id.startsWith(`pipeline:run:${RUN}:1:started:`))).toHaveLength(1);
     expect(ids.filter((id) => id.startsWith(`pipeline:run:${RUN}:1:completed:`))).toHaveLength(1);
+  });
+
+  const fillProcessed = (count: number): void => {
+    for (let i = 0; i < count; i += 1) {
+      const id = `old-${String(i).padStart(5, '0')}`;
+      mockTable.set(id, { outboxId: id, status: 'PROCESSED', eventType: 'x', payload: '{}', createdAt: '2026-09-22T00:00:00.000Z' });
+    }
+  };
+
+  it('NFR #34c: a new row behind 8,000 processed ones is found by reading only the pending rows', async () => {
+    fillProcessed(8_000);
+    const drainer = startOutboxDrainer({ pollIntervalMs: 5, batchSize: 25 });
+    try {
+      // The one-time stray walk (rows written before the index existed) sees
+      // the whole table once, finds none, and switches itself off.
+      await until(() => mockReads.scanEnds >= 1);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const scansAtRest = mockReads.scanned;
+      mockReads.queried = 0;
+
+      await runThreeStepPipeline();
+      const enqueued = [...mockTable.values()].filter((row) => row.status === 'UNPROCESSED').length;
+      await until(() => [...mockTable.values()].every((row) => row.status !== 'UNPROCESSED'));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(mockDelivered).toHaveLength(enqueued);
+      // No table walk after the stray check, and the index returned only the
+      // run's own rows (each at most once more if a poll overlapped the write).
+      expect(mockReads.scanned).toBe(scansAtRest);
+      expect(mockReads.queried).toBeLessThanOrEqual(enqueued * 2);
+      expect([...mockTable.values()].filter((row) => row.pendingShard !== undefined)).toHaveLength(0);
+    } finally {
+      drainer.stop();
+    }
+  });
+
+  it('NFR #34c: a row written without a shard (older build) is adopted and delivered once', async () => {
+    fillProcessed(5_000);
+    mockTable.set('stray-1', {
+      outboxId: 'stray-1', status: 'UNPROCESSED', eventType: 'social.room.join',
+      payload: JSON.stringify({ roomId: 'r' }), createdAt: '2026-09-23T00:00:00.000Z',
+    });
+    const drainer = startOutboxDrainer({ pollIntervalMs: 5, batchSize: 25 });
+    try {
+      await until(() => mockTable.get('stray-1')!.status !== 'UNPROCESSED');
+    } finally {
+      drainer.stop();
+    }
+    expect(mockDelivered.map((entry) => entry.eventName)).toEqual(['social.room.join']);
+    expect(mockTable.get('stray-1')!.pendingShard).toBeUndefined();
   });
 });

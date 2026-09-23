@@ -18,6 +18,7 @@ import { createServiceRequestHeaders } from '@connorhoehn/service-runtime';
 import { docClient } from './aws-clients';
 import { tableName } from './ddb-table-name';
 import log from './logger';
+import { pendingFields } from './outbox-pending';
 
 // ---------------------------------------------------------------------------
 // Catalog instance
@@ -768,12 +769,14 @@ export async function publishDurable(
   payload: Record<string, unknown>,
 ): Promise<void> {
   const now = new Date().toISOString();
+  const outboxId = ulid();
   await docClient.send(
     new PutCommand({
       TableName: OUTBOX_TABLE,
       Item: {
-        outboxId: ulid(),
+        outboxId,
         status: 'UNPROCESSED',
+        ...pendingFields(outboxId),
         eventType: eventName,
         queueName: 'platform-events',
         payload: JSON.stringify(payload),

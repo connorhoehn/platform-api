@@ -1,6 +1,7 @@
 import { DynamoDBDocumentClient, BatchGetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
+import { pendingFields } from '../lib/outbox-pending';
 
 export interface RoomItem {
   roomId: string;
@@ -132,7 +133,9 @@ export class RoomRepository {
       new TransactWriteCommand({
         TransactItems: [
           { Put: { TableName: ROOM_MEMBERS_TABLE, Item: memberItem as unknown as Record<string, unknown> } },
-          { Put: { TableName: OUTBOX_TABLE, Item: outboxItem } },
+          // The repository adds the pending-index attribute so no caller can
+          // write an outbox row the drainer's index would not see.
+          { Put: { TableName: OUTBOX_TABLE, Item: { ...outboxItem, ...pendingFields(String(outboxItem.outboxId)) } } },
         ],
       }),
     );

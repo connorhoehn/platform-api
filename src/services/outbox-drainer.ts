@@ -1,4 +1,4 @@
-import { ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { randomUUID } from 'crypto';
 import { hostname } from 'os';
 import { LeasedKVLock } from 'distributed-core';
@@ -6,6 +6,13 @@ import { docClient } from '../lib/aws-clients';
 import { catalog } from '../lib/event-catalog';
 import { tableName } from '../lib/ddb-table-name';
 import { createDDBLeaseStore } from '../lib/ddb-lease-store';
+import {
+  PENDING_ATTR,
+  PENDING_INDEX,
+  PENDING_SHARDS,
+  isPendingIndexUnavailable,
+  pendingShardFor,
+} from '../lib/outbox-pending';
 import log from '../lib/logger';
 import {
   recordOutboxLeaseAcquired,
@@ -91,8 +98,13 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
   let activeLock: LeasedKVLock | null = null;
   let running = false;
   let stopping = false;
-  /** Where the next poll's table walk resumes (undefined = the top). NFR 34b. */
+  /** Where the next fallback table walk resumes (undefined = the top). NFR 34b. */
   let scanCursor: Record<string, unknown> | undefined;
+  /** The stray-adoption walk: its cursor, strays seen this pass, and whether a clean pass ended it. */
+  let adoptCursor: Record<string, unknown> | undefined;
+  let strayCount = 0;
+  let adoptionDone = false;
+  let indexUnavailableLogged = false;
 
   async function poll(): Promise<void> {
     if (running || stopping) return;
@@ -120,65 +132,11 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       recordOutboxLeaseAcquired();
 
       try {
-        // A Scan's `Limit` counts rows EXAMINED, not rows matched, and the
-        // filter is applied afterwards. Terminal rows live for a day, so as
-        // soon as more than `Limit` of them sat ahead of the pending ones in
-        // the table's own order, every poll came back empty and the drainer
-        // stopped publishing entirely — rows enqueued, nothing drained, and
-        // nothing in the log to say so. Page until the batch is full or the
-        // table is exhausted.
-        //
-        // NFR 34b: and every poll started that walk from the top of the table,
-        // so with more than MAX_SCAN_PAGES × SCAN_PAGE_SIZE rows (≈ one day of
-        // terminal rows under the TTL) a row whose key hashed past that point
-        // was never examined by anyone — it sat UNPROCESSED for ever. Which
-        // rows were stranded depended only on their ulid's hash, so one run's
-        // work-graph steps arrived at random: "load" never, "write" started
-        // but never completed. The walk now RESUMES where the last poll
-        // stopped and wraps at the end, so every row is examined within
-        // ceil(table / (MAX_SCAN_PAGES × SCAN_PAGE_SIZE)) polls.
-        const rows: OutboxRow[] = [];
-        let cursor = scanCursor;
-        let wrapped = cursor === undefined;
-        let pages = 0;
-        for (;;) {
-          const pageStart = cursor;
-          const result = await docClient.send(
-            new ScanCommand({
-              TableName: OUTBOX_TABLE,
-              FilterExpression: '#status = :unprocessed',
-              ExpressionAttributeNames: { '#status': 'status' },
-              ExpressionAttributeValues: { ':unprocessed': 'UNPROCESSED' },
-              Limit: SCAN_PAGE_SIZE,
-              ...(pageStart ? { ExclusiveStartKey: pageStart } : {}),
-            }),
-          );
-          rows.push(...((result.Items ?? []) as OutboxRow[]));
-          pages += 1;
-          if (rows.length > batchSize) {
-            // This page is only partly taken: read it again next poll (the
-            // rows published from it will be PROCESSED by then).
-            cursor = pageStart;
-            break;
-          }
-          cursor = result.LastEvaluatedKey as Record<string, unknown> | undefined;
-          if (rows.length === batchSize) break;
-          if (!cursor) {
-            // The end of the table: go round once more from the top.
-            if (wrapped) break;
-            wrapped = true;
-          }
-          // The lease is the budget for a whole poll cycle, and each page is
-          // a round trip; a scan that outlives it would publish as a
-          // non-leader and be refused row by row.
-          if (pages >= MAX_SCAN_PAGES || !lock.isLeader()) break;
-        }
-        scanCursor = cursor;
-        rows.length = Math.min(rows.length, batchSize);
+        const rows = await findPending(lock);
 
-        // Approximate "oldest pending" — DDB Scan doesn't order results,
-        // so the oldest in this batch is a lower bound on the true oldest
-        // when there are more than batchSize pending rows. Good enough as
+        // "Oldest pending": from the index the batch is each shard's oldest
+        // rows, so this is exact; on the fallback table walk it is a lower
+        // bound when there are more than batchSize pending rows. Good enough as
         // a "is the drainer keeping up" signal; an emergency-paging alert
         // would also watch run-queue depth.
         let oldestPendingSeconds = 0;
@@ -213,6 +171,159 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       activeLock = null;
       running = false;
     }
+  }
+
+  /**
+   * The rows to publish this poll, oldest first.
+   *
+   * Normally `pending-index` (see lib/outbox-pending): PENDING_SHARDS Queries
+   * that read only undrained rows, so a poll costs the backlog, not the
+   * table — the table keeps ~a day of PROCESSED rows under the ttl, and
+   * walking them was O(table) per poll (NFR #34c). The table walk below is
+   * kept for the one case the index cannot serve: it does not exist yet or is
+   * still backfilling.
+   */
+  async function findPending(lock: LeasedKVLock): Promise<OutboxRow[]> {
+    let rows: OutboxRow[];
+    try {
+      rows = await queryPendingIndex();
+    } catch (err: unknown) {
+      if (!isPendingIndexUnavailable(err)) throw err;
+      if (!indexUnavailableLogged) {
+        indexUnavailableLogged = true;
+        log.warn({}, 'outbox-drainer: pending-index unavailable — walking the table');
+      }
+      return scanPending(lock);
+    }
+    if (indexUnavailableLogged) {
+      indexUnavailableLogged = false;
+      log.info({}, 'outbox-drainer: pending-index available — table walk off');
+    }
+    if (rows.length < batchSize && !adoptionDone) await adoptStrays(lock);
+    return rows;
+  }
+
+  /** Each shard's oldest rows, merged into receipt (ulid) order, one batch. */
+  async function queryPendingIndex(): Promise<OutboxRow[]> {
+    const pages = await Promise.all(PENDING_SHARDS.map((shard) => docClient.send(
+      new QueryCommand({
+        TableName: OUTBOX_TABLE,
+        IndexName: PENDING_INDEX,
+        KeyConditionExpression: '#p = :shard',
+        ExpressionAttributeNames: { '#p': PENDING_ATTR },
+        ExpressionAttributeValues: { ':shard': shard },
+        Limit: batchSize,
+      }),
+    )));
+    const rows = pages.flatMap((page) => (page.Items ?? []) as OutboxRow[])
+      // The index is eventually consistent: a row processed a moment ago can
+      // still be listed. Its own status says so; the conditional write would
+      // refuse it anyway, this just saves a duplicate publish.
+      .filter((row) => row.status === 'UNPROCESSED');
+    rows.sort((a, b) => (a.outboxId < b.outboxId ? -1 : a.outboxId > b.outboxId ? 1 : 0));
+    return rows.slice(0, batchSize);
+  }
+
+  /**
+   * Rows written without `pendingShard` — by a build from before the index,
+   * e.g. the other pod mid-rollout — are invisible to it. Until one full walk
+   * of the table finds none, each poll that has spare batch room walks up to
+   * MAX_SCAN_PAGES pages and gives such rows their shard (conditional: still
+   * UNPROCESSED, still unsharded), so they drain through the index next poll.
+   * One delivery path; the walk switches itself off for the life of the
+   * process once the table is clean.
+   */
+  async function adoptStrays(lock: LeasedKVLock): Promise<void> {
+    let pages = 0;
+    while (pages < MAX_SCAN_PAGES && lock.isLeader()) {
+      const result = await docClient.send(
+        new ScanCommand({
+          TableName: OUTBOX_TABLE,
+          FilterExpression: '#status = :unprocessed AND attribute_not_exists(#p)',
+          ExpressionAttributeNames: { '#status': 'status', '#p': PENDING_ATTR },
+          ExpressionAttributeValues: { ':unprocessed': 'UNPROCESSED' },
+          Limit: SCAN_PAGE_SIZE,
+          ...(adoptCursor ? { ExclusiveStartKey: adoptCursor } : {}),
+        }),
+      );
+      pages += 1;
+      for (const row of (result.Items ?? []) as OutboxRow[]) {
+        strayCount += 1;
+        try {
+          await docClient.send(new UpdateCommand({
+            TableName: OUTBOX_TABLE,
+            Key: { outboxId: row.outboxId },
+            UpdateExpression: 'SET #p = :shard',
+            ConditionExpression: '#status = :unprocessed AND attribute_not_exists(#p)',
+            ExpressionAttributeNames: { '#status': 'status', '#p': PENDING_ATTR },
+            ExpressionAttributeValues: { ':unprocessed': 'UNPROCESSED', ':shard': pendingShardFor(row.outboxId) },
+          }));
+        } catch (err: unknown) {
+          if ((err as { name?: string })?.name !== 'ConditionalCheckFailedException') throw err;
+        }
+      }
+      adoptCursor = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+      if (!adoptCursor) {
+        // End of a full walk from the top.
+        if (strayCount === 0) {
+          adoptionDone = true;
+          log.info({}, 'outbox-drainer: no unsharded rows left — stray walk off');
+        } else {
+          log.info({ adopted: strayCount }, 'outbox-drainer: adopted unsharded rows into pending-index');
+        }
+        strayCount = 0;
+        return;
+      }
+    }
+  }
+
+  /**
+   * Fallback while `pending-index` is unavailable: walk the table for
+   * UNPROCESSED rows. A Scan's `Limit` counts rows EXAMINED, not matched, so
+   * page until the batch is full; and resume where the last poll stopped,
+   * wrapping at the end (NFR 34b — restarting from the top every poll
+   * stranded any row past the first MAX_SCAN_PAGES × SCAN_PAGE_SIZE).
+   */
+  async function scanPending(lock: LeasedKVLock): Promise<OutboxRow[]> {
+    const rows: OutboxRow[] = [];
+    let cursor = scanCursor;
+    let wrapped = cursor === undefined;
+    let pages = 0;
+    for (;;) {
+      const pageStart = cursor;
+      const result = await docClient.send(
+        new ScanCommand({
+          TableName: OUTBOX_TABLE,
+          FilterExpression: '#status = :unprocessed',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':unprocessed': 'UNPROCESSED' },
+          Limit: SCAN_PAGE_SIZE,
+          ...(pageStart ? { ExclusiveStartKey: pageStart } : {}),
+        }),
+      );
+      rows.push(...((result.Items ?? []) as OutboxRow[]));
+      pages += 1;
+      if (rows.length > batchSize) {
+        // This page is only partly taken: read it again next poll (the
+        // rows published from it will be PROCESSED by then).
+        cursor = pageStart;
+        break;
+      }
+      cursor = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+      if (rows.length === batchSize) break;
+      if (!cursor) {
+        // The end of the table: go round once more from the top.
+        if (wrapped) break;
+        wrapped = true;
+      }
+      // The lease is the budget for a whole poll cycle, and each page is
+      // a round trip; a scan that outlives it would publish as a
+      // non-leader and be refused row by row.
+      if (pages >= MAX_SCAN_PAGES || !lock.isLeader()) break;
+    }
+    scanCursor = cursor;
+    rows.length = Math.min(rows.length, batchSize);
+    return rows;
   }
 
   async function processRow(
@@ -256,9 +367,9 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         new UpdateCommand({
           TableName: OUTBOX_TABLE,
           Key: { outboxId: row.outboxId },
-          UpdateExpression: 'SET #status = :processed, processedAt = :now, completedAt = :completedAt, #ttl = :ttl',
+          UpdateExpression: 'SET #status = :processed, processedAt = :now, completedAt = :completedAt, #ttl = :ttl REMOVE #p',
           ConditionExpression: 'attribute_exists(outboxId) AND #status = :unprocessed',
-          ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
+          ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl', '#p': PENDING_ATTR },
           ExpressionAttributeValues: {
             ':processed': 'PROCESSED',
             ':unprocessed': 'UNPROCESSED',
@@ -312,9 +423,9 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
             new UpdateCommand({
               TableName: OUTBOX_TABLE,
               Key: { outboxId: row.outboxId },
-              UpdateExpression: 'SET #status = :failed, retryCount = :retryCount, failedAt = :failedAt, #ttl = :ttl',
+              UpdateExpression: 'SET #status = :failed, retryCount = :retryCount, failedAt = :failedAt, #ttl = :ttl REMOVE #p',
               ConditionExpression: 'attribute_exists(outboxId) AND #status = :unprocessed',
-              ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
+              ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl', '#p': PENDING_ATTR },
               ExpressionAttributeValues: {
                 ':failed': 'FAILED',
                 ':unprocessed': 'UNPROCESSED',

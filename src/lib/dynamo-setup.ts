@@ -4,6 +4,7 @@ import {
 } from '@aws-sdk/client-dynamodb';
 import { ddbClient } from './aws-clients';
 import { tableName } from './ddb-table-name';
+import { ensureOutboxPendingIndex } from './outbox-pending';
 import log from './logger';
 
 const OUTBOX_TABLE = tableName('social-outbox');
@@ -36,6 +37,10 @@ async function ensureTableTTL(tableNameStr: string, attributeName = 'ttl'): Prom
 
 export async function ensureOutboxTTL(): Promise<void> {
   await ensureTableTTL(OUTBOX_TABLE);
+  // The drainer's pending-index (NFR #34c) — additive UpdateTable only; the
+  // drainer walks the table until the index is ACTIVE, so this never gates boot.
+  const index = await ensureOutboxPendingIndex(ddbClient, OUTBOX_TABLE);
+  if (index === 'created') log.info({ table: OUTBOX_TABLE }, 'outbox pending-index created');
 }
 
 /**

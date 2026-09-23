@@ -17,6 +17,7 @@ import {
   PutCommand,
   UpdateCommand,
   ScanCommand,
+  QueryCommand,
   DeleteCommand,
 } from '@aws-sdk/lib-dynamodb';
 
@@ -70,9 +71,21 @@ function findAllCalls(cmdClass: { name: string }): DDBCmd[] {
 
 /** Drain the microtask queue so awaited promises in the drainer settle. */
 async function flush(): Promise<void> {
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 50; i++) {
     await Promise.resolve();
   }
+}
+
+/** A pending-index Query for one shard. */
+function isShardQuery(cmd: DDBCmd, shard: string): boolean {
+  return cmd.constructor.name === 'QueryCommand'
+    && cmd.input.IndexName === 'pending-index'
+    && (cmd.input.ExpressionAttributeValues as Record<string, unknown>)[':shard'] === shard;
+}
+
+/** What DynamoDB says when the index does not exist (yet). */
+function noIndex(): Error {
+  return Object.assign(new Error('The table does not have the specified index: pending-index'), { name: 'ValidationException' });
 }
 
 class ConditionalCheckFailedException extends Error {
@@ -98,7 +111,7 @@ describe('outbox-drainer — lease lifecycle', () => {
     await flush();
 
     expect(findCall(PutCommand)).toBeDefined();
-    expect(findCall(ScanCommand)).toBeDefined();
+    expect(findAllCalls(QueryCommand)).toHaveLength(4); // one per pending shard
     expect(findCall(DeleteCommand)).toBeDefined();
   });
 
@@ -117,6 +130,7 @@ describe('outbox-drainer — lease lifecycle', () => {
 
     expect(findCall(PutCommand)).toBeDefined();
     expect(findCall(ScanCommand)).toBeUndefined();
+    expect(findCall(QueryCommand)).toBeUndefined();
   });
 });
 
@@ -132,7 +146,7 @@ describe('outbox-drainer — processRow happy path', () => {
     };
 
     mockSend.mockImplementation(async (cmd: DDBCmd) => {
-      if (cmd.constructor.name === 'ScanCommand') return { Items: [row] };
+      if (isShardQuery(cmd, 'P0')) return { Items: [row] };
       return {};
     });
     mockPublishDurable.mockResolvedValue(undefined);
@@ -171,7 +185,7 @@ describe('outbox-drainer — retry & failure paths', () => {
     };
 
     mockSend.mockImplementation(async (cmd: DDBCmd) => {
-      if (cmd.constructor.name === 'ScanCommand') return { Items: [row] };
+      if (isShardQuery(cmd, 'P0')) return { Items: [row] };
       return {};
     });
     mockPublishDurable.mockRejectedValue(new Error('transport down'));
@@ -206,7 +220,7 @@ describe('outbox-drainer — retry & failure paths', () => {
     };
 
     mockSend.mockImplementation(async (cmd: DDBCmd) => {
-      if (cmd.constructor.name === 'ScanCommand') return { Items: [row] };
+      if (isShardQuery(cmd, 'P0')) return { Items: [row] };
       return {};
     });
     mockPublishDurable.mockRejectedValue(new Error('transport down'));
@@ -246,7 +260,7 @@ describe('outbox-drainer — ownership contention', () => {
     };
 
     mockSend.mockImplementation(async (cmd: DDBCmd) => {
-      if (cmd.constructor.name === 'ScanCommand') return { Items: [row] };
+      if (isShardQuery(cmd, 'P0')) return { Items: [row] };
       if (cmd.constructor.name === 'UpdateCommand') {
         const key = (cmd.input.Key as { outboxId?: string }) ?? {};
         if (key.outboxId === 'o-claimed') {
@@ -271,7 +285,9 @@ describe('outbox-drainer — ownership contention', () => {
 // for a day, so once enough of them sat ahead of the pending ones in the
 // table's own order every poll came back empty: rows enqueued, nothing
 // drained, and nothing in the log to say so.
-describe('outbox-drainer — finding pending rows behind terminal ones', () => {
+// The table walk is now only the fallback for a missing / backfilling
+// pending-index; these pin its NFR 34b behaviour.
+describe('outbox-drainer — fallback walk: finding pending rows behind terminal ones', () => {
   /** Each row is published in turn, so the queue needs more than one turn. */
   const settle = async (): Promise<void> => {
     for (let i = 0; i < 400; i += 1) await Promise.resolve();
@@ -291,6 +307,7 @@ describe('outbox-drainer — finding pending rows behind terminal ones', () => {
     ];
     let page = 0;
     mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (cmd.constructor.name === 'QueryCommand') throw noIndex();
       if (cmd.constructor.name === 'ScanCommand') return pages[Math.min(page++, pages.length - 1)];
       return {};
     });
@@ -310,6 +327,7 @@ describe('outbox-drainer — finding pending rows behind terminal ones', () => {
 
   it('stops paging once the batch is full, rather than walking the table', async () => {
     mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (cmd.constructor.name === 'QueryCommand') throw noIndex();
       if (cmd.constructor.name === 'ScanCommand') {
         return {
           Items: Array.from({ length: 25 }, (_, i) => pending(`o-${i}`)),
@@ -332,6 +350,7 @@ describe('outbox-drainer — finding pending rows behind terminal ones', () => {
   it('never publishes more than one batch, however many pages it walked', async () => {
     let page = 0;
     mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (cmd.constructor.name === 'QueryCommand') throw noIndex();
       if (cmd.constructor.name === 'ScanCommand') {
         page += 1;
         return { Items: [pending(`o-${page}`), pending(`p-${page}`)], LastEvaluatedKey: { outboxId: `${page}` } };
@@ -350,6 +369,7 @@ describe('outbox-drainer — finding pending rows behind terminal ones', () => {
 
   it('gives up on an exhausted table instead of scanning for ever', async () => {
     mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (cmd.constructor.name === 'QueryCommand') throw noIndex();
       if (cmd.constructor.name === 'ScanCommand') return { Items: [] };
       return {};
     });
