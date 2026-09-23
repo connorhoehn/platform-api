@@ -591,4 +591,11 @@ describe('stepLabelsOf — a run lists its steps by the names its plan gave them
     expect(labels.get('deck:s2')).toBe('Draft slides');
     expect(labels.has('agent:s9')).toBe(false);
   });
+
+  it('names a system pipeline’s steps from the registry, in the order the plan declares them', () => {
+    const { getSystemPipeline } = jest.requireActual('../../../pipeline/systemPipelines');
+    const labels = stepLabelsOf(getSystemPipeline('deck-revise'), { stepsSummary: {} });
+    expect([...labels.entries()].filter(([id]) => ['load', 'propose', 'check', 'write'].includes(id)))
+      .toEqual([['load', 'Read the deck'], ['propose', 'Write the edit'], ['check', 'Check the edit'], ['write', 'Save the new revision']]);
+  });
 });

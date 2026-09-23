@@ -7,6 +7,7 @@
  * the source has nothing to say, so an absent record discloses nothing rather
  * than producing a plausible-looking placeholder.
  */
+import { getSystemPipeline } from '../../pipeline/systemPipelines';
 import { GetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { tableName } from '../../lib/ddb-table-name';
 import log from '../../lib/logger';
@@ -232,6 +233,13 @@ export function documentEditFacts(steps: Row): DocumentEditFacts | undefined {
  * plan it checkpointed (`checkpoint.context.plan.steps[].title`, filed as
  * `agent:<id>`, `deck:<id>`, … — matched on the plan step id after the colon).
  */
+/** A step's place in the plan's declared order (`stepLabelsOf` keeps it); unknown steps sort last. */
+function planOrder(labels: Map<string, string>, stepId: string): number {
+  const keys = [...labels.keys()];
+  const index = keys.indexOf(stepId) >= 0 ? keys.indexOf(stepId) : keys.indexOf(stepId.replace(/:\d+$/, ''));
+  return index >= 0 ? index : Number.MAX_SAFE_INTEGER;
+}
+
 export function stepLabelsOf(definition: unknown, row: Row): Map<string, string> {
   const labels = new Map<string, string>();
   const nodes = (definition as { nodes?: unknown } | undefined)?.nodes;
@@ -249,11 +257,11 @@ export function stepLabelsOf(definition: unknown, row: Row): Map<string, string>
   }
   if (titles.size > 0) {
     const steps = row.stepsSummary && typeof row.stepsSummary === 'object' ? Object.keys(row.stepsSummary as Row) : [];
-    for (const key of steps) {
-      if (labels.has(key)) continue;
-      const planId = key.split(':')[1];
-      const title = planId ? titles.get(planId) : undefined;
-      if (title) labels.set(key, title);
+    // Walk the plan, not the summary, so the map's order is the plan's.
+    for (const [planId, title] of titles) {
+      for (const key of steps) {
+        if (!labels.has(key) && key.split(':')[1] === planId) labels.set(key, title);
+      }
     }
   }
   return labels;
@@ -310,7 +318,12 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     // A step's name is the label its plan gave it — the definition's node
     // label, or for an /agent loop's own row the plan step's title — never the
     // node id the engine files it under (`agent:s1` meant nothing to a reader).
-    const stepLabels = stepLabelsOf((definition?.Item as Row | undefined)?.definition, row);
+    // A system pipeline (deck-revise, document edits, …) has no stored row;
+    // its definition is the registry's.
+    const stepLabels = stepLabelsOf(
+      (definition?.Item as Row | undefined)?.definition ?? getSystemPipeline(String(row.pipelineId ?? '')),
+      row,
+    );
     // The tools are the steps this run actually recorded, in execution order.
     const tools = Object.entries(steps)
       .map(([stepId, summary]) => ({
@@ -321,7 +334,13 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
           ?? text(stepLabels.get(stepId) ?? stepLabels.get(stepId.replace(/:\d+$/, '')), 60),
         startedAt: Date.parse(iso((summary as Row | undefined)?.startedAt) ?? '') || 0,
       }))
-      .sort((left, right) => left.startedAt - right.startedAt || left.stepId.localeCompare(right.stepId))
+      // Execution order, and where two steps carry the same start (or none),
+      // the order the plan declares them — never the ids' alphabetical order:
+      // a deck-revise run's uuid-keyed steps listed "Check the edit" before
+      // "Read the deck".
+      .sort((left, right) => left.startedAt - right.startedAt
+        || planOrder(stepLabels, left.stepId) - planOrder(stepLabels, right.stepId)
+        || left.stepId.localeCompare(right.stepId))
       // A bare uuid is not a tool name — live, a failed run listed
       // "a10af720-…" under "Tools in this run".
       .map((step) => step.name ?? (UUID.test(step.stepId) ? undefined : text(step.stepId, 60)))
