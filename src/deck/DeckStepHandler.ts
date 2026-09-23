@@ -18,6 +18,8 @@ import {
   PRESENTATION_DOCUMENT_TYPE,
   type PresentationDocumentStore,
 } from './presentationDocuments';
+import { canEditDocument, documentRoleOf, editRefusal } from './documentEditAccess';
+import log from '../lib/logger';
 
 export const DECK_STEP_KIND = 'deck';
 
@@ -148,8 +150,12 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
       const notices: string[] = [];
       let documentId = candidate ?? newDocumentId();
       let displaced: { documentId: string; title: string; type: string } | undefined;
+      let existing: Awaited<ReturnType<PresentationDocumentStore['get']>> = null;
       if (candidate) {
-        const existing = await store.get(candidate).catch(() => null);
+        // Fail closed: a row that could not be read cannot be checked (#47).
+        try { existing = await store.get(candidate); } catch (err) {
+          return { status: 'failed', error: `deck: could not read ${candidate} to check who may change it (${err instanceof Error ? err.message : String(err)})` };
+        }
         const type = str(existing?.type);
         if (existing && type !== PRESENTATION_DOCUMENT_TYPE) {
           displaced = { documentId: candidate, title: str(existing.title) ?? candidate, type: type ?? 'unknown' };
@@ -160,6 +166,20 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
         }
       }
       const requestedBy = firstOf(REQUESTER_FALLBACK_PATHS, context) ?? 'agent:deck';
+      // The revision is written as the requester, so the #41 rule applies here
+      // too, at write time: an existing presentation takes a revision only from
+      // its owner or an editor (NFR #47). The chat command checks the same rule
+      // before the run starts; this catches a run whose context names someone
+      // else's deck however it got there, and a requester who lost access
+      // while the run was queued.
+      if (!displaced && candidate && existing) {
+        const decision = await canEditDocument(existing, { sub: requestedBy }, documentId);
+        if (!decision.allow) {
+          log.warn({ runId: helpers.runId, documentId, requestedBy, role: documentRoleOf(existing, requestedBy) },
+            'deck step refused: the requester may not edit this presentation');
+          return { status: 'failed', error: `deck forbidden: ${editRefusal(existing, requestedBy)}` };
+        }
+      }
       const transcriptIds = [...new Set([
         ...TRANSCRIPT_SOURCE_PATHS.map((path) => str(readPath(context, path))).filter((value): value is string => !!value),
         ...(Array.isArray(context.transcriptIds) ? context.transcriptIds.map((value) => str(value)).filter((value): value is string => !!value) : []),

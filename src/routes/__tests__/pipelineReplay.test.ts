@@ -269,7 +269,7 @@ describe('POST /pipelines/:pipelineId/runs/:runId/replay', () => {
     });
 
     const callArgs = triggerMock.mock.calls[0]![0] as { triggerPayload: unknown };
-    expect(callArgs.triggerPayload).toEqual({ foo: 'bar' });
+    expect(callArgs.triggerPayload).toEqual({ foo: 'bar', requestedBy: 'user-1' });
   });
 
   test('stepsSummary is used as triggerPayload fallback when body.triggerPayload absent', async () => {
@@ -285,7 +285,7 @@ describe('POST /pipelines/:pipelineId/runs/:runId/replay', () => {
     await run(app, 'POST', '/pipelines/p1/runs/r1/replay');
 
     const callArgs = triggerMock.mock.calls[0]![0] as { triggerPayload: unknown };
-    expect(callArgs.triggerPayload).toEqual(runWithSteps.stepsSummary);
+    expect(callArgs.triggerPayload).toEqual({ ...runWithSteps.stepsSummary, requestedBy: 'user-1' });
   });
 
   test('empty object used as triggerPayload when both body and stepsSummary are absent', async () => {
@@ -298,6 +298,6 @@ describe('POST /pipelines/:pipelineId/runs/:runId/replay', () => {
     await run(app, 'POST', '/pipelines/p1/runs/r1/replay');
 
     const callArgs = triggerMock.mock.calls[0]![0] as { triggerPayload: unknown };
-    expect(callArgs.triggerPayload).toEqual({});
+    expect(callArgs.triggerPayload).toEqual({ requestedBy: 'user-1' });
   });
 });

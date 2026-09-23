@@ -1,5 +1,6 @@
 // Per-document automations ("doc bots"). See documents/documentAutomations.ts
 // for what one is. Mounted under /api/documents.
+import { pinRequester } from '../pipeline/pinRequester';
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { requireAuth } from '../middleware/auth';
@@ -70,7 +71,7 @@ documentAutomationsRouter.post('/:documentId/automations/:automationId/run', asy
   const out = await Promise.resolve(bridge.trigger({
     pipelineId: automationId,
     definition: def as never,
-    triggerPayload: { ...payload, triggerType: 'manual', requestId: randomUUID() },
+    triggerPayload: { ...pinRequester(payload, userId).payload, triggerType: 'manual', requestId: randomUUID() },
     triggeredBy: { userId },
   } as never));
   const runId = (out as { runId: string }).runId;

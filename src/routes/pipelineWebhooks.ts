@@ -26,6 +26,7 @@
 // After signature verification we parse the raw buffer ourselves into the JSON
 // object that the existing log line / Phase-4 forwarder expects.
 
+import { pinRequester } from '../pipeline/pinRequester';
 import express, { Router, type Request, type Response } from 'express';
 import {
   SIGNATURE_HEADER,
@@ -306,7 +307,8 @@ pipelineWebhooksRouter.post(
       const out = await bridge.trigger({
         pipelineId: resolvedPipelineId,
         definition: binding.definition,
-        triggerPayload: payload,
+        // A webhook body cannot name a person to act as (NFR #47).
+        triggerPayload: pinRequester(payload, actorUserId).payload,
         triggeredBy: { userId: actorUserId },
       });
 

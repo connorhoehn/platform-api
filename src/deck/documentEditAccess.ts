@@ -12,6 +12,7 @@
 
 import { authorize, principalOf, type Decision } from '../lib/authorize';
 import { tenantOf } from '../lib/tenant';
+import { ForbiddenError } from '../middleware/error-handler';
 
 /** What the check reads off a document row. Any row shape with these fields. */
 export interface EditableDocumentRow {
@@ -65,4 +66,27 @@ export function editRefusal(row: EditableDocumentRow | null | undefined, userId:
   return documentRoleOf(row, userId) === 'viewer'
     ? 'You can view this document but not change it. Ask its owner to make you an editor.'
     : 'Only this document\'s owner or an editor can change it.';
+}
+
+/**
+ * A refusal thrown where a route cannot answer directly (a chat command's
+ * `prepare`): 403 with `code: 'forbidden'` and the document named.
+ */
+export class DocumentEditForbiddenError extends ForbiddenError {
+  public readonly code = 'forbidden';
+  constructor(message: string, public readonly documentId: string, public readonly role: DocumentRole) {
+    super(message);
+  }
+}
+
+/** Throws `DocumentEditForbiddenError` unless `user` may change the document. */
+export async function assertCanEditDocument(
+  row: EditableDocumentRow | null | undefined,
+  user: { sub?: string; orgId?: string } | undefined,
+  documentId: string,
+): Promise<void> {
+  const decision = await canEditDocument(row, user, documentId);
+  if (decision.allow) return;
+  const userId = user?.sub ?? '';
+  throw new DocumentEditForbiddenError(editRefusal(row, userId), documentId, documentRoleOf(row, userId));
 }

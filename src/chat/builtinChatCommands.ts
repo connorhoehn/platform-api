@@ -9,6 +9,8 @@
 // "running" card with the metadata the run returns, and /summarize and
 // /diagram post their finished card from their own last step.
 import { AppError, NotFoundError } from '../middleware/error-handler';
+import { getPresentationDocumentStore, PRESENTATION_DOCUMENT_TYPE } from '../deck/presentationDocuments';
+import { assertCanEditDocument } from '../deck/documentEditAccess';
 import { documentTypeRepo } from '../repositories';
 import type { DocumentTypeItem } from '../repositories';
 import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOCUMENT_AGENT_EDIT_PIPELINE_ID, DOCUMENT_TRANSFORM_PIPELINE_ID } from '../documents/documentAgentPipeline';
@@ -427,9 +429,20 @@ export function registerBuiltinChatCommands(): void {
     // all. `prepare` enforces it instead, conditioned on `--preview`.
     requires: { argumentText: true },
     postCard: false,
-    prepare: (input) => {
-      if (!parseDeckCommand(input.argumentText ?? '').preview && !str(input.documentId)) {
+    prepare: async (input) => {
+      if (parseDeckCommand(input.argumentText ?? '').preview) return input;
+      const documentId = str(input.documentId);
+      if (!documentId) {
         throw new ChatCommandRequiresError(`${input.trigger} needs documentId`, { document: true });
+      }
+      // The run writes a revision as the requester: an existing presentation
+      // takes one only from its owner or an editor (#41's rule, NFR #47). A
+      // fresh id (the client's new document) has no row yet and passes; a
+      // document of another kind is displaced into a new presentation by the
+      // step, so it is not written either. The step re-checks at write time.
+      const row = await getPresentationDocumentStore().get(documentId);
+      if (row && (!row.type || row.type === PRESENTATION_DOCUMENT_TYPE)) {
+        await assertCanEditDocument(row, { sub: input.requestedBy, orgId: input.organizationId }, documentId);
       }
       return input;
     },

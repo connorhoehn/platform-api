@@ -17,6 +17,9 @@ import { auditRepo, type AuditAction, type AuditDecision } from '../pipeline/aud
 import { getPipelineBridge, type PendingApprovalRow } from '../pipeline/bridge-types';
 import type { InlinePipelineDefinition } from '../pipeline/http/contracts';
 import { definitionsRepo } from '../pipeline/definitions-repository';
+import { pinRequester } from '../pipeline/pinRequester';
+
+export { pinRequester };
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { getLiveCaptionsProgress } from '../recordings/liveCaptions';
 import { stubRunStore } from '../pipeline/stub-run-store';
@@ -216,6 +219,13 @@ pipelineTriggersRouter.post(
         userId,
         pipelineId,
       });
+      // The trigger payload becomes the run's context, and step handlers act
+      // AS `context.requestedBy` (the deck steps write revisions with it and
+      // check edit rights against it). Here the payload is the caller's own
+      // JSON, so the requester is pinned to the verified caller (NFR #47).
+      const pinned = pinRequester(body.triggerPayload, userId);
+      if (pinned.overridden) reqLog.warn({ claimed: pinned.overridden }, 'trigger payload named another requester; pinned to the caller');
+      body.triggerPayload = pinned.payload;
 
       // Establish a create-only source account join before the executor can
       // publish its first lifecycle transition. `organizationId` is a

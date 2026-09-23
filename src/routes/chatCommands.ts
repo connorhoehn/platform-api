@@ -18,6 +18,7 @@ import {
 } from '../chat/chatCommandRegistry';
 import { registerBuiltinChatCommands } from '../chat/builtinChatCommands';
 import { installBuiltinChatCommandPlugins } from '../chat/plugins';
+import { DocumentEditForbiddenError } from '../deck/documentEditAccess';
 
 registerBuiltinChatCommands();
 // The platform's own plugins (/search …) install after the built-ins through the plugin contract;
@@ -59,6 +60,7 @@ chatCommandsRouter.post('/:trigger/run', asyncHandler(async (req: Request, res: 
   } catch (err) {
     if (err instanceof UnknownChatCommandError) { res.status(404).json({ error: err.message, known: err.known }); return; }
     if (err instanceof ChatCommandRequiresError) { res.status(400).json({ error: err.message, requires: err.requires }); return; }
+    if (err instanceof DocumentEditForbiddenError) { res.status(403).json({ error: err.message, code: err.code, documentId: err.documentId }); return; }
     throw err;
   }
 }));

@@ -16,6 +16,7 @@
 //   - Reproduce a bug from production run
 //   - Test pipeline behavior with historical inputs
 
+import { pinRequester } from '../pipeline/pinRequester';
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
 import { withSpan } from 'distributed-core';
@@ -116,7 +117,8 @@ pipelineReplayRouter.post(
     }
 
     // Trigger new run with original definition and payload (or override)
-    const triggerPayload = body.triggerPayload ?? originalRun.stepsSummary ?? {};
+    // A replay runs as the caller, whatever the override or the original named (NFR #47).
+    const triggerPayload = pinRequester(body.triggerPayload ?? originalRun.stepsSummary ?? {}, userId).payload;
     let newRunId: string = '';
 
     try {

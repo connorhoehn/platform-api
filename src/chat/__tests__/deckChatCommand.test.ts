@@ -304,3 +304,35 @@ describe('/deck --preview through runChatCommand (the real dispatch path, not ju
     } as ChatCommandRunInput)).rejects.toThrow(/needs documentId/);
   });
 });
+
+// NFR #47: /deck writes a revision as the requester, so it answers 403 before
+// the run starts when the named presentation is someone else's.
+describe('/deck names an existing presentation', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { setPresentationDocumentStore } = require('../../deck/presentationDocuments') as typeof import('../../deck/presentationDocuments');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { DocumentEditForbiddenError } = require('../../deck/documentEditAccess') as typeof import('../../deck/documentEditAccess');
+  const rows: Record<string, Record<string, unknown>> = {
+    'audit-deck-owned': { documentId: 'audit-deck-owned', type: 'presentation', createdBy: 'user-connor', editors: ['user-erin'], viewers: ['user-vic'] },
+    'audit-page': { documentId: 'audit-page', type: 'page', createdBy: 'user-connor' },
+  };
+  beforeAll(() => setPresentationDocumentStore({ get: async (id: string) => (rows[id] ?? null) as never, appendRevision: async () => { throw new Error('not in this test'); } } as never));
+  afterAll(() => setPresentationDocumentStore(null));
+  const prepare = (requestedBy: string, documentId: string) => getChatCommandPipeline('/deck')!.prepare!({
+    trigger: '/deck', channel: 'chat:room:eng', text: '/deck the Q4 review', argumentText: 'the Q4 review',
+    documentId, requestedBy, requestedByName: requestedBy,
+  } as ChatCommandRunInput);
+
+  it.each([['owner', 'user-connor'], ['editor', 'user-erin']])('the %s may run it', async (_role, user) => {
+    await expect(prepare(user, 'audit-deck-owned')).resolves.toMatchObject({ documentId: 'audit-deck-owned' });
+  });
+  it.each([['viewer', 'user-vic'], ['stranger', 'user-frank']])('a %s gets 403 forbidden', async (_role, user) => {
+    const err = await Promise.resolve(prepare(user, 'audit-deck-owned')).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DocumentEditForbiddenError);
+    expect(err).toMatchObject({ status: 403, code: 'forbidden', documentId: 'audit-deck-owned' });
+  });
+  it('a fresh id, or a document of another kind (the step files a new deck), passes', async () => {
+    await expect(prepare('user-frank', 'audit-new-id')).resolves.toBeTruthy();
+    await expect(prepare('user-frank', 'audit-page')).resolves.toBeTruthy();
+  });
+});

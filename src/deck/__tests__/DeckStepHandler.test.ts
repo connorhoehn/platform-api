@@ -10,9 +10,10 @@ import { hidePptxNodeDetection } from './pptxTestEnv';
 class FakeStore implements PresentationDocumentStore {
   readonly calls: AppendRevisionInput[] = [];
   /** Rows the store already holds, by id — what `get` answers with. */
-  readonly rows = new Map<string, { documentId: string; title?: string; type?: string }>();
+  readonly rows = new Map<string, { documentId: string; title?: string; type?: string; createdBy?: string; editors?: string[]; viewers?: string[] }>();
+  failGet = false;
 
-  async get(documentId: string) { return (this.rows.get(documentId) ?? null) as never; }
+  async get(documentId: string) { if (this.failGet) throw new Error('ddb down'); return (this.rows.get(documentId) ?? null) as never; }
 
   async appendRevision(input: AppendRevisionInput): Promise<AppendRevisionResult> {
     this.calls.push(input);
@@ -188,9 +189,9 @@ describe('a deck never writes into another kind of document', () => {
   }, 30_000);
 
   it('adds a revision to a real presentation, as before', async () => {
-    store.rows.set('doc-deck-1', { documentId: 'doc-deck-1', title: 'Sprint review', type: 'presentation' });
+    store.rows.set('doc-deck-1', { documentId: 'doc-deck-1', title: 'Sprint review', type: 'presentation', createdBy: 'user-connor' });
     const handler = createDeckStepHandler({ store, newDocumentId: () => 'unused' });
-    const outcome = await handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'doc-deck-1' }, helpers());
+    const outcome = await handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'doc-deck-1', requestedBy: 'user-connor' }, helpers());
     expect((outcome.output as Record<string, unknown>).documentId).toBe('doc-deck-1');
     expect((outcome.output as Record<string, unknown>).displacedDocument).toBeUndefined();
   }, 30_000);
@@ -200,4 +201,46 @@ describe('a deck never writes into another kind of document', () => {
     const outcome = await handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'doc-fresh' }, helpers());
     expect((outcome.output as Record<string, unknown>).documentId).toBe('doc-fresh');
   }, 30_000);
+
+  // NFR #47: the revision is written as the requester, so #41's rule applies at write time.
+  describe('who may add a revision to an existing presentation', () => {
+    const deckRow = { documentId: 'doc-owned', title: 'Connor\'s deck', type: 'presentation', createdBy: 'user-connor', editors: ['user-erin'], viewers: ['user-vic'] };
+    const run = (requestedBy: string) => {
+      const handler = createDeckStepHandler({ store, newDocumentId: () => 'unused' });
+      return handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'doc-owned', requestedBy }, helpers());
+    };
+    beforeEach(() => { store.rows.set('doc-owned', { ...deckRow }); });
+
+    it.each([['owner', 'user-connor'], ['editor', 'user-erin']])('the %s revises it in place', async (_role, user) => {
+      const outcome = await run(user);
+      expect(outcome.status).toBe('completed');
+      expect(store.calls).toHaveLength(1);
+      expect(store.calls[0]!.documentId).toBe('doc-owned');
+      expect(store.calls[0]!.createdBy).toBe(user);
+    }, 30_000);
+
+    it.each([['viewer', 'user-vic', /view this document but not change it/], ['stranger', 'user-frank', /owner or an editor/]])(
+      'a %s is refused as forbidden and nothing is written', async (_role, user, message) => {
+        const outcome = await run(user);
+        expect(outcome.status).toBe('failed');
+        expect(outcome.error).toMatch(/^deck forbidden: /);
+        expect(outcome.error).toMatch(message);
+        expect(store.calls).toHaveLength(0);
+      }, 30_000);
+
+    it('a run with no requester cannot revise someone\'s deck', async () => {
+      const handler = createDeckStepHandler({ store, newDocumentId: () => 'unused' });
+      const outcome = await handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'doc-owned' }, helpers());
+      expect(outcome.status).toBe('failed');
+      expect(store.calls).toHaveLength(0);
+    }, 30_000);
+
+    it('fails closed when the row cannot be read', async () => {
+      store.failGet = true;
+      const outcome = await run('user-connor');
+      expect(outcome.status).toBe('failed');
+      expect(outcome.error).toMatch(/could not read doc-owned/);
+      expect(store.calls).toHaveLength(0);
+    }, 30_000);
+  });
 });

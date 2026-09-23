@@ -243,9 +243,26 @@ describe('POST /pipelines/:pipelineId/runs (trigger)', () => {
     expect(trigger).toHaveBeenCalledWith({
       pipelineId: 'p1',
       definition: undefined,
-      triggerPayload: { foo: 'bar' },
+      triggerPayload: { foo: 'bar', requestedBy: 'user-1' },
       triggeredBy: { userId: 'user-1' },
     });
+  });
+
+  // NFR #47: the payload becomes the run context, and the deck steps act AS
+  // `requestedBy` — a caller cannot name someone else.
+  test('pins requestedBy (and trigger.requestedBy) to the verified caller', async () => {
+    const trigger = jest.fn(async () => ({ runId: 'bridge-run-2' }));
+    setPipelineBridge({ trigger, getRun: async () => null, getHistory: async () => [], resolveApproval: async () => {} } as never);
+    const app = buildApp();
+    const res = await run(app, 'POST', '/pipelines/p1/runs', {
+      userId: 'dev-frank',
+      body: { triggerPayload: { documentId: 'connors-deck', requestedBy: 'dev-connor', trigger: { requestedBy: 'dev-connor', x: 1 } } },
+    });
+    expect(res.statusCode).toBe(202);
+    expect(trigger).toHaveBeenCalledWith(expect.objectContaining({
+      triggerPayload: { documentId: 'connors-deck', requestedBy: 'dev-frank', trigger: { requestedBy: 'dev-frank', x: 1 } },
+      triggeredBy: { userId: 'dev-frank' },
+    }));
   });
 
   test('rejects 400 when definition.id does not match :pipelineId', async () => {

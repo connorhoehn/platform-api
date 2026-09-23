@@ -30,4 +30,20 @@ describe('document edit access', () => {
     expect(editRefusal(row, 'dev-frank')).toMatch(/view this document but not change it/);
     expect(editRefusal(row, 'dev-mallory')).toMatch(/owner or an editor/);
   });
+
+  it('assertCanEditDocument throws a 403 forbidden naming the document, and passes owner/editor/new rows', async () => {
+    const { assertCanEditDocument, DocumentEditForbiddenError } = await import('../documentEditAccess');
+    const row = { createdBy: 'u-owner', editors: ['u-ed'], viewers: ['u-view'] };
+    await expect(assertCanEditDocument(row, { sub: 'u-owner' }, 'd1')).resolves.toBeUndefined();
+    await expect(assertCanEditDocument(row, { sub: 'u-ed' }, 'd1')).resolves.toBeUndefined();
+    await expect(assertCanEditDocument(null, { sub: 'u-anyone' }, 'd1')).resolves.toBeUndefined();
+    for (const [sub, role] of [['u-view', 'viewer'], ['u-x', 'stranger']] as const) {
+      const err = await assertCanEditDocument(row, { sub }, 'd1').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(DocumentEditForbiddenError);
+      expect((err as InstanceType<typeof DocumentEditForbiddenError>).status).toBe(403);
+      expect((err as InstanceType<typeof DocumentEditForbiddenError>).code).toBe('forbidden');
+      expect((err as InstanceType<typeof DocumentEditForbiddenError>).documentId).toBe('d1');
+      expect((err as InstanceType<typeof DocumentEditForbiddenError>).role).toBe(role);
+    }
+  });
 });
