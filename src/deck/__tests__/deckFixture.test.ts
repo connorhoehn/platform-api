@@ -10,7 +10,7 @@ import { validateDeckSpec } from '../DeckSpec';
 import {
   FIXTURE_TITLE_PREFIX, NoFixtureMaterialError,
   buildDeckFixture, citableSources, fixturePrompt, fixtureSpec, materialBlock, readFixtureMaterial, recordingTitle,
-  transcriptIdsOf, uncitedMaterialWarnings,
+  liftSlideSubtitles, transcriptIdsOf, uncitedMaterialWarnings,
   type FixtureMaterial,
 } from '../deckFixture';
 
@@ -142,6 +142,27 @@ describe('buildDeckFixture', () => {
     expect(result.source).toBe('model');
     expect(result.reason).toBeUndefined();
     expect(result.spec.slides).toHaveLength(2);
+  });
+
+  it('keeps the model’s deck when it puts a subtitle on the title slide — lifted to the deck', async () => {
+    const withSlideSubtitle = { ...modelDeck, slides: [{ ...modelDeck.slides[0], subtitle: 'Call with Connor & Frank' }, modelDeck.slides[1]] };
+    const result = await buildDeckFixture({ documentId: 'doc-release-plan' }, 'Sprint review', {
+      ...deps, llm: scriptedModel(JSON.stringify(withSlideSubtitle)),
+    });
+    expect(result.source).toBe('model');
+    expect(result.spec.subtitle).toBe('Call with Connor & Frank');
+    expect('subtitle' in result.spec.slides[0]!).toBe(false);
+  });
+
+  it('a slide subtitle never overrides the deck’s own, and other stray fields still fail', async () => {
+    expect(liftSlideSubtitles({ subtitle: 'Deck', slides: [{ id: 'a', subtitle: 'Slide' }] }))
+      .toEqual({ subtitle: 'Deck', slides: [{ id: 'a' }] });
+    const stray = { ...modelDeck, slides: [{ ...modelDeck.slides[0], footer: 'x' }] };
+    const result = await buildDeckFixture({ documentId: 'doc-release-plan' }, 'Sprint review', {
+      ...deps, llm: scriptedModel(JSON.stringify(stray)),
+    });
+    expect(result.source).toBe('fixture');
+    expect(result.reason).toContain("unknown field 'footer'");
   });
 
   it('falls back with a reason when the model invents a source', async () => {

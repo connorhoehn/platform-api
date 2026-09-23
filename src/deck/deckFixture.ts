@@ -235,7 +235,7 @@ export function fixturePrompt(material: FixtureMaterial, title: string, requeste
     '- EVERY slide cites at least one source, using the exact documentId given below.',
     '- EVERY source listed below must be cited by at least one slide. Material you were given and did not use is material you were asked for and ignored: if a document and a transcript are both listed, the deck draws on both.',
     '- Only state what the material says. A quote must be something a named person actually said in it. A chart\'s numbers must appear in it. Name a person as the owner of something only when the material ties them to it.',
-    '- Open with a `title` slide. Speaker notes in `notes`.',
+    '- Open with a `title` slide. Speaker notes in `notes`. `subtitle` belongs to the deck, never to a slide.',
     '',
     'Sources you may cite:',
     citableSources(material).map((source) => `- ${source.title} (documentId: ${source.documentId})`).join('\n'),
@@ -367,6 +367,28 @@ export interface BuildFixtureOpts extends ReadMaterialDeps {
  * back to the offline deck — with the reason — when it cannot answer or answers
  * with something that does not validate.
  */
+/**
+ * The model's one recurring slip: a `subtitle` on the title slide. The deck
+ * has a subtitle and a slide does not, and the strict validator (right for a
+ * saved spec) rejected the whole draft over it, so the reader got the offline
+ * deck (live 2026-09-23: "slides[0]: unknown field 'subtitle'"). The words are
+ * the deck's subtitle when the model gave none; otherwise they repeat it and
+ * are dropped. Nothing else is loosened — every other stray field still fails.
+ */
+export function liftSlideSubtitles(parsed: unknown): unknown {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
+  const deck = parsed as Record<string, unknown>;
+  if (!Array.isArray(deck.slides)) return parsed;
+  let subtitle = typeof deck.subtitle === 'string' && deck.subtitle.trim() ? deck.subtitle : undefined;
+  const slides = deck.slides.map((slide) => {
+    if (!slide || typeof slide !== 'object' || !('subtitle' in slide)) return slide;
+    const { subtitle: own, ...rest } = slide as Record<string, unknown>;
+    if (!subtitle && typeof own === 'string' && own.trim()) subtitle = own.trim().slice(0, 200);
+    return rest;
+  });
+  return { ...deck, ...(subtitle ? { subtitle } : {}), slides };
+}
+
 export async function buildDeckFixture(
   from: DeckFixtureFrom,
   title: string | undefined,
@@ -392,7 +414,7 @@ export async function buildDeckFixture(
       const answer = await askModel(llm, fixturePrompt(material, deckTitle, from.personId), opts.timeoutMs ?? FIXTURE_TIMEOUT_MS);
       const parsed = parseDeckSpecJson(answer);
       if (parsed === undefined) throw new Error('the model answered with no JSON object');
-      const validation = validateDeckSpec(parsed);
+      const validation = validateDeckSpec(liftSlideSubtitles(parsed));
       if (!validation.ok) throw new Error(validation.errors.slice(0, 4).join('; '));
       const citable = new Set(sources.map((source) => source.documentId));
       const invented = validation.spec.slides
