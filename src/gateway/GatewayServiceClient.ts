@@ -162,31 +162,70 @@ export async function postChatMessage(input: { channel: string; message: string;
 }
 
 /**
- * Read a channel's history as a service identity: join, ask for `limit`
- * messages, and hand back the records oldest first. The join itself replays a
- * short history; the explicit request may answer with more, so whichever
- * reply carries the most messages wins.
+ * A chat-service refusal: the gateway answered, and the answer was no (not a
+ * member of a direct-message channel, a closed channel, a bad request). It is
+ * the gateway's own reason, not a timeout, so a caller can tell "you may not
+ * read this" apart from "the gateway did not answer" and must not retry it.
+ */
+export class ChatRefusedError extends Error {
+  constructor(readonly channel: string, readonly code: string | undefined, reason: string) {
+    super(`the chat service refused to read ${channel}: ${reason}${code ? ` (${code})` : ''}`);
+    this.name = 'ChatRefusedError';
+  }
+}
+
+/**
+ * A chat error frame. Only ever read on a socket opened for one request, so
+ * ANY chat error on it is the answer to that request: the dm-membership gate
+ * sends its refusal without the channel, and matching on the channel is what
+ * made a refused read sit out its whole timeout, three times.
+ */
+function chatErrorOf(frame: GatewayFrame): { code?: string; message: string } | null {
+  if (frame.type !== 'error' || (frame.service !== undefined && frame.service !== 'chat')) return null;
+  const e = frame.error as { code?: string; message?: string } | string | undefined;
+  if (typeof e === 'string') return { message: e };
+  return { ...(e?.code ? { code: e.code } : {}), message: e?.message ?? e?.code ?? 'the gateway refused' };
+}
+
+type HistoryClientFactory = (identity: ServiceIdentity, gatewayUrl?: string) => GatewayServiceClient;
+let historyClientFactory: HistoryClientFactory = (identity, url) => new GatewayServiceClient(identity, url);
+/** Tests swap the socket for a fake. */
+export function _setHistoryClientFactory(f: HistoryClientFactory | null): void {
+  historyClientFactory = f ?? ((identity, url) => new GatewayServiceClient(identity, url));
+}
+
+/**
+ * Read a channel's durable history through the chat service, AS the identity
+ * given — pass the person who asked, so the gateway's own gates (dm
+ * membership, a closed channel's per-member history floor) decide what they
+ * may read, exactly as they would for that person's browser.
+ *
+ * No `join`. A read needs no live subscription: `history` is gated and answered
+ * on its own, from the channel's store (DynamoDB, merged with the process
+ * cache), so any gateway replica gives the same answer and nothing is
+ * subscribed across the cluster for a one-shot read. Joining first cost a
+ * distributed channel subscribe per read, and a refused join was indistinguishable
+ * from a slow one: the read waited out its timeout on an error it never looked at.
  */
 export async function readChatHistory(input: { channel: string; limit?: number; identity?: ServiceIdentity; gatewayUrl?: string; timeoutMs?: number }): Promise<ChatHistoryMessage[]> {
-  const client = new GatewayServiceClient(input.identity ?? PIPELINE_IDENTITY, input.gatewayUrl);
+  const client = historyClientFactory(input.identity ?? PIPELINE_IDENTITY, input.gatewayUrl);
   const timeoutMs = input.timeoutMs ?? 4000;
-  await client.connect(timeoutMs);
-  const seen: ChatHistoryMessage[][] = [];
-  const off = client.onFrame((f) => {
-    if (isChatFrame(f, 'history', input.channel) && Array.isArray(f.messages)) seen.push(f.messages as ChatHistoryMessage[]);
-  });
+  // Worded so the executor's classifier reads both as transient ("connection",
+  // "timeout") and retries them, while a refusal — which is neither — is not.
   try {
-    client.send({ service: 'chat', action: 'join', channel: input.channel });
-    const joined = await client.waitFor((f) => isChatFrame(f, 'joined', input.channel) || isChatFrame(f, 'history', input.channel), timeoutMs);
-    if (!joined) throw new Error(`the chat service did not confirm the join of ${input.channel} within ${timeoutMs}ms`);
+    await client.connect(timeoutMs);
+  } catch (err) {
+    throw new Error(`gateway connection failed: ${describeError(err)}`);
+  }
+  try {
     client.send({ service: 'chat', action: 'history', channel: input.channel, limit: input.limit ?? 200 });
-    const reply = await client.waitFor((f) => isChatFrame(f, 'history', input.channel), timeoutMs);
-    if (!reply && seen.length === 0) throw new Error(`the chat service did not answer the history request for ${input.channel} within ${timeoutMs}ms`);
-    const best = seen.reduce<ChatHistoryMessage[]>((acc, m) => (m.length > acc.length ? m : acc), []);
-    return [...best].sort((a, b) => String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')));
+    const reply = await client.waitFor((f) => isChatFrame(f, 'history', input.channel) || !!chatErrorOf(f), timeoutMs);
+    if (!reply) throw new Error(`the chat service did not answer the history request for ${input.channel} (timeout after ${timeoutMs}ms)`);
+    const refused = chatErrorOf(reply);
+    if (refused) throw new ChatRefusedError(input.channel, refused.code, refused.message);
+    const messages = Array.isArray(reply.messages) ? reply.messages as ChatHistoryMessage[] : [];
+    return [...messages].sort((a, b) => String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')));
   } finally {
-    off();
-    client.send({ service: 'chat', action: 'leave', channel: input.channel });
-    await client.close();
+    await client.close(0);
   }
 }

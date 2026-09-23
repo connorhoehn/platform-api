@@ -17,6 +17,13 @@ import { postRunCardToChannel, runCardMetadata, str } from './chatRunCard';
 
 export const CONVERSATION_SUMMARIZE_PIPELINE_ID = 'conversation-summarize';
 export const CHAT_READ_HISTORY_KIND = 'chat:read-history';
+/**
+ * A read retries a connection failure or a timeout, never a refusal: the chat
+ * service saying this person may not read the channel is the same answer the
+ * second and third time. `retryUnknown: false` makes the executor retry only
+ * what its classifier calls transient.
+ */
+export const READ_HISTORY_RETRY = { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: false } as const;
 export const SUMMARIZE_PUBLISH_KIND = 'summarize:publish';
 export const DEFAULT_HISTORY_LIMIT = 200;
 
@@ -71,7 +78,7 @@ export function buildConversationSummarizeDefinition(model = process.env.DOCUMEN
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: '/summarize command' } },
-      { id: 'read-history', type: CHAT_READ_HISTORY_KIND, position: pos(200), data: { type: CHAT_READ_HISTORY_KIND, label: 'Read the conversation', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
+      { id: 'read-history', type: CHAT_READ_HISTORY_KIND, position: pos(200), data: { type: CHAT_READ_HISTORY_KIND, label: 'Read the conversation', retryPolicy: READ_HISTORY_RETRY } },
       { id: 'plan', type: 'agent', position: pos(400), data: { type: 'agent', label: 'Plan the page (Haiku)', prompt: CONVERSATION_SUMMARY_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: PLAN_RETRY } },
       { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(600), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the page as a collaborator', opsFrom: 'steps.plan.text', agent: { userId: 'agent:haiku', displayName: 'Haiku' }, retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
       { id: 'publish', type: SUMMARIZE_PUBLISH_KIND, position: pos(800), data: { type: SUMMARIZE_PUBLISH_KIND, label: 'Post the card to the conversation', retryPolicy: { maxAttempts: 3, backoffMs: 1500, backoffMultiplier: 2, retryUnknown: true } } },
@@ -95,7 +102,15 @@ export function createChatReadHistoryHandler(deps: { readHistory?: typeof readCh
       if (!channel) return { status: 'failed', error: 'chatChannel missing from the run context' };
       const limit = typeof ctx.limit === 'number' && ctx.limit > 0 ? Math.min(Math.floor(ctx.limit), 1000) : DEFAULT_HISTORY_LIMIT;
       try {
-        const messages = await read({ channel, limit });
+        // Read AS the person who asked: the gateway then judges this read
+        // exactly as it would their own browser's. As `agent:pipeline` every
+        // direct message was refused — the pipeline is not one of its two
+        // members — and a refusal read as a 4 s timeout, three times.
+        const requester = str(ctx.requestedBy);
+        const identity = requester && !requester.startsWith('agent:')
+          ? { userId: requester, displayName: str(ctx.requestedByName) ?? requester, kind: 'person' as const }
+          : undefined;
+        const messages = await read({ channel, limit, ...(identity ? { identity } : {}) });
         const { text, count } = conversationText(messages);
         // Merged into the run context: `{{ context.conversationText }}` and `{{ context.messageCount }}`.
         return { status: 'completed', output: { conversationText: text || '(no messages)', messageCount: count, rawMessages: messages.length } };

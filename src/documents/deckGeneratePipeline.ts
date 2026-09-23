@@ -11,7 +11,7 @@
 // from, and the validator in src/deck refuses the slide that names none.
 
 import type { StepHandler } from 'distributed-core/applications/pipeline';
-import { CHAT_READ_HISTORY_KIND } from './conversationSummarizePipeline';
+import { CHAT_READ_HISTORY_KIND, READ_HISTORY_RETRY } from './conversationSummarizePipeline';
 import { DECK_READ_SOURCES_KIND } from '../deck/DeckSourcesStepHandler';
 import { DECK_STEP_KIND } from '../deck/DeckStepHandler';
 import { buildDeckStepHandlers } from '../deck/registerDeckHandlers';
@@ -63,7 +63,7 @@ export function buildDeckGenerateDefinition(model = process.env.DOCUMENT_AGENT_M
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: '/deck command' } },
-      { id: 'read-history', type: CHAT_READ_HISTORY_KIND, position: pos(200), data: { type: CHAT_READ_HISTORY_KIND, label: 'Read the conversation', retryPolicy: retry } },
+      { id: 'read-history', type: CHAT_READ_HISTORY_KIND, position: pos(200), data: { type: CHAT_READ_HISTORY_KIND, label: 'Read the conversation', retryPolicy: READ_HISTORY_RETRY } },
       { id: 'read-sources', type: DECK_READ_SOURCES_KIND, position: pos(400), data: { type: DECK_READ_SOURCES_KIND, label: 'Read the source documents', retryPolicy: retry } },
       { id: 'draft', type: 'agent', position: pos(600), data: { type: 'agent', label: 'Draft the slides (Haiku)', prompt: DECK_DRAFT_PROMPT, model, allowedTools: [], maxTurns: 1, retryPolicy: DRAFT_RETRY } },
       { id: 'render', type: DECK_STEP_KIND, position: pos(800), data: { type: DECK_STEP_KIND, label: 'Render the deck (.pptx)', specFrom: 'steps.draft.text', retryPolicy: retry } },

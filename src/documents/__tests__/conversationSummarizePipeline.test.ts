@@ -75,6 +75,23 @@ describe('the read-history step', () => {
     expect(readHistory).toHaveBeenCalledWith({ channel: 'room:x', limit: 50 });
     expect(out).toEqual({ status: 'completed', output: { conversationText: '[10:00] Grace: hi', messageCount: 1, rawMessages: 2 } });
   });
+  it('reads as the person who asked, so a direct message they are in is readable', async () => {
+    const readHistory = jest.fn(async () => []);
+    const h = createChatReadHistoryHandler({ readHistory });
+    await h.execute({ id: 'read-history', type: CHAT_READ_HISTORY_KIND, data: {} } as never,
+      { chatChannel: 'chat:dm:dev-connor:dev-frank', requestedBy: 'dev-connor', requestedByName: 'Connor' }, { runId: 'r', emit: async () => undefined } as never);
+    expect(readHistory).toHaveBeenCalledWith(expect.objectContaining({ identity: { userId: 'dev-connor', displayName: 'Connor', kind: 'person' } }));
+  });
+  it('never reads as an agent requester — the pipeline identity is the fallback', async () => {
+    const readHistory = jest.fn(async () => []);
+    await createChatReadHistoryHandler({ readHistory }).execute({ id: 'read-history', type: CHAT_READ_HISTORY_KIND, data: {} } as never,
+      { chatChannel: 'room:x', requestedBy: 'agent:planner' }, { runId: 'r', emit: async () => undefined } as never);
+    expect(readHistory).toHaveBeenCalledWith({ channel: 'room:x', limit: expect.any(Number) });
+  });
+  it('retries a timeout or a dropped connection, never a refusal', () => {
+    const node = (buildConversationSummarizeDefinition().nodes as Array<{ id: string }>).find((n) => n.id === 'read-history') as unknown as { data: { retryPolicy: { retryUnknown: boolean; maxAttempts: number } } };
+    expect(node.data.retryPolicy).toMatchObject({ retryUnknown: false, maxAttempts: 3 });
+  });
   it('fails without a channel', async () => {
     const out = await createChatReadHistoryHandler({ readHistory: jest.fn() }).execute({ id: 'r', type: CHAT_READ_HISTORY_KIND, data: {} } as never, {}, { runId: 'x', emit: async () => undefined } as never);
     expect(out.status).toBe('failed');
