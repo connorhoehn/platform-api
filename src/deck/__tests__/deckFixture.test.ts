@@ -186,6 +186,14 @@ describe('every provided material has to be used', () => {
     expect(fixturePrompt(both, 'Sprint review')).toContain('EVERY source listed below must be cited');
   });
 
+  it('tells the model a short source makes a short deck, with no invented owners', () => {
+    // A three-line transcript drafted "Rollback procedures documented and
+    // tested" when the prompt demanded at least six slides.
+    const prompt = fixturePrompt(both, 'Sprint review');
+    expect(prompt).toContain('A short source makes a short deck');
+    expect(prompt).toContain('Name a person as the owner of something only when the material ties them to it');
+  });
+
   it('warns rather than rejects when a material is never cited', async () => {
     const onlyTranscript = {
       title: 'Sprint review',

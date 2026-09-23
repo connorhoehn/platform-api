@@ -189,6 +189,7 @@ describe('reviseDeck — adding information, not rewording it', () => {
     await reviseDeck({ spec: deck(), instruction: 'shorter title', slideId: 'transcript' }, { ...deps, llm: scripted(answer, prompts) });
     expect(prompts[0]).toMatch(/add information the deck does not already state/);
     expect(prompts[0]).toMatch(/Never add a rewording/);
+    expect(prompts[0]).toMatch(/Never attach a person's name to a line the material does not tie to them/);
   });
 
   it('warns when an added bullet only restates a line already on the deck', async () => {

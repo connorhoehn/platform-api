@@ -165,6 +165,7 @@ function rules(): string[] {
     '- A slide carries only the payload its layout is named after; bullets may appear on any slide. Omit fields you do not use.',
     '- EVERY slide cites at least one source, using the exact documentId listed below and nothing else.',
     '- Only state what the material says. Anything you add must come from the material; if the material does not support the instruction, change as little as possible and say so in "summary".',
+    '- Never attach a person\'s name to a line the material does not tie to them. If the instruction asks for owners the material does not name, leave those lines unowned and say which in "summary".',
     '- When the instruction asks you to add something, add information the deck does not already state: an owner, a date, a number, a decision, a risk and its mitigation — taken from the material. Never add a rewording of a bullet or quote the deck already has. If the material holds nothing new for it, add nothing and say so in "summary".',
     '- Change only what the instruction asks for. Leave everything else exactly as it is.',
     '- "summary" is one short sentence saying what you changed, written for the person who asked.',
