@@ -4,6 +4,8 @@ import {
   WorkGraphConcurrencyError,
   WorkGraphDataIntegrityError,
   WorkGraphRepository,
+  decodeLocalDayWatermark,
+  encodeLocalDayWatermark,
   type AuthenticatedWorkEvent,
   type WorkGraphReducer,
   type WorkProjectionState,
@@ -117,7 +119,9 @@ describe('WorkGraphRepository', () => {
     expect(writes[2].Put?.Item).toMatchObject({
       previousWatermark: 0,
       watermark: 1,
-      operations: [{ kind: 'upsert-node', node: expect.objectContaining({ id: 'node-1' }) }],
+      // NFR #22: a node new to the partition is flagged so replay can prove
+      // that an authorization revision moved only because of additions.
+      operations: [{ kind: 'upsert-node', created: true, node: expect.objectContaining({ id: 'node-1' }) }],
     });
     expect(writes[3].Put?.ConditionExpression).toBe('attribute_not_exists(PK)');
     expect(writes[3].Put?.Item).toMatchObject({
@@ -258,7 +262,86 @@ describe('WorkGraphRepository', () => {
       'inside-first-utc-day',
       'inside-second-utc-day',
     ]);
-    expect(state!.revision).toBe(5);
+    // Packed, not summed: replay splits it back into one cursor per partition.
+    expect(state!.revision).toBe(encodeLocalDayWatermark(2, 3));
+    expect(decodeLocalDayWatermark(state!.revision)).toEqual([2, 3]);
+  });
+
+  describe('local-day replay (NFR #22)', () => {
+    const delta = (watermark: number, committedAt: string, id: string) => ({
+      itemKind: 'delta',
+      previousWatermark: watermark - 1,
+      watermark,
+      committedAt,
+      operations: [{ kind: 'upsert-node', node: { id } }],
+    });
+    const logs: Record<string, Array<Record<string, unknown>>> = {
+      '2026-09-20': [delta(3, '2026-09-20T14:00:00.000Z', 'a3'), delta(4, '2026-09-20T16:00:00.000Z', 'a4')],
+      '2026-09-21': [delta(2, '2026-09-21T01:00:00.000Z', 'b2')],
+    };
+    const repositoryWithLogs = () => {
+      const send: Send = jest.fn(async (command: unknown) => {
+        if (!(command instanceof QueryCommand)) return {};
+        const values = command.input.ExpressionAttributeValues ?? {};
+        const day = String(values[':pk']).slice(-10);
+        const from = Number(String(values[':from']).split('#')[1]);
+        const to = Number(String(values[':through']).split('#')[1]);
+        return { Items: (logs[day] ?? []).filter((row) => Number(row.watermark) >= from && Number(row.watermark) <= to) };
+      });
+      return { repository: new WorkGraphRepository(client(send), reducer), send };
+    };
+
+    it('merges both UTC partitions into single-step batches with packed watermarks', async () => {
+      const { repository } = repositoryWithLogs();
+      const result = await repository.listLocalDayDeltas(
+        'org-1', 'actor-1', '2026-09-20', 'America/New_York',
+        encodeLocalDayWatermark(2, 1), encodeLocalDayWatermark(4, 2), 1_001,
+      );
+      expect(result.complete).toBe(true);
+      expect(result.batches.map((batch) => [
+        decodeLocalDayWatermark(batch.previousWatermark),
+        decodeLocalDayWatermark(batch.watermark),
+        (batch.operations[0] as { node: { id: string } }).node.id,
+      ])).toEqual([
+        [[2, 1], [3, 1], 'a3'],
+        [[3, 1], [4, 1], 'a4'],
+        [[4, 1], [4, 2], 'b2'],
+      ]);
+      for (let index = 1; index < result.batches.length; index += 1) {
+        expect(result.batches[index]!.previousWatermark).toBe(result.batches[index - 1]!.watermark);
+      }
+    });
+
+    it('answers incomplete for a cursor from the old summed encoding instead of guessing a split', async () => {
+      const { repository, send } = repositoryWithLogs();
+      await expect(repository.listLocalDayDeltas(
+        'org-1', 'actor-1', '2026-09-20', 'America/New_York', 3, encodeLocalDayWatermark(4, 2), 1_001,
+      )).resolves.toEqual({ batches: [], complete: false });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('is incomplete when one partition has a gap (expired delta rows)', async () => {
+      const { repository } = repositoryWithLogs();
+      const result = await repository.listLocalDayDeltas(
+        'org-1', 'actor-1', '2026-09-20', 'America/New_York',
+        encodeLocalDayWatermark(1, 1), encodeLocalDayWatermark(4, 2), 1_001,
+      );
+      expect(result.complete).toBe(false);
+    });
+
+    it('reads a UTC day exactly like listDeltas', async () => {
+      const { repository } = repositoryWithLogs();
+      const result = await repository.listLocalDayDeltas('org-1', 'actor-1', '2026-09-20', 'UTC', 2, 4, 1_001);
+      expect(result.complete).toBe(true);
+      expect(result.batches.map((batch) => batch.watermark)).toEqual([3, 4]);
+    });
+
+    it('treats 0 as the empty two-partition day and rejects out-of-range revisions', () => {
+      expect(decodeLocalDayWatermark(0)).toEqual([0, 0]);
+      expect(encodeLocalDayWatermark(0, 0)).toBeGreaterThan(Number.MAX_SAFE_INTEGER / 2);
+      expect(() => encodeLocalDayWatermark(2 ** 26, 0)).toThrow(WorkGraphDataIntegrityError);
+      expect(encodeLocalDayWatermark(1, 0)).toBeGreaterThan(encodeLocalDayWatermark(0, 2 ** 26 - 1));
+    });
   });
 
   it('returns the durable state for a duplicate event without reducing or writing', async () => {

@@ -100,14 +100,17 @@ type ReplayBody = {
   limit: number;
   schemaVersion?: 2;
   view?: GatewayWorkGraphViewRequest;
+  fromPolicyRevision?: string;
 };
 
 function replayBody(value: unknown): value is ReplayBody {
   return base(value)
     && Object.keys(value).every((key) => [
       'organizationId', 'viewerId', 'query', 'afterWatermark', 'throughWatermark', 'since', 'limit',
-      'schemaVersion', 'view',
+      'schemaVersion', 'view', 'fromPolicyRevision',
     ].includes(key))
+    && (value.fromPolicyRevision === undefined
+      || (typeof value.fromPolicyRevision === 'string' && value.fromPolicyRevision.length > 0 && value.fromPolicyRevision.length <= 256))
     && requestedView(value) !== false
     && Number.isSafeInteger(value.afterWatermark) && Number(value.afterWatermark) >= 0
     && Number.isSafeInteger(value.throughWatermark)
@@ -153,6 +156,7 @@ router.post('/replay', async (req, res, next) => {
         throughWatermark: Number(req.body.throughWatermark),
         since: req.body.since,
         limit: Number(req.body.limit),
+        ...(typeof req.body.fromPolicyRevision === 'string' ? { fromPolicyRevision: req.body.fromPolicyRevision } : {}),
       },
       (requestedView(req.body as Record<string, unknown>) || undefined) as GatewayWorkGraphViewRequest | undefined,
     ));

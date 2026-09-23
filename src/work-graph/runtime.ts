@@ -18,6 +18,7 @@ import type {
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import { WorkGraphRepository, type WorkSourceKind } from '../repositories/WorkGraphRepository';
+import { authorizationEntityDigest, revisionExplainedByAdditions } from './authorizationRevision';
 import { publishProjectionChangedSignal } from '../services/work-graph-outbox-drainer';
 import { WorkSharingRepository, type SharingAudience } from '../repositories/WorkSharingRepository';
 import {
@@ -1052,7 +1053,19 @@ export async function replayGatewayWorkGraph(
   organizationId: string,
   viewerId: string,
   query: GatewayWorkGraphQuery,
-  request: { afterWatermark: number; throughWatermark: number; since: string; limit: number },
+  request: {
+    afterWatermark: number;
+    throughWatermark: number;
+    since: string;
+    limit: number;
+    /**
+     * The authorization revision the caller's stream last accepted. When the
+     * current one differs, the replay runs to the current watermark and
+     * advances the stream only if entities created inside it explain the
+     * whole difference (NFR #22); otherwise `policyChanged`.
+     */
+    fromPolicyRevision?: string;
+  },
   requestedView?: GatewayWorkGraphViewRequest,
 ): Promise<{
   batches: Array<{
@@ -1061,32 +1074,26 @@ export async function replayGatewayWorkGraph(
     policyRevision: string;
     operations: WorkGraphDeltaOperation[];
     committedAt: string;
+    /** Set when this batch moves the stream from an older, verified revision. */
+    policyAdvancedFrom?: string;
     /** Present only for a schemaVersion 2 request. */
     view?: GatewayWorkGraphViewV2;
   }>;
   complete: boolean;
+  /** The revision the batches carry; with `fromPolicyRevision`, the one to accept. */
+  policyRevision?: string;
+  /** `fromPolicyRevision` cannot be advanced to the current one: invalidate. */
+  policyChanged?: true;
   /** Echoed only for a schemaVersion 2 request, with the refreshed view. */
   schemaVersion?: 2;
   view?: GatewayWorkGraphViewV2;
 }> {
-  // A non-UTC local day can span two UTC projection partitions. Its snapshot
-  // watermark is a composite revision, not a cursor into either partition's
-  // delta log. An empty barrier is safe; any observed change must force the
-  // gateway client to fetch a newly authorized composite snapshot.
+  // A non-UTC local day spans two UTC projection partitions; its watermark
+  // packs both partitions' revisions, and `listLocalDayDeltas` replays each
+  // partition from its own cursor and merges them (NFR #22). A cursor it
+  // cannot split (issued before the packing) answers incomplete: one reset.
   const viewer = await directory.resolveViewerById(organizationId, viewerId);
   if (!viewer) return { batches: [], complete: false };
-  if (query.timezone !== 'UTC' && request.afterWatermark < request.throughWatermark) {
-    // The barrier still has to answer in the version it was asked in: a v2
-    // caller that receives no `schemaVersion` reads the deployment as v1-only
-    // and stops asking for the activity layer altogether.
-    if (!requestedView) return { batches: [], complete: false };
-    return {
-      batches: [],
-      complete: false,
-      schemaVersion: 2 as const,
-      view: await gatewayWorkGraphView(viewer, query, requestedView),
-    };
-  }
   const current = await workGraphOrchestrator.getGraph(
     viewer,
     query.personId,
@@ -1094,18 +1101,29 @@ export async function replayGatewayWorkGraph(
     query.timezone,
   );
   if (request.throughWatermark > current.snapshot.watermark) return { batches: [], complete: false };
-  const stored = await graphRepository.listDeltas(
+  const currentRevision = current.snapshot.scope.policyRevision;
+  const advancing = request.fromPolicyRevision !== undefined && request.fromPolicyRevision !== currentRevision;
+  // Proving an advance needs every entity created up to the state the current
+  // revision describes, so it replays through the current watermark.
+  const throughWatermark = advancing ? current.snapshot.watermark : request.throughWatermark;
+  const stored = await graphRepository.listLocalDayDeltas(
     organizationId,
     query.personId,
     query.day,
+    query.timezone,
     request.afterWatermark,
-    request.throughWatermark,
+    throughWatermark,
     request.limit,
   );
   const visibleNodes = new Map(current.snapshot.nodes.map((node) => [node.id, node]));
   const visibleEdges = new Map(current.snapshot.edges.map((edge) => [edge.id, edge]));
+  const authorizedNodes = new Map(current.authorization.nodes.map((node) => [node.id, node]));
+  const authorizedEdges = new Map(current.authorization.edges.map((edge) => [edge.id, edge]));
+  // Digests of disclosed entities first created inside this replay: the only
+  // difference an advance may explain.
+  const created: bigint[] = [];
   let safe = stored.complete;
-  const batches = stored.batches.map((batch) => {
+  const mapped = stored.batches.map((batch) => {
     if (Date.parse(batch.committedAt) < Date.parse(request.since)) safe = false;
     const operations: WorkGraphDeltaOperation[] = [];
     for (const operation of batch.operations) {
@@ -1114,6 +1132,8 @@ export async function replayGatewayWorkGraph(
         const node = publicId ? visibleNodes.get(publicId) : undefined;
         if (node) operations.push({ kind: 'upsert-node', node });
         else safe = false; // an opaque prior node id cannot be safely removed
+        const authorized = publicId ? authorizedNodes.get(publicId) : undefined;
+        if (operation.created && authorized) created.push(authorizationEntityDigest('node', authorized));
       } else if (operation.kind === 'remove-node') {
         safe = false; // disclosure may have used a reader-scoped opaque id
       } else if (operation.kind === 'upsert-edge') {
@@ -1121,6 +1141,8 @@ export async function replayGatewayWorkGraph(
         operations.push(edge
           ? { kind: 'upsert-edge', edge }
           : { kind: 'remove-edge', edgeId: operation.edge.id });
+        const authorized = authorizedEdges.get(operation.edge.id);
+        if (operation.created && authorized) created.push(authorizationEntityDigest('edge', authorized));
       } else {
         operations.push({ kind: 'remove-edge', edgeId: operation.edgeId });
       }
@@ -1128,12 +1150,27 @@ export async function replayGatewayWorkGraph(
     return {
       previousWatermark: batch.previousWatermark,
       watermark: batch.watermark,
-      policyRevision: current.snapshot.scope.policyRevision,
+      policyRevision: currentRevision,
       operations,
       committedAt: batch.committedAt,
     };
   });
-  if (!requestedView) return { batches, complete: safe };
+  if (advancing) {
+    // A stream may only move to the current revision when the replay reaches
+    // the state it describes and the entities created on the way account for
+    // every bit of the difference. Anything else is a real permission change.
+    const reachesCurrent = safe && (mapped.at(-1)?.watermark ?? request.afterWatermark) === current.snapshot.watermark;
+    if (!reachesCurrent) return { batches: [], complete: false };
+    if (!revisionExplainedByAdditions(request.fromPolicyRevision!, currentRevision, created)) {
+      return { batches: [], complete: false, policyChanged: true };
+    }
+  }
+  const batches = advancing
+    ? mapped.map((batch) => ({ ...batch, policyAdvancedFrom: request.fromPolicyRevision! }))
+    : mapped;
+  if (!requestedView) {
+    return { batches, complete: safe, ...(request.fromPolicyRevision !== undefined ? { policyRevision: currentRevision } : {}) };
+  }
   // The activity layer is derived, not delta-encoded: every batch carries the
   // whole refreshed view, so effort membership can never drift away from the
   // node/edge state the same authorization decision produced. A zero-batch
@@ -1142,6 +1179,7 @@ export async function replayGatewayWorkGraph(
   return {
     batches: batches.map((batch) => ({ ...batch, view })),
     complete: safe,
+    ...(request.fromPolicyRevision !== undefined ? { policyRevision: currentRevision } : {}),
     schemaVersion: 2 as const,
     view,
   };

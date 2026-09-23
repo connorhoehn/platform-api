@@ -249,9 +249,10 @@ interface MetaItem extends StoredItem {
 }
 
 export type StoredWorkGraphDeltaOperation =
-  | { kind: 'upsert-node'; node: StoredWorkNode }
+  /** `created`: the entity did not exist in this partition before the batch (NFR #22). */
+  | { kind: 'upsert-node'; node: StoredWorkNode; created?: true }
   | { kind: 'remove-node'; nodeId: string }
-  | { kind: 'upsert-edge'; edge: StoredWorkEdge }
+  | { kind: 'upsert-edge'; edge: StoredWorkEdge; created?: true }
   | { kind: 'remove-edge'; edgeId: string };
 
 export interface StoredWorkGraphDeltaBatch {
@@ -293,6 +294,48 @@ function partitionKey(organizationId: string, actorId: string, day: string): str
     throw new RangeError('organizationId, actorId, and a valid UTC calendar day are required');
   }
   return `WG#${organizationId}#${actorId}#${day}`;
+}
+
+/**
+ * A local calendar day that is not UTC-aligned (America/New_York, …) spans two
+ * UTC projection partitions. Its read watermark packs both partitions'
+ * revisions into one monotone integer, so replay can split it back into a
+ * cursor per partition and serve deltas instead of forcing a refetch:
+ *
+ *   TAG + firstRevision * SHIFT + secondRevision
+ *
+ * TAG (2^52) keeps every packed value above every value the old encoding (the
+ * plain sum of the two revisions) could produce, so a cursor issued before this
+ * change never decodes into a wrong pair — it fails to decode and the gateway
+ * resets once. 2^26 revisions per person per UTC day is far past any real load
+ * and the result stays a safe integer.
+ */
+const LOCAL_DAY_WATERMARK_TAG = 2 ** 52;
+const LOCAL_DAY_WATERMARK_SHIFT = 2 ** 26;
+
+export function encodeLocalDayWatermark(first: number, second: number): number {
+  if (!Number.isSafeInteger(first) || !Number.isSafeInteger(second)
+    || first < 0 || second < 0
+    || first >= LOCAL_DAY_WATERMARK_SHIFT || second >= LOCAL_DAY_WATERMARK_SHIFT) {
+    throw new WorkGraphDataIntegrityError('local-day projection revision exceeded the packed watermark range');
+  }
+  return LOCAL_DAY_WATERMARK_TAG + first * LOCAL_DAY_WATERMARK_SHIFT + second;
+}
+
+/** The two partition revisions, or null for a value this encoding never produced. `0` is the empty day. */
+export function decodeLocalDayWatermark(watermark: number): [number, number] | null {
+  if (watermark === 0) return [0, 0];
+  if (!Number.isSafeInteger(watermark) || watermark < LOCAL_DAY_WATERMARK_TAG) return null;
+  const packed = watermark - LOCAL_DAY_WATERMARK_TAG;
+  return [Math.floor(packed / LOCAL_DAY_WATERMARK_SHIFT), packed % LOCAL_DAY_WATERMARK_SHIFT];
+}
+
+/** The UTC partitions a local day touches, earliest first (one for a UTC-aligned day, else two). */
+export function utcPartitionsForLocalDay(day: string, timezone: string): string[] {
+  const window = workDayWindow(day, timezone);
+  const startDay = window.start.slice(0, 10);
+  const lastInstant = new Date(Date.parse(window.end) - 1).toISOString().slice(0, 10);
+  return startDay === lastInstant ? [startDay] : [startDay, lastInstant];
 }
 
 function isCalendarDate(value: string): boolean {
@@ -412,13 +455,21 @@ function deltaOperations(
 ): StoredWorkGraphDeltaOperation[] {
   const operations: StoredWorkGraphDeltaOperation[] = [];
   for (const [id, node] of Object.entries(after.nodes)) {
-    if (!sameValue(before.nodes[id], node)) operations.push({ kind: 'upsert-node', node });
+    if (!sameValue(before.nodes[id], node)) {
+      operations.push(before.nodes[id] === undefined
+        ? { kind: 'upsert-node', node, created: true }
+        : { kind: 'upsert-node', node });
+    }
   }
   for (const id of Object.keys(before.nodes)) {
     if (after.nodes[id] === undefined) operations.push({ kind: 'remove-node', nodeId: id });
   }
   for (const [id, edge] of Object.entries(after.edges)) {
-    if (!sameValue(before.edges[id], edge)) operations.push({ kind: 'upsert-edge', edge });
+    if (!sameValue(before.edges[id], edge)) {
+      operations.push(before.edges[id] === undefined
+        ? { kind: 'upsert-edge', edge, created: true }
+        : { kind: 'upsert-edge', edge });
+    }
   }
   for (const id of Object.keys(before.edges)) {
     if (after.edges[id] === undefined) operations.push({ kind: 'remove-edge', edgeId: id });
@@ -491,14 +542,13 @@ export class WorkGraphRepository {
     timezone: string,
   ): Promise<WorkProjectionState | null> {
     const window = workDayWindow(day, timezone);
-    const startDay = window.start.slice(0, 10);
-    const lastInstant = new Date(Date.parse(window.end) - 1).toISOString().slice(0, 10);
-    const utcDays = startDay === lastInstant ? [startDay] : [startDay, lastInstant];
-    const projections = (await Promise.all(utcDays.map((utcDay) => this.loadProjection(
+    const utcDays = utcPartitionsForLocalDay(day, timezone);
+    const loaded = await Promise.all(utcDays.map((utcDay) => this.loadProjection(
       organizationId,
       actorId,
       utcDay,
-    )))).filter((projection): projection is WorkProjectionState => projection !== null);
+    )));
+    const projections = loaded.filter((projection): projection is WorkProjectionState => projection !== null);
     if (projections.length === 0) return null;
 
     const latest = <T extends { id: string; updatedAt: string; revision: number }>(
@@ -531,14 +581,13 @@ export class WorkGraphRepository {
         && nodes[edge.fromId] !== undefined
         && nodes[edge.toId] !== undefined));
 
-    // Each source commit increments exactly one UTC partition by one, so the
-    // sum changes for every committed event in this bounded local view. It is
-    // a read watermark only; replay continues to use its authoritative UTC
-    // partition and must reset/refetch when a cross-partition scope changes.
-    const revision = projections.reduce((total, projection) => total + projection.revision, 0);
-    if (!Number.isSafeInteger(revision)) {
-      throw new WorkGraphDataIntegrityError('local-day projection revision exceeded safe integer range');
-    }
+    // Each source commit increments exactly one UTC partition by one. A
+    // two-partition day packs both revisions (see encodeLocalDayWatermark) so
+    // `listLocalDayDeltas` can replay each partition from its own cursor; a
+    // missing partition counts as revision 0 so its position never shifts.
+    const revision = utcDays.length === 2
+      ? encodeLocalDayWatermark(loaded[0]?.revision ?? 0, loaded[1]?.revision ?? 0)
+      : projections[0]!.revision;
     return {
       schemaVersion: 1,
       organizationId,
@@ -783,6 +832,71 @@ export class WorkGraphRepository {
     return {
       batches,
       complete: expected === throughWatermark && (result.Items?.length ?? 0) <= limit,
+    };
+  }
+
+  /**
+   * Replay for a local day. A UTC-aligned day is one partition and reads
+   * exactly like `listDeltas`. A two-partition day splits the packed
+   * watermarks into a cursor per partition, reads both delta logs, and merges
+   * them by commit time into batches that carry packed watermarks again, so
+   * every batch still advances the caller's single cursor by one commit.
+   * A cursor this encoding did not produce (an old sum) answers incomplete,
+   * which the gateway turns into one reset.
+   */
+  async listLocalDayDeltas(
+    organizationId: string,
+    actorId: string,
+    day: string,
+    timezone: string,
+    afterWatermark: number,
+    throughWatermark: number,
+    limit: number,
+  ): Promise<{ batches: StoredWorkGraphDeltaBatch[]; complete: boolean }> {
+    const utcDays = utcPartitionsForLocalDay(day, timezone);
+    if (utcDays.length === 1) {
+      return this.listDeltas(organizationId, actorId, utcDays[0]!, afterWatermark, throughWatermark, limit);
+    }
+    const after = decodeLocalDayWatermark(afterWatermark);
+    const through = decodeLocalDayWatermark(throughWatermark);
+    if (!after || !through || through[0] < after[0] || through[1] < after[1]) {
+      return { batches: [], complete: false };
+    }
+    if (afterWatermark === throughWatermark) return { batches: [], complete: true };
+    const [first, second] = await Promise.all([0, 1].map((index) => this.listDeltas(
+      organizationId,
+      actorId,
+      utcDays[index]!,
+      after[index]!,
+      through[index]!,
+      limit,
+    )));
+    // A two-way merge, not a sort: each partition's log is already in commit
+    // order and must stay in it even if two writers' clocks disagree.
+    const tagged: Array<{ batch: StoredWorkGraphDeltaBatch; partition: 0 | 1 }> = [];
+    let left = 0;
+    let right = 0;
+    while (left < first!.batches.length || right < second!.batches.length) {
+      const a = first!.batches[left];
+      const b = second!.batches[right];
+      if (a && (!b || a.committedAt <= b.committedAt)) {
+        tagged.push({ batch: a, partition: 0 });
+        left += 1;
+      } else {
+        tagged.push({ batch: b!, partition: 1 });
+        right += 1;
+      }
+    }
+    const cursor: [number, number] = [after[0], after[1]];
+    const batches: StoredWorkGraphDeltaBatch[] = [];
+    for (const { batch, partition } of tagged.slice(0, limit)) {
+      const previousWatermark = encodeLocalDayWatermark(cursor[0], cursor[1]);
+      cursor[partition] = batch.watermark;
+      batches.push({ ...batch, previousWatermark, watermark: encodeLocalDayWatermark(cursor[0], cursor[1]) });
+    }
+    return {
+      batches,
+      complete: first!.complete && second!.complete && tagged.length <= limit,
     };
   }
 
