@@ -11,6 +11,8 @@ import {
   _resetLocalReplicaForTests,
   createMemoryLeaseStore,
   isOwnerLive,
+  ownerLiveness,
+  REPLICA_LEASE_TTL_MS,
   setLocalReplica,
 } from '../replicaLiveness';
 import { failOrphanedLoops, pendingRow, PENDING_PLAN } from '../../chat/agentLoopRunner';
@@ -157,5 +159,56 @@ describe('rolling restart with two replicas', () => {
     setLocalReplica('node-z', 1);
     const row = pendingRow('l1', { instruction: 'x', requestedBy: 'u', chatChannel: 'c' } as never, new Date());
     expect((row.checkpoint!.context as Record<string, unknown>).plannerNodeId).toBe('node-z');
+  });
+});
+
+describe('NFR #59 — resume follows the owner\'s lease, not the sweep interval', () => {
+  it('the default lease is 10 s (was 30 s)', () => {
+    expect(REPLICA_LEASE_TTL_MS).toBe(10_000);
+  });
+
+  it('ownerLiveness says when a live peer\'s lease lapses; none for ourselves or the dead', async () => {
+    const now = 2_000_000;
+    const store = createMemoryLeaseStore(() => now);
+    store.rows.set('platform-replica#node-a', { owner: `node-a@${now - 100}`, expiresAt: now + 7_000 });
+    expect(await ownerLiveness(store, 'node-a', now, () => now)).toEqual({ live: true, recheckAt: now + 7_000 });
+    expect(await ownerLiveness(store, 'node-b', now, () => now)).toEqual({ live: false });
+    setLocalReplica('node-self', now - 10);
+    expect(await ownerLiveness(store, 'node-self', now, () => now)).toEqual({ live: true });
+  });
+
+  it('wakeAt runs only the named task at the lease expiry, and a follower claims within a third of a TTL', async () => {
+    jest.useFakeTimers();
+    try {
+      const store = createMemoryLeaseStore();
+      const runs: string[] = [];
+      const tasks = [
+        { name: 'orphan-scan-and-resume', run: async () => { runs.push('orphan'); } },
+        { name: 'deck-blob-sweep', run: async () => { runs.push('deck'); } },
+      ];
+      const leader = new ClusterSweeper({ store, ownerId: 'A', tasks, intervalMs: 60_000, ttlMs: 9_000 });
+      leader.start();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(runs).toEqual(['orphan', 'deck']);
+      leader.wakeAt(Date.now() + 5_000, 'orphan-scan-and-resume');
+      leader.wakeAt(Date.now() + 8_000, 'orphan-scan-and-resume'); // later: ignored
+      await jest.advanceTimersByTimeAsync(5_000);
+      expect(runs).toEqual(['orphan', 'deck', 'orphan']);
+      await jest.advanceTimersByTimeAsync(5_000);
+      expect(runs).toHaveLength(3); // no second wake, interval not yet due
+
+      await leader.stop();
+      // A leader that died without releasing: its lease lapses 9 s from now.
+      store.rows.set('platform-sweep-leader', { owner: 'A-dead', expiresAt: Date.now() + 9_000 });
+      const follower = new ClusterSweeper({ store, ownerId: 'B', tasks: [{ name: 'orphan-scan-and-resume', run: async () => { runs.push('B'); } }], intervalMs: 60_000, ttlMs: 9_000 });
+      follower.start();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(runs).not.toContain('B'); // A's lease still held
+      await jest.advanceTimersByTimeAsync(12_000); // lease gone + at most one claim retry (3 s)
+      expect(runs).toContain('B');
+      await follower.stop();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

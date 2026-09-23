@@ -31,6 +31,18 @@ import log from './logger';
 export const REPLICA_KEY_PREFIX = 'platform-replica#';
 export const SWEEP_LEADER_KEY = 'platform-sweep-leader';
 
+/**
+ * NFR #59: liveness and sweep-leader lease TTL. Was 30 s, with a 60 s sweep
+ * interval: a run lost with its pod waited ~49 s to resume. Now 10 s (renewed
+ * every ~3.3 s, so three missed renewals in a row before a peer may act), and
+ * the sweeper wakes when an owner's lease is due to lapse rather than on its
+ * next interval. A resumed run takes the row with an owner-conditioned write
+ * (#39), so a slow-but-alive former owner's later writes are refused.
+ */
+export const REPLICA_LEASE_TTL_MS = Number(process.env.PLATFORM_REPLICA_LEASE_TTL_MS) > 0
+  ? Number(process.env.PLATFORM_REPLICA_LEASE_TTL_MS)
+  : 10_000;
+
 /** This process's incarnation — set once at bootstrap, read by row writers. */
 let localReplica: { nodeId: string; bootedAtMs: number } | null = null;
 
@@ -75,7 +87,7 @@ export class ReplicaHeartbeat {
       store: opts.store,
       lockKey: `${REPLICA_KEY_PREFIX}${opts.nodeId}`,
       ownerId: incarnationOwner(opts.nodeId, opts.bootedAtMs),
-      ttlMs: opts.ttlMs ?? 30_000,
+      ttlMs: opts.ttlMs ?? REPLICA_LEASE_TTL_MS,
       ...(opts.now ? { now: opts.now } : {}),
       onLeaseLost: () => log.warn({ nodeId: opts.nodeId }, 'replica liveness lease lost; re-claiming'),
     });
@@ -91,7 +103,7 @@ export class ReplicaHeartbeat {
       }
     };
     const won = await claim();
-    const every = Math.max(1_000, Math.floor((this.opts.ttlMs ?? 30_000) / 3));
+    const every = Math.max(1_000, Math.floor((this.opts.ttlMs ?? REPLICA_LEASE_TTL_MS) / 3));
     this.retry = setInterval(() => {
       if (!this.lock.isLeader()) void claim();
     }, every);
@@ -125,11 +137,25 @@ export async function isOwnerLive(
   sinceMs: number,
   now: () => number = Date.now,
 ): Promise<boolean> {
-  if (!ownerNodeId) return false;
+  return (await ownerLiveness(store, ownerNodeId, sinceMs, now)).live;
+}
+
+/**
+ * `isOwnerLive` plus WHEN to look again (NFR #59): for a live owner on another
+ * replica, the moment its lease lapses unless renewed (`recheckAt`). Absent
+ * for ourselves — our own runs are not ours to sweep.
+ */
+export async function ownerLiveness(
+  store: LeaseStore,
+  ownerNodeId: string | undefined,
+  sinceMs: number,
+  now: () => number = Date.now,
+): Promise<{ live: boolean; recheckAt?: number }> {
+  if (!ownerNodeId) return { live: false };
   const self = localReplica;
   if (self && self.nodeId === ownerNodeId) {
     // Ourselves: no store round trip. Alive iff we were already running.
-    return Number.isFinite(sinceMs) && sinceMs >= self.bootedAtMs;
+    return { live: Number.isFinite(sinceMs) && sinceMs >= self.bootedAtMs };
   }
   let row: { owner: string; expiresAt: number } | null;
   try {
@@ -138,12 +164,13 @@ export async function isOwnerLive(
     // Cannot tell → do not sweep. A missed sweep is retried next interval;
     // failing a live loop is not undoable.
     log.warn({ ownerNodeId, err: String(err) }, 'replica liveness read failed; treating owner as live');
-    return true;
+    return { live: true, recheckAt: now() + REPLICA_LEASE_TTL_MS / 2 };
   }
-  if (!row || row.expiresAt <= now()) return false;
+  if (!row || row.expiresAt <= now()) return { live: false };
   const inc = parseIncarnation(row.owner);
-  if (!inc || inc.nodeId !== ownerNodeId) return false;
-  return Number.isFinite(sinceMs) && sinceMs >= inc.bootedAtMs;
+  if (!inc || inc.nodeId !== ownerNodeId) return { live: false };
+  const live = Number.isFinite(sinceMs) && sinceMs >= inc.bootedAtMs;
+  return live ? { live, recheckAt: row.expiresAt } : { live };
 }
 
 export interface SweepTask {
@@ -159,6 +186,9 @@ export interface SweepTask {
 export class ClusterSweeper {
   private readonly lock: LeasedKVLock;
   private timer: NodeJS.Timeout | null = null;
+  private claimTimer: NodeJS.Timeout | null = null;
+  private wake: { atMs: number; timer: NodeJS.Timeout } | null = null;
+  private started = false;
   private running = false;
   /** Ticks this process actually swept on (observable for tests / metrics). */
   sweeps = 0;
@@ -177,7 +207,7 @@ export class ClusterSweeper {
     this.lock = new LeasedKVLock({
       store: opts.store,
       lockKey: opts.lockKey ?? SWEEP_LEADER_KEY,
-      ttlMs: opts.ttlMs ?? 30_000,
+      ttlMs: opts.ttlMs ?? REPLICA_LEASE_TTL_MS,
       ...(opts.ownerId ? { ownerId: opts.ownerId } : {}),
       ...(opts.now ? { now: opts.now } : {}),
       onLeaseLost: () => log.warn('sweep leadership lost'),
@@ -192,8 +222,29 @@ export class ClusterSweeper {
     return this.lock.isLeader();
   }
 
-  /** One pass: take/keep the lease, then run every task if we hold it. */
-  async tick(): Promise<boolean> {
+  /**
+   * NFR #59: run `taskName` (or every task) at `atMs` — the moment a live
+   * owner's lease lapses — instead of waiting for the next interval. Only the
+   * earliest pending wake is kept; a tick that finds the owner renewed simply
+   * asks again.
+   */
+  wakeAt(atMs: number, taskName?: string): void {
+    if (!this.started || !Number.isFinite(atMs)) return;
+    if (this.wake && this.wake.atMs <= atMs) return;
+    if (this.wake) clearTimeout(this.wake.timer);
+    const timer = setTimeout(() => {
+      this.wake = null;
+      void this.tick(taskName).then((ran) => {
+        // Busy with another pass: try again shortly rather than lose the wake.
+        if (!ran && this.isLeader()) this.wakeAt(Date.now() + 250, taskName);
+      });
+    }, Math.max(0, atMs - Date.now()));
+    timer.unref?.();
+    this.wake = { atMs, timer };
+  }
+
+  /** One pass: take/keep the lease, then run every task (or `only`) if we hold it. */
+  async tick(only?: string): Promise<boolean> {
     if (this.running) return false;
     this.running = true;
     try {
@@ -209,6 +260,7 @@ export class ClusterSweeper {
       }
       for (const task of this.opts.tasks) {
         if (!this.lock.isLeader()) break;
+        if (only && task.name !== only) continue;
         try {
           await task.run();
         } catch (err) {
@@ -223,13 +275,25 @@ export class ClusterSweeper {
   }
 
   start(): void {
+    this.started = true;
     void this.tick();
     this.timer = setInterval(() => void this.tick(), this.opts.intervalMs ?? 60_000);
     this.timer.unref?.();
+    // NFR #59: a non-leader retries the claim every third of a TTL, so a dead
+    // leader is replaced within about one TTL — and the winner sweeps at once.
+    this.claimTimer = setInterval(() => {
+      if (!this.lock.isLeader()) void this.tick();
+    }, Math.max(1_000, Math.floor((this.opts.ttlMs ?? REPLICA_LEASE_TTL_MS) / 3)));
+    this.claimTimer.unref?.();
   }
 
   async stop(): Promise<void> {
+    this.started = false;
     if (this.timer) clearInterval(this.timer);
+    if (this.claimTimer) clearInterval(this.claimTimer);
+    if (this.wake) clearTimeout(this.wake.timer);
+    this.wake = null;
+    this.claimTimer = null;
     this.timer = null;
     await this.lock.stop();
   }

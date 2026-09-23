@@ -112,6 +112,7 @@ import {
   ReplicaHeartbeat,
   createMemoryLeaseStore,
   isOwnerLive,
+  ownerLiveness,
   setLocalReplica,
   type SweepTask,
 } from '../lib/replicaLiveness';
@@ -1175,15 +1176,24 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     // whose owner replica is alive are skipped, so a rolling restart no longer
     // interrupts — and then re-executes — the other pod's in-flight runs.
     let resumeRanOnce = false;
+    let nextOwnerExpiry = Infinity;
     clusterSweepTasks.push({ name: 'orphan-scan-and-resume', run: () => scanOrphanedRuns({
       repository: pipelineRunRepository,
       ...(Number.isFinite(resumeWindowMs) && (resumeWindowMs ?? 0) >= 0
         ? { resumeWindowMs: resumeWindowMs as number }
         : {}),
-      isOwnerLive: (item) =>
-        isOwnerLive(sweepLeaseStore, item.ownerNodeId, Date.parse(item.resumedAt ?? item.startedAt)),
+      // NFR #59: remember when each live owner's lease lapses, and wake this
+      // task then — resume follows the owner's death by ~one lease TTL, not
+      // TTL + the sweep interval.
+      isOwnerLive: async (item) => {
+        const seen = await ownerLiveness(sweepLeaseStore, item.ownerNodeId, Date.parse(item.resumedAt ?? item.startedAt));
+        if (seen.recheckAt !== undefined) nextOwnerExpiry = Math.min(nextOwnerExpiry, seen.recheckAt);
+        return seen.live;
+      },
     })
       .then(async (scan) => {
+        if (Number.isFinite(nextOwnerExpiry)) clusterSweeper.wakeAt(nextOwnerExpiry + 250, 'orphan-scan-and-resume');
+        nextOwnerExpiry = Infinity;
         // Resume runs this pass interrupted, plus one pass after taking
         // leadership (rows a dead leader interrupted but never resumed).
         if (scan.transitioned === 0 && resumeRanOnce) return;
