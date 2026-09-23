@@ -7,7 +7,8 @@ jest.mock('../../lib/logger', () => {
   return { __esModule: true, default: l };
 });
 
-import { createDeckReviseEmitter, deckReviseChannelKey } from '../deckReviseEvents';
+import { createDeckReviseEmitter, deckReviseChannelKey, publishDeckRevisionWritten, setDeckReviseLiveSink, DECK_REVISION_WRITTEN_EVENT_TYPE } from '../deckReviseEvents';
+import { isPipelineMqLaneEvent } from '@connorhoehn/event-catalog';
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -38,5 +39,31 @@ describe('createDeckReviseEmitter', () => {
     const noRedis = createDeckReviseEmitter({ documentId: 'd', requestId: 'r', userId: 'u' });
     expect(() => noRedis.started()).not.toThrow();
     await settle();
+  });
+});
+
+describe('publishDeckRevisionWritten (NFR #15)', () => {
+  it('names the revision on the document channel, rides both lanes, and carries no deck text', async () => {
+    const sunk: Array<{ id: unknown; type: unknown }> = [];
+    setDeckReviseLiveSink((event) => { sunk.push({ id: event.id, type: event.type }); });
+    const sent: Array<{ channel: string; event: { id: string; type: string; payload: Record<string, unknown> } }> = [];
+    try {
+      const event = publishDeckRevisionWritten(
+        { documentId: 'doc-9', revisionId: 'rev-3', slideCount: 7, createdBy: 'u1', createdAt: '2026-09-23T00:00:00.000Z' },
+        { now: () => 0, publish: async (channel, message) => { sent.push({ channel, event: JSON.parse(message) }); } },
+      );
+      await settle();
+      expect(event?.type).toBe(DECK_REVISION_WRITTEN_EVENT_TYPE);
+      expect(isPipelineMqLaneEvent(DECK_REVISION_WRITTEN_EVENT_TYPE)).toBe(true);
+      expect(sent).toHaveLength(1);
+      expect(sent[0].channel).toBe('dcore:topic:pipeline.events.deck.revise.revision-written');
+      expect(sunk).toEqual([{ id: sent[0].event.id, type: DECK_REVISION_WRITTEN_EVENT_TYPE }]);
+      expect(Object.keys(sent[0].event.payload).sort()).toEqual(
+        ['createdAt', 'createdBy', 'documentId', 'occurredAt', 'revisionId', 'runId', 'slideCount'],
+      );
+      expect(sent[0].event.payload.runId).toBe('deck-revise:doc-9');
+    } finally {
+      setDeckReviseLiveSink(null);
+    }
   });
 });

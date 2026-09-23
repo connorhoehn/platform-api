@@ -208,3 +208,63 @@ export function createDeckReviseEmitter(init: DeckReviseEmitterInit): DeckRevise
 export const NOOP_DECK_REVISE_EMITTER: DeckReviseEmitter = {
   started: () => undefined, phase: () => undefined, completed: () => undefined, failed: () => undefined, ended: false,
 };
+
+/**
+ * NFR #15 (realtime-examples): every revision written to a presentation —
+ * a `/deck` generation, a `deck-revise` run, a manual save, an Undo — says so
+ * on the document's revise channel, so an already-open presentation page
+ * shows it without a reload, whichever gateway replica it is on.
+ *
+ * The type sits under `pipeline:deck:revise:` on purpose: that prefix is an
+ * MQ-lane prefix (event-catalog `isPipelineMqLaneEvent`), so the event rides
+ * the MQ relay AND the Redis relay with one `id`, and the gateway keeps one.
+ * A client that only knows the revise phases ignores it (not a phase).
+ *
+ * CONTENT: ids and counts only — no label, title or slide text.
+ */
+export const DECK_REVISION_WRITTEN_EVENT_TYPE = 'pipeline:deck:revise:revision-written';
+
+export interface DeckRevisionWrittenPayload {
+  runId: string;
+  documentId: string;
+  revisionId: string;
+  slideCount: number;
+  createdBy: string;
+  createdAt: string;
+  occurredAt: string;
+}
+
+export function publishDeckRevisionWritten(
+  revision: { documentId: string; revisionId: string; slideCount: number; createdBy: string; createdAt: string },
+  opts: { publish?: DeckRevisePublish; now?: () => number } = {},
+): DeckReviseBusEvent | null {
+  const publish = opts.publish ?? redisPublish;
+  const at = (opts.now ?? Date.now)();
+  const type = DECK_REVISION_WRITTEN_EVENT_TYPE;
+  const payload: DeckRevisionWrittenPayload = {
+    runId: deckReviseChannelKey(revision.documentId),
+    documentId: revision.documentId,
+    revisionId: revision.revisionId,
+    slideCount: revision.slideCount,
+    createdBy: revision.createdBy,
+    createdAt: revision.createdAt,
+    occurredAt: new Date(at).toISOString(),
+  };
+  const event = {
+    id: randomUUID(),
+    type,
+    payload: payload as unknown as DeckReviseEventPayload,
+    timestamp: at,
+    version: 1,
+    sourceNodeId: NODE_ID,
+  } satisfies DeckReviseBusEvent;
+  try {
+    try { liveSink?.(event); } catch { /* a sink never fails a write */ }
+    publish(channelForType(type), JSON.stringify(event)).catch((err: unknown) => {
+      log.warn({ err: err instanceof Error ? err.message : String(err), documentId: revision.documentId }, 'deck revision-written event not published');
+    });
+  } catch {
+    return null;
+  }
+  return event;
+}

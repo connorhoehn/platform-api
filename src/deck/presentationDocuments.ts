@@ -512,8 +512,9 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       if (input.expectedHead !== undefined && (headOf(existing)?.id ?? null) !== input.expectedHead) {
         throw new PresentationRevisionConflictError(input.documentId, headOf(existing), existing?.revisions?.length ?? 0);
       }
+      let written: AppendRevisionResult;
       try {
-        return await this.writeRevision(input, existing);
+        written = await this.writeRevision(input, existing);
       } catch (error) {
         if (!conditionFailed(error)) throw error;
         // Someone else's revision took this id between our read and our write.
@@ -522,7 +523,23 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
         if (input.expectedHead !== undefined || attempt >= MAX_APPEND_ATTEMPTS) {
           throw new PresentationRevisionConflictError(input.documentId, headOf(current), current?.revisions?.length ?? 0);
         }
+        continue;
       }
+      // NFR #15: every writer (a `/deck` run, a revise run, a save, an Undo)
+      // tells the open presentation pages, over the Redis relay and MQ.
+      // Loaded on first use: the relay module is not part of the store's own
+      // load (tests that mock the logger import the store without it).
+      const note = {
+        documentId: written.documentId,
+        revisionId: written.revision.id,
+        slideCount: written.revision.slideCount,
+        createdBy: written.revision.createdBy,
+        createdAt: written.revision.createdAt,
+      };
+      void import('./deckReviseEvents.js')
+        .then(({ publishDeckRevisionWritten }) => { publishDeckRevisionWritten(note); })
+        .catch(() => { /* a signal never fails a write */ });
+      return written;
     }
   }
 
