@@ -29,6 +29,7 @@ import {
   getPresentationDocumentStore,
   resolveRevisionSlides,
   resolveRevisionSpec,
+  revisionHeading,
   withRevisionSlides,
   PRESENTATION_DOCUMENT_TYPE,
   PresentationRevisionConflictError,
@@ -90,6 +91,8 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
       ...(revision.sources ? { sources: revision.sources } : {}),
       // A composer edit's revision names the run that wrote it.
       ...(revision.producedBy ? { producedBy: revision.producedBy } : {}),
+      // The deck's own heading, only where it differs from the document's name.
+      ...(revisionHeading(revision, row.title) ? { heading: revisionHeading(revision, row.title) } : {}),
       slides: (revision.slides ?? []).map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
     })),
   });

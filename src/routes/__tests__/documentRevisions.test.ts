@@ -60,6 +60,7 @@ const row: PresentationDocumentRow = {
     createdAt: '2026-09-21T10:00:00.000Z',
     createdBy: 'user-frank',
     slideCount: 2,
+    heading: 'Platform audit',
     asset: { key: PPTX_KEY, contentType: PPTX_CONTENT_TYPE, sizeBytes: 9 },
     slides: [
       { id: 'cover', index: 1, title: 'Cover', previewHandle: 'doc-1.v1.cover', asset: { key: SVG_KEY, contentType: 'image/svg+xml', sizeBytes: SVG.length } },
@@ -205,6 +206,8 @@ describe('GET /api/documents/:id/revisions', () => {
     expect(body.revisions).toHaveLength(1);
     expect(body.revisions[0].slides.map((slide: { id: string }) => slide.id)).toEqual(['cover', 'sources', 'gone']);
     expect(body.revisions[0].slides[0].previewHandle).toBe('doc-1.v1.cover');
+    // The deck's own title rides along as a subtitle where it differs from the name.
+    expect(body.revisions[0].heading).toBe('Platform audit');
   });
 
   it('404s an unknown document', async () => {

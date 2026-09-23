@@ -14,6 +14,7 @@ import {
   nextRevisionId,
   parseDeckPreviewHandle,
   pptxBlobKey,
+  revisionHeading,
   slideBlobKey,
   type PresentationDocumentRow,
 } from '../presentationDocuments';
@@ -42,6 +43,26 @@ const slides = [
   { id: 'cover', title: 'Cover', svg: '<svg>cover</svg>' },
   { id: 'sources', title: 'Sources', svg: '<svg>sources</svg>' },
 ];
+
+describe('revisionHeading — the deck\'s own title as a subtitle', () => {
+  it('names the spec title only where it says something the document name does not', () => {
+    expect(revisionHeading({ heading: 'Audit E2E' }, 'audit-e2e-1790150600')).toBe('Audit E2E');
+    expect(revisionHeading({ heading: 'Audit E2E' }, 'audit-e2e')).toBeUndefined();
+    expect(revisionHeading({ spec: { title: 'Q4 review' } as never }, 'Q4 Review')).toBeUndefined();
+    expect(revisionHeading({ spec: { title: 'Release plan' } as never }, 'Sprint deck')).toBe('Release plan');
+    expect(revisionHeading({}, 'Sprint deck')).toBeUndefined();
+    expect(revisionHeading(undefined, 'Sprint deck')).toBeUndefined();
+  });
+
+  it('is stored on every revision a spec wrote, so no reader needs the spec blob for it', async () => {
+    const store = new DdbPresentationDocumentStore({ docClient: fakeClient(() => null).client, blobStore: new InMemoryImageBlobStore(), now: () => new Date('2026-09-21T10:00:00.000Z') });
+    const { revision } = await store.appendRevision({
+      documentId: 'doc-h', title: 'audit-e2e-1', createdBy: 'user-frank',
+      pptx: Buffer.from('PKdeck'), slides, spec: { ...sampleDeck(), title: '  Audit E2E ' },
+    });
+    expect(revision.heading).toBe('Audit E2E');
+  });
+});
 
 describe('appendRevision — the first revision', () => {
   it('writes a presentation row the Documents page and the work graph can both read', async () => {

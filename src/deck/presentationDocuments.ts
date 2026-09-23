@@ -127,6 +127,25 @@ export interface StoredRevision {
    * finds its own revision here instead of filing a second one.
    */
   producedBy?: RevisionProducer;
+  /**
+   * The spec's own title ("Audit E2E") at write time. Kept on every revision,
+   * because only the head keeps its spec inline and readers that show it as a
+   * subtitle (the editor, the run card, the work-graph pane) should not have to
+   * fetch a spec blob for one line.
+   */
+  heading?: string;
+}
+
+/**
+ * The deck's own heading, when it says something the document's name does not
+ * — shown as a subtitle, never as a second name. Case, spacing and dashes do
+ * not count as a difference ("audit-e2e" and "Audit E2E" are the same words).
+ */
+export function revisionHeading(revision: Pick<StoredRevision, 'heading' | 'spec'> | undefined, documentTitle: string | undefined): string | undefined {
+  const heading = (revision?.heading ?? revision?.spec?.title ?? '').trim().slice(0, 120);
+  if (!heading) return undefined;
+  const fold = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  return fold(heading) === fold(documentTitle ?? '') ? undefined : heading;
 }
 
 /** Which run, and which composer request, wrote a revision. */
@@ -594,6 +613,7 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       asset: pptxAsset,
       slides,
       ...(input.spec ? { spec: input.spec } : {}),
+      ...(input.spec?.title?.trim() ? { heading: input.spec.title.trim().slice(0, 120) } : {}),
       ...(input.producedBy ? { producedBy: input.producedBy } : {}),
       ...(input.sources ?? (input.spec ? revisionSources(input.spec, input.transcriptIds) : undefined)
         ? { sources: input.sources ?? revisionSources(input.spec!, input.transcriptIds) }
