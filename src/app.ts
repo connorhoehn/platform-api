@@ -2,6 +2,7 @@ import express from 'express';
 import { requestContextMiddleware } from '@connorhoehn/service-runtime';
 import { requireDocumentPolicy } from './middleware/document-policy';
 import { requireAuth } from './middleware/auth';
+import { serviceOnBehalfOf } from './middleware/serviceOnBehalfOf';
 import { requestLogger } from './middleware/request-logger';
 import { httpMetrics } from './middleware/http-metrics';
 import { errorHandler } from './middleware/error-handler';
@@ -136,6 +137,9 @@ export function createApp(): express.Application {
     if (req.params.documentId === 'lifecycle-schema') { next(); return; }
     void requireDocumentPolicy(req, res, next);
   });
+  // A WebSocket-triggered run: the gateway names the person inside its signed
+  // body; verified here, then requireAuth accepts that principal (NFR #72).
+  app.use('/api/pipelines/:pipelineId/runs', serviceOnBehalfOf);
   // All other routes retain normal Cognito authentication. requireAuth accepts
   // a document identity only after the scoped verifier attached it above.
   app.use(requireAuth);

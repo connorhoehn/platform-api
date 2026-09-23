@@ -2,6 +2,27 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import jwksClient from 'jwks-rsa';
 import { readOrgClaim } from '../lib/org-claim';
+import { withContext } from '../lib/logger';
+
+// The SKIP_AUTH dev fallback: a request with no usable bearer runs as
+// `dev-user` with no organization. That identity owns nothing and projects
+// nowhere (NFR #72 hid behind it), so every use is logged — at most once a
+// minute per route, with a count of the ones in between.
+const authLog = withContext({ component: 'auth' });
+const DEV_FALLBACK_LOG_MS = 60_000;
+const devFallbackSeen = new Map<string, { at: number; suppressed: number }>();
+export function devUserFallback(req: Request): { sub: string; email: string } {
+  const route = `${req.method} ${(req.baseUrl || '') + (req.path || '')}`.replace(/\/[0-9a-f-]{16,}/gi, '/:id');
+  const now = Date.now();
+  const seen = devFallbackSeen.get(route);
+  if (!seen || now - seen.at >= DEV_FALLBACK_LOG_MS) {
+    authLog.warn({ route, suppressed: seen?.suppressed ?? 0 }, 'SKIP_AUTH dev fallback: no bearer, request runs as dev-user with no organization');
+    devFallbackSeen.set(route, { at: now, suppressed: 0 });
+  } else {
+    seen.suppressed += 1;
+  }
+  return { sub: 'dev-user', email: 'dev@local' };
+}
 
 const region = process.env.COGNITO_REGION!;
 const userPoolId = process.env.COGNITO_USER_POOL_ID!;
@@ -28,6 +49,8 @@ export async function requireAuth(
   // This value is attached only after the document policy verifies signature,
   // current session epoch, tenant, document and operation on this request.
   if (req.documentGrant) { next(); return; }
+  // A gateway call already verified by serviceOnBehalfOf (NFR #72).
+  if (req.serviceActor && req.user) { next(); return; }
   // Skip auth in local development. We still try to extract the user
   // identity from the bearer when present — the FE's useAuth ships a
   // signed dev token whose `sub` is the actual dev userId (e.g. dev-bob
@@ -50,7 +73,7 @@ export async function requireAuth(
         /* fall through to generic dev-user */
       }
     }
-    req.user = { sub: 'dev-user', email: 'dev@local' };
+    req.user = devUserFallback(req);
     next();
     return;
   }
@@ -109,7 +132,7 @@ export async function optionalAuth(
         /* fall through */
       }
     }
-    req.user = { sub: 'dev-user', email: 'dev@local' };
+    req.user = devUserFallback(req);
     next();
     return;
   }
