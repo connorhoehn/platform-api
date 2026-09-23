@@ -93,7 +93,7 @@ export class RunRowLocator {
             ExpressionAttributeValues: { ':r': runId },
             ...(startKey ? { ExclusiveStartKey: startKey } : {}),
           }));
-          matches.push(...((result?.Items ?? []) as Row[]).filter((item) => item.runId === runId));
+          matches.push(...((result?.Items ?? []) as Row[]).filter((item) => item.runId === runId && !isIndexRow(item)));
           startKey = result?.LastEvaluatedKey as Record<string, unknown> | undefined;
         } while (startKey && matches.length < 2);
         found.set(runId, matches.length === 1 ? matches[0]! : null);
@@ -121,7 +121,7 @@ export class RunRowLocator {
         }));
         for (const item of (result?.Items ?? []) as Row[]) {
           const id = typeof item.runId === 'string' ? item.runId : undefined;
-          if (!id || !chunk.includes(id)) continue;
+          if (!id || !chunk.includes(id) || isIndexRow(item)) continue;
           matches.set(id, matches.has(id) ? null : item);
         }
         scanned += result?.ScannedCount ?? 0;
@@ -131,6 +131,18 @@ export class RunRowLocator {
     }
     return found;
   }
+}
+
+/**
+ * An agent loop's per-person-day pointer (`personDayIndexRow`,
+ * `PA/chat/agentLoopRunner.ts`) carries the loop's run id under a
+ * `loops-by-person#…` partition with `status: 'index'`. It is not a run.
+ * Counted as one, every agent loop had two rows for its id, the ambiguity
+ * rule below answered "no row", and the loop was withheld from the work
+ * graph (realtime-examples NFR #134).
+ */
+function isIndexRow(item: Row): boolean {
+  return item.status === 'index';
 }
 
 /** One per process: it holds no rows, only whether each table has the index. */

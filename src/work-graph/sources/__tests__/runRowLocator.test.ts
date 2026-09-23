@@ -59,6 +59,19 @@ describe('RunRowLocator', () => {
     expect(t.calls).not.toContain('scan');
   });
 
+  it("skips an agent loop's person-day pointer row, on the index and on the Scan", async () => {
+    const rows = [
+      { pipelineId: 'chat-agent-loop', runId: 'loop-1', status: 'completed', triggeredBy: 'u1' },
+      { pipelineId: 'loops-by-person#u1#2026-09-23', runId: 'loop-1', status: 'index', triggeredBy: 'u1' },
+    ];
+    for (const index of [true, false]) {
+      const found = await new RunRowLocator().rows(table(rows, { index }).client, 'runs', ['loop-1']);
+      expect(found.get('loop-1')?.pipelineId).toBe('chat-agent-loop');
+    }
+    const onlyPointer = await new RunRowLocator().rows(table([rows[1]!]).client, 'runs', ['loop-1']);
+    expect(onlyPointer.get('loop-1')).toBeNull();
+  });
+
   it('treats two rows claiming one run id as no row', async () => {
     const t = table([{ pipelineId: 'p1', runId: 'dup' }, { pipelineId: 'p2', runId: 'dup' }]);
     expect((await new RunRowLocator().rows(t.client, 'runs', ['dup'])).get('dup')).toBeNull();
