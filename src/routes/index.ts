@@ -83,6 +83,8 @@ import { workGraphComputeSessionsRouter } from './work-graph-compute-sessions';
 // promoted to /api/* once the legacy counterpart is removed.
 import { createPipelineRouter } from '../pipeline/http/createPipelineRouter';
 import { getPipelineBridge } from '../pipeline/bridge-types';
+import { resolveStoredRun } from '../pipeline/storedRunLookup';
+import { pipelineRunRepo } from '../repositories';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import type { Request } from 'express';
@@ -320,19 +322,19 @@ router.use(
       const snap = await Promise.resolve(bridge.getRun(runId));
       return (snap as PipelineRunDetailResponse | null) ?? null;
     },
-    // Durable fallback. listRuns already does PipelineRunItem →
-    // snapshot conversion for the list endpoint; reuse the mapping
-    // by filtering its result rather than duplicating the converter.
-    // Effectively a small in-memory scan over the most-recent N rows
-    // for the pipeline; acceptable at single-node scale.
+    // Durable fallback: one keyed read, and an /agent loop's accept-time
+    // row followed to the run it points at (pipeline/storedRunLookup.ts,
+    // realtime-examples NFR #136).
     getStoredRun: async (pipelineId, runId) => {
-      const bridge = getPipelineBridge();
-      if (!bridge?.listRuns) return null;
-      const out = await Promise.resolve(
-        bridge.listRuns(pipelineId, { limit: 100 }),
-      );
-      const found = (out.runs ?? []).find((r) => r.runId === runId);
-      return (found as PipelineRunDetailResponse | undefined) ?? null;
+      const found = await resolveStoredRun(pipelineId, runId, {
+        get: (p, r) => pipelineRunRepo.get(p, r),
+        live: async (id) => {
+          const bridge = getPipelineBridge();
+          if (!bridge?.getRun) return null;
+          return ((await Promise.resolve(bridge.getRun(id))) as Record<string, unknown> | null) ?? null;
+        },
+      });
+      return (found as unknown as PipelineRunDetailResponse | null) ?? null;
     },
   }),
 );
