@@ -14,7 +14,7 @@ function runIndexItems(command: unknown, rows: Array<Record<string, unknown>>): 
 }
 import { InMemoryImageBlobStore } from '../../../pipeline/image/ImageBlobStore';
 import type { PresentationDocumentRow, StoredSlide } from '../../../deck/presentationDocuments';
-import { DynamoWorkActivityReader, stepLabelsOf } from '../activityReader';
+import { DynamoWorkActivityReader, stepLabelsOf, triggerStepIds } from '../activityReader';
 
 type Row = Record<string, unknown>;
 
@@ -597,5 +597,13 @@ describe('stepLabelsOf — a run lists its steps by the names its plan gave them
     const labels = stepLabelsOf(getSystemPipeline('deck-revise'), { stepsSummary: {} });
     expect([...labels.entries()].filter(([id]) => ['load', 'propose', 'check', 'write'].includes(id)))
       .toEqual([['load', 'Read the deck'], ['propose', 'Write the edit'], ['check', 'Check the edit'], ['write', 'Save the new revision']]);
+  });
+
+  it('knows a definition’s trigger is not one of its tools', () => {
+    const { getSystemPipeline } = jest.requireActual('../../../pipeline/systemPipelines');
+    const ids = triggerStepIds(getSystemPipeline('deck-revise'));
+    expect(ids.has('trigger')).toBe(true);
+    expect(ids.has('load')).toBe(false);
+    expect(triggerStepIds({ nodes: [{ id: 'kickoff', data: { type: 'trigger' } }] }).has('kickoff')).toBe(true);
   });
 });

@@ -240,6 +240,18 @@ function planOrder(labels: Map<string, string>, stepId: string): number {
   return index >= 0 ? index : Number.MAX_SAFE_INTEGER;
 }
 
+/** The definition's trigger node ids (`data.type === 'trigger'`), plus the conventional `trigger`. */
+export function triggerStepIds(definition: unknown): Set<string> {
+  const ids = new Set<string>(['trigger']);
+  const nodes = (definition as { nodes?: unknown } | undefined)?.nodes;
+  if (Array.isArray(nodes)) {
+    for (const node of nodes as Row[]) {
+      if (typeof node?.id === 'string' && ((node.data as Row | undefined)?.type === 'trigger' || node.type === 'trigger')) ids.add(node.id);
+    }
+  }
+  return ids;
+}
+
 export function stepLabelsOf(definition: unknown, row: Row): Map<string, string> {
   const labels = new Map<string, string>();
   const nodes = (definition as { nodes?: unknown } | undefined)?.nodes;
@@ -320,12 +332,14 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     // node id the engine files it under (`agent:s1` meant nothing to a reader).
     // A system pipeline (deck-revise, document edits, …) has no stored row;
     // its definition is the registry's.
-    const stepLabels = stepLabelsOf(
-      (definition?.Item as Row | undefined)?.definition ?? getSystemPipeline(String(row.pipelineId ?? '')),
-      row,
-    );
+    const plan = (definition?.Item as Row | undefined)?.definition ?? getSystemPipeline(String(row.pipelineId ?? ''));
+    const stepLabels = stepLabelsOf(plan, row);
+    // The trigger is how the run started, not a tool it used ("Composer edit"
+    // was listed first under "Tools in this run" and counted in "· 5 tools").
+    const triggers = triggerStepIds(plan);
     // The tools are the steps this run actually recorded, in execution order.
     const tools = Object.entries(steps)
+      .filter(([stepId]) => !triggers.has(stepId))
       .map(([stepId, summary]) => ({
         stepId,
         // A generated pipeline's steps are keyed by uuid; its title, when the
