@@ -25,6 +25,7 @@ import {
   type WorkGraphQueryV2,
 } from '@connorhoehn/realtime-modules/work-graph';
 import type { StoredWorkNode } from '../repositories/WorkGraphRepository';
+import { distinctHeading } from '../deck/distinctHeading';
 import { parsePipelineStepResourceId } from './sources/mapPipeline';
 import type { AuthorizedWorkGraph, ViewerWorkEdge, ViewerWorkNode } from './policy';
 
@@ -165,6 +166,8 @@ export interface ArtifactRevisionFacts {
   /** How many slides the source says this revision has. */
   slideCount: number;
   slides: Array<{ id: string; index: number; title: string }>;
+  /** The revision's own heading (a deck's title slide), as the source stored it. */
+  heading?: string;
   /**
    * The documents this revision cites, as the generator recorded them. Absent
    * when the source declared none — never the run's inputs guessed into place.
@@ -941,6 +944,11 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       // against; the document's `pageCount` is the fallback for a source that
       // records no per-revision slides.
       const pageCount = (newest && storedRevisions.get(newest.id)?.slideCount) || facts?.pageCount;
+      // The newest revision's own heading, only where it names something the
+      // document title does not ("Titled “Audit E2E”" under audit-e2e-…).
+      const heading = newest
+        ? distinctHeading(storedRevisions.get(newest.id)?.heading, facts?.name ?? node.title)
+        : undefined;
 
       const firstDraft = revisions[0] && clock(revisions[0].createdAt, query.timezone);
       setDetail(node.id, {
@@ -952,6 +960,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         artifact: {
           mediaKind: facts?.mediaKind ?? 'document',
           ...(pageCount ? { pageCount } : {}),
+          ...(heading ? { heading } : {}),
           revisions: anchoredRevisions,
           ...(pending ? { pending } : {}),
         },

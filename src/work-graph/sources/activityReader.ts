@@ -681,6 +681,7 @@ function storedRevisionFacts(row: Row): ArtifactRevisionFacts[] {
         })
         .filter((value): value is { documentId: string; title: string; kind?: 'document' | 'transcript' } => !!value);
       const label = text(revision?.label, 80);
+      const heading = text(revision?.heading, 120);
       const createdAt = iso(revision?.createdAt);
       const slideCount = typeof revision?.slideCount === 'number'
         && Number.isSafeInteger(revision.slideCount)
@@ -694,6 +695,7 @@ function storedRevisionFacts(row: Row): ArtifactRevisionFacts[] {
         ...(createdAt ? { createdAt } : {}),
         slideCount,
         slides,
+        ...(heading ? { heading } : {}),
         ...(sources.length ? { sources } : {}),
       };
     })

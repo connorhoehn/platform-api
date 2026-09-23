@@ -83,6 +83,14 @@ describe('artifact facts from a presentation row', () => {
       { id: 'risks', index: 2, title: 'Open risks' },
     ]);
     expect(facts?.revisions?.[0]?.slideCount).toBe(2);
+    expect(facts?.revisions?.[0]?.heading).toBeUndefined();
+
+    // NFR #93: the revision's own heading reaches the facts, for the pane subtitle.
+    const titled = await readerFor({
+      ...deckRow,
+      revisions: [{ ...(deckRow.revisions ?? [])[0], heading: 'Audit E2E' }],
+    }).artifact('doc-deck');
+    expect(titled?.revisions?.[0]?.heading).toBe('Audit E2E');
 
     // The same row with the slides only under `revisionSlides`.
     const keyed = await readerFor({

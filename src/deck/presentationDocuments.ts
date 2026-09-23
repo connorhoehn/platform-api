@@ -30,6 +30,7 @@ import {
   type AssetBlobStore, type BlobAsset,
 } from '../pipeline/image/ImageBlobStore';
 import { deckSources, type DeckSpec } from './DeckSpec';
+import { distinctHeading } from './distinctHeading';
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
 import log from '../lib/logger';
 import { AppError } from '../middleware/error-handler';
@@ -138,14 +139,10 @@ export interface StoredRevision {
 
 /**
  * The deck's own heading, when it says something the document's name does not
- * — shown as a subtitle, never as a second name. Case, spacing and dashes do
- * not count as a difference ("audit-e2e" and "Audit E2E" are the same words).
+ * (see `distinctHeading`).
  */
 export function revisionHeading(revision: Pick<StoredRevision, 'heading' | 'spec'> | undefined, documentTitle: string | undefined): string | undefined {
-  const heading = (revision?.heading ?? revision?.spec?.title ?? '').trim().slice(0, 120);
-  if (!heading) return undefined;
-  const fold = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-  return fold(heading) === fold(documentTitle ?? '') ? undefined : heading;
+  return distinctHeading(revision?.heading ?? revision?.spec?.title, documentTitle);
 }
 
 /** Which run, and which composer request, wrote a revision. */
