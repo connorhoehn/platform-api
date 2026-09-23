@@ -511,6 +511,42 @@ describe('a loop that ended on its context budget', () => {
   });
 });
 
+describe('a run whose lifecycle event was stamped after it started', () => {
+  it('takes the start time from the run\'s own record, so the card and the run page agree', async () => {
+    // A re-published "started" event (the seed, a resume) carries the time it
+    // was stamped; the run page reads the record's `startedAt`.
+    const state = project([
+      conversationEvent(`${DAY}T17:59:00.000Z`),
+      runEvent('running', `${DAY}T18:03:00.000Z`),
+    ]);
+    const { nodes, edges, authorization } = authorize(state);
+    const run = nodes.find((node) => node.title?.startsWith('Agent loop'));
+    expect(run?.startedAt).not.toBe(`${DAY}T17:33:00.000Z`);
+    await buildWorkActivity({
+      query, nodes, edges, authorization,
+      reader: reader({
+        [RUN]: { runId: RUN, status: 'running', attempt: 1, startedAt: `${DAY}T17:33:00.000Z`, updatedAt: `${DAY}T18:04:00.000Z`, tools: [] },
+      }),
+      now: NOW,
+    });
+    expect(run?.startedAt).toBe(`${DAY}T17:33:00.000Z`);
+    expect(run?.status).toBe('running');
+  });
+
+  it('keeps the projected start when the record has no usable one', async () => {
+    const state = project([conversationEvent(`${DAY}T17:59:00.000Z`), runEvent('running', `${DAY}T18:03:00.000Z`)]);
+    const { nodes, edges, authorization } = authorize(state);
+    const run = nodes.find((node) => node.title?.startsWith('Agent loop'));
+    const before = run?.startedAt;
+    await buildWorkActivity({
+      query, nodes, edges, authorization,
+      reader: reader({ [RUN]: { runId: RUN, status: 'running', attempt: 1, startedAt: '', updatedAt: `${DAY}T18:04:00.000Z`, tools: [] } }),
+      now: NOW,
+    });
+    expect(run?.startedAt).toBe(before);
+  });
+});
+
 describe('a run whose projected status never caught up to its failure', () => {
   it('corrects the node to error rather than leaving it "running" beside a failed summary', async () => {
     // The projection only ever saw the 'running' lifecycle event for this run

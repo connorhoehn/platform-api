@@ -651,6 +651,14 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         node.status = 'error';
         node.endedAt ??= facts?.updatedAt ?? now;
       }
+      // The same authority for WHEN it started: the projected node carries
+      // the time its lifecycle event was stamped, which for a re-observed or
+      // re-published "started" event is not the run's start. The run page
+      // reads the record's `startedAt`, so the card must too, or the two
+      // disagree about the same run.
+      if (facts?.startedAt && Number.isFinite(Date.parse(facts.startedAt)) && node.startedAt !== facts.startedAt) {
+        node.startedAt = facts.startedAt;
+      }
       const edit = facts?.edit;
       const stepId = facts?.step?.stepId;
       const summary = failed
