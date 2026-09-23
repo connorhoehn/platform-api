@@ -295,6 +295,31 @@ function inferNodeKind(stepOutput: unknown): string {
   return 'unknown';
 }
 
+/**
+ * The status of a run row only moves forward: once a run is finished
+ * (completed / failed / cancelled / rejected, `completedAt` set), a progress
+ * write whose last event is OLDER than that finish must not land. Event
+ * handlers persist full rows concurrently, so a step-completed put that
+ * started before the run-completed put can finish after it; without this the
+ * row went back to `running` and the runs list (and every page seeded from it)
+ * showed a finished run as Running forever. A resume-from-step of a failed
+ * run is still allowed: its events are newer than the old `completedAt`.
+ * Terminal writes, and rows without `lastEventAt`, are not guarded.
+ */
+function terminalGuard(item: PipelineRunItem): { expression: string; values: Record<string, unknown> } | null {
+  if (isTerminalRunStatus(item.status) || !item.lastEventAt) return null;
+  return {
+    expression: 'attribute_not_exists(completedAt) OR completedAt <= :lastEventAt',
+    values: { ':lastEventAt': item.lastEventAt },
+  };
+}
+
+/** True when `row` finished after `item`'s last event — the write is stale. */
+export function isSupersededBy(row: Pick<PipelineRunItem, 'completedAt'>, item: Pick<PipelineRunItem, 'status' | 'lastEventAt'>): boolean {
+  if (isTerminalRunStatus(item.status) || !item.lastEventAt) return false;
+  return typeof row.completedAt === 'string' && row.completedAt > item.lastEventAt;
+}
+
 export class PipelineRunRepository extends BaseRepository {
   constructor(docClient: DynamoDBDocumentClient) {
     super(tableName('pipeline-runs'), docClient);
@@ -318,7 +343,21 @@ export class PipelineRunRepository extends BaseRepository {
       item.ttl === undefined && isTerminalRunStatus(item.status)
         ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
         : item;
-    return this.putItem(stamped as unknown as Record<string, unknown>);
+    const guard = terminalGuard(item);
+    if (!guard) return this.putItem(stamped as unknown as Record<string, unknown>);
+    try {
+      await this.docClient.send(new PutCommand({
+        TableName: this.tableName,
+        Item: stamped as unknown as Record<string, unknown>,
+        ConditionExpression: guard.expression,
+        ExpressionAttributeValues: guard.values,
+      }));
+    } catch (err) {
+      // A later terminal write already landed; this older progress write is
+      // dropped rather than turning a finished run back into a running one.
+      if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return;
+      throw err;
+    }
   }
 
   /**
@@ -329,24 +368,30 @@ export class PipelineRunRepository extends BaseRepository {
    * never owned it gets `false` and writes nothing — instead of racing the
    * owner with a full-row put and erasing its fields.
    */
-  async putOwned(item: PipelineRunItem, ownerNodeId: string): Promise<boolean> {
+  async putOwned(item: PipelineRunItem, ownerNodeId: string): Promise<boolean | 'superseded'> {
     const stamped =
       item.ttl === undefined && isTerminalRunStatus(item.status)
         ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
         : item;
+    const ownership =
+      'attribute_not_exists(runId) OR attribute_not_exists(ownerNodeId) OR resumeClaimedBy = :owner '
+      + 'OR (ownerNodeId = :owner AND attribute_not_exists(resumeClaimedBy))';
+    const guard = terminalGuard(item);
     try {
       await this.docClient.send(new PutCommand({
         TableName: this.tableName,
         Item: stamped as unknown as Record<string, unknown>,
-        ConditionExpression:
-          'attribute_not_exists(runId) OR attribute_not_exists(ownerNodeId) OR resumeClaimedBy = :owner '
-          + 'OR (ownerNodeId = :owner AND attribute_not_exists(resumeClaimedBy))',
-        ExpressionAttributeValues: { ':owner': ownerNodeId },
+        ConditionExpression: guard ? `(${ownership}) AND (${guard.expression})` : ownership,
+        ExpressionAttributeValues: { ':owner': ownerNodeId, ...(guard?.values ?? {}) },
       }));
       return true;
     } catch (err) {
-      if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return false;
-      throw err;
+      if ((err as { name?: string })?.name !== 'ConditionalCheckFailedException') throw err;
+      if (!guard) return false;
+      // Which half refused it? A finished row newer than this write is not an
+      // ownership change — the caller must keep writing (and not drop its cache).
+      const row = await this.get(item.pipelineId, item.runId);
+      return row && isSupersededBy(row, item) ? 'superseded' : false;
     }
   }
 

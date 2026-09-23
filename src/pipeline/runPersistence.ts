@@ -372,6 +372,8 @@ export class RunPersistenceService {
   private static readonly SEEN_EVENT_CAP = 10_000;
   /** Writes refused because another node owns the run row (NFR #39). */
   ownershipLost = 0;
+  /** Progress writes refused because the stored row finished after them. */
+  staleWritesDropped = 0;
   /** How many deliveries the dedupe dropped — should stay 0 (NFR #38). */
   duplicateDeliveries = 0;
 
@@ -1708,6 +1710,14 @@ export class RunPersistenceService {
         const written = await retryWithBackoff(() => this.repository.putOwned(item, owner), {
           maxAttempts: 4, initialDelayMs: 100, multiplier: 4, maxDelayMs: 1600,
         });
+        if (written === 'superseded') {
+          // The run already finished after this write's last event; the
+          // stored terminal row stays (it is newer). Not an ownership loss.
+          this.staleWritesDropped += 1;
+          log.info({ runId: state.runId, pipelineId: state.pipelineId, status: item.status },
+            'run persistence: a newer terminal row is stored; this older progress write was dropped');
+          return;
+        }
         if (!written) {
           this.ownershipLost += 1;
           log.warn({ runId: state.runId, pipelineId: state.pipelineId, ownerNodeId: owner, status: state.status },
