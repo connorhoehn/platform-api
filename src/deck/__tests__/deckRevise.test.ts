@@ -276,6 +276,16 @@ describe('reviseDeck — a target inside one slide', () => {
     expect(subtitle.changedSlideIds).toEqual([]);
   });
 
+  it('keeps the part when the model answers null to an instruction that asked for no removal', async () => {
+    const result = await reviseDeck(
+      { spec: bulletsDeck(), instruction: 'make this bullet more specific', slideId: 'risks', target: { field: 'bullets', index: 1 } },
+      { ...deps, llm: scripted(JSON.stringify({ summary: 'Cannot make it more specific.', value: null })) },
+    );
+    expect(result.spec.slides[1]!.bullets).toEqual(bulletsDeck().slides[1]!.bullets);
+    expect(result.changedSlideIds).toEqual([]);
+    expect(result.warnings.join(' ')).toContain('did not ask for a removal');
+  });
+
   it('refuses a value of the wrong kind, a missing value, and an invented citation', async () => {
     const call = (answer: unknown) => reviseDeck(
       { spec: bulletsDeck(), instruction: 'x', slideId: 'risks', target: { field: 'title' } },

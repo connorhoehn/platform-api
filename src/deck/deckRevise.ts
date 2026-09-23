@@ -224,6 +224,7 @@ export function revisePrompt(input: DeckReviseInput, sources: ReadSource[]): str
       '',
       'Rules:',
       '- "value" replaces that part and nothing else; every other part of the deck is kept exactly as it is.',
+      '- null removes the part. Answer null ONLY when the instruction asks to remove or delete it. If you cannot do what was asked, answer the part exactly as it is now and say why in "summary".',
       '- "sources" is optional: list a source only when the new value uses material the slide does not already cite.',
       `- Bullets under ${MAX_BULLET_CHARS} characters, titles under ${MAX_TITLE_CHARS}, notes under ${MAX_NOTES_CHARS}.`,
       ...rules().slice(3),
@@ -339,6 +340,9 @@ export function validateReviseInputSpec(spec: unknown): { ok: true; spec: DeckSp
     },
   };
 }
+
+/** An instruction that asks for a part to go. */
+const REMOVAL_ASKED = /\b(remove|delete|drop|cut|clear|erase|get rid of|take out|strip)\b/i;
 
 const isStringList = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === 'string');
 
@@ -482,7 +486,14 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
           : [];
       })
       : [];
-    candidate = applyTargetValue(input.spec, input.slideId, input.target, parsed.value, added);
+    let value = parsed.value;
+    // A removal nobody asked for is the worst kind of "could not": the model
+    // that finds nothing to add must not delete what is there instead.
+    if (value === null && !REMOVAL_ASKED.test(input.instruction)) {
+      value = currentTargetValue(input.spec, input.spec.slides.find((slide) => slide.id === input.slideId), input.target);
+      warnings.push(`The agent proposed removing ${describeReviseTarget(input.target)}, but the instruction did not ask for a removal, so it was kept.`);
+    }
+    candidate = applyTargetValue(input.spec, input.slideId, input.target, value, added);
   } else if (input.slideId) {
     const slide = parsed.slide as Record<string, unknown> | undefined;
     if (!slide || typeof slide !== 'object') {
