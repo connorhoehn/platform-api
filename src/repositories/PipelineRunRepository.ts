@@ -179,6 +179,12 @@ export interface PipelineRunItem {
   /** Node id that claimed the interrupted run for resume (double-resume guard). */
   resumeClaimedBy?: string;
   /**
+   * NFR #26: node id of the process executing this run (for a resumed run,
+   * the node that claimed it). The cluster sweep leaves a `running` row alone
+   * while that node's liveness lease says the same incarnation is up.
+   */
+  ownerNodeId?: string;
+  /**
    * DLQ redrive lineage. `redriveOf` names the failed run this one replaces
    * (lifted from the trigger payload the redrive injects); `redrivenBy` on
    * the failed run lists every run started to replace it, oldest first.

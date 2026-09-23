@@ -537,3 +537,69 @@ describe('the trigger is not a step', () => {
     expect(publisher.pipeline).not.toHaveBeenCalled();
   });
 });
+
+describe('NFR #34 — an at-least-once bus never regresses a finished step', () => {
+  beforeEach(() => { publisher.pipeline.mockClear(); });
+
+  function idHarness() {
+    const handlers = new Map<string, (event: Record<string, unknown>) => Promise<void>>();
+    const eventBus = { subscribe: (name: string, handler: (e: Record<string, unknown>) => Promise<void>) => { handlers.set(name, handler); return name; } };
+    const repository = { put: jest.fn(async () => undefined) };
+    const service = new RunPersistenceService({
+      eventBus: eventBus as never,
+      repository: repository as unknown as PipelineRunRepository,
+    });
+    service.start();
+    const deliver = async (name: string, id: string | undefined, payload: Record<string, unknown>) =>
+      handlers.get(name)!({ ...(id ? { id } : {}), type: name, sourceNodeId: 'node-a', payload });
+    return { service, deliver, repository };
+  }
+
+  it('the same events delivered twice ~250 ms apart leave step s1 completed', async () => {
+    const { service, deliver, repository } = idHarness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'chat-agent-loop', userId: 'dev-frank',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan,
+    });
+    const started = { runId: RUN, pipelineId: 'chat-agent-loop', at: AT, triggeredBy: { triggerType: 'manual', userId: 'dev-frank' } };
+    const s1Start = { runId: RUN, stepId: 'agent:s1', at: '2026-09-21T18:00:01.000Z' };
+    const s1Done = { runId: RUN, stepId: 'agent:s1', durationMs: 10, at: '2026-09-21T18:00:02.000Z' };
+
+    // First delivery.
+    await deliver('pipeline:run:started', 'e1', started);
+    await deliver('pipeline:step:started', 'e2', s1Start);
+    await deliver('pipeline:step:completed', 'e3', s1Done);
+    const putsAfterFirst = repository.put.mock.calls.length;
+    publisher.pipeline.mockClear();
+
+    // Redelivery of the same ids: dropped outright.
+    await deliver('pipeline:run:started', 'e1', started);
+    await deliver('pipeline:step:started', 'e2', s1Start);
+    await deliver('pipeline:step:completed', 'e3', s1Done);
+    expect(published()).toHaveLength(0);
+    expect(repository.put.mock.calls.length).toBe(putsAfterFirst);
+
+    // A late `started` with NO id (cannot be deduped by id): still must not
+    // rebuild the run or regress the finished step.
+    await deliver('pipeline:run:started', undefined, started);
+    await deliver('pipeline:step:started', undefined, s1Start);
+    const steps = published().filter((r) => r.kind === 'pipeline-step');
+    expect(steps.filter((r) => (r.step as { status: string }).status !== 'completed')).toHaveLength(0);
+    const lastPut = repository.put.mock.calls.at(-1)?.[0] as { stepsSummary?: Record<string, { status: string }>; ownerNodeId?: string };
+    expect(lastPut.stepsSummary?.['agent:s1']?.status).toBe('completed');
+    expect(lastPut.ownerNodeId).toBe('node-a');
+  });
+
+  it('a genuinely newer start of the same step (a re-run) still shows running', async () => {
+    const { service, deliver } = idHarness();
+    service.registerTrigger({
+      runId: RUN, pipelineId: 'chat-agent-loop', userId: 'dev-frank',
+      triggerType: 'manual', at: AT, organizationId: 'dev-org', workGraph: plan,
+    });
+    await deliver('pipeline:run:started', 'r1', { runId: RUN, pipelineId: 'chat-agent-loop', at: AT, triggeredBy: { triggerType: 'manual', userId: 'dev-frank' } });
+    await deliver('pipeline:step:completed', 'r2', { runId: RUN, stepId: 'agent:s1', durationMs: 10, at: '2026-09-21T18:00:02.000Z' });
+    publisher.pipeline.mockClear();
+    await deliver('pipeline:step:started', 'r3', { runId: RUN, stepId: 'agent:s1', at: '2026-09-21T18:00:05.000Z' });
+    expect(published()).toMatchObject([{ step: { stepId: 'agent:s1', status: 'running' } }]);
+  });
+});

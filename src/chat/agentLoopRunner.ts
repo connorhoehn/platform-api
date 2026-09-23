@@ -36,6 +36,7 @@ import {
   type AgentLoopRequest, type AgentLoopSource, type LoopPlan,
 } from './agentLoopPlanner';
 import log from '../lib/logger';
+import { getLocalReplica } from '../lib/replicaLiveness';
 
 /** The plan a loop has before its planner has answered. */
 export const PENDING_PLAN: LoopPlan = { source: 'pending' as unknown as LoopPlan['source'], steps: [] };
@@ -88,6 +89,9 @@ export function pendingRow(loopId: string, request: AgentLoopRequest, at: Date):
         requestedBy: request.requestedBy,
         ...(request.requestedByName ? { requestedByName: request.requestedByName } : {}),
         plan: PENDING_PLAN,
+        // Which process is planning (NFR #26): the orphan sweep leaves the
+        // loop alone while this replica's liveness lease says it is up.
+        ...(getLocalReplica() ? { plannerNodeId: getLocalReplica()!.nodeId } : {}),
       },
       currentStepIds: [],
     },
@@ -272,11 +276,19 @@ export async function failOrphanedLoops(args: {
   listPending: () => Promise<PipelineRunItem[]>;
   putRun: (item: PipelineRunItem) => Promise<void>;
   stopSession?: (sessionId: string) => Promise<unknown>;
+  /**
+   * Is the replica planning this loop still running it? A loop whose planner
+   * is alive is NOT orphaned, however long planning takes (NFR #26 / #11:
+   * with two replicas, the other pod's boot must not fail our loops). Omitted
+   * → the old single-process meaning: every pending loop is an orphan.
+   */
+  isPlannerLive?: (plannerNodeId: string | undefined, startedAtMs: number) => Promise<boolean>;
   now?: () => Date;
-}): Promise<{ failed: string[]; sessionsStopped: number }> {
+}): Promise<{ failed: string[]; sessionsStopped: number; skippedLive: number }> {
   const now = args.now ?? (() => new Date());
   const failed: string[] = [];
   let sessionsStopped = 0;
+  let skippedLive = 0;
 
   const rows = await args.listPending();
   for (const row of rows) {
@@ -285,6 +297,10 @@ export async function failOrphanedLoops(args: {
     const context = (row.checkpoint?.context ?? {}) as Record<string, unknown>;
     const plan = (context.plan ?? {}) as { source?: unknown };
     if (plan.source !== 'pending') continue;
+    if (args.isPlannerLive) {
+      const owner = typeof context.plannerNodeId === 'string' ? context.plannerNodeId : undefined;
+      if (await args.isPlannerLive(owner, Date.parse(row.startedAt))) { skippedLive += 1; continue; }
+    }
 
     await args.putRun({
       ...row,
@@ -299,8 +315,8 @@ export async function failOrphanedLoops(args: {
       try { await args.stopSession(lab.sessionId); sessionsStopped += 1; } catch { /* best effort */ }
     }
   }
-  if (failed.length) log.warn({ loops: failed, sessionsStopped }, 'agent loops orphaned by a restart were failed');
-  return { failed, sessionsStopped };
+  if (failed.length) log.warn({ loops: failed, sessionsStopped, skippedLive }, 'agent loops orphaned by a restart were failed');
+  return { failed, sessionsStopped, skippedLive };
 }
 
 // ─── Finding a person's loops without a GSI ───────────────────────────

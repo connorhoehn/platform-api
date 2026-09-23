@@ -30,12 +30,22 @@ export interface ScanOrphanedRunsOptions {
   resumeWindowMs?: number;
   /** Override `now` for tests. */
   now?: () => number;
+  /**
+   * NFR #26: is the process executing this run still alive? A run whose owner
+   * replica holds its liveness lease is not orphaned — with two replicas the
+   * other pod's run is `running` in DDB and must be left alone (interrupting
+   * it here made the resume path execute it a second time). Omitted → the
+   * original single-node meaning: every `running` row is an orphan.
+   */
+  isOwnerLive?: (item: PipelineRunItem) => Promise<boolean>;
 }
 
 export interface ScanOrphanedRunsResult {
   scanned: number;
   transitioned: number;
   skippedOutsideWindow: number;
+  /** Rows left alone because their owner replica is alive. */
+  skippedLive?: number;
 }
 
 const DEFAULT_RESUME_WINDOW_MS = 4 * 60 * 60 * 1000; // 4 hours
@@ -68,6 +78,7 @@ export async function scanOrphanedRuns(
 
   let transitioned = 0;
   let skippedOutsideWindow = 0;
+  let skippedLive = 0;
 
   for (const item of running) {
     const startedAtMs = Date.parse(item.startedAt);
@@ -77,6 +88,10 @@ export async function scanOrphanedRuns(
     }
     if (startedAtMs < cutoffMs) {
       skippedOutsideWindow++;
+      continue;
+    }
+    if (options.isOwnerLive && (await options.isOwnerLive(item))) {
+      skippedLive++;
       continue;
     }
 
@@ -101,9 +116,10 @@ export async function scanOrphanedRuns(
     }
   }
 
-  if (running.length > 0 || transitioned > 0) {
+  // Periodic now (NFR #26 cluster sweeper): stay quiet when nothing moved.
+  if (transitioned > 0 || skippedLive > 0) {
     log.info(
-      { scanned: running.length, transitioned, skippedOutsideWindow, resumeWindowMs },
+      { scanned: running.length, transitioned, skippedOutsideWindow, skippedLive, resumeWindowMs },
       'orphan-scan complete',
     );
   }
@@ -112,5 +128,6 @@ export async function scanOrphanedRuns(
     scanned: running.length,
     transitioned,
     skippedOutsideWindow,
+    ...(options.isOwnerLive ? { skippedLive } : {}),
   };
 }

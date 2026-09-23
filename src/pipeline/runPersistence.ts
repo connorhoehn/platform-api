@@ -152,6 +152,10 @@ interface RunState {
   resumedAt?: string;
   resumeCount?: number;
   resumeClaimedBy?: string;
+  /** NFR #26: node executing the run; see PipelineRunItem.ownerNodeId. */
+  ownerNodeId?: string;
+  /** NFR #34: set once `run:started` has built this state; later ones are ignored. */
+  startedSeen?: boolean;
   /** DLQ redrive lineage — see PipelineRunItem. Carried so full-row puts keep them. */
   redriveOf?: string;
   redrivenBy?: string[];
@@ -210,9 +214,26 @@ export class RunPersistenceService {
     if (this.subscriptionActive) return;
     this.subscriptionActive = true;
 
+    // NFR #34: the bus is at-least-once here — every event was observed
+    // reaching this service twice ~250 ms apart, and the second `run:started`
+    // rebuilt the run's state from scratch, leaving finished steps `waiting`
+    // in the work graph. Drop a BusEvent id already handled. Events with no
+    // id (tests, synthetic publishers) pass through.
+    const bus = this.eventBus;
+    const dedupedBus = {
+      subscribe: (type: string, handler: (event: any) => Promise<void>): string =>
+        (bus as unknown as { subscribe(t: string, h: (e: any) => Promise<void>): string }).subscribe(
+          type,
+          async (event: any) => {
+            if (this.seenEvent(event)) return;
+            await handler(event);
+          },
+        ),
+    };
+
     // Subscribe to run lifecycle events
-    this.eventBus.subscribe('pipeline:run:started', async (event) => {
-      await this.handleRunStarted(event.payload).catch((err) => {
+    dedupedBus.subscribe('pipeline:run:started', async (event) => {
+      await this.handleRunStarted(event.payload, (event as { sourceNodeId?: string }).sourceNodeId).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:started');
       });
     });
@@ -220,11 +241,11 @@ export class RunPersistenceService {
     // A step's own start. It is the earliest honest moment to say a step is
     // running, and unlike `step:attempt:started` it fires for every step
     // rather than only for ones with a retry policy.
-    this.eventBus.subscribe('pipeline:step:started', async (event) => {
+    dedupedBus.subscribe('pipeline:step:started', async (event) => {
       await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'running', event.payload.at);
     });
 
-    this.eventBus.subscribe('pipeline:step:completed', async (event) => {
+    dedupedBus.subscribe('pipeline:step:completed', async (event) => {
       // AFTER the summary is written: the step's own output is what names the
       // document it produced, and that is not on the bus event.
       await this.handleStepCompleted(event.payload).catch((err) => {
@@ -241,7 +262,7 @@ export class RunPersistenceService {
       }
     });
 
-    this.eventBus.subscribe('pipeline:step:failed', async (event) => {
+    dedupedBus.subscribe('pipeline:step:failed', async (event) => {
       await this.handleStepFailed(event.payload).catch((err) => {
         log.warn(
           { runId: event.payload.runId, stepId: event.payload.stepId, err: String(err) },
@@ -251,19 +272,19 @@ export class RunPersistenceService {
       await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'failed', event.payload.at);
     });
 
-    this.eventBus.subscribe('pipeline:run:completed', async (event) => {
+    dedupedBus.subscribe('pipeline:run:completed', async (event) => {
       await this.handleRunCompleted(event.payload).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:completed');
       });
     });
 
-    this.eventBus.subscribe('pipeline:run:failed', async (event) => {
+    dedupedBus.subscribe('pipeline:run:failed', async (event) => {
       await this.handleRunFailed(event.payload).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:failed');
       });
     });
 
-    this.eventBus.subscribe('pipeline:run:cancelled', async (event) => {
+    dedupedBus.subscribe('pipeline:run:cancelled', async (event) => {
       await this.handleRunCancelled(event.payload).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:cancelled');
       });
@@ -273,28 +294,26 @@ export class RunPersistenceService {
     // compacted and persisted onto the run row so an in-flight run's
     // frontier survives pod replacement (the file WAL does not — it lives
     // on the pod's ephemeral filesystem).
-    this.eventBus.subscribe('pipeline:run:checkpoint', async (event) => {
+    dedupedBus.subscribe('pipeline:run:checkpoint', async (event) => {
       await this.handleCheckpoint(event.payload).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:checkpoint');
       });
     });
 
     // Per-attempt retry events (DC-15 — only emitted when maxAttempts > 1)
-    this.eventBus.subscribe('pipeline:step:attempt:started', async (event) => {
+    dedupedBus.subscribe('pipeline:step:attempt:started', async (event) => {
       this.handleStepAttemptStarted(event.payload);
       await this.markWorkGraphStep(event.payload.runId, event.payload.stepId, 'running', event.payload.startedAt);
     });
 
-    this.eventBus.subscribe('pipeline:step:attempt:failed', async (event) => {
+    dedupedBus.subscribe('pipeline:step:attempt:failed', async (event) => {
       this.handleStepAttemptFailed(event.payload);
     });
 
     // A deck the run rendered. The platform's deck store wrote the row, so
     // the platform is the document's producer and says so on the same event
     // the gateway publishes for a page — one deck, one node, either way.
-    (this.eventBus as unknown as {
-      subscribe(name: string, handler: (event: { payload: Record<string, unknown> }) => Promise<void>): string;
-    }).subscribe('pipeline:step:deck:produced', async (event) => {
+    dedupedBus.subscribe('pipeline:step:deck:produced', async (event) => {
       await this.handleDeckProduced(event.payload).catch((err) => {
         log.warn({ err: String(err) }, 'failed to project a produced deck');
       });
@@ -303,20 +322,18 @@ export class RunPersistenceService {
     // The agent loop's own turn counter. It is the only evidence a devbox
     // step is still alive between its start and its completion, so it both
     // records what the step has spent and refreshes the step node's lease.
-    (this.eventBus as unknown as {
-      subscribe(name: string, handler: (event: { payload: Record<string, unknown> }) => Promise<void>): string;
-    }).subscribe('pipeline:step:agent:iteration', async (event) => {
+    dedupedBus.subscribe('pipeline:step:agent:iteration', async (event) => {
       await this.handleAgentIteration(event.payload).catch((err) => {
         log.warn({ err: String(err) }, 'failed to record step:agent:iteration');
       });
     });
 
     // LLM cost tracking — correlate prompt (has model) with response (has tokens)
-    this.eventBus.subscribe('pipeline:llm:prompt', async (event) => {
+    dedupedBus.subscribe('pipeline:llm:prompt', async (event) => {
       this.handleLLMPrompt(event.payload);
     });
 
-    this.eventBus.subscribe('pipeline:llm:response', async (event) => {
+    dedupedBus.subscribe('pipeline:llm:response', async (event) => {
       await this.handleLLMResponse(event.payload).catch((err) => {
         log.warn(
           { runId: event.payload.runId, stepId: event.payload.stepId, err: String(err) },
@@ -350,13 +367,38 @@ export class RunPersistenceService {
     log.info('run persistence service stopped');
   }
 
+  /** Bounded memory of handled BusEvent ids (NFR #34 at-least-once dedupe). */
+  private readonly seenEventIds = new Set<string>();
+  private static readonly SEEN_EVENT_CAP = 10_000;
+
+  private seenEvent(event: { id?: unknown } | null | undefined): boolean {
+    const id = event && typeof event.id === 'string' ? event.id : '';
+    if (!id) return false;
+    if (this.seenEventIds.has(id)) return true;
+    this.seenEventIds.add(id);
+    if (this.seenEventIds.size > RunPersistenceService.SEEN_EVENT_CAP) {
+      // Sets iterate in insertion order: drop the oldest.
+      const oldest = this.seenEventIds.values().next().value;
+      if (oldest !== undefined) this.seenEventIds.delete(oldest);
+    }
+    return false;
+  }
+
   private async handleRunStarted(event: {
     runId: string;
     pipelineId: string;
     triggeredBy: { triggerType: string; userId?: string; payload?: Record<string, unknown> };
     at: string;
-  }): Promise<void> {
+  }, sourceNodeId?: string): Promise<void> {
     const userId = event.triggeredBy.userId ?? 'system';
+    // NFR #34: a second `started` for a run already started (a redelivery
+    // without an id, or one from another path) must never rebuild its state —
+    // that is what reset finished steps to `waiting`.
+    const already = this.runCache.get(event.runId);
+    if (already?.startedSeen) {
+      if (sourceNodeId && !already.ownerNodeId) already.ownerNodeId = sourceNodeId;
+      return;
+    }
     // The executor puts the trigger payload on `started`, so a redrive is
     // recognisable here for every caller — including ones that never call
     // registerTrigger. A registerTrigger that already named it wins.
@@ -386,6 +428,10 @@ export class RunPersistenceService {
       ...(registered?.workGraph ? { workGraph: registered.workGraph } : {}),
       ...(instruction ? { instruction } : {}),
       ...(redriveOf ? { redriveOf } : {}),
+      // NFR #26: the node executing the run (the bus event's publisher), so a
+      // sweep on another replica can tell a live run from an orphan.
+      ...(sourceNodeId ? { ownerNodeId: sourceNodeId } : {}),
+      startedSeen: true,
     };
 
     this.runCache.set(event.runId, state);
@@ -739,6 +785,9 @@ export class RunPersistenceService {
       resumedAt: item.resumedAt,
       resumeCount: item.resumeCount,
       resumeClaimedBy: item.resumeClaimedBy,
+      // A resumed run is executed by the node that claimed it, from now on.
+      ownerNodeId: item.resumeClaimedBy ?? item.ownerNodeId,
+      startedSeen: true,
       redriveOf: item.redriveOf,
       redrivenBy: item.redrivenBy,
     });
@@ -1328,6 +1377,7 @@ export class RunPersistenceService {
       resumedAt: state.resumedAt,
       resumeCount: state.resumeCount,
       resumeClaimedBy: state.resumeClaimedBy,
+      ownerNodeId: state.ownerNodeId,
       redriveOf: state.redriveOf,
       redrivenBy: state.redrivenBy,
       review: state.review,
@@ -1582,6 +1632,12 @@ export class RunPersistenceService {
     const state = this.runCache.get(runId);
     if (!state || !state.workGraph) return;
     const previous = state.stepLifecycle[stepId];
+    // NFR #34: a `running` that is not newer than the step's terminal state is
+    // a late or repeated delivery, not a re-run — never regress a finished step.
+    if (status === 'running' && (previous === 'completed' || previous === 'failed' || previous === 'cancelled')) {
+      const newer = Date.parse(occurredAt) > Date.parse(state.stepLifecycleAt[stepId] ?? '');
+      if (!newer) return;
+    }
     if (previous === status && status === 'running') {
       const since = Date.parse(occurredAt) - Date.parse(state.stepLifecycleAt[stepId] ?? '');
       if (Number.isFinite(since) && since < WORK_GRAPH_STEP_REFRESH_MS) return;
