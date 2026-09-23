@@ -436,6 +436,17 @@ describe('work graph schemaVersion 2 route', () => {
       { personId: 'connor', day: DAY, timezone: 'America/New_York', question: 'anything?' })).statusCode).toBe(404);
   });
 
+  it('reads only the deck, its revisions and its run for a preview — not the whole day', async () => {
+    const transcript = jest.fn(async () => null);
+    const meeting = jest.fn(async () => null);
+    const app = setup({ activityReader: reader({ transcript, meeting }) });
+    const ok = await get(app, `/api/work-graph/previews/deck.v2?personId=connor&day=${DAY}&timezone=America%2FNew_York`);
+    expect(ok.statusCode).toBe(200);
+    // The day has a transcript and a meeting; a preview of the deck reads neither.
+    expect(transcript).not.toHaveBeenCalled();
+    expect(meeting).not.toHaveBeenCalled();
+  });
+
   it('serves a revision preview only to a viewer the source still allows', async () => {
     const app = setup();
     const url = (handle: string) => `/api/work-graph/previews/${handle}?personId=connor&day=${DAY}&timezone=America%2FNew_York`;

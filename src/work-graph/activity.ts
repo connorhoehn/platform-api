@@ -665,7 +665,11 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         ? (produced ?? nodes.find((candidate) => candidate.kind === 'document'
           && storedNode(authorization, candidate.id)?.sourceRef.resourceId === edit.documentId))
         : undefined;
-      const workItem = edit && editTarget ? link(editTarget, edit.revisionId) : undefined;
+      // The load step names the revision it READ; the run and its other steps
+      // the one the edit wrote.
+      const workItem = edit && editTarget
+        ? link(editTarget, stepId === 'load' ? edit.baseRevisionId : edit.revisionId)
+        : undefined;
       const tools = facts?.tools.slice(0, 16) ?? [];
       // "Presentation agent · 3 tools": the definition's own name and the
       // number of steps this run actually recorded.

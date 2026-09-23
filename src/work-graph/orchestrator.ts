@@ -832,10 +832,21 @@ export class WorkGraphOrchestrator {
     // The revision — and the slide, when the handle names one — has to be one
     // this same snapshot listed. A handle naming a revision the viewer was
     // never shown is indistinguishable from absent.
+    //
+    // Only the named deck, its revision (`change` → `edited`) nodes and the
+    // run that produced it (a deck is an artifact only under its run): the
+    // revision list is built from exactly those. Building the WHOLE day's
+    // activity per preview read every run row and every artifact for each
+    // handle — ~3 s each, and a card grid asks for dozens, so the one on
+    // screen queued behind the rest of the browser's six connections.
+    const keep = new Set(named.map((candidate) => candidate.nodeId));
+    for (const edge of snapshot.edges) {
+      if ((edge.relation === 'edited' || edge.relation === 'produced') && keep.has(edge.toId)) keep.add(edge.fromId);
+    }
     const activity = await buildWorkActivity({
       query: this.resolveWindow(personId, day, timezone, {}, this.deps.now()),
-      nodes: snapshot.nodes,
-      edges: snapshot.edges,
+      nodes: snapshot.nodes.filter((node) => keep.has(node.id)),
+      edges: snapshot.edges.filter((edge) => keep.has(edge.fromId) && keep.has(edge.toId)),
       authorization,
       reader,
       now: this.deps.now(),
