@@ -18,6 +18,8 @@
 import type { PipelineRunRepository } from '../repositories/PipelineRunRepository';
 import type { RunPersistenceService } from './runPersistence';
 import { withContext } from '../lib/logger';
+import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
+import { getRunRollupSubscriber, type RunRollupSubscriber } from './run-rollup-subscriber';
 
 const log = withContext({ service: 'StuckRunDetector' });
 
@@ -28,6 +30,15 @@ export interface StuckRunDetectorOptions {
   stuckThresholdMs?: number;
   /** Override `Date.now()` for tests. */
   now?: () => number;
+  /**
+   * NFR loop 18: `stuckAt` used to reach the run table only. The transition is
+   * now also merged into the pipeline's rollup row (`rollup`, default: the
+   * process-wide subscriber; `null` = off) and raised on the bus as
+   * `pipeline:run:stuck` (`publish`) for the audit trail and the browser.
+   * Best-effort; the run-table write stands if either fails.
+   */
+  rollup?: Pick<RunRollupSubscriber, 'applyResolved'> | null;
+  publish?: <K extends keyof PipelineEventMap>(type: K, payload: PipelineEventMap[K]) => Promise<unknown>;
 }
 
 export class StuckRunDetector {
@@ -82,6 +93,7 @@ export class StuckRunDetector {
     const cutoff = now - threshold;
 
     const stale = this.opts.runPersistence.getStaleRunIds(cutoff);
+    const rollup = this.opts.rollup === undefined ? getRunRollupSubscriber() : this.opts.rollup;
     for (const { runId, pipelineId } of stale) {
       try {
         const existing = await this.opts.repository.get(pipelineId, runId);
@@ -89,6 +101,21 @@ export class StuckRunDetector {
         const stuckAt = new Date(now).toISOString();
         await this.opts.repository.put({ ...existing, stuckAt });
         log.warn({ runId, pipelineId, stuckAt, thresholdMs: threshold }, 'run marked stuck');
+        if (rollup) {
+          try {
+            await rollup.applyResolved({ pipelineId, runId, status: 'stuck', at: stuckAt, ...(existing.startedAt ? { startedAt: existing.startedAt } : {}) });
+          } catch (err) {
+            log.warn({ runId, pipelineId, err: String(err) }, 'stuck-run: rollup not updated');
+          }
+        }
+        if (this.opts.publish) {
+          try {
+            // `pipelineId` rides along for consumers that never indexed this run.
+            await this.opts.publish('pipeline:run:stuck', { runId, lastHeartbeatAt: existing.lastEventAt ?? null, at: stuckAt, pipelineId } as PipelineEventMap['pipeline:run:stuck']);
+          } catch (err) {
+            log.warn({ runId, pipelineId, err: String(err) }, 'stuck-run: pipeline:run:stuck not published');
+          }
+        }
       } catch (err) {
         log.warn({ runId, pipelineId, err: String(err) }, 'failed to mark run stuck');
       }

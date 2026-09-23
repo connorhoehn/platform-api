@@ -337,7 +337,7 @@ export class ExecutorAuditSubscriber {
         this.fireAndForget({
           action: 'pipeline.run.stuck',
           actorUserId: 'system',
-          pipelineId: this.lookupPipelineId(event.payload.runId),
+          pipelineId: this.lookupPipelineId(event.payload.runId, (event.payload as { pipelineId?: unknown }).pipelineId),
           runId: event.payload.runId,
           outcome: 'error',
           trace: {
@@ -422,7 +422,7 @@ export class ExecutorAuditSubscriber {
         this.fireAndForget({
           action: 'pipeline.run.orphaned',
           actorUserId: 'system',
-          pipelineId: this.lookupPipelineId(event.payload.runId),
+          pipelineId: this.lookupPipelineId(event.payload.runId, (event.payload as { pipelineId?: unknown }).pipelineId),
           runId: event.payload.runId,
           outcome: 'error',
           trace: {
@@ -550,8 +550,13 @@ export class ExecutorAuditSubscriber {
     this.runIndex.set(runId, pipelineId);
   }
 
-  private lookupPipelineId(runId: string): string {
-    return this.runIndex.get(runId) ?? 'unknown';
+  /**
+   * `hint` is the pipelineId a publisher put on the payload: the orphan scan and
+   * the stuck detector run on the sweep leader, which never saw the run start
+   * (NFR loop 18), and without it these rows were filed under 'unknown'.
+   */
+  private lookupPipelineId(runId: string, hint?: unknown): string {
+    return this.runIndex.get(runId) ?? (typeof hint === 'string' && hint ? hint : 'unknown');
   }
 
   private fireAndForget(event: AuditEvent): void {

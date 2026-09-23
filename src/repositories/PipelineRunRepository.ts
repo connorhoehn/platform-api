@@ -4,7 +4,7 @@
 // the source of truth for replay; this repository backs the
 // `/api/pipelines/:pipelineId/runs` operator-facing surface.
 
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import type { PipelineRunStatus, PipelineStepStatus } from '@connorhoehn/pipeline-runtime';
 import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { BaseRepository } from './BaseRepository';
@@ -417,6 +417,29 @@ export class PipelineRunRepository extends BaseRepository {
       ScanIndexForward: false,
       Limit: limit,
     });
+  }
+
+  /**
+   * Exact number of runs of one pipeline: a COUNT Query on the table's own
+   * partition (`pipelineId` is the hash key), paged to the end. No GSI is
+   * needed and the `runId-index` (hash `runId`) could not answer it. Cost is
+   * the partition's bytes (read RCUs), not the count returned — NFR loop 18.
+   */
+  async countByPipeline(pipelineId: string): Promise<number> {
+    let total = 0;
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const page = await this.docClient.send(new QueryCommand({
+        TableName: this.tableName,
+        KeyConditionExpression: 'pipelineId = :pipelineId',
+        ExpressionAttributeValues: { ':pipelineId': pipelineId },
+        Select: 'COUNT',
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }));
+      total += page.Count ?? 0;
+      exclusiveStartKey = page.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    return total;
   }
 
   /** Query the status-startedAt GSI. Most recent first. */

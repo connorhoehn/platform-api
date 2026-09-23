@@ -30,6 +30,12 @@ export interface RollupReadDeps {
   rollups: Pick<PipelineRunRollupRepository, 'getMany' | 'putIfNotNewer'>;
   /** The run table, newest first. `null` = no run table wired: missing rows stay null. */
   listRuns: ((pipelineId: string, limit: number) => Promise<RunRowLike[]>) | null;
+  /**
+   * Exact run total for a pipeline (a COUNT query on its partition), so a
+   * backfilled `runCount` is not capped at the probe size. Optional; a failure
+   * falls back to the probe length.
+   */
+  countRuns?: ((pipelineId: string) => Promise<number>) | null;
   now?: () => string;
 }
 
@@ -49,8 +55,16 @@ export async function loadRollups(candidates: readonly RollupCandidate[], deps: 
   const at = (deps.now ?? (() => new Date().toISOString()))();
   await Promise.all(missing.map(async ({ id }) => {
     try {
-      const runs = await deps.listRuns!(id, RECENT_RUNS_PER_PROBE);
-      const rollup = runs.length ? rollupFromRuns(id, runs, at) : emptyRollup(id, at);
+      const [runs, total] = await Promise.all([
+        deps.listRuns!(id, RECENT_RUNS_PER_PROBE),
+        deps.countRuns
+          ? Promise.resolve().then(() => deps.countRuns!(id)).catch((err) => {
+            log.warn({ pipelineId: id, err: String(err) }, 'run count failed; runCount from the probe');
+            return undefined;
+          })
+          : Promise.resolve(undefined),
+      ]);
+      const rollup = runs.length ? rollupFromRuns(id, runs, at, total) : emptyRollup(id, at);
       const wrote = await deps.rollups.putIfNotNewer(rollup);
       if (wrote) found.set(id, rollup);
       else {

@@ -21,6 +21,9 @@
 
 import type { PipelineRunRepository, PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { withContext } from '../lib/logger';
+import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
+import { getRunRollupSubscriber, type RunRollupSubscriber } from './run-rollup-subscriber';
+import { normalizeRunStatus } from './run-rollup';
 
 import { finalizedRow, type TerminalEvidenceCheck } from './runTerminalEvidence';
 
@@ -46,6 +49,18 @@ export interface ScanOrphanedRunsOptions {
    * original single-node meaning: every `running` row is an orphan.
    */
   isOwnerLive?: (item: PipelineRunItem) => Promise<boolean>;
+  /**
+   * NFR loop 18: this sweep runs on the LEADER, which never saw the run start
+   * (the executor's bus is per process), and it used to write the run table
+   * alone — so the pipeline's rollup row, the audit trail and the browser all
+   * said `running` until the run was next touched. Each transition is now also
+   * merged into the rollup row (`rollup`, default: the process-wide subscriber;
+   * `null` = off) and put on the bus as `pipeline:run:orphaned` (`publish`),
+   * the event the executor would have raised. Both are best-effort: a failure
+   * is logged and the run-table write stands.
+   */
+  rollup?: Pick<RunRollupSubscriber, 'applyResolved'> | null;
+  publish?: <K extends keyof PipelineEventMap>(type: K, payload: PipelineEventMap[K]) => Promise<unknown>;
 }
 
 export interface ScanOrphanedRunsResult {
@@ -70,6 +85,7 @@ export async function scanOrphanedRuns(
   options: ScanOrphanedRunsOptions,
 ): Promise<ScanOrphanedRunsResult> {
   const { repository } = options;
+  const rollup = options.rollup === undefined ? getRunRollupSubscriber() : options.rollup;
   const resumeWindowMs = options.resumeWindowMs ?? DEFAULT_RESUME_WINDOW_MS;
   const now = options.now ?? (() => Date.now());
 
@@ -109,12 +125,25 @@ export async function scanOrphanedRuns(
     const evidence = options.terminalEvidence ? await options.terminalEvidence(item) : null;
     if (evidence) {
       try {
-        await repository.put(finalizedRow(item, evidence, new Date(nowMs).toISOString()));
+        const row = finalizedRow(item, evidence, new Date(nowMs).toISOString());
+        await repository.put(row);
         finalized++;
         log.info(
           { runId: item.runId, pipelineId: item.pipelineId, status: evidence.status, source: evidence.source, detail: evidence.detail },
           'orphan-scan: row said running but the run had finished — written terminal, not interrupted',
         );
+        // The owner's terminal event was lost or never persisted; tell the
+        // rollup what the row now says. No bus event: the run did finish
+        // where it ran, and a synthesized `completed` has no duration to give.
+        const at = row.completedAt ?? new Date(nowMs).toISOString();
+        await mergeRollup(rollup, {
+          pipelineId: item.pipelineId,
+          runId: item.runId,
+          status: normalizeRunStatus(row.status) ?? 'completed',
+          at,
+          completedAt: at,
+          ...(item.startedAt ? { startedAt: item.startedAt } : {}),
+        });
       } catch (err) {
         log.warn({ runId: item.runId, err: String(err) }, 'orphan-scan: failed to finalize run');
       }
@@ -134,6 +163,27 @@ export async function scanOrphanedRuns(
         { runId: item.runId, pipelineId: item.pipelineId, ageMs: nowMs - startedAtMs },
         'orphan-scan: transitioned running → interrupted',
       );
+      await mergeRollup(rollup, {
+        pipelineId: item.pipelineId,
+        runId: item.runId,
+        status: 'interrupted',
+        at: interruptedAt,
+        ...(item.startedAt ? { startedAt: item.startedAt } : {}),
+      });
+      if (options.publish) {
+        try {
+          // `pipelineId` rides along for consumers that never indexed this run
+          // (the audit subscriber on the leader); the declared shape is dc's.
+          await options.publish('pipeline:run:orphaned', {
+            runId: item.runId,
+            previousOwner: item.ownerNodeId ?? 'unknown',
+            at: interruptedAt,
+            pipelineId: item.pipelineId,
+          } as PipelineEventMap['pipeline:run:orphaned']);
+        } catch (err) {
+          log.warn({ runId: item.runId, err: String(err) }, 'orphan-scan: pipeline:run:orphaned not published');
+        }
+      }
     } catch (err) {
       log.warn(
         { runId: item.runId, err: String(err) },
@@ -157,4 +207,17 @@ export async function scanOrphanedRuns(
     ...(options.isOwnerLive ? { skippedLive } : {}),
     ...(options.terminalEvidence ? { finalized } : {}),
   };
+}
+
+/** Best-effort: the run-table write is the source of truth; the rollup heals on read if this fails. */
+async function mergeRollup(
+  rollup: Pick<RunRollupSubscriber, 'applyResolved'> | null,
+  event: Parameters<RunRollupSubscriber['applyResolved']>[0],
+): Promise<void> {
+  if (!rollup) return;
+  try {
+    await rollup.applyResolved(event);
+  } catch (err) {
+    log.warn({ runId: event.runId, pipelineId: event.pipelineId, status: event.status, err: String(err) }, 'orphan-scan: rollup not updated');
+  }
 }

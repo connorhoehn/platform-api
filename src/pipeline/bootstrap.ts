@@ -1155,6 +1155,8 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     stuckRunDetector = new StuckRunDetector({
       runPersistence,
       repository: opts.pipelineRunRepository,
+      // NFR loop 18: the transition reaches the rollup row and the bus, not only the run table.
+      publish: (type, payload) => eventBus.publish(type, payload),
     });
     stuckRunDetector.start();
 
@@ -1210,6 +1212,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     clusterSweepTasks.push({ name: 'orphan-scan-and-resume', everyMs: orphanScanEveryMs, run: () => scanOrphanedRuns({
       repository: pipelineRunRepository,
       terminalEvidence,
+      // NFR loop 18: `interrupted` reaches the rollup row and the bus
+      // (`pipeline:run:orphaned`), so the list, the audit trail and the
+      // browser learn it now, not when the run is next touched.
+      publish: (type, payload) => eventBus.publish(type, payload),
       ...(Number.isFinite(resumeWindowMs) && (resumeWindowMs ?? 0) >= 0
         ? { resumeWindowMs: resumeWindowMs as number }
         : {}),

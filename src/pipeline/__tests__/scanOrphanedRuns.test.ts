@@ -61,6 +61,56 @@ describe('scanOrphanedRuns (hub#1282)', () => {
     expect(updated.triggeredBy).toBe('u1');
   });
 
+  it('NFR loop 18: an interrupted run reaches the rollup row and the bus as pipeline:run:orphaned', async () => {
+    const recentStart = new Date(NOW - 30 * 60 * 1000).toISOString();
+    const run = makeRun({ runId: 'r-recent', startedAt: recentStart, ownerNodeId: 'node-a' });
+    const { repo } = stubRepo([run]);
+    const applyResolved = jest.fn(async () => null);
+    const publish = jest.fn(async () => undefined);
+
+    const result = await scanOrphanedRuns({ repository: repo, now: () => NOW, rollup: { applyResolved }, publish });
+
+    expect(result.transitioned).toBe(1);
+    expect(applyResolved).toHaveBeenCalledWith({
+      pipelineId: 'p1', runId: 'r-recent', status: 'interrupted', at: '2026-05-06T12:00:00.000Z', startedAt: recentStart,
+    });
+    expect(publish).toHaveBeenCalledWith('pipeline:run:orphaned', { runId: 'r-recent', previousOwner: 'node-a', at: '2026-05-06T12:00:00.000Z', pipelineId: 'p1' });
+  });
+
+  it('NFR loop 18: a rollup or bus failure is logged; the run-table transition stands', async () => {
+    const run = makeRun({ runId: 'r-recent', startedAt: new Date(NOW - 30 * 60 * 1000).toISOString() });
+    const { repo, put } = stubRepo([run]);
+    const result = await scanOrphanedRuns({
+      repository: repo,
+      now: () => NOW,
+      rollup: { applyResolved: jest.fn(async () => { throw new Error('ddb cas gave up'); }) },
+      publish: jest.fn(async () => { throw new Error('bus down'); }),
+    });
+    expect(result.transitioned).toBe(1);
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
+  it('NFR loop 18: a row finalized from terminal evidence reaches the rollup as that terminal status, with no bus event', async () => {
+    const recentStart = new Date(NOW - 30 * 60 * 1000).toISOString();
+    const run = makeRun({ runId: 'r-done', startedAt: recentStart });
+    const { repo } = stubRepo([run]);
+    const applyResolved = jest.fn(async () => null);
+    const publish = jest.fn(async () => undefined);
+
+    const result = await scanOrphanedRuns({
+      repository: repo,
+      now: () => NOW,
+      terminalEvidence: async () => ({ status: 'completed', source: 'audit', detail: 'pipeline.run.completed row' }),
+      rollup: { applyResolved },
+      publish,
+    });
+
+    expect(result.transitioned).toBe(0);
+    expect(applyResolved).toHaveBeenCalledTimes(1);
+    expect(applyResolved.mock.calls[0][0]).toMatchObject({ pipelineId: 'p1', runId: 'r-done', status: 'completed', startedAt: recentStart });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('skips runs outside the resume window (older than 4h default)', async () => {
     const oldStart = new Date(NOW - 5 * 60 * 60 * 1000).toISOString(); // 5h ago
     const recentStart = new Date(NOW - 1 * 60 * 60 * 1000).toISOString(); // 1h ago

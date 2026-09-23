@@ -153,11 +153,25 @@ export class RunRollupSubscriber {
     on('pipeline:run:stuck', async (event) => {
       await this.applyLive(event.id, event.payload.runId, 'stuck', event.payload.at);
     });
+    // Approval gates: the executor's queue is process memory on the replica
+    // that runs the pipeline, so the count on the row is what every replica
+    // answers (NFR loop 18). A gate is keyed (runId, stepId) on the row.
+    on('pipeline:approval:requested', async (event) => {
+      const { runId, stepId, at } = event.payload;
+      if (typeof stepId !== 'string') return;
+      await this.applyLive(event.id, runId, 'awaiting_approval', at, { stepId, pending: true });
+    });
+    on('pipeline:approval:recorded', async (event) => {
+      const { runId, stepId, at } = event.payload;
+      if (typeof stepId !== 'string') return;
+      await this.applyLive(event.id, runId, 'running', at, { stepId, pending: false });
+    });
   }
 
   stop(): void {
     if (!this.active) return;
     this.active = false;
+    if (current === this) current = null;
     for (const id of this.subscriptionIds) {
       try { this.eventBus.unsubscribe(id); } catch { /* already gone */ }
     }
@@ -213,12 +227,12 @@ export class RunRollupSubscriber {
     await this.applyResolved({ pipelineId: found.pipelineId, runId, status, at, completedAt: at, ...(found.startedAt ? { startedAt: found.startedAt } : {}) });
   }
 
-  private async applyLive(eventId: string | undefined, runId: string, status: RollupRunStatus, at: string): Promise<void> {
+  private async applyLive(eventId: string | undefined, runId: string, status: RollupRunStatus, at: string, approval?: RunRollupEvent['approval']): Promise<void> {
     if (typeof runId !== 'string' || !runId) return;
     if (!this.remember(eventId)) { this.stats.duplicates += 1; return; }
     const found = await this.resolve(runId);
-    if (!found) { this.stats.unresolved += 1; return; }
-    await this.applyResolved({ pipelineId: found.pipelineId, runId, status, at, ...(found.startedAt ? { startedAt: found.startedAt } : {}) });
+    if (!found) { this.stats.unresolved += 1; log.warn({ runId, status }, 'run unknown to this process and not in the run table; rollup left to the read-side backfill'); return; }
+    await this.applyResolved({ pipelineId: found.pipelineId, runId, status, at, ...(found.startedAt ? { startedAt: found.startedAt } : {}), ...(approval ? { approval } : {}) });
   }
 
   private async apply(eventId: string | undefined, event: RunRollupEvent): Promise<void> {
@@ -226,8 +240,15 @@ export class RunRollupSubscriber {
     await this.applyResolved(event);
   }
 
-  /** Public for tests and for a future orphan-scan hook: merge one already-resolved event. */
+  /**
+   * Merge one already-resolved event. Public: the orphan scan and the stuck
+   * detector call it with the pipelineId they read off the run row (the
+   * leader replica never saw that run start), and tests drive it directly.
+   * The run is indexed here so the bus copy of the same transition resolves
+   * locally instead of querying the run table.
+   */
   async applyResolved(event: RunRollupEvent): Promise<PipelineRunRollup | null> {
+    this.indexRun(event.runId, event.pipelineId, event.startedAt ?? event.at);
     const prev = this.lanes.get(event.pipelineId) ?? Promise.resolve();
     let result: PipelineRunRollup | null = null;
     const next = prev.then(async () => { result = await this.merge(event); }, async () => { result = await this.merge(event); });
@@ -249,12 +270,23 @@ export class RunRollupSubscriber {
       } catch (err) {
         if (!(err instanceof RollupVersionConflict)) throw err;
         this.stats.conflicts += 1;
+        // Visible evidence of the CAS doing its job (the other replica, or the
+        // read-side backfill, wrote the row between our read and our put).
+        log.info({ pipelineId: event.pipelineId, runId: event.runId, status: event.status, attempt }, 'rollup CAS conflict; re-reading');
         if (attempt === CAS_ATTEMPTS) throw err;
       }
     }
     return null;
   }
 }
+
+let current: RunRollupSubscriber | null = null;
+
+/** The process-wide subscriber `startRunRollupSubscriber` installed, or null (disabled / not started). */
+export function getRunRollupSubscriber(): RunRollupSubscriber | null { return current; }
+
+/** Tests: install or clear the process-wide instance. */
+export function setRunRollupSubscriber(subscriber: RunRollupSubscriber | null): void { current = subscriber; }
 
 /**
  * The one line bootstrap.ts calls. Opt-out via PIPELINE_RUN_ROLLUP_ENABLED=false.
@@ -265,6 +297,7 @@ export function startRunRollupSubscriber(options: RunRollupSubscriberOptions): R
   if (options.enabled === false) { log.info('run rollup subscriber DISABLED: no run table wired'); return null; }
   const subscriber = new RunRollupSubscriber(options);
   subscriber.start();
+  current = subscriber;
   log.info('run rollup subscriber ENABLED');
   return subscriber;
 }

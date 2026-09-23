@@ -8,6 +8,7 @@ const mockList = jest.fn();
 const mockGet = jest.fn();
 const mockGetMany = jest.fn();
 const mockPutIfNotNewer = jest.fn();
+const mockCountByPipeline = jest.fn(async () => 0);
 const mockListByPipeline = jest.fn();
 const mockPendingApprovals = jest.fn();
 
@@ -21,7 +22,7 @@ jest.mock('../../repositories/PipelineRunRollupRepository', () => ({
   pipelineRunRollupRepo: { getMany: mockGetMany, putIfNotNewer: mockPutIfNotNewer },
 }));
 jest.mock('../../repositories/PipelineRunRepository', () => ({
-  PipelineRunRepository: jest.fn().mockImplementation(() => ({ listByPipeline: mockListByPipeline })),
+  PipelineRunRepository: jest.fn().mockImplementation(() => ({ listByPipeline: mockListByPipeline, countByPipeline: mockCountByPipeline })),
 }));
 jest.mock('../../pipeline/bridge-types', () => ({
   getPipelineBridge: () => ({ getPendingApprovals: mockPendingApprovals }),
@@ -126,11 +127,18 @@ describe('GET /api/pipelines/defs', () => {
   it('?include=rollup: one batch get over every id, backfill for the missing, approvals count attached', async () => {
     mockList.mockResolvedValue([legacy('user-legacy')]);
     const stored = { ...emptyRollup('deck-revise', '2026-09-23T13:00:00.000Z'), lastRunId: 'run-9', lastRunStatus: 'completed' as const };
-    mockGetMany.mockImplementation(async (ids: string[]) => new Map(ids.map((id) => [id, id === 'deck-revise' ? stored : null])));
+    // One approval gate waiting on `document-agent-edit`, keyed on its rollup row (NFR loop 18).
+    const gated = {
+      ...emptyRollup('document-agent-edit', '2026-09-23T13:00:00.000Z'),
+      approvals: [{ runId: 'x', stepId: 's', at: '2026-09-23T13:00:00.000Z' }],
+      pendingApprovals: 1,
+    };
+    mockGetMany.mockImplementation(async (ids: string[]) => new Map(ids.map((id) => [id, id === 'deck-revise' ? stored : id === 'document-agent-edit' ? gated : null])));
     mockListByPipeline.mockImplementation(async (id: string) => (id === 'user-legacy'
       ? [{ runId: 'r1', status: 'failed', startedAt: '2026-09-23T12:00:00.000Z', completedAt: '2026-09-23T12:00:30.000Z' }]
       : []));
-    mockPendingApprovals.mockReturnValue([{ runId: 'x', stepId: 's', pipelineId: 'document-agent-edit', approvers: [], requestedAt: 'now' }]);
+    // The bridge's replica-local queue says something else; it is no longer consulted.
+    mockPendingApprovals.mockReturnValue([{ runId: 'y', stepId: 's', pipelineId: 'deck-revise', approvers: [], requestedAt: 'now' }]);
 
     const res = await run(buildApp(), 'GET', '/api/pipelines/defs?include=rollup');
     expect(res.statusCode).toBe(200);

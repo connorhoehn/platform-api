@@ -3,9 +3,9 @@
 
 import type { EventBus } from 'distributed-core';
 import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
-import { RunRollupSubscriber } from '../run-rollup-subscriber';
+import { RunRollupSubscriber, getRunRollupSubscriber, setRunRollupSubscriber } from '../run-rollup-subscriber';
 import { RollupVersionConflict } from '../../repositories/PipelineRunRollupRepository';
-import type { PipelineRunRollup } from '../run-rollup';
+import { emptyRollup, type PipelineRunRollup } from '../run-rollup';
 
 jest.mock('../../lib/logger', () => ({
   withContext: () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }),
@@ -177,6 +177,42 @@ describe('RunRollupSubscriber', () => {
     await sub.idle();
     expect(table.puts).toBe(1);
     sub.stop();
-    expect(unsub).toHaveBeenCalledTimes(7);
+    expect(unsub).toHaveBeenCalledTimes(9);
+  });
+
+  it('approval requested on replica A and recorded on replica B: one count, on the row, for both (NFR loop 18)', async () => {
+    const table = new SharedTable();
+    const a = replica(table);
+    const b = replica(table, async (runId) => (runId === 'r1' ? 'p' : null)); // B never saw r1 start: runId-index lookup
+    await a.bus.emit('pipeline:run:started', { runId: 'r1', pipelineId: 'p', triggeredBy: {}, at: t(1) }, 's');
+    await a.bus.emit('pipeline:approval:requested', { runId: 'r1', stepId: 'gate', approvers: [], at: t(2) }, 'q');
+    await a.sub.idle();
+    expect(table.rows.get('p')).toMatchObject({ pendingApprovals: 1, lastRunStatus: 'awaiting_approval' });
+    // The same `requested` delivered again (outbox replay) changes nothing.
+    await a.bus.emit('pipeline:approval:requested', { runId: 'r1', stepId: 'gate', approvers: [], at: t(2) }, 'q2');
+    await a.sub.idle();
+    expect(table.rows.get('p')!.pendingApprovals).toBe(1);
+    await b.bus.emit('pipeline:approval:recorded', { runId: 'r1', stepId: 'gate', userId: 'u', decision: 'approve', at: t(3) }, 'd');
+    await b.sub.idle();
+    expect(table.rows.get('p')).toMatchObject({ pendingApprovals: 0, approvals: [], lastRunStatus: 'running' });
+    expect(b.sub.stats.unresolved).toBe(0);
+  });
+
+  it('the process-wide instance: applyResolved from the sweep, then the bus copy of the same transition needs no lookup', async () => {
+    const table = new SharedTable();
+    const lookup = jest.fn(async () => null);
+    const leader = replica(table, lookup);
+    setRunRollupSubscriber(leader.sub);
+    expect(getRunRollupSubscriber()).toBe(leader.sub);
+    await table.putIfUnchanged({ ...emptyRollup('p', t(1)), lastRunId: 'r1', lastRunAt: t(1), lastRunStatus: 'running', runningCount: 1, runCount: 1, recent: [{ runId: 'r1', status: 'running', startedAt: t(1), at: t(1) }] }, null);
+    await getRunRollupSubscriber()!.applyResolved({ pipelineId: 'p', runId: 'r1', status: 'interrupted', at: t(5), startedAt: t(1) });
+    expect(table.rows.get('p')).toMatchObject({ lastRunStatus: 'interrupted', failedOfRecent: 1, runningCount: 0 });
+    await leader.bus.emit('pipeline:run:orphaned', { runId: 'r1', previousOwner: 'node-a', at: t(5) }, 'o');
+    await leader.sub.idle();
+    expect(lookup).not.toHaveBeenCalled();
+    expect(leader.sub.stats.unchanged).toBe(1);
+    expect(table.puts).toBe(2);
+    leader.sub.stop();
+    expect(getRunRollupSubscriber()).toBeNull();
   });
 });

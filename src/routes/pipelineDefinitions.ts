@@ -161,25 +161,6 @@ function runRepo(): PipelineRunRepository {
   return runRepoSingleton;
 }
 
-/**
- * Pending approvals per pipeline from the bridge's in-memory queue. Known
- * hole, out of scope here: the queue is replica-local, so with two platform
- * replicas the count depends on which one answers (PLAN §2.2).
- */
-async function pendingApprovalsByPipeline(): Promise<Map<string, number>> {
-  const out = new Map<string, number>();
-  const bridge = getPipelineBridge();
-  if (!bridge?.getPendingApprovals) return out;
-  try {
-    for (const row of await bridge.getPendingApprovals()) {
-      if (typeof row.pipelineId === 'string') out.set(row.pipelineId, (out.get(row.pipelineId) ?? 0) + 1);
-    }
-  } catch (e) {
-    log.warn({ err: e instanceof Error ? e.message : String(e) }, 'pending approvals unavailable for the list');
-  }
-  return out;
-}
-
 // List
 pipelineDefinitionsRouter.get(
   '/',
@@ -218,19 +199,24 @@ pipelineDefinitionsRouter.get(
       // workType / kind / route filled on the response only; never written back.
       const pipelines: Record<string, unknown>[] = [...byId.values()].map((def) => decorateDefinition(def));
 
-      if (include.has('rollup')) {
+      if (include.size > 0) {
         const candidates = pipelines
           .filter((p) => typeof p.id === 'string')
           .map((p) => ({ id: p.id as string, ...(typeof p.updatedAt === 'string' ? { updatedAt: p.updatedAt } : {}) }));
         const rollups = await loadRollups(candidates, {
           rollups: pipelineRunRollupRepo,
           listRuns: (pipelineId, limit) => runRepo().listByPipeline(pipelineId, { limit }),
+          countRuns: (pipelineId) => runRepo().countByPipeline(pipelineId),
         });
-        for (const p of pipelines) p.rollup = typeof p.id === 'string' ? rollups.get(p.id) ?? null : null;
-      }
-      if (include.has('approvals')) {
-        const pending = await pendingApprovalsByPipeline();
-        for (const p of pipelines) p.pendingApprovals = typeof p.id === 'string' ? pending.get(p.id) ?? 0 : 0;
+        for (const p of pipelines) {
+          const rollup = typeof p.id === 'string' ? rollups.get(p.id) ?? null : null;
+          if (include.has('rollup')) p.rollup = rollup;
+          // NFR loop 18: the count comes off the rollup row, where the
+          // subscriber keys every approval gate by (runId, stepId), so two
+          // replicas answer the same number. The bridge's in-memory queue only
+          // knew the runs executing on the replica that answered.
+          if (include.has('approvals')) p.pendingApprovals = rollup?.pendingApprovals ?? 0;
+        }
       }
       res.json({ pipelines });
     } catch (e) {

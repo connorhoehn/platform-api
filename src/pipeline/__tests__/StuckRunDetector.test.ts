@@ -60,6 +60,40 @@ describe('StuckRunDetector (hub#1285)', () => {
       expect(saved.status).toBe('running'); // status not changed by detector
     });
 
+    it('NFR loop 18: a stuck run reaches the rollup row and the bus as pipeline:run:stuck', async () => {
+      const run = makeRun({ runId: 'r1', pipelineId: 'p1', lastEventAt: '2026-01-01T00:00:00.000Z' });
+      const { repo } = stubRepo(run);
+      const applyResolved = jest.fn(async () => null);
+      const publish = jest.fn(async () => undefined);
+      const detector = new StuckRunDetector({
+        runPersistence: stubPersistence([{ runId: 'r1', pipelineId: 'p1' }]),
+        repository: repo,
+        stuckThresholdMs: 300_000,
+        now: () => NOW,
+        rollup: { applyResolved },
+        publish,
+      });
+
+      await detector.check();
+
+      const stuckAt = new Date(NOW).toISOString();
+      expect(applyResolved).toHaveBeenCalledWith({ pipelineId: 'p1', runId: 'r1', status: 'stuck', at: stuckAt, startedAt: run.startedAt });
+      expect(publish).toHaveBeenCalledWith('pipeline:run:stuck', { runId: 'r1', lastHeartbeatAt: '2026-01-01T00:00:00.000Z', at: stuckAt, pipelineId: 'p1' });
+    });
+
+    it('NFR loop 18: a rollup failure is logged; stuckAt stands', async () => {
+      const { repo, put } = stubRepo(makeRun());
+      const detector = new StuckRunDetector({
+        runPersistence: stubPersistence([{ runId: 'r1', pipelineId: 'p1' }]),
+        repository: repo,
+        stuckThresholdMs: 300_000,
+        now: () => NOW,
+        rollup: { applyResolved: jest.fn(async () => { throw new Error('cas gave up'); }) },
+      });
+      await detector.check();
+      expect(put).toHaveBeenCalledTimes(1);
+    });
+
     it('skips runs that are already marked stuck', async () => {
       const run = makeRun({ stuckAt: '2026-01-01T00:00:00.000Z' });
       const { repo, put } = stubRepo(run);

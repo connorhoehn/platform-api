@@ -13,6 +13,11 @@
 //   - `updatedAt` is the newest event time the row absorbed. The repository's
 //     conditional put compares against it, so an older event can never
 //     overwrite a newer row from the other replica.
+//   - `approvals` is the set of approval gates still waiting, keyed by
+//     (runId, stepId): `requested` adds a key, `recorded` removes it, and any
+//     non-live status for the run drops all of its keys. `pendingApprovals` is
+//     its size — the count every replica answers alike, instead of the
+//     executor's in-memory queue on whichever replica took the request.
 
 export type RollupRunStatus =
   | 'pending' | 'running' | 'awaiting_approval' | 'paused_at_breakpoint'
@@ -52,6 +57,14 @@ export interface RollupRecentRun {
   at: string;
 }
 
+/** One approval gate still waiting on a run of this pipeline. */
+export interface RollupPendingApproval {
+  runId: string;
+  stepId: string;
+  /** When it was requested. */
+  at: string;
+}
+
 export interface PipelineRunRollup {
   pipelineId: string;
   /** '' when the pipeline has never run (the sentinel row that stops the backfill probe). */
@@ -70,6 +83,10 @@ export interface PipelineRunRollup {
    * a replay older than the RECENT_LIMIT newest runs may count once more.
    */
   runCount: number;
+  /** Approval gates still waiting, keyed by (runId, stepId). Absent on rows written before it existed. */
+  approvals?: RollupPendingApproval[];
+  /** `approvals.length` — shared across replicas because it lives on this row. */
+  pendingApprovals: number;
   /** The newest event time the row absorbed. */
   updatedAt: string;
 }
@@ -83,6 +100,8 @@ export interface RunRollupEvent {
   /** Known for `started`; a terminal event on an unknown run falls back to `at`. */
   startedAt?: string;
   completedAt?: string;
+  /** An approval gate on this run: `pending: true` = requested, `false` = recorded. */
+  approval?: { stepId: string; pending: boolean };
 }
 
 function byStartedAtDesc(a: RollupRecentRun, b: RollupRecentRun): number {
@@ -90,7 +109,7 @@ function byStartedAtDesc(a: RollupRecentRun, b: RollupRecentRun): number {
   return a.startedAt < b.startedAt ? 1 : -1;
 }
 
-function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number, updatedAt: string): PipelineRunRollup {
+function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number, updatedAt: string, approvals: RollupPendingApproval[] = []): PipelineRunRollup {
   const sorted = [...recent].sort(byStartedAtDesc).slice(0, RECENT_LIMIT);
   const newest = sorted[0];
   return {
@@ -102,8 +121,29 @@ function derive(pipelineId: string, recent: RollupRecentRun[], runCount: number,
     failedOfRecent: sorted.filter((r) => BAD.has(r.status)).length,
     runningCount: sorted.filter((r) => LIVE.has(r.status)).length,
     runCount,
+    approvals,
+    pendingApprovals: approvals.length,
     updatedAt,
   };
+}
+
+/**
+ * The approval set after one event. Returns the SAME array when nothing
+ * changes. A run leaving the live statuses (terminal, interrupted, stuck)
+ * releases every gate it held: the executor that held them is gone or done.
+ */
+function nextApprovals(list: RollupPendingApproval[], event: RunRollupEvent): RollupPendingApproval[] {
+  if (!LIVE.has(event.status)) {
+    const kept = list.filter((a) => a.runId !== event.runId);
+    return kept.length === list.length ? list : kept;
+  }
+  const gate = event.approval;
+  if (!gate) return list;
+  const idx = list.findIndex((a) => a.runId === event.runId && a.stepId === gate.stepId);
+  if (gate.pending) {
+    return idx >= 0 ? list : [...list, { runId: event.runId, stepId: gate.stepId, at: event.at }];
+  }
+  return idx < 0 ? list : list.filter((_, i) => i !== idx);
 }
 
 /** The row a pipeline gets before any run: nothing recent, so the probe is not repeated. */
@@ -118,49 +158,62 @@ export function emptyRollup(pipelineId: string, at: string): PipelineRunRollup {
  */
 export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRollupEvent): PipelineRunRollup {
   const base = existing ?? emptyRollup(event.pipelineId, event.at);
+  const approvalsBefore = base.approvals ?? [];
   const idx = base.recent.findIndex((r) => r.runId === event.runId);
   const recent = base.recent.slice();
   let runCount = base.runCount;
+  const cur = idx >= 0 ? recent[idx] : undefined;
+  // A replayed `requested` that lands after its `recorded` is older than the
+  // entry and must not re-open the gate; a release (non-live status) always
+  // applies.
+  const older = cur !== undefined && event.at < cur.at;
+  const approvals = older && LIVE.has(event.status) ? approvalsBefore : nextApprovals(approvalsBefore, event);
+  const approvalsChanged = approvals !== approvalsBefore;
+  // One gate recorded while another on the same run still waits: the run is
+  // still awaiting approval.
+  const status: RollupRunStatus =
+    event.approval && !event.approval.pending && approvals.some((a) => a.runId === event.runId)
+      ? 'awaiting_approval'
+      : event.status;
+  const touched = () => derive(base.pipelineId, recent, runCount, maxIso(base.updatedAt, event.at), approvals);
 
-  if (idx >= 0) {
-    const cur = recent[idx];
-    const older = event.at < cur.at;
+  if (cur !== undefined) {
     // Terminal is final: a late `running`, `interrupted` or `stuck` for a run
     // that already finished is stale news, whatever its timestamp says.
-    const regress = TERMINAL.has(cur.status) && !TERMINAL.has(event.status);
-    const same = cur.status === event.status && !(event.completedAt && !cur.completedAt);
+    const regress = TERMINAL.has(cur.status) && !TERMINAL.has(status);
+    const same = cur.status === status && !(event.completedAt && !cur.completedAt);
     if (older || regress || same) {
       // Nothing new — but a started event can still fill a missing startedAt.
       if (event.startedAt && cur.startedAt === cur.at && event.startedAt < cur.startedAt) {
         recent[idx] = { ...cur, startedAt: event.startedAt };
-        return derive(base.pipelineId, recent, runCount, maxIso(base.updatedAt, event.at));
+        return touched();
       }
-      return existing ?? base;
+      return approvalsChanged ? touched() : existing ?? base;
     }
     recent[idx] = {
       ...cur,
-      status: event.status,
+      status,
       at: event.at,
       ...(event.startedAt && event.startedAt < cur.startedAt ? { startedAt: event.startedAt } : {}),
-      ...(event.completedAt ? { completedAt: event.completedAt } : TERMINAL.has(event.status) ? { completedAt: event.at } : {}),
+      ...(event.completedAt ? { completedAt: event.completedAt } : TERMINAL.has(status) ? { completedAt: event.at } : {}),
     };
   } else {
     const startedAt = event.startedAt ?? event.at;
     // A run older than everything we keep, arriving after the window is full,
     // is history: it must not evict a newer run.
     if (recent.length >= RECENT_LIMIT && startedAt < recent[recent.length - 1].startedAt) {
-      return existing ?? base;
+      return approvalsChanged ? touched() : existing ?? base;
     }
     recent.push({
       runId: event.runId,
-      status: event.status,
+      status,
       startedAt,
       at: event.at,
-      ...(event.completedAt ? { completedAt: event.completedAt } : TERMINAL.has(event.status) ? { completedAt: event.at } : {}),
+      ...(event.completedAt ? { completedAt: event.completedAt } : TERMINAL.has(status) ? { completedAt: event.at } : {}),
     });
     runCount += 1;
   }
-  return derive(base.pipelineId, recent, runCount, maxIso(base.updatedAt, event.at));
+  return touched();
 }
 
 function maxIso(a: string, b: string): string { return a > b ? a : b; }
@@ -192,5 +245,8 @@ export function rollupFromRuns(pipelineId: string, runs: readonly RunRowLike[], 
   }
   const sorted = recent.sort(byStartedAtDesc).slice(0, RECENT_LIMIT);
   const updatedAt = sorted.reduce((m, r) => (r.at > m ? r.at : m), sorted.length ? sorted[0].at : at);
+  // The run table does not record approval gates (run persistence never
+  // writes `awaiting_approval`), so a backfilled row starts with none; the
+  // subscriber adds them as they are requested.
   return derive(pipelineId, sorted, Math.max(totalHint ?? 0, recent.length), updatedAt);
 }

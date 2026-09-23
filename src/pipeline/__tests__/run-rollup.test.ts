@@ -87,6 +87,71 @@ describe('rollupFromRuns (the read-side backfill)', () => {
     expect(row).toMatchObject({ lastRunId: 'r3', lastRunStatus: 'completed', failedOfRecent: 1, runningCount: 0, runCount: 3, updatedAt: t(35) });
   });
   it('the sentinel for a pipeline with no runs', () => {
-    expect(emptyRollup('p', t(1))).toEqual({ pipelineId: 'p', lastRunId: '', lastRunAt: '', lastRunStatus: null, recent: [], failedOfRecent: 0, runningCount: 0, runCount: 0, updatedAt: t(1) });
+    expect(emptyRollup('p', t(1))).toEqual({ pipelineId: 'p', lastRunId: '', lastRunAt: '', lastRunStatus: null, recent: [], failedOfRecent: 0, runningCount: 0, runCount: 0, approvals: [], pendingApprovals: 0, updatedAt: t(1) });
+  });
+
+});
+
+describe('approval gates on the row (NFR loop 18: the count every replica answers)', () => {
+  const started = () => applyRunEvent(null, { pipelineId: 'p', runId: 'r1', status: 'running', at: t(1), startedAt: t(1) });
+
+  it('requested adds a (runId, stepId) key and marks the run awaiting; a replay adds nothing', () => {
+    const a = applyRunEvent(started(), { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(2), approval: { stepId: 's1', pending: true } });
+    expect(a.pendingApprovals).toBe(1);
+    expect(a.approvals).toEqual([{ runId: 'r1', stepId: 's1', at: t(2) }]);
+    expect(a.lastRunStatus).toBe('awaiting_approval');
+    expect(a.runningCount).toBe(1);
+    const again = applyRunEvent(a, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(2), approval: { stepId: 's1', pending: true } });
+    expect(again).toBe(a);
+  });
+
+  it('recorded removes its key; the run stays awaiting while another gate on it waits', () => {
+    let row = started();
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(2), approval: { stepId: 's1', pending: true } });
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(3), approval: { stepId: 's2', pending: true } });
+    expect(row.pendingApprovals).toBe(2);
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'running', at: t(4), approval: { stepId: 's1', pending: false } });
+    expect(row.pendingApprovals).toBe(1);
+    expect(row.lastRunStatus).toBe('awaiting_approval');
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'running', at: t(5), approval: { stepId: 's2', pending: false } });
+    expect(row.pendingApprovals).toBe(0);
+    expect(row.lastRunStatus).toBe('running');
+  });
+
+  it('a replayed `requested` older than the `recorded` does not re-open the gate', () => {
+    let row = started();
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(2), approval: { stepId: 's1', pending: true } });
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'running', at: t(4), approval: { stepId: 's1', pending: false } });
+    const late = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(2), approval: { stepId: 's1', pending: true } });
+    expect(late).toBe(row);
+    expect(late.pendingApprovals).toBe(0);
+  });
+
+  it('a run leaving the live statuses releases every gate it held (terminal, interrupted, stuck)', () => {
+    for (const status of ['completed', 'failed', 'cancelled', 'rejected', 'interrupted', 'stuck'] as const) {
+      let row = started();
+      row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(2), approval: { stepId: 's1', pending: true } });
+      row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(3), approval: { stepId: 's2', pending: true } });
+      const done = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status, at: t(6) });
+      expect(done.pendingApprovals).toBe(0);
+      expect(done.approvals).toEqual([]);
+      expect(done.lastRunStatus).toBe(status);
+    }
+  });
+
+  it('gates of one run do not touch another run of the same pipeline', () => {
+    let row = started();
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r2', status: 'running', at: t(2), startedAt: t(2) });
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(3), approval: { stepId: 's1', pending: true } });
+    row = applyRunEvent(row, { pipelineId: 'p', runId: 'r2', status: 'completed', at: t(4), completedAt: t(4) });
+    expect(row.pendingApprovals).toBe(1);
+    expect(row.recent.find((r) => r.runId === 'r1')!.status).toBe('awaiting_approval');
+  });
+
+  it('a row written before the field existed reads as no gates', () => {
+    const legacy = { ...started() } as PipelineRunRollup & { approvals?: unknown };
+    delete legacy.approvals;
+    const row = applyRunEvent(legacy as PipelineRunRollup, { pipelineId: 'p', runId: 'r1', status: 'awaiting_approval', at: t(2), approval: { stepId: 's1', pending: true } });
+    expect(row.pendingApprovals).toBe(1);
   });
 });

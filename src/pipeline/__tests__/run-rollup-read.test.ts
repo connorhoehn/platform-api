@@ -54,6 +54,18 @@ describe('loadRollups', () => {
     expect(out.get('p')!.lastRunId).toBe('live');
   });
 
+  it('runCount comes from the exact count when one is wired, and from the probe when the count fails (NFR loop 18 item 4)', async () => {
+    const rollups = fakeRollups();
+    const runs = [
+      { runId: 'r1', status: 'completed', startedAt: '2026-09-23T13:00:00.000Z', completedAt: '2026-09-23T13:00:05.000Z' },
+      { runId: 'r2', status: 'failed', startedAt: '2026-09-23T12:00:00.000Z', completedAt: '2026-09-23T12:00:05.000Z' },
+    ];
+    const exact = await loadRollups([{ id: 'p' }], { rollups, listRuns: async () => runs, countRuns: async () => 41, now: () => '2026-09-23T14:00:00.000Z' });
+    expect(exact.get('p')).toMatchObject({ runCount: 41, lastRunId: 'r1', failedOfRecent: 1 });
+    const fallback = await loadRollups([{ id: 'q' }], { rollups, listRuns: async () => runs, countRuns: async () => { throw new Error('throttled'); }, now: () => '2026-09-23T14:00:00.000Z' });
+    expect(fallback.get('q')).toMatchObject({ runCount: 2 });
+  });
+
   it('with no run table wired, missing rows stay null and nothing is written', async () => {
     const rollups = fakeRollups();
     const out = await loadRollups([{ id: 'p' }], { rollups, listRuns: null });
