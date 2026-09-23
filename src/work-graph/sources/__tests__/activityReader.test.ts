@@ -545,3 +545,29 @@ describe('readableError — a stored failure as the pane shows it', () => {
     expect(readableError(undefined)).toBeUndefined();
   });
 });
+
+describe('why a paused run waits (NFR #126)', () => {
+  const read = async (row: Record<string, unknown>) => {
+    const items = [{ runId: 'run-9', startedAt: '2026-09-21T13:33:00.000Z', triggeredBy: 'connor', pipelineId: 'deck-revise', stepsSummary: {}, ...row }];
+    const client = {
+      async send(command: unknown) {
+        if (command instanceof ScanCommand) return { Items: items };
+        return runIndexItems(command, items) ?? {};
+      },
+    } as unknown as DynamoDBDocumentClient;
+    return new DynamoWorkActivityReader(client).pipelineRun('run-9');
+  };
+
+  it('carries the reason and the step from the row while the row is paused', async () => {
+    const facts = await read({ status: 'paused_at_breakpoint', pause: { reason: 'paused_at_breakpoint', stepId: 'write' } });
+    expect(facts?.status).toBe('waiting');
+    expect(facts?.pause).toEqual({ reason: 'paused_at_breakpoint', step: 'write' });
+    expect((await read({ status: 'awaiting_approval' }))?.pause).toEqual({ reason: 'awaiting_approval' });
+  });
+
+  it('says nothing once the row runs or finishes, and drops a reason the status contradicts', async () => {
+    expect((await read({ status: 'running', pause: { reason: 'paused_at_breakpoint', stepId: 'write' } }))?.pause).toBeUndefined();
+    expect((await read({ status: 'completed', pause: { reason: 'awaiting_approval', stepId: 'approve' } }))?.pause).toBeUndefined();
+    expect((await read({ status: 'awaiting_approval', pause: { reason: 'paused_at_breakpoint', stepId: 'write' } }))?.pause).toEqual({ reason: 'awaiting_approval' });
+  });
+});

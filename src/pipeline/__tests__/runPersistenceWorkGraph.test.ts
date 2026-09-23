@@ -304,6 +304,18 @@ describe('a run that stops to wait is not running (NFR #126)', () => {
     await emit('pipeline:run:resumed', { runId: RUN, pipelineId: 'deck-revise', frontier: [], at: '2026-09-21T18:03:00.000Z' });
     expect(runRecords()).toEqual(['paused_at_breakpoint', 'running']);
   });
+
+  it('writes why the run waits on the row with the pause, and clears it when the run works again', async () => {
+    const { emit, repository } = await startedRun();
+    const lastRow = () => repository.put.mock.calls.at(-1)?.[0] as { status: string; pause?: unknown };
+    await emit('pipeline:step:breakpoint', { runId: RUN, stepId: 'write', at: '2026-09-21T18:01:00.000Z' });
+    expect(lastRow().pause).toEqual({ reason: 'paused_at_breakpoint', stepId: 'write' });
+    await emit('pipeline:step:started', { runId: RUN, stepId: 'write', at: '2026-09-21T18:02:00.000Z' });
+    expect(lastRow().status).toBe('running');
+    expect(lastRow().pause).toBeUndefined();
+    await emit('pipeline:approval:requested', { runId: RUN, stepId: 'approve', approvers: [], at: '2026-09-21T18:03:00.000Z' });
+    expect(lastRow().pause).toEqual({ reason: 'awaiting_approval', stepId: 'approve' });
+  });
 });
 
 describe('a run that fails before it has a plan or an instruction to be named after', () => {

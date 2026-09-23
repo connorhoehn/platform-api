@@ -120,11 +120,22 @@ export interface PersistedCheckpoint {
   droppedContextStepKeys?: string[];
 }
 
+export interface RunPause {
+  reason: 'paused_at_breakpoint' | 'awaiting_approval';
+  stepId: string;
+}
+
 export interface PipelineRunItem {
   pipelineId: string;
   runId: string;
   /** Canonical run status. `interrupted` and `stuck` are platform-api lifecycle extensions. */
   status: RunItemStatus;
+  /**
+   * NFR #126: why a `paused_at_breakpoint` / `awaiting_approval` run waits —
+   * the reason and the step it waits at. Written with the pause, cleared when
+   * the run works again, so a replica that reloads the row says the same.
+   */
+  pause?: RunPause;
   triggeredBy: string; // userId or 'system'
   /** Verified organization captured at the authenticated trigger boundary. */
   organizationId?: string;

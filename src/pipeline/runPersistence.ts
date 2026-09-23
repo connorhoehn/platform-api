@@ -32,6 +32,7 @@ import {
   type PipelineRunItem,
   type RunItemStatus,
   type StepAttempt,
+  type RunPause,
   type RunReview,
   type StepSummary,
   type TokenUsageByModel,
@@ -170,6 +171,8 @@ interface RunState {
   review?: RunReview;
   /** The trigger's model / budget overrides — see PipelineRunItem.runOverrides. */
   runOverrides?: RunOverrides;
+  /** NFR #126: why the run is waiting, while it is. See PipelineRunItem.pause. */
+  pause?: RunPause;
 }
 
 /** An agent step's output names the model it ran and the budget it ran under. */
@@ -355,10 +358,10 @@ export class RunPersistenceService {
     // for as long as it sat there. The pause and the resume are lifecycle
     // transitions like any other: the row and the graph both follow them.
     dedupedBus.subscribe('pipeline:step:breakpoint', async (event) => {
-      await this.markRunLifecycle(event.payload.runId, 'paused_at_breakpoint', event.payload.at);
+      await this.markRunLifecycle(event.payload.runId, 'paused_at_breakpoint', event.payload.at, event.payload.stepId);
     });
     dedupedBus.subscribe('pipeline:approval:requested', async (event) => {
-      await this.markRunLifecycle(event.payload.runId, 'awaiting_approval', event.payload.at);
+      await this.markRunLifecycle(event.payload.runId, 'awaiting_approval', event.payload.at, event.payload.stepId);
     });
     dedupedBus.subscribe('pipeline:approval:recorded', async (event) => {
       // A rejection ends the run through `pipeline:run:completed` (status
@@ -858,6 +861,7 @@ export class RunPersistenceService {
       redriveOf: item.redriveOf,
       redrivenBy: item.redrivenBy,
       ...(item.runOverrides ? { runOverrides: item.runOverrides } : {}),
+      pause: item.pause,
     });
   }
 
@@ -1453,6 +1457,7 @@ export class RunPersistenceService {
       redrivenBy: state.redrivenBy,
       review: state.review,
       ...(state.runOverrides ? { runOverrides: state.runOverrides } : {}),
+      pause: state.pause,
     };
 
     await this.putWithRetry(item, state);
@@ -1708,6 +1713,7 @@ export class RunPersistenceService {
     runId: string,
     status: 'paused_at_breakpoint' | 'awaiting_approval' | 'running',
     occurredAt: string,
+    stepId?: string,
   ): Promise<void> {
     const state = this.runCache.get(runId);
     if (!state) return;
@@ -1716,6 +1722,11 @@ export class RunPersistenceService {
     // step's side; a `running` that is older than the pause is a late copy.
     if (status === 'running' && !(Date.parse(occurredAt) >= Date.parse(state.lastEventAt ?? ''))) return;
     state.status = status;
+    // NFR #126: the reason rides the same conditional put as the status, so
+    // the row never says `waiting` with the previous pause's reason.
+    if (status === 'running') delete state.pause;
+    else if (typeof stepId === 'string' && stepId) state.pause = { reason: status, stepId };
+    else delete state.pause;
     this.touchLastEvent(runId, occurredAt);
     await this.persistRun(state);
     await this.publishWorkGraphLifecycle(state, occurredAt)

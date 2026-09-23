@@ -103,6 +103,19 @@ function iso(value: unknown): string | undefined {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
 }
 
+/**
+ * NFR #126: why a paused run waits, from the row's own `pause`, and only when
+ * it agrees with the row's status — a row that resumed or finished says none.
+ */
+function runPause(row: Row): PipelineRunFacts['pause'] {
+  const status = String(row.status);
+  if (status !== 'paused_at_breakpoint' && status !== 'awaiting_approval') return undefined;
+  const pause = row.pause && typeof row.pause === 'object' ? row.pause as Row : undefined;
+  if (!pause || pause.reason !== status) return { reason: status };
+  const step = text(pause.stepId, 60);
+  return { reason: status, ...(step ? { step } : {}) };
+}
+
 /** Folds the platform's extra lifecycle states onto the five we can describe. */
 function runStatus(value: unknown): PipelineRunFacts['status'] {
   switch (String(value)) {
@@ -298,6 +311,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       updatedAt: iso(row.lastEventAt) ?? iso(row.completedAt) ?? startedAt,
       tools: [...new Set(tools)],
       ...(running && text(running.stepId, 60) ? { runningStep: { stepId: text(running.stepId, 60) as string } } : {}),
+      ...(runPause(row) ? { pause: runPause(row) } : {}),
       ...(agentLabel ? { agentLabel } : {}),
       ...(readableError(row.error) ? { error: readableError(row.error) as string } : {}),
       ...(edit ? { edit } : {}),

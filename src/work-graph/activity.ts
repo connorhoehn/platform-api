@@ -21,6 +21,7 @@ import {
   type ViewerWorkActivityDetail,
   type ViewerWorkNodeLink,
   type ViewerWorkOperation,
+  type WorkRunPause,
   type WorkGraphActivityV2,
   type WorkGraphQueryV2,
 } from '@connorhoehn/realtime-modules/work-graph';
@@ -72,6 +73,11 @@ export interface PipelineRunFacts {
    * which of its steps is actually doing the work.
    */
   runningStep?: { stepId: string };
+  /**
+   * NFR #126: why a `waiting` run waits — an approval gate or a breakpoint,
+   * and the step it waits at. Read from the run's own row; absent otherwise.
+   */
+  pause?: WorkRunPause;
   /**
    * What a document-edit run (a composer edit, `deck-revise`) was asked to do
    * and what it wrote, copied from the run's own step outputs: the trigger's
@@ -711,6 +717,10 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         ...(tools.length ? { tools } : {}),
         ...(inputs.length ? { inputs } : {}),
         ...(freshness ? { freshness } : {}),
+        // "Needs approval" / "Paused at write" instead of a bare "Waiting" —
+        // only while BOTH the record and the projected node say waiting, so a
+        // run that resumed never carries a stale reason.
+        ...(facts?.pause && facts.status === 'waiting' && node.status === 'waiting' ? { pause: facts.pause } : {}),
       });
       return;
     }

@@ -281,6 +281,22 @@ describe('an /agent loop in the requester\'s work graph', () => {
     expect(detail?.freshness).toBeDefined();
   });
 
+  it('says why a waiting run waits, and only while the node itself is waiting (NFR #126)', async () => {
+    const state = project(events);
+    const { nodes, edges, authorization } = authorize(state);
+    const runNode = nodes.find((node) => node.title === 'Agent loop · create a meeting with the X team')!;
+    const facts: PipelineRunFacts = {
+      runId: RUN, status: 'waiting', attempt: 1, startedAt: `${DAY}T18:00:00.000Z`, updatedAt: `${DAY}T18:04:00.000Z`,
+      tools: [], pause: { reason: 'paused_at_breakpoint', step: 'write' },
+    };
+    const build = () => buildWorkActivity({ query, nodes, edges, authorization, reader: reader({ [RUN]: facts }), now: NOW });
+    runNode.status = 'running';
+    expect((await build()).details.find((entry) => entry.nodeId === runNode.id)?.pause).toBeUndefined();
+    runNode.status = 'waiting';
+    expect((await build()).details.find((entry) => entry.nodeId === runNode.id)?.pause)
+      .toEqual({ reason: 'paused_at_breakpoint', step: 'write' });
+  });
+
   it('shows ONE node when the planner fell back to a single step', () => {
     const state = project([
       conversationEvent(`${DAY}T17:59:00.000Z`),
