@@ -34,6 +34,7 @@ import type {
 import { DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT_MS } from './types';
 import { isToolless } from './ClaudeCodeAgentClient';
 import { rememberRunLab } from './DevboxAgentClient';
+import { effectiveAgentSettings } from '../runOverrides';
 
 /**
  * `pipeline:step:agent:tool` is not in DC's `PipelineEventMap`, which
@@ -271,8 +272,17 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
       // So a run that has hit its budget marks the context, and later agent
       // steps stop before they start, saying so. No tokens, no turns, no
       // pretending the step ran.
+      // THE RUN'S OVERRIDES WIN. A trigger that chose a model or a budget for
+      // this run (a run draft's dispatch) is honoured here: the model outright,
+      // the budget as a cap under the step's own (runOverrides.ts).
+      const effective = effectiveAgentSettings(
+        { model: data.model, contextBudgetTokens: data.contextBudgetTokens as number | undefined },
+        context,
+        defaultModel,
+      );
+
       if (runtime === 'devbox' && context.budgetExhausted === true) {
-        const model = data.model?.trim() || defaultModel;
+        const model = effective.model;
         const facts: AgentLoopStepFacts = {
           iterations: 0, contextTokens: 0, stopReason: 'budget',
           tokensIn: 0, tokensOut: 0, model, runtime, skipped: true,
@@ -290,7 +300,7 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
         };
       }
 
-      const model = data.model?.trim() || defaultModel;
+      const model = effective.model;
       const maxTurns = Number.isFinite(data.maxTurns) && (data.maxTurns as number) > 0
         ? (data.maxTurns as number)
         : DEFAULT_MAX_TURNS;
@@ -315,9 +325,7 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
       let contextTokens = 0;
       let lab: AgentLabSession | undefined;
 
-      const contextBudgetTokens = Number.isFinite(data.contextBudgetTokens) && (data.contextBudgetTokens as number) > 0
-        ? (data.contextBudgetTokens as number)
-        : undefined;
+      const contextBudgetTokens = effective.contextBudgetTokens;
 
       const stepFacts = (): AgentLoopStepFacts => ({
         iterations: iterations || turns,

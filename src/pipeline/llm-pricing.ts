@@ -64,6 +64,25 @@ export function getPricing(model: string): ModelPricing {
 }
 
 /**
+ * Whether `model` is one this table actually prices — an exact key, a key
+ * prefix, or a family (`haiku`, `sonnet`, `opus`) — rather than falling to the
+ * unknown-model default. This is THE list of models a caller may choose: the
+ * estimate endpoint (`GET /api/pipelines/:id/estimate?model=`) and a run's
+ * trigger-level model override (runOverrides.ts) both refuse anything else,
+ * so a run can never be priced at a made-up rate.
+ */
+export function isPricedModel(model: string): boolean {
+  const lower = model.trim().toLowerCase();
+  if (!lower) return false;
+  if (PRICING_TABLE[lower]) return true;
+  if (Object.keys(PRICING_TABLE).some((key) => lower.startsWith(key))) return true;
+  return FAMILY_PRICING.some(([family]) => lower.includes(family));
+}
+
+/** The names a person picks from; any priced model id is accepted too (`isPricedModel`). */
+export const PRICED_MODEL_FAMILIES: readonly string[] = FAMILY_PRICING.map(([family]) => family);
+
+/**
  * Compute estimated cost in USD given token counts and a model identifier.
  */
 export function computeCost(model: string, tokensIn: number, tokensOut: number): number {

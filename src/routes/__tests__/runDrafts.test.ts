@@ -286,6 +286,25 @@ describe('run drafts', () => {
     expect(ok.body.runId).toBe('run-2'); // the refused attempt's id (run-1) started nothing; a new dispatch gets a new id
   });
 
+  it('dispatch passes the model and budget to the trigger; an unpriced model is refused with 400 and the draft does not move', async () => {
+    await put(a, 'dev-connor', { ...DRAFT, model: 'haiku', contextBudgetTokens: 50_000 });
+    const ok = await dispatch(a, 'dev-connor');
+    expect(ok.status).toBe(200);
+    expect(world.triggers[0].body.triggerPayload).toMatchObject({ model: 'haiku', contextBudgetTokens: 50_000 });
+
+    await put(a, 'dev-connor', DRAFT, 'req-2');
+    // A draft written before the model list existed, or by another writer.
+    const key = ['doc-1', 'req-2'].join('\u0000');
+    world.table.rows.set(key, { ...world.table.rows.get(key)!, model: 'gpt-9' });
+    const refused = await dispatch(a, 'dev-connor', 'req-2');
+    expect(refused.status).toBe(400);
+    expect(refused.body).toMatchObject({ error: 'invalid_run_overrides', draftId: 'req-2' });
+    expect(refused.body.message).toMatch(/gpt-9.*not a priced model/);
+    expect(world.triggers).toHaveLength(1);
+    const back = (await call(a.url, 'GET', '/api/documents/doc-1/run-drafts/req-2', 'dev-connor')).body.draft;
+    expect(back).toMatchObject({ status: 'draft', revision: 1 });
+  });
+
   it('after dispatch the draft is frozen: a changed PUT is refused, the same PUT replays', async () => {
     await put(a, 'dev-connor', DRAFT);
     await dispatch(a, 'dev-connor');

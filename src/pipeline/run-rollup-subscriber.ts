@@ -47,6 +47,7 @@ import {
   type PipelineRunRollupRepository,
 } from '../repositories/PipelineRunRollupRepository';
 import { applyRunEvent, type PipelineRunRollup, type RollupRunStatus, type RunRollupEvent } from './run-rollup';
+import { runOverridesFrom } from './runOverrides';
 
 const log = withContext({ service: 'run-rollup-subscriber' });
 
@@ -129,7 +130,8 @@ export class RunRollupSubscriber {
       const { runId, pipelineId, at } = event.payload;
       if (typeof runId !== 'string' || typeof pipelineId !== 'string') return;
       this.indexRun(runId, pipelineId, at);
-      await this.apply(event.id, { pipelineId, runId, status: 'running', at, startedAt: at });
+      const model = runOverridesFrom((event.payload as { triggeredBy?: { payload?: Record<string, unknown> } }).triggeredBy?.payload)?.model;
+      await this.apply(event.id, { pipelineId, runId, status: 'running', at, startedAt: at, ...(model ? { model } : {}) });
     });
     on('pipeline:run:resumed', async (event) => {
       const { runId, pipelineId, at } = event.payload;

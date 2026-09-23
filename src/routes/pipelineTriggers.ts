@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { getCorrelationId } from '@connorhoehn/service-runtime';
 import { withSpan } from 'distributed-core';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
+import { stampRunOverrides } from '../pipeline/runOverrides';
 import { idempotency } from '../middleware/idempotency';
 import { createRateLimiter } from '../middleware/rateLimit';
 import { withContext } from '../lib/logger';
@@ -291,7 +292,10 @@ export async function triggerPipelineRun(input: {
   // JSON, so the requester is pinned to the verified caller (NFR #47).
   const pinned = pinRequester(body.triggerPayload, userId);
   if (pinned.overridden) reqLog.warn({ claimed: pinned.overridden }, 'trigger payload named another requester; pinned to the caller');
-  body.triggerPayload = pinned.payload;
+  // A model / budget chosen for this run is validated here (an unpriced model
+  // is a 400, not a silently ignored field) and stamped as `runOverrides`,
+  // which agent steps honour over their own config (runOverrides.ts).
+  body.triggerPayload = stampRunOverrides(pinned.payload);
 
   // Establish a create-only source account join before the executor can
   // publish its first lifecycle transition. `organizationId` is a

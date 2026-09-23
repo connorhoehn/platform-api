@@ -26,7 +26,7 @@ import { Router, type Request, type Response } from 'express';
 import { asyncHandler } from '../middleware/error-handler';
 import type { RollupRecentRun } from '../pipeline/run-rollup';
 import type { PipelineRunItem } from '../repositories/PipelineRunRepository';
-import { computeCost } from '../pipeline/llm-pricing';
+import { computeCost, isPricedModel } from '../pipeline/llm-pricing';
 import { costOfRun } from './agentLoops';
 
 export type EstimateConfidence = 'none' | 'low' | 'medium';
@@ -120,8 +120,10 @@ export function createPipelineEstimateRouter(deps: PipelineEstimateDeps = defaul
     const pipelineId = String((req.params as { pipelineId?: string }).pipelineId ?? '');
     if (!pipelineId) { res.status(400).json({ error: 'pipelineId is required' }); return; }
     const rawModel = req.query.model;
-    if (rawModel !== undefined && (typeof rawModel !== 'string' || !MODEL.test(rawModel))) {
-      res.status(400).json({ error: 'model must be haiku, sonnet, opus or a model id' });
+    // The same list a run's model override is checked against (runOverrides.ts):
+    // a model the pricing table does not know would be priced at a made-up rate.
+    if (rawModel !== undefined && (typeof rawModel !== 'string' || !MODEL.test(rawModel) || !isPricedModel(rawModel))) {
+      res.status(400).json({ error: 'model must be haiku, sonnet, opus or a priced model id' });
       return;
     }
     const model = typeof rawModel === 'string' && rawModel ? rawModel : undefined;

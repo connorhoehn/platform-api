@@ -61,6 +61,8 @@ export interface RollupRecentRun {
   completedAt?: string;
   /** The event time that set `status` — the per-entry ordering guard. */
   at: string;
+  /** The model the run's trigger chose for its agent steps (runOverrides.ts); absent = the steps' own. */
+  model?: string;
 }
 
 /** One approval gate still waiting on a run of this pipeline. */
@@ -151,6 +153,8 @@ export interface RunRollupEvent {
   at: string;
   /** Known for `started`; a terminal event on an unknown run falls back to `at`. */
   startedAt?: string;
+  /** `started` only: the trigger's model override, carried onto the recent entry. */
+  model?: string;
   completedAt?: string;
   /** An approval gate on this run: `pending: true` = requested, `false` = recorded. */
   approval?: { stepId: string; pending: boolean };
@@ -357,6 +361,7 @@ export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRoll
       at: event.at,
       ...(event.startedAt && event.startedAt < cur.startedAt ? { startedAt: event.startedAt } : {}),
       ...(event.completedAt ? { completedAt: event.completedAt } : TERMINAL.has(status) ? { completedAt: event.at } : {}),
+      ...(event.model && !cur.model ? { model: event.model } : {}),
     };
   } else {
     const startedAt = event.startedAt ?? event.at;
@@ -371,6 +376,7 @@ export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRoll
       startedAt,
       at: event.at,
       ...(event.completedAt ? { completedAt: event.completedAt } : TERMINAL.has(status) ? { completedAt: event.at } : {}),
+      ...(event.model ? { model: event.model } : {}),
     });
     runCount += 1;
   }
@@ -388,6 +394,7 @@ export interface RunRowLike {
   lastEventAt?: string;
   interruptedAt?: string;
   stuckAt?: string;
+  runOverrides?: { model?: string };
 }
 
 export function rollupFromRuns(pipelineId: string, runs: readonly RunRowLike[], at: string, totalHint?: number): PipelineRunRollup {
@@ -402,6 +409,7 @@ export function rollupFromRuns(pipelineId: string, runs: readonly RunRowLike[], 
       startedAt,
       at: run.completedAt ?? run.interruptedAt ?? run.stuckAt ?? run.lastEventAt ?? startedAt,
       ...(run.completedAt ? { completedAt: run.completedAt } : {}),
+      ...(typeof run.runOverrides?.model === 'string' ? { model: run.runOverrides.model } : {}),
     });
   }
   const sorted = recent.sort(byStartedAtDesc).slice(0, RECENT_LIMIT);

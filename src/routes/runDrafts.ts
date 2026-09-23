@@ -48,6 +48,7 @@ import { randomUUID } from 'crypto';
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { AppError, ValidationError } from '../middleware/error-handler';
+import { resolveRunOverrides } from '../pipeline/runOverrides';
 import { handle } from './documentWork';
 import { requireDocumentAccess, type DocumentAccessDeps } from '../documents/documentAccess';
 import {
@@ -347,6 +348,16 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
 
       let tookStep1 = false;
       if (draft.status === 'draft') {
+        // The model / budget the draft asks for must be ones the run can honour
+        // (runOverrides.ts). Refused here, before the draft moves, so a bad
+        // model is a 400 the pane can show — never a run on the step's model.
+        try {
+          resolveRunOverrides(triggerBodyOf(draft).triggerPayload);
+        } catch (err) {
+          if (!(err instanceof ValidationError)) throw err;
+          res.status(400).json({ error: 'invalid_run_overrides', message: err.message, draftId });
+          return;
+        }
         // Step 1: claim the dispatch, with the run's id chosen up front.
         const now = deps.now();
         const owner = deps.localNodeId?.();

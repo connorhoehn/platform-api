@@ -44,6 +44,7 @@ import { pipelineStepResourceId } from '../work-graph/sources/mapPipeline';
 import { recallRunLab } from './agent/DevboxAgentClient';
 import { parseRunResult } from './runResult';
 import { workGraphPlanFromStoredRun, type RunWorkGraphPlan } from './workGraphPlan';
+import { runOverridesFrom, type RunOverrides } from './runOverrides';
 
 const log = withContext({ service: 'runPersistence' });
 
@@ -167,6 +168,20 @@ interface RunState {
   redrivenBy?: string[];
   /** A person's verdict on the run's suggestions — carried so a late full-row put keeps it. */
   review?: RunReview;
+  /** The trigger's model / budget overrides — see PipelineRunItem.runOverrides. */
+  runOverrides?: RunOverrides;
+}
+
+/** An agent step's output names the model it ran and the budget it ran under. */
+function agentRanWith(output: unknown): { model: string; contextBudgetTokens?: number; runtime?: string } | undefined {
+  if (!output || typeof output !== 'object') return undefined;
+  const o = output as { model?: unknown; contextBudgetTokens?: unknown; runtime?: unknown };
+  if (typeof o.model !== 'string' || !o.model || (o.runtime !== 'local' && o.runtime !== 'devbox')) return undefined;
+  return {
+    model: o.model,
+    ...(typeof o.contextBudgetTokens === 'number' && Number.isFinite(o.contextBudgetTokens) ? { contextBudgetTokens: o.contextBudgetTokens } : {}),
+    runtime: o.runtime,
+  };
 }
 
 /** A redrive marks its trigger payload with the run it replaces (failedRunDeadLetters.ts). */
@@ -450,6 +465,7 @@ export class RunPersistenceService {
     const instruction = typeof event.triggeredBy.payload?.instruction === 'string'
       ? event.triggeredBy.payload.instruction.trim().replace(/\s+/g, ' ')
       : '';
+    const runOverrides = runOverridesFrom(event.triggeredBy.payload as Record<string, unknown> | undefined);
     const state: RunState = {
       pipelineId: event.pipelineId,
       runId: event.runId,
@@ -471,6 +487,7 @@ export class RunPersistenceService {
       ...(registered?.workGraph ? { workGraph: registered.workGraph } : {}),
       ...(instruction ? { instruction } : {}),
       ...(redriveOf ? { redriveOf } : {}),
+      ...(runOverrides ? { runOverrides } : {}),
       // NFR #26: the node executing the run (the bus event's publisher), so a
       // sweep on another replica can tell a live run from an orphan.
       ...(sourceNodeId ? { ownerNodeId: sourceNodeId } : {}),
@@ -582,10 +599,17 @@ export class RunPersistenceService {
       attempts = [attempt];
     }
 
+    // What an agent step ACTUALLY ran with (its model and budget after the
+    // run's overrides), from its own output — a local step emits no iteration
+    // telemetry, so this is the only place a quick run records it.
+    const ranWith = agentRanWith(event.output);
+    const agentSummary = state.steps[stepKey]?.agent || ranWith
+      ? { ...(state.steps[stepKey]?.agent ?? {}), ...(ranWith ?? {}) }
+      : undefined;
     state.steps[stepKey] = {
       // The loop's own turn counter is not on the completion event, so a
       // wholesale overwrite threw away what the step reported while running.
-      ...(state.steps[stepKey]?.agent ? { agent: state.steps[stepKey].agent } : {}),
+      ...(agentSummary ? { agent: agentSummary } : {}),
       ...(state.steps[stepKey]?.startedAt ? { startedAt: state.steps[stepKey].startedAt } : {}),
       status: 'completed',
       output,
@@ -833,6 +857,7 @@ export class RunPersistenceService {
       startedSeen: true,
       redriveOf: item.redriveOf,
       redrivenBy: item.redrivenBy,
+      ...(item.runOverrides ? { runOverrides: item.runOverrides } : {}),
     });
   }
 
@@ -1427,6 +1452,7 @@ export class RunPersistenceService {
       redriveOf: state.redriveOf,
       redrivenBy: state.redrivenBy,
       review: state.review,
+      ...(state.runOverrides ? { runOverrides: state.runOverrides } : {}),
     };
 
     await this.putWithRetry(item, state);

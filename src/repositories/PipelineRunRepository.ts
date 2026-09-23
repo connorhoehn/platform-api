@@ -197,6 +197,13 @@ export interface PipelineRunItem {
   redriveOf?: string;
   redrivenBy?: string[];
   /**
+   * The model / context budget the TRIGGER chose for this run's agent steps
+   * (validated and platform-capped, runOverrides.ts). Each agent step's summary
+   * records what it actually ran with (`stepsSummary[stepId].agent`), which can
+   * be lower than this budget when the step's own is lower. Absent = no override.
+   */
+  runOverrides?: { model?: string; contextBudgetTokens?: number; requestedContextBudgetTokens?: number };
+  /**
    * A person's verdict on what this run SUGGESTED in a document (tracked
    * changes under `suggestionKey`). Written by POST /runs/:runId/review after
    * the run is terminal; the run's status does not change — the edit landed as
