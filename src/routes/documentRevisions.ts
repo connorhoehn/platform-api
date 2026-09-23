@@ -13,6 +13,7 @@
 // to be listed on the row and the asset key has to be the one it recorded, so a
 // guessed key reads nothing.
 
+import { createHash } from 'crypto';
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler, AppError, NotFoundError, ValidationError } from '../middleware/error-handler';
@@ -35,6 +36,7 @@ import {
   PresentationRevisionConflictError,
   type PresentationDocumentRow,
   type StoredRevision,
+  type StoredSlide,
 } from '../deck/presentationDocuments';
 
 export const documentRevisionsRouter = Router({ mergeParams: true });
@@ -266,6 +268,73 @@ documentRevisionsRouter.get('/:revisionId/file', requireAuth, asyncHandler(async
     .setHeader('cache-control', 'private, no-store')
     .setHeader('x-content-type-options', 'nosniff')
     .send(stored.body);
+}));
+
+/**
+ * GET /api/documents/:documentId/revisions/:revisionId/slides
+ * Every slide of one revision in ONE answer (NFR #6). The per-slide route makes
+ * a reader pay the auth check, the row read and the manifest resolve once per
+ * slide — seven of each for a seven-slide deck, and the store's own
+ * `slidePreview` reads the row again inside each. Here the row is read once, the
+ * slide list resolved once, and each slide's markup taken from the row (or its
+ * blob when it was too big to inline).
+ *
+ * The markup travels as JSON strings; the reader turns each into an
+ * `image/svg+xml` blob shown through `<img>`, which runs nothing in it — the
+ * same inertness the per-slide route gets from its CSP. A revision never
+ * changes, so the answer is `private, immutable` and carries an ETag over the
+ * slides' hashes; a revalidation still passes the auth check before its 304.
+ */
+documentRevisionsRouter.get('/:revisionId/slides', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const started = Date.now();
+  const documentId = String(req.params.documentId ?? '');
+  const { row, revision } = await loadRevision(documentId, String(req.params.revisionId ?? ''));
+  const loadedAt = Date.now();
+  const store = getPresentationDocumentStore();
+  const recorded: StoredSlide[] = [
+    ...((await resolveRevisionSlides(store, revision)) ?? []),
+    ...(row.revisionSlides?.[revision.id] ?? []),
+  ];
+  const seen = new Set<string>();
+  const recordedSlides = recorded.filter((slide) => {
+    if (!slide?.id || seen.has(slide.id)) return false;
+    seen.add(slide.id);
+    return true;
+  });
+  if (recordedSlides.length === 0) throw new NotFoundError('Slide previews not found');
+  const readBytes = async (slide: StoredSlide): Promise<Buffer | null> => {
+    if (!slide.asset?.key) return null;
+    try {
+      if (store.readAsset) return await store.readAsset(slide.asset);
+      return (await getAssetBlobStore().getBlob(slide.asset.key))?.body ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const slides = await Promise.all(recordedSlides.map(async (slide) => {
+    const contentType = slide.asset?.contentType || SVG_CONTENT_TYPE;
+    const svg = slide.svg ?? (await readBytes(slide))?.toString('utf8');
+    return svg
+      ? { id: slide.id, contentType, svg }
+      : { id: slide.id, contentType, missing: true as const };
+  }));
+  const bytesAt = Date.now();
+  const hashes = recordedSlides.map((slide) => slide.sha256 ?? '').join(',');
+  if (recordedSlides.every((slide) => slide.sha256)) {
+    const etag = `"${createHash('sha256').update(`${revision.id}:${hashes}`).digest('hex').slice(0, 40)}"`;
+    res.setHeader('etag', etag);
+    if (req.headers['if-none-match'] === etag) {
+      res.status(304).setHeader('cache-control', 'private, max-age=31536000, immutable').end();
+      return;
+    }
+  }
+  log.info({ documentId, revisionId: revision.id, slides: slides.length, missing: slides.filter((slide) => 'missing' in slide).length, ms: bytesAt - started }, 'deck slide batch served (one authorization pass)');
+  res
+    .status(200)
+    .setHeader('cache-control', 'private, max-age=31536000, immutable')
+    .setHeader('x-content-type-options', 'nosniff')
+    .setHeader('server-timing', `load;dur=${loadedAt - started}, bytes;dur=${bytesAt - loadedAt}`)
+    .json({ documentId, revisionId: revision.id, slides });
 }));
 
 /**

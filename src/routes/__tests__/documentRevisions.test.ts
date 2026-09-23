@@ -275,12 +275,31 @@ describe('GET /api/documents/:id/revisions/:rev/slides/:slide.svg', () => {
   });
 });
 
+describe('GET /api/documents/:id/revisions/:rev/slides (NFR #6)', () => {
+  it('answers every slide of the revision at once, from the row or its blob', async () => {
+    const res = await request('/api/documents/doc-1/revisions/v1/slides');
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('private, max-age=31536000, immutable');
+    const body = JSON.parse(res.body.toString('utf8')) as { slides: Array<{ id: string; svg?: string; missing?: boolean }> };
+    const byId = Object.fromEntries(body.slides.map((slide) => [slide.id, slide]));
+    expect(byId.cover.svg).toBe(SVG);
+    expect(byId.sources.svg).toContain('sources');
+    expect(byId.gone.missing).toBe(true);
+  });
+
+  it('404s a revision the document does not list', async () => {
+    expect((await request('/api/documents/doc-1/revisions/v9/slides')).status).toBe(404);
+  });
+});
+
 describe('authorization', () => {
   it('refuses an unauthenticated request', async () => {
     delete process.env.SKIP_AUTH;
     try {
       const file = await request('/api/documents/doc-1/revisions/v1/file');
       const slide = await request('/api/documents/doc-1/revisions/v1/slides/cover.svg');
+      const batch = await request('/api/documents/doc-1/revisions/v1/slides');
+      expect(batch.status).toBe(401);
       const list = await request('/api/documents/doc-1/revisions');
       const spec = await request('/api/documents/doc-1/revisions/v1/spec');
       const write = await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck() });
