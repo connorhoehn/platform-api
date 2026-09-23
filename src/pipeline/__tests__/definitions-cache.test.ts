@@ -134,8 +134,11 @@ describe('PipelineDefinitionsCache', () => {
     it('coalesces concurrent callers onto one in-flight fetch', async () => {
       const loader = jest.fn(async () => [] as PipelineDefinition[]);
       cache = new PipelineDefinitionsCache({ loader, intervalMs: 60_000 });
-      await Promise.all([cache.refresh(), cache.refresh(), cache.refresh()]);
-      expect(loader).toHaveBeenCalledTimes(1);
+      await Promise.all([cache.refresh(), cache.refresh(), cache.refresh(), cache.refresh()]);
+      await new Promise((r) => setImmediate(r));
+      // One Scan for the burst plus exactly one follow-up (writes that landed
+      // mid-Scan, dfffe2d) — never one per caller.
+      expect(loader).toHaveBeenCalledTimes(2);
     });
 
     it('keeps previous snapshot when loader throws', async () => {

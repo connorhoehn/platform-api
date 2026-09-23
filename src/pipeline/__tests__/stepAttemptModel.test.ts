@@ -62,11 +62,11 @@ describe('readAttempts', () => {
 });
 
 describe('RunPersistenceService — attempts[] written on step:completed', () => {
-  let mockRepository: { put: jest.Mock };
+  let mockRepository: { put: jest.Mock; listByStatus: jest.Mock };
   let cleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    mockRepository = { put: jest.fn().mockResolvedValue(undefined) };
+    mockRepository = { put: jest.fn().mockResolvedValue(undefined), listByStatus: jest.fn().mockResolvedValue([]) };
     const fixture = new FixtureLLMClient(['ok']);
     const { shutdown } = await bootstrapPipeline({
       llmClient: fixture,

@@ -80,6 +80,9 @@ describe('setupFailureDetectorBridge — opt-in liveness wiring', () => {
       failureDetection: { heartbeatMs: 100, deadTimeoutMs: 600, activeProbing: true },
     });
     await cluster.start();
+    // distributed-core >= 0.41 leaves the FailureDetector inert when SWIM owns
+    // detection, so the pre-bridge state is the baseline, not `true`.
+    const runningBefore = cluster.failureDetector.getStatus().isRunning;
 
     let handle: Awaited<ReturnType<typeof setupFailureDetectorBridge>> = null;
     try {
@@ -114,7 +117,7 @@ describe('setupFailureDetectorBridge — opt-in liveness wiring', () => {
       // surface; instead we assert getStatus() reports running, which is
       // enough to prove the bridge didn't accidentally tear it down.
       const status = cluster.failureDetector.getStatus();
-      expect(status.isRunning).toBe(true);
+      expect(status.isRunning).toBe(runningBefore);
     } finally {
       if (handle) await handle.stop();
       await cluster.stop();

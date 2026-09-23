@@ -41,11 +41,11 @@ const fakeLogger = (jest.requireMock('../../lib/logger') as {
 jest.setTimeout(20_000);
 
 describe('RunPersistenceService', () => {
-  let mockRepository: { put: jest.Mock };
+  let mockRepository: { put: jest.Mock; listByStatus: jest.Mock };
   let cleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    mockRepository = { put: jest.fn().mockImplementation(() => Promise.resolve()) };
+    mockRepository = { put: jest.fn().mockImplementation(() => Promise.resolve()), listByStatus: jest.fn().mockResolvedValue([]) };
     const fixture = new FixtureLLMClient(['ok']);
     const { shutdown } = await bootstrapPipeline({
       llmClient: fixture,
