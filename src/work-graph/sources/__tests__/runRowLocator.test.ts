@@ -108,3 +108,21 @@ describe('RunRowLocator', () => {
     await expect(new RunRowLocator().rows(client, 'runs', ['r1'])).rejects.toThrow(/throughput/);
   });
 });
+
+describe('RunRowLocator inside one graph build (NFR #16)', () => {
+  it('reads each run once across the ACL pass and the activity layer, and fresh in the next build', async () => {
+    const { withBuildMemo } = await import('../../buildMemo');
+    const rows = [{ pipelineId: 'p', runId: 'r1' }, { pipelineId: 'p', runId: 'r2' }];
+    const t = table(rows);
+    const locator = new RunRowLocator();
+    await withBuildMemo(async () => {
+      const acl = await locator.rows(t.client, 'pipeline-runs', ['r1', 'r2']);
+      const activity = await locator.rows(t.client, 'pipeline-runs', ['r2', 'r1']);
+      expect(activity.get('r1')).toEqual(acl.get('r1'));
+      expect(activity.get('r2')).toEqual(rows[1]);
+    });
+    expect(t.calls.filter((call) => call === 'query')).toHaveLength(2);
+    await withBuildMemo(() => locator.rows(t.client, 'pipeline-runs', ['r1']));
+    expect(t.calls.filter((call) => call === 'query')).toHaveLength(3);
+  });
+});

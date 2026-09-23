@@ -1,3 +1,4 @@
+import { withBuildMemo } from './buildMemo';
 import type {
   WorkProjectionState,
   WorkSourceKind,
@@ -731,15 +732,23 @@ export class WorkGraphOrchestrator {
     // cost hours once already.
     const profiling = process.env.WORK_GRAPH_PROFILE === '1';
     const started = profiling ? Date.now() : 0;
-    const { snapshot, authorization } = await this.getGraph(viewer, personId, day, timezone, previousCursor);
-    const authorized = profiling ? Date.now() : 0;
-    const activity = await buildWorkActivity({
-      query,
-      nodes: snapshot.nodes,
-      edges: snapshot.edges,
-      authorization,
-      reader,
-      now,
+    // One read memo for the whole build: the ACL pass and the activity layer
+    // ask for the same runs and definitions (NFR #16).
+    const { snapshot, authorization, activity, authorized } = await withBuildMemo(async () => {
+      const graph = await this.getGraph(viewer, personId, day, timezone, previousCursor);
+      const at = profiling ? Date.now() : 0;
+      return {
+        ...graph,
+        authorized: at,
+        activity: await buildWorkActivity({
+          query,
+          nodes: graph.snapshot.nodes,
+          edges: graph.snapshot.edges,
+          authorization: graph.authorization,
+          reader,
+          now,
+        }),
+      };
     });
     if (profiling) {
       log.info({

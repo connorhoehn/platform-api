@@ -1,3 +1,5 @@
+import { membershipProjection, withFreshMembership } from './membershipProjection';
+import { withBuildMemo } from './buildMemo';
 import { createHash, randomUUID } from 'crypto';
 import {
   BatchGetCommand,
@@ -172,6 +174,12 @@ export class DynamoWorkGraphDirectory implements WorkGraphDirectory {
   }
 
   private async conversationIds(userId: string): Promise<string[]> {
+    // NFR #16: the maintained answer in the cache Redis; the Scan runs only
+    // on a miss (membershipProjection.ts).
+    return membershipProjection.conversationIds(userId, () => this.scanConversationIds(userId));
+  }
+
+  private async scanConversationIds(userId: string): Promise<string[]> {
     const rows = await scanAll(this.client, {
       TableName: CHAT_MEMBERS_TABLE,
       FilterExpression: 'userId = :user AND attribute_not_exists(removedAt)',
@@ -1062,11 +1070,18 @@ export function authorizeGatewayWorkGraph(
   query: GatewayWorkGraphQuery,
   requestedView?: GatewayWorkGraphViewRequest,
 ): Promise<GatewayWorkGraphAccess> {
-  if (requestedView) return authorizeGatewayWorkGraphOnce(organizationId, viewerId, query, requestedView);
+  // The access re-check reads membership from DynamoDB, never the cache: the
+  // gateway sends it the moment a membership write signals, racing the
+  // signal's invalidation of the cached answer (NFR #16). One build memo
+  // spans the decision and the v2 view derived from it.
+  const once = (view?: GatewayWorkGraphViewRequest) => withFreshMembership(() => withBuildMemo(
+    () => authorizeGatewayWorkGraphOnce(organizationId, viewerId, query, view),
+  ));
+  if (requestedView) return once(requestedView);
   const key = JSON.stringify([organizationId, viewerId, query.personId, query.day, query.timezone]);
   const pending = authorizeInFlight.get(key);
   if (pending) return pending;
-  const pass = authorizeGatewayWorkGraphOnce(organizationId, viewerId, query)
+  const pass = once()
     .finally(() => { authorizeInFlight.delete(key); });
   authorizeInFlight.set(key, pass);
   return pass;

@@ -9,6 +9,7 @@ import { createScheduleEvaluator } from './services/scheduleEvaluator';
 import { createDDBSchedulerLeaderLock } from './services/scheduler-leader-lock';
 import { pipelineDefinitionsCache } from './pipeline/definitions-cache';
 import { startInvalidationSubscriber } from './pipeline/definitions-invalidator';
+import { startMembershipInvalidationSubscriber } from './work-graph/membershipProjection';
 import { wirePipelineBridge } from '@connorhoehn/pipeline-runtime';
 import { setPipelineBridge, getPipelineBridge } from './pipeline/bridge-types';
 import { bootstrapPipeline } from './pipeline/bootstrap';
@@ -370,6 +371,12 @@ pipelineDefinitionsCache.start().catch((err: unknown) => {
 // sibling replica writes. Failure to start is non-fatal — falls back to
 // the timer.
 let definitionsInvalidationSubscriber: { stop: () => Promise<void> } | null = null;
+// NFR #16: the membership projection's invalidation — every committed chat
+// membership write (gateway) drops that person's cached conversation list.
+void startMembershipInvalidationSubscriber().catch((err: unknown) => {
+  log.warn({ errMessage: err instanceof Error ? err.message : String(err) },
+    'membership-invalidate subscriber failed to start (cached conversation lists age out by TTL)');
+});
 void startInvalidationSubscriber(pipelineDefinitionsCache).then((sub) => {
   definitionsInvalidationSubscriber = sub;
 }).catch((err: unknown) => {

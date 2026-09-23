@@ -1,3 +1,4 @@
+import { countDynamoCalls } from '../lib/aws-clients';
 import { createHash } from 'crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import type {
@@ -370,9 +371,15 @@ export function createWorkGraphRouter(
     const query = parseGraphQuery(req);
     const activity = parseActivityQuery(req);
     if (activity) {
-      const snapshot = await orchestrator.getGraphV2(
+      const started = Date.now();
+      const { result: snapshot, tally } = await countDynamoCalls(() => orchestrator.getGraphV2(
         viewer, query.personId, query.day, query.timezone, activity, query.cursor,
-      );
+      ));
+      // NFR #16: what this build cost — wall time and DynamoDB calls by kind.
+      const reads = [...tally.entries()].filter(([key]) => !key.startsWith('ms:')).reduce((sum, [, n]) => sum + n, 0);
+      const scans = [...tally.entries()].filter(([key]) => key.startsWith('Scan:')).reduce((sum, [, n]) => sum + n, 0);
+      res.setHeader('server-timing', `build;dur=${Date.now() - started}, ddb;desc="calls=${reads} scans=${scans}"`);
+      if (req.get('x-ddb-tally') === '1') res.setHeader('x-ddb-tally', [...tally.entries()].map(([k, n]) => `${k}=${n}`).join(' '));
       // NFR #85: only a reader that asked (it can seed its stream from this
       // view) gets the extra field; the strict older validators never see it.
       const viewHash = req.query['viewBase'] === '1'

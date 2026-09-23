@@ -17,6 +17,9 @@
  */
 import { QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import log from '../../lib/logger';
+import { buildMemoActive, memoHas, memoOnce } from '../buildMemo';
+
+const memoKey = (table: string, runId: string): string => `run-row\u0000${table}\u0000${runId}`;
 
 type Row = Record<string, unknown>;
 
@@ -59,6 +62,24 @@ export class RunRowLocator {
   async rows(client: DynamoDBDocumentClient, table: string, runIds: readonly string[]): Promise<Map<string, Row | null>> {
     const wanted = [...new Set(runIds)].filter(Boolean);
     if (!wanted.length) return new Map();
+    if (buildMemoActive()) {
+      // Within one graph build a run is read once: the ACL pass and the
+      // activity layer both ask for every run (NFR #16). Ids no one in this
+      // build has asked for are read together, as one call.
+      const missing = wanted.filter((id) => !memoHas(memoKey(table, id)));
+      if (missing.length) {
+        const batch = this.readRows(client, table, missing);
+        for (const id of missing) {
+          memoOnce(memoKey(table, id), () => batch.then((found) => found.get(id) ?? null)).catch(() => undefined);
+        }
+      }
+      const answers = await Promise.all(wanted.map(async (id) => [id, await memoOnce(memoKey(table, id), () => this.readRows(client, table, [id]).then((found) => found.get(id) ?? null))] as const));
+      return new Map(answers);
+    }
+    return this.readRows(client, table, wanted);
+  }
+
+  private async readRows(client: DynamoDBDocumentClient, table: string, wanted: string[]): Promise<Map<string, Row | null>> {
     if (this.usesIndex(table)) {
       try {
         const found = await this.viaIndex(client, table, wanted);

@@ -7,6 +7,7 @@
  * the source has nothing to say, so an absent record discloses nothing rather
  * than producing a plausible-looking placeholder.
  */
+import { memoOnce } from '../buildMemo';
 import { getSystemPipeline } from '../../pipeline/systemPipelines';
 import { GetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { tableName } from '../../lib/ddb-table-name';
@@ -323,10 +324,13 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     // than an internal pipeline id.
     // The definitions table is keyed (userId, pipelineId): the owner is the
     // person who triggered this run, which is the same person the graph is of.
-    const definition = await this.client.send(new GetCommand({
-      TableName: PIPELINE_DEFINITIONS_TABLE,
-      Key: { userId: String(row.triggeredBy ?? ''), pipelineId: String(row.pipelineId ?? '') },
-    })).catch(() => undefined);
+    // Once per (owner, pipeline) per graph build — a day of fifty deck-revise
+    // runs asked for the same definition fifty times (NFR #16).
+    const definitionKey = { userId: String(row.triggeredBy ?? ''), pipelineId: String(row.pipelineId ?? '') };
+    const definition = await memoOnce(
+      `pipeline-definition\u0000${definitionKey.userId}\u0000${definitionKey.pipelineId}`,
+      () => this.client.send(new GetCommand({ TableName: PIPELINE_DEFINITIONS_TABLE, Key: definitionKey })).catch(() => undefined),
+    );
     // A step's name is the label its plan gave it — the definition's node
     // label, or for an /agent loop's own row the plan step's title — never the
     // node id the engine files it under (`agent:s1` meant nothing to a reader).
