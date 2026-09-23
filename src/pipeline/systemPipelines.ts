@@ -33,7 +33,10 @@ const REGISTRY: SystemPipelineEntry[] = [
 // Retries and approvers are platform properties: a definition that forgets
 // them fails boot here, with every offender named, rather than shipping a step
 // that gives up on its first blip.
-assertSystemPipelinesLint(REGISTRY.map((e) => e.build()));
+// The page's grouping fields are required of the seeds we ship; a command or
+// plugin registering at runtime (below) is linted for retries and approvers
+// only, and the page infers its workType / kind / route on read.
+assertSystemPipelinesLint(REGISTRY.map((e) => e.build()), { metadata: true });
 
 export function registerSystemPipeline(entry: SystemPipelineEntry): void {
   if (REGISTRY.some((e) => e.id === entry.id)) return;

@@ -13,7 +13,14 @@
 //   - `approval` nodes must name at least one approver, or the run parks
 //     forever with nobody able to release it.
 
-export type LintRule = 'retry-policy' | 'approvers';
+//   - the definition itself must say what it is for the pipelines page:
+//     `workType` (a WorkType), `kind` (a PipelineKind) and `route` (a
+//     non-empty list of short step labels). The page infers these for a
+//     person's legacy rows; a seed we ship has no excuse for a guess.
+
+import { isPipelineKind, isRoute, isWorkType } from './definition-metadata';
+
+export type LintRule = 'retry-policy' | 'approvers' | 'work-type' | 'kind' | 'route';
 
 export interface LintViolation {
   pipelineId: string;
@@ -29,7 +36,16 @@ export function needsRetryPolicy(type: string): boolean {
   return type === 'agent' || type === 'llm' || type.includes(':');
 }
 
-export function lintSystemPipeline(def: Record<string, unknown>): LintViolation[] {
+export interface LintOptions {
+  /**
+   * Also require `workType`, `kind` and `route`. On for the registry the code
+   * ships (boot fails naming the builder); off for pipelines a chat command
+   * or plugin registers at runtime, whose fields the page infers on read.
+   */
+  metadata?: boolean;
+}
+
+export function lintSystemPipeline(def: Record<string, unknown>, options: LintOptions = {}): LintViolation[] {
   const pipelineId = typeof def.id === 'string' ? def.id : '(unnamed)';
   const nodes = Array.isArray(def.nodes) ? (def.nodes as NodeLike[]) : [];
   const out: LintViolation[] = [];
@@ -51,12 +67,22 @@ export function lintSystemPipeline(def: Record<string, unknown>): LintViolation[
       }
     }
   }
+  if (!options.metadata) return out;
+  if (!isWorkType(def.workType)) {
+    out.push({ pipelineId, nodeId: '(definition)', rule: 'work-type', message: 'definition has no workType (documents | agents | conversations | other)' });
+  }
+  if (!isPipelineKind(def.kind)) {
+    out.push({ pipelineId, nodeId: '(definition)', rule: 'kind', message: 'definition has no kind (document | presentation | diagram | agent | experiment | recording | call | conversation | media | workflow)' });
+  }
+  if (!isRoute(def.route)) {
+    out.push({ pipelineId, nodeId: '(definition)', rule: 'route', message: 'definition has no route (a non-empty list of short step labels)' });
+  }
   return out;
 }
 
 /** Throws when any registered definition violates the rules; the message names every offender. */
-export function assertSystemPipelinesLint(defs: Array<Record<string, unknown>>): void {
-  const violations = defs.flatMap((d) => lintSystemPipeline(d));
+export function assertSystemPipelinesLint(defs: Array<Record<string, unknown>>, options: LintOptions = {}): void {
+  const violations = defs.flatMap((d) => lintSystemPipeline(d, options));
   if (violations.length === 0) return;
   const lines = violations.map((v) => `  - ${v.pipelineId}: ${v.message}`);
   throw new Error(`system pipeline lint failed (${violations.length} violation${violations.length === 1 ? '' : 's'}):\n${lines.join('\n')}`);

@@ -162,6 +162,7 @@ export function buildRecordingFinalizeDefinition(): Record<string, unknown> {
   return {
     id: RECORDING_FINALIZE_PIPELINE_ID,
     name: 'Recording finalize',
+    workType: 'conversations', kind: 'recording', route: ['Recording completed', 'Find the call', 'Save', 'Compose', 'Announce', 'Transcribe'], origin: { kind: 'system' },
     description: 'After a call ends: find the call, save the recording, wait for the composed file, tell the conversation, start transcription.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
@@ -182,6 +183,7 @@ export function buildCallTranscriptionDefinition(model = process.env.DOCUMENT_AG
   return {
     id: CALL_TRANSCRIPTION_PIPELINE_ID,
     name: 'Call transcription',
+    workType: 'conversations', kind: 'call', route: ['Recording ready', 'Transcribe', 'Merge reactions', 'Store', 'Summarise', 'Publish'], origin: { kind: 'system' },
     description: 'Transcribe the composed recording, merge in-call reactions by time, store the transcript, summarise it with a light model, publish it to the conversation and the call\'s document.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [

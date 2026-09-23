@@ -56,6 +56,7 @@ export function buildDiagramGenerateDefinition(model = process.env.DOCUMENT_AGEN
   return {
     id: DIAGRAM_GENERATE_PIPELINE_ID,
     name: 'Diagram from a description',
+    workType: 'documents', kind: 'diagram', route: ['/diagram', 'Sketch', 'Draw', 'Card'], origin: { kind: 'system' },
     description: 'A /diagram command from a chat: a light model sketches the boxes and arrows, the sketch becomes Excalidraw elements in the new diagram document, a card in the thread opens it.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [

@@ -46,6 +46,15 @@ import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { withContext } from '../lib/logger';
 import { validateShape, isPublishable } from '../pipeline/validate-shape';
 import { listStepKinds } from '../pipeline/customStepHandlers';
+import { decorateDefinition } from '../pipeline/definition-metadata';
+import { loadRollups } from '../pipeline/run-rollup-read';
+import { pipelineRunRollupRepo } from '../repositories/PipelineRunRollupRepository';
+import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
+import { docClient } from '../lib/aws-clients';
+import { getPipelineBridge } from '../pipeline/bridge-types';
+import { idempotency } from '../middleware/idempotency';
+import { generateDraftDefinition, InvalidInstructionError } from '../pipeline/generate-definition';
+import type { LoopPlan } from '../chat/agentLoopPlanner';
 
 const log = withContext({ route: 'pipelineDefinitions' });
 
@@ -129,11 +138,54 @@ function definitionSnapshot(def: unknown): Record<string, unknown> | undefined {
 
 export const pipelineDefinitionsRouter = Router();
 
+/** `?include=rollup,approvals` — what the list attaches beyond the definitions. */
+type ListInclude = 'rollup' | 'approvals';
+function parseInclude(raw: unknown): Set<ListInclude> {
+  const out = new Set<ListInclude>();
+  const values = Array.isArray(raw) ? raw : typeof raw === 'string' ? [raw] : [];
+  for (const v of values) {
+    for (const part of String(v).split(',')) {
+      const p = part.trim().toLowerCase();
+      if (p === 'rollup' || p === 'approvals') out.add(p);
+      // `rollup` is what the page asks for; approvals ride along with it.
+      if (p === 'rollup') out.add('approvals');
+    }
+  }
+  return out;
+}
+
+/** The run table, for the rollup backfill. Lazy: a test that never asks for rollups never builds it. */
+let runRepoSingleton: PipelineRunRepository | null = null;
+function runRepo(): PipelineRunRepository {
+  if (!runRepoSingleton) runRepoSingleton = new PipelineRunRepository(docClient);
+  return runRepoSingleton;
+}
+
+/**
+ * Pending approvals per pipeline from the bridge's in-memory queue. Known
+ * hole, out of scope here: the queue is replica-local, so with two platform
+ * replicas the count depends on which one answers (PLAN §2.2).
+ */
+async function pendingApprovalsByPipeline(): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const bridge = getPipelineBridge();
+  if (!bridge?.getPendingApprovals) return out;
+  try {
+    for (const row of await bridge.getPendingApprovals()) {
+      if (typeof row.pipelineId === 'string') out.set(row.pipelineId, (out.get(row.pipelineId) ?? 0) + 1);
+    }
+  } catch (e) {
+    log.warn({ err: e instanceof Error ? e.message : String(e) }, 'pending approvals unavailable for the list');
+  }
+  return out;
+}
+
 // List
 pipelineDefinitionsRouter.get(
   '/',
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const userId = req.user!.sub;
+    const include = parseInclude(req.query.include);
     try {
       const items = await definitionsRepo.list(userId);
       // Platform-owned pipelines ride along, read-only, so their runs have a home.
@@ -149,24 +201,186 @@ pipelineDefinitionsRouter.get(
       //
       // Stored wins, seed fills the gaps — the same precedence `GET /:id` has
       // always used.
-      const byId = new Map<string, unknown>();
+      const byId = new Map<string, Record<string, unknown>>();
       for (const sys of listSystemPipelines()) {
         const id = (sys as { id?: unknown }).id;
-        if (typeof id === 'string') byId.set(id, sys);
+        // A seed with no stored override is read-only: the UI could not tell a
+        // seed from a saved copy before this flag.
+        if (typeof id === 'string') byId.set(id, { ...sys, readOnly: true });
       }
       for (const item of items) {
         const id = (item as { id?: unknown }).id;
-        if (typeof id === 'string') byId.set(id, item);
+        if (typeof id === 'string') byId.set(id, item as Record<string, unknown>);
         // A stored row with no usable id cannot collide with anything; keep it
         // rather than dropping someone's pipeline over a missing field.
-        else byId.set(`__anon-${byId.size}`, item);
+        else byId.set(`__anon-${byId.size}`, item as Record<string, unknown>);
       }
-      res.json({ pipelines: [...byId.values()] });
+      // workType / kind / route filled on the response only; never written back.
+      const pipelines: Record<string, unknown>[] = [...byId.values()].map((def) => decorateDefinition(def));
+
+      if (include.has('rollup')) {
+        const candidates = pipelines
+          .filter((p) => typeof p.id === 'string')
+          .map((p) => ({ id: p.id as string, ...(typeof p.updatedAt === 'string' ? { updatedAt: p.updatedAt } : {}) }));
+        const rollups = await loadRollups(candidates, {
+          rollups: pipelineRunRollupRepo,
+          listRuns: (pipelineId, limit) => runRepo().listByPipeline(pipelineId, { limit }),
+        });
+        for (const p of pipelines) p.rollup = typeof p.id === 'string' ? rollups.get(p.id) ?? null : null;
+      }
+      if (include.has('approvals')) {
+        const pending = await pendingApprovalsByPipeline();
+        for (const p of pipelines) p.pendingApprovals = typeof p.id === 'string' ? pending.get(p.id) ?? 0 : 0;
+      }
+      res.json({ pipelines });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       log.error({ err: message, action: 'def.list' }, 'failed to list definitions');
       res.status(500).json({ error: 'internal_error', detail: 'failed to list definitions' });
     }
+  }),
+);
+
+// Generate — the /agent planner writing a DRAFT the caller owns.
+//
+//   POST /api/pipelines/defs/generate
+//   { instruction, mode: 'draft' | 'run', requestId?, hints?, model?, contextBudgetTokens? }
+//   (`action: 'draft' | 'draft-and-run'` from the plan is accepted as an alias)
+//   200 { pipeline, runId?, runError?, planner: { source: 'model' | 'fallback', steps } }
+//   400 invalid_body · 422 invalid_instruction · 500 internal_error
+//
+// Idempotent by `requestId`: it is carried as the Idempotency-Key, so the
+// same DynamoDB conditional-write claim that guards run triggers (NFR #97)
+// guards this — a retry replays the first answer, a concurrent duplicate gets
+// 409 idempotency_in_progress, and a non-2xx releases the claim.
+function requestIdAsIdempotencyKey(req: Request, _res: Response, next: () => void): void {
+  const body = (req.body ?? {}) as { requestId?: unknown };
+  if (!req.headers['idempotency-key'] && typeof body.requestId === 'string' && body.requestId.trim()) {
+    req.headers['idempotency-key'] = body.requestId.trim();
+  }
+  next();
+}
+
+interface GenerateBody {
+  instruction?: unknown;
+  mode?: unknown;
+  action?: unknown;
+  requestId?: unknown;
+  hints?: unknown;
+  model?: unknown;
+  contextBudgetTokens?: unknown;
+}
+
+pipelineDefinitionsRouter.post(
+  '/generate',
+  requestIdAsIdempotencyKey,
+  idempotency({ scope: 'pipeline-generate' }),
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const userId = req.user!.sub;
+    const organizationId = req.user!.orgId;
+    const body = (req.body ?? {}) as GenerateBody;
+    if (!body || typeof body !== 'object') {
+      res.status(400).json({ error: 'invalid_body' });
+      return;
+    }
+    const mode: 'draft' | 'run' | null =
+      body.mode === 'draft' || body.mode === 'run' ? body.mode
+        : body.action === 'draft' ? 'draft'
+          : body.action === 'draft-and-run' ? 'run'
+            : body.mode === undefined && body.action === undefined ? 'draft' : null;
+    if (mode === null) {
+      res.status(400).json({ error: 'invalid_body', detail: "mode must be 'draft' or 'run'" });
+      return;
+    }
+    const hints = Array.isArray(body.hints) ? body.hints.filter((h): h is string => typeof h === 'string') : undefined;
+
+    let generated: Awaited<ReturnType<typeof generateDraftDefinition>>;
+    try {
+      generated = await generateDraftDefinition({
+        instruction: typeof body.instruction === 'string' ? body.instruction : '',
+        ...(hints ? { hints } : {}),
+        ...(typeof body.model === 'string' ? { model: body.model } : {}),
+        ...(typeof body.contextBudgetTokens === 'number' ? { contextBudgetTokens: body.contextBudgetTokens } : {}),
+        userId,
+        ...(req.user!.email ? { userName: req.user!.email } : {}),
+        ...(organizationId ? { organizationId } : {}),
+      });
+    } catch (e) {
+      if (e instanceof InvalidInstructionError) {
+        res.status(422).json({ error: 'invalid_instruction', detail: e.detail });
+        return;
+      }
+      throw e;
+    }
+
+    const def = generated.definition;
+    if (mode === 'run') {
+      def.status = 'published';
+      def.publishedVersion = 1;
+    }
+
+    try {
+      await definitionsRepo.put(userId, def);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      log.error({ err: message, pipelineId: def.id, action: 'def.generate' }, 'failed to persist generated definition');
+      res.status(500).json({ error: 'internal_error', detail: 'failed to persist definition' });
+      return;
+    }
+    pokeCacheAfterWrite('definition.generate');
+    fireAndForgetAudit({
+      action: 'pipeline.definition.put',
+      actorUserId: userId,
+      pipelineId: def.id,
+      outcome: 'success',
+      details: { origin: 'agent', mode, plannerSource: generated.plan.source, steps: generated.plan.steps.length },
+      ...(definitionSnapshot(def) ? { after: definitionSnapshot(def)! } : {}),
+    });
+
+    let runId: string | undefined;
+    let runError: string | undefined;
+    if (mode === 'run') {
+      const bridge = getPipelineBridge();
+      if (!bridge?.trigger) {
+        runError = 'bridge_unavailable';
+      } else {
+        try {
+          const out = await bridge.trigger({
+            pipelineId: def.id,
+            definition: def,
+            triggerPayload: generated.triggerPayload,
+            triggeredBy: { userId },
+          });
+          runId = out.runId;
+          // Lazy: the persistence module drags the work-graph projection in with it.
+          const { getRunPersistenceService } = await import('../pipeline/runPersistence.js');
+          getRunPersistenceService()?.registerTrigger({
+            runId,
+            pipelineId: def.id,
+            userId,
+            triggerType: 'manual',
+            at: new Date().toISOString(),
+            ...(organizationId ? { organizationId } : {}),
+          });
+        } catch (e) {
+          runError = e instanceof Error ? e.message : String(e);
+          log.warn({ err: runError, pipelineId: def.id, action: 'def.generate.run' }, 'generated definition saved but the run did not start');
+        }
+      }
+    }
+
+    const planner: { source: 'model' | 'fallback'; steps: number; notice?: string } = {
+      source: (generated.plan as LoopPlan).source === 'planner' ? 'model' : 'fallback',
+      steps: generated.plan.steps.length,
+      ...(generated.plan.notice ? { notice: generated.plan.notice } : {}),
+    };
+    log.info({ pipelineId: def.id, mode, planner: planner.source, steps: planner.steps, runId, action: 'def.generate' }, 'definition generated');
+    res.json({
+      pipeline: decorateDefinition(def),
+      ...(runId ? { runId } : {}),
+      ...(runError ? { runError } : {}),
+      planner,
+    });
   }),
 );
 
@@ -177,12 +391,13 @@ pipelineDefinitionsRouter.get(
     const userId = req.user!.sub;
     const pipelineId = req.params.pipelineId;
     try {
-      const def = (await definitionsRepo.get(userId, pipelineId)) ?? getSystemPipeline(pipelineId);
+      const stored = await definitionsRepo.get(userId, pipelineId);
+      const def = stored ?? getSystemPipeline(pipelineId);
       if (!def) {
         res.status(404).json({ error: 'not_found' });
         return;
       }
-      res.json(def);
+      res.json(decorateDefinition(stored ? def : { ...def, readOnly: true }));
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       log.error({ err: message, pipelineId, action: 'def.get' }, 'failed to get definition');

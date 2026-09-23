@@ -11,7 +11,8 @@ export const DECK_REVISE_CHECK_KIND = 'deck:revise-check';
 export const DECK_REVISE_WRITE_KIND = 'deck:revise-write';
 
 export function buildDeckReviseDefinition(): Record<string, unknown> {
-  return buildDocumentEditDefinition({
+  return {
+    ...buildDocumentEditDefinition({
     id: DECK_REVISE_PIPELINE_ID,
     name: 'Presentation edit',
     description: 'A composer edit of a presentation: read the deck, have the model make the edit from the deck\'s sources, measure it against what was asked, and save it as a new revision conditioned on the revision it was made against.',
@@ -22,5 +23,8 @@ export function buildDeckReviseDefinition(): Record<string, unknown> {
       check: { kind: DECK_REVISE_CHECK_KIND, label: 'Check the edit' },
       write: { kind: DECK_REVISE_WRITE_KIND, label: 'Save the new revision' },
     },
-  });
+    }),
+    // The pipelines page's group, mark and one-line route (PLAN §2.1).
+    workType: 'documents', kind: 'presentation', route: ['Composer edit', 'Read', 'Edit', 'Check', 'Save'], origin: { kind: 'system' },
+  };
 }

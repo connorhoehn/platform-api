@@ -294,6 +294,7 @@ export function buildMediaCatalogDefinition(): Record<string, unknown> {
   return {
     id: MEDIA_CATALOG_PIPELINE_ID,
     name: 'Media catalog',
+    workType: 'conversations', kind: 'media', route: ['Walker batch', 'Thumbnails', 'Bursts', 'Classify', 'Catalog'], origin: { kind: 'system' },
     description: 'For each batch the drive walker posts: store the thumbnails, group frames into bursts, classify one frame per burst, and write the catalog.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [

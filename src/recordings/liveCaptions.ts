@@ -387,6 +387,7 @@ export function buildLiveCaptionsDefinition(): Record<string, unknown> {
   return {
     id: LIVE_CAPTIONS_PIPELINE_ID,
     name: 'Live captions',
+    workType: 'conversations', kind: 'recording', route: ['Captions on', 'Arm tap', 'Stream', 'Remove tap', 'Post'], origin: { kind: 'system' },
     description: 'While a call runs: arm the audio tap, stream captions to the call until it ends, remove the tap, tell the conversation.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [

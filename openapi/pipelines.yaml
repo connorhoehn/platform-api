@@ -161,7 +161,22 @@ paths:
     get:
       tags: [pipelines]
       summary: List pipeline definitions for the caller
+      description: |
+        The caller's stored definitions plus the platform's system pipelines
+        (`readOnly: true` when no stored override exists). Every entry carries
+        `workType`, `kind` and `route` — stored, or inferred on the response
+        (`inferred` names which) without writing anything back.
+        `?include=rollup` attaches `rollup` (the derived last-run read model,
+        `null` until it exists) and `pendingApprovals` to each entry.
       operationId: listPipelineDefinitions
+      parameters:
+        - in: query
+          name: include
+          required: false
+          schema:
+            type: string
+            enum: [rollup, approvals]
+          description: Comma-separated extras; `rollup` implies `approvals`.
       responses:
         '200':
           description: OK
@@ -175,6 +190,59 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/PipelineDefinition'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /pipelines/defs/generate:
+    post:
+      tags: [pipelines]
+      summary: Plan an instruction into a draft definition the caller owns
+      description: |
+        The chat's `/agent` planner, pointed at a page instruction. Stores a
+        `status: 'draft'` definition with `origin.kind: 'agent'` (the
+        instruction verbatim, `plannerSource: 'model' | 'fallback'`);
+        `mode: 'run'` publishes it and triggers the first run. Idempotent by
+        `requestId` (carried as the Idempotency-Key claim in DynamoDB): a retry
+        replays the first answer, a duplicate still running answers 409.
+      operationId: generatePipelineDefinition
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [instruction]
+              properties:
+                instruction: { type: string, maxLength: 4000 }
+                mode: { type: string, enum: [draft, run], default: draft }
+                requestId: { type: string }
+                hints: { type: array, items: { type: string } }
+                model: { type: string }
+                contextBudgetTokens: { type: integer }
+      responses:
+        '200':
+          description: The stored draft (decorated), the run it started if any, and how it was planned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pipeline, planner]
+                properties:
+                  pipeline: { $ref: '#/components/schemas/PipelineDefinition' }
+                  runId: { type: string }
+                  runError: { type: string }
+                  planner:
+                    type: object
+                    required: [source, steps]
+                    properties:
+                      source: { type: string, enum: [model, fallback] }
+                      steps: { type: integer }
+                      notice: { type: string }
+        '400':
+          description: The body is not an object or `mode` is not `draft` | `run`
+        '409':
+          description: A request with this `requestId` is still being processed (`idempotency_in_progress`)
+        '422':
+          description: The instruction is empty or longer than 4000 characters (`invalid_instruction`)
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /pipelines/defs/{pipelineId}:

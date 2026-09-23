@@ -80,6 +80,7 @@ import type { DeadLetterQueue, Envelope } from 'distributed-core/messaging-queue
 
 import { createLLMClient } from './factories/LLMClientFactory';
 import { ExecutorAuditSubscriber } from './executor-audit-subscriber';
+import { startRunRollupSubscriber } from './run-rollup-subscriber';
 import { auditRepo } from './audit-repository';
 import { setupFailureDetectorBridge } from './config/failureDetectorBridge';
 import {
@@ -1377,6 +1378,8 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   } else {
     logger.info('executor audit subscriber DISABLED via PIPELINE_AUDIT_LIFECYCLE_ENABLED=false');
   }
+  // The pipelines page's last-run rollup, fed by the same lifecycle events (run-rollup-subscriber.ts).
+  startRunRollupSubscriber({ eventBus, enabled: opts.pipelineRunRepository !== undefined });
 
   // ── Judge aggregator subscriber ───────────────────────────────────────
   //

@@ -25,6 +25,7 @@ import { DECK_STEP_KIND } from '../deck/DeckStepHandler';
 import { MEETING_STEP_KIND, teamNameFrom } from '../loop/meetingStepHandler';
 import { AGENDA_STEP_KIND, type Agenda } from '../loop/agendaStepHandler';
 import { isSilentClaudeFailure } from '../pipeline/claudeCliErrors';
+import { routeSummary } from '../pipeline/definition-metadata';
 import type { DeckSpec } from '../deck/DeckSpec';
 import log from '../lib/logger';
 
@@ -828,6 +829,7 @@ export function buildAgentLoopDefinition(plan: LoopPlan, request: AgentLoopReque
   return {
     id: CHAT_AGENT_LOOP_PIPELINE_ID,
     name: 'Agent loop',
+    workType: 'agents', kind: 'agent', route: routeSummary({ nodes, edges }), origin: { kind: 'system' },
     description: 'An /agent command from a chat: a planner turns the instruction into steps, and each step runs as an agent in the run\'s shared cloud workspace until it meets its acceptance. A deck step drafts a grounded DeckSpec and renders a real .pptx.',
     version: 1,
     status: 'published',

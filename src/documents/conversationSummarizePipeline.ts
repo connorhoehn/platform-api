@@ -74,6 +74,7 @@ export function buildConversationSummarizeDefinition(model = process.env.DOCUMEN
   return {
     id: CONVERSATION_SUMMARIZE_PIPELINE_ID,
     name: 'Conversation summary',
+    workType: 'conversations', kind: 'conversation', route: ['/summarize', 'Read', 'Plan', 'Write', 'Card'], origin: { kind: 'system' },
     description: 'A /summarize command from a chat: read the conversation, plan a page with a light model (action items as a checklist), write it as a collaborator, leave a card in the thread.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [

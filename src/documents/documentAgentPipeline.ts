@@ -161,6 +161,7 @@ export function buildDocumentTransformDefinition(model = process.env.DOCUMENT_AG
   return {
     id: DOCUMENT_TRANSFORM_PIPELINE_ID,
     name: 'Document transform',
+    workType: 'documents', kind: 'document', route: ['Transform', 'Read', 'Plan', 'Approval', 'Write'], origin: { kind: 'system' },
     description: 'Transform to <type>: read the source page, plan the target under its fields with a light model (macros carried verbatim), pause for approval when the plan is big, write it as a collaborator.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
@@ -199,6 +200,7 @@ export function buildDocumentAgentEditDefinition(model = process.env.DOCUMENT_AG
   return {
     id: DOCUMENT_AGENT_EDIT_PIPELINE_ID,
     name: 'Document agent edit',
+    workType: 'documents', kind: 'document', route: ['/doc', 'Read', 'Plan', 'Approval', 'Suggestions'], origin: { kind: 'system' },
     description: 'A /doc command from a chat: read the document, plan the edit with a light model, pause for approval when the plan is big or deletes, apply it as a collaborator.',
     version: 1,
     status: 'published',
@@ -226,6 +228,7 @@ export function buildDocumentReviewApplyDefinition(): Record<string, unknown> {
   return {
     id: DOCUMENT_AGENT_REVIEW_PIPELINE_ID,
     name: 'Document suggestion review',
+    workType: 'documents', kind: 'document', route: ['Suggestion reviewed', 'Resolve'], origin: { kind: 'system' },
     description: 'A person accepted or rejected an agent\'s suggestions: resolve them in the document as a collaborator.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
