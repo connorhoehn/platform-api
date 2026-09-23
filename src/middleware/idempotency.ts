@@ -401,3 +401,97 @@ export function idempotency(opts: IdempotencyOptions): RequestHandler {
     }
   };
 }
+
+// ---------------------------------------------------------------------------
+// runIdempotent — the same claim, taken from code instead of a request
+// ---------------------------------------------------------------------------
+
+export type IdempotentOutcome<T> =
+  | { outcome: 'ran'; status: number; body: T }
+  | { outcome: 'replayed'; status: number; body: T }
+  /** Another caller holds the claim at 'pending' (running, or died holding it — see PENDING_TTL_SECONDS). */
+  | { outcome: 'in_progress' }
+  /** The key was committed for a different body. */
+  | { outcome: 'key_conflict' };
+
+/**
+ * Run `handler` under the Idempotency-Key claim the middleware would take for
+ * `POST` with this `scope`, `userId`, `key` and `body` — the same cache key
+ * (`idem:<scope>:<userId>:<key>`), the same body hash, the same store. So a
+ * server-side caller (a run draft's dispatch) and an HTTP retry with the same
+ * key and body see one claim: whichever ran first, the other replays its
+ * answer.
+ *
+ * A 2xx result is committed; anything else, or a throw, releases the claim so
+ * a retry runs again. A claim whose holder died stays `pending` until
+ * `PENDING_TTL_SECONDS` pass, then the next caller takes it over.
+ *
+ * Throws `IdempotencyStoreUnavailableError` when the store cannot be reached:
+ * the handler never runs (fail closed, as the middleware's 503).
+ */
+export class IdempotencyStoreUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IdempotencyStoreUnavailableError';
+  }
+}
+
+export async function runIdempotent<T>(
+  opts: { scope: string; userId: string; key: string; body: unknown; ttlSeconds?: number; store?: IdempotencyStore | null },
+  handler: () => Promise<{ status: number; body: T }>,
+): Promise<IdempotentOutcome<T>> {
+  const cacheKey = `idem:${opts.scope}:${opts.userId || 'anon'}:${opts.key}`;
+  const requestHash = hashBody(opts.body);
+  const store = resolveStore(opts.store);
+  const fromExisting = (existing: string): IdempotentOutcome<T> | null => {
+    if (existing === PENDING) return { outcome: 'in_progress' };
+    const cached = parseCached(existing);
+    if (!cached) return null;
+    if (cached.bodyHash !== requestHash) return { outcome: 'key_conflict' };
+    return { outcome: 'replayed', status: cached.status, body: cached.body as T };
+  };
+
+  try {
+    const existing = await store.get(cacheKey);
+    const answered = existing !== null ? fromExisting(existing) : null;
+    if (answered) return answered;
+    let claimed = await store.claim(cacheKey, PENDING_TTL_SECONDS);
+    if (!claimed) {
+      const raced = await store.get(cacheKey);
+      const again = raced !== null ? fromExisting(raced) : null;
+      if (again) return again;
+      claimed = await store.claim(cacheKey, PENDING_TTL_SECONDS);
+      if (!claimed) return { outcome: 'in_progress' };
+    }
+  } catch (err) {
+    throw new IdempotencyStoreUnavailableError((err as Error).message);
+  }
+
+  let result: { status: number; body: T };
+  try {
+    result = await handler();
+  } catch (err) {
+    await store.release(cacheKey).catch((releaseErr: unknown) => {
+      log.warn({ err: (releaseErr as Error).message, scope: opts.scope, cacheKey }, 'idempotency failed to release claim');
+    });
+    throw err;
+  }
+  const committed = result.status >= 200 && result.status < 300;
+  try {
+    if (committed) {
+      const entry: CachedResponse = {
+        status: result.status,
+        headers: {},
+        body: result.body ?? null,
+        bodyHash: requestHash,
+        cachedAt: Date.now(),
+      };
+      await store.commit(cacheKey, JSON.stringify(entry), opts.ttlSeconds ?? DEFAULT_TTL_SECONDS);
+    } else {
+      await store.release(cacheKey);
+    }
+  } catch (err) {
+    log.warn({ err: (err as Error).message, scope: opts.scope, cacheKey, committed }, 'idempotency failed to settle claim');
+  }
+  return { outcome: 'ran', status: result.status, body: result.body };
+}

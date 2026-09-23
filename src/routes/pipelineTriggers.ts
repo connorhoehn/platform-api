@@ -224,78 +224,15 @@ pipelineTriggersRouter.post(
         userId,
         pipelineId,
       });
-      // The trigger payload becomes the run's context, and step handlers act
-      // AS `context.requestedBy` (the deck steps write revisions with it and
-      // check edit rights against it). Here the payload is the caller's own
-      // JSON, so the requester is pinned to the verified caller (NFR #47).
-      const pinned = pinRequester(body.triggerPayload, userId);
-      if (pinned.overridden) reqLog.warn({ claimed: pinned.overridden }, 'trigger payload named another requester; pinned to the caller');
-      body.triggerPayload = pinned.payload;
-
-      // Establish a create-only source account join before the executor can
-      // publish its first lifecycle transition. `organizationId` is a
-      // verified JWT claim; absent org claims deliberately leave this source
-      // unprojected rather than inventing a shared/default organization.
-      if (organizationId) {
-        await workSourceAccountRepo.ensureVerifiedPrincipal({
-          source: 'pipeline', organizationId, subject: userId,
-        });
-      }
-
-      if (body.definition && body.definition.id !== pipelineId) {
-        throw new ValidationError(
-          `definition.id (${body.definition.id}) does not match :pipelineId (${pipelineId})`,
-        );
-      }
-
-      // Server-side definition resolution. The frontend used to ship the
-      // definition inline from localStorage, which produced "No trigger node
-      // in definition" failures whenever the local copy was stale or absent
-      // (definitions edited in another browser/tab, or pipelines created
-      // server-side that never made it into local storage). DDB is the
-      // canonical store — fall back to it whenever the body lacks one.
-      let resolvedDefinition = body.definition;
-      if (!resolvedDefinition) {
-        const fromDb = await definitionsRepo.get(userId, pipelineId);
-        if (fromDb) resolvedDefinition = fromDb;
-      }
-
-      const bridge = getPipelineBridge();
-
-      let runId: string;
-      if (bridge?.trigger) {
-        try {
-          const out = await withSpan(
-            'pipeline.trigger',
-            { 'pipeline.id': pipelineId, 'pipeline.user_id': userId },
-            async () =>
-              Promise.resolve(
-                bridge!.trigger!({
-                  pipelineId,
-                  definition: resolvedDefinition,
-                  triggerPayload: body.triggerPayload,
-                  triggeredBy: { userId },
-                  breakpoints: body.breakpoints,
-                }),
-              ),
-          );
-          runId = out.runId;
-          // Pre-populate the run cache so terminal events have a pipelineId
-          // even if the framework rejects the definition before publishing
-          // pipeline:run:started (e.g. "No trigger node in definition").
-          getRunPersistenceService()?.registerTrigger({
-            runId,
-            pipelineId,
-            userId,
-            triggerType: 'manual',
-            at: new Date().toISOString(),
-            ...(organizationId ? { organizationId } : {}),
-          });
-        } catch (err) {
+      try {
+        const response = await triggerPipelineRun({ pipelineId, userId, organizationId, body, reqLog });
+        res.status(202).json(response);
+      } catch (err) {
+        if (err instanceof PipelineTriggerBridgeError) {
           respondBridgeError({
             res,
             reqLog,
-            err,
+            err: err.cause,
             action: 'trigger',
             auditAction: 'pipeline.trigger',
             actorUserId: userId,
@@ -303,49 +240,144 @@ pipelineTriggersRouter.post(
           });
           return;
         }
-      } else {
-        runId = randomUUID();
-        reqLog.info(
-          { runId, action: 'trigger.stub' },
-          'pipeline bridge not wired; synthesized runId',
-        );
+        throw err;
       }
-
-      const at = new Date().toISOString();
-
-      if (!bridge?.trigger) {
-        stubRunStore.put({
-          runId,
-          pipelineId,
-          userId,
-          status: 'pending',
-          triggeredAt: at,
-          updatedAt: at,
-          triggerPayload: body.triggerPayload,
-        });
-      }
-
-      // Success-path observability.
-      recordPipelineTrigger();
-      fireAndForgetAudit({
-        action: 'pipeline.trigger',
-        actorUserId: userId,
-        pipelineId,
-        runId,
-      });
-      reqLog.info({ runId, action: 'trigger.create' }, 'pipeline triggered');
-
-      const response: TriggerRunResponse = {
-        runId,
-        pipelineId,
-        triggeredBy: { userId, triggerType: 'manual' },
-        at,
-      };
-
-      res.status(202).json(response);
     },
   ),
 );
+
+/** A bridge call inside `triggerPipelineRun` failed; the route answers it with `respondBridgeError`. */
+export class PipelineTriggerBridgeError extends Error {
+  constructor(public readonly cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'PipelineTriggerBridgeError';
+  }
+}
+
+/**
+ * The body of `POST /api/pipelines/:pipelineId/runs` after rate limiting and
+ * the Idempotency-Key claim: pin the requester, resolve the definition, start
+ * the run. Exported so a run draft's dispatch (routes/runDrafts.ts) starts a
+ * run through exactly this code, under the same claim (`runIdempotent`).
+ * Throws `PipelineTriggerBridgeError` when the bridge refuses the run.
+ */
+export async function triggerPipelineRun(input: {
+  pipelineId: string;
+  userId: string;
+  organizationId?: string;
+  body: TriggerRunRequest;
+  reqLog: ReturnType<typeof withContext>;
+}): Promise<TriggerRunResponse> {
+  const { pipelineId, userId, organizationId, body, reqLog } = input;
+  // The trigger payload becomes the run's context, and step handlers act
+  // AS `context.requestedBy` (the deck steps write revisions with it and
+  // check edit rights against it). Here the payload is the caller's own
+  // JSON, so the requester is pinned to the verified caller (NFR #47).
+  const pinned = pinRequester(body.triggerPayload, userId);
+  if (pinned.overridden) reqLog.warn({ claimed: pinned.overridden }, 'trigger payload named another requester; pinned to the caller');
+  body.triggerPayload = pinned.payload;
+
+  // Establish a create-only source account join before the executor can
+  // publish its first lifecycle transition. `organizationId` is a
+  // verified JWT claim; absent org claims deliberately leave this source
+  // unprojected rather than inventing a shared/default organization.
+  if (organizationId) {
+    await workSourceAccountRepo.ensureVerifiedPrincipal({
+      source: 'pipeline', organizationId, subject: userId,
+    });
+  }
+
+  if (body.definition && body.definition.id !== pipelineId) {
+    throw new ValidationError(
+      `definition.id (${body.definition.id}) does not match :pipelineId (${pipelineId})`,
+    );
+  }
+
+  // Server-side definition resolution. The frontend used to ship the
+  // definition inline from localStorage, which produced "No trigger node
+  // in definition" failures whenever the local copy was stale or absent
+  // (definitions edited in another browser/tab, or pipelines created
+  // server-side that never made it into local storage). DDB is the
+  // canonical store — fall back to it whenever the body lacks one.
+  let resolvedDefinition = body.definition;
+  if (!resolvedDefinition) {
+    const fromDb = await definitionsRepo.get(userId, pipelineId);
+    if (fromDb) resolvedDefinition = fromDb;
+  }
+
+  const bridge = getPipelineBridge();
+
+  let runId: string;
+  if (bridge?.trigger) {
+    try {
+      const out = await withSpan(
+        'pipeline.trigger',
+        { 'pipeline.id': pipelineId, 'pipeline.user_id': userId },
+        async () =>
+          Promise.resolve(
+            bridge!.trigger!({
+              pipelineId,
+              definition: resolvedDefinition,
+              triggerPayload: body.triggerPayload,
+              triggeredBy: { userId },
+              breakpoints: body.breakpoints,
+            }),
+          ),
+      );
+      runId = out.runId;
+      // Pre-populate the run cache so terminal events have a pipelineId
+      // even if the framework rejects the definition before publishing
+      // pipeline:run:started (e.g. "No trigger node in definition").
+      getRunPersistenceService()?.registerTrigger({
+        runId,
+        pipelineId,
+        userId,
+        triggerType: 'manual',
+        at: new Date().toISOString(),
+        ...(organizationId ? { organizationId } : {}),
+      });
+    } catch (err) {
+      throw new PipelineTriggerBridgeError(err);
+    }
+  } else {
+    runId = randomUUID();
+    reqLog.info(
+      { runId, action: 'trigger.stub' },
+      'pipeline bridge not wired; synthesized runId',
+    );
+  }
+
+  const at = new Date().toISOString();
+
+  if (!bridge?.trigger) {
+    stubRunStore.put({
+      runId,
+      pipelineId,
+      userId,
+      status: 'pending',
+      triggeredAt: at,
+      updatedAt: at,
+      triggerPayload: body.triggerPayload,
+    });
+  }
+
+  // Success-path observability.
+  recordPipelineTrigger();
+  fireAndForgetAudit({
+    action: 'pipeline.trigger',
+    actorUserId: userId,
+    pipelineId,
+    runId,
+  });
+  reqLog.info({ runId, action: 'trigger.create' }, 'pipeline triggered');
+
+  return {
+    runId,
+    pipelineId,
+    triggeredBy: { userId, triggerType: 'manual' },
+    at,
+  };
+}
 
 // GET / — list past runs for a pipeline (paginated).
 //

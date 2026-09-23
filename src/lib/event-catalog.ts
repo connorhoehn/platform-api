@@ -193,6 +193,63 @@ catalog.declare({
 });
 
 catalog.declare({
+  name: 'doc:work_updated',
+  transport: 'signal',
+  producer: 'platform-api',
+  description: 'Work fields on a document changed (on doc-work:<documentId> and doc-work-scope:<scopeId>); ids and enums only — re-read GET /api/documents/:id/work',
+  schema: {
+    type: 'object',
+    properties: {
+      documentId: { type: 'string' },
+      revision: { type: 'number' },
+      fields: { type: 'array', items: { type: 'string' } },
+      status: { type: 'string' },
+      rank: { type: 'string' },
+      scopeId: { type: 'string' },
+    },
+    required: ['documentId', 'revision', 'fields'],
+  },
+});
+
+catalog.declare({
+  name: 'doc:run_draft_updated',
+  transport: 'signal',
+  producer: 'platform-api',
+  description: 'A run draft on a document changed status or content (on doc-work:<documentId>); ids and enums only',
+  schema: {
+    type: 'object',
+    properties: {
+      documentId: { type: 'string' },
+      draftId: { type: 'string' },
+      status: { type: 'string' },
+      revision: { type: 'number' },
+      runId: { type: 'string' },
+    },
+    required: ['documentId', 'draftId', 'status', 'revision'],
+  },
+});
+
+catalog.declare({
+  name: 'document.work.updated',
+  transport: 'durable',
+  producer: 'platform-api',
+  description: 'Durable record that work fields on a document changed (for a later work-graph task projection)',
+  schema: {
+    type: 'object',
+    properties: {
+      documentId: { type: 'string' },
+      organizationId: { type: 'string' },
+      revision: { type: 'number' },
+      fields: { type: 'array', items: { type: 'string' } },
+      updatedBy: { type: 'string' },
+      status: { type: 'string' },
+      scopeId: { type: 'string' },
+    },
+    required: ['documentId', 'revision', 'fields', 'updatedBy'],
+  },
+});
+
+catalog.declare({
   name: 'doc:section_updated',
   transport: 'signal',
   producer: 'platform-api',

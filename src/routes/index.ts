@@ -24,6 +24,9 @@ import { agentLoopsRouter } from './agentLoops';
 import { requireAuth } from '../middleware/auth';
 import { callLogRouter } from './callLog';
 import { workItemsRouter } from './workItems';
+import { documentWorkRouter, documentWorkListRouter } from './documentWork';
+import { runDraftsRouter } from './runDrafts';
+import { pipelineEstimateRouter } from './pipelineEstimate';
 import { documentLifecycleRouter, lifecycleSchemaRouter } from './documentLifecycle';
 import {
   documentReviewRequestsRouter,
@@ -145,6 +148,11 @@ router.use('/items', myItemsRouter);
 // Must precede the '/documents/:documentId' mount below, which would otherwise
 // swallow '/work-items' as a sub-path of the import/export router.
 router.use('/documents/:documentId/work-items', workItemsRouter);
+// Work fields and run drafts (documents-detail PLAN §2.1/§2.2). Same reason: before
+// the '/documents/:documentId' mount below.
+router.use('/documents/:documentId/work', documentWorkRouter);
+router.use('/documents/:documentId/run-drafts', runDraftsRouter);
+router.use('/document-work', documentWorkListRouter);
 // A presentation's stored revisions: the .pptx and the per-slide SVG previews
 // the deck generator files. Same reason as work-items — it must precede the
 // '/documents/:documentId' mount, which would otherwise swallow '/revisions'.
@@ -224,6 +232,8 @@ router.use('/images', imagesRouter);
 // Per-pipeline cost aggregation — GET /api/pipelines/:pipelineId/cost.
 // Mounted alongside other :pipelineId routes, after static segments.
 router.use('/pipelines/:pipelineId/cost', pipelineCostRouter);
+// Cost/duration range from the pipeline's last completed runs (documents-detail PLAN §2.3).
+router.use('/pipelines/:pipelineId/estimate', pipelineEstimateRouter);
 // Per-pipeline run trigger. Mounted AFTER the static `/metrics`, `/defs`,
 // `/health`, `/validate`, `/runs/active`, and `/approvals` segments so
 // their specific paths match first (Express resolves mounts in
