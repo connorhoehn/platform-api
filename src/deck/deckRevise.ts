@@ -304,10 +304,21 @@ export function restatedBullets(before: DeckSpec, after: DeckSpec): string[] {
 }
 
 /** Slides whose content differs, plus slides that are new. */
+/** JSON with object keys sorted at every depth; `undefined` members dropped as JSON does. */
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, member: unknown) => (
+    member && typeof member === 'object' && !Array.isArray(member)
+      ? Object.fromEntries(Object.keys(member as Record<string, unknown>).sort().map((k) => [k, (member as Record<string, unknown>)[k]]))
+      : member
+  ));
+}
+
 export function changedSlides(before: DeckSpec, after: DeckSpec): string[] {
   // A citation's title is a label, not content: renaming a wire-titled
-  // citation must not mark every slide as edited.
-  const key = (slide: DeckSlide) => JSON.stringify({
+  // citation must not mark every slide as edited. Keys are compared in sorted
+  // order: the same slide re-hydrated with its fields in another order (a run
+  // resumed after a pod swap reads its input back from storage) is unchanged.
+  const key = (slide: DeckSlide) => stableJson({
     ...slide,
     sources: slide.sources.map((source) => `${source.documentId}#${source.anchor ?? ''}`),
   });

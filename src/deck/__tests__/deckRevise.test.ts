@@ -151,6 +151,14 @@ describe('helpers', () => {
     next.slides[1] = { ...next.slides[1]!, bullets: ['Ship Friday'] };
     expect(changedSlides(deck(), next)).toEqual(['transcript']);
   });
+
+  it('changedSlides ignores key order (a resumed run re-reads its input spec from storage)', () => {
+    const reordered = deck();
+    reordered.slides = reordered.slides.map((slide) => Object.fromEntries(Object.entries(slide).reverse()) as typeof slide);
+    expect(changedSlides(deck(), reordered)).toEqual([]);
+    reordered.slides[1] = { ...reordered.slides[1]!, bullets: ['Ship Friday'] };
+    expect(changedSlides(deck(), reordered)).toEqual(['transcript']);
+  });
 });
 
 describe('reviseDeck — citations titled with a wire id (decks drafted before f100e61)', () => {
