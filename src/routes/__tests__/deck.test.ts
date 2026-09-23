@@ -18,7 +18,15 @@ jest.mock('../../deck/deckFixture', () => {
 jest.mock('../../lib/aws-clients', () => ({ docClient: { send: jest.fn() }, ddbClient: { send: jest.fn() } }));
 jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `test-${name}` }));
 
+const reviseDeck = jest.fn();
+
+jest.mock('../../deck/deckRevise', () => {
+  const actual = jest.requireActual('../../deck/deckRevise');
+  return { ...actual, reviseDeck: (...args: unknown[]) => reviseDeck(...args) };
+});
+
 import { deckRouter } from '../deck';
+import { DeckReviseError } from '../../deck/deckRevise';
 import { NoFixtureMaterialError } from '../../deck/deckFixture';
 
 function post(path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -61,7 +69,7 @@ afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-beforeEach(() => buildDeckFixture.mockReset());
+beforeEach(() => { buildDeckFixture.mockReset(); reviseDeck.mockReset(); });
 
 describe('POST /api/deck/preview', () => {
   it('renders every slide plus Sources, with warnings, and stores nothing', async () => {
@@ -131,5 +139,56 @@ describe('POST /api/deck/fixture', () => {
     const res = await post('/api/deck/fixture', { from: { recordingId: 'rec-missing' } });
     expect(res.status).toBe(400);
     expect(String(res.body.error)).toContain('can be read');
+  });
+});
+
+describe('POST /api/deck/revise', () => {
+  it('passes the instruction, the slide and the sources through and answers the edit', async () => {
+    const edited = sampleDeck();
+    edited.slides[1]!.title = 'Agenda, short';
+    reviseDeck.mockResolvedValue({ spec: edited, summary: 'Shortened the title.', changedSlideIds: ['agenda'], warnings: [], source: 'model' });
+    const res = await post('/api/deck/revise', {
+      spec: sampleDeck(), instruction: '  make it shorter ', slideId: 'agenda',
+      sources: [{ kind: 'transcript', id: 'active-now-planning-transcript' }],
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ summary: 'Shortened the title.', changedSlideIds: ['agenda'], source: 'model' });
+    const [input] = reviseDeck.mock.calls[0] as [{ instruction: string; slideId?: string; sources: unknown[] }];
+    expect(input.instruction).toBe('make it shorter');
+    expect(input.slideId).toBe('agenda');
+    expect(input.sources).toEqual([{ kind: 'transcript', id: 'active-now-planning-transcript' }]);
+  });
+
+  it('edits the whole deck when no slide is named', async () => {
+    reviseDeck.mockResolvedValue({ spec: sampleDeck(), summary: 's', changedSlideIds: [], warnings: [], source: 'model' });
+    expect((await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'tighten it' })).status).toBe(200);
+    expect((reviseDeck.mock.calls[0] as [{ slideId?: string }])[0].slideId).toBeUndefined();
+  });
+
+  it('400s a missing instruction, an unknown slide, a bad source and a spec that is not a deck', async () => {
+    expect((await post('/api/deck/revise', { spec: sampleDeck(), instruction: ' ' })).status).toBe(400);
+    expect((await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x', slideId: 'nope' })).status).toBe(400);
+    expect((await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x', sources: [{ kind: 'web', id: 'x' }] })).status).toBe(400);
+    const broken = { ...sampleDeck(), slides: [{ id: 'a', layout: 'bullets', title: 'A', sources: [] }] };
+    const res = await post('/api/deck/revise', { spec: broken, instruction: 'x' });
+    expect(res.status).toBe(400);
+    expect(String(res.body.error)).toContain('needs at least one bullet');
+    expect(reviseDeck).not.toHaveBeenCalled();
+  });
+
+  it('lets an uncited deck through — the agent can add the citation', async () => {
+    reviseDeck.mockResolvedValue({ spec: sampleDeck(), summary: 's', changedSlideIds: [], warnings: [], source: 'model' });
+    const spec = sampleDeck();
+    spec.slides[0]!.sources = [];
+    expect((await post('/api/deck/revise', { spec, instruction: 'cite the plan', sources: [{ kind: 'document', id: 'doc-plan' }] })).status).toBe(200);
+  });
+
+  it('answers the model failure honestly, with the reason and no spec', async () => {
+    reviseDeck.mockRejectedValue(new DeckReviseError('The agent\'s edit broke the deck\'s rules, so nothing was changed.', 502, 'slides[1].sources: every slide must cite at least one source document', ['slides[1].sources: every slide must cite at least one source document']));
+    const res = await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x' });
+    expect(res.status).toBe(502);
+    expect(res.body.spec).toBeUndefined();
+    expect(String(res.body.reason)).toContain('must cite');
+    expect(res.body.errors).toHaveLength(1);
   });
 });

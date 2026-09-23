@@ -341,7 +341,7 @@ export function fixtureSpec(material: FixtureMaterial, title: string): DeckSpec 
   return validation.spec;
 }
 
-async function askModel(llm: LLMClient, prompt: string, timeoutMs: number): Promise<string> {
+export async function askModel(llm: LLMClient, prompt: string, timeoutMs: number): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let text = '';
