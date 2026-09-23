@@ -21,6 +21,7 @@
 // The bytes live in the existing blob store (`IMAGE_BLOB_STORE=fs` →
 // VolumeImageBlobStore), which now stores assets as well as images.
 
+import { randomUUID } from 'node:crypto';
 import { GetCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { docClient as defaultDocClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
@@ -139,6 +140,41 @@ export interface AppendRevisionInput {
   transcriptIds?: readonly string[];
   /** A name for this revision. Defaults to its id (`v3`). */
   label?: string;
+  /**
+   * The newest revision the caller knew about when it started editing — `null`
+   * for "none yet". When given and the row's head has moved past it, the append
+   * is refused with a `PresentationRevisionConflictError` naming the new head,
+   * rather than filing the caller's spec on top of a revision it never saw.
+   * Left out (a pipeline run that owns the document), a concurrent append just
+   * pushes this one to the next id.
+   */
+  expectedHead?: string | null;
+}
+
+/** Someone else's revision landed first. Carries the head the caller did not see. */
+export class PresentationRevisionConflictError extends Error {
+  constructor(
+    readonly documentId: string,
+    readonly head: StoredRevision | null,
+    readonly revisionCount: number,
+  ) {
+    super(head
+      ? `${head.label || head.id} was saved while this one was being written`
+      : 'the presentation changed while this revision was being written');
+    this.name = 'PresentationRevisionConflictError';
+  }
+}
+
+/** How many times an unconditioned append re-reads and takes the next id. */
+export const MAX_APPEND_ATTEMPTS = 5;
+
+function conditionFailed(error: unknown): boolean {
+  return (error as { name?: string })?.name === 'ConditionalCheckFailedException';
+}
+
+function headOf(row: PresentationDocumentRow | null): StoredRevision | null {
+  const revisions = row?.revisions ?? [];
+  return revisions.length ? revisions[revisions.length - 1]! : null;
 }
 
 export interface AppendRevisionResult {
@@ -224,12 +260,19 @@ export function blobKeySegment(value: string): string {
   return value.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 80);
 }
 
-export function pptxBlobKey(documentId: string, revisionId: string): string {
-  return `deck-${blobKeySegment(documentId)}-${blobKeySegment(revisionId)}.pptx`;
+/**
+ * `attempt` makes the key unique to one write. Two saves racing for the same
+ * `vN` both write their bytes before either commits the row; with a key made
+ * of the revision id alone the loser overwrote the winner's `.pptx`, and the
+ * row that won pointed at the bytes that lost. Readers only ever follow the
+ * key the row recorded, so the suffix costs nothing to read.
+ */
+export function pptxBlobKey(documentId: string, revisionId: string, attempt?: string): string {
+  return `deck-${blobKeySegment(documentId)}-${blobKeySegment(revisionId)}${attempt ? `-${blobKeySegment(attempt)}` : ''}.pptx`;
 }
 
-export function slideBlobKey(documentId: string, revisionId: string, slideId: string): string {
-  return `deck-${blobKeySegment(documentId)}-${blobKeySegment(revisionId)}-${blobKeySegment(slideId)}.svg`;
+export function slideBlobKey(documentId: string, revisionId: string, slideId: string, attempt?: string): string {
+  return `deck-${blobKeySegment(documentId)}-${blobKeySegment(revisionId)}${attempt ? `-${blobKeySegment(attempt)}` : ''}-${blobKeySegment(slideId)}.svg`;
 }
 
 export function nextRevisionId(row: PresentationDocumentRow | null): string {
@@ -294,11 +337,36 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
    * generates a deck unprompted may not).
    */
   async appendRevision(input: AppendRevisionInput): Promise<AppendRevisionResult> {
-    const existing = await this.get(input.documentId);
+    for (let attempt = 1; ; attempt += 1) {
+      const existing = await this.get(input.documentId);
+      if (input.expectedHead !== undefined && (headOf(existing)?.id ?? null) !== input.expectedHead) {
+        throw new PresentationRevisionConflictError(input.documentId, headOf(existing), existing?.revisions?.length ?? 0);
+      }
+      try {
+        return await this.writeRevision(input, existing);
+      } catch (error) {
+        if (!conditionFailed(error)) throw error;
+        // Someone else's revision took this id between our read and our write.
+        const current = await this.get(input.documentId);
+        log.info({ documentId: input.documentId, attempt, head: headOf(current)?.id ?? null }, 'presentation revision raced another save');
+        if (input.expectedHead !== undefined || attempt >= MAX_APPEND_ATTEMPTS) {
+          throw new PresentationRevisionConflictError(input.documentId, headOf(current), current?.revisions?.length ?? 0);
+        }
+      }
+    }
+  }
+
+  /**
+   * One attempt: bytes under keys unique to this attempt, then the row, whose
+   * write is conditioned on the revision count this attempt read — so of two
+   * saves that both computed `vN`, exactly one records it.
+   */
+  private async writeRevision(input: AppendRevisionInput, existing: PresentationDocumentRow | null): Promise<AppendRevisionResult> {
     const at = this.now().toISOString();
     const revisionId = nextRevisionId(existing);
+    const writeId = randomUUID().slice(0, 8);
 
-    const pptxKey = pptxBlobKey(input.documentId, revisionId);
+    const pptxKey = pptxBlobKey(input.documentId, revisionId, writeId);
     const pptxMeta = { contentType: PPTX_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId}.pptx` };
     // The durable copy first: a revision recorded with bytes only on a volume
     // that may not come back is the failure this whole file keeps fixing.
@@ -318,7 +386,7 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     const slides: StoredSlide[] = [];
     for (const [index, slide] of input.slides.entries()) {
       const asset = await this.blobStore.putBlob(
-        slideBlobKey(input.documentId, revisionId, slide.id),
+        slideBlobKey(input.documentId, revisionId, slide.id, writeId),
         Buffer.from(slide.svg, 'utf8'),
         { contentType: SVG_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId} ${slide.id}` },
       );
@@ -373,13 +441,15 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
           revisionSlides: { [revisionId]: slides },
           revisionPreviews: firstSlidePreview(revisionId, input.slides),
         },
+        ConditionExpression: 'attribute_not_exists(documentId)',
       }));
       return { documentId: input.documentId, revision };
     }
 
-    // Read-modify-write on the maps: DDB cannot SET a nested path whose parent
-    // map may not exist, and a document only ever has one deck run writing to it
-    // at a time (the run owns the document it was handed).
+    // Read-modify-write on the maps (DDB cannot SET a nested path whose parent
+    // map may not exist), so the write only lands if the row still holds the
+    // revisions this attempt read. A deck run and a person saving by hand — or
+    // two people — can and do write the same document at once.
     const revisions = [...(existing.revisions ?? []), revision];
     await this.docClient.send(new UpdateCommand({
       TableName: DOCUMENTS_TABLE,
@@ -394,8 +464,14 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
         'pageCount = :pageCount',
         'updatedAt = :updatedAt',
       ].join(', '),
+      // A row the client created empty has no `revisions` at all, and
+      // size() of a missing attribute is false, not 0.
+      ConditionExpression: existing.revisions?.length
+        ? 'attribute_exists(documentId) AND size(revisions) = :expectedCount'
+        : 'attribute_exists(documentId) AND (attribute_not_exists(revisions) OR size(revisions) = :expectedCount)',
       ExpressionAttributeNames: { '#type': 'type', '#title': 'title' },
       ExpressionAttributeValues: {
+        ':expectedCount': existing.revisions?.length ?? 0,
         ':type': PRESENTATION_DOCUMENT_TYPE,
         ':title': existing.title || input.title,
         ':revisions': revisions,

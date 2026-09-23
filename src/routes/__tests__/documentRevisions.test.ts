@@ -34,6 +34,7 @@ jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `tes
 import { documentRevisionsRouter, safeFilename } from '../documentRevisions';
 import {
   DdbPresentationDocumentStore,
+  PresentationRevisionConflictError,
   setPresentationDocumentStore,
   type PresentationDocumentRow,
   type PresentationDocumentStore,
@@ -87,6 +88,9 @@ const store: PresentationDocumentStore = {
   revisionFile: (documentId, revisionId) => realStore.revisionFile(documentId, revisionId),
   appendRevision: async (input) => {
     appended.push(input as unknown as Record<string, unknown>);
+    if (input.expectedHead !== undefined && input.expectedHead !== 'v1') {
+      throw new PresentationRevisionConflictError(input.documentId, row.revisions![0]!, 1);
+    }
     return {
       documentId: input.documentId,
       revision: {
@@ -285,6 +289,27 @@ describe('POST /api/documents/:id/revisions', () => {
 
   it('400s when no spec is given', async () => {
     expect((await postJson('/api/documents/doc-1/revisions', {})).status).toBe(400);
+  });
+
+  it('passes the base the editor knew about through, and saves when it is still the head', async () => {
+    const res = await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck(), baseRevisionId: 'v1' });
+    expect(res.status).toBe(201);
+    expect(appended[0]!.expectedHead).toBe('v1');
+  }, 30_000);
+
+  it('409s a save built on a revision that is no longer the head, naming the one that landed', async () => {
+    const res = await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck(), baseRevisionId: null });
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      code: 'revision-conflict',
+      revisionCount: 1,
+      head: { id: 'v1', label: 'v1', createdBy: 'user-frank', createdAt: '2026-09-21T10:00:00.000Z' },
+    });
+  }, 30_000);
+
+  it('400s a base that is not a revision id', async () => {
+    expect((await postJson('/api/documents/doc-1/revisions', { spec: sampleDeck(), baseRevisionId: 7 })).status).toBe(400);
+    expect(appended).toHaveLength(0);
   });
 });
 

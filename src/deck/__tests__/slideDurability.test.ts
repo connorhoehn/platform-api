@@ -109,15 +109,15 @@ describe('a slide’s markup lives on the row', () => {
 });
 
 describe('the .pptx has a second home', () => {
-  it('is written to both stores, and re-rendering overwrites both', async () => {
+  it('is written to both stores under the same key', async () => {
     const primary = new InMemoryImageBlobStore();
     const mirror = new InMemoryImageBlobStore();
     const { client } = fakeClient();
     const store = new DdbPresentationDocumentStore({ docClient: client, blobStore: primary, mirror });
-    await store.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PKdeck'), slides });
+    const { revision } = await store.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PKdeck'), slides });
 
-    expect((await primary.getBlob('deck-doc-1-v1.pptx'))!.body.toString('utf8')).toBe('PKdeck');
-    expect((await mirror.getBlob('deck-doc-1-v1.pptx'))!.body.toString('utf8')).toBe('PKdeck');
+    expect((await primary.getBlob(revision.asset.key))!.body.toString('utf8')).toBe('PKdeck');
+    expect((await mirror.getBlob(revision.asset.key))!.body.toString('utf8')).toBe('PKdeck');
   });
 
   it('serves the file from the durable copy when the volume no longer has it', async () => {
@@ -155,7 +155,7 @@ describe('the .pptx has a second home', () => {
     const { client } = fakeClient();
     const store = new DdbPresentationDocumentStore({ docClient: client, blobStore: new InMemoryImageBlobStore(), mirror: null });
     const { revision } = await store.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides });
-    expect(revision.asset.key).toBe('deck-doc-1-v1.pptx');
+    expect(revision.asset.key).toMatch(/^deck-doc-1-v1-[A-Za-z0-9]{8}\.pptx$/);
   });
 });
 
@@ -194,9 +194,8 @@ describe('a deck’s blobs go to the configured directory', () => {
     });
 
     const files = readdirSync(directory);
-    expect(files).toContain('deck-doc-1-v1.pptx');
-    expect(files).toContain('deck-doc-1-v1-cover.svg');
-    expect(files).toContain('deck-doc-1-v1-sources.svg');
-    expect(revision.asset.key).toBe('deck-doc-1-v1.pptx');
+    expect(files).toContain(revision.asset.key);
+    for (const slide of revision.slides) expect(files).toContain(slide.asset.key);
+    expect(revision.asset.key).toMatch(/^deck-doc-1-v1-[A-Za-z0-9]{8}\.pptx$/);
   });
 });

@@ -75,15 +75,17 @@ describe('appendRevision — the first revision', () => {
     expect((item.revisionSlides as Record<string, unknown[]>).v1).toHaveLength(2);
 
     expect(revision).toMatchObject({ id: 'v1', label: 'v1', slideCount: 2, createdBy: 'user-frank' });
-    expect(revision.asset).toEqual({ key: 'deck-doc-1-v1.pptx', contentType: PPTX_CONTENT_TYPE, sizeBytes: 6 });
+    // Keys carry a per-write suffix so a racing save cannot overwrite them.
+    expect(revision.asset).toEqual({ key: expect.stringMatching(/^deck-doc-1-v1-[A-Za-z0-9]{8}\.pptx$/), contentType: PPTX_CONTENT_TYPE, sizeBytes: 6 });
     expect(revision.slides[0]).toMatchObject({
       id: 'cover', index: 1, title: 'Cover', previewHandle: 'doc-1.v1.cover',
-      asset: { key: 'deck-doc-1-v1-cover.svg', contentType: 'image/svg+xml' },
+      asset: { key: expect.stringMatching(/^deck-doc-1-v1-[A-Za-z0-9]{8}-cover\.svg$/), contentType: 'image/svg+xml' },
     });
+    expect(put.input.ConditionExpression).toBe('attribute_not_exists(documentId)');
 
     // The bytes really are in the store, under the keys the row points at.
-    expect((await blobStore.getBlob('deck-doc-1-v1.pptx'))!.body.toString('utf8')).toBe('PKdeck');
-    expect((await blobStore.getBlob('deck-doc-1-v1-cover.svg'))!.body.toString('utf8')).toBe('<svg>cover</svg>');
+    expect((await blobStore.getBlob(revision.asset.key))!.body.toString('utf8')).toBe('PKdeck');
+    expect((await blobStore.getBlob(revision.slides[0]!.asset.key))!.body.toString('utf8')).toBe('<svg>cover</svg>');
   });
 });
 

@@ -27,6 +27,7 @@ import log from '../lib/logger';
 import {
   getPresentationDocumentStore,
   PRESENTATION_DOCUMENT_TYPE,
+  PresentationRevisionConflictError,
   type PresentationDocumentRow,
   type StoredRevision,
 } from '../deck/presentationDocuments';
@@ -98,8 +99,16 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
 documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
   if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
-  const body = (req.body ?? {}) as { spec?: unknown; label?: unknown; title?: unknown; transcriptIds?: unknown };
+  const body = (req.body ?? {}) as { spec?: unknown; label?: unknown; title?: unknown; transcriptIds?: unknown; baseRevisionId?: unknown };
   if (body.spec === undefined) throw new ValidationError('spec is required');
+  // The newest revision the editor knew about. Sent, a save that would land on
+  // top of a revision the person never saw answers 409 instead; left out (an
+  // older client), it appends as before, but still never shares an id.
+  if (body.baseRevisionId !== undefined && body.baseRevisionId !== null
+    && (typeof body.baseRevisionId !== 'string' || !ID.test(body.baseRevisionId))) {
+    throw new ValidationError('baseRevisionId must be a revision id or null');
+  }
+  const expectedHead = body.baseRevisionId as string | null | undefined;
   const outcome = previewDeckSpec(body.spec);
   if (!outcome.ok) {
     res.status(outcome.status).json({ error: outcome.errors[0], errors: outcome.errors });
@@ -115,16 +124,35 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
     : [];
 
   const pptx = await renderPptx(outcome.spec);
-  const { revision } = await getPresentationDocumentStore().appendRevision({
-    documentId,
-    title,
-    createdBy,
-    pptx,
-    slides: outcome.preview.slides.map((slide) => ({ id: slide.id, title: slide.title, svg: slide.svg })),
-    spec: outcome.spec,
-    ...(transcriptIds.length ? { transcriptIds } : {}),
-    ...(label ? { label } : {}),
-  });
+  let revision: StoredRevision;
+  try {
+    ({ revision } = await getPresentationDocumentStore().appendRevision({
+      documentId,
+      title,
+      createdBy,
+      pptx,
+      slides: outcome.preview.slides.map((slide) => ({ id: slide.id, title: slide.title, svg: slide.svg })),
+      spec: outcome.spec,
+      ...(transcriptIds.length ? { transcriptIds } : {}),
+      ...(label ? { label } : {}),
+      ...(expectedHead !== undefined ? { expectedHead } : {}),
+    }));
+  } catch (error) {
+    if (!(error instanceof PresentationRevisionConflictError)) throw error;
+    log.info({ documentId, expectedHead: expectedHead ?? null, head: error.head?.id ?? null, userId: createdBy }, 'deck revision refused: someone saved first');
+    res.status(409).json({
+      error: error.message,
+      code: 'revision-conflict',
+      revisionCount: error.revisionCount,
+      head: error.head ? {
+        id: error.head.id,
+        label: error.head.label,
+        createdAt: error.head.createdAt,
+        createdBy: error.head.createdBy,
+      } : null,
+    });
+    return;
+  }
   log.info({ documentId, revisionId: revision.id, slides: revision.slideCount, userId: createdBy }, 'deck revision saved');
   // A revision saved by hand reaches the work graph the same way a rendered
   // one does — same source, same node — with no run to claim as its
