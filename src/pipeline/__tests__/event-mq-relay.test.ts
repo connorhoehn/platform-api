@@ -1,3 +1,4 @@
+import { isPipelineMqLaneEvent, isPipelineHotLaneEvent } from '@connorhoehn/event-catalog';
 import { isLiveMqEventType, resolveLiveMqConfig, startPipelineEventMqRelay } from '../event-mq-relay';
 
 // NFR #35: live pipeline progress onto the MQ queue the gateway consumes.
@@ -22,6 +23,13 @@ describe('pipeline live events → MQ (NFR #35)', () => {
     }
     for (const t of ['pipeline:llm:token', 'pipeline:run:checkpoint', 'pipeline:step:heartbeat', 'pipeline:step:context.patched', 'social:thing', undefined]) {
       expect(isLiveMqEventType(t)).toBe(false);
+    }
+  });
+
+  it('is the event-catalog lane predicate, so the gateway hot lane carries exactly the rest (NFR #130)', () => {
+    expect(isLiveMqEventType).toBe(isPipelineMqLaneEvent);
+    for (const t of ['pipeline:run:started', 'pipeline:llm:token', 'pipeline:run:checkpoint', 'pipeline:step:context.patched']) {
+      expect(isLiveMqEventType(t)).toBe(!isPipelineHotLaneEvent(t));
     }
   });
 

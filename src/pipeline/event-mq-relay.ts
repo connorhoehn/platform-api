@@ -11,8 +11,10 @@
  * so a deployment without the Redis path saw no run/step progress at all.
  *
  * WHAT: run and step lifecycle, approvals, and the deck-revise phases — the
- * progress a person watches. Not token streams, heartbeats or checkpoints
- * (high rate or large context; they stay on the Redis path).
+ * progress a person watches (event-catalog `isPipelineMqLaneEvent`). Not token
+ * streams, heartbeats or checkpoints (high rate or large context; they stay on
+ * the Redis path, which the gateway subscribes as its hot lane even in MQ-only
+ * mode).
  *
  * ONE DELIVERY: the body is the BusEvent unchanged, `id` included. When a
  * gateway also runs its Redis relay it drops the second copy by `id`
@@ -25,7 +27,7 @@
  * memory and never blocks or fails a run.
  */
 import type { BusEvent } from 'distributed-core';
-import { MQ_QUEUE_NAMES } from '@connorhoehn/event-catalog';
+import { MQ_QUEUE_NAMES, isPipelineMqLaneEvent, PIPELINE_MQ_MAX_BODY_BYTES } from '@connorhoehn/event-catalog';
 import { createServiceRequestHeaders } from '@connorhoehn/service-runtime';
 import log from '../lib/logger';
 
@@ -33,25 +35,19 @@ const relayLog = log.child({ component: 'pipeline-event-mq-relay' });
 
 export const LIVE_MQ_QUEUE: string = MQ_QUEUE_NAMES.PIPELINE_EVENTS;
 const MAX_BACKLOG = 1_000;
-/** MQ's default max message is 256 KiB; leave room for the envelope. */
-const MAX_BODY_BYTES = 200 * 1024;
+/** MQ's default max message is 256 KiB; leave room for the envelope. Shared with the gateway's hot lane. */
+const MAX_BODY_BYTES = PIPELINE_MQ_MAX_BODY_BYTES;
 /** Live progress is worthless after an hour; do not let a dead consumer hoard it. */
 const RETENTION_SECONDS = 3_600;
 
-const EXCLUDED = new Set([
-  'pipeline:run:checkpoint',
-  'pipeline:step:heartbeat',
-]);
-
-/** True for the progress events that go to MQ. */
-export function isLiveMqEventType(type: unknown): boolean {
-  if (typeof type !== 'string' || EXCLUDED.has(type)) return false;
-  if (type.startsWith('pipeline:step:context.')) return false;
-  return type.startsWith('pipeline:run:')
-    || type.startsWith('pipeline:step:')
-    || type.startsWith('pipeline:approval:')
-    || type.startsWith('pipeline:deck:revise:');
-}
+/**
+ * True for the progress events that go to MQ. The list lives in event-catalog
+ * so the gateway's hot lane (the Redis subscription it keeps in MQ-only mode)
+ * carries exactly the complement: checkpoints, heartbeats, step context
+ * patches, every `pipeline:llm:*` event, and bodies over MAX_BODY_BYTES
+ * (realtime-examples NFR #130).
+ */
+export const isLiveMqEventType: (type: unknown) => boolean = isPipelineMqLaneEvent;
 
 export interface LiveMqConfig {
   enabled: boolean;
