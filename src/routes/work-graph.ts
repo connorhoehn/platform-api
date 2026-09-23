@@ -24,6 +24,9 @@ import {
 } from '../work-graph/orchestrator';
 import { publishViewBase, type ViewBaseStore } from '../work-graph/viewBase';
 import { getRedisCacheClient } from '../lib/redis-client';
+import {
+  perUserRateLimit, WORK_GRAPH_PREVIEW_PER_MINUTE, WORK_GRAPH_READ_PER_MINUTE,
+} from '../middleware/rateLimit';
 
 type JsonRecord = Record<string, unknown>;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -318,10 +321,27 @@ async function redisViewBaseStore(): Promise<ViewBaseStore | null> {
 
 export function createWorkGraphRouter(
   orchestrator: WorkGraphOrchestrator,
-  options: { viewBaseStore?: () => Promise<ViewBaseStore | null> } = {},
+  options: {
+    viewBaseStore?: () => Promise<ViewBaseStore | null>;
+    /** Per-user limits (NFR #9); tests that fire many requests pass false. */
+    rateLimit?: boolean;
+  } = {},
 ): Router {
   const router = Router();
   const viewBaseStore = options.viewBaseStore ?? redisViewBaseStore;
+
+  if (options.rateLimit !== false) {
+    // Previews are one request per image, so they get their own, larger
+    // bucket; everything else here is a read of the graph. The sibling
+    // compute-sessions router is mounted under this prefix and is not charged.
+    const readLimit = perUserRateLimit('work-graph:read', WORK_GRAPH_READ_PER_MINUTE);
+    const previewLimit = perUserRateLimit('work-graph:preview', WORK_GRAPH_PREVIEW_PER_MINUTE);
+    router.use((req, res, next) => {
+      if (req.path.startsWith('/compute-sessions')) { next(); return; }
+      const limit = req.path.startsWith('/previews/') ? previewLimit : readLimit;
+      void limit(req, res, next);
+    });
+  }
 
   const handler = (
     fn: (req: Request, res: Response, viewer: AuthenticatedWorkGraphViewer) => Promise<void>,

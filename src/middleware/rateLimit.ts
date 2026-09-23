@@ -313,3 +313,39 @@ export function pipelineWriteRateLimit(
     store: storeOverride ?? null,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Per-user limits on the Active Now / deck surfaces (realtime-examples NFR #9).
+//
+// Each scope is its own bucket per verified subject. With
+// `REDIS_RATE_LIMIT=true` (set by the chart) the buckets live in the main
+// Redis — one `EVAL` per request — so every platform replica spends from the
+// same bucket; without it each replica enforces the cap on its own.
+//
+//   deck:fixture       6 / min   — each call is a model call (up to ~10 s)
+//   deck:preview      60 / min   — renders a whole spec to SVG
+//   work-graph:read  300 / min   — snapshot, node/edge, people, grants, actions
+//   work-graph:preview 1200 / min — one image per slide/card, revalidations
+//                                   included (the batch route counts once)
+// ---------------------------------------------------------------------------
+
+/** Capacity and refill are the same number per minute: a full minute's burst. */
+export function perUserRateLimit(
+  scope: string,
+  perMinute: number,
+  storeOverride?: RateLimitStore | null,
+): RequestHandler {
+  return createRateLimiter({
+    capacity: perMinute,
+    refillRate: perMinute,
+    refillIntervalMs: 60_000,
+    scope,
+    key: (req) => req.user?.sub ?? req.ip ?? 'anon',
+    store: storeOverride ?? null,
+  });
+}
+
+export const DECK_FIXTURE_PER_MINUTE = 6;
+export const DECK_PREVIEW_PER_MINUTE = 60;
+export const WORK_GRAPH_READ_PER_MINUTE = 300;
+export const WORK_GRAPH_PREVIEW_PER_MINUTE = 1200;

@@ -15,6 +15,7 @@
 import { randomUUID } from 'crypto';
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
+import { DECK_FIXTURE_PER_MINUTE, DECK_PREVIEW_PER_MINUTE, perUserRateLimit } from '../middleware/rateLimit';
 import { asyncHandler, AppError, ValidationError } from '../middleware/error-handler';
 import { previewDeckSpec } from '../deck/preview';
 import { buildDeckFixture, NoFixtureMaterialError, type DeckFixtureFrom } from '../deck/deckFixture';
@@ -37,6 +38,10 @@ import type { DeckSpec } from '../deck/DeckSpec';
 
 export const deckRouter = Router();
 
+/** Per-user limits (NFR #9): a fixture is a model call, a preview renders a whole spec. */
+const fixtureLimit = perUserRateLimit('deck:fixture', DECK_FIXTURE_PER_MINUTE);
+const previewLimit = perUserRateLimit('deck:preview', DECK_PREVIEW_PER_MINUTE);
+
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,200}$/;
 /** A client-chosen revise id: short, and safe in a log line and a channel payload. */
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
@@ -51,7 +56,7 @@ export const MAX_SPEC_BYTES = 512 * 1024;
  * Renders a spec without keeping it. 400 when it is not a deck, 413 when it is
  * too big to be one — the editor can act on the difference.
  */
-deckRouter.post('/preview', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+deckRouter.post('/preview', requireAuth, previewLimit, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const body = (req.body ?? {}) as { spec?: unknown };
   const spec = body.spec ?? body;
   const size = Buffer.byteLength(JSON.stringify(spec ?? null));
@@ -77,7 +82,7 @@ deckRouter.post('/preview', requireAuth, asyncHandler(async (req: Request, res: 
  * transcript. `source` says whether the model wrote it; when it did not, the
  * reason is returned with it.
  */
-deckRouter.post('/fixture', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+deckRouter.post('/fixture', requireAuth, fixtureLimit, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const body = (req.body ?? {}) as { from?: unknown; title?: unknown };
   const raw = (body.from ?? {}) as Record<string, unknown>;
   const from: DeckFixtureFrom = {};

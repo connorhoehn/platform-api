@@ -34,13 +34,14 @@ jest.mock('../../deck/deckRevise', () => {
 });
 
 import { deckRouter } from '../deck';
+import { _resetRateLimitMemFallback } from '../../middleware/rateLimit';
 import { DeckReviseError } from '../../deck/deckRevise';
 import { NoFixtureMaterialError } from '../../deck/deckFixture';
 import { setPresentationDocumentStore, type PresentationDocumentRow } from '../../deck/presentationDocuments';
 
 const deckRows = new Map<string, PresentationDocumentRow>();
 
-function post(path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
+function post(path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown>; headers: http.IncomingHttpHeaders }> {
   const { port } = server.address() as AddressInfo;
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
   return new Promise((resolve, reject) => {
@@ -52,7 +53,7 @@ function post(path: string, body: unknown): Promise<{ status: number; body: Reco
       res.on('data', (chunk: Buffer) => chunks.push(chunk));
       res.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
-        resolve({ status: res.statusCode ?? 0, body: text ? JSON.parse(text) : {} });
+        resolve({ status: res.statusCode ?? 0, body: text ? JSON.parse(text) : {}, headers: res.headers });
       });
     });
     req.on('error', reject);
@@ -82,7 +83,7 @@ afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-beforeEach(() => { buildDeckFixture.mockReset(); reviseDeck.mockReset(); published.length = 0; });
+beforeEach(() => { _resetRateLimitMemFallback(); buildDeckFixture.mockReset(); reviseDeck.mockReset(); published.length = 0; });
 
 /** Lets the fire-and-forget publishes land. */
 const settle = () => new Promise((resolve) => setImmediate(resolve));
@@ -148,6 +149,19 @@ describe('POST /api/deck/fixture', () => {
     expect((await post('/api/deck/fixture', { from: {} })).status).toBe(400);
     expect((await post('/api/deck/fixture', { from: { documentId: '../etc/passwd' } })).status).toBe(400);
     expect(buildDeckFixture).not.toHaveBeenCalled();
+  });
+
+  it('limits each person to 6 fixtures a minute: the 7th of 10 rapid calls is a 429 with Retry-After (NFR #9)', async () => {
+    buildDeckFixture.mockResolvedValue({ spec: sampleDeck(), source: 'model', warnings: [], transcriptIds: [], material: {} });
+    const answers = [];
+    for (let i = 0; i < 10; i += 1) {
+      answers.push(await post('/api/deck/fixture', { from: { documentId: 'doc-release-plan' } }));
+    }
+    expect(answers.map((a) => a.status)).toEqual([200, 200, 200, 200, 200, 200, 429, 429, 429, 429]);
+    expect(Number(answers[6]!.headers['retry-after'])).toBeGreaterThanOrEqual(1);
+    expect(answers[6]!.body).toMatchObject({ status: 429, title: 'Too Many Requests' });
+    // Refused calls never reach the model.
+    expect(buildDeckFixture).toHaveBeenCalledTimes(6);
   });
 
   it('400s when the named material cannot be read', async () => {
