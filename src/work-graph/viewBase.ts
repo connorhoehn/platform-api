@@ -20,7 +20,13 @@ import type { WorkGraphSnapshotV2 } from '@connorhoehn/realtime-modules/work-gra
  * The gateway keeps an identical copy of `hashViewBase` (src/work-graph/
  * viewBase.ts there); the shared test vector in both suites keeps them equal.
  */
-export const VIEW_BASE_TTL_SECONDS = 600;
+/**
+ * The base is needed from the snapshot answer to the subscribe (~1–2 s; a
+ * reconnect fetches a fresh snapshot). Two minutes covers a slow client
+ * without holding a 50–75 KB view per snapshot for long in a Redis that has
+ * no maxmemory yet (NFR #88). Identical snapshots share one key.
+ */
+export const VIEW_BASE_TTL_SECONDS = 120;
 const PUBLISH_TIMEOUT_MS = 150;
 
 export interface ViewBaseScope {

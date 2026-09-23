@@ -428,7 +428,7 @@ describe('work graph schemaVersion 2 route', () => {
     const { viewHash, ...snapshot } = asked.body as WorkGraphSnapshotV2 & { viewHash: string };
     expect(validateWorkGraphSnapshotV2(snapshot).ok).toBe(true);
     const entry = stored.get(viewBaseRedisKey(viewHash))!;
-    expect(entry.ttl).toBe(600);
+    expect(entry.ttl).toBe(120);
     expect(entry.value).toBe(serializeViewBase(snapshot as WorkGraphSnapshotV2));
     const scope = { organizationId: 'org-1', viewerId: 'frank', personId: 'connor', day: DAY, timezone: 'America/New_York', watermark: snapshot.watermark };
     expect(hashViewBase(scope, entry.value)).toBe(viewHash);
