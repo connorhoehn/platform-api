@@ -273,19 +273,19 @@ export class RunPersistenceService {
     });
 
     dedupedBus.subscribe('pipeline:run:completed', async (event) => {
-      await this.handleRunCompleted(event.payload).catch((err) => {
+      await this.handleRunCompleted(event.payload, (event as { sourceNodeId?: string }).sourceNodeId).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:completed');
       });
     });
 
     dedupedBus.subscribe('pipeline:run:failed', async (event) => {
-      await this.handleRunFailed(event.payload).catch((err) => {
+      await this.handleRunFailed(event.payload, (event as { sourceNodeId?: string }).sourceNodeId).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:failed');
       });
     });
 
     dedupedBus.subscribe('pipeline:run:cancelled', async (event) => {
-      await this.handleRunCancelled(event.payload).catch((err) => {
+      await this.handleRunCancelled(event.payload, (event as { sourceNodeId?: string }).sourceNodeId).catch((err) => {
         log.warn({ runId: event.payload.runId, err: String(err) }, 'failed to persist run:cancelled');
       });
     });
@@ -370,6 +370,8 @@ export class RunPersistenceService {
   /** Bounded memory of handled BusEvent ids → when first seen (NFR #34 at-least-once dedupe). */
   private readonly seenEventIds = new Map<string, number>();
   private static readonly SEEN_EVENT_CAP = 10_000;
+  /** Writes refused because another node owns the run row (NFR #39). */
+  ownershipLost = 0;
   /** How many deliveries the dedupe dropped — should stay 0 (NFR #38). */
   duplicateDeliveries = 0;
 
@@ -961,8 +963,11 @@ export class RunPersistenceService {
    * event alone — those fields are best-effort placeholders so the row at
    * least exists and the operator can see "something failed."
    */
-  private synthesizeStateFromTerminal(runId: string, terminalAt: string): RunState {
+  private synthesizeStateFromTerminal(runId: string, terminalAt: string, sourceNodeId?: string): RunState {
     return {
+      // NFR #39: the node that emitted the terminal event owns the run; a
+      // synthesized row is written only under that ownership condition.
+      ...(sourceNodeId ? { ownerNodeId: sourceNodeId } : {}),
       pipelineId: 'unknown',
       runId,
       status: 'running',
@@ -988,11 +993,11 @@ export class RunPersistenceService {
     at: string;
     status?: 'completed' | 'rejected';
     rejection?: RunRejection;
-  }): Promise<void> {
+  }, sourceNodeId?: string): Promise<void> {
     this.touchLastEvent(event.runId, event.at);
     const state =
       (await this.waitForCachedRun(event.runId)) ??
-      this.synthesizeStateFromTerminal(event.runId, event.at);
+      this.synthesizeStateFromTerminal(event.runId, event.at, sourceNodeId);
 
     // Canonical spelling (matches PipelineExecutor and the UI). This used to
     // write the legacy `succeeded` alias, which made the runs *list* endpoint
@@ -1017,11 +1022,11 @@ export class RunPersistenceService {
     runId: string;
     error: { nodeId: string; message: string; stack?: string };
     at: string;
-  }): Promise<void> {
+  }, sourceNodeId?: string): Promise<void> {
     this.touchLastEvent(event.runId, event.at);
     const state =
       (await this.waitForCachedRun(event.runId)) ??
-      this.synthesizeStateFromTerminal(event.runId, event.at);
+      this.synthesizeStateFromTerminal(event.runId, event.at, sourceNodeId);
 
     state.status = 'failed';
     state.completedAt = event.at;
@@ -1050,11 +1055,11 @@ export class RunPersistenceService {
     this.runCache.delete(event.runId);
   }
 
-  private async handleRunCancelled(event: { runId: string; at: string }): Promise<void> {
+  private async handleRunCancelled(event: { runId: string; at: string }, sourceNodeId?: string): Promise<void> {
     this.touchLastEvent(event.runId, event.at);
     const state =
       (await this.waitForCachedRun(event.runId)) ??
-      this.synthesizeStateFromTerminal(event.runId, event.at);
+      this.synthesizeStateFromTerminal(event.runId, event.at, sourceNodeId);
 
     // Canonical spelling — see handleRunCompleted. The US-spelled `canceled`
     // was the same class of divergence.
@@ -1697,6 +1702,20 @@ export class RunPersistenceService {
     // Equivalent to the historical [100, 400, 1600] array via multiplier=4:
     //   sleep(n) = min(100 * 4^(n-1), 1600) → 100, 400, 1600.
     try {
+      // NFR #39: a row this node owns is written only while it still owns it.
+      const owner = item.ownerNodeId;
+      if (owner && typeof this.repository.putOwned === 'function') {
+        const written = await retryWithBackoff(() => this.repository.putOwned(item, owner), {
+          maxAttempts: 4, initialDelayMs: 100, multiplier: 4, maxDelayMs: 1600,
+        });
+        if (!written) {
+          this.ownershipLost += 1;
+          log.warn({ runId: state.runId, pipelineId: state.pipelineId, ownerNodeId: owner, status: state.status },
+            'run persistence: another node owns this run row now; this node stops writing it');
+          this.runCache.delete(state.runId);
+        }
+        return;
+      }
       await retryWithBackoff(() => this.repository.put(item), {
         maxAttempts: 4,
         initialDelayMs: 100,

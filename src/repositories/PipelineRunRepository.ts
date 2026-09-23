@@ -4,7 +4,7 @@
 // the source of truth for replay; this repository backs the
 // `/api/pipelines/:pipelineId/runs` operator-facing surface.
 
-import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { PipelineRunStatus, PipelineStepStatus } from '@connorhoehn/pipeline-runtime';
 import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { BaseRepository } from './BaseRepository';
@@ -319,6 +319,35 @@ export class PipelineRunRepository extends BaseRepository {
         ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
         : item;
     return this.putItem(stamped as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * NFR #39: `put`, but only by the node that owns the run. The row is
+   * written when it does not exist yet, has no owner, is claimed for resume
+   * by `ownerNodeId`, or is owned by `ownerNodeId` and not claimed by anyone
+   * else. A replica whose run was taken over (resumed elsewhere) or that
+   * never owned it gets `false` and writes nothing — instead of racing the
+   * owner with a full-row put and erasing its fields.
+   */
+  async putOwned(item: PipelineRunItem, ownerNodeId: string): Promise<boolean> {
+    const stamped =
+      item.ttl === undefined && isTerminalRunStatus(item.status)
+        ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
+        : item;
+    try {
+      await this.docClient.send(new PutCommand({
+        TableName: this.tableName,
+        Item: stamped as unknown as Record<string, unknown>,
+        ConditionExpression:
+          'attribute_not_exists(runId) OR attribute_not_exists(ownerNodeId) OR resumeClaimedBy = :owner '
+          + 'OR (ownerNodeId = :owner AND attribute_not_exists(resumeClaimedBy))',
+        ExpressionAttributeValues: { ':owner': ownerNodeId },
+      }));
+      return true;
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return false;
+      throw err;
+    }
   }
 
   /** Fetch a single run by composite key. */
