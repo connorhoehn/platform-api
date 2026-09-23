@@ -184,7 +184,9 @@ export function createDeckStepHandler(opts: DeckStepHandlerOpts = {}): Described
         ...TRANSCRIPT_SOURCE_PATHS.map((path) => str(readPath(context, path))).filter((value): value is string => !!value),
         ...(Array.isArray(context.transcriptIds) ? context.transcriptIds.map((value) => str(value)).filter((value): value is string => !!value) : []),
       ])];
-      const title = str(data.title) ?? spec.title;
+      // An existing presentation keeps the name its owner gave it (the store
+      // keeps it too); the spec's title only names a new one.
+      const title = str(data.title) ?? (existing && !displaced ? str(existing.title) : undefined) ?? spec.title;
 
       try {
         const { pptx, slides } = await renderDeckFiles(spec);

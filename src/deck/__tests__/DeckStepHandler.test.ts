@@ -194,6 +194,8 @@ describe('a deck never writes into another kind of document', () => {
     const outcome = await handler.execute(node({ type: 'deck', spec: sampleDeck() }), { documentId: 'doc-deck-1', requestedBy: 'user-connor' }, helpers());
     expect((outcome.output as Record<string, unknown>).documentId).toBe('doc-deck-1');
     expect((outcome.output as Record<string, unknown>).displacedDocument).toBeUndefined();
+    // The presentation keeps its owner's name; the spec's title does not rename it.
+    expect((outcome.output as Record<string, unknown>).title).toBe('Sprint review');
   }, 30_000);
 
   it('uses the id it was given when no row exists yet — the client made the page', async () => {

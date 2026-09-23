@@ -493,6 +493,16 @@ describe('work graph schemaVersion 2 route', () => {
     expect(v1?.previewHandle).toBe('deck.v1');
   });
 
+  it('names a document by its stored title, not the title an event projected', async () => {
+    const renamed = reader({
+      artifact: async (documentId) => (documentId === 'doc-deck'
+        ? { name: 'audit-e2e-1790150600', mediaKind: 'presentation' as const }
+        : { name: 'Release plan', mediaKind: 'document' as const }),
+    });
+    const body = (await get(setup({ activityReader: renamed }), v2)).body as WorkGraphSnapshotV2;
+    expect(body.nodes.find((node) => node.id === 'deck')?.title).toBe('audit-e2e-1790150600');
+  });
+
   it('keeps a document whose source records no per-revision slides exactly as it was', async () => {
     // The hand-seeded deck: an outline and one preview per revision, no
     // `revisions[]` on the row. Its newest revision still gets the outline.

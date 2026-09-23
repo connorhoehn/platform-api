@@ -802,6 +802,13 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     if (node.kind === 'document') {
       const documentId = stored?.sourceRef.resourceId;
       const facts = documentId ? await reader.artifact(documentId) : null;
+      // The document is called what its owner named it. The projected node
+      // title comes from whatever event first saw it — a deck step's produced
+      // event carried the spec's title — so one deck read "Audit E2E" on some
+      // cards and "audit-e2e-1790150600" on others (live 2026-09-23). The
+      // store's title wins wherever the store has one.
+      const storedName = trim(facts?.name);
+      if (storedName && storedName !== node.title) node.title = storedName;
       const run = producingRun(index, node.id);
       const attention = documentId ? await reader.attention(documentId) : null;
       // What each revision is actually made of, as its own source recorded it.
