@@ -676,13 +676,13 @@ export class DynamoSourceActionAdapter implements WorkSourceActionAdapter {
     }
     if (this.source === 'pipeline' && capability === 'view-run') {
       // Opening a step opens the run it belongs to — the run page is where a
-      // step is actually readable.
-      const rows = await scanAll(this.client, {
-        TableName: PIPELINE_RUNS_TABLE,
-        FilterExpression: 'runId = :run',
-        ExpressionAttributeValues: { ':run': parsePipelineStepResourceId(resourceId).runId },
-      }, 2);
-      const row = rows.length === 1 ? rows[0] : undefined;
+      // step is actually readable. Through the same locator the ACL pass
+      // uses: one keyed read on the runId index, and an agent loop's
+      // person-day pointer row (same run id) is not mistaken for a second
+      // run — the full-table Scan here found both, called it ambiguous and
+      // 404'd every agent loop's "Open run" (realtime-examples NFR #134).
+      const runId = parsePipelineStepResourceId(resourceId).runId;
+      const row = (await runRowLocator.rows(this.client, PIPELINE_RUNS_TABLE, [runId])).get(runId) ?? undefined;
       if (typeof row?.pipelineId !== 'string' || typeof row.runId !== 'string') return { decision: 'deny' };
       return { decision: 'allow', descriptor: { kind: 'route', capability, path: `/pipelines/${encodeURIComponent(row.pipelineId)}/runs/${encodeURIComponent(row.runId)}` } };
     }

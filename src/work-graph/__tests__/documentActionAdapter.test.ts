@@ -77,3 +77,50 @@ describe('DynamoSourceActionAdapter — view-document exchange', () => {
     });
   });
 });
+
+describe('DynamoSourceActionAdapter — view-run exchange (NFR #134)', () => {
+  const { QueryCommand } = jest.requireActual('@aws-sdk/lib-dynamodb') as typeof import('@aws-sdk/lib-dynamodb');
+  function runClient(rows: Array<Record<string, unknown>>) {
+    const calls: string[] = [];
+    return {
+      calls,
+      client: {
+        send: async (command: unknown) => {
+          calls.push((command as { constructor: { name: string } }).constructor.name);
+          if (command instanceof QueryCommand) {
+            const runId = command.input.ExpressionAttributeValues?.[':r'];
+            return { Items: rows.filter((row) => row.runId === runId) };
+          }
+          throw new Error('unexpected command');
+        },
+      } as never,
+    };
+  }
+  function runTarget(runId: string): WorkAclTarget {
+    const target = documentTarget(runId, 'run');
+    const sourceRef = { source: 'pipeline' as const, resourceId: runId };
+    return { ...target, sourceRef, node: { ...target.node!, sourceRef } } as WorkAclTarget;
+  }
+
+  it("routes an agent loop to its run, ignoring the loop's person-day pointer row, with one keyed read", async () => {
+    const t = runClient([
+      { pipelineId: 'chat-agent-loop', runId: 'loop-1', status: 'completed', triggeredBy: 'owner-1' },
+      { pipelineId: 'loops-by-person#owner-1#2026-09-22', runId: 'loop-1', status: 'index', triggeredBy: 'owner-1' },
+    ]);
+    const result = await new DynamoSourceActionAdapter('pipeline', t.client).exchangeAction(scope, runTarget('loop-1'), 'view-run');
+    expect(result).toEqual({
+      decision: 'allow',
+      descriptor: { kind: 'route', capability: 'view-run', path: '/pipelines/chat-agent-loop/runs/loop-1' },
+    });
+    expect(t.calls).toEqual(['QueryCommand']);
+  });
+
+  it('still refuses a run id two real runs claim', async () => {
+    const t = runClient([
+      { pipelineId: 'p1', runId: 'dup', status: 'completed' },
+      { pipelineId: 'p2', runId: 'dup', status: 'completed' },
+    ]);
+    const result = await new DynamoSourceActionAdapter('pipeline', t.client).exchangeAction(scope, runTarget('dup'), 'view-run');
+    expect(result).toEqual({ decision: 'deny' });
+  });
+});
