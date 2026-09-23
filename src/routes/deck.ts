@@ -2,12 +2,14 @@
 //
 //   POST /api/deck/preview  { spec }        → the slides, as SVG, plus warnings
 //   POST /api/deck/fixture  { from, title } → a DeckSpec derived from real local material
-//   POST /api/deck/revise   { spec, instruction, slideId?, sources? } → the spec with the agent's edit
+//   POST /api/deck/revise   { spec, instruction, slideId?, target?, sources?, documentId?, requestId? }
+//                            → the spec with the agent's edit (+ live `deck:revise:*` progress)
 //
 // Persisting is a separate, deliberate act: POST /api/documents/:id/revisions.
 // Keeping them apart is what lets the editor redraw on every keystroke without
 // leaving a trail of revisions nobody asked for.
 
+import { randomUUID } from 'crypto';
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler, AppError, ValidationError } from '../middleware/error-handler';
@@ -16,11 +18,17 @@ import { buildDeckFixture, NoFixtureMaterialError, type DeckFixtureFrom } from '
 import {
   DeckReviseError, MAX_INSTRUCTION_CHARS, reviseDeck, validateReviseInputSpec, type DeckReviseSourceRef,
 } from '../deck/deckRevise';
+import { describeReviseTarget, validateReviseTarget, type DeckReviseTarget } from '../deck/DeckSpec';
+import { NOOP_DECK_REVISE_EMITTER, createDeckReviseEmitter } from '../deck/deckReviseEvents';
 import log from '../lib/logger';
 
 export const deckRouter = Router();
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,200}$/;
+/** A client-chosen revise id: short, and safe in a log line and a channel payload. */
+const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+/** A document id rides a WS channel name (`pipeline:run:deck-revise:<id>`, ≤ 100 chars). */
+const DOCUMENT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 /** A deck bigger than this is a document, not a deck — refused before rendering. */
 export const MAX_SPEC_BYTES = 512 * 1024;
@@ -93,8 +101,19 @@ deckRouter.post('/fixture', requireAuth, asyncHandler(async (req: Request, res: 
 
 /**
  * POST /api/deck/revise
- *   { spec, instruction, slideId?, sources?: [{ kind, id }] }
- *   → { spec, summary, changedSlideIds, warnings, source: 'model' }
+ *   { spec, instruction, slideId?, target?: { field, index? }, sources?: [{ kind, id }],
+ *     documentId?, requestId? }
+ *   → { spec, summary, changedSlideIds, warnings, source: 'model', requestId }
+ *
+ * `target` narrows a slide-scoped edit to one field of the slide — 'title',
+ * 'eyebrow', 'bullets' (index = one bullet), 'columns' (index = 0|1), 'chart',
+ * 'quote', 'image', 'notes' — or the deck's 'subtitle'. It must fit the
+ * slide's layout; everything outside it is kept byte-for-byte.
+ *
+ * `documentId` (the presentation being edited) turns on live progress:
+ * `pipeline.deck.revise.started|phase|completed|failed` on the gateway channel
+ * `pipeline:run:deck-revise:<documentId>` (see `deck/deckReviseEvents.ts`).
+ * `requestId` names this revise in those events; one is made when omitted.
  *
  * The editor's agent composer. Applies an instruction to one slide (`slideId`)
  * or the whole deck, grounded in the real text of the deck's sources, and
@@ -103,7 +122,9 @@ deckRouter.post('/fixture', requireAuth, asyncHandler(async (req: Request, res: 
  * make. See `deck/deckRevise.ts`.
  */
 deckRouter.post('/revise', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const body = (req.body ?? {}) as { spec?: unknown; instruction?: unknown; slideId?: unknown; sources?: unknown };
+  const body = (req.body ?? {}) as {
+    spec?: unknown; instruction?: unknown; slideId?: unknown; target?: unknown; sources?: unknown; documentId?: unknown; requestId?: unknown;
+  };
   const size = Buffer.byteLength(JSON.stringify(body.spec ?? null));
   if (size > MAX_SPEC_BYTES) throw new AppError(413, `the spec is ${size} bytes; the cap is ${MAX_SPEC_BYTES}`);
 
@@ -126,6 +147,24 @@ deckRouter.post('/revise', requireAuth, asyncHandler(async (req: Request, res: R
     slideId = body.slideId;
   }
 
+  let target: DeckReviseTarget | undefined;
+  if (body.target !== undefined && body.target !== null) {
+    const checkedTarget = validateReviseTarget(body.target, spec, slideId);
+    if (!checkedTarget.ok) throw new ValidationError(checkedTarget.error);
+    target = checkedTarget.target;
+  }
+
+  let documentId: string | undefined;
+  if (body.documentId !== undefined && body.documentId !== null) {
+    if (typeof body.documentId !== 'string' || !DOCUMENT_ID.test(body.documentId)) throw new ValidationError('documentId is invalid');
+    documentId = body.documentId;
+  }
+  let requestId: string = randomUUID();
+  if (body.requestId !== undefined && body.requestId !== null) {
+    if (typeof body.requestId !== 'string' || !REQUEST_ID.test(body.requestId)) throw new ValidationError('requestId is invalid (letters, digits, - and _, at most 64)');
+    requestId = body.requestId;
+  }
+
   const sources: DeckReviseSourceRef[] = [];
   if (body.sources !== undefined) {
     if (!Array.isArray(body.sources)) throw new ValidationError('sources must be an array');
@@ -139,16 +178,29 @@ deckRouter.post('/revise', requireAuth, asyncHandler(async (req: Request, res: R
     }
   }
 
+  const userId = req.user?.sub ?? 'unknown';
+  const events = documentId
+    ? createDeckReviseEmitter({ documentId, requestId, userId, ...(slideId ? { slideId } : {}), ...(target ? { target } : {}) })
+    : NOOP_DECK_REVISE_EMITTER;
+  events.started();
   try {
-    const result = await reviseDeck({ spec, instruction, ...(slideId ? { slideId } : {}), sources });
-    log.info({ scope: slideId ? 'slide' : 'deck', changed: result.changedSlideIds.length, userId: req.user?.sub }, 'deck revised');
-    res.status(200).json(result);
+    const result = await reviseDeck(
+      { spec, instruction, ...(slideId ? { slideId } : {}), ...(target ? { target } : {}), sources },
+      { onPhase: (phase) => events.phase(phase) },
+    );
+    events.completed(result.changedSlideIds);
+    log.info({ scope: target ? 'field' : slideId ? 'slide' : 'deck', ...(target ? { target: describeReviseTarget(target) } : {}), changed: result.changedSlideIds.length, requestId, documentId, userId }, 'deck revised');
+    res.status(200).json({ ...result, requestId });
   } catch (err) {
     if (err instanceof DeckReviseError) {
-      log.warn({ status: err.status, reason: err.reason, userId: req.user?.sub }, 'deck revise refused');
-      res.status(err.status).json({ error: err.message, reason: err.reason, ...(err.errors.length ? { errors: err.errors } : {}) });
+      // The event carries the plain sentence, not `reason`: a model's reason
+      // can quote the deck, and the channel is not per-document authorized.
+      events.failed(err.status, err.message);
+      log.warn({ status: err.status, reason: err.reason, requestId, documentId, userId }, 'deck revise refused');
+      res.status(err.status).json({ error: err.message, reason: err.reason, requestId, ...(err.errors.length ? { errors: err.errors } : {}) });
       return;
     }
+    events.failed(500, 'The revise failed unexpectedly, so nothing was changed.');
     throw err;
   }
 }));

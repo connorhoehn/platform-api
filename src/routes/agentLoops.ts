@@ -5,6 +5,8 @@
 //   POST /:runId/instruct    a line typed at the `›` prompt, into the session
 //   POST /:runId/shell-url   a browser terminal on the box (requester only)
 //   POST /:runId/stop        cancel the run and stop the session
+//   POST /:runId/pause       501 — not supported (see PAUSE_UNSUPPORTED)
+//   POST /:runId/resume      501 — not supported
 //
 // AUTH, the same shape as /api/chat/commands: the person who typed the
 // command, or anyone who can see the conversation it was typed in. The one
@@ -131,7 +133,36 @@ export interface AgentLoopView {
   workItem?: AgentLoopWorkItem;
   /** Documents this run made — a rendered deck, today. Empty until it has. */
   produced: AgentLoopProduced[];
+  /**
+   * The executor's own run id when it differs from `runId` (the loop id). The
+   * gateway's live frames for this loop ride `pipeline:run:<executorRunId>`.
+   */
+  executorRunId?: string;
+  /** What a person can do to this run from here. A UI renders only these. */
+  controls: AgentLoopControls;
 }
+
+/**
+ * The run's controls. `pause` is always false: see PAUSE_UNSUPPORTED — a
+ * button for it would be a button that does nothing.
+ */
+export interface AgentLoopControls {
+  /** POST /:runId/stop will cancel it: true while the run is not over. */
+  stop: boolean;
+  pause: false;
+  resume: false;
+  /** Why pause/resume are not offered, in a sentence a tooltip can show. */
+  pauseUnsupportedReason: string;
+}
+
+/**
+ * Why a loop cannot be paused. The executor (distributed-core
+ * PipelineModule) can only hold a run at a breakpoint declared when the run
+ * STARTS, and a devbox step is one long model task inside the box with no
+ * suspend in the middleware. Anything called "pause" here would either be a
+ * stop in disguise or a flag the next step ignores. Stop is real.
+ */
+export const PAUSE_UNSUPPORTED = 'Pausing is not supported: a running step cannot be suspended, and the engine can only hold a run at breakpoints set when it starts. Stop ends the run.';
 
 /** One row of the Computer Lab tab: a person's loop, summarised. */
 export interface AgentLoopSummary {
@@ -565,6 +596,13 @@ export function viewOf(run: LoadedAgentLoop, now: number = Date.now()): AgentLoo
     artifacts: [],
     ...(workItem ? { workItem } : {}),
     produced,
+    ...(run.executorRunId && run.executorRunId !== run.runId ? { executorRunId: run.executorRunId } : {}),
+    controls: {
+      stop: !terminal && !run.completedAt,
+      pause: false,
+      resume: false,
+      pauseUnsupportedReason: PAUSE_UNSUPPORTED,
+    },
   };
 }
 
@@ -875,6 +913,16 @@ export function createAgentLoopsRouter(deps: AgentLoopsDeps = defaultDeps): Rout
     if (sessionId) sessionStopped = await deps.devbox().deleteSession(sessionId).catch(() => false);
     res.status(202).json({ stopped: true, runId: run.runId, sessionStopped });
   }));
+
+  // Pause and resume are named in the contract so a client that tries them
+  // learns why they are missing instead of meeting a 404 it might retry.
+  // Authorized first: a run you cannot see does not exist, here too.
+  for (const action of ['pause', 'resume'] as const) {
+    router.post(`/:runId/${action}`, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+      const run = await authorize(req);
+      res.status(501).json({ error: PAUSE_UNSUPPORTED, supported: false, action, runId: run.runId });
+    }));
+  }
 
   return router;
 }

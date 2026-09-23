@@ -240,6 +240,37 @@ describe('POST /api/agent-loops/:runId/stop', () => {
   });
 });
 
+describe('POST /api/agent-loops/:runId/pause|resume', () => {
+  it('answers 501 with the reason for someone who can see the run, and touches nothing', async () => {
+    for (const action of ['pause', 'resume']) {
+      const res = await call(buildApp(), 'post', `/api/agent-loops/run-1/${action}`, 'dev-frank');
+      expect(res.statusCode).toBe(501);
+      expect(res.body).toMatchObject({ supported: false, action, runId: 'run-1', error: expect.stringContaining('Pausing is not supported') });
+    }
+    expect(cancelRun).not.toHaveBeenCalled();
+    expect(deleteSession).not.toHaveBeenCalled();
+  });
+
+  it('is a 404 for someone who cannot see the run', async () => {
+    const res = await call(buildApp(), 'post', '/api/agent-loops/run-1/pause', 'dev-stranger');
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toMatchObject({ error: 'agent loop not found' });
+  });
+});
+
+describe('controls', () => {
+  it('offers stop while the run is live, never pause, and says why', () => {
+    expect(viewOf(loadedRun()).controls).toEqual({ stop: true, pause: false, resume: false, pauseUnsupportedReason: expect.stringContaining('Stop ends the run') });
+    expect(viewOf(loadedRun({ status: 'completed', completedAt: '2026-09-21T12:00:00.000Z' })).controls.stop).toBe(false);
+    expect(viewOf(loadedRun({ status: 'failed' })).controls.stop).toBe(false);
+  });
+
+  it('names the executor run when the loop id differs, for the live channel', () => {
+    expect(viewOf(loadedRun({ executorRunId: 'exec-9' })).executorRunId).toBe('exec-9');
+    expect(viewOf(loadedRun()).executorRunId).toBeUndefined();
+  });
+});
+
 describe('viewOf', () => {
   it('says the lab is pending, not devbox, before a session exists', () => {
     const view = viewOf(loadedRun({ context: { ...loadedRun().context, lab: undefined } }));

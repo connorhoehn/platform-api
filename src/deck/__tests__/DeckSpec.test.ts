@@ -117,3 +117,33 @@ describe('deckSources', () => {
     expect(sources.map((source) => source.documentId)).toEqual(['doc-sprint-review', 'doc-roadmap']);
   });
 });
+
+describe('validateReviseTarget', () => {
+  const { validateReviseTarget, describeReviseTarget } = jest.requireActual('../DeckSpec') as typeof import('../DeckSpec');
+  const spec = {
+    title: 'D',
+    slides: [
+      { id: 'b', layout: 'bullets' as const, title: 'B', bullets: ['one', 'two', 'three'], sources: [{ documentId: 'd', title: 'D' }] },
+      { id: 'c', layout: 'chart' as const, title: 'C', chart: { kind: 'bar' as const, labels: ['a'], series: [{ name: 's', values: [1] }] }, sources: [{ documentId: 'd', title: 'D' }] },
+    ],
+  };
+
+  it('accepts a field the slide can carry, with an index where one applies', () => {
+    expect(validateReviseTarget({ field: 'bullets', index: 2 }, spec, 'b')).toEqual({ ok: true, target: { field: 'bullets', index: 2 } });
+    expect(validateReviseTarget({ field: 'notes' }, spec, 'c')).toEqual({ ok: true, target: { field: 'notes' } });
+    expect(validateReviseTarget({ field: 'chart' }, spec, 'c')).toEqual({ ok: true, target: { field: 'chart' } });
+    expect(validateReviseTarget({ field: 'subtitle' }, spec, undefined)).toEqual({ ok: true, target: { field: 'subtitle' } });
+    expect(describeReviseTarget({ field: 'bullets', index: 2 })).toBe('bullets[2]');
+  });
+
+  it('refuses an unknown field, a field the layout does not have, a missing bullet, a stray index and no slide', () => {
+    expect(validateReviseTarget({ field: 'footer' }, spec, 'b')).toMatchObject({ ok: false });
+    expect(validateReviseTarget({ field: 'chart' }, spec, 'b')).toMatchObject({ ok: false, error: expect.stringContaining("only a 'chart' slide") });
+    expect(validateReviseTarget({ field: 'bullets', index: 3 }, spec, 'b')).toMatchObject({ ok: false, error: expect.stringContaining('has 3 bullets') });
+    expect(validateReviseTarget({ field: 'title', index: 0 }, spec, 'b')).toMatchObject({ ok: false });
+    expect(validateReviseTarget({ field: 'columns', index: 0 }, spec, 'b')).toMatchObject({ ok: false });
+    expect(validateReviseTarget({ field: 'title' }, spec, undefined)).toMatchObject({ ok: false, error: expect.stringContaining('slideId') });
+    expect(validateReviseTarget({ field: 'title', extra: 1 }, spec, 'b')).toMatchObject({ ok: false });
+    expect(validateReviseTarget('title', spec, 'b')).toMatchObject({ ok: false });
+  });
+});

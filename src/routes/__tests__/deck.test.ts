@@ -18,6 +18,14 @@ jest.mock('../../deck/deckFixture', () => {
 jest.mock('../../lib/aws-clients', () => ({ docClient: { send: jest.fn() }, ddbClient: { send: jest.fn() } }));
 jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `test-${name}` }));
 
+// The revise progress events go to Redis; the fake records them.
+const published: Array<{ channel: string; event: { type: string; version: number; payload: Record<string, unknown> } }> = [];
+jest.mock('../../lib/redis-client', () => ({
+  getRedisClient: async () => ({
+    publish: async (channel: string, message: string) => { published.push({ channel, event: JSON.parse(message) }); return 1; },
+  }),
+}));
+
 const reviseDeck = jest.fn();
 
 jest.mock('../../deck/deckRevise', () => {
@@ -69,7 +77,10 @@ afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-beforeEach(() => { buildDeckFixture.mockReset(); reviseDeck.mockReset(); });
+beforeEach(() => { buildDeckFixture.mockReset(); reviseDeck.mockReset(); published.length = 0; });
+
+/** Lets the fire-and-forget publishes land. */
+const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 describe('POST /api/deck/preview', () => {
   it('renders every slide plus Sources, with warnings, and stores nothing', async () => {
@@ -190,5 +201,85 @@ describe('POST /api/deck/revise', () => {
     expect(res.body.spec).toBeUndefined();
     expect(String(res.body.reason)).toContain('must cite');
     expect(res.body.errors).toHaveLength(1);
+  });
+});
+
+describe('POST /api/deck/revise — target', () => {
+  it('passes a target that fits the slide through', async () => {
+    reviseDeck.mockResolvedValue({ spec: sampleDeck(), summary: 's', changedSlideIds: ['agenda'], warnings: [], source: 'model' });
+    const res = await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'shorter', slideId: 'agenda', target: { field: 'bullets', index: 2 } });
+    expect(res.status).toBe(200);
+    expect((reviseDeck.mock.calls[0] as [{ target?: unknown }])[0].target).toEqual({ field: 'bullets', index: 2 });
+  });
+
+  it('400s a field the layout does not have, a missing bullet, an unknown field and a slide target with no slide', async () => {
+    const bad = async (slideId: string | undefined, target: unknown) => {
+      const res = await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x', ...(slideId ? { slideId } : {}), target });
+      return [res.status, String(res.body.error)];
+    };
+    expect(await bad('agenda', { field: 'chart' })).toEqual([400, expect.stringContaining("only a 'chart' slide")]);
+    expect(await bad('agenda', { field: 'bullets', index: 3 })).toEqual([400, expect.stringContaining('has 3 bullets')]);
+    expect(await bad('agenda', { field: 'footer' })).toEqual([400, expect.stringContaining('target.field must be one of')]);
+    expect(await bad(undefined, { field: 'notes' })).toEqual([400, expect.stringContaining('slideId')]);
+    expect(reviseDeck).not.toHaveBeenCalled();
+    expect(published).toHaveLength(0);
+  });
+});
+
+describe('POST /api/deck/revise — live progress', () => {
+  it('publishes started, each phase and completed on the document\'s channel, and returns the requestId', async () => {
+    reviseDeck.mockImplementation(async (_input: unknown, opts: { onPhase?: (phase: string) => void }) => {
+      opts.onPhase?.('reading-sources');
+      opts.onPhase?.('asking-model');
+      opts.onPhase?.('checking');
+      return { spec: sampleDeck(), summary: 'Secret deck words.', changedSlideIds: ['agenda'], warnings: [], source: 'model' };
+    });
+    const res = await post('/api/deck/revise', {
+      spec: sampleDeck(), instruction: 'confidential instruction', slideId: 'agenda', target: { field: 'notes' },
+      documentId: 'doc-123', requestId: 'req-1',
+    });
+    await settle();
+    expect(res.status).toBe(200);
+    expect(res.body.requestId).toBe('req-1');
+    expect(published.map((entry) => entry.channel)).toEqual([
+      'dcore:topic:pipeline.events.deck.revise.started',
+      'dcore:topic:pipeline.events.deck.revise.phase',
+      'dcore:topic:pipeline.events.deck.revise.phase',
+      'dcore:topic:pipeline.events.deck.revise.phase',
+      'dcore:topic:pipeline.events.deck.revise.completed',
+    ]);
+    const events = published.map((entry) => entry.event);
+    expect(events.map((event) => event.payload.phase)).toEqual(['started', 'reading-sources', 'asking-model', 'checking', 'completed']);
+    expect(events.map((event) => event.version)).toEqual([1, 2, 3, 4, 5]);
+    expect(events[0]).toMatchObject({
+      type: 'pipeline:deck:revise:started',
+      payload: { runId: 'deck-revise:doc-123', documentId: 'doc-123', requestId: 'req-1', userId: expect.any(String), scope: 'slide', slideId: 'agenda', target: { field: 'notes' } },
+    });
+    expect(events[4]!.payload.changedSlideIds).toEqual(['agenda']);
+    // Nothing the deck or the instruction says rides the channel.
+    const wire = JSON.stringify(events);
+    expect(wire).not.toContain('confidential');
+    expect(wire).not.toContain('Secret deck words');
+  });
+
+  it('publishes failed with the status and the plain sentence (not the model\'s reason)', async () => {
+    reviseDeck.mockRejectedValue(new DeckReviseError('The agent could not answer, so nothing was changed.', 503, 'model said: "the deck text"'));
+    const res = await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x', documentId: 'doc-123' });
+    await settle();
+    expect(res.status).toBe(503);
+    expect(typeof res.body.requestId).toBe('string');
+    const last = published[published.length - 1]!.event;
+    expect(last.type).toBe('pipeline:deck:revise:failed');
+    expect(last.payload).toMatchObject({ phase: 'failed', status: 503, reason: 'The agent could not answer, so nothing was changed.', scope: 'deck', requestId: res.body.requestId });
+    expect(JSON.stringify(last)).not.toContain('the deck text');
+  });
+
+  it('publishes nothing without a documentId, and 400s a bad documentId or requestId', async () => {
+    reviseDeck.mockResolvedValue({ spec: sampleDeck(), summary: 's', changedSlideIds: [], warnings: [], source: 'model' });
+    expect((await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x' })).status).toBe(200);
+    await settle();
+    expect(published).toHaveLength(0);
+    expect((await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x', documentId: 'a b' })).status).toBe(400);
+    expect((await post('/api/deck/revise', { spec: sampleDeck(), instruction: 'x', documentId: 'd', requestId: 'x'.repeat(65) })).status).toBe(400);
   });
 });

@@ -391,3 +391,91 @@ export function deckSources(spec: DeckSpec): DeckSource[] {
   }
   return [...seen.values()];
 }
+
+// ---------------------------------------------------------------------------
+// Revise targets — "revise the third bullet" without element ids
+// ---------------------------------------------------------------------------
+//
+// A slide's parts have no ids below the slide (bullets, columns and the quote
+// are plain strings), and the layouts are typed. So an element is addressed by
+// the FIELD it lives in plus, for a list, its position — never by an id the
+// spec does not carry. `subtitle` is the deck's own field (the cover shows it);
+// every other field belongs to the slide `slideId` names, and only to a layout
+// that may carry it.
+
+export type DeckReviseTargetField =
+  | 'title' | 'eyebrow' | 'subtitle' | 'bullets' | 'columns' | 'chart' | 'quote' | 'image' | 'notes';
+
+export interface DeckReviseTarget {
+  field: DeckReviseTargetField;
+  /**
+   * `bullets`: the bullet (0-based) to change — it must exist. `columns`: the
+   * column, 0 or 1. Omitted: the whole field. Not allowed on any other field.
+   */
+  index?: number;
+}
+
+export const REVISE_TARGET_FIELDS: readonly DeckReviseTargetField[] = [
+  'title', 'eyebrow', 'subtitle', 'bullets', 'columns', 'chart', 'quote', 'image', 'notes',
+];
+
+/** Fields a slide may carry whatever its layout; the rest belong to one layout. */
+const ANY_LAYOUT_FIELDS: ReadonlySet<DeckReviseTargetField> = new Set(['title', 'eyebrow', 'bullets', 'notes']);
+const LAYOUT_OF_FIELD: Partial<Record<DeckReviseTargetField, SlideLayout>> = {
+  columns: 'two-column', chart: 'chart', quote: 'quote', image: 'image',
+};
+
+export type DeckReviseTargetValidation =
+  | { ok: true; target: DeckReviseTarget }
+  | { ok: false; error: string };
+
+/**
+ * Checks a target against the deck it will be applied to. `slideId` must
+ * already name a slide of `spec` (the caller checks that first) unless the
+ * target is the deck's `subtitle`.
+ */
+export function validateReviseTarget(raw: unknown, spec: DeckSpec, slideId: string | undefined): DeckReviseTargetValidation {
+  if (!isObject(raw)) return { ok: false, error: 'target must be an object: { field, index? }' };
+  const extra = Object.keys(raw).filter((key) => key !== 'field' && key !== 'index' && raw[key] !== undefined);
+  if (extra.length) return { ok: false, error: `target: unknown field '${extra[0]}'` };
+  const field = raw.field;
+  if (typeof field !== 'string' || !(REVISE_TARGET_FIELDS as readonly string[]).includes(field)) {
+    return { ok: false, error: `target.field must be one of ${REVISE_TARGET_FIELDS.join(', ')}` };
+  }
+  const f = field as DeckReviseTargetField;
+  let index: number | undefined;
+  if (raw.index !== undefined && raw.index !== null) {
+    if (typeof raw.index !== 'number' || !Number.isInteger(raw.index) || raw.index < 0) {
+      return { ok: false, error: 'target.index must be a whole number, 0 or more' };
+    }
+    if (f !== 'bullets' && f !== 'columns') return { ok: false, error: `target.index applies only to bullets and columns, not ${f}` };
+    index = raw.index;
+  }
+
+  if (f === 'subtitle') {
+    // The deck's own field. A slideId alongside it is harmless (the editor
+    // sends the selected slide); it does not narrow anything.
+    return { ok: true, target: { field: f } };
+  }
+  if (!slideId) return { ok: false, error: `target.field '${f}' is a slide's field — name the slide with slideId` };
+  const slide = spec.slides.find((candidate) => candidate.id === slideId);
+  if (!slide) return { ok: false, error: 'slideId does not name a slide in this deck' };
+
+  const layout = LAYOUT_OF_FIELD[f];
+  if (!ANY_LAYOUT_FIELDS.has(f) && layout && slide.layout !== layout) {
+    return { ok: false, error: `slide '${slide.id}' is a '${slide.layout}' slide; only a '${layout}' slide has ${f}` };
+  }
+  if (f === 'bullets' && index !== undefined) {
+    const count = slide.bullets?.length ?? 0;
+    if (index >= count) return { ok: false, error: `slide '${slide.id}' has ${count} bullet${count === 1 ? '' : 's'}; target.index ${index} is not one of them` };
+  }
+  if (f === 'columns' && index !== undefined && index > 1) {
+    return { ok: false, error: 'target.index for columns is 0 (left) or 1 (right)' };
+  }
+  return { ok: true, target: { field: f, ...(index !== undefined ? { index } : {}) } };
+}
+
+/** How a target reads in a prompt, a log line or an event: "bullets[2]", "columns[1]", "notes". */
+export function describeReviseTarget(target: DeckReviseTarget): string {
+  return target.index === undefined ? target.field : `${target.field}[${target.index}]`;
+}

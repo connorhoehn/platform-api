@@ -24,9 +24,9 @@ import { CALL_RECORDINGS_TABLE } from '../repositories/CallRecordingRepository';
 import { createLLMClient } from '../pipeline/createLLMClient';
 import type { LLMClient } from '../pipeline/LLMClient';
 import {
-  MAX_BULLETS_PER_SLIDE, MAX_BULLET_CHARS, MAX_SLIDES, MAX_TITLE_CHARS,
-  deckSources, parseDeckSpecJson, validateDeckSpec,
-  type DeckSlide, type DeckSource, type DeckSpec,
+  MAX_BULLETS_PER_SLIDE, MAX_BULLET_CHARS, MAX_NOTES_CHARS, MAX_SLIDES, MAX_SOURCES_PER_SLIDE, MAX_TITLE_CHARS,
+  deckSources, describeReviseTarget, parseDeckSpecJson, validateDeckSpec,
+  type DeckReviseTarget, type DeckSlide, type DeckSource, type DeckSpec,
 } from './DeckSpec';
 import {
   WIRE_LOBBY, askModel, materialBlock, readFixtureMaterial,
@@ -49,8 +49,21 @@ export interface DeckReviseInput {
   instruction: string;
   /** Present: the edit is confined to this slide. Absent: the whole deck. */
   slideId?: string;
+  /**
+   * Present: the edit is confined to one field of `slideId`'s slide (or the
+   * deck's subtitle). Validated by `validateReviseTarget` before it gets here.
+   * Everything outside the field is copied from the input, not from the model.
+   */
+  target?: DeckReviseTarget;
   sources?: DeckReviseSourceRef[];
 }
+
+/**
+ * Where a revise is, for a progress line: the sources are being read, the
+ * model is thinking (the long part — up to REVISE_TIMEOUT_MS), the answer is
+ * being checked against the deck's rules. Reported in this order, each once.
+ */
+export type DeckRevisePhase = 'reading-sources' | 'asking-model' | 'checking';
 
 export interface DeckReviseResult {
   spec: DeckSpec;
@@ -84,6 +97,8 @@ export interface DeckReviseOpts extends ReadMaterialDeps {
   timeoutMs?: number;
   /** A transcript id → the recording that holds it. Injected in tests. */
   findRecordingIdByTranscript?: (transcriptId: string) => Promise<string | null>;
+  /** Told as the revise moves between phases. Must not throw; a throw is ignored. */
+  onPhase?: (phase: DeckRevisePhase) => void;
 }
 
 /**
@@ -172,10 +187,48 @@ function rules(): string[] {
   ];
 }
 
+/** The JSON shape of `value` for each target, as the prompt states it. */
+function targetValueShape(target: DeckReviseTarget): string {
+  switch (target.field) {
+    case 'title': return '"…" (a non-empty string)';
+    case 'eyebrow':
+    case 'notes':
+    case 'subtitle': return '"…" (a string), or null to remove it';
+    case 'bullets': return target.index === undefined ? '["…", "…"] (the slide\'s whole bullet list)' : '"…" (the one bullet), or null to remove that bullet';
+    case 'columns': return target.index === undefined ? '[["…"], ["…"]] (both columns)' : '["…"] (that column\'s bullets)';
+    case 'chart': return '{"kind":"bar|line","labels":["…"],"series":[{"name":"…","values":[1,2]}]}';
+    case 'quote': return '{"text":"…","by":"…"}';
+    case 'image': return '{"alt":"…"}';
+    default: return 'null';
+  }
+}
+
+/** The part a target names, as the deck has it now. */
+function currentTargetValue(spec: DeckSpec, slide: DeckSlide | undefined, target: DeckReviseTarget): unknown {
+  if (target.field === 'subtitle') return spec.subtitle ?? null;
+  if (!slide) return null;
+  if (target.field === 'bullets' && target.index !== undefined) return slide.bullets?.[target.index] ?? null;
+  if (target.field === 'columns' && target.index !== undefined) return slide.columns?.[target.index] ?? null;
+  return (slide as unknown as Record<string, unknown>)[target.field] ?? null;
+}
+
 export function revisePrompt(input: DeckReviseInput, sources: ReadSource[]): string {
   const sourceList = sources.map((source) => `- ${source.title} (documentId: ${source.documentId})`).join('\n');
   const slide = input.slideId ? input.spec.slides.find((candidate) => candidate.id === input.slideId) : undefined;
-  const head = slide
+  const target = input.target;
+  const head = target
+    ? [
+      `You revise ONE PART of a presentation — ${target.field === 'subtitle' ? 'the deck\'s subtitle' : `the ${describeReviseTarget(target)} of slide "${slide?.id ?? ''}"`} — following the instruction. Answer with ONLY a JSON object, no prose, no code fence:`,
+      '',
+      `{"summary":"…","value":${targetValueShape(target)},"sources":[{"documentId":"…","title":"…"}]}`,
+      '',
+      'Rules:',
+      '- "value" replaces that part and nothing else; every other part of the deck is kept exactly as it is.',
+      '- "sources" is optional: list a source only when the new value uses material the slide does not already cite.',
+      `- Bullets under ${MAX_BULLET_CHARS} characters, titles under ${MAX_TITLE_CHARS}, notes under ${MAX_NOTES_CHARS}.`,
+      ...rules().slice(3),
+    ]
+    : slide
     ? [
       'You revise ONE slide of a presentation, following the instruction. Answer with ONLY a JSON object, no prose, no code fence:',
       '',
@@ -205,7 +258,8 @@ export function revisePrompt(input: DeckReviseInput, sources: ReadSource[]): str
     '',
     'The deck as it is now:',
     JSON.stringify(input.spec),
-    ...(slide ? ['', 'The slide to change:', JSON.stringify(slide)] : []),
+    ...(slide ? ['', target ? 'The slide:' : 'The slide to change:', JSON.stringify(slide)] : []),
+    ...(target ? ['', `The part to change (${describeReviseTarget(target)}) as it is now:`, JSON.stringify(currentTargetValue(input.spec, slide, target))] : []),
     '',
     `Instruction: ${input.instruction}`,
   ].join('\n');
@@ -286,6 +340,76 @@ export function validateReviseInputSpec(spec: unknown): { ok: true; spec: DeckSp
   };
 }
 
+const isStringList = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === 'string');
+
+/**
+ * The deck with one part replaced by the model's `value`. Everything else is
+ * copied from the input — the model never gets to touch what it was not
+ * pointed at, whatever it answers. Shape errors are refused here; content
+ * rules (lengths, a layout's payload, citations) by `validateDeckSpec` after.
+ */
+export function applyTargetValue(
+  spec: DeckSpec, slideId: string | undefined, target: DeckReviseTarget, value: unknown, addedSources: DeckSource[] = [],
+): DeckSpec {
+  const wrong = (what: string) => new DeckReviseError('The agent answered with the wrong kind of value, so nothing was changed.', 502, `"value" for ${describeReviseTarget(target)} must be ${what}`);
+  if (target.field === 'subtitle') {
+    if (value !== null && typeof value !== 'string') throw wrong('a string or null');
+    const { subtitle: _old, ...rest } = spec;
+    return typeof value === 'string' && value.trim() ? { ...rest, subtitle: value } : rest;
+  }
+  const slides = spec.slides.map((slide): DeckSlide => {
+    if (slide.id !== slideId) return slide;
+    const next: Record<string, unknown> = { ...slide };
+    switch (target.field) {
+      case 'title':
+        if (typeof value !== 'string') throw wrong('a string');
+        next.title = value;
+        break;
+      case 'eyebrow':
+      case 'notes':
+        if (value !== null && typeof value !== 'string') throw wrong('a string or null');
+        if (typeof value === 'string' && value.trim()) next[target.field] = value; else delete next[target.field];
+        break;
+      case 'bullets':
+        if (target.index === undefined) {
+          if (!isStringList(value)) throw wrong('an array of strings');
+          if (value.length) next.bullets = value; else delete next.bullets;
+        } else {
+          if (value !== null && typeof value !== 'string') throw wrong('a string or null');
+          const bullets = [...(slide.bullets ?? [])];
+          if (typeof value === 'string' && value.trim()) bullets[target.index] = value; else bullets.splice(target.index, 1);
+          if (bullets.length) next.bullets = bullets; else delete next.bullets;
+        }
+        break;
+      case 'columns':
+        if (target.index === undefined) {
+          if (!Array.isArray(value) || value.length !== 2 || !value.every(isStringList)) throw wrong('two arrays of strings');
+          next.columns = value;
+        } else {
+          if (!isStringList(value)) throw wrong('an array of strings');
+          const columns: [string[], string[]] = [[...(slide.columns?.[0] ?? [])], [...(slide.columns?.[1] ?? [])]];
+          columns[target.index as 0 | 1] = value;
+          next.columns = columns;
+        }
+        break;
+      case 'chart':
+      case 'quote':
+      case 'image':
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw wrong('an object');
+        next[target.field] = value;
+        break;
+      default:
+        throw wrong('a known field');
+    }
+    if (addedSources.length) {
+      const have = new Set(slide.sources.map((source) => source.documentId));
+      next.sources = [...slide.sources, ...addedSources.filter((source) => !have.has(source.documentId))].slice(0, MAX_SOURCES_PER_SLIDE);
+    }
+    return next as unknown as DeckSlide;
+  });
+  return { ...spec, slides };
+}
+
 export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = {}): Promise<DeckReviseResult> {
   const cited = deckSources(input.spec);
   // A citation still titled with a call's wire id (decks drafted before
@@ -312,6 +436,8 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
     throw new DeckReviseError('Add a source first: the agent only writes what a cited document or transcript says.', 400, 'the deck cites nothing and no source was named');
   }
 
+  const phase = (next: DeckRevisePhase) => { try { opts.onPhase?.(next); } catch { /* a progress line is not the edit */ } };
+  phase('reading-sources');
   const read = await Promise.all(refs.map((ref) => readSource(ref, titleOf.get(ref.id), opts)));
   const warnings = read
     .filter((source) => !hasText(source.material))
@@ -327,6 +453,7 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
   if (!llm) throw new DeckReviseError('The agent is unavailable, so nothing was changed.', 503, 'no model is configured on this deployment');
 
   let answer: string;
+  phase('asking-model');
   try {
     answer = await askModel(llm, revisePrompt(input, read), opts.timeoutMs ?? REVISE_TIMEOUT_MS);
   } catch (err) {
@@ -334,13 +461,29 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
     throw new DeckReviseError('The agent could not answer, so nothing was changed.', 503, reason);
   }
 
-  const parsed = parseDeckSpecJson(answer) as { summary?: unknown; slide?: unknown; spec?: unknown } | undefined;
+  phase('checking');
+  const parsed = parseDeckSpecJson(answer) as { summary?: unknown; slide?: unknown; spec?: unknown; value?: unknown; sources?: unknown } | undefined;
   if (!parsed || typeof parsed !== 'object') {
     throw new DeckReviseError('The agent answered with something that is not an edit, so nothing was changed.', 502, 'the model answered with no JSON object');
   }
 
   let candidate: unknown;
-  if (input.slideId) {
+  if (input.target) {
+    if (!('value' in parsed)) {
+      throw new DeckReviseError('The agent did not return the new text, so nothing was changed.', 502, 'the answer had no "value"');
+    }
+    // A citation the model adds must be one of the sources it was handed and
+    // well-formed; anything else is refused below like any invented citation.
+    const added: DeckSource[] = Array.isArray(parsed.sources)
+      ? parsed.sources.flatMap((raw): DeckSource[] => {
+        const entry = (raw ?? {}) as { documentId?: unknown; title?: unknown };
+        return typeof entry.documentId === 'string' && entry.documentId.trim()
+          ? [{ documentId: entry.documentId.trim(), title: typeof entry.title === 'string' && entry.title.trim() ? entry.title.trim() : entry.documentId.trim() }]
+          : [];
+      })
+      : [];
+    candidate = applyTargetValue(input.spec, input.slideId, input.target, parsed.value, added);
+  } else if (input.slideId) {
     const slide = parsed.slide as Record<string, unknown> | undefined;
     if (!slide || typeof slide !== 'object') {
       throw new DeckReviseError('The agent did not return the slide, so nothing was changed.', 502, 'the answer had no "slide"');

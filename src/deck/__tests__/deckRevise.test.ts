@@ -219,3 +219,79 @@ describe('reviseDeck — adding information, not rewording it', () => {
     expect(restatedBullets(before, after)).toEqual([]);
   });
 });
+
+describe('reviseDeck — a target inside one slide', () => {
+  function bulletsDeck(): DeckSpec {
+    return {
+      title: 'Release review',
+      subtitle: 'Planning sync',
+      slides: [
+        deck().slides[0]!,
+        // Keys in the order validateDeckSpec writes them, as the route hands them over.
+        { id: 'risks', layout: 'bullets', title: 'Risks', eyebrow: 'Week 38', bullets: ['Ship Thursday', 'Gateway rollback untested', 'Frank owns the rollback plan'], notes: 'Say who owns it.', sources: [{ documentId: TRANSCRIPT_ID, title: 'Call with Connor Hoehn & Frank Davis' }] },
+      ],
+    };
+  }
+
+  it('bullets index 2 changes only that bullet, whatever else the model says', async () => {
+    const prompts: string[] = [];
+    const answer = JSON.stringify({ summary: 'Named the owner.', value: 'Frank Davis owns the rollback plan', slide: { id: 'x', title: 'ignored' } });
+    const before = bulletsDeck();
+    const result = await reviseDeck(
+      { spec: before, instruction: 'use his full name', slideId: 'risks', target: { field: 'bullets', index: 2 } },
+      { ...deps, llm: scripted(answer, prompts) },
+    );
+    const risks = result.spec.slides[1]!;
+    expect(risks.bullets).toEqual(['Ship Thursday', 'Gateway rollback untested', 'Frank Davis owns the rollback plan']);
+    expect({ ...risks, bullets: undefined }).toEqual({ ...before.slides[1]!, bullets: undefined });
+    expect(result.spec.slides[0]).toEqual(before.slides[0]);
+    expect(result.spec.title).toBe(before.title);
+    expect(result.changedSlideIds).toEqual(['risks']);
+    // The prompt names the part and shows it as it is now.
+    expect(prompts[0]).toContain('bullets[2]');
+    expect(prompts[0]).toContain('"Frank owns the rollback plan"');
+    expect(prompts[0]).toContain('"value"');
+  });
+
+  it('removes a bullet when the value is null, and edits notes and the deck subtitle', async () => {
+    const removed = await reviseDeck(
+      { spec: bulletsDeck(), instruction: 'drop it', slideId: 'risks', target: { field: 'bullets', index: 0 } },
+      { ...deps, llm: scripted(JSON.stringify({ summary: 'Removed.', value: null })) },
+    );
+    expect(removed.spec.slides[1]!.bullets).toEqual(['Gateway rollback untested', 'Frank owns the rollback plan']);
+
+    const notes = await reviseDeck(
+      { spec: bulletsDeck(), instruction: 'longer notes', slideId: 'risks', target: { field: 'notes' } },
+      { ...deps, llm: scripted(JSON.stringify({ summary: 'Expanded.', value: 'Say who owns it.\nFrank named himself.' })) },
+    );
+    expect(notes.spec.slides[1]!.notes).toBe('Say who owns it.\nFrank named himself.');
+    expect(notes.spec.slides[1]!.bullets).toEqual(bulletsDeck().slides[1]!.bullets);
+
+    const subtitle = await reviseDeck(
+      { spec: bulletsDeck(), instruction: 'date it', target: { field: 'subtitle' } },
+      { ...deps, llm: scripted(JSON.stringify({ summary: 'Dated.', value: 'Planning sync · 22 Sep' })) },
+    );
+    expect(subtitle.spec.subtitle).toBe('Planning sync · 22 Sep');
+    expect(subtitle.spec.slides).toEqual(bulletsDeck().slides);
+    expect(subtitle.changedSlideIds).toEqual([]);
+  });
+
+  it('refuses a value of the wrong kind, a missing value, and an invented citation', async () => {
+    const call = (answer: unknown) => reviseDeck(
+      { spec: bulletsDeck(), instruction: 'x', slideId: 'risks', target: { field: 'title' } },
+      { ...deps, llm: scripted(JSON.stringify(answer)) },
+    );
+    await expect(call({ summary: 's', value: ['a list'] })).rejects.toMatchObject({ status: 502, reason: expect.stringContaining('must be a string') });
+    await expect(call({ summary: 's' })).rejects.toMatchObject({ status: 502, reason: 'the answer had no "value"' });
+    await expect(call({ summary: 's', value: 'New title', sources: [{ documentId: 'made-up', title: 'x' }] })).rejects.toMatchObject({ status: 502, reason: expect.stringContaining("'made-up'") });
+  });
+
+  it('reports its phases in order', async () => {
+    const phases: string[] = [];
+    await reviseDeck(
+      { spec: bulletsDeck(), instruction: 'x', slideId: 'risks', target: { field: 'title' } },
+      { ...deps, llm: scripted(JSON.stringify({ summary: 's', value: 'Release risks' })), onPhase: (phase) => phases.push(phase) },
+    );
+    expect(phases).toEqual(['reading-sources', 'asking-model', 'checking']);
+  });
+});
