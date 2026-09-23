@@ -339,7 +339,15 @@ deckRouter.post('/revise-run', requireAuth, asyncHandler(async (req: Request, re
   const bridge = getPipelineBridge();
   if (!bridge?.trigger) { res.status(503).json({ error: 'pipeline engine is not available' }); return; }
 
-  const claim = await claimDeckReviseRequest({ userId, documentId, requestId });
+  // Fail closed: without a durable claim a retry could start a second edit.
+  let claim: Awaited<ReturnType<typeof claimDeckReviseRequest>>;
+  try {
+    claim = await claimDeckReviseRequest({ userId, documentId, requestId });
+  } catch (error) {
+    log.warn({ err: error, documentId, requestId }, 'deck revise claim store unavailable');
+    res.status(503).json({ error: 'Could not record this request; try again in a moment.', code: 'claim-store-unavailable', requestId });
+    return;
+  }
   if (claim.status === 'existing') { answer(claim.runId, true); return; }
   if (claim.status === 'in-flight') {
     res.status(409).json({ error: 'This request is still being started; retry in a moment.', code: 'request-in-flight', requestId });

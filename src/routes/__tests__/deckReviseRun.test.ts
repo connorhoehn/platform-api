@@ -17,7 +17,7 @@ import { errorHandler } from '../../middleware/error-handler';
 import { deckRouter } from '../deck';
 import { setPipelineBridge } from '../../pipeline/bridge-types';
 import { setPresentationDocumentStore, type PresentationDocumentRow } from '../../deck/presentationDocuments';
-import { setClaimStore } from '../../deck/deckReviseRequests';
+import { MemoryClaimStore, setClaimStore } from '../../deck/deckReviseRequests';
 import { sampleDeck } from '../../deck/__tests__/fixtures';
 
 const deck = sampleDeck();
@@ -72,7 +72,7 @@ afterAll(async () => {
 beforeEach(() => {
   trigger.mockClear();
   registerTrigger.mockClear();
-  setClaimStore(null);
+  setClaimStore(new MemoryClaimStore());
   rows.clear();
   rows.set('audit-deck-1', { documentId: 'audit-deck-1', type: 'presentation', createdBy: 'dev-user', revisions: [{ id: 'v1', label: 'v1', spec: deck } as never] });
 });
@@ -155,5 +155,14 @@ describe('POST /api/deck/revise-run', () => {
     const retry = await post({ documentId: 'audit-deck-1', instruction: 'x', requestId: 'r-3' });
     expect(retry.status).toBe(202);
     expect(retry.body.replay).toBe(false);
+  });
+
+  it('fails closed with 503 and starts nothing when the claim store is unreachable', async () => {
+    const down = async () => { throw new Error('ddb down'); };
+    setClaimStore({ create: down, get: down, commit: down, release: down });
+    const res = await post({ documentId: 'audit-deck-1', instruction: 'x', requestId: 'r-5' });
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('claim-store-unavailable');
+    expect(trigger).not.toHaveBeenCalled();
   });
 });
