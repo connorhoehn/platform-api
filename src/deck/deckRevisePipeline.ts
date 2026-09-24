@@ -427,7 +427,9 @@ export function createDeckReviseProposeHandler(opts: DeckReviseStepOpts = {}): D
             // breaker would refuse the retry the same way.
             const outcome = fail(runId, request, 503, err.message, 'model-unavailable');
             log.warn({ runId, reason: err.reason, documentId: request.documentId }, 'deck revise run: model unavailable (breaker open)');
-            return outcome;
+            // "unavailable" reads as transient to the executor's classifier;
+            // retry: false (distributed-core 0.46.5) returns it at once.
+            return { ...outcome, retry: false };
           }
           if (MODEL_AUTH_RE.test(err.reason)) {
             // The model's login, not the edit: say so plainly, once, and never
