@@ -1069,6 +1069,57 @@ export function authorizeGatewayWorkGraph(
   return pass;
 }
 
+export interface RunGraphScope { personId: string; day: string; timezone: string }
+
+const utcDay = (ms: number): string | null => (Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : null);
+
+/**
+ * realtime-examples NFR #172: is run `runId` shown to `viewerId` by its
+ * owner's work graph? One rule for the graph and for the run's live channel:
+ * the gateway's run subscribe asks this (through
+ * `/internal/pipeline-access/authorize`) after the owner and document-reader
+ * checks, and the answer is the graph's own pass (`viewsRunThroughGraph`).
+ *
+ * The day is the graph the viewer has open (`graphs`, the gateway's
+ * authorized work-graph stream of that socket) when it names the run's
+ * owner — only that one, so the answer is the one that graph shows — else
+ * the run's start day and today, in UTC, the scope a pane's "Open run"
+ * exchange resolves a node to. The owner is the stored run row's
+ * `triggeredBy`, the same field the graph's pipeline ACL reads.
+ */
+export async function runSharedThroughWorkGraph(
+  organizationId: string,
+  viewerId: string,
+  runId: string,
+  graphs: readonly RunGraphScope[] = [],
+): Promise<{ allow: boolean; ownerId?: string }> {
+  const row = (await runRowLocator.rows(docClient, PIPELINE_RUNS_TABLE, [runId])).get(runId) ?? undefined;
+  const ownerId = typeof row?.triggeredBy === 'string' && row.triggeredBy ? row.triggeredBy : undefined;
+  if (!ownerId) return { allow: false };
+  if (ownerId === viewerId) return { allow: true, ownerId };
+  const viewer = await directory.resolveViewerById(organizationId, viewerId);
+  if (!viewer) return { allow: false, ownerId };
+  const scopes = new Map<string, RunGraphScope>();
+  const add = (scope: RunGraphScope) => { scopes.set(`${scope.day}|${scope.timezone}`, scope); };
+  for (const scope of graphs) if (scope.personId === ownerId) add(scope);
+  // A socket with the owner's graph open is decided on exactly that graph;
+  // one without falls back to the UTC scope "Open run" resolves to.
+  if (scopes.size === 0) {
+    for (const at of [Date.parse(String(row?.startedAt ?? row?.createdAt ?? '')), Date.now()]) {
+      const day = utcDay(at);
+      if (day) add({ personId: ownerId, day, timezone: 'UTC' });
+    }
+  }
+  for (const scope of [...scopes.values()].slice(0, 4)) {
+    const shown = await withBuildMemo(() => workGraphOrchestrator.viewsRunThroughGraph(
+      viewer, ownerId, scope.day, scope.timezone, runId,
+      (resourceId) => parsePipelineStepResourceId(resourceId).runId,
+    )).catch(() => false);
+    if (shown) return { allow: true, ownerId };
+  }
+  return { allow: false, ownerId };
+}
+
 async function authorizeGatewayWorkGraphOnce(
   organizationId: string,
   viewerId: string,

@@ -1242,6 +1242,54 @@ export class WorkGraphOrchestrator {
     );
   }
 
+  /**
+   * realtime-examples NFR #172: does `personId`'s work graph for this day show
+   * `viewer` a node of run `runId` that it may open (`view-run`)?
+   *
+   * The run's live channel (`pipeline:run:<id>`) is decided by the gateway
+   * through `/internal/pipeline-access/authorize`: the run's owner, a reader of
+   * its target document — and, through this, anyone the owner's graph shows
+   * the run to. It is the same pass the graph itself is built from
+   * (`getGraph` → grants ∩ source ACLs) and the same capability check the
+   * pane's "Open run" exchange makes, so a run node a reader can see is a run
+   * they get live, and nothing a graph withholds opens its channel. Any
+   * failure (no grant, a revoked one, a source outage) answers false.
+   */
+  async viewsRunThroughGraph(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    runId: string,
+    runIdOf: (resourceId: string) => string,
+  ): Promise<boolean> {
+    let graph: { snapshot: WorkGraphSnapshot; authorization: AuthorizedWorkGraph };
+    try {
+      graph = await this.getGraph(viewer, personId, day, timezone);
+    } catch {
+      return false;
+    }
+    const { snapshot, authorization } = graph;
+    const visible = new Map(authorization.nodes.map((node) => [node.id, node]));
+    const scope: WorkGraphPolicyScope = {
+      organizationId: viewer.organizationId,
+      viewerId: viewer.viewerId,
+      personId,
+      day,
+      timezone,
+      policyRevision: snapshot.scope.policyRevision,
+    };
+    for (const target of authorization.targets.values()) {
+      if (target.kind !== 'node' || target.node.kind !== 'run' || target.sourceRef.source !== 'pipeline') continue;
+      if (runIdOf(target.sourceRef.resourceId) !== runId) continue;
+      const publicId = authorization.publicTargetIds.get(target.id);
+      const node = publicId ? visible.get(publicId) : undefined;
+      if (!node?.capabilities.includes('view-run')) continue;
+      if (await authorizeWorkCapability(scope, target, 'view-run', this.deps.sourceAcls).catch(() => 'unavailable') === 'allow') return true;
+    }
+    return false;
+  }
+
   async exchangeAction(
     viewer: AuthenticatedWorkGraphViewer,
     input: { target: WorkCollaborationTarget; capability: WorkCollaborationCapability },

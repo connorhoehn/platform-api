@@ -33,7 +33,14 @@ export interface PipelineAccessDeps {
   /** The live executor's view of a run: who started it and on which document. */
   liveRun(runId: string): Promise<{ ownerId?: string; documentId?: string } | null>;
   documentRow(documentId: string): Promise<EditableDocumentRow | null>;
+  /**
+   * NFR #172: the run's owner shows it to this user in their work graph — the
+   * graph's own decision, so a visible run node is a run you get live.
+   */
+  sharedThroughGraph?(organizationId: string, userId: string, runId: string, graphs: GraphScope[]): Promise<{ allow: boolean; ownerId?: string }>;
 }
+
+export interface GraphScope { personId: string; day: string; timezone: string }
 
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined;
@@ -55,6 +62,11 @@ export const defaultPipelineAccessDeps: PipelineAccessDeps = {
   async documentRow(documentId) {
     const res = await docClient.send(new GetCommand({ TableName: DOCUMENTS_TABLE, Key: { documentId } }));
     return (res.Item as EditableDocumentRow | undefined) ?? null;
+  },
+  async sharedThroughGraph(organizationId, userId, runId, graphs) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { runSharedThroughWorkGraph } = require('../work-graph/runtime') as typeof import('../work-graph/runtime');
+    return runSharedThroughWorkGraph(organizationId, userId, runId, graphs);
   },
 };
 
@@ -81,6 +93,16 @@ export async function decidePipelineAccess(
   return decision.allow
     ? { allow: true, ...(ownerId ? { ownerId } : {}), documentId }
     : { allow: false, ...(ownerId ? { ownerId } : {}), documentId, reason: decision.reason };
+}
+
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+const TIMEZONE = /^[A-Za-z0-9_+\-/]{1,64}$/;
+function validGraphs(value: unknown): value is GraphScope[] {
+  return Array.isArray(value) && value.length <= 4 && value.every((g) => g && typeof g === 'object'
+    && typeof g.personId === 'string' && ID.test(g.personId)
+    && typeof g.day === 'string' && DAY.test(g.day)
+    && typeof g.timezone === 'string' && TIMEZONE.test(g.timezone)
+    && Object.keys(g).every((k) => ['personId', 'day', 'timezone'].includes(k)));
 }
 
 function authenticated(req: Request, res: Response): boolean {
@@ -116,12 +138,28 @@ export function createInternalPipelineAccessRouter(deps: PipelineAccessDeps = de
         && (b.runId === undefined || (typeof b.runId === 'string' && ID.test(b.runId)))
         && (b.documentId === undefined || (typeof b.documentId === 'string' && ID.test(b.documentId)))
         && (b.runId !== undefined || b.documentId !== undefined)
-        && Object.keys(b).every((k) => ['organizationId', 'userId', 'runId', 'documentId'].includes(k));
+        && (b.graphs === undefined || validGraphs(b.graphs))
+        && Object.keys(b).every((k) => ['organizationId', 'userId', 'runId', 'documentId', 'graphs'].includes(k));
       if (!valid) {
         res.status(400).json({ error: 'INVALID_REQUEST' });
         return;
       }
-      res.status(200).json(await decidePipelineAccess(b as any, deps));
+      const { graphs, ...body } = b as any;
+      const decided = await decidePipelineAccess(body, deps);
+      // NFR #172: not the owner, not a reader of its document — does the
+      // owner's work graph show it to this user?
+      if (!decided.allow && body.runId && deps.sharedThroughGraph) {
+        const shared = await deps.sharedThroughGraph(body.organizationId, body.userId, body.runId, graphs ?? []).catch(() => null);
+        if (shared?.allow) {
+          res.status(200).json({ allow: true, ownerId: shared.ownerId, ...(decided.documentId ? { documentId: decided.documentId } : {}), via: 'work-graph' });
+          return;
+        }
+        if (shared?.ownerId && !decided.ownerId) {
+          res.status(200).json({ ...decided, ownerId: shared.ownerId });
+          return;
+        }
+      }
+      res.status(200).json(decided);
     } catch (error) {
       next(error);
     }

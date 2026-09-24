@@ -54,10 +54,10 @@ describe('POST /internal/pipeline-access/authorize', () => {
   beforeAll(() => { process.env.SERVICE_AUTH_SECRET = SECRET; });
   afterAll(() => { process.env.SERVICE_AUTH_SECRET = prev; });
 
-  async function post(body: Record<string, unknown>, signed = true): Promise<{ status: number; json: any }> {
+  async function post(body: Record<string, unknown>, signed = true, d: PipelineAccessDeps = deps()): Promise<{ status: number; json: any }> {
     const app = express();
     app.use(express.json());
-    app.use('/internal/pipeline-access', createInternalPipelineAccessRouter(deps()));
+    app.use('/internal/pipeline-access', createInternalPipelineAccessRouter(d));
     const server = app.listen(0);
     try {
       const port = (server.address() as { port: number }).port;
@@ -82,5 +82,45 @@ describe('POST /internal/pipeline-access/authorize', () => {
   it('rejects a request naming neither a run nor a document', async () => {
     const res = await post({ organizationId: 'org-1', userId: 'dev-alice' });
     expect(res.status).toBe(400);
+  });
+
+  // NFR #172: a run the owner's work graph shows this user is theirs to watch
+  // live — the graph's own decision, asked only after owner and document.
+  describe('shown by the owner\'s work graph (NFR #172)', () => {
+    const graph = { personId: 'dev-connor', day: '2026-09-23', timezone: 'America/New_York' };
+    function withGraph(shows: boolean, seen: unknown[] = []): PipelineAccessDeps {
+      return deps({
+        sharedThroughGraph: async (organizationId, userId, runId, graphs) => {
+          seen.push({ organizationId, userId, runId, graphs });
+          return shows ? { allow: true, ownerId: 'dev-connor' } : { allow: false, ownerId: 'dev-connor' };
+        },
+      });
+    }
+    it('allows a run the graph shows, and hands the graph the socket\'s open scope', async () => {
+      const seen: unknown[] = [];
+      const res = await post({ organizationId: 'org-1', userId: 'dev-frank', runId: 'run-nodoc', graphs: [graph] }, true, withGraph(true, seen));
+      expect(res.json).toMatchObject({ allow: true, ownerId: 'dev-connor', via: 'work-graph' });
+      expect(seen).toEqual([{ organizationId: 'org-1', userId: 'dev-frank', runId: 'run-nodoc', graphs: [graph] }]);
+    });
+    it('refuses a run the graph does not show, and names its owner', async () => {
+      const res = await post({ organizationId: 'org-1', userId: 'dev-frank', runId: 'unknown-here' }, true, withGraph(false));
+      expect(res.json).toMatchObject({ allow: false, ownerId: 'dev-connor' });
+    });
+    it('does not ask the graph when owner or document already decided', async () => {
+      const seen: unknown[] = [];
+      const res = await post({ organizationId: 'org-1', userId: 'dev-alice', runId: 'run-1' }, true, withGraph(true, seen));
+      expect(res.json).toMatchObject({ allow: true });
+      expect(seen).toHaveLength(0);
+    });
+    it('never for a document-only (deck-revise) question', async () => {
+      const seen: unknown[] = [];
+      const res = await post({ organizationId: 'org-1', userId: 'dev-frank', documentId: 'doc-1' }, true, withGraph(true, seen));
+      expect(res.json.allow).toBe(false);
+      expect(seen).toHaveLength(0);
+    });
+    it('rejects a malformed graph scope', async () => {
+      const res = await post({ organizationId: 'org-1', userId: 'dev-frank', runId: 'run-1', graphs: [{ ...graph, day: 'today' }] }, true, withGraph(true));
+      expect(res.status).toBe(400);
+    });
   });
 });
