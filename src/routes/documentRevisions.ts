@@ -84,9 +84,43 @@ async function loadRevision(req: Request, documentId: string, revisionId: string
   return { row, revision };
 }
 
+/** The most one page of `GET …/revisions?limit=` may hold. */
+export const MAX_REVISION_PAGE = 50;
+
+/** One revision as a list shows it: what it is, never its slide list or bytes. */
+function revisionSummary(revision: StoredRevision, documentTitle: string | undefined) {
+  const heading = revisionHeading(revision, documentTitle);
+  return {
+    id: revision.id,
+    label: revision.label,
+    createdAt: revision.createdAt,
+    createdBy: revision.createdBy,
+    slideCount: revision.slideCount,
+    contentType: revision.asset.contentType,
+    sizeBytes: revision.asset.sizeBytes,
+    hasSpec: !!(revision.spec || revision.specRef),
+    ...(revision.sources ? { sources: revision.sources } : {}),
+    ...(revision.producedBy ? { producedBy: revision.producedBy } : {}),
+    ...(heading ? { heading } : {}),
+  };
+}
+
+function slideRefs(slides: readonly StoredSlide[] | null | undefined) {
+  return (slides ?? []).map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle }));
+}
+
 /**
  * GET /api/documents/:documentId/revisions
  * What revisions exist and what each one holds — no bytes.
+ *
+ * `?limit=N[&before=<revisionId>]` (NFR revision paging, Loop 30): one page,
+ * NEWEST first, summary fields only — the head alone carries its slide list
+ * (it is on the row already) — plus `total` and `nextCursor` (the id to pass as
+ * `before` for the next older page; null on the last). Revisions live in one
+ * array on the document row, so a page is still ONE GetItem, and it resolves no
+ * slide manifests: the unpaged form reads one blob per older revision. An older
+ * revision's slides come from `GET …/revisions/:revisionId`. Without `limit` the
+ * answer is the full oldest-first list it always was (scripts, seeders).
  */
 documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
@@ -95,6 +129,30 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
   const stored = await store.get(documentId);
   if (!stored) throw new NotFoundError('Document not found');
   await assertCanReadDocument(req, stored, documentId);
+  if (req.query.limit !== undefined) {
+    const limit = Number(req.query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_REVISION_PAGE) throw new ValidationError(`limit must be 1–${MAX_REVISION_PAGE}`);
+    const before = typeof req.query.before === 'string' && req.query.before ? req.query.before : undefined;
+    if (before !== undefined && !ID.test(before)) throw new ValidationError('before is invalid');
+    const all = stored.revisions ?? [];
+    const end = before === undefined ? all.length : all.findIndex((revision) => revision.id === before);
+    if (end === -1) throw new NotFoundError('Revision not found');
+    const start = Math.max(0, end - limit);
+    const head = all[all.length - 1];
+    const page = all.slice(start, end).reverse().map((revision) => ({
+      ...revisionSummary(revision, stored.title),
+      ...(revision === head && Array.isArray(revision.slides) ? { slides: slideRefs(revision.slides) } : {}),
+    }));
+    res.status(200).json({
+      documentId,
+      title: stored.title ?? 'Untitled',
+      type: stored.type ?? PRESENTATION_DOCUMENT_TYPE,
+      total: all.length,
+      revisions: page,
+      nextCursor: start > 0 ? all[start]!.id : null,
+    });
+    return;
+  }
   // Older revisions' slide lists live in manifests off the row (NFR #36).
   const row = await withRevisionSlides(store, stored);
   res.status(200).json({
@@ -102,20 +160,8 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
     title: row.title ?? 'Untitled',
     type: row.type ?? PRESENTATION_DOCUMENT_TYPE,
     revisions: (row.revisions ?? []).map((revision) => ({
-      id: revision.id,
-      label: revision.label,
-      createdAt: revision.createdAt,
-      createdBy: revision.createdBy,
-      slideCount: revision.slideCount,
-      contentType: revision.asset.contentType,
-      sizeBytes: revision.asset.sizeBytes,
-      hasSpec: !!(revision.spec || revision.specRef),
-      ...(revision.sources ? { sources: revision.sources } : {}),
-      // A composer edit's revision names the run that wrote it.
-      ...(revision.producedBy ? { producedBy: revision.producedBy } : {}),
-      // The deck's own heading, only where it differs from the document's name.
-      ...(revisionHeading(revision, row.title) ? { heading: revisionHeading(revision, row.title) } : {}),
-      slides: (revision.slides ?? []).map((slide) => ({ id: slide.id, index: slide.index, title: slide.title, previewHandle: slide.previewHandle })),
+      ...revisionSummary(revision, row.title),
+      slides: slideRefs(revision.slides),
     })),
   });
 }));
@@ -269,6 +315,21 @@ documentRevisionsRouter.post('/', requireAuth, asyncHandler(async (req: Request,
     },
     warnings: outcome.preview.warnings,
   });
+}));
+
+/**
+ * GET /api/documents/:documentId/revisions/:revisionId
+ * One revision's summary and its slide list (id, index, title) — what a paged
+ * list leaves off every revision but the head. One GetItem, and one manifest
+ * blob for a revision whose slide list moved off the row.
+ */
+documentRevisionsRouter.get('/:revisionId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const documentId = String(req.params.documentId ?? '');
+  const { row, revision } = await loadRevision(req, documentId, String(req.params.revisionId ?? ''));
+  const slides = await resolveRevisionSlides(getPresentationDocumentStore(), revision);
+  res.status(200)
+    .setHeader('cache-control', 'private, max-age=31536000, immutable')
+    .json({ documentId, revision: { ...revisionSummary(revision, row.title), slides: slideRefs(slides) } });
 }));
 
 /**

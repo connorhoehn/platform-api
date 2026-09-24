@@ -129,6 +129,7 @@ export const ACCESS_ALLOWLIST: Record<string, string> = {
   ...each('in handler: canReadDocument / canEditDocument (#135, #41)', [
     'GET /api/documents/:documentId/revisions/',
     'POST /api/documents/:documentId/revisions/',
+    'GET /api/documents/:documentId/revisions/:revisionId',
     'GET /api/documents/:documentId/revisions/:revisionId/spec',
     'GET /api/documents/:documentId/revisions/:revisionId/file',
     'GET /api/documents/:documentId/revisions/:revisionId/slides',

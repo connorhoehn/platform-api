@@ -240,6 +240,48 @@ describe('GET /api/documents/:id/revisions', () => {
   });
 });
 
+describe('GET /api/documents/:id/revisions?limit= (revision paging, Loop 30)', () => {
+  it('answers one page newest first, summaries only, the head with its slides, and a cursor to older ones', async () => {
+    const getBlob = jest.spyOn(mirrorStore, 'getBlob');
+    const first = await request('/api/documents/doc-moved/revisions?limit=1');
+    expect(first.status).toBe(200);
+    const page1 = JSON.parse(first.body.toString('utf8'));
+    expect(page1.total).toBe(2);
+    expect(page1.revisions.map((revision: { id: string }) => revision.id)).toEqual(['v2']);
+    expect(page1.revisions[0].slides.map((slide: { title: string }) => slide.title)).toEqual(['Head cover']);
+    expect(page1.nextCursor).toBe('v2');
+    const second = JSON.parse((await request(`/api/documents/doc-moved/revisions?limit=1&before=${page1.nextCursor}`)).body.toString('utf8'));
+    expect(second.revisions.map((revision: { id: string }) => revision.id)).toEqual(['v1']);
+    // An older revision's slide list is a manifest blob; a page never reads it.
+    expect(second.revisions[0].slides).toBeUndefined();
+    expect(second.revisions[0].slideCount).toBe(2);
+    expect(second.nextCursor).toBeNull();
+    expect(getBlob).not.toHaveBeenCalled();
+    getBlob.mockRestore();
+  });
+
+  it('400s a bad limit and 404s a cursor the deck does not list', async () => {
+    expect((await request('/api/documents/doc-moved/revisions?limit=0')).status).toBe(400);
+    expect((await request('/api/documents/doc-moved/revisions?limit=51')).status).toBe(400);
+    expect((await request('/api/documents/doc-moved/revisions?limit=5&before=v9')).status).toBe(404);
+  });
+
+  it('GET …/revisions/:rev answers one older revision with its slide list', async () => {
+    await mirrorStore.putBlob(MOVED_KEY, Buffer.from(JSON.stringify(MOVED_SLIDES)), { contentType: 'application/json' });
+    const res = await request('/api/documents/doc-moved/revisions/v1');
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body.toString('utf8'));
+    expect(body.revision.id).toBe('v1');
+    expect(body.revision.slides.map((slide: { title: string }) => slide.title)).toEqual(['Moved cover']);
+    expect((await request('/api/documents/doc-moved/revisions/v9')).status).toBe(404);
+  });
+
+  it('a stranger gets the same 404 from a page as from a missing deck', async () => {
+    expect((await request('/api/documents/doc-moved/revisions?limit=5', { authorization: devToken('user-stranger') })).status).toBe(404);
+    expect((await request('/api/documents/doc-moved/revisions/v1', { authorization: devToken('user-stranger') })).status).toBe(404);
+  });
+});
+
 describe('GET /api/documents/:id/revisions/:rev/file', () => {
   it('serves the .pptx from the durable copy when the volume no longer has it', async () => {
     const res = await request('/api/documents/doc-1/revisions/v1/file');
