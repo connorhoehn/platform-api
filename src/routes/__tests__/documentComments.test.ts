@@ -48,7 +48,17 @@ jest.mock('../../middleware/auth', () => ({
   optionalAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
 }));
 
+// NFR #154: the reader gate, over an in-memory document row per test.
+const mockDocRow = jest.fn();
+const mockLifecycleOwner = jest.fn();
+let mockGate: import('../../documents/documentReadGate').DocumentReadGate;
+jest.mock('../../documents/documentReadGate', () => {
+  const actual = jest.requireActual('../../documents/documentReadGate');
+  return { ...actual, documentReadGate: () => mockGate };
+});
+
 import { documentCommentsRouter } from '../documentComments';
+import { makeDocumentReadGate } from '../../documents/documentReadGate';
 import { errorHandler } from '../../middleware/error-handler';
 import { createDocumentPolicy } from '../../middleware/document-policy';
 import type { DocumentGrantClaims } from '@connorhoehn/realtime-modules/server';
@@ -81,7 +91,7 @@ function mockRes(): MockRes {
   return r;
 }
 
-interface RunOpts { body?: unknown; userId?: string }
+interface RunOpts { body?: unknown; userId?: string; anonymous?: boolean }
 
 async function run(
   app: express.Express,
@@ -101,7 +111,7 @@ async function run(
     url,
     originalUrl: url,
     path: qIdx >= 0 ? url.slice(0, qIdx) : url,
-    headers: { 'content-type': 'application/json', authorization: 'Bearer test-grant' },
+    headers: opts.anonymous ? { 'content-type': 'application/json' } : { 'content-type': 'application/json', authorization: 'Bearer test-grant' },
     query,
     body: opts.body,
     user: { sub: opts.userId ?? 'tester', email: 'tester@example.com' },
@@ -135,6 +145,10 @@ function buildApp(grant?: DocumentGrantClaims): express.Express {
 }
 
 beforeEach(() => {
+  // tester and other read the document through `viewers`; doc-owner owns it.
+  mockDocRow.mockReset().mockResolvedValue({ createdBy: 'doc-owner', viewers: ['tester', 'other'] });
+  mockLifecycleOwner.mockReset().mockResolvedValue(undefined);
+  mockGate = makeDocumentReadGate({ getDocumentRow: mockDocRow, getLifecycleOwner: mockLifecycleOwner });
   mockCreateComment.mockReset();
   mockGetComment.mockReset().mockResolvedValue({ documentId: DOC, commentId: 'c-1', userId: 'tester' });
   mockEditComment.mockReset().mockResolvedValue({ documentId: DOC, commentId: 'c-1', text: 'Edited' });
@@ -379,5 +393,76 @@ describe('mounted comment routes with document grants', () => {
     const res = await run(buildApp(grant), 'GET', BASE + '?cursor=' + cursor);
     expect(res.statusCode).toBe(400);
     expect(mockGetCommentsForDocument).not.toHaveBeenCalled();
+  });
+});
+
+describe('NFR #154: the comment routes ask document:read', () => {
+  const post = { body: { scope: 'document', text: 'Looks good' } };
+  beforeEach(() => {
+    mockGetCommentsForDocument.mockResolvedValue({ items: [{ commentId: 'c-1' }] });
+    mockCreateComment.mockResolvedValue({ commentId: 'c-new' });
+  });
+
+  it.each(['doc-owner', 'tester'])('%s (owner / reader) lists 200 and posts 201', async (userId) => {
+    const app = buildApp();
+    expect((await run(app, 'GET', BASE, { userId })).statusCode).toBe(200);
+    expect((await run(app, 'POST', BASE, { ...post, userId })).statusCode).toBe(201);
+  });
+
+  it('a stranger gets 404 on every comment route and nothing is read or written', async () => {
+    const app = buildApp();
+    for (const [method, url] of [['GET', BASE], ['POST', BASE], ['PATCH', BASE + '/c-1'], ['DELETE', BASE + '/c-1']]) {
+      const res = await run(app, method, url, { userId: 'mallory', body: method === 'PATCH' ? { resolved: true } : post.body });
+      expect([method, res.statusCode]).toEqual([method, 404]);
+    }
+    expect(mockGetCommentsForDocument).not.toHaveBeenCalled();
+    expect(mockCreateComment).not.toHaveBeenCalled();
+    expect(mockGetComment).not.toHaveBeenCalled();
+    expect(mockResolveThread).not.toHaveBeenCalled();
+    expect(mockDeleteComment).not.toHaveBeenCalled();
+  });
+
+  it('a missing document is the same 404; a lifecycle-only document belongs to its lifecycle owner', async () => {
+    mockDocRow.mockResolvedValue(null);
+    expect((await run(buildApp(), 'GET', BASE, { userId: 'tester' })).statusCode).toBe(404);
+    mockLifecycleOwner.mockResolvedValue('tester');
+    expect((await run(buildApp(), 'GET', BASE, { userId: 'tester' })).statusCode).toBe(200);
+  });
+
+  it.each([['GET', BASE], ['POST', BASE], ['PATCH', BASE + '/c-1'], ['DELETE', BASE + '/c-1']])('anonymous %s is 401', async (method, url) => {
+    const res = await run(buildApp(), method, url, { anonymous: true, body: method === 'PATCH' ? { resolved: true } : post.body });
+    expect(res.statusCode).toBe(401);
+    expect(mockDocRow).not.toHaveBeenCalled();
+  });
+
+  it('the document owner may delete a reader\'s comment but not rewrite it; another reader may do neither', async () => {
+    mockGetComment.mockResolvedValue({ documentId: DOC, commentId: 'c-1', userId: 'tester' });
+    const app = buildApp();
+    expect((await run(app, 'PATCH', BASE + '/c-1', { userId: 'doc-owner', body: { text: 'Rewritten' } })).statusCode).toBe(403);
+    expect((await run(app, 'DELETE', BASE + '/c-1', { userId: 'other' })).statusCode).toBe(403);
+    expect(mockDeleteComment).not.toHaveBeenCalled();
+    expect((await run(app, 'DELETE', BASE + '/c-1', { userId: 'doc-owner' })).statusCode).toBe(204);
+    expect(mockDeleteComment).toHaveBeenCalledWith(DOC, 'c-1');
+  });
+
+  it('a reader may resolve a thread', async () => {
+    expect((await run(buildApp(), 'PATCH', BASE + '/c-1', { userId: 'other', body: { resolved: true } })).statusCode).toBe(200);
+  });
+
+  it('an allow is cached per user and document; a refusal is not, so a fresh share opens at once', async () => {
+    const app = buildApp();
+    await run(app, 'GET', BASE, { userId: 'tester' });
+    await run(app, 'POST', BASE, { ...post, userId: 'tester' });
+    await run(app, 'GET', BASE, { userId: 'tester' });
+    expect(mockDocRow).toHaveBeenCalledTimes(1);
+    expect((await run(app, 'GET', BASE, { userId: 'erin' })).statusCode).toBe(404);
+    mockDocRow.mockResolvedValue({ createdBy: 'doc-owner', viewers: ['tester', 'erin'] });
+    expect((await run(app, 'GET', BASE, { userId: 'erin' })).statusCode).toBe(200);
+  });
+
+  it('a scoped document grant was checked by the policy middleware and is not re-checked', async () => {
+    const grant = { documentId: DOC, tenantId: 'assessment', sub: 'mallory', operations: ['read'] } as DocumentGrantClaims;
+    expect((await run(buildApp(grant), 'GET', BASE, { userId: 'mallory' })).statusCode).toBe(200);
+    expect(mockDocRow).not.toHaveBeenCalled();
   });
 });

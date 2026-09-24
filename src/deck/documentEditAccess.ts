@@ -142,6 +142,24 @@ export function makeChannelMemberLookup(get: Get = ddbGet): ChannelMemberLookup 
 export const isChannelMember: ChannelMemberLookup = makeChannelMemberLookup();
 
 /**
+ * NFR #155: a member-addressed DM (`chat:dm:a:b[:c…]`) names its participants —
+ * the library's `dmChannelMembers` reads membership off the name, and the name
+ * never changes. A document the owner filed in such a DM is shared with the
+ * other names for as long as the owner stays one of them, however long the
+ * thread is silent: the `chat-conversations` row expires ~90 days after the
+ * last message, and a deck must not become unreadable with it. The owner being
+ * named is what makes the name a grant (the owner could name anyone as a viewer
+ * anyway); a name alone, on a row someone else owns, still goes to the table.
+ * Hashed group DMs (`chat:dmg:`) do not carry names and still use the table.
+ */
+export function dmNamesAdmit(channel: string, ownerId: unknown, userId: string): boolean {
+  if (!channel.startsWith('chat:dm:') || typeof ownerId !== 'string' || !ownerId || !userId) return false;
+  const names = channel.slice('chat:dm:'.length).split(':');
+  if (names.some((name) => !name)) return false;
+  return names.includes(ownerId) && names.includes(userId);
+}
+
+/**
  * May `user` read this document — its revision list, slides, spec and file
  * (NFR #135)? The `document:read` policy in lib/authorize.ts: owner, editor,
  * viewer, or a member of the channel the row names. A missing row is the
@@ -159,7 +177,9 @@ export async function canReadDocument(
   const userId = user?.sub ?? '';
   const channel = typeof row.channel === 'string' ? row.channel : '';
   const role = documentRoleOf(row, userId);
-  const member = role === 'stranger' && !!channel && !!userId ? await memberLookup(channel, userId) : false;
+  const member = role === 'stranger' && !!channel && !!userId
+    ? dmNamesAdmit(channel, row.createdBy, userId) || await memberLookup(channel, userId)
+    : false;
   return authorize({
     principal: principalOf(user, tenant),
     action: 'document:read',

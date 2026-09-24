@@ -103,4 +103,22 @@ describe('channel membership for document:read', () => {
     expect(stranger.allow).toBe(false);
     if (!stranger.allow) expect(stranger.status).toBe(404);
   });
+
+  it('NFR #155: a deck the owner filed in a DM stays readable to the other member after the conversation row expires', async () => {
+    const { canReadDocument, makeChannelMemberLookup, dmNamesAdmit } = await import('../documentEditAccess');
+    // The TTL deleted both conversation rows: the table has nothing for this DM.
+    const expired = jest.fn(async () => ({ Item: undefined }));
+    const member = makeChannelMemberLookup(expired);
+    expect(await member(dm, 'dev-frank')).toBe(false); // the table alone no longer admits frank
+    const deck = { createdBy: 'dev-connor', channel: dm };
+    expect((await canReadDocument(deck, { sub: 'dev-frank' }, 'doc-dm', member)).allow).toBe(true);
+    expect(expired).toHaveBeenCalledTimes(1); // only the lookup above: the name decided frank
+    expect((await canReadDocument(deck, { sub: 'dev-mallory' }, 'doc-dm', member)).allow).toBe(false);
+    // The owner must be one of the names; otherwise the name is no grant and the (expired) table decides.
+    expect((await canReadDocument({ createdBy: 'dev-erin', channel: dm }, { sub: 'dev-frank' }, 'doc-dm', member)).allow).toBe(false);
+    // Hashed group DMs carry no names; malformed names admit nobody.
+    expect(dmNamesAdmit('chat:dmg:abc', 'dev-connor', 'dev-frank')).toBe(false);
+    expect(dmNamesAdmit('chat:dm::dev-frank', '', 'dev-frank')).toBe(false);
+    expect(dmNamesAdmit('chat:dm:dev-a:dev-b:dev-c', 'dev-a', 'dev-c')).toBe(true);
+  });
 });

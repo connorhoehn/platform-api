@@ -10,6 +10,7 @@ import {
   ForbiddenError,
 } from '../middleware/error-handler';
 import log from '../lib/logger';
+import { documentReadGate } from '../documents/documentReadGate';
 
 // ---------------------------------------------------------------------------
 // Anchors
@@ -102,6 +103,9 @@ documentCommentsRouter.post('/:documentId/comments', requireAuth, asyncHandler(a
     scope?: unknown;
   };
   const userId = req.user!.sub;
+  // NFR #154: a commenter is a reader — the Comments tab is open to everyone
+  // who may read the document, and so is posting in it.
+  await documentReadGate().assertCanRead(req, documentId);
 
   const trimmedSectionId =
     typeof sectionId === 'string' && sectionId.trim() ? sectionId.trim() : undefined;
@@ -158,6 +162,7 @@ documentCommentsRouter.get('/:documentId/comments', requireAuth, asyncHandler(as
   const { documentId } = req.params;
   const sectionId = req.query['sectionId'] as string | undefined;
   const limit = Math.min(parseInt(req.query['limit'] as string ?? '50', 10) || 50, 200);
+  await documentReadGate().assertCanRead(req, documentId);
 
   let cursor: Record<string, unknown> | undefined;
   if (req.query['cursor'] !== undefined) {
@@ -184,6 +189,7 @@ documentCommentsRouter.patch('/:documentId/comments/:commentId', requireAuth, as
   const { documentId, commentId } = req.params;
   const { resolved, text } = req.body as { resolved?: boolean; text?: unknown };
   const userId = req.user!.sub;
+  await documentReadGate().assertCanRead(req, documentId);
 
   const existing = await documentCommentRepo.getComment(documentId, commentId);
   if (!existing) throw new NotFoundError('Comment not found');
@@ -233,9 +239,17 @@ documentCommentsRouter.patch('/:documentId/comments/:commentId', requireAuth, as
 documentCommentsRouter.delete('/:documentId/comments/:commentId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { documentId, commentId } = req.params;
 
+  const gate = documentReadGate();
+  const { ownerId } = await gate.assertCanRead(req, documentId);
+
   const existing = await documentCommentRepo.getComment(documentId, commentId);
   if (!existing) throw new NotFoundError('Comment not found');
-  if (existing.userId !== req.user!.sub) throw new ForbiddenError('Only the author may delete a comment');
+  // The author, or the document's owner tidying their own document. Editing
+  // the words stays the author's alone (PATCH above).
+  if (existing.userId !== req.user!.sub) {
+    const owner = ownerId ?? (req.documentGrant ? undefined : await gate.ownerOf(documentId));
+    if (!owner || owner !== req.user!.sub) throw new ForbiddenError('Only the author or the document owner may delete a comment');
+  }
   await documentCommentRepo.deleteComment(documentId, commentId);
 
   publishSignal(`doc-comments:${documentId}`, 'doc:comment_deleted', {
