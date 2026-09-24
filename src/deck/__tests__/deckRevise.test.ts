@@ -313,3 +313,30 @@ describe('reviseDeck — a target inside one slide', () => {
     expect(phases).toEqual(['reading-sources', 'asking-model', 'checking']);
   });
 });
+
+describe('reviseDeck — the title slide\'s subtitle (NFR Loop 28)', () => {
+  const withSubtitle = (): DeckSpec => ({ ...deck(), subtitle: 'Release risks and mitigation strategy' });
+
+  it('tells the model the line under a title slide is the deck subtitle, and lifts a slide "subtitle" onto the deck', async () => {
+    const prompts: string[] = [];
+    const answer = JSON.stringify({
+      summary: 'Shortened the subtitle.',
+      slide: { id: 'cover', layout: 'title', title: 'Release review', subtitle: 'Risks and mitigations', sources: [{ documentId: 'doc-plan', title: 'Release plan' }] },
+    });
+    const result = await reviseDeck(
+      { spec: withSubtitle(), instruction: 'Change the subtitle on this slide to exactly: Risks and mitigations', slideId: 'cover' },
+      { ...deps, llm: scripted(answer, prompts) },
+    );
+    expect(prompts[0]).toContain('is the deck\'s subtitle (now "Release risks and mitigation strategy")');
+    expect(result.spec.subtitle).toBe('Risks and mitigations');
+    expect('subtitle' in result.spec.slides[0]!).toBe(false);
+    expect(result.spec.slides[1]).toEqual(withSubtitle().slides[1]);
+  });
+
+  it('says nothing about a subtitle on a bullets slide', async () => {
+    const prompts: string[] = [];
+    const answer = JSON.stringify({ summary: 'Same.', slide: deck().slides[1] });
+    await reviseDeck({ spec: withSubtitle(), instruction: 'shorter title', slideId: 'transcript' }, { ...deps, llm: scripted(answer, prompts) }).catch(() => undefined);
+    expect(prompts[0]).not.toContain('is the deck\'s subtitle');
+  });
+});

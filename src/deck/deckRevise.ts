@@ -237,6 +237,13 @@ export function revisePrompt(input: DeckReviseInput, sources: ReadSource[]): str
       '',
       'Rules:',
       `- The slide keeps "id": "${slide.id}". Do not return any other slide.`,
+      // The line under a title slide's title is the DECK's subtitle; a slide has
+      // none. Without saying so the model either left it alone ("Subtitle has 5
+      // words; before it had 5") or put "subtitle" on the slide, which the
+      // validator refused (live 2026-09-24, NFR Loop 28).
+      ...(slide.layout === 'title'
+        ? [`- The line under this slide's title is the deck's subtitle (now ${JSON.stringify(input.spec.subtitle ?? null)}). To change it, add "subtitle": "…" to the slide you return; it becomes the deck's subtitle.`]
+        : []),
       ...rules(),
     ]
     : [
@@ -512,7 +519,15 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
     }
     // The id is the one thing a slide-scoped edit may not change: the rail,
     // the preview handles and the stored revision all key on it.
-    candidate = { ...input.spec, slides: input.spec.slides.map((existing) => (existing.id === input.slideId ? { ...slide, id: input.slideId } : existing)) };
+    // A "subtitle" on the returned slide is the deck's subtitle (the prompt
+    // says so for a title slide); a slide has no such field.
+    const { subtitle: slideSubtitle, ...slideRest } = slide;
+    const subtitle = typeof slideSubtitle === 'string' && slideSubtitle.trim() ? slideSubtitle.trim().slice(0, 200) : undefined;
+    candidate = {
+      ...input.spec,
+      ...(subtitle ? { subtitle } : {}),
+      slides: input.spec.slides.map((existing) => (existing.id === input.slideId ? { ...slideRest, id: input.slideId } : existing)),
+    };
   } else {
     candidate = parsed.spec;
     if (!candidate || typeof candidate !== 'object') {
