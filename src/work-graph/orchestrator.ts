@@ -536,8 +536,11 @@ export class WorkGraphOrchestrator {
     day: string,
     timezone: string,
     previousCursor?: string,
+    timing?: Record<string, number>,
   ): Promise<{ snapshot: WorkGraphSnapshot; authorization: AuthorizedWorkGraph }> {
+    const started = Date.now();
     if (!await this.deps.directory.personBelongsToOrganization(viewer.organizationId, personId)) throw unavailable();
+    if (timing) timing.person = Date.now() - started;
     const now = this.deps.now();
     const scopeBase = {
       organizationId: viewer.organizationId,
@@ -546,7 +549,9 @@ export class WorkGraphOrchestrator {
       day,
       timezone,
     };
-    const { empty, authorization, sourceScope } = await this.authorizeDay(viewer, personId, day, timezone, now);
+    const { empty, authorization, sourceScope } = await this.authorizeDay(
+      viewer, personId, day, timezone, now, undefined, timing,
+    );
     const policyRevision = workGraphAuthorizationRevision(sourceScope.policyRevision, authorization);
     const scope: WorkGraphPolicyScope = { ...scopeBase, policyRevision };
     if (previousCursor && !this.deps.cursorCodec.verify(previousCursor, scope, now)) {
@@ -655,7 +660,7 @@ export class WorkGraphOrchestrator {
     const loaded = Date.now();
     if (timing) timing.load = loaded - started;
     const authorization = await authorizeWorkGraph(
-      narrow ? narrow(empty) : empty, sourceScope, grants, this.deps.sourceAcls, now,
+      narrow ? narrow(empty) : empty, sourceScope, grants, this.deps.sourceAcls, now, timing,
     );
     if (timing) timing.acl = Date.now() - loaded;
     return { empty, authorization, sourceScope };
@@ -722,6 +727,7 @@ export class WorkGraphOrchestrator {
     timezone: string,
     input: WorkGraphWindowInput = {},
     previousCursor?: string,
+    timing?: Record<string, number>,
   ): Promise<{ snapshot: WorkGraphSnapshot; query: WorkGraphQueryV2; activity: WorkGraphActivityV2 }> {
     const reader = this.deps.activityReader;
     if (!reader) throw new WorkGraphInputError('Schema version 2 is not available on this deployment.');
@@ -735,8 +741,8 @@ export class WorkGraphOrchestrator {
     // One read memo for the whole build: the ACL pass and the activity layer
     // ask for the same runs and definitions (NFR #16).
     const { snapshot, authorization, activity, authorized } = await withBuildMemo(async () => {
-      const graph = await this.getGraph(viewer, personId, day, timezone, previousCursor);
-      const at = profiling ? Date.now() : 0;
+      const graph = await this.getGraph(viewer, personId, day, timezone, previousCursor, timing);
+      const at = profiling || timing ? Date.now() : 0;
       return {
         ...graph,
         authorized: at,
@@ -747,7 +753,8 @@ export class WorkGraphOrchestrator {
           authorization: graph.authorization,
           reader,
           now,
-        }),
+          ...(timing ? { timing } : {}),
+        }).finally(() => { if (timing) timing.activity = Date.now() - at; }),
       };
     });
     if (profiling) {
@@ -772,8 +779,11 @@ export class WorkGraphOrchestrator {
     timezone: string,
     input: WorkGraphWindowInput = {},
     previousCursor?: string,
+    timing?: Record<string, number>,
   ): Promise<WorkGraphSnapshotV2> {
-    const { snapshot, query, activity } = await this.getActivity(viewer, personId, day, timezone, input, previousCursor);
+    const { snapshot, query, activity } = await this.getActivity(
+      viewer, personId, day, timezone, input, previousCursor, timing,
+    );
     const built = buildWorkGraphSnapshotV2({ snapshot: snapshot as never, query, activity });
     // Failing closed keeps a partially derived activity layer off the wire.
     // The reason never reaches the caller — every unavailable answer looks the

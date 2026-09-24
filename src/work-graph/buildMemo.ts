@@ -40,3 +40,19 @@ export function buildMemoActive(): boolean {
 export function memoHas(key: string): boolean {
   return !!store.getStore()?.has(key);
 }
+
+const fullReads = new AsyncLocalStorage<true>();
+
+/**
+ * Runs `build` with every read unprojected — the whole row, as a build read it
+ * before NFR #157 — so an operator can check a projected build against the
+ * full one (`x-graph-full-read: 1` on the graph route).
+ */
+export function withFullReads<T>(build: () => Promise<T>): Promise<T> {
+  return fullReads.run(true, build);
+}
+
+/** Whether the enclosing build asked for whole rows. */
+export function fullReadsRequested(): boolean {
+  return fullReads.getStore() === true;
+}

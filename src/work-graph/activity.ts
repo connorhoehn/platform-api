@@ -246,6 +246,12 @@ export interface WorkActivityReader {
   attention(documentId: string): Promise<DocumentAttentionFacts | null>;
 }
 
+/** A document's own record and its attention state, read once per build. */
+type DocumentFacts = [
+  Awaited<ReturnType<WorkActivityReader['artifact']>>,
+  Awaited<ReturnType<WorkActivityReader['attention']>>,
+];
+
 export interface BuildWorkActivityInput {
   query: WorkGraphQueryV2;
   nodes: ViewerWorkNode[];
@@ -253,6 +259,8 @@ export interface BuildWorkActivityInput {
   authorization: AuthorizedWorkGraph;
   reader: WorkActivityReader;
   now: string;
+  /** Filled with phase wall times (ms) when given: runs, meetings, describe. */
+  timing?: Record<string, number>;
 }
 
 /** A source lease, not a lifecycle flag: five minutes without evidence is stale. */
@@ -554,9 +562,15 @@ function runInputs(index: GraphIndex, runId: string): ViewerWorkNode[] {
 }
 
 export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<WorkGraphActivityV2> {
-  const { query, nodes, edges, authorization, reader, now } = input;
+  const { query, nodes, edges, authorization, reader, now, timing } = input;
+  let phaseStarted = Date.now();
+  const phase = (name: string): void => {
+    if (timing) timing[name] = Date.now() - phaseStarted;
+    phaseStarted = Date.now();
+  };
   const index = indexGraph(nodes, edges);
   const details = new Map<string, ViewerWorkActivityDetail>();
+  const position = new Map(nodes.map((node, at) => [node.id, at]));
   const operations: ViewerWorkOperation[] = [];
   const detailed = nodes.filter((node) => node.disclosure === 'details' && !node.locked);
 
@@ -628,6 +642,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     }));
   }
 
+  phase('runs');
   // Meetings first: a transcript's first line names its meeting's span, and
   // resolving both in one parallel pass left that line to a race.
   const ordered = [
@@ -827,21 +842,9 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
 
     if (node.kind === 'document') {
       const documentId = stored?.sourceRef.resourceId;
-      const facts = documentId ? await reader.artifact(documentId) : null;
-      // The document is called what its owner named it. The projected node
-      // title comes from whatever event first saw it — a deck step's produced
-      // event carried the spec's title — so one deck read "Audit E2E" on some
-      // cards and "audit-e2e-1790150600" on others (live 2026-09-23). The
-      // store's title wins wherever the store has one.
-      const storedName = trim(facts?.name);
-      if (storedName && storedName !== node.title) node.title = storedName;
-      if (storedName && documentId) {
-        for (const change of changeNodesByDocument.get(documentId) ?? []) {
-          if (change.title.endsWith(' · revision')) change.title = `${storedName} · revision`;
-        }
-      }
+      // Read, and the stored name applied, before any node was described.
+      const [facts, attention] = (documentId ? documentFacts.get(documentId) : undefined) ?? [null, null];
       const run = producingRun(index, node.id);
-      const attention = documentId ? await reader.attention(documentId) : null;
       // What each revision is actually made of, as its own source recorded it.
       // A revision the source has no record of keeps whatever the projected
       // change node said and gains nothing.
@@ -1005,8 +1008,42 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       setDetail(node.id, { lines: [trim(node.description) as string] });
     }
   };
+  phaseStarted = Date.now();
+  // Every document's own row and attention state, in one parallel wave before
+  // anything is described (NFR #157: they were two reads in a row per
+  // document, inside the describe wave). Their stored names are applied here
+  // too: a deck's sources name the documents it drew on, and reading a title
+  // while that document's own branch was renaming it answered "Project
+  // documents" on one build and "Release plan" on the next.
+  const documentReads = new Map<string, Promise<DocumentFacts>>();
+  for (const node of ordered) {
+    const documentId = node.kind === 'document' ? storedNode(authorization, node.id)?.sourceRef.resourceId : undefined;
+    if (documentId && !documentReads.has(documentId)) {
+      documentReads.set(documentId, Promise.all([reader.artifact(documentId), reader.attention(documentId)]));
+    }
+  }
+  const documentFacts = new Map(await Promise.all(
+    [...documentReads].map(async ([documentId, read]) => [documentId, await read] as const),
+  ));
+  for (const node of ordered) {
+    const documentId = node.kind === 'document' ? storedNode(authorization, node.id)?.sourceRef.resourceId : undefined;
+    // The document is called what its owner named it. The projected node
+    // title comes from whatever event first saw it — a deck step's produced
+    // event carried the spec's title — so one deck read "Audit E2E" on some
+    // cards and "audit-e2e-1790150600" on others (live 2026-09-23). The
+    // store's title wins wherever the store has one.
+    const storedName = documentId ? trim(documentFacts.get(documentId)?.[0]?.name) : undefined;
+    if (!storedName || !documentId) continue;
+    if (storedName !== node.title) node.title = storedName;
+    for (const change of changeNodesByDocument.get(documentId) ?? []) {
+      if (change.title.endsWith(' · revision')) change.title = `${storedName} · revision`;
+    }
+  }
+  phase('documents');
   await Promise.all(ordered.filter((node) => node.kind === 'meeting').map(describe));
+  phase('meetings');
   await Promise.all(ordered.filter((node) => node.kind !== 'meeting').map(describe));
+  phase('describe');
 
   // An operation is evidence that one process edge was observed running. Both
   // the process node and the relationship must still be inside their lease.
@@ -1250,7 +1287,12 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       },
     },
     efforts,
-    details: detailsForDisclosedNodes(nodes, [...details.values()]),
+    // In node order, not in the order concurrent reads happened to finish:
+    // two builds of the same graph answer the same bytes (a view hash, NFR #85).
+    details: detailsForDisclosedNodes(nodes, [...details.values()].sort((a, b) => (
+      (position.get(a.nodeId) ?? Number.MAX_SAFE_INTEGER) - (position.get(b.nodeId) ?? Number.MAX_SAFE_INTEGER)
+      || a.nodeId.localeCompare(b.nodeId)
+    ))),
     operations: freshWorkOperations(operations, now),
     eventBuckets: bucketWorkEvents(query, observations, { observedAt }),
   };

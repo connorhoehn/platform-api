@@ -499,6 +499,14 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
   }
 
   async artifact(documentId: string): Promise<ArtifactFacts | null> {
+    // The comment count does not depend on the row: asked at the same time,
+    // not after it (NFR #157).
+    const counted = this.client.send(new QueryCommand({
+      TableName: DOCUMENT_COMMENTS_TABLE,
+      KeyConditionExpression: 'documentId = :doc',
+      ExpressionAttributeValues: { ':doc': documentId },
+      Select: 'COUNT',
+    })).catch(() => undefined);
     const row = (await this.client.send(new GetCommand({
       TableName: DOCUMENTS_TABLE,
       Key: { documentId },
@@ -530,13 +538,6 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       })
       .filter((value): value is NonNullable<typeof value> => !!value);
 
-    const comments = await this.client.send(new QueryCommand({
-      TableName: DOCUMENT_COMMENTS_TABLE,
-      KeyConditionExpression: 'documentId = :doc',
-      ExpressionAttributeValues: { ':doc': documentId },
-      Select: 'COUNT',
-    })).catch(() => undefined);
-
     const pageCount = typeof row.pageCount === 'number' && Number.isSafeInteger(row.pageCount) && row.pageCount > 0
       ? row.pageCount
       : anchors.length || undefined;
@@ -544,7 +545,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     // it back in place so each revision still names its own slides.
     // NFR #188: a row whose revisions are items (`revisionCount` set) gets
     // them back from `presentation-revisions`, merged with any array left.
-    const hydrated = await Promise.resolve()
+    const [comments, hydrated] = await Promise.all([counted, Promise.resolve()
       .then(async () => {
         const base = row as unknown as PresentationDocumentRow;
         if (typeof base.revisionCount !== 'number') return base;
@@ -552,7 +553,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
         return { ...base, revisions: mergeRevisions(base.revisions, items) };
       })
       .then((full) => withRevisionSlides((this.deps.presentations ?? getPresentationDocumentStore)(), full))
-      .catch(() => row as unknown as PresentationDocumentRow);
+      .catch(() => row as unknown as PresentationDocumentRow)]);
     const revisions = storedRevisionFacts(hydrated as unknown as Row);
     return {
       ...(text(row.title, 120) ? { name: text(row.title, 120) as string } : {}),

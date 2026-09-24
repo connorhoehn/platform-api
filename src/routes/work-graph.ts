@@ -24,6 +24,7 @@ import {
   type WorkReference,
 } from '../work-graph/orchestrator';
 import { publishViewBase, type ViewBaseStore } from '../work-graph/viewBase';
+import { withFullReads } from '../work-graph/buildMemo';
 import { getRedisCacheClient } from '../lib/redis-client';
 import {
   perUserRateLimit, WORK_GRAPH_PREVIEW_PER_MINUTE, WORK_GRAPH_READ_PER_MINUTE,
@@ -372,13 +373,23 @@ export function createWorkGraphRouter(
     const activity = parseActivityQuery(req);
     if (activity) {
       const started = Date.now();
-      const { result: snapshot, tally } = await countDynamoCalls(() => orchestrator.getGraphV2(
-        viewer, query.personId, query.day, query.timezone, activity, query.cursor,
-      ));
+      const phases: Record<string, number> = {};
+      // `x-graph-full-read: 1` builds from whole rows (NFR #157's drift check).
+      const build = () => orchestrator.getGraphV2(
+        viewer, query.personId, query.day, query.timezone, activity, query.cursor, phases,
+      );
+      const { result: snapshot, tally } = await countDynamoCalls(
+        () => (req.get('x-graph-full-read') === '1' ? withFullReads(build) : build()),
+      );
       // NFR #16: what this build cost — wall time and DynamoDB calls by kind.
       const reads = [...tally.entries()].filter(([key]) => !key.startsWith('ms:')).reduce((sum, [, n]) => sum + n, 0);
       const scans = [...tally.entries()].filter(([key]) => key.startsWith('Scan:')).reduce((sum, [, n]) => sum + n, 0);
-      res.setHeader('server-timing', `build;dur=${Date.now() - started}, ddb;desc="calls=${reads} scans=${scans}"`);
+      // NFR #157: and where the time went, phase by phase (person, load, acl, activity).
+      res.setHeader('server-timing', [
+        `build;dur=${Date.now() - started}`,
+        ...(Object.keys(phases).length ? [serverTiming(phases)] : []),
+        `ddb;desc="calls=${reads} scans=${scans}"`,
+      ].join(', '));
       if (req.get('x-ddb-tally') === '1') res.setHeader('x-ddb-tally', [...tally.entries()].map(([k, n]) => `${k}=${n}`).join(' '));
       // NFR #85: only a reader that asked (it can seed its stream from this
       // view) gets the extra field; the strict older validators never see it.

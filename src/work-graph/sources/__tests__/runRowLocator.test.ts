@@ -232,3 +232,41 @@ describe('RunRowLocator with remembered run keys (NFR #147)', () => {
     expect(t.calls).toEqual(['query']);
   });
 });
+
+describe('RunRowLocator projection inside a graph build (NFR #157)', () => {
+  const keys = {
+    get: async () => new Map([['r1', 'p']]),
+    fill: async () => undefined,
+    drop: async () => undefined,
+  };
+  const recording = () => {
+    const inputs: Array<Record<string, unknown>> = [];
+    const client = {
+      send: async (command: unknown) => {
+        const input = (command as BatchGetCommand).input;
+        inputs.push(input.RequestItems!['pipeline-runs'] as Record<string, unknown>);
+        return { Responses: { 'pipeline-runs': [{ pipelineId: 'p', runId: 'r1', status: 'completed' }] } };
+      },
+    } as unknown as DynamoDBDocumentClient;
+    return { inputs, client };
+  };
+
+  it('a build reads remembered runs without the definition snapshot or the resume checkpoint', async () => {
+    const { withBuildMemo } = await import('../../buildMemo');
+    const { inputs, client } = recording();
+    await withBuildMemo(() => new RunRowLocator(Date.now, keys).rows(client, 'pipeline-runs', ['r1']));
+    const projection = String(inputs[0]!.ProjectionExpression);
+    const names = Object.values(inputs[0]!.ExpressionAttributeNames as Record<string, string>);
+    expect(projection).toContain('#ck.#ctx.#plan');
+    expect(names).toEqual(expect.arrayContaining(['stepsSummary', 'triggeredBy', 'checkpoint', 'plan']));
+    expect(names).not.toContain('definitionSnapshot');
+  });
+
+  it('whole rows outside a build, and inside one that asked for a full read', async () => {
+    const { withBuildMemo, withFullReads } = await import('../../buildMemo');
+    const { inputs, client } = recording();
+    await new RunRowLocator(Date.now, keys).rows(client, 'pipeline-runs', ['r1']);
+    await withFullReads(() => withBuildMemo(() => new RunRowLocator(Date.now, keys).rows(client, 'pipeline-runs', ['r1'])));
+    expect(inputs.map((input) => input.ProjectionExpression)).toEqual([undefined, undefined]);
+  });
+});

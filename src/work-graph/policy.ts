@@ -288,6 +288,8 @@ export async function authorizeWorkGraph(
   grants: StoredWorkGrant[],
   adapters: ReadonlyMap<WorkSourceKind, WorkSourceAclAdapter>,
   checkedAt: string,
+  /** Filled with each source adapter's wall time (ms) as `acl.<source>` when given. */
+  timing?: Record<string, number>,
 ): Promise<AuthorizedWorkGraph> {
   if (projection.organizationId !== scope.organizationId || projection.actorId !== scope.personId) {
     return {
@@ -331,12 +333,15 @@ export async function authorizeWorkGraph(
       unavailableSources.add(source);
       return;
     }
+    const started = Date.now();
     try {
       const result = await adapter.authorizeDisclosure(scope, targets);
       if (!(result instanceof Map)) unavailableSources.add(source);
       else decisions.set(source, result);
     } catch {
       unavailableSources.add(source);
+    } finally {
+      if (timing) timing[`acl.${source}`] = Date.now() - started;
     }
   }));
 

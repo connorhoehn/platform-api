@@ -17,7 +17,7 @@
  */
 import { BatchGetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import log from '../../lib/logger';
-import { buildMemoActive, memoHas, memoOnce } from '../buildMemo';
+import { buildMemoActive, fullReadsRequested, memoHas, memoOnce } from '../buildMemo';
 import { runKeyStore, type RunKeyStore } from './runKeyMap';
 
 const memoKey = (table: string, runId: string): string => `run-row\u0000${table}\u0000${runId}`;
@@ -37,6 +37,31 @@ const QUERY_CONCURRENCY = 16;
 const INDEX_RECHECK_MS = 5 * 60_000;
 /** DynamoDB's cap on keys per `BatchGetItem`. */
 const BATCH_GET_KEYS = 100;
+
+/**
+ * What a graph build reads of a run row (NFR #157): every attribute a run row
+ * carries except the two a build never looks at — `definitionSnapshot` (the
+ * pipeline's full definition, copied onto each run) and `checkpoint` beyond
+ * `checkpoint.context.plan` (the engine's resume state). They are about half
+ * of a row's bytes, and a 100-run BatchGetItem took ~100 ms p50 in full
+ * against ~40 ms projected. Only the build memo's keyed path uses it; every
+ * other caller still reads whole rows. An attribute added to run rows later
+ * that a graph reader needs must be named here.
+ */
+const GRAPH_RUN_ATTRIBUTES = [
+  'pipelineId', 'runId', 'status', 'triggeredBy', 'triggerType', 'organizationId', 'ownerNodeId',
+  'startedAt', 'completedAt', 'lastEventAt', 'interruptedAt', 'resumedAt', 'resumeCount', 'resumeClaimedBy',
+  'stepsSummary', 'steps', 'error', 'pause', 'review', 'workGraph', 'finalizedFromEvidence',
+  'agentLoopRunId', 'runOverrides', 'estimatedCostUsd', 'tokenUsage', 'ttl',
+  'createdBy', 'startedBy', 'participants', 'workItem', 'summary', 'title',
+] as const;
+const GRAPH_RUN_PROJECTION = {
+  ProjectionExpression: [...GRAPH_RUN_ATTRIBUTES.map((_, index) => `#a${index}`), '#ck.#ctx.#plan'].join(', '),
+  ExpressionAttributeNames: {
+    ...Object.fromEntries(GRAPH_RUN_ATTRIBUTES.map((name, index) => [`#a${index}`, name])),
+    '#ck': 'checkpoint', '#ctx': 'context', '#plan': 'plan',
+  },
+};
 /** Rounds of `UnprocessedKeys` retried before those runs go back to the index. */
 const BATCH_GET_RETRIES = 4;
 
@@ -81,23 +106,30 @@ export class RunRowLocator {
       // build has asked for are read together, as one call.
       const missing = wanted.filter((id) => !memoHas(memoKey(table, id)));
       if (missing.length) {
-        const batch = this.readRows(client, table, missing);
+        const batch = this.readRows(client, table, missing, !fullReadsRequested());
         for (const id of missing) {
           memoOnce(memoKey(table, id), () => batch.then((found) => found.get(id) ?? null)).catch(() => undefined);
         }
       }
-      const answers = await Promise.all(wanted.map(async (id) => [id, await memoOnce(memoKey(table, id), () => this.readRows(client, table, [id]).then((found) => found.get(id) ?? null))] as const));
+      const answers = await Promise.all(wanted.map(async (id) => [id, await memoOnce(memoKey(table, id), () => this.readRows(client, table, [id], !fullReadsRequested()).then((found) => found.get(id) ?? null))] as const));
       return new Map(answers);
     }
     return this.readRows(client, table, wanted);
   }
 
-  private async readRows(client: DynamoDBDocumentClient, table: string, wanted: string[]): Promise<Map<string, Row | null>> {
+  private async readRows(
+    client: DynamoDBDocumentClient,
+    table: string,
+    wanted: string[],
+    projected = false,
+  ): Promise<Map<string, Row | null>> {
     if (!this.keys || !this.usesIndex(table)) return this.readUnkeyed(client, table, wanted);
     const known = await this.keys.get(table, wanted).catch(() => new Map<string, string>());
     const found = new Map<string, Row | null>();
     if (known.size) {
-      const byKey = await this.viaKeys(client, table, [...known].map(([runId, pipelineId]) => ({ pipelineId, runId })));
+      const byKey = await this.viaKeys(
+        client, table, [...known].map(([runId, pipelineId]) => ({ pipelineId, runId })), projected,
+      );
       for (const [runId, row] of byKey) found.set(runId, row);
     }
     // Not remembered, or remembered and not where the key said (row gone,
@@ -125,6 +157,7 @@ export class RunRowLocator {
     client: DynamoDBDocumentClient,
     table: string,
     keys: Array<{ pipelineId: string; runId: string }>,
+    projected = false,
   ): Promise<Map<string, Row>> {
     const found = new Map<string, Row>();
     const pipelineOf = new Map(keys.map((key) => [key.runId, key.pipelineId]));
@@ -134,7 +167,9 @@ export class RunRowLocator {
       let pending: Array<Record<string, unknown>> | undefined = chunk;
       for (let round = 0; pending?.length && round <= BATCH_GET_RETRIES; round += 1) {
         if (round > 0) await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** round));
-        const result = await client.send(new BatchGetCommand({ RequestItems: { [table]: { Keys: pending } } }));
+        const result = await client.send(new BatchGetCommand({
+          RequestItems: { [table]: { Keys: pending, ...(projected ? GRAPH_RUN_PROJECTION : {}) } },
+        }));
         for (const item of (result?.Responses?.[table] ?? []) as Row[]) {
           const runId = typeof item.runId === 'string' ? item.runId : undefined;
           if (!runId || pipelineOf.get(runId) !== item.pipelineId || isIndexRow(item)) continue;
