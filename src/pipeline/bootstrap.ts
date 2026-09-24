@@ -154,6 +154,7 @@ import { getPipelineBridge } from '../routes/pipelineTriggers';
 import { describePipelineRecovery, runWalPreflight } from './WalPreflight';
 import { stampPipelineArtifactIds } from './busArtifactIds';
 import { stampPipelineRunSeq } from './busRunSeq';
+import { timeBusPublish } from './busPublishTiming';
 import { resolveLiveMqConfig, startPipelineEventMqRelay, type PipelineEventMqRelay } from './event-mq-relay';
 import { setDeckReviseLiveSink } from '../deck/deckReviseEvents';
 import { createShutdown } from './ShutdownOrchestrator';
@@ -861,6 +862,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       ...(eventBusDeadLetterHandler ? { eventBusDeadLetterHandler } : {}),
       eventBusAutoCompactIntervalMs: effectiveAutoCompactIntervalMs,
       eventBusAutoCompactOptions: effectiveAutoCompactOptions,
+      // NFR #197: with Redis pub-sub the bus's subscribers never ran inside
+      // publish anyway; do not hold the executor for the PUBLISH round trip.
+      // PIPELINE_BUS_AWAIT_FANOUT=on restores the awaited hand-off.
+      eventBusAwaitFanOut: pubsubMode === 'redis' && !/^(on|true|1)$/i.test(process.env.PIPELINE_BUS_AWAIT_FANOUT ?? '') ? false : undefined,
       ...(eventBusMetricsEnabled ? { eventBusMetrics: metricsRegistry } : {}),
       customStepHandlers: liveStepHandlers,
       ...(actionApiBaseUrl ? { actionApiBaseUrl } : {}),
@@ -961,6 +966,8 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       bootstrapLog.info({ reason: liveMq.reason }, 'live pipeline events → MQ: off');
     }
   }
+  // NFR #197: time the executor's `await eventBus.publish` (outermost wrap).
+  timeBusPublish(eventBus);
 
   const runQueueSubIds: string[] = [];
   // A composer edit (`deck-revise`) that dies in any step still has to tell

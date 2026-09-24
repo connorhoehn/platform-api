@@ -34,7 +34,7 @@
     "@opentelemetry/sdk-node": "^0.219.0",
     "@types/uuid": "^10.0.0",
     "csv-parse": "^6.2.1",
-    "distributed-core": "github:connorhoehn/distributed-core#737b8824be7411b0a0c65878f81544c33ebdffbd",
+    "distributed-core": "github:connorhoehn/distributed-core#4034336796b562e481cdf39d4498bfd81fecd9ce",
     "express": "^4.18.2",
     "googleapis": "^171.4.0",
     "jsonwebtoken": "^9.0.3",

@@ -71,6 +71,12 @@ export interface PipelineModuleConstructorConfig {
    */
   eventBusAutoCompactOptions?: EventBusCompactionOptions;
   /**
+   * realtime-examples NFR #197: false → the bus's `publish` (which the
+   * executor awaits) resolves at the durable WAL write; the pub-sub hand-off
+   * starts in publish order without being awaited. dc >= 0.46.3.
+   */
+  eventBusAwaitFanOut?: boolean;
+  /**
    * Stream 5 (BusMetrics): bus-level metrics threaded into the underlying
    * EventBus's `EventBusConfig.metrics`. When set, EventBus emits
    * publish/subscribe/replay/compaction counters into the supplied
@@ -118,6 +124,8 @@ export interface BuildPipelineModuleConfigArgs {
   eventBusAutoCompactIntervalMs?: number;
   /** Stream 4 (BusCompact): see `PipelineModuleConstructorConfig`. */
   eventBusAutoCompactOptions?: EventBusCompactionOptions;
+  /** NFR #197: see `PipelineModuleConstructorConfig`. */
+  eventBusAwaitFanOut?: boolean;
   /**
    * Stream 5 (BusMetrics): optional MetricsRegistry forwarded into the
    * pipeline EventBus for bus-level counters. When omitted (env-disabled),
@@ -192,6 +200,9 @@ export function buildPipelineModuleConfig(
   }
   if (args.eventBusAutoCompactOptions !== undefined) {
     config.eventBusAutoCompactOptions = args.eventBusAutoCompactOptions;
+  }
+  if (args.eventBusAwaitFanOut !== undefined) {
+    config.eventBusAwaitFanOut = args.eventBusAwaitFanOut;
   }
   if (args.eventBusMetrics !== undefined) {
     config.eventBusMetrics = args.eventBusMetrics;

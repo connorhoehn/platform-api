@@ -11,6 +11,7 @@ import healthRouter from './routes/health';
 import apiRouter from './routes/index';
 import { pipelineWebhooksRouter } from './routes/pipelineWebhooks';
 import { renderPrometheusText } from './observability/metrics';
+import { busPublishTimingSummary } from './pipeline/busPublishTiming';
 import { createCapabilitiesRouter } from './routes/capabilities';
 import { definitionsRepo } from './pipeline/definitions-repository';
 import { internalWorkGraphRouter } from './routes/internal-work-graph';
@@ -104,6 +105,11 @@ export function createApp(): express.Application {
   app.get('/internal/metrics', (_req, res) => {
     res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
     res.status(200).send(renderPrometheusText());
+  });
+
+  // realtime-examples NFR #197: pipeline bus publish latency, by phase.
+  app.get('/internal/bus-publish-timing', (req, res) => {
+    res.status(200).json(busPublishTimingSummary(req.query.reset === '1'));
   });
 
   // Gateway-only signed projection authorization/replay boundary. This is
