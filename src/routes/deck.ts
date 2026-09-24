@@ -18,7 +18,7 @@ import { requireAuth } from '../middleware/auth';
 import { DECK_FIXTURE_PER_MINUTE, DECK_PREVIEW_PER_MINUTE, perUserRateLimit } from '../middleware/rateLimit';
 import { asyncHandler, AppError, ValidationError } from '../middleware/error-handler';
 import { previewDeckSpec } from '../deck/preview';
-import { buildDeckFixture, materialBlock, NoFixtureMaterialError, type DeckFixtureFrom } from '../deck/deckFixture';
+import { buildDeckFixture, citableSources, materialBlock, NoFixtureMaterialError, readFixtureMaterial, type DeckFixtureFrom } from '../deck/deckFixture';
 import {
   DeckReviseError, MAX_INSTRUCTION_CHARS, reviseDeck, validateReviseInputSpec, type DeckReviseSourceRef,
 } from '../deck/deckRevise';
@@ -84,7 +84,7 @@ deckRouter.post('/preview', requireAuth, previewLimit, asyncHandler(async (req: 
  * reason is returned with it.
  */
 deckRouter.post('/fixture', requireAuth, fixtureLimit, requireDeckSourcesReadable(), asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const body = (req.body ?? {}) as { from?: unknown; title?: unknown; includeMaterial?: unknown };
+  const body = (req.body ?? {}) as { from?: unknown; title?: unknown; includeMaterial?: unknown; materialOnly?: unknown };
   const raw = (body.from ?? {}) as Record<string, unknown>;
   const from: DeckFixtureFrom = {};
   for (const key of ['documentId', 'recordingId', 'personId'] as const) {
@@ -97,6 +97,16 @@ deckRouter.post('/fixture', requireAuth, fixtureLimit, requireDeckSourcesReadabl
     throw new ValidationError('from.documentId or from.recordingId is required');
   }
   const title = typeof body.title === 'string' ? body.title.slice(0, 120) : undefined;
+
+  // Only the material, no draft (Loop 34 ppt): checking a SAVED deck against
+  // what it cites (`deck-preview --deck <id> --check`) needs the text, not a
+  // 6–14 s model call whose draft is thrown away.
+  if (body.materialOnly === true) {
+    const material = await readFixtureMaterial(from);
+    if (!citableSources(material).length) throw new ValidationError('name a documentId or a recordingId that can be read');
+    res.status(200).json({ materialText: materialBlock(material) });
+    return;
+  }
 
   try {
     const result = await buildDeckFixture(from, title, {});

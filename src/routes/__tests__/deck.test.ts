@@ -9,6 +9,7 @@ import { MAX_SLIDES } from '../../deck/DeckSpec';
 import { sampleDeck } from '../../deck/__tests__/fixtures';
 
 const buildDeckFixture = jest.fn();
+const readFixtureMaterial = jest.fn();
 
 // Loop 29c: the route's access gate is covered in resourceAccess.routes.test.ts;
 // here every caller may read and edit.
@@ -17,7 +18,11 @@ jest.mock('../../deck/deckSourceAccess', () => ({
 }));
 jest.mock('../../deck/deckFixture', () => {
   const actual = jest.requireActual('../../deck/deckFixture');
-  return { ...actual, buildDeckFixture: (...args: unknown[]) => buildDeckFixture(...args) };
+  return {
+    ...actual,
+    buildDeckFixture: (...args: unknown[]) => buildDeckFixture(...args),
+    readFixtureMaterial: (...args: unknown[]) => readFixtureMaterial(...args),
+  };
 });
 
 jest.mock('../../lib/aws-clients', () => ({ docClient: { send: jest.fn() }, ddbClient: { send: jest.fn() } }));
@@ -140,6 +145,15 @@ describe('POST /api/deck/fixture', () => {
     expect(res.body.warnings).toEqual(['Release plan was provided but not cited.']);
     expect(res.body.transcriptIds).toEqual(['active-now-planning-transcript']);
     expect(buildDeckFixture).toHaveBeenCalledWith({ documentId: 'doc-release-plan' }, 'Sprint review', {});
+  });
+
+  it('answers only the material, with no draft, when asked for materialOnly (Loop 34 ppt)', async () => {
+    readFixtureMaterial.mockResolvedValue({ document: { documentId: 'doc-release-plan', title: 'Release plan', text: 'Rollback owner: Sam.' } });
+    const res = await post('/api/deck/fixture', { from: { documentId: 'doc-release-plan' }, materialOnly: true });
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body)).toEqual(['materialText']);
+    expect(String(res.body.materialText)).toContain('Rollback owner: Sam.');
+    expect(buildDeckFixture).not.toHaveBeenCalled();
   });
 
   it('passes the fallback reason through rather than hiding it', async () => {
