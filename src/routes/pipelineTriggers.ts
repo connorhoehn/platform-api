@@ -482,6 +482,46 @@ pipelineTriggersRouter.get(
   }),
 );
 
+/**
+ * A stored run whose row predates `definitionSnapshot` (or a seeded one) still
+ * answers the definition it ran, so a card never falls back to reading
+ * `GET /api/pipelines/:pipelineId` — the CALLER's definition, a 404 for anyone
+ * but the owner, and for a chat-command pipeline (`deck-generate`) until its
+ * first run since boot. In order: the platform's own pipeline, the run
+ * owner's stored definition, the chat command that runs this pipeline.
+ * The caller has already passed run access (NFR #184).
+ */
+async function withRunDefinition(
+  snap: Record<string, unknown>,
+  item: { pipelineId: string; triggeredBy?: string },
+): Promise<Record<string, unknown>> {
+  if (snap.pipelineDefinitionSnapshot !== undefined) return snap;
+  const definition = await runDefinitionFallback(item).catch(() => null);
+  const nodes = (definition as { nodes?: unknown } | null)?.nodes;
+  if (!definition || !Array.isArray(nodes) || nodes.length === 0) return snap;
+  const { nodes: n, edges } = definition as { nodes: unknown[]; edges?: unknown[] };
+  return { ...snap, pipelineDefinitionSnapshot: { nodes: n, edges: Array.isArray(edges) ? edges : [] } };
+}
+
+async function runDefinitionFallback(item: { pipelineId: string; triggeredBy?: string }): Promise<Record<string, unknown> | null> {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const { getSystemPipeline } = require('../pipeline/systemPipelines') as typeof import('../pipeline/systemPipelines');
+  const system = getSystemPipeline(item.pipelineId);
+  if (system) return system;
+  const owner = item.triggeredBy && item.triggeredBy !== 'system' ? item.triggeredBy : null;
+  const stored = owner ? await definitionsRepo.get(owner, item.pipelineId).catch(() => null) : null;
+  if (stored) return stored as unknown as Record<string, unknown>;
+  const registry = require('../chat/chatCommandRegistry') as typeof import('../chat/chatCommandRegistry');
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  const listing = registry.listChatCommandPipelines().find((c) => c.pipelineId === item.pipelineId);
+  const command = listing ? registry.getChatCommandPipeline(listing.trigger) : undefined;
+  if (!command) return null;
+  return command.buildDefinition({
+    trigger: command.trigger, channel: '', text: '', argumentText: '',
+    requestedBy: owner ?? 'system', requestedByName: '',
+  } as Parameters<typeof command.buildDefinition>[0]);
+}
+
 // GET /:runId — run snapshot
 pipelineTriggersRouter.get(
   '/:runId',
@@ -556,12 +596,12 @@ pipelineTriggersRouter.get(
             live: async (id) => ((await Promise.resolve(bridge!.getRun(id))) as Record<string, unknown> | null) ?? null,
           }).catch(() => null);
           if (followed) {
-            res.json(followed);
+            res.json(await withRunDefinition(followed, persisted));
             return;
           }
         }
         // The verdict on the run's suggestions lives on the row only (written after the run was terminal).
-        res.json({ ...storedRunDetail(persisted), ...(persisted.review ? { review: persisted.review } : {}) });
+        res.json(await withRunDefinition({ ...storedRunDetail(persisted), ...(persisted.review ? { review: persisted.review } : {}) }, persisted));
         return;
       }
       throw new NotFoundError('run not found');

@@ -387,6 +387,31 @@ describe('GET /pipelines/:pipelineId/runs/:runId (snapshot)', () => {
     expect(body.status).toBe('completed');
   });
 
+  // NFR #184: the detail carries the definition the run executed, so a card
+  // ordering its steps never reads GET /api/pipelines/:id — the CALLER's copy,
+  // a 404 for a reader who is not the owner.
+  test("a stored run answers its row's definitionSnapshot, else the owner's stored definition", async () => {
+    const snapshot = { nodes: [{ id: 'trigger' }, { id: 'a' }], edges: [] };
+    const row = {
+      runId: 'r-def', pipelineId: 'p1', status: 'completed', startedAt: '2026-09-22T00:00:00.000Z',
+      stepsSummary: {}, triggeredBy: 'owner-1', triggerType: 'manual',
+    };
+    setPipelineBridge({ getRun: async () => null, getHistory: async () => [], resolveApproval: async () => {} });
+    mockRunRepoGet.mockResolvedValueOnce({ ...row, definitionSnapshot: snapshot });
+    const withRow = await run(buildApp(), 'GET', '/pipelines/p1/runs/r-def');
+    expect(withRow.statusCode).toBe(200);
+    expect(withRow.body).toMatchObject({ pipelineDefinitionSnapshot: snapshot });
+
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { definitionsRepo } = require('../../pipeline/definitions-repository');
+    const spy = jest.spyOn(definitionsRepo, 'get').mockResolvedValueOnce({ id: 'p1', nodes: [{ id: 'trigger' }, { id: 'b' }], edges: [{ id: 'e' }] });
+    mockRunRepoGet.mockResolvedValueOnce(row);
+    const fromOwner = await run(buildApp(), 'GET', '/pipelines/p1/runs/r-def');
+    expect(spy).toHaveBeenCalledWith('owner-1', 'p1');
+    expect(fromOwner.body).toMatchObject({ pipelineDefinitionSnapshot: { nodes: [{ id: 'trigger' }, { id: 'b' }], edges: [{ id: 'e' }] } });
+    spy.mockRestore();
+  });
+
   // NFR #136: an /agent loop's accept-time row points at its executor run and
   // stays 'pending' for ever; the chat card polled it indefinitely.
   test("follows an /agent loop's accept-time row to the executor's settled run", async () => {
