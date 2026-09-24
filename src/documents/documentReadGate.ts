@@ -77,7 +77,13 @@ export function makeDocumentReadGate(deps: DocumentReadGateDeps): DocumentReadGa
 
   return {
     async assertCanRead(req, documentId) {
-      if (req.documentGrant) return {};
+      // A scoped grant speaks for ONE document (Loop 29c): a grant for A must
+      // not read B through a body-supplied id (transform-run's source, a deck
+      // source). The path document was already checked by document-policy.
+      if (req.documentGrant) {
+        if (req.documentGrant.documentId !== documentId) throw new NotFoundError('Document not found');
+        return {};
+      }
       if (!req.headers.authorization?.startsWith('Bearer ')) throw new AppError(401, 'Authorization required');
       const userId = req.user?.sub ?? '';
       const key = `${req.user?.orgId ?? ''}|${userId}|${documentId}`;

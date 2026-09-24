@@ -19,6 +19,7 @@ import { publishSignal } from '../lib/event-catalog';
 import { commentScopedInstruction, linkRunToComment } from '../documents/commentAgentRequests';
 import { getCommentAgentResolver } from '../documents/commentAgentResolver';
 import { NotFoundError } from '../middleware/error-handler';
+import { bodyId, requireChannelMember, requireDocumentEdit, requireDocumentRead } from '../middleware/resource-access';
 
 export const documentAgentEditRouter = Router();
 
@@ -102,7 +103,10 @@ documentAgentEditRouter.post('/:documentId/agent-edit', requireAuth, asyncHandle
 // created; `sourceDocumentId` is the page being transformed. The run reads the
 // source, plans the target, and writes it as a collaborator — the person
 // watching the new page sees Haiku build it.
-documentAgentEditRouter.post('/:documentId/transform-run', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+// Loop 29c: the run writes `:documentId` and reads `sourceDocumentId`, so it
+// takes document:edit on the target and document:read on the source (a
+// stranger's source is 404, as if it did not exist).
+documentAgentEditRouter.post('/:documentId/transform-run', requireAuth, requireDocumentEdit(), requireDocumentRead(bodyId('sourceDocumentId'), { optional: true }), asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
   const body = (req.body ?? {}) as { sourceDocumentId?: unknown; target?: { id?: unknown; name?: unknown; icon?: unknown; fields?: unknown }; requestedByName?: unknown };
   const sourceDocumentId = typeof body.sourceDocumentId === 'string' ? body.sourceDocumentId : '';
@@ -142,7 +146,9 @@ documentAgentEditRouter.post('/:documentId/transform-run', requireAuth, asyncHan
 // command. `:documentId` is the NEW, empty page the client just created; the
 // run reads the conversation through the chat service, plans a page, writes it
 // as a collaborator and leaves a card in the thread that opens the page.
-documentAgentEditRouter.post('/:documentId/summarize-run', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+// Loop 29c: writes `:documentId` (document:edit) from `chatChannel`'s history,
+// which only a member of that conversation may read.
+documentAgentEditRouter.post('/:documentId/summarize-run', requireAuth, requireDocumentEdit(), requireChannelMember(bodyId('chatChannel'), { optional: true }), asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
   const body = (req.body ?? {}) as { chatChannel?: unknown; requestedByName?: unknown; limit?: unknown };
   const chatChannel = typeof body.chatChannel === 'string' ? body.chatChannel.trim() : '';
@@ -169,7 +175,8 @@ documentAgentEditRouter.post('/:documentId/summarize-run', requireAuth, asyncHan
 // command. `:documentId` is the NEW diagram-shaped document the client just
 // created; the run sketches it with a light model, draws the elements through
 // the CRDT as a collaborator, and leaves a card in the thread that opens it.
-documentAgentEditRouter.post('/:documentId/diagram-run', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+// Loop 29c: the run draws into `:documentId` — document:edit.
+documentAgentEditRouter.post('/:documentId/diagram-run', requireAuth, requireDocumentEdit(), asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
   const body = (req.body ?? {}) as { title?: unknown; prompt?: unknown; chatChannel?: unknown; requestedByName?: unknown };
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
