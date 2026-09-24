@@ -153,6 +153,7 @@ import { getSystemPipeline } from './systemPipelines';
 import { getPipelineBridge } from '../routes/pipelineTriggers';
 import { describePipelineRecovery, runWalPreflight } from './WalPreflight';
 import { stampPipelineArtifactIds } from './busArtifactIds';
+import { stampPipelineRunSeq } from './busRunSeq';
 import { resolveLiveMqConfig, startPipelineEventMqRelay, type PipelineEventMqRelay } from './event-mq-relay';
 import { setDeckReviseLiveSink } from '../deck/deckReviseEvents';
 import { createShutdown } from './ShutdownOrchestrator';
@@ -907,6 +908,9 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // and the run's `pipeline:run:completed` as `artifactIds`, on every lane
   // (dc pub-sub, the Redis relay, the MQ relay all read this publish).
   stampPipelineArtifactIds(eventBus);
+  // NFR #170: a contiguous per-run `runSeq` on the progress events, so a
+  // consumer fed by several gateway replicas can put a run back in order.
+  stampPipelineRunSeq(eventBus);
 
   // --- Live pipeline signal transport (EventBus → Redis → gateway) ---
   //
