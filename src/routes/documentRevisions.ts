@@ -119,6 +119,40 @@ documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, 
   });
 }));
 
+/** How many decks one `row-summaries` read may ask about (the list's page of deck rows). */
+export const MAX_ROW_SUMMARY_IDS = 24;
+
+/**
+ * GET /api/deck/row-summaries?ids=a,b,c
+ * The documents list's `v4 · 12 slides` chip for a page of deck rows, in one
+ * read. The list is org-wide while a deck's revisions answer only its readers
+ * (NFR #135), so asking `/revisions` per row turned every deck the viewer may
+ * not read into a 404 in the console. Here a deck that is missing or unreadable
+ * is simply absent from the answer — the same silence for both, so nothing
+ * about a hidden deck leaks — and the reader check runs once per id.
+ */
+export const deckRowSummariesRouter = Router();
+
+deckRowSummariesRouter.get('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  if (!req.headers.authorization?.startsWith('Bearer ')) throw new AppError(401, 'Authorization required');
+  const raw = typeof req.query.ids === 'string' ? req.query.ids : '';
+  const ids = [...new Set(raw.split(',').map((id) => id.trim()).filter(Boolean))];
+  if (ids.length > MAX_ROW_SUMMARY_IDS) throw new ValidationError(`at most ${MAX_ROW_SUMMARY_IDS} ids`);
+  if (ids.some((id) => !ID.test(id))) throw new ValidationError('ids are invalid');
+  const store = getPresentationDocumentStore();
+  const summaries: Record<string, { revisionLabel: string; slideCount: number }> = {};
+  await Promise.all(ids.map(async (documentId) => {
+    const row = await store.get(documentId);
+    if (!row) return;
+    const decision = await canReadDocument(row, req.user, documentId);
+    if (!decision.allow) return;
+    const head = (row.revisions ?? [])[(row.revisions ?? []).length - 1];
+    if (!head?.label) return;
+    summaries[documentId] = { revisionLabel: head.label, slideCount: Number(head.slideCount ?? 0) };
+  }));
+  res.status(200).json({ summaries });
+}));
+
 /**
  * POST /api/documents/:documentId/revisions  { spec, label? }
  * Renders the spec and files it as the next revision. This is the only write in

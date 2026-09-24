@@ -32,7 +32,7 @@ jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `tes
 
 // Import AFTER the mocks.
 import { docClient } from '../../lib/aws-clients';
-import { documentRevisionsRouter, safeFilename } from '../documentRevisions';
+import { deckRowSummariesRouter, documentRevisionsRouter, MAX_ROW_SUMMARY_IDS, safeFilename } from '../documentRevisions';
 import {
   DdbPresentationDocumentStore,
   PresentationRevisionConflictError,
@@ -194,6 +194,7 @@ beforeAll(async () => {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
   app.use('/api/documents/:documentId/revisions', documentRevisionsRouter);
+  app.use('/api/deck/row-summaries', deckRowSummariesRouter);
   app.use(errorHandler);
   server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -375,6 +376,36 @@ describe('who may read a revision (NFR #135)', () => {
     const hidden = await request('/api/documents/doc-1/revisions/v9/slides', { authorization: devToken('user-mallory') });
     expect(hidden.status).toBe(404);
     expect(JSON.parse(hidden.body.toString('utf8')).error ?? JSON.parse(hidden.body.toString('utf8')).message).toMatch(/Document not found/);
+  });
+});
+
+describe('GET /api/deck/row-summaries', () => {
+  const send = jest.mocked(docClient.send as jest.Mock);
+  afterEach(() => send.mockReset());
+  const summaries = async (ids: string, headers: Record<string, string> | null = {}) => {
+    const res = await request(`/api/deck/row-summaries?ids=${ids}`, headers);
+    return { status: res.status, body: res.status === 200 ? JSON.parse(res.body.toString('utf8')).summaries : null };
+  };
+
+  it('answers the head revision of every deck the caller may read, in one request', async () => {
+    expect(await summaries('doc-1,doc-moved')).toEqual({
+      status: 200,
+      body: { 'doc-1': { revisionLabel: 'v1', slideCount: 2 }, 'doc-moved': { revisionLabel: 'v2', slideCount: 2 } },
+    });
+  });
+
+  it('leaves out a missing deck and a deck the caller may not read, alike, with no error', async () => {
+    expect(await summaries('doc-1,doc-nope', { authorization: devToken('user-mallory') })).toEqual({ status: 200, body: {} });
+    expect(await summaries('doc-shared,doc-1', { authorization: devToken('user-viewer') })).toEqual({
+      status: 200, body: { 'doc-shared': { revisionLabel: 'v1', slideCount: 2 } },
+    });
+  });
+
+  it('401s without a bearer and refuses a malformed or oversized ask', async () => {
+    expect((await summaries('doc-1', null)).status).toBe(401);
+    expect((await summaries('bad%20id')).status).toBe(400);
+    const many = Array.from({ length: MAX_ROW_SUMMARY_IDS + 1 }, (_, i) => `d${i}`).join(',');
+    expect((await summaries(many)).status).toBe(400);
   });
 });
 

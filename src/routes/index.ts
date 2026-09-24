@@ -33,7 +33,7 @@ import {
   sectionReviewRequestsRouter,
 } from './documentReviewRequests';
 import { documentImportExportRouter } from './documentImportExport';
-import { documentRevisionsRouter } from './documentRevisions';
+import { deckRowSummariesRouter, documentRevisionsRouter } from './documentRevisions';
 import { deckRouter } from './deck';
 import { videoSessionsRouter } from './videoSessions';
 import { recordingsRouter } from './recordings';
@@ -161,6 +161,8 @@ router.use('/document-work', documentWorkListRouter);
 router.use('/documents/:documentId/revisions', documentRevisionsRouter);
 // The deck editor's two stateless paths: preview a spec, and derive one from
 // real local material. Neither persists — /documents/:id/revisions does that.
+// A page of deck rows' revision chips in one read (static segment before '/deck').
+router.use('/deck/row-summaries', deckRowSummariesRouter);
 router.use('/deck', deckRouter);
 router.use('/documents/:documentId', documentImportExportRouter);
 // Ambient voice capture — authenticated PCM proxy in front of the
