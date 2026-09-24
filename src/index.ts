@@ -20,6 +20,7 @@ import { DLQRepository } from './repositories/DLQRepository';
 import { ddbClient, docClient } from './lib/aws-clients';
 import { ensureWorkGraphTable } from './lib/work-graph-dynamo';
 import log from './lib/logger';
+import { startEventLoopMetrics } from './observability/eventLoop';
 import { assertRequiredInProd } from 'distributed-core';
 import { createShutdownManager, drainHttpServer } from '@connorhoehn/service-runtime';
 import { RetryManager } from 'distributed-core/transport';
@@ -104,6 +105,9 @@ void assertRequiredInProd(
 );
 
 const app = createApp();
+// realtime-examples NFR #202: event-loop delay + utilization on /internal/metrics.
+startEventLoopMetrics();
+
 const server = app.listen(Number(port), () => {
   log.info({ port }, 'platform-api listening');
   // Register the LVS recording webhook subscription on boot so

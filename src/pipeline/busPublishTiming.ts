@@ -12,13 +12,15 @@
 // `GET /internal/bus-publish-timing` (`?reset=1` clears), and observed into
 // `pipeline_operation_duration_ms{operation="bus.publish.<phase>"}`.
 
-import { monitorEventLoopDelay } from 'perf_hooks';
+import { monitorEventLoopDelay, performance } from 'perf_hooks';
 import { recordPipelineOperationDuration } from '../observability/metrics';
 
 // Event-loop delay over the same window: a phase that is mostly waiting for
 // the loop (not for disk or Redis) shows up here, not in its own work.
 const loopDelay = monitorEventLoopDelay({ resolution: 10 });
 loopDelay.enable();
+// Event-loop utilization since the last reset (NFR #202).
+let eluMark = performance.eventLoopUtilization();
 
 const RING = 2000;
 
@@ -49,6 +51,7 @@ function observe(phase: Phase, ms: number): void {
 
 export function busPublishTimingSummary(reset = false): Record<Phase, ReturnType<Ring['summary']>> & {
   eventLoopDelayMs: { p50: number; p95: number; p99: number; max: number };
+  eventLoopUtilization: number;
 } {
   const ms = (ns: number) => Math.round(ns / 1e5) / 10;
   const out = {
@@ -61,10 +64,12 @@ export function busPublishTimingSummary(reset = false): Record<Phase, ReturnType
       p99: ms(loopDelay.percentile(99)),
       max: ms(loopDelay.max),
     },
+    eventLoopUtilization: Math.round(performance.eventLoopUtilization(eluMark).utilization * 1000) / 1000,
   };
   if (reset) {
     for (const r of Object.values(rings)) r.reset();
     loopDelay.reset();
+    eluMark = performance.eventLoopUtilization();
   }
   return out;
 }
