@@ -570,6 +570,14 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
     if (!candidate || typeof candidate !== 'object') {
       throw new DeckReviseError('The agent did not return the deck, so nothing was changed.', 502, 'the answer had no "spec"');
     }
+    // The answer schema shows `"subtitle":"…"`, so on a deck with no subtitle
+    // the model fills in "" — which is "no subtitle", not a broken deck (it
+    // failed 4 of 10 whole-deck title edits, Loop 35 ppt).
+    const deck = candidate as { subtitle?: unknown };
+    if (typeof deck.subtitle === 'string' && !deck.subtitle.trim()) {
+      const { subtitle: _blank, ...rest } = candidate as Record<string, unknown>;
+      candidate = rest;
+    }
   }
 
   const validation = validateDeckSpec(candidate);

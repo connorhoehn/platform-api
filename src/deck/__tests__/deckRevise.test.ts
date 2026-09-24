@@ -336,6 +336,16 @@ describe('reviseDeck — a target inside one slide', () => {
     ]);
   });
 
+  it('reads a blank subtitle in a whole-deck answer as no subtitle, not a broken deck', async () => {
+    const spec = { ...deck(), title: 'Release review plan' };
+    const out = await reviseDeck(
+      { spec, instruction: 'Make the title one word shorter' },
+      { ...deps, llm: scripted(JSON.stringify({ summary: 'Shorter title.', spec: { ...spec, title: 'Release review', subtitle: '' } })), modelSlot: null },
+    );
+    expect(out.spec.title).toBe('Release review');
+    expect(out.spec).not.toHaveProperty('subtitle');
+  });
+
   it('fails plainly when no model slot comes free, and never asks the model', async () => {
     const prompts: string[] = [];
     const modelSlot = (async () => { throw new ModelSlotTimeoutError(120_000, 5, 4); }) as unknown as typeof withModelSlot;
