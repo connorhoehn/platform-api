@@ -49,7 +49,7 @@ import {
   createDeckReviseEmitter, durableDeckRevisePublish,
   type DeckReviseDurablePublish, type DeckReviseEmitter, type DeckRevisePublish,
 } from './deckReviseEvents';
-import { renderDeckFiles } from './DeckStepHandler';
+import { renderDeckSlides } from './DeckStepHandler';
 import {
   getPresentationDocumentStore, PresentationRevisionConflictError, PRESENTATION_DOCUMENT_TYPE,
   type PresentationDocumentRow, type PresentationDocumentStore, type StoredRevision,
@@ -628,12 +628,14 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
       let rebasedOnto: string | undefined;
       for (let attempt = 0; ; attempt += 1) {
         try {
-          const { pptx, slides } = await renderDeckFiles(spec);
+          // No .pptx now: most edits are never downloaded, and the first
+          // download builds it once (content key, pptxCache.ts, NFR #171).
+          const slides = renderDeckSlides(spec);
           const { revision } = await store.appendRevision({
             documentId: request.documentId,
             title: loaded.title,
             createdBy: request.requestedBy,
-            pptx, slides, spec,
+            slides, spec,
             expectedHead,
             producedBy: { pipelineId: DECK_REVISE_PIPELINE_ID, runId, requestId: request.requestId },
             ...(loaded.transcriptIds.length ? { transcriptIds: loaded.transcriptIds } : {}),

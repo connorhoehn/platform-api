@@ -304,12 +304,15 @@ documentRevisionsRouter.get('/:revisionId/spec', requireAuth, asyncHandler(async
  */
 documentRevisionsRouter.get('/:revisionId/file', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
+  const started = Date.now();
   const { row, revision } = await loadRevision(req, documentId, String(req.params.revisionId ?? ''));
-  // The configured store first, then the durable copy the store keeps for it —
-  // a deck rendered before a pod replacement is still downloadable.
+  const loadedAt = Date.now();
+  // Memory, then the configured store, then the durable copy — a deck rendered
+  // before a pod replacement is still downloadable — then, for a content key,
+  // one build across replicas (NFR #171). The row loadRevision read is reused.
   const store = getPresentationDocumentStore();
   const stored = store.revisionFile
-    ? await store.revisionFile(documentId, revision.id)
+    ? await store.revisionFile(documentId, revision.id, row)
     : await getAssetBlobStore().getBlob(revision.asset.key)
       .then((blob) => (blob ? { contentType: blob.asset.contentType, body: blob.body } : null));
   if (!stored) throw new NotFoundError('Revision file not found');
@@ -321,6 +324,8 @@ documentRevisionsRouter.get('/:revisionId/file', requireAuth, asyncHandler(async
     .setHeader('content-disposition', `attachment; filename="${filename}"`)
     .setHeader('cache-control', 'private, no-store')
     .setHeader('x-content-type-options', 'nosniff')
+    .setHeader('x-pptx-source', 'from' in stored && stored.from ? String(stored.from) : 'blob')
+    .setHeader('server-timing', `row;dur=${loadedAt - started}, file;dur=${Date.now() - loadedAt}`)
     .send(stored.body);
 }));
 

@@ -101,13 +101,18 @@ export function resolveSpecSource(data: DeckNodeData, context: Record<string, un
  */
 export async function renderDeckFiles(spec: DeckSpec): Promise<{ pptx: Buffer; slides: Array<{ id: string; title: string; svg: string }> }> {
   const pptx = await renderPptx(spec);
+  return { pptx, slides: renderDeckSlides(spec) };
+}
+
+/** The slide SVGs alone — a composer edit's revision, whose `.pptx` is built on first download (NFR #171). */
+export function renderDeckSlides(spec: DeckSpec): Array<{ id: string; title: string; svg: string }> {
   const svgs = renderAllSlideSvgs(spec);
   // The renderers agree on slide order: the deck's own slides, then Sources.
   const slides = svgs.map((svg, index) => {
     const slide = spec.slides[index];
     return { id: slide?.id ?? SOURCES_SLIDE_ID, title: slide?.title ?? SOURCES_SLIDE_TITLE, svg };
   });
-  return { pptx, slides };
+  return slides;
 }
 
 export interface DeckStepHandlerOpts {

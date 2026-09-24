@@ -44,7 +44,7 @@ class FakeStore implements PresentationDocumentStore {
     const id = `v${(row.revisions?.length ?? 0) + 1}`;
     const revision: StoredRevision = {
       id, label: id, createdAt: '2026-09-22T10:00:00.000Z', createdBy: input.createdBy, slideCount: input.slides.length,
-      asset: { key: `k-${id}`, contentType: 'application/pptx', sizeBytes: input.pptx.byteLength } as never,
+      asset: { key: `k-${id}`, contentType: 'application/pptx', sizeBytes: input.pptx?.byteLength ?? 0 } as never,
       slides: input.slides.map((slide, index) => ({ id: slide.id, index: index + 1, title: slide.title, previewHandle: deckPreviewHandle(input.documentId, id, slide.id), asset: {} as never })),
       ...(input.spec ? { spec: input.spec } : {}),
       ...(input.producedBy ? { producedBy: input.producedBy } : {}),

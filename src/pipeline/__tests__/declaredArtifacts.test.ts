@@ -25,7 +25,7 @@ const store: PresentationDocumentStore = {
       createdAt: '2026-09-21T10:00:00.000Z',
       createdBy: input.createdBy,
       slideCount: input.slides.length,
-      asset: { key: 'deck.pptx', contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', sizeBytes: input.pptx.byteLength },
+      asset: { key: 'deck.pptx', contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', sizeBytes: input.pptx!.byteLength },
       slides: input.slides.map((slide, index) => ({
         id: slide.id, index: index + 1, title: slide.title,
         previewHandle: `${input.documentId}.v3.${slide.id}`,

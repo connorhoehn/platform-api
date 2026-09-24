@@ -3,6 +3,7 @@ import { InMemoryImageBlobStore, IMAGE_BLOB_SIZE_CAP_BYTES, type PutBlobMeta } f
 import { BlobTooLargeError, CHUNK_MANIFEST_CONTENT_TYPE, ChunkedBlobStore, MAX_CHUNKED_BLOB_BYTES } from '../chunkedBlobStore';
 import { DdbPresentationDocumentStore, type PresentationDocumentRow } from '../presentationDocuments';
 import { PPTX_CONTENT_TYPE } from '../renderPptx';
+import { resetPptxCache } from '../pptxCache';
 
 // NFR #61: the durable DynamoDB copy of a .pptx holds 350 KB per item; a
 // 40-slide deck with long notes renders ~428 KB and its save failed with a 500.
@@ -99,7 +100,7 @@ describe('DdbPresentationDocumentStore with a chunked durable copy (NFR #61)', (
     const pptx = bytes(428 * 1024);
     const { revision } = await store.appendRevision({ documentId: 'audit-61', title: 'Forty slides', createdBy: 'user-frank', pptx, slides });
     saved = puts[0] as unknown as PresentationDocumentRow;
-    volume.reset(); // the pod and its hostPath are gone
+    volume.reset(); resetPptxCache(); // the pod (its memory) and its hostPath are gone
     const file = await store.revisionFile('audit-61', revision.id);
     expect(file?.from).toBe('mirror');
     expect(file!.body.equals(pptx)).toBe(true);

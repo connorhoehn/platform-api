@@ -37,6 +37,7 @@ import { AppError } from '../middleware/error-handler';
 import { PPTX_CONTENT_TYPE } from './renderPptx';
 import { SVG_CONTENT_TYPE } from './renderSlideSvg';
 import { ChunkedBlobStore, assertChunkedBlobFits } from './chunkedBlobStore';
+import { PPTX_CONTENT_KEY, buildPptxOnce, pptxContentKey, recalledPptx, rememberPptx } from './pptxCache';
 
 export const DOCUMENTS_TABLE = tableName(process.env.DYNAMODB_DOCUMENTS_TABLE || 'crdt-documents');
 export const PRESENTATION_DOCUMENT_TYPE = 'presentation';
@@ -197,8 +198,12 @@ export interface AppendRevisionInput {
   documentId: string;
   title: string;
   createdBy: string;
-  /** The `.pptx` bytes. */
-  pptx: Buffer;
+  /**
+   * The `.pptx` bytes. Left out (a composer edit), nothing is rendered or
+   * stored now: the revision names the content key its spec hashes to and the
+   * first download builds it (`pptxCache.ts`). Requires `spec`.
+   */
+  pptx?: Buffer;
   /** One SVG per slide, in slide order, including the Sources slide. */
   slides: Array<{ id: string; title: string; svg: string }>;
   /** The spec the bytes were rendered from, kept so the revision can be edited. */
@@ -268,7 +273,7 @@ export interface SlidePreview {
   contentType: string;
   body: Buffer;
   /** The row itself, the configured blob store, or the durable copy of it. */
-  from: 'inline' | 'blob' | 'mirror';
+  from: 'inline' | 'blob' | 'mirror' | 'memory' | 'built' | 'joined-local' | 'joined-remote' | 'stored';
   /** The content hash, when the record carries one — an ETag that never changes for these bytes. */
   sha256?: string;
 }
@@ -288,7 +293,7 @@ export interface PresentationDocumentStore {
    * Optional for the same reason `slidePreview` is — a caller that finds it
    * absent reads the blob the revision names.
    */
-  revisionFile?(documentId: string, revisionId: string): Promise<SlidePreview | null>;
+  revisionFile?(documentId: string, revisionId: string, row?: PresentationDocumentRow | null): Promise<SlidePreview | null>;
   /**
    * The bytes behind a blob reference the row recorded (a spec that moved off
    * the row): the configured store first, then the durable copy.
@@ -559,17 +564,22 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     const revisionId = nextRevisionId(existing);
     const writeId = randomUUID().slice(0, 8);
 
-    const pptxKey = pptxBlobKey(input.documentId, revisionId, writeId);
+    // The file is content-addressed by its spec (NFR #171): the same spec is
+    // the same blob, and a revision with no bytes yet (a composer edit) names
+    // the key its first download will build. A spec-less save keeps the old
+    // per-attempt key.
+    if (!input.pptx && !input.spec) throw new Error('appendRevision: a revision with no .pptx needs its spec');
+    const pptxKey = input.spec ? pptxContentKey(input.spec) : pptxBlobKey(input.documentId, revisionId, writeId);
     const pptxMeta = { contentType: PPTX_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId}.pptx` };
     // NFR #61: over one DynamoDB item the durable copy is chunked; over the
     // chunked limit the save is refused with a 413 before any blob is written.
-    if (this.mirror || this.blobStore instanceof ChunkedBlobStore) {
+    if (input.pptx && (this.mirror || this.blobStore instanceof ChunkedBlobStore)) {
       assertChunkedBlobFits(pptxKey, input.pptx.byteLength, 'rendered deck (.pptx)');
     }
     // What the store will record (every store returns exactly this). Planned
     // here and written only after the row-size guard below, so a refused save
-    // leaves no `.pptx` behind (NFR #48).
-    const pptxAsset: BlobAsset = { key: pptxKey, contentType: PPTX_CONTENT_TYPE, sizeBytes: input.pptx.byteLength };
+    // leaves no `.pptx` behind (NFR #48). `sizeBytes: 0` = not built yet.
+    const pptxAsset: BlobAsset = { key: pptxKey, contentType: PPTX_CONTENT_TYPE, sizeBytes: input.pptx?.byteLength ?? 0 };
 
     // Slides by content (NFR #4). A slide the deck already stored — an
     // unchanged slide of any earlier revision — is the same blob; only new
@@ -674,8 +684,11 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     // The key is unique to this attempt; if the row write below loses a race
     // (or fails), nothing references it and the deck blob sweeper removes it
     // once it is past the grace period (src/deck/blobSweeper.ts).
-    if (this.mirror) await this.mirror.putBlob(pptxKey, input.pptx, pptxMeta);
-    await this.blobStore.putBlob(pptxKey, input.pptx, pptxMeta);
+    if (input.pptx) {
+      if (this.mirror) await this.mirror.putBlob(pptxKey, input.pptx, pptxMeta);
+      await this.blobStore.putBlob(pptxKey, input.pptx, pptxMeta);
+      rememberPptx(pptxKey, input.pptx);
+    }
 
     // New content only, durable copy first, in parallel.
     await Promise.all([...pending.values()].map(async (blob) => {
@@ -748,19 +761,43 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
    * second. Either is the same bytes under the same key; which one answers
    * depends only on whether the volume outlived the row.
    */
-  async revisionFile(documentId: string, revisionId: string): Promise<SlidePreview | null> {
-    const row = await this.get(documentId).catch(() => null);
+  async revisionFile(documentId: string, revisionId: string, rowIn?: PresentationDocumentRow | null): Promise<SlidePreview | null> {
+    const row = rowIn ?? await this.get(documentId).catch(() => null);
     const revision = row?.revisions?.find((candidate) => candidate.id === revisionId);
     if (!revision?.asset?.key) return null;
+    const key = revision.asset.key;
     const contentType = revision.asset.contentType || PPTX_CONTENT_TYPE;
-    const primary = await this.blobStore.getBlob(revision.asset.key).catch(() => null);
-    if (primary) return { contentType: primary.asset.contentType || contentType, body: primary.body, from: 'blob' };
-    const mirrored = this.mirror ? await this.mirror.getBlob(revision.asset.key).catch(() => null) : null;
+    // Immutable bytes: a warm download is a memory read (NFR #171).
+    const warm = recalledPptx(key);
+    if (warm) return { contentType, body: warm, from: 'memory' };
+    const primary = await this.blobStore.getBlob(key).catch(() => null);
+    if (primary) { rememberPptx(key, primary.body); return { contentType: primary.asset.contentType || contentType, body: primary.body, from: 'blob' }; }
+    const mirrored = this.mirror ? await this.mirror.getBlob(key).catch(() => null) : null;
     if (mirrored) {
-      log.info({ documentId, revisionId, key: revision.asset.key }, 'presentation file served from the durable copy; the volume no longer has it');
+      log.info({ documentId, revisionId, key }, 'presentation file served from the durable copy; the volume no longer has it');
+      rememberPptx(key, mirrored.body);
       return { contentType: mirrored.asset.contentType || contentType, body: mirrored.body, from: 'mirror' };
     }
-    log.warn({ documentId, revisionId, key: revision.asset.key }, 'a revision names a .pptx that neither store holds');
+    // Not built yet (a composer edit), or its blob aged out: a content key is
+    // rebuilt from the revision's own spec, once across replicas. A legacy
+    // per-revision key is not — see pptxCache.ts.
+    if (PPTX_CONTENT_KEY.test(key)) {
+      const spec = await resolveRevisionSpec(this, revision);
+      if (spec) {
+        const meta = { contentType: PPTX_CONTENT_TYPE, createdBy: revision.createdBy, label: `${row?.title ?? 'presentation'} ${revisionId}.pptx` };
+        const built = await buildPptxOnce(key, spec, {
+          read: async (k) => (await this.blobStore.getBlob(k).catch(() => null))?.body
+            ?? (this.mirror ? (await this.mirror.getBlob(k).catch(() => null))?.body ?? null : null),
+          write: async (k, body) => {
+            if (this.mirror || this.blobStore instanceof ChunkedBlobStore) assertChunkedBlobFits(k, body.byteLength, 'rendered deck (.pptx)');
+            if (this.mirror) await this.mirror.putBlob(k, body, meta);
+            await this.blobStore.putBlob(k, body, meta);
+          },
+        });
+        return { contentType, body: built.body, from: built.source };
+      }
+    }
+    log.warn({ documentId, revisionId, key }, 'a revision names a .pptx that neither store holds');
     return null;
   }
 

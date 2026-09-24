@@ -26,7 +26,7 @@ class FakeStore implements PresentationDocumentStore {
         createdAt: '2026-09-21T10:00:00.000Z',
         createdBy: input.createdBy,
         slideCount: input.slides.length,
-        asset: { key: `deck-${input.documentId}-${revisionId}.pptx`, contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', sizeBytes: input.pptx.byteLength },
+        asset: { key: `deck-${input.documentId}-${revisionId}.pptx`, contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', sizeBytes: input.pptx!.byteLength },
         slides: input.slides.map((slide, index) => ({
           id: slide.id,
           index: index + 1,
@@ -82,7 +82,7 @@ describe('the deck step', () => {
     const stored = store.calls[0]!;
     expect(stored.createdBy).toBe('user-frank');
     expect(stored.title).toBe('Q4 platform review');
-    expect(stored.pptx.subarray(0, 2).toString('utf8')).toBe('PK');
+    expect(stored.pptx!.subarray(0, 2).toString('utf8')).toBe('PK');
     expect(stored.slides).toHaveLength(9);
     // The spec travels with the bytes, so the revision can be reopened and edited.
     expect(stored.spec?.title).toBe('Q4 platform review');

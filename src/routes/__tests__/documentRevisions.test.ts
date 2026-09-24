@@ -121,7 +121,7 @@ const store: PresentationDocumentStore = {
         createdAt: '2026-09-21T11:00:00.000Z',
         createdBy: input.createdBy,
         slideCount: input.slides.length,
-        asset: { key: 'deck-doc-1-v2.pptx', contentType: PPTX_CONTENT_TYPE, sizeBytes: input.pptx.byteLength },
+        asset: { key: 'deck-doc-1-v2.pptx', contentType: PPTX_CONTENT_TYPE, sizeBytes: input.pptx!.byteLength },
         slides: input.slides.map((slide, index) => ({
           id: slide.id, index: index + 1, title: slide.title,
           previewHandle: `${input.documentId}.v2.${slide.id}`,
