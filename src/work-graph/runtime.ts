@@ -1071,6 +1071,32 @@ export function authorizeGatewayWorkGraph(
 
 export interface RunGraphScope { personId: string; day: string; timezone: string }
 
+/**
+ * One graph pass answers every run on it: a page that opens twenty run
+ * nodes, or a reconnect that re-subscribes them, asks once per graph per
+ * `RUN_GRAPH_TTL_MS`, not once per run. The gateway caches each decision for
+ * 60 s on top, so a revoked grant is seen within the same bound as before.
+ */
+const RUN_GRAPH_TTL_MS = 10_000;
+const runGraphCache = new Map<string, { at: number; runs: Promise<Set<string>> }>();
+function viewableRuns(viewer: AuthenticatedWorkGraphViewer, ownerId: string, scope: RunGraphScope): Promise<Set<string>> {
+  const key = JSON.stringify([viewer.organizationId, viewer.viewerId, ownerId, scope.day, scope.timezone]);
+  const now = Date.now();
+  const hit = runGraphCache.get(key);
+  if (hit && now - hit.at < RUN_GRAPH_TTL_MS) return hit.runs;
+  const runs = withBuildMemo(() => workGraphOrchestrator.runsViewableThroughGraph(
+    viewer, ownerId, scope.day, scope.timezone,
+    (resourceId) => parsePipelineStepResourceId(resourceId).runId,
+  ));
+  runGraphCache.set(key, { at: now, runs });
+  runs.catch(() => runGraphCache.delete(key));
+  if (runGraphCache.size > 1_000) {
+    const oldest = runGraphCache.keys().next().value;
+    if (oldest !== undefined) runGraphCache.delete(oldest);
+  }
+  return runs;
+}
+
 const utcDay = (ms: number): string | null => (Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : null);
 
 /**
@@ -1078,14 +1104,15 @@ const utcDay = (ms: number): string | null => (Number.isFinite(ms) ? new Date(ms
  * owner's work graph? One rule for the graph and for the run's live channel:
  * the gateway's run subscribe asks this (through
  * `/internal/pipeline-access/authorize`) after the owner and document-reader
- * checks, and the answer is the graph's own pass (`viewsRunThroughGraph`).
+ * checks, and the answer is the graph's own pass (`runsViewableThroughGraph`).
  *
  * The day is the graph the viewer has open (`graphs`, the gateway's
  * authorized work-graph stream of that socket) when it names the run's
  * owner — only that one, so the answer is the one that graph shows — else
  * the run's start day and today, in UTC, the scope a pane's "Open run"
  * exchange resolves a node to. The owner is the stored run row's
- * `triggeredBy`, the same field the graph's pipeline ACL reads.
+ * `triggeredBy`, the same field the graph's pipeline ACL reads. The graph's
+ * run set is cached per (viewer, owner, day) for 10 s (`viewableRuns`).
  */
 export async function runSharedThroughWorkGraph(
   organizationId: string,
@@ -1111,11 +1138,8 @@ export async function runSharedThroughWorkGraph(
     }
   }
   for (const scope of [...scopes.values()].slice(0, 4)) {
-    const shown = await withBuildMemo(() => workGraphOrchestrator.viewsRunThroughGraph(
-      viewer, ownerId, scope.day, scope.timezone, runId,
-      (resourceId) => parsePipelineStepResourceId(resourceId).runId,
-    )).catch(() => false);
-    if (shown) return { allow: true, ownerId };
+    const shown = await viewableRuns(viewer, ownerId, scope).catch(() => new Set<string>());
+    if (shown.has(runId)) return { allow: true, ownerId };
   }
   return { allow: false, ownerId };
 }
