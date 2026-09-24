@@ -1,6 +1,6 @@
 /**
  * One model call per identical deck draft, across replicas (realtime-examples
- * NFR #161).
+ * NFR #162).
  *
  * `POST /api/deck/fixture` asks the model for a deck from named material. Ten
  * callers asking for the same material at once made ten model calls (live,

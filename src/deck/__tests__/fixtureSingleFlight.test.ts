@@ -24,7 +24,7 @@ function fakeRedis(): SingleFlightStore & { data: Map<string, string> } {
 
 const tick = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-describe('fixture single-flight (NFR #161)', () => {
+describe('fixture single-flight (NFR #162)', () => {
   it('30 concurrent identical asks over 2 replicas run once; everyone gets the answer', async () => {
     const redis = fakeRedis();
     const replicas = [0, 1].map(() => createSingleFlight<{ n: number }>({ store: async () => redis, prefix: 't', lockTtlMs: 5_000, pollMs: 5 }));

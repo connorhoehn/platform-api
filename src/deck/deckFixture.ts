@@ -54,7 +54,7 @@ export interface DeckFixtureResult {
   material: FixtureMaterial;
   /** Which of the cited ids are transcripts — known from what was read, not from the id. */
   transcriptIds: string[];
-  /** Whether this caller asked the model or shared a concurrent identical draft (NFR #161). */
+  /** Whether this caller asked the model or shared a concurrent identical draft (NFR #162). */
   flight?: SingleFlightRole;
 }
 
