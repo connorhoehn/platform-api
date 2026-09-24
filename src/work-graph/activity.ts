@@ -567,6 +567,9 @@ function runInputs(index: GraphIndex, runId: string): ViewerWorkNode[] {
     .filter((node): node is ViewerWorkNode => !!node);
 }
 
+/** A deck saved this recently keeps a frame on a day already at the effort limit (NFR #221). */
+const RECENT_DECK_FRAME_MS = 2 * 60 * 60 * 1_000;
+
 export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<WorkGraphActivityV2> {
   const { query, nodes, edges, authorization, reader, now, timing } = input;
   let phaseStarted = Date.now();
@@ -1197,11 +1200,19 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       anchorKinds: ['document'],
     })) {
       if (efforts.length < WORK_GRAPH_V2_LIMITS.efforts) { efforts.push(deck); continue; }
+      // NFR #221: a deck saved in the last two hours keeps its frame however
+      // many runs landed after it — it takes the oldest frame that holds no
+      // document (a run's, whose nodes stay in the graph). 87 probe runs in
+      // 15 minutes otherwise pushed a deck saved at 11:42 out of all 50 frames
+      // by 11:55 while its node was still in the snapshot. An older deck keeps
+      // the rule it had: it replaces only an effort older than itself.
+      const recent = instant(now) - anchorAt(deck) <= RECENT_DECK_FRAME_MS;
       let oldest = -1;
       efforts.forEach((effort, position) => {
+        if (recent && effort.nodeIds.some((id) => index.byId.get(id)?.kind === 'document')) return;
         if (oldest < 0 || anchorAt(effort) < anchorAt(efforts[oldest])) oldest = position;
       });
-      if (oldest < 0 || anchorAt(efforts[oldest]) >= anchorAt(deck)) break;
+      if (oldest < 0 || (!recent && anchorAt(efforts[oldest]) >= anchorAt(deck))) continue;
       efforts[oldest] = deck;
     }
   }

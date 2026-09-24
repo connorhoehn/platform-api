@@ -932,6 +932,45 @@ describe('work graph schemaVersion 2 route', () => {
     }
   });
 
+  it('keeps a deck saved minutes ago in a frame on a day already at the effort limit (NFR #221)', async () => {
+    // Sixty runs land AFTER the deck: each is a frame of its own, so the day is
+    // past the 50-effort limit and every other frame is newer than the deck.
+    const runs = Array.from({ length: 60 }, (_, i) => node(`burst-${i}`, 'run', 'Pipeline run', `run-burst-${i}`, 'pipeline',
+      new Date(Date.parse(at('13:35')) + i * 5_000).toISOString(), { status: 'completed' }));
+    const extraNodes = [
+      node('saved', 'document', 'Offline brief', 'doc-saved', 'document', at('13:34')),
+      node('saved-v1', 'change', 'Offline brief · revision', 'doc-saved:v1', 'document', at('13:34')),
+      ...runs,
+    ];
+    const extraEdges = [edge('e-saved-v1', 'saved-v1', 'saved', 'edited')];
+    for (const item of extraNodes) projection.nodes[item.id] = item;
+    for (const item of extraEdges) projection.edges[item.id] = item;
+    const selection = grant.selection;
+    grant.selection = {
+      ...selection,
+      nodeIds: [...selection.nodeIds, ...extraNodes.map((item) => item.id)],
+      edgeIds: [...selection.edgeIds, ...extraEdges.map((item) => item.id)],
+    };
+    try {
+      const fallback = reader();
+      const saved = reader({
+        artifact: async (documentId) => (documentId === 'doc-saved'
+          ? { name: 'Offline brief', mediaKind: 'presentation' as const, revisions: [{ id: 'v1', label: 'v1', createdAt: at('13:34'), slideCount: 2, slides: deckSlides('Scope').slice(0, 2) }] }
+          : fallback.artifact(documentId)),
+      });
+      const body = (await get(setup({ activityReader: saved }), v2)).body as WorkGraphSnapshotV2;
+      expect(validateWorkGraphSnapshotV2(body).ok).toBe(true);
+      expect(body.efforts.length).toBe(50);
+      expect(body.efforts.find((effort) => effort.anchorNodeId === 'saved')?.nodeIds.sort()).toEqual(['saved', 'saved-v1']);
+      // The frame it took was a run's, never another artifact's.
+      expect(body.efforts.find((effort) => effort.anchorNodeId === 'meeting')).toBeDefined();
+    } finally {
+      for (const item of extraNodes) delete projection.nodes[item.id];
+      for (const item of extraEdges) delete projection.edges[item.id];
+      grant.selection = selection;
+    }
+  });
+
   it('refuses schemaVersion 2 on a deployment without an activity reader', async () => {
     const response = await get(setup({ activityReader: undefined }), v2);
     expect(response.statusCode).toBe(400);
