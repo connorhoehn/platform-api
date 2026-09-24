@@ -4,6 +4,22 @@
 //   GET /api/pipelines/:pipelineId/runs/:runId/audit
 //   GET /api/pipelines/audit/search
 
+// Loop 29c: run access has its own suite (runAccess.test.ts); these tests
+// exercise the route behaviour behind it, so the gate passes here.
+jest.mock('../../pipeline/runAccess', () => {
+  const actual = jest.requireActual('../../pipeline/runAccess');
+  const pass = (policy: string) => Object.assign((_q: unknown, _s: unknown, n: () => void) => n(), { accessPolicy: policy });
+  return {
+    ...actual,
+    requireRunAccess: () => pass('run:read'),
+    requirePipelineVisible: () => pass('pipeline:owner'),
+    assertRunAccess: async () => ({ role: 'owner' }),
+    assertItemRunAccess: async () => undefined,
+    canSeeRun: async () => true,
+    filterVisibleRunItems: async (_r: unknown, items: unknown[]) => items,
+  };
+});
+
 import express, { type NextFunction, type Request, type Response } from 'express';
 
 // --- module-level mocks (must precede route import) -------------------------
@@ -216,7 +232,7 @@ describe('GET /pipelines/audit/search', () => {
     const res = await dispatch(app, 'GET', '/pipelines/audit/search?actor=alice@example.com&limit=10');
     expect(res.statusCode).toBe(200);
     expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({
-      actor: 'alice@example.com',
+      actor: 'user-1', // Loop 29c: another actor is pinned to the caller unless the pipeline is theirs
       limit: 10,
     }));
   });
@@ -232,7 +248,7 @@ describe('GET /pipelines/audit/search', () => {
     mockSearch.mockResolvedValueOnce({ items: [] });
     await dispatch(app, 'GET', '/pipelines/audit/search?actor=alice&action=pipeline.trigger');
     expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({
-      actor: 'alice',
+      actor: 'user-1',
       actions: ['pipeline.trigger'],
     }));
   });

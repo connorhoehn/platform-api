@@ -18,6 +18,7 @@ import { requireAuth } from '../middleware/auth';
 import { asyncHandler, NotFoundError } from '../middleware/error-handler';
 import { PipelineRunRepository, type ImageLineageEntry } from '../repositories/PipelineRunRepository';
 import { getDynamoClient } from '../lib/ddb-client';
+import { requireRunAccess } from '../pipeline/runAccess';
 
 export const pipelineLineageRouter = Router({ mergeParams: true });
 
@@ -43,6 +44,8 @@ function getRunRepo(): PipelineRunRepository {
 pipelineLineageRouter.get(
   '/',
   requireAuth,
+  // Loop 29c (NFR #173): the run's owner or a reader of its document; pipelineId is a query param.
+  requireRunAccess('read', (req) => req.params.runId, (req) => (req.query as Record<string, unknown>).pipelineId),
   asyncHandler(async (req: Request<{ runId: string }>, res: Response) => {
     const { runId } = req.params;
     const pipelineId = (req.query as Record<string, string>)['pipelineId'];

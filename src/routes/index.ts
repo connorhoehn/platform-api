@@ -89,6 +89,8 @@ import { pipelineRunRepo } from '../repositories';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import type { Request } from 'express';
+import { requireRunAccess } from '../pipeline/runAccess';
+import { pinRequester } from '../pipeline/pinRequester';
 import type {
   AuthContext,
   PipelineRunDetailResponse,
@@ -285,6 +287,9 @@ router.get('/pipelines/:pipelineId', (req, res, next) => { req.url = `/${encodeU
 // distributed-core/src/applications/pipeline/http/. Hosts inject auth +
 // persistence + the bridge into the runtime.
 // ---------------------------------------------------------------------------
+// Loop 29c (NFR #173): a v2 run read is the run's owner's, or a reader of its
+// document's — the same rule as GET /pipelines/:pipelineId/runs/:runId.
+router.use('/v2/pipelines/:pipelineId/runs/:runId', requireRunAccess('read'));
 router.use(
   '/v2',
   // No silent 'dev-user': the principal is whatever requireAuth set (Cognito,
@@ -307,7 +312,9 @@ router.use(
           pipelineId: args.pipelineId,
           definition: args.definition,
           triggeredBy: args.triggeredBy,
-          triggerPayload: args.triggerPayload,
+          // Loop 29c (NFR #173): the run acts as the verified caller (#47),
+          // whatever `requestedBy` the body's payload claims.
+          triggerPayload: pinRequester(args.triggerPayload as Record<string, unknown> | undefined, args.triggeredBy.userId).payload,
           breakpoints: args.breakpoints ? [...args.breakpoints] : undefined,
         }),
       );

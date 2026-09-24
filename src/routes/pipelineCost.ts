@@ -8,6 +8,7 @@ import { Router, type Request } from 'express';
 import { PipelineRunRepository, type TokenUsageByModel } from '../repositories/PipelineRunRepository';
 import { getDynamoClient } from '../lib/ddb-client';
 import { asyncHandler } from '../middleware/error-handler';
+import { requirePipelineVisible } from '../pipeline/runAccess';
 
 export const pipelineCostRouter = Router({ mergeParams: true });
 
@@ -19,7 +20,8 @@ export interface PipelineCostResponse {
   runCount: number;
 }
 
-pipelineCostRouter.get('/', asyncHandler(async (req: Request<{ pipelineId: string }>, res) => {
+// Loop 29c (NFR #173): the caller's own pipeline, or a system one.
+pipelineCostRouter.get('/', requirePipelineVisible(), asyncHandler(async (req: Request<{ pipelineId: string }>, res) => {
   const { pipelineId } = req.params;
   if (!pipelineId) {
     res.status(400).json({ error: 'pipelineId is required' });

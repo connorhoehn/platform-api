@@ -27,6 +27,8 @@
 import { Router } from 'express';
 import { asyncHandler, ValidationError } from '../middleware/error-handler';
 import { withContext } from '../lib/logger';
+import { requireRunAccess } from '../pipeline/runAccess';
+import { definitionsRepo } from '../pipeline/definitions-repository';
 import {
   auditRepo,
   type AuditAction,
@@ -109,6 +111,8 @@ export const pipelineRunAuditRouter = Router({ mergeParams: true });
 
 pipelineRunAuditRouter.get(
   '/',
+  // Loop 29c (NFR #173): the run's owner or a reader of its document.
+  requireRunAccess('read'),
   asyncHandler<
     { pipelineId: string; runId: string },
     AuditListResponse | { error: string }
@@ -163,10 +167,15 @@ pipelineAuditSearchRouter.get(
       );
     }
 
+    // Loop 29c (NFR #173): the audit trail is every user's. A caller searches
+    // their own actions, or anyone's on a pipeline they own; otherwise the
+    // actor is pinned to the caller (a stranger's trail is never returned).
+    const ownsPipeline = pipelineId ? !!(await definitionsRepo.get(userId, pipelineId).catch(() => null)) : false;
+    const effectiveActor = ownsPipeline ? actor : userId;
     const opts = toListOptions(query);
     const result = await auditRepo.search({
       ...opts,
-      ...(actor ? { actor } : {}),
+      ...(effectiveActor ? { actor: effectiveActor } : {}),
       ...(pipelineId ? { pipelineId } : {}),
     });
 

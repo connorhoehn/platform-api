@@ -28,6 +28,7 @@ import type { RollupRecentRun } from '../pipeline/run-rollup';
 import type { PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { computeCost, isPricedModel } from '../pipeline/llm-pricing';
 import { costOfRun } from './agentLoops';
+import { requirePipelineVisible } from '../pipeline/runAccess';
 
 export type EstimateConfidence = 'none' | 'low' | 'medium';
 
@@ -163,4 +164,6 @@ function defaultEstimateDeps(): PipelineEstimateDeps {
 let router: Router | null = null;
 /** Mounted at /pipelines/:pipelineId/estimate. */
 export const pipelineEstimateRouter = Router({ mergeParams: true });
+// Loop 29c (NFR #173): the caller's own pipeline, or a system one.
+pipelineEstimateRouter.use(requirePipelineVisible());
 pipelineEstimateRouter.use((req, res, next) => { router ??= createPipelineEstimateRouter(); router(req, res, next); });

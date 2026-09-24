@@ -37,6 +37,7 @@ import { getSystemPipeline } from '../pipeline/systemPipelines';
 import { DefinitionsRepository } from '../pipeline/definitions-repository';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { getDynamoClient } from '../lib/ddb-client';
+import { requireRunAccess } from '../pipeline/runAccess';
 
 const log = withContext({ route: 'pipelineResume' });
 const tracer = trace.getTracer('platform-api');
@@ -87,6 +88,8 @@ interface ResumeFromStepResponse {
 // POST /resume?fromNodeId=<nodeId>
 pipelineResumeRouter.post(
   '/',
+  // Loop 29c (NFR #173): the run's owner only — before any system-pipeline fallback.
+  requireRunAccess('owner'),
   idempotency({ scope: 'pipeline-resume-from-step' }),
   asyncHandler<
     { pipelineId: string; runId: string },

@@ -65,7 +65,13 @@ export async function decidePipelineAccess(
   const live = body.runId ? await deps.liveRun(body.runId).catch(() => null) : null;
   const ownerId = live?.ownerId;
   if (ownerId && ownerId === body.userId) return { allow: true, ownerId, ...(live?.documentId ? { documentId: live.documentId } : {}) };
-  const documentId = body.documentId ?? live?.documentId;
+  // Loop 29c (NFR #173): a run this replica knows is decided on its OWN
+  // document. A different body documentId cannot borrow access: reading
+  // document A must not open a run of document B.
+  if (live?.documentId && body.documentId && body.documentId !== live.documentId) {
+    return { allow: false, ...(ownerId ? { ownerId } : {}), documentId: live.documentId, reason: 'documentId does not match the run' };
+  }
+  const documentId = live?.documentId ?? body.documentId;
   if (!documentId || !ID.test(documentId)) {
     return { allow: false, ...(ownerId ? { ownerId } : {}), reason: live ? 'not the run owner and the run names no document' : 'run not known here' };
   }

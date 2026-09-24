@@ -5,6 +5,22 @@
 //   GET /api/judgments/aggregates?pipelineId=…
 //   GET /api/judgments/aggregates?rubricId=…
 
+// Loop 29c: run access has its own suite (runAccess.test.ts); these tests
+// exercise the route behaviour behind it, so the gate passes here.
+jest.mock('../../pipeline/runAccess', () => {
+  const actual = jest.requireActual('../../pipeline/runAccess');
+  const pass = (policy: string) => Object.assign((_q: unknown, _s: unknown, n: () => void) => n(), { accessPolicy: policy });
+  return {
+    ...actual,
+    requireRunAccess: () => pass('run:read'),
+    requirePipelineVisible: () => pass('pipeline:owner'),
+    assertRunAccess: async () => ({ role: 'owner' }),
+    assertItemRunAccess: async () => undefined,
+    canSeeRun: async () => true,
+    filterVisibleRunItems: async (_r: unknown, items: unknown[]) => items,
+  };
+});
+
 import express, { type NextFunction, type Request, type Response } from 'express';
 
 // --- module-level mocks (must precede route import) -------------------------
@@ -14,11 +30,15 @@ const mockListByPipeline = jest.fn();
 const mockListByRubric = jest.fn();
 
 jest.mock('../../pipeline/judge/judgeServices', () => ({
-  getJudgmentRepo: () => ({ getRawText: (...args: unknown[]) => mockGetRawText(...args) }),
+  getJudgmentRepo: () => ({ getRawText: (...args: unknown[]) => mockGetRawText(...args), getById: async (id: string) => ({ judgmentId: id, runId: 'run-1', pipelineId: 'pl_1' }) }),
   getJudgmentAggregateRepo: () => ({
     listByPipeline: (...args: unknown[]) => mockListByPipeline(...args),
     listByRubric: (...args: unknown[]) => mockListByRubric(...args),
   }),
+}));
+
+jest.mock('../../pipeline/definitions-repository', () => ({
+  definitionsRepo: { get: async (_u: string, id: string) => (id === 'pl_1' ? { id } : null) },
 }));
 
 const mockLogger = {

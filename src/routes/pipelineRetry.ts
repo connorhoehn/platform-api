@@ -33,6 +33,8 @@ import { readAttempts } from '../repositories/PipelineRunRepository';
 import { DefinitionsRepository } from '../pipeline/definitions-repository';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { getDynamoClient } from '../lib/ddb-client';
+import { requireRunAccess } from '../pipeline/runAccess';
+import { pinRequester } from '../pipeline/pinRequester';
 
 const log = withContext({ route: 'pipelineRetry' });
 const tracer = trace.getTracer('platform-api');
@@ -86,6 +88,8 @@ interface RetryFromNodeResponse {
 // POST /:runId/retry/:nodeId
 pipelineRetryRouter.post(
   '/:nodeId',
+  // Loop 29c (NFR #173): the original run's owner only — before any system-pipeline fallback.
+  requireRunAccess('owner'),
   idempotency({ scope: 'pipeline-retry-from-node' }),
   asyncHandler<
     { pipelineId: string; runId: string; nodeId: string },
@@ -189,10 +193,14 @@ pipelineRetryRouter.post(
     const originalInput = triggerOutput && typeof triggerOutput === 'object' && !Array.isArray(triggerOutput)
       ? (triggerOutput as Record<string, unknown>)
       : {};
+    // Loop 29c (NFR #173): the retry acts as the verified caller, whatever the
+    // original trigger output or `body.inputs` claim (pinRequester, #47).
     const retryPayload = {
-      ...originalInput,
-      ...(snapshotInput !== undefined ? { __snapshotInput: snapshotInput } : {}),
-      ...(body.inputs ?? {}),
+      ...pinRequester({
+        ...originalInput,
+        ...(snapshotInput !== undefined ? { __snapshotInput: snapshotInput } : {}),
+        ...(body.inputs ?? {}),
+      }, userId).payload,
       __retry: {
         originalRunId: runId,
         retryFromNodeId: nodeId,
@@ -289,6 +297,7 @@ pipelineRetryRouter.post(
 // `stuckAt` flag in DDB so the UI transitions to "interrupted" → retryable.
 pipelineRunActionsRouter.post(
   '/force-fail',
+  requireRunAccess('owner'),
   asyncHandler<
     { pipelineId: string; runId: string },
     { runId: string; status: string; hint: string; at: string } | { error: string }

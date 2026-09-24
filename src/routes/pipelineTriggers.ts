@@ -35,6 +35,8 @@ import { PipelineRunRepository, type PipelineRunItem } from '../repositories/Pip
 import { getDynamoClient } from '../lib/ddb-client';
 import { pipelineRunReviewRouter } from './pipelineRunReview';
 import { workSourceAccountRepo } from '../repositories';
+import { assertRunAccess, canSeeRun, isTrustedServiceCall, requireRunAccess } from '../pipeline/runAccess';
+import { markAccess } from '../middleware/resource-access';
 
 export { classifyPipelineError, type ErrorCategory };
 export {
@@ -454,7 +456,11 @@ pipelineTriggersRouter.get(
           { 'pipeline.id': pipelineId, 'pipeline.limit': limit },
           async () => Promise.resolve(bridge!.listRuns!(pipelineId, { limit, cursor })),
         );
-        res.json(out);
+        // Loop 29c (NFR #173): only the runs the caller owns, or whose target
+        // document the caller may read — the same rule as GET /:runId.
+        const rows = Array.isArray(out?.runs) ? out.runs : [];
+        const seen = await Promise.all(rows.map((r) => canSeeRun(req, pipelineId, String((r as { runId?: unknown }).runId ?? ''))));
+        res.json({ ...out, runs: rows.filter((_r, i) => seen[i]) });
         return;
       } catch (err) {
         respondBridgeError({
@@ -479,6 +485,8 @@ pipelineTriggersRouter.get(
 // GET /:runId — run snapshot
 pipelineTriggersRouter.get(
   '/:runId',
+  // Loop 29c (NFR #173): owner, or a reader of the run's document; else 404.
+  requireRunAccess('read'),
   asyncHandler<{ pipelineId: string; runId: string }>(async (req, res) => {
     const { runId, pipelineId } = req.params;
     const userId = req.user!.sub;
@@ -608,6 +616,7 @@ pipelineTriggersRouter.get(
 // GET /:runId/history?fromVersion=0
 pipelineTriggersRouter.get(
   '/:runId/history',
+  requireRunAccess('read'),
   asyncHandler<{ pipelineId: string; runId: string }, unknown, unknown, { fromVersion?: string }>(
     async (req, res) => {
       const { runId, pipelineId } = req.params;
@@ -680,7 +689,13 @@ pipelineActiveRunsRouter.get(
           { 'pipeline.user_id': userId },
           async () => Promise.resolve(bridge!.listActiveRuns!()),
         );
-        res.json({ runs });
+        // Loop 29c (NFR #173): the executor's list is every user's; keep the caller's.
+        const list = Array.isArray(runs) ? runs : [];
+        const seen = await Promise.all(list.map((r) => {
+          const row = r as { runId?: unknown; pipelineId?: unknown };
+          return canSeeRun(req, typeof row.pipelineId === 'string' ? row.pipelineId : undefined, String(row.runId ?? ''));
+        }));
+        res.json({ runs: list.filter((_r, i) => seen[i]) });
         return;
       } catch (err) {
         respondBridgeError({
@@ -717,6 +732,8 @@ interface CancelRunRequest {
 
 pipelineCancelRouter.post(
   '/',
+  // Loop 29c (NFR #173): only the run's owner cancels it (a reader 403, a stranger 404).
+  requireRunAccess('owner', (req) => req.params.runId, () => undefined),
   idempotency({ scope: 'pipeline-cancel' }),
   asyncHandler<{ runId: string }, unknown, CancelRunRequest>(async (req, res) => {
     const { runId } = req.params;
@@ -1031,14 +1048,22 @@ pipelinePendingApprovalsRouter.get(
         return;
       }
 
+      // Loop 29c (NFR #173): the queue is every run's gates. Keep the gates
+      // that name the caller as an approver, and those on runs the caller may
+      // read (owner, or a reader of the run's document). `?userId` narrows
+      // further; it never widens.
+      const mine = await Promise.all(rows.map(async (row) =>
+        row.approvers.some((a) => a.type === 'user' && (a.value === userId || a.userId === userId))
+        || canSeeRun(req, (row as { pipelineId?: string }).pipelineId, row.runId)));
+      const visibleRows = rows.filter((_r, i) => mine[i]);
       const filterUserId = req.query.userId ? String(req.query.userId) : undefined;
       const filtered = filterUserId
-        ? rows.filter((row) =>
+        ? visibleRows.filter((row) =>
             row.approvers.some(
               (a) => a.type === 'user' && (a.value === filterUserId || a.userId === filterUserId),
             ),
           )
-        : rows;
+        : visibleRows;
 
       // Enrich each row with the run snapshot's context + step outputs so
       // the approval card has the upstream LLM response inline. De-dupe by
@@ -1265,10 +1290,52 @@ async function enrichWithRunContext(
 // Mounted separately from the runs router so the path matches the spec.
 // ---------------------------------------------------------------------------
 
+/**
+ * Loop 29c (NFR #173): who may resolve a run's approval gate. A stranger to
+ * the run is 404 — unless a gate lists them as a user approver (they were
+ * asked). A gate that lists user approvers is theirs (403 for anyone else,
+ * except under SKIP_AUTH, the handler's existing dev bypass); a gate with no
+ * user approvers (role-only, or not found) is the run owner's (a reader 403).
+ */
+function requireApprovalAccess() {
+  return markAccess((req, res, next) => {
+    void (async () => {
+      if (isTrustedServiceCall(req)) { next(); return; }
+      const runId = String(req.params.runId ?? '');
+      const userId = req.user?.sub ?? '';
+      const stepId = typeof (req.body as { stepId?: unknown } | undefined)?.stepId === 'string' ? (req.body as { stepId: string }).stepId : '';
+      let approvers: PendingApprovalRow['approvers'] | null = null;
+      const bridge = getPipelineBridge();
+      if (bridge?.getPendingApprovals && stepId) {
+        const rows = await Promise.resolve(bridge.getPendingApprovals()).catch(() => [] as PendingApprovalRow[]);
+        const row = rows.find((r) => r.runId === runId && r.stepId === stepId);
+        if (row) approvers = row.approvers;
+      }
+      if (!approvers && stepId) {
+        const pipelineId = await lookupPipelineIdByRunId(runId).catch(() => null);
+        const item = pipelineId ? await getRunRepo().get(pipelineId, runId).catch(() => null) : null;
+        const node = item ? approvalNodeOf(item.definitionSnapshot, stepId) : null;
+        if (node) approvers = node.approvers ?? [];
+      }
+      const userApprovers = (approvers ?? []).filter((a) => a.type === 'user');
+      const listed = userApprovers.some((a) => a.value === userId || a.userId === userId);
+      if (listed) { next(); return; }
+      await assertRunAccess(req, undefined, runId, userApprovers.length > 0 ? 'read' : 'owner');
+      if (userApprovers.length > 0 && process.env.SKIP_AUTH !== 'true') {
+        res.status(403).json({ error: 'not authorized to resolve this approval step' });
+        return;
+      }
+      next();
+    })().catch(next);
+  }, 'run:approver');
+}
+
 export const pipelineApprovalsRouter = Router({ mergeParams: true });
 
 pipelineApprovalsRouter.post(
   '/',
+  // Loop 29c (NFR #173): fail closed before the gate is touched.
+  requireApprovalAccess(),
   idempotency({ scope: 'pipeline-approval' }),
   asyncHandler<{ runId: string }, unknown, ResolveApprovalRequest>(async (req, res) => {
     const { runId } = req.params;
@@ -1515,6 +1582,8 @@ interface ResolveBreakpointRequest {
 
 pipelineBreakpointRouter.post(
   '/',
+  // Loop 29c (NFR #173): resuming a paused run is the owner's.
+  requireRunAccess('owner'),
   asyncHandler<
     { pipelineId: string; runId: string; stepId: string },
     unknown,

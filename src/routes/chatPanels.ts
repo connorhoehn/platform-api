@@ -23,12 +23,26 @@ import { getPipelineBridge } from '../pipeline/bridge-types';
 import { pipelineRunRepo } from '../repositories';
 import { runResultFromContext } from '../pipeline/runResult';
 import { getPanelDataProvider } from '../chat/chatPanelProviders';
+import { canSeeRun } from '../pipeline/runAccess';
+import { isChannelMember } from '../deck/documentEditAccess';
 
 export interface ChatPanelsDeps {
   /** The run as the executor holds it, with its `context`; null when this process never ran it. */
   getLiveRun: (runId: string) => Promise<{ context?: unknown } | null> | { context?: unknown } | null;
   /** The persisted run's last checkpoint context; null when there is no row. */
   getStoredRunContext: (pipelineId: string, runId: string) => Promise<unknown | null>;
+  /**
+   * Loop 29c (NFR #173): may the caller see this run's panel? The run's owner,
+   * a reader of its document, or a member of the chat channel the run answered
+   * in (the card is posted there for everyone in it).
+   */
+  canSee?: (req: Request, pipelineId: string | undefined, runId: string, context: Record<string, unknown>) => Promise<boolean>;
+}
+
+async function defaultCanSee(req: Request, pipelineId: string | undefined, runId: string, context: Record<string, unknown>): Promise<boolean> {
+  if (await canSeeRun(req, pipelineId, runId)) return true;
+  const channel = typeof context.chatChannel === 'string' ? context.chatChannel : typeof context.channel === 'string' ? context.channel : '';
+  return !!channel && !!req.user?.sub && isChannelMember(channel, req.user.sub);
 }
 
 /** `<pipelineId>:<runId>` → both; a bare id → runId only. */
@@ -74,6 +88,7 @@ export function createChatPanelsRouter(deps: ChatPanelsDeps = defaultDeps): Rout
       try { context = await deps.getStoredRunContext(pipelineId, runId); } catch { context = null; }
     }
     if (!context || typeof context !== 'object') throw new NotFoundError('panel not found');
+    if (!(await (deps.canSee ?? defaultCanSee)(req, pipelineId, runId, context as Record<string, unknown>))) throw new NotFoundError('panel not found');
 
     // The run has to have answered with THIS panel, and left something to show in it.
     const result = runResultFromContext(context);

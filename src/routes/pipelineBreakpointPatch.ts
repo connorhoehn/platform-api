@@ -36,6 +36,7 @@ import { asyncHandler, NotFoundError, ValidationError } from '../middleware/erro
 import { withContext } from '../lib/logger';
 import { getPipelineBridge, type PipelineRunSnapshot } from '../pipeline/bridge-types';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
+import { requireRunAccess } from '../pipeline/runAccess';
 
 const log = withContext({ route: 'pipelineBreakpointPatch' });
 
@@ -96,6 +97,8 @@ export const pipelineBreakpointPatchRouter = Router({ mergeParams: true });
 
 pipelineBreakpointPatchRouter.post(
   '/',
+  // Loop 29c (NFR #173): rewriting a paused run's context is the owner's.
+  requireRunAccess('owner'),
   asyncHandler<
     { pipelineId: string; runId: string; stepId: string },
     unknown,
@@ -250,6 +253,7 @@ pipelineBreakpointPatchRouter.post(
 
 pipelineBreakpointPatchRouter.delete(
   '/:patchId',
+  requireRunAccess('owner'),
   asyncHandler<{
     pipelineId: string;
     runId: string;

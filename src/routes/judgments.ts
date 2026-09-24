@@ -31,12 +31,40 @@ import {
   getJudgmentRepo,
   getJudgmentAggregateRepo,
 } from '../pipeline/judge/judgeServices';
+import { assertRunAccess } from '../pipeline/runAccess';
+import { markAccess } from '../middleware/resource-access';
+import { definitionsRepo } from '../pipeline/definitions-repository';
+import { getSystemPipeline } from '../pipeline/systemPipelines';
 import type {
   AggregateRow,
   ListAggregatesOptions,
 } from '../pipeline/judge/JudgmentAggregateRepository';
 
 const log = withContext({ route: 'judgments' });
+
+/**
+ * Loop 29c (NFR #173): a judgment belongs to the run that made it — the run's
+ * owner or a reader of its document may read it (401 / 404 otherwise).
+ */
+const requireJudgmentRunAccess = markAccess((req, _res, next) => {
+  void (async () => {
+    const judgmentId = String(req.params.judgmentId ?? '');
+    const row = judgmentId ? await getJudgmentRepo().getById(judgmentId).catch(() => null) : null;
+    if (!row) {
+      // Same answer as a run the caller may not see — but the bearer check first.
+      await assertRunAccess(req, undefined, '', 'read');
+      return;
+    }
+    await assertRunAccess(req, row.pipelineId, row.runId, 'read');
+    next();
+  })().catch(next);
+}, 'run:read');
+
+/** A pipeline the caller may see aggregate numbers for: their own definition, or a system pipeline. */
+async function ownsPipeline(userId: string, pipelineId: string): Promise<boolean> {
+  if (getSystemPipeline(pipelineId)) return true;
+  return !!(await definitionsRepo.get(userId, pipelineId).catch(() => null));
+}
 
 const MAX_LIMIT = 365;
 const DEFAULT_LIMIT = 30;
@@ -89,6 +117,7 @@ export const judgmentsRouter = Router({ mergeParams: true });
 
 judgmentsRouter.get(
   '/:judgmentId/raw-text',
+  requireJudgmentRunAccess,
   asyncHandler<
     { judgmentId: string },
     RawTextResponse | { error: string }
@@ -148,11 +177,21 @@ judgmentsRouter.get(
       );
     }
 
+    // Loop 29c (NFR #173): only pipelines the caller owns (or system ones).
+    if (pipelineId && !(await ownsPipeline(userId, pipelineId))) {
+      res.status(404).json({ error: 'pipeline not found' });
+      return;
+    }
     const opts = toListAggregatesOptions(query);
     const repo = getJudgmentAggregateRepo();
-    const result = pipelineId
+    const raw = pipelineId
       ? await repo.listByPipeline(pipelineId, opts)
       : await repo.listByRubric(rubricId!, opts);
+    const owned = new Map<string, boolean>();
+    for (const row of raw.items) {
+      if (!owned.has(row.pipelineId)) owned.set(row.pipelineId, await ownsPipeline(userId, row.pipelineId));
+    }
+    const result = { ...raw, items: raw.items.filter((row) => owned.get(row.pipelineId)) };
 
     reqLog.info(
       { pipelineId, rubricId, count: result.items.length, opts },
