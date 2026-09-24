@@ -1154,6 +1154,36 @@ describe('RunPersistenceService — redriveOf', () => {
     expect(last.redriveOf).toBe('r-old');
     expect(last.redrivenBy).toEqual(['r-newer']);
   });
+
+  it('keeps the work-graph plan across a resume: persisted on the row, seeded back (NFR #189)', async () => {
+    const { repo, bus, service } = makeService();
+    const workGraph = {
+      title: 'Edit Risks', produces: [{ source: 'document' as const, resourceId: 'deck-1' }],
+      steps: [{ stepId: 'write', title: 'Save the new revision', dependsOn: [] }],
+    };
+    service.seedResumedRun({
+      pipelineId: 'p', runId: 'r-plan', status: 'interrupted', triggeredBy: 'u', triggerType: 'manual', startedAt: 't0', workGraph,
+    });
+    await bus.publish('pipeline:run:completed', { runId: 'r-plan', durationMs: 1, at: 't1' });
+    expect((repo.put.mock.calls.at(-1)![0] as PipelineRunItem).workGraph).toEqual(workGraph);
+  });
+
+  it('a row with no persisted plan resumes with the steps its definition snapshot declares (NFR #189)', async () => {
+    const { repo, bus, service } = makeService();
+    service.seedResumedRun({
+      pipelineId: 'p', runId: 'r-old-row', status: 'interrupted', triggeredBy: 'u', triggerType: 'manual', startedAt: 't0',
+      definitionSnapshot: {
+        name: 'Deck revise',
+        nodes: [{ id: 'trigger', type: 'trigger', data: { label: 'Start' } }, { id: 'load', data: { label: 'Read the deck' } }, { id: 'write', data: { label: 'Save' } }],
+        edges: [{ source: 'load', target: 'write' }],
+      },
+    });
+    await bus.publish('pipeline:run:completed', { runId: 'r-old-row', durationMs: 1, at: 't1' });
+    const plan = (repo.put.mock.calls.at(-1)![0] as PipelineRunItem).workGraph;
+    expect(plan?.title).toBe('Deck revise');
+    expect(plan?.steps.map((step) => step.stepId)).toEqual(['load', 'write']);
+    expect(plan?.steps[1]!.dependsOn).toEqual(['load']);
+  });
 });
 
 describe('RunPersistenceService prices steps that report their own token usage', () => {

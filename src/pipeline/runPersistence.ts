@@ -44,7 +44,21 @@ import { declaredArtifactRefs } from './declaredArtifacts';
 import { pipelineStepResourceId } from '../work-graph/sources/mapPipeline';
 import { recallRunLab } from './agent/DevboxAgentClient';
 import { parseRunResult } from './runResult';
-import { workGraphPlanFromStoredRun, type RunWorkGraphPlan } from './workGraphPlan';
+import { workGraphPlanFromDefinition, workGraphPlanFromStoredRun, type RunWorkGraphPlan } from './workGraphPlan';
+
+/**
+ * The work-graph plan for a run being resumed: the one persisted on its row,
+ * else the steps its definition snapshot declares (named like the trigger
+ * would), else what its checkpoint context says (an /agent plan).
+ */
+function resumedWorkGraphPlan(item: PipelineRunItem): RunWorkGraphPlan | undefined {
+  if (item.workGraph) return item.workGraph as RunWorkGraphPlan;
+  const fromDefinition = workGraphPlanFromDefinition(item.definitionSnapshot);
+  const fromContext = workGraphPlanFromStoredRun(item).workGraph;
+  if (fromContext?.steps.length) return { ...(fromDefinition ?? {}), ...fromContext };
+  if (!fromDefinition) return fromContext;
+  return { ...fromDefinition, ...(fromContext?.conversationId ? { conversationId: fromContext.conversationId } : {}) };
+}
 import { runOverridesFrom, type RunOverrides } from './runOverrides';
 
 const log = withContext({ service: 'runPersistence' });
@@ -862,6 +876,11 @@ export class RunPersistenceService {
       redrivenBy: item.redrivenBy,
       ...(item.runOverrides ? { runOverrides: item.runOverrides } : {}),
       pause: item.pause,
+      // NFR #189: the plan the trigger declared, so the resumed run's step
+      // updates reach the graph and its end closes every step. A row written
+      // before the plan was persisted falls back to the plan its own
+      // definition snapshot implies (steps and name; `produces` is lost).
+      ...(resumedWorkGraphPlan(item) ? { workGraph: resumedWorkGraphPlan(item) } : {}),
     });
   }
 
@@ -966,7 +985,9 @@ export class RunPersistenceService {
     // never answered — has only the row written when the command was accepted.
     // That row still knows what was asked for and where, and replaying it as
     // an unnamed, unanchored "Pipeline run" throws both away.
-    const stored = workGraphPlanFromStoredRun(item, await this.definitionName(item));
+    const fromRow = workGraphPlanFromStoredRun(item, await this.definitionName(item));
+    // The persisted plan (NFR #189) names the steps and the produced document exactly.
+    const stored = item.workGraph ? { ...fromRow, workGraph: item.workGraph as RunWorkGraphPlan } : fromRow;
     // A replay at the SAME instant is exactly idempotent — same event key, and
     // never newer — so it can only ever re-assert what the projection already
     // has. That is right for an outage replay and useless for a repair: a run
@@ -1457,6 +1478,7 @@ export class RunPersistenceService {
       redrivenBy: state.redrivenBy,
       review: state.review,
       ...(state.runOverrides ? { runOverrides: state.runOverrides } : {}),
+      ...(state.workGraph ? { workGraph: state.workGraph } : {}),
       pause: state.pause,
     };
 

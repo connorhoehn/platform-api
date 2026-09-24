@@ -177,6 +177,19 @@ export interface PipelineRunItem {
    */
   definitionSnapshot?: unknown;
   /**
+   * What the work graph shows for this run (its steps, title, the document it
+   * produces), as the trigger declared it. Persisted so a run resumed on
+   * another process — or this one after a restart — still projects its steps
+   * and closes them when it ends (realtime-examples NFR #189); without it a
+   * resumed run's step nodes stayed `running` for ever. Shape: RunWorkGraphPlan.
+   */
+  workGraph?: {
+    conversationId?: string;
+    title?: string;
+    produces?: Array<{ source: 'document'; resourceId: string }>;
+    steps: Array<{ stepId: string; title: string; dependsOn: string[] }>;
+  };
+  /**
    * An /agent loop's PENDING row points at the executor run its planner
    * eventually started. The loop id is what the chat client polls — it is
    * handed out at 202 time, before the planner has finished, and the executor
