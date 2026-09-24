@@ -29,6 +29,13 @@
 // a review it does not recognise and the card would go back to offering both
 // buttons. So the first verdict is the decision and the comment says it was not
 // the whole story.
+//
+// Who may give a verdict (NFR #171): accepting a suggestion changes the
+// document, so the caller must be allowed to EDIT it — #41's `document:edit`
+// through the document gate. No bearer 401; cannot read it 404; can read but
+// not edit 403 `{ code: 'forbidden' }`. A run answering a comment is bound to
+// that comment's document (its link), so a verdict naming another document —
+// one the caller does own — cannot resolve someone else's thread: 404.
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
 import { asyncHandler, ConflictError, NotFoundError, ValidationError } from '../middleware/error-handler';
@@ -38,6 +45,9 @@ import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { PipelineRunRepository, type RunReview } from '../repositories/PipelineRunRepository';
 import { getDynamoClient } from '../lib/ddb-client';
 import { buildDocumentReviewApplyDefinition, DOCUMENT_AGENT_REVIEW_PIPELINE_ID } from '../documents/documentAgentPipeline';
+import { documentReadGate } from '../documents/documentReadGate';
+import { DocumentEditForbiddenError } from '../deck/documentEditAccess';
+import { commentForRun } from '../documents/commentAgentRequests';
 
 const log = withContext({ route: 'pipelineRunReview' });
 
@@ -93,8 +103,23 @@ pipelineRunReviewRouter.post(
     const userId = req.user!.sub;
     const body = parseBody(req.body);
 
+    try {
+      await documentReadGate().assertCanEdit(req, body.documentId);
+    } catch (err) {
+      if (err instanceof DocumentEditForbiddenError) {
+        res.status(403).json({ error: err.message, code: err.code, documentId: body.documentId } as never);
+        return;
+      }
+      throw err;
+    }
+
     const run = await getRunRepo().get(pipelineId, runId);
     if (!run) throw new NotFoundError(`run ${runId} not found for pipeline ${pipelineId}`);
+    const link = await commentForRun(runId);
+    if (link && link.documentId !== body.documentId) {
+      log.warn({ pipelineId, runId, userId, documentId: body.documentId, linkedDocumentId: link.documentId }, 'run review refused: the run belongs to another document');
+      throw new NotFoundError(`run ${runId} not found for pipeline ${pipelineId}`);
+    }
     // One verdict per run, and the FIRST one stands. The suggestion is gone
     // from the document once resolved either way, so a second verdict is
     // describing something that is no longer there.

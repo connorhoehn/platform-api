@@ -16,12 +16,22 @@ const mockPublish = jest.fn().mockResolvedValue(undefined);
 const mockRegisterTrigger = jest.fn();
 const mockPersistenceSetReview = jest.fn();
 jest.mock('../../pipeline/runPersistence', () => ({ getRunPersistenceService: jest.fn() }));
+// NFR #171: the real gate over a mocked row — owner dev-owner, editor dev-grace, viewer dev-reader.
+const mockDocRow = jest.fn();
+let mockGate: import('../../documents/documentReadGate').DocumentReadGate;
+jest.mock('../../documents/documentReadGate', () => {
+  const actual = jest.requireActual('../../documents/documentReadGate');
+  return { ...actual, documentReadGate: () => mockGate };
+});
+const mockCommentForRun = jest.fn();
+jest.mock('../../documents/commentAgentRequests', () => ({ commentForRun: (...a: unknown[]) => mockCommentForRun(...a) }));
 
 import { pipelineRunReviewRouter, RUN_REVIEWED_EVENT } from '../pipelineRunReview';
 import { errorHandler } from '../../middleware/error-handler';
 import { getPipelineBridge } from '../../pipeline/bridge-types';
 import { getRunPersistenceService } from '../../pipeline/runPersistence';
 import { DOCUMENT_AGENT_REVIEW_PIPELINE_ID } from '../../documents/documentAgentPipeline';
+import { makeDocumentReadGate } from '../../documents/documentReadGate';
 
 interface MockRes { statusCode: number; body: unknown; ended: boolean; finished: Promise<void>; status(c: number): MockRes; json(b: unknown): MockRes; setHeader(): MockRes; getHeader(): unknown; end(): MockRes }
 function mockRes(): MockRes {
@@ -35,9 +45,10 @@ function mockRes(): MockRes {
     end() { this.ended = true; resolve(); return this; },
   };
 }
-async function post(app: express.Express, url: string, body: unknown): Promise<MockRes> {
+async function post(app: express.Express, url: string, body: unknown, opts: { userId?: string; anonymous?: boolean } = {}): Promise<MockRes> {
   const res = mockRes();
-  const req = { method: 'POST', url, originalUrl: url, path: url, headers: { 'content-type': 'application/json' }, query: {}, body, user: { sub: 'dev-grace' }, params: {} } as unknown as Request;
+  const headers = opts.anonymous ? { 'content-type': 'application/json' } : { 'content-type': 'application/json', authorization: 'Bearer t' };
+  const req = { method: 'POST', url, originalUrl: url, path: url, headers, query: {}, body, user: { sub: opts.userId ?? 'dev-grace' }, params: {} } as unknown as Request;
   await new Promise<void>((done, reject) => {
     (app as unknown as (req: Request, res: Response, next: NextFunction) => void)(req, res as unknown as Response, (err?: unknown) => {
       if (err) { reject(err); return; }
@@ -64,6 +75,9 @@ const good = { decision: 'reject', suggestionKey: 'agent:haiku@1788000000000', d
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockDocRow.mockResolvedValue({ documentId: 'doc-1', createdBy: 'dev-owner', editors: ['dev-grace'], viewers: ['dev-reader'] });
+  mockGate = makeDocumentReadGate({ getDocumentRow: mockDocRow, getLifecycleOwner: async () => undefined });
+  mockCommentForRun.mockResolvedValue(null);
   mockGet.mockResolvedValue({ pipelineId: 'document-agent-edit', runId: 'run-1', status: 'completed' });
   mockSetReview.mockResolvedValue(true);
   (getPipelineBridge as jest.Mock).mockReturnValue({ trigger: mockTrigger });
@@ -162,5 +176,56 @@ describe('POST /pipelines/:pipelineId/runs/:runId/review', () => {
     expect((await post(app, URL, { ...good, suggestionKey: 'no-at-sign' })).statusCode).toBe(400);
     expect((await post(app, URL, { ...good, documentId: '' })).statusCode).toBe(400);
     expect(mockSetReview).not.toHaveBeenCalled();
+  });
+
+  // NFR #171: a verdict changes the document, so it takes document:edit.
+  describe('who may give a verdict', () => {
+    const accept = { ...good, decision: 'accept', applyServerSide: true };
+
+    it('the owner and an editor may accept', async () => {
+      expect((await post(app, URL, accept, { userId: 'dev-owner' })).statusCode).toBe(200);
+      mockGet.mockResolvedValue({ pipelineId: 'document-agent-edit', runId: 'run-1', status: 'completed' });
+      expect((await post(app, URL, accept, { userId: 'dev-grace' })).statusCode).toBe(200);
+      expect(mockSetReview).toHaveBeenCalledTimes(2);
+    });
+
+    it('a reader is refused 403 forbidden: nothing recorded, no apply run, no event', async () => {
+      const res = await post(app, URL, accept, { userId: 'dev-reader' });
+      expect(res.statusCode).toBe(403);
+      expect(res.body).toMatchObject({ code: 'forbidden', documentId: 'doc-1' });
+      expect((res.body as { error: string }).error).toMatch(/view this document but not change it/);
+      expect(mockGet).not.toHaveBeenCalled();
+      expect(mockTrigger).not.toHaveBeenCalled();
+      expect(mockSetReview).not.toHaveBeenCalled();
+      expect(mockPublish).not.toHaveBeenCalled();
+    });
+
+    it('a stranger gets 404, the same as a missing document; a missing document is 404', async () => {
+      expect((await post(app, URL, accept, { userId: 'dev-frank' })).statusCode).toBe(404);
+      mockDocRow.mockResolvedValue(null);
+      expect((await post(app, URL, accept, { userId: 'dev-owner' })).statusCode).toBe(404);
+      expect(mockSetReview).not.toHaveBeenCalled();
+      expect(mockTrigger).not.toHaveBeenCalled();
+    });
+
+    it('no bearer is 401', async () => {
+      expect((await post(app, URL, accept, { anonymous: true })).statusCode).toBe(401);
+      expect(mockSetReview).not.toHaveBeenCalled();
+    });
+
+    it('a comment run is bound to its comment\'s document: a verdict naming another document is 404', async () => {
+      mockCommentForRun.mockResolvedValue({ documentId: 'doc-someone-elses', commentId: 'c-1', pipelineId: 'document-agent-edit' });
+      const res = await post(app, URL, accept, { userId: 'dev-owner' });
+      expect(res.statusCode).toBe(404);
+      expect(mockSetReview).not.toHaveBeenCalled();
+      expect(mockTrigger).not.toHaveBeenCalled();
+    });
+
+    it('an editor\'s accept on a comment run still records and publishes pipeline:run:reviewed (the resolve path)', async () => {
+      mockCommentForRun.mockResolvedValue({ documentId: 'doc-1', commentId: 'c-1', pipelineId: 'document-agent-edit' });
+      const res = await post(app, URL, { ...good, decision: 'accept' }, { userId: 'dev-grace' });
+      expect(res.statusCode).toBe(200);
+      expect(mockPublish).toHaveBeenCalledWith(RUN_REVIEWED_EVENT, expect.objectContaining({ runId: 'run-1', decision: 'accept', by: 'dev-grace' }));
+    });
   });
 });

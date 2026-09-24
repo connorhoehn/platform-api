@@ -14,6 +14,7 @@ import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '..
 import log from '../lib/logger';
 import { documentCommentRepo } from '../repositories';
 import { documentReadGate } from '../documents/documentReadGate';
+import { DocumentEditForbiddenError } from '../deck/documentEditAccess';
 import { publishSignal } from '../lib/event-catalog';
 import { commentScopedInstruction, linkRunToComment } from '../documents/commentAgentRequests';
 import { getCommentAgentResolver } from '../documents/commentAgentResolver';
@@ -42,9 +43,20 @@ documentAgentEditRouter.post('/:documentId/agent-edit', requireAuth, asyncHandle
     throw new ValidationError('resolveOnApply must be a boolean');
   }
   const commentId = typeof body.commentId === 'string' ? body.commentId.trim() : undefined;
+  // NFR #171: the run writes into the document (suggestions, or a direct edit
+  // after approval), so asking for one takes #41's `document:edit` — not only
+  // read. No bearer 401; cannot read it 404; reader 403 `{ code: 'forbidden' }`.
+  try {
+    await documentReadGate().assertCanEdit(req, documentId);
+  } catch (err) {
+    if (err instanceof DocumentEditForbiddenError) {
+      res.status(403).json({ error: err.message, code: err.code, documentId });
+      return;
+    }
+    throw err;
+  }
   let instruction = typed;
   if (commentId) {
-    await documentReadGate().assertCanRead(req, documentId);
     const comment = await documentCommentRepo.getComment(documentId, commentId);
     if (!comment || comment.documentId !== documentId) throw new NotFoundError('Comment not found in this document');
     if (comment.parentCommentId) throw new ValidationError('Ask the agent about the thread, not a reply');
