@@ -1,4 +1,4 @@
-// NFR #163 — `9d9fff04…/v1` lost every slide's bytes. Reproduces that row's
+// NFR #165 — `9d9fff04…/v1` lost every slide's bytes. Reproduces that row's
 // shape (a pre-#4 revision whose slides are blobs only, named twice: in
 // `revisions[].slides` and the legacy `revisionSlides`), with both blob stores
 // empty, and pins what each actor does with it:
@@ -62,7 +62,7 @@ function legacyRow(documentId: string, opts: { inlineSvg?: boolean } = {}): { ro
   return { row, bodies };
 }
 
-describe('NFR #163: a legacy revision whose only slide copies were on a lost volume', () => {
+describe('NFR #165: a legacy revision whose only slide copies were on a lost volume', () => {
   it('the row-diet backfill keeps the legacy entry — it has no bytes to prove the strip lossless', async () => {
     const { row } = legacyRow('lost');
     const { store } = setup([row]);

@@ -1,4 +1,4 @@
-// Slide census and same-content recovery (NFR #163).
+// Slide census and same-content recovery (NFR #165).
 //
 // `9d9fff04…/v1` lost every slide's bytes: a pre-#4 revision whose slides were
 // blobs only (`deck-<doc>-v1-<slide>.svg`, no inline `svg`) written to the

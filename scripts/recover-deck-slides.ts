@@ -1,7 +1,7 @@
 // scripts/recover-deck-slides.ts
 //
 // Census + same-content recovery for presentation slides whose bytes are gone
-// (NFR #163). The logic and its proofs live in src/deck/slideRecovery.ts: a
+// (NFR #165). The logic and its proofs live in src/deck/slideRecovery.ts: a
 // missing slide is re-rendered from its revision's stored spec and restored
 // only when its recorded sha256 matches, or (legacy, no hash) its recorded
 // size matches and the renderer reproduces every checkable legacy slide byte
