@@ -912,7 +912,11 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         : runSources;
 
       const newestRevision = revisions[revisions.length - 1];
-      if (!run) {
+      // A presentation is a deck by its own record's type, whoever made it:
+      // one saved by hand or by `deck-preview --save` has revisions and slides
+      // exactly like a run's, and the pane showed it as a plain page (#218).
+      const isDeck = facts?.mediaKind === 'presentation';
+      if (!run && !isDeck) {
         // A document nobody's run produced is an input, not an artifact: it
         // says what it is and which revision was read, and nothing more.
         const label = [trim(facts?.name) ?? node.title, newestRevision?.label, clock(newestRevision?.createdAt, query.timezone)]
@@ -986,7 +990,9 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         ...(newest && pending ? { summary: `${pending.label} ${pending.status} · ${newest.label} available` } : {}),
         // "First draft · 09:27" · "Shared": when it started, and that the
         // viewer is seeing it because it was shared with them.
-        ...(firstDraft ? { footer: { label: `First draft · ${firstDraft}`, note: 'Shared' } } : {}),
+        // A run's deck reached the viewer through the run; a saved one is
+        // simply the owner's or shared with them, which the pane says itself.
+        ...(firstDraft ? { footer: { label: `First draft · ${firstDraft}`, ...(run ? { note: 'Shared' } : {}) } } : {}),
         ...(sources.length ? { sources } : {}),
         artifact: {
           mediaKind: facts?.mediaKind ?? 'document',
@@ -1166,6 +1172,25 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       // agent loop is a STEP. The effort is the whole loop, so it is named
       // after the run that started it — the earliest — not its latest step.
       titleFor: (_anchor, members) => earliestRun(members)?.title,
+    }).slice(0, Math.max(0, WORK_GRAPH_V2_LIMITS.efforts - efforts.length)));
+  }
+
+  // A deck no run or container claimed (saved by hand, #218) frames its own
+  // revisions, so its `change` nodes fold into the deck instead of sitting
+  // loose with nothing to say. Only presentations: a plain page stays ungrouped.
+  const claimedNow = new Set(efforts.flatMap((effort) => effort.nodeIds));
+  const looseDecks = nodes.filter((node) => node.kind === 'document' && !claimedNow.has(node.id)
+    && details.get(node.id)?.artifact?.mediaKind === 'presentation');
+  if (looseDecks.length > 0 && efforts.length < WORK_GRAPH_V2_LIMITS.efforts) {
+    const deckIds = new Set(looseDecks.map((node) => node.id));
+    const deckEdges = edges.filter((edge) => edge.relation === 'edited' && deckIds.has(edge.toId)
+      && !claimedNow.has(edge.fromId) && index.byId.get(edge.fromId)?.kind === 'change');
+    const revisionIds = new Set(deckEdges.map((edge) => edge.fromId));
+    efforts.push(...deriveWorkEfforts({
+      ...effortInput,
+      nodes: nodes.filter((node) => deckIds.has(node.id) || revisionIds.has(node.id)),
+      edges: deckEdges,
+      anchorKinds: ['document'],
     }).slice(0, Math.max(0, WORK_GRAPH_V2_LIMITS.efforts - efforts.length)));
   }
 

@@ -860,6 +860,59 @@ describe('work graph schemaVersion 2 route', () => {
     expect(String(response.body)).toContain('id="v3-slide-1"');
   });
 
+  it('shows a deck saved without a run as a deck, framing its own revisions (#218)', async () => {
+    // A presentation saved by hand: a document and its two save records, in no
+    // effort and produced by no run.
+    const extraNodes = [
+      node('saved', 'document', 'Offline brief', 'doc-saved', 'document', at('13:34')),
+      node('saved-v1', 'change', 'Offline brief · revision', 'doc-saved:v1', 'document', at('13:32')),
+      node('saved-v2', 'change', 'Offline brief · revision', 'doc-saved:v2', 'document', at('13:34')),
+    ];
+    const extraEdges = [edge('e-saved-v1', 'saved-v1', 'saved', 'edited'), edge('e-saved-v2', 'saved-v2', 'saved', 'edited')];
+    for (const item of extraNodes) projection.nodes[item.id] = item;
+    for (const item of extraEdges) projection.edges[item.id] = item;
+    const selection = grant.selection;
+    grant.selection = {
+      ...selection,
+      nodeIds: [...selection.nodeIds, ...extraNodes.map((item) => item.id)],
+      edgeIds: [...selection.edgeIds, ...extraEdges.map((item) => item.id)],
+    };
+    try {
+      const fallback = reader();
+      const saved = reader({
+        artifact: async (documentId) => (documentId === 'doc-saved'
+          ? {
+            name: 'Offline brief',
+            mediaKind: 'presentation' as const,
+            revisions: [
+              { id: 'v1', label: 'v1', createdAt: at('13:32'), slideCount: 2, slides: deckSlides('Scope').slice(0, 2) },
+              { id: 'v2', label: 'v2', createdAt: at('13:34'), slideCount: 3, slides: deckSlides('Scope and owners') },
+            ],
+          }
+          : fallback.artifact(documentId)),
+      });
+      const body = (await get(setup({ activityReader: saved }), v2)).body as WorkGraphSnapshotV2;
+      expect(validateWorkGraphSnapshotV2(body).ok).toBe(true);
+      const deck = body.details.find((detail) => detail.nodeId === 'saved');
+      expect(deck?.artifact?.mediaKind).toBe('presentation');
+      expect(deck?.artifact?.revisions.map((revision) => revision.label)).toEqual(['v1', 'v2']);
+      expect(deck?.artifact?.revisions[1].anchors?.map((anchor) => anchor.label)).toEqual(['Sprint review', 'Scope and owners', 'Next steps']);
+      expect(deck?.artifact?.pending).toBeUndefined();
+      // Not "Shared": no run carried it to the viewer.
+      expect(deck?.footer).toEqual({ label: 'First draft · 09:32' });
+      expect(deck?.lines).toBeUndefined();
+      const own = body.efforts.find((effort) => effort.anchorNodeId === 'saved');
+      expect(own?.nodeIds.sort()).toEqual(['saved', 'saved-v1', 'saved-v2']);
+      expect(own?.subtitle).toBe('v2 available');
+      // A plain input document is still an input, not a deck.
+      expect(body.details.find((detail) => detail.nodeId === 'release-plan')?.artifact).toBeUndefined();
+    } finally {
+      for (const item of extraNodes) delete projection.nodes[item.id];
+      for (const item of extraEdges) delete projection.edges[item.id];
+      grant.selection = selection;
+    }
+  });
+
   it('refuses schemaVersion 2 on a deployment without an activity reader', async () => {
     const response = await get(setup({ activityReader: undefined }), v2);
     expect(response.statusCode).toBe(400);
