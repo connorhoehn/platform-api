@@ -30,7 +30,8 @@ jest.mock('../../documents/commentAgentRequests', () => ({
   settleCommentSuggestionReview: (...a: unknown[]) => mockSettleReview(...a),
 }));
 
-import { pipelineRunReviewRouter, RUN_REVIEWED_EVENT } from '../pipelineRunReview';
+import { pipelineRunReviewRouter, RUN_REVIEWED_EVENT, setReviewApplyClaimStore } from '../pipelineRunReview';
+import { MemoryClaimStore } from '../../deck/deckReviseRequests';
 import { errorHandler } from '../../middleware/error-handler';
 import { getPipelineBridge } from '../../pipeline/bridge-types';
 import { getRunPersistenceService } from '../../pipeline/runPersistence';
@@ -79,6 +80,7 @@ const good = { decision: 'reject', suggestionKey: 'agent:haiku~run-1@17880000001
 
 beforeEach(() => {
   jest.clearAllMocks();
+  setReviewApplyClaimStore(new MemoryClaimStore());
   mockDocRow.mockResolvedValue({ documentId: 'doc-1', createdBy: 'dev-owner', editors: ['dev-grace'], viewers: ['dev-reader'] });
   mockGate = makeDocumentReadGate({ getDocumentRow: mockDocRow, getLifecycleOwner: async () => undefined });
   mockCommentForRun.mockResolvedValue(null);
@@ -181,6 +183,23 @@ describe('POST /pipelines/:pipelineId/runs/:runId/review', () => {
     expect((await post(app, URL, { ...good, suggestionKey: 'no-at-sign' })).statusCode).toBe(400);
     expect((await post(app, URL, { ...good, documentId: '' })).statusCode).toBe(400);
     expect(mockSetReview).not.toHaveBeenCalled();
+  });
+
+  // NFR #214: a keepalive margin verdict, a reload replay and the run card can
+  // all ask for the server-side resolve; exactly one resolve run starts.
+  it('concurrent applyServerSide verdicts for one run start one resolve run', async () => {
+    const accept = { ...good, decision: 'accept', applyServerSide: true };
+    const [r1, r2, r3] = await Promise.all([post(app, URL, accept), post(app, URL, accept), post(app, URL, accept)]);
+    expect([r1.statusCode, r2.statusCode, r3.statusCode]).toEqual([200, 200, 200]);
+    expect(mockTrigger).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed trigger releases the claim so a retry can resolve', async () => {
+    mockTrigger.mockRejectedValueOnce(new Error('engine hiccup'));
+    const accept = { ...good, decision: 'accept', applyServerSide: true };
+    expect((await post(app, URL, accept)).statusCode).toBe(500);
+    expect((await post(app, URL, accept)).statusCode).toBe(200);
+    expect(mockTrigger).toHaveBeenCalledTimes(2);
   });
 
   // NFR #213: suggestion identity is per run.

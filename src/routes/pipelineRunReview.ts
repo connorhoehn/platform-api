@@ -49,6 +49,8 @@ import { documentReadGate } from '../documents/documentReadGate';
 import { DocumentEditForbiddenError } from '../deck/documentEditAccess';
 import { commentForRun, settleCommentSuggestionReview, type CommentRunLink } from '../documents/commentAgentRequests';
 import { suggestionKeyRunId } from '../documents/documentAgentOps';
+import { DynamoClaimStore, type ClaimStore } from '../deck/deckReviseRequests';
+import { IDEMPOTENCY_CLAIMS_TABLE } from '../middleware/idempotency';
 
 const log = withContext({ route: 'pipelineRunReview' });
 
@@ -168,10 +170,24 @@ pipelineRunReviewRouter.post(
     if (body.applyServerSide && !keyRun) {
       throw new ConflictError('This suggestion predates per-run suggestions and may be shared with other runs; accept or reject it in the document.');
     }
+    // NFR #214: a margin verdict is sent with keepalive AND applyServerSide
+    // (the tab may close before its Yjs resolve reaches the server), and may be
+    // replayed on reload or raced by the run card. Only the first caller per
+    // run starts the resolve run — a claim, not the `run.review` read above,
+    // which two concurrent callers both pass.
+    let claimed = false;
     if (body.applyServerSide) {
       const bridge = getPipelineBridge();
       if (!bridge?.trigger) { res.status(503).json({ error: 'pipeline engine is not available' } as never); return; }
-      const out = await Promise.resolve(bridge.trigger({
+      claimed = await reviewApplyClaims().create(reviewApplyKey(runId), 'pending', REVIEW_APPLY_TTL_SECONDS).catch(() => true);
+    }
+    if (body.applyServerSide && !claimed) {
+      const held = await reviewApplyClaims().get(reviewApplyKey(runId)).catch(() => null);
+      if (held && held !== 'pending') applied = { runId: held, pipelineId: DOCUMENT_AGENT_REVIEW_PIPELINE_ID };
+      log.info({ pipelineId, runId, held }, 'review apply already started by another request');
+    } else if (body.applyServerSide) {
+      const bridge = getPipelineBridge()!;
+      const out = await Promise.resolve(bridge.trigger!({
         pipelineId: DOCUMENT_AGENT_REVIEW_PIPELINE_ID,
         definition: buildDocumentReviewApplyDefinition() as never,
         triggerPayload: {
@@ -183,8 +199,12 @@ pipelineRunReviewRouter.post(
           requestId: randomUUID(),
         },
         triggeredBy: { userId },
-      } as never));
+      } as never)).catch(async (err: unknown) => {
+        await reviewApplyClaims().release(reviewApplyKey(runId)).catch(() => undefined);
+        throw err;
+      });
       const applyRunId = (out as { runId: string }).runId;
+      void reviewApplyClaims().commit(reviewApplyKey(runId), applyRunId, REVIEW_APPLY_TTL_SECONDS).catch(() => undefined);
       getRunPersistenceService()?.registerTrigger({ runId: applyRunId, pipelineId: DOCUMENT_AGENT_REVIEW_PIPELINE_ID, userId, triggerType: 'manual', at: new Date().toISOString() });
       applied = { runId: applyRunId, pipelineId: DOCUMENT_AGENT_REVIEW_PIPELINE_ID };
     }
@@ -233,6 +253,16 @@ pipelineRunReviewRouter.post(
     res.status(200).json({ runId, pipelineId, review, ...(applied ? { applied } : {}) });
   }),
 );
+
+const REVIEW_APPLY_TTL_SECONDS = 7 * 24 * 60 * 60;
+const reviewApplyKey = (runId: string) => `run-review-apply:${runId}`;
+let applyClaims: ClaimStore | null = null;
+function reviewApplyClaims(): ClaimStore {
+  applyClaims ??= new DynamoClaimStore(undefined, undefined, IDEMPOTENCY_CLAIMS_TABLE);
+  return applyClaims;
+}
+/** Test seam. */
+export function setReviewApplyClaimStore(next: ClaimStore | null): void { applyClaims = next; }
 
 /** Settles the comment a run answers from the recorded verdict; idempotent (the comment row's CAS). */
 async function settleLinkedComment(link: CommentRunLink, runId: string, review: Pick<RunReview, 'decision' | 'by' | 'byName'>): Promise<void> {
