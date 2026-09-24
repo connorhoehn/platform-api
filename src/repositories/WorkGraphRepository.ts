@@ -520,7 +520,7 @@ export class WorkGraphRepository {
     for (let attempt = 0; attempt < MAX_FENCED_READ_ATTEMPTS; attempt += 1) {
       const before = await this.readMeta(pk);
       if (!before || before.erasing === true) return null;
-      const items = await this.queryPartition(pk);
+      const items = await this.queryProjectionItems(pk);
       const after = await this.readMeta(pk);
       if (!after || after.erasing === true) return null;
       if (before.revision !== after.revision
@@ -544,6 +544,28 @@ export class WorkGraphRepository {
    * Per process on purpose: correctness comes from the DynamoDB META check,
    * so replicas never need to agree about what they hold.
    */
+  /**
+   * NFR #202: the writer's load — the held copy when META still names its
+   * revision (one Get), else a fenced full read. Every event used to read the
+   * whole partition twice (1.8 MB, 2 pages for a busy day) to change a node.
+   */
+  async loadCurrentProjection(
+    organizationId: string,
+    actorId: string,
+    day: string,
+  ): Promise<WorkProjectionState | null> {
+    return this.loadProjectionAtRevision(organizationId, actorId, day);
+  }
+
+  private holdProjection(pk: string, projection: WorkProjectionState): void {
+    if (process.env.JEST_WORKER_ID) deepFreeze(projection); // a reader that mutates a shared copy fails its tests
+    this.heldProjections.delete(pk);
+    this.heldProjections.set(pk, projection);
+    while (this.heldProjections.size > HELD_PROJECTIONS_MAX) {
+      this.heldProjections.delete(this.heldProjections.keys().next().value as string);
+    }
+  }
+
   private async loadProjectionAtRevision(
     organizationId: string,
     actorId: string,
@@ -563,13 +585,7 @@ export class WorkGraphRepository {
       if (!meta || meta.erasing === true) return null;
     }
     const fresh = await this.loadProjection(organizationId, actorId, day);
-    if (fresh) {
-      if (process.env.JEST_WORKER_ID) deepFreeze(fresh); // a reader that mutates a shared copy fails its tests
-      this.heldProjections.set(pk, fresh);
-      while (this.heldProjections.size > HELD_PROJECTIONS_MAX) {
-        this.heldProjections.delete(this.heldProjections.keys().next().value as string);
-      }
-    }
+    if (fresh) this.holdProjection(pk, fresh);
     return fresh;
   }
 
@@ -648,6 +664,12 @@ export class WorkGraphRepository {
   async commitEvent(
     event: AuthenticatedWorkEvent,
     expectedRevision: number,
+    /**
+     * NFR #202: the projection the caller just loaded at `expectedRevision`.
+     * Reused instead of reading the partition a second time; the META
+     * condition in the transaction still rejects it if it went stale.
+     */
+    loaded?: WorkProjectionState | null,
   ): Promise<WorkProjectionState> {
     if (event.actor.organizationId !== event.producer.organizationId) {
       throw new RangeError('producer and actor organizations must match');
@@ -662,7 +684,10 @@ export class WorkGraphRepository {
       return existing;
     }
 
-    const current = await this.loadProjection(event.actor.organizationId, event.actor.actorId, day)
+    const current = (loaded && loaded.revision === expectedRevision
+      && loaded.organizationId === event.actor.organizationId && loaded.actorId === event.actor.actorId
+      ? loaded
+      : await this.loadProjection(event.actor.organizationId, event.actor.actorId, day))
       ?? initialProjection(event);
     if (current.revision !== expectedRevision) {
       throw new WorkGraphConcurrencyError(expectedRevision);
@@ -768,6 +793,9 @@ export class WorkGraphRepository {
 
     try {
       await this.docClient.send(new TransactWriteCommand({ TransactItems: writes }));
+      // NFR #202: the committed state is exactly META's new revision, so the
+      // next commit (or read) on this partition proves it with one META Get.
+      this.holdProjection(pk, next);
       try {
         this.onCommitted?.({ organizationId: next.organizationId, actorId: next.actorId, day, revision: next.revision });
       } catch {
@@ -1048,14 +1076,34 @@ export class WorkGraphRepository {
     return item?.itemKind === 'meta' && item.SK === 'META' ? item : null;
   }
 
-  private async queryPartition(pk: string): Promise<StoredItem[]> {
+  /**
+   * NFR #202: only what a projection is made of. The partition also holds an
+   * EVENT# marker per event (30 days) and a DELTA# row per revision (30 min) —
+   * on a busy day ~1,650 of ~2,300 items and most of the 1.8 MB — which
+   * `hydrateProjection` drops. Filtered server-side so they are never sent,
+   * parsed and unmarshalled here (the SDK's response parsing was the largest
+   * CPU cost under run load). Pagination is unchanged: DynamoDB still pages
+   * by bytes read, and the META fence around the read is what makes it safe.
+   */
+  private queryProjectionItems(pk: string): Promise<StoredItem[]> {
+    return this.queryPartition(pk, {
+      FilterExpression: 'itemKind IN (:meta, :session, :node, :edge)',
+      ExpressionAttributeValues: { ':meta': 'meta', ':session': 'session', ':node': 'node', ':edge': 'edge' },
+    });
+  }
+
+  private async queryPartition(
+    pk: string,
+    filter?: { FilterExpression: string; ExpressionAttributeValues: Record<string, string> },
+  ): Promise<StoredItem[]> {
     const items: StoredItem[] = [];
     let exclusiveStartKey: Record<string, unknown> | undefined;
     do {
       const result = await this.docClient.send(new QueryCommand({
         TableName: WORK_GRAPH_TABLE,
         KeyConditionExpression: 'PK = :pk',
-        ExpressionAttributeValues: { ':pk': pk },
+        ExpressionAttributeValues: { ':pk': pk, ...filter?.ExpressionAttributeValues },
+        ...(filter ? { FilterExpression: filter.FilterExpression } : {}),
         ConsistentRead: true,
         ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
       }));

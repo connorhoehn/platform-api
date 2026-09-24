@@ -63,7 +63,9 @@ interface DurableTransport {
 
 interface ProjectionRepository {
   loadProjection(organizationId: string, actorId: string, day: string): Promise<WorkProjectionState | null>;
-  commitEvent(event: AuthenticatedWorkEvent, expectedRevision: number): Promise<WorkProjectionState>;
+  commitEvent(event: AuthenticatedWorkEvent, expectedRevision: number, loaded?: WorkProjectionState | null): Promise<WorkProjectionState>;
+  /** NFR #202: the held copy when META still names its revision (optional). */
+  loadCurrentProjection?(organizationId: string, actorId: string, day: string): Promise<WorkProjectionState | null>;
 }
 
 interface SourceAccountResolver {
@@ -148,21 +150,42 @@ function verifyDirectEvent(payload: unknown, authenticatedServiceId: string): Au
   return event;
 }
 
+// NFR #202: commits to one partition from this process go one at a time.
+// Every run event of a person's day lands in the same partition, and the
+// commit is conditional on META's revision, so concurrent deliveries used to
+// race, lose, reload the whole partition and retry. Other replicas still race
+// (and retry) — this only stops a process from racing itself.
+const partitionTails = new Map<string, Promise<void>>();
+
+function serializedByPartition<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const previous = partitionTails.get(key) ?? Promise.resolve();
+  const run = previous.then(work, work);
+  const tail = run.then(() => undefined, () => undefined);
+  partitionTails.set(key, tail);
+  void tail.then(() => { if (partitionTails.get(key) === tail) partitionTails.delete(key); });
+  return run;
+}
+
 async function commitWithRetry(
   repository: ProjectionRepository,
   event: AuthenticatedWorkEvent,
   maximumAttempts = 4,
 ): Promise<void> {
   const day = eventDay(event.occurredAt);
-  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
-    const current = await repository.loadProjection(event.actor.organizationId, event.actor.actorId, day);
-    try {
-      await repository.commitEvent(event, current?.revision ?? 0);
-      return;
-    } catch (error) {
-      if ((error as { name?: string })?.name !== 'WorkGraphConcurrencyError' || attempt === maximumAttempts) throw error;
+  const { organizationId, actorId } = event.actor;
+  await serializedByPartition(`${organizationId}|${actorId}|${day}`, async () => {
+    for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+      const current = repository.loadCurrentProjection
+        ? await repository.loadCurrentProjection(organizationId, actorId, day)
+        : await repository.loadProjection(organizationId, actorId, day);
+      try {
+        await repository.commitEvent(event, current?.revision ?? 0, current);
+        return;
+      } catch (error) {
+        if ((error as { name?: string })?.name !== 'WorkGraphConcurrencyError' || attempt === maximumAttempts) throw error;
+      }
     }
-  }
+  });
 }
 
 async function authorizeAndCommit(
@@ -206,7 +229,7 @@ async function authorizeAndCommit(
 export async function ingestAuthenticatedWorkEvent(options: {
   payload: unknown;
   authenticatedServiceId: string;
-  repository: Pick<WorkGraphRepository, 'loadProjection' | 'commitEvent'>;
+  repository: Pick<WorkGraphRepository, 'loadProjection' | 'commitEvent'> & Partial<Pick<WorkGraphRepository, 'loadCurrentProjection'>>;
   accountResolver: Pick<WorkSourceAccountRepository, 'resolve'>;
   ownership?: WorkGraphOwnershipCheck;
 }): Promise<AuthenticatedWorkEvent> {
@@ -228,7 +251,7 @@ export async function ingestAuthenticatedWorkEvent(options: {
  */
 export function startWorkGraphConsumer(options: {
   transport: DurableTransport;
-  repository: Pick<WorkGraphRepository, 'loadProjection' | 'commitEvent'>;
+  repository: Pick<WorkGraphRepository, 'loadProjection' | 'commitEvent'> & Partial<Pick<WorkGraphRepository, 'loadCurrentProjection'>>;
   accountResolver: Pick<WorkSourceAccountRepository, 'resolve'>;
   /** Required for any source with more than one declared writer. */
   ownership?: WorkGraphOwnershipCheck;

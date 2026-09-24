@@ -577,4 +577,54 @@ describe('WorkGraphRepository', () => {
       await expect(locate([lookup('yesterday')])).resolves.toBeNull();
     });
   });
+
+  describe('writer path (NFR #202)', () => {
+    it('reads only projection items, reuses the caller\'s load, and holds the committed state', async () => {
+      let revision = 0;
+      const send: Send = jest.fn(async (command: unknown) => {
+        if (command instanceof GetCommand) {
+          if (String(command.input.Key?.['SK']).startsWith('EVENT#')) return {};
+          return revision ? { Item: meta(revision) } : {};
+        }
+        if (command instanceof QueryCommand) return { Items: revision ? [meta(revision)] : [] };
+        if (command instanceof TransactWriteCommand) { revision += 1; return {}; }
+        return {};
+      });
+      const repository = new WorkGraphRepository(client(send), reducer);
+      const count = (type: unknown) => send.mock.calls.filter(([c]) => c instanceof (type as never)).length;
+
+      const first = await repository.commitEvent(event, 0, null);
+      expect(first.revision).toBe(1);
+      send.mockClear();
+
+      // The next writer load is one META Get: the committed state is held.
+      const current = await repository.loadCurrentProjection('org-1', 'actor-1', '2026-09-20');
+      expect(current?.revision).toBe(1);
+      expect(count(QueryCommand)).toBe(0);
+      expect(count(GetCommand)).toBe(1);
+
+      // Passing it to commitEvent skips a second partition read.
+      send.mockClear();
+      await repository.commitEvent({ ...event, eventId: 'evt-2', idempotencyKey: 'idem-2' }, 1, current);
+      expect(count(QueryCommand)).toBe(0);
+      expect(count(TransactWriteCommand)).toBe(1);
+
+      // A full read filters events and deltas out server-side.
+      send.mockClear();
+      await repository.loadProjection('org-1', 'actor-1', '2026-09-20');
+      const query = send.mock.calls.map(([c]) => c).find((c): c is QueryCommand => c instanceof QueryCommand)!;
+      expect(query.input.FilterExpression).toBe('itemKind IN (:meta, :session, :node, :edge)');
+    });
+
+    it('ignores a caller\'s load at another revision and reads afresh', async () => {
+      const send: Send = jest.fn(async (command: unknown) => {
+        if (command instanceof GetCommand) return String(command.input.Key?.['SK']).startsWith('EVENT#') ? {} : { Item: meta(1) };
+        if (command instanceof QueryCommand) return { Items: [meta(1)] };
+        return {};
+      });
+      const repository = new WorkGraphRepository(client(send), reducer);
+      await repository.commitEvent(event, 1, emptyState(0));
+      expect(send.mock.calls.filter(([c]) => c instanceof QueryCommand)).toHaveLength(1);
+    });
+  });
 });

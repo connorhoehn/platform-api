@@ -70,7 +70,7 @@ describe('work-graph durable consumer', () => {
     expect(h.accountResolver.resolve).toHaveBeenCalledWith(
       'cloud-compute', 'aws-agentcore', 'org-1', 'subject-1',
     );
-    expect(h.repository.commitEvent).toHaveBeenCalledWith(expect.objectContaining({ eventId: 'event-1' }), 0);
+    expect(h.repository.commitEvent).toHaveBeenCalledWith(expect.objectContaining({ eventId: 'event-1' }), 0, null);
     await h.consumer.stop();
     expect(h.cancel).toHaveBeenCalledTimes(1);
   });
@@ -90,6 +90,20 @@ describe('work-graph durable consumer', () => {
     expect(h.accountResolver.resolve).not.toHaveBeenCalled();
   });
 
+  it('commits one event at a time per partition from this process (NFR #202)', async () => {
+    const h = harness();
+    let inFlight = 0; let peak = 0;
+    h.repository.commitEvent.mockImplementation(async () => {
+      inFlight += 1; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight -= 1;
+      return {};
+    });
+    await Promise.all([1, 2, 3, 4].map((n) => h.run(envelope(event({ eventId: `event-${n}`, idempotencyKey: `event-${n}` })))));
+    expect(h.repository.commitEvent).toHaveBeenCalledTimes(4);
+    expect(peak).toBe(1);
+  });
+
   it('reloads the projection and retries conditional races without weakening identity checks', async () => {
     const h = harness();
     h.repository.loadProjection
@@ -99,8 +113,8 @@ describe('work-graph durable consumer', () => {
       .mockRejectedValueOnce(Object.assign(new Error('race'), { name: 'WorkGraphConcurrencyError' }))
       .mockResolvedValueOnce({});
     await h.run(envelope());
-    expect(h.repository.commitEvent).toHaveBeenNthCalledWith(1, expect.anything(), 0);
-    expect(h.repository.commitEvent).toHaveBeenNthCalledWith(2, expect.anything(), 1);
+    expect(h.repository.commitEvent).toHaveBeenNthCalledWith(1, expect.anything(), 0, null);
+    expect(h.repository.commitEvent).toHaveBeenNthCalledWith(2, expect.anything(), 1, { revision: 1 });
   });
 });
 
@@ -125,7 +139,7 @@ describe('work-graph authenticated HTTP ingestion', () => {
     expect(h.accountResolver.resolve).toHaveBeenCalledWith(
       'cloud-compute', 'aws-agentcore', 'org-1', 'subject-1',
     );
-    expect(h.repository.commitEvent).toHaveBeenCalledWith(expect.anything(), 0);
+    expect(h.repository.commitEvent).toHaveBeenCalledWith(expect.anything(), 0, null);
   });
 
   it('rejects a correctly signed service presenting a source owned by another producer', async () => {
