@@ -1017,7 +1017,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       setDetail(node.id, { lines: [trim(node.description) as string] });
     }
   };
-  phaseStarted = Date.now();
+  phase('prepare');
   // Every document's own row and attention state, in one parallel wave before
   // anything is described (NFR #157: they were two reads in a row per
   // document, inside the describe wave). Their stored names are applied here
@@ -1025,6 +1025,12 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
   // while that document's own branch was renaming it answered "Project
   // documents" on one build and "Release plan" on the next.
   const documentReads = new Map<string, Promise<DocumentFacts>>();
+  // The slowest read of each kind, so `server-timing` says which one a slow
+  // documents phase waited on (Loop 33 (activity), NFR #208).
+  const wave = Date.now();
+  const timed = <T>(name: string, read: Promise<T>): Promise<T> => (timing
+    ? read.finally(() => { timing[name] = Math.max(timing[name] ?? 0, Date.now() - wave); })
+    : read);
   for (const node of ordered) {
     const documentId = node.kind === 'document' ? storedNode(authorization, node.id)?.sourceRef.resourceId : undefined;
     if (documentId && !documentReads.has(documentId)) {
@@ -1033,7 +1039,11 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       const opening = reader.excerpt && node.disclosure === 'details' && !node.locked && node.capabilities.includes('view-document')
         ? reader.excerpt(documentId, node.title).catch(() => null)
         : Promise.resolve(null);
-      documentReads.set(documentId, Promise.all([reader.artifact(documentId), reader.attention(documentId), opening]));
+      documentReads.set(documentId, Promise.all([
+        timed('documents.artifact', reader.artifact(documentId)),
+        timed('documents.attention', reader.attention(documentId)),
+        timed('documents.excerpt', opening),
+      ]));
     }
   }
   const documentFacts = new Map(await Promise.all(
@@ -1290,6 +1300,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     .filter((value) => Number.isFinite(value))
     .sort((left, right) => left - right)[0];
 
+  phase('assemble');
   return {
     temporal: {
       mode: query.mode === 'live' ? 'live' : 'recent',

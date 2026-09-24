@@ -108,6 +108,7 @@ export class PipelineDefinitionsCache {
   private dirty = false;
   /** Set true once the first refresh has completed (success or failure). */
   private primed = false;
+  private generationCount = 0;
 
   constructor(opts: PipelineDefinitionsCacheOptions = {}) {
     this.intervalMs = opts.intervalMs ?? 60_000;
@@ -151,6 +152,9 @@ export class PipelineDefinitionsCache {
    * doesn't trigger a Scan storm under burst-write workloads.
    */
   refresh(): Promise<void> {
+    // Anything keyed on a definition read before this call is suspect from
+    // here on: a write published its invalidation before the refresh ran.
+    this.generationCount += 1;
     if (this.inFlight) {
       // Coalesce onto the in-flight Scan, but remember that state may have
       // changed after it started — one follow-up refresh runs when it
@@ -251,6 +255,16 @@ export class PipelineDefinitionsCache {
     const entry = this.webhookIndex.get(path);
     recordCacheAccess('definitions', entry !== undefined);
     return entry;
+  }
+
+  /**
+   * Bumped by every refresh — the 60 s tick and each invalidation any
+   * replica publishes after a definition write. A cache keyed on it (the
+   * work graph's definition reads, realtime-examples NFR #208) drops what it
+   * held the moment a write is announced.
+   */
+  generation(): number {
+    return this.generationCount;
   }
 
   /** True after the first refresh has completed (success or failure). */

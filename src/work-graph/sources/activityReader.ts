@@ -39,6 +39,7 @@ import { parsePipelineStepResourceId } from './mapPipeline';
 import { runRowLocator } from './runRowLocator';
 import { readDocumentExcerpt } from './documentExcerpt';
 import { recordingLocator } from './recordingLocator';
+import { cachedDefinitionRow, cachedRevisionFacts } from './sourceFactsCache';
 
 const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
 const RECORDINGS_TABLE = tableName('video-call-recordings');
@@ -334,7 +335,10 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     const definitionKey = { userId: String(row.triggeredBy ?? ''), pipelineId: String(row.pipelineId ?? '') };
     const definition = await memoOnce(
       `pipeline-definition\u0000${definitionKey.userId}\u0000${definitionKey.pipelineId}`,
-      () => this.client.send(new GetCommand({ TableName: PIPELINE_DEFINITIONS_TABLE, Key: definitionKey })).catch(() => undefined),
+      // Across builds too, until a definition write is announced (NFR #208).
+      () => cachedDefinitionRow(definitionKey.userId, definitionKey.pipelineId,
+        () => this.client.send(new GetCommand({ TableName: PIPELINE_DEFINITIONS_TABLE, Key: definitionKey }))
+          .then((result) => ({ Item: result.Item }))).catch(() => undefined),
     );
     // A step's name is the label its plan gave it — the definition's node
     // label, or for an /agent loop's own row the plan step's title — never the
@@ -552,7 +556,9 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     // items and that many manifests, not every revision the deck ever had on
     // every graph build. A reader who can open the deck pages older ones in
     // the pane through the document's own revision routes.
-    const [comments, hydrated] = await Promise.all([counted, Promise.resolve()
+    // NFR #208: a saved state's revision facts never change — keyed by the
+    // row's `revisionCount`/`headRevision` (read fresh above), a save misses.
+    const [comments, revisions] = await Promise.all([counted, cachedRevisionFacts(documentId, row.revisionCount, row.headRevision, () => Promise.resolve()
       .then(async () => {
         const base = row as unknown as PresentationDocumentRow;
         if (typeof base.revisionCount !== 'number') {
@@ -566,8 +572,9 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
         return { ...base, revisions: mergeRevisions(base.revisions, items).slice(-ACTIVITY_DECK_REVISIONS) };
       })
       .then((full) => withRevisionSlides((this.deps.presentations ?? getPresentationDocumentStore)(), full))
-      .catch(() => row as unknown as PresentationDocumentRow)]);
-    const revisions = storedRevisionFacts(hydrated as unknown as Row);
+      .then((hydrated) => storedRevisionFacts(hydrated as unknown as Row)))
+      // A failed read is not cached; the row's own list stands in, as before.
+      .catch(() => storedRevisionFacts(row))]);
     return {
       ...(text(row.title, 120) ? { name: text(row.title, 120) as string } : {}),
       mediaKind,
