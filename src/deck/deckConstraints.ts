@@ -157,6 +157,12 @@ function slideRefs(text: string): { refs: SlideRef[]; nounText: string } {
     refs.push({ slide, at: m.index ?? 0 });
     if (m[1] || m[3]) blank(m.index ?? 0, m[0].length);
   }
+  // "the title slide subtitle" / "the cover slide's notes": "title slide" only
+  // names WHICH slide, so the noun after it is the subject (Loop 31 ppt: the
+  // subtitle edit was measured as a deck-title edit and refused).
+  for (const m of nounText.matchAll(new RegExp(`\\b(?:title|cover|opening) slide(?:'s)?(?=\\s+(?:${NOUN.slice(1, -1)})\\b)`, 'gi'))) {
+    blank(m.index ?? 0, m[0].length);
+  }
   return { refs: refs.sort((a, b) => a.at - b.at), nounText };
 }
 

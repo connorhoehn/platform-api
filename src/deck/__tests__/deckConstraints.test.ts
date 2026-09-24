@@ -38,6 +38,8 @@ describe('parseConstraints', () => {
     ['shorter by one word', [{ kind: 'delta', subject: 'slide', metric: 'words', n: -1 }]],
     ['at least 3 bullets', [{ kind: 'min', subject: 'bullets', metric: 'bullets', n: 3 }]],
     ['rename the slide to match the transcript', []],
+    ['Shorten the title slide subtitle', [{ kind: 'shorter', subject: 'subtitle', metric: 'words' }]],
+    ['shorten the cover slide\'s notes', [{ kind: 'shorter', subject: 'notes', metric: 'words' }]],
   ])('%s', (instruction, expected) => {
     expect(pick(parseConstraints(instruction, slide))).toEqual(expected);
   });
