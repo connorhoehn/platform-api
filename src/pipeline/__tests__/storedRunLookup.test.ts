@@ -48,3 +48,27 @@ describe('resolveStoredRun (NFR #136)', () => {
     expect(await resolveStoredRun('chat-agent-loop', 'loop-2', r)).toMatchObject({ runId: 'loop-2', status: 'pending' });
   });
 });
+
+describe('stored run detail carries the definition it ran (NFR #184)', () => {
+  const definitionSnapshot = { nodes: [{ id: 'trigger' }, { id: 'draft' }, { id: 'render' }], edges: [] };
+
+  it('answers pipelineDefinitionSnapshot from the row, so a reader never needs the owner\'s definition', async () => {
+    const r = repo([{ pipelineId: 'deck-generate', runId: 'r1', status: 'failed', definitionSnapshot } as unknown as PipelineRunItem]);
+    const snap = await resolveStoredRun('deck-generate', 'r1', r);
+    expect(snap).toMatchObject({ runId: 'r1', pipelineDefinitionSnapshot: definitionSnapshot });
+  });
+
+  it("follows an /agent loop to the executor row's definition", async () => {
+    const r = repo([
+      { pipelineId: 'chat-agent-loop', runId: 'loop-1', status: 'pending', agentLoopRunId: 'exec-1' },
+      { pipelineId: 'chat-agent-loop', runId: 'exec-1', status: 'completed', definitionSnapshot },
+    ] as unknown as PipelineRunItem[]);
+    const snap = await resolveStoredRun('chat-agent-loop', 'loop-1', r);
+    expect(snap).toMatchObject({ runId: 'loop-1', executorRunId: 'exec-1', pipelineDefinitionSnapshot: definitionSnapshot });
+  });
+
+  it('omits the field when the row has none', async () => {
+    const snap = await resolveStoredRun('p', 'r1', repo([{ pipelineId: 'p', runId: 'r1', status: 'completed' } as PipelineRunItem]));
+    expect(snap).not.toHaveProperty('pipelineDefinitionSnapshot');
+  });
+});

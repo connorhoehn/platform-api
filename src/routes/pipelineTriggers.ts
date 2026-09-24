@@ -30,7 +30,7 @@ import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { getLiveCaptionsProgress } from '../recordings/liveCaptions';
 import { stubRunStore } from '../pipeline/stub-run-store';
 import { runItemToSnapshot } from '../pipeline/createBridge';
-import { resolveStoredRun } from '../pipeline/storedRunLookup';
+import { resolveStoredRun, storedRunDetail } from '../pipeline/storedRunLookup';
 import { PipelineRunRepository, type PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { getDynamoClient } from '../lib/ddb-client';
 import { pipelineRunReviewRouter } from './pipelineRunReview';
@@ -561,7 +561,7 @@ pipelineTriggersRouter.get(
           }
         }
         // The verdict on the run's suggestions lives on the row only (written after the run was terminal).
-        res.json({ ...runItemToSnapshot(persisted), ...(persisted.review ? { review: persisted.review } : {}) });
+        res.json({ ...storedRunDetail(persisted), ...(persisted.review ? { review: persisted.review } : {}) });
         return;
       }
       throw new NotFoundError('run not found');

@@ -40,7 +40,22 @@ export async function resolveStoredRun(
     const live = deps.live ? await deps.live(executorRunId).catch(() => null) : null;
     if (live) return { ...live, runId, executorRunId };
     const executor = await deps.get(pipelineId, executorRunId);
-    if (executor) return { ...runItemToSnapshot(executor), runId, executorRunId };
+    if (executor) return { ...storedRunDetail(executor), runId, executorRunId };
   }
-  return runItemToSnapshot(item) as unknown as Record<string, unknown>;
+  return storedRunDetail(item);
+}
+
+/**
+ * One stored run for the DETAIL endpoint: the list row plus the definition the
+ * run executed (`pipelineDefinitionSnapshot`, as a live or remote snapshot
+ * already carries it). A card orders its steps by it; without it the client
+ * read `GET /api/pipelines/:pipelineId`, which is the CALLER's definition —
+ * a 404 for anyone but the owner, and for a command pipeline (`deck-generate`)
+ * until its first run since the pod started (realtime-examples NFR #184).
+ */
+export function storedRunDetail(item: PipelineRunItem): Record<string, unknown> {
+  return {
+    ...(runItemToSnapshot(item) as unknown as Record<string, unknown>),
+    ...(item.definitionSnapshot !== undefined ? { pipelineDefinitionSnapshot: item.definitionSnapshot } : {}),
+  };
 }
