@@ -47,3 +47,60 @@ describe('document edit access', () => {
     }
   });
 });
+
+// NFR #151: a deck shared in a DM is readable by the other DM member — from
+// the chat-conversations rows the gateway keeps per peer, not the name alone.
+describe('channel membership for document:read', () => {
+  const dm = 'chat:dm:dev-connor:dev-frank';
+  const tables: Record<string, Record<string, Record<string, unknown>>> = {
+    'chat-conversations': {
+      [`dev-frank|${dm}`]: { userId: 'dev-frank', channel: dm, peers: JSON.stringify(['dev-connor', 'dev-frank']) },
+      [`dev-connor|${dm}`]: { userId: 'dev-connor', channel: dm, peers: JSON.stringify(['dev-connor', 'dev-frank']) },
+      // a row a stranger somehow holds, but the thread does not list them
+      [`dev-mallory|chat:dmg:g1`]: { userId: 'dev-mallory', channel: 'chat:dmg:g1', peers: JSON.stringify(['dev-a', 'dev-b']) },
+      [`dev-a|chat:dmg:g1`]: { userId: 'dev-a', channel: 'chat:dmg:g1', peers: JSON.stringify(['dev-a', 'dev-b']) },
+    },
+    'chat-members': {
+      'room:x|dev-erin': { channel: 'room:x', userId: 'dev-erin' },
+      'room:x|dev-gone': { channel: 'room:x', userId: 'dev-gone', removedAt: '2026-09-01' },
+    },
+  };
+  const get = jest.fn(async ({ TableName, Key }: { TableName: string; Key: Record<string, string> }) => {
+    const table = Object.keys(tables).find((t) => TableName.endsWith(t))!;
+    const id = table === 'chat-conversations' ? `${Key.userId}|${Key.channel}` : `${Key.channel}|${Key.userId}`;
+    return { Item: tables[table][id] };
+  });
+
+  it('DM and group-DM members are read from chat-conversations; a room from chat-members', async () => {
+    const { makeChannelMemberLookup } = await import('../documentEditAccess');
+    const member = makeChannelMemberLookup(get);
+    expect(await member(dm, 'dev-frank')).toBe(true);
+    expect(await member(dm, 'dev-connor')).toBe(true);
+    expect(await member('chat:dmg:g1', 'dev-a')).toBe(true);
+    expect(await member('chat:dmg:g1', 'dev-mallory')).toBe(false); // holds a row, not in peers
+    expect(await member(dm, 'dev-mallory')).toBe(false);
+    expect(await member('chat:dm:dev-connor:dev-mallory', 'dev-mallory')).toBe(false); // named, but no conversation
+    expect(await member('room:x', 'dev-erin')).toBe(true);
+    expect(await member('room:x', 'dev-gone')).toBe(false);
+    expect(await member('room:x', 'dev-frank')).toBe(false);
+  });
+
+  it('a name that does not include the user is refused without a read; a failing table fails closed', async () => {
+    const { makeChannelMemberLookup } = await import('../documentEditAccess');
+    get.mockClear();
+    expect(await makeChannelMemberLookup(get)(dm, 'dev-mallory')).toBe(false);
+    expect(get).not.toHaveBeenCalled();
+    const failing = makeChannelMemberLookup(async () => { throw new Error('down'); });
+    expect(await failing(dm, 'dev-frank')).toBe(false);
+  });
+
+  it('canReadDocument: the other DM member reads a deck shared in the DM, a third user does not', async () => {
+    const { canReadDocument, makeChannelMemberLookup } = await import('../documentEditAccess');
+    const deck = { createdBy: 'dev-connor', channel: dm };
+    const member = makeChannelMemberLookup(get);
+    expect((await canReadDocument(deck, { sub: 'dev-frank' }, 'doc-dm', member)).allow).toBe(true);
+    const stranger = await canReadDocument(deck, { sub: 'dev-mallory' }, 'doc-dm', member);
+    expect(stranger.allow).toBe(false);
+    if (!stranger.allow) expect(stranger.status).toBe(404);
+  });
+});

@@ -97,19 +97,49 @@ export async function assertCanEditDocument(
 }
 
 const CHAT_MEMBERS_TABLE = tableName(process.env.DYNAMODB_CHAT_MEMBERS_TABLE || 'chat-members');
+const CHAT_CONVERSATIONS_TABLE = tableName(process.env.DYNAMODB_CHAT_CONVERSATIONS_TABLE || 'chat-conversations');
 
 /** Is `userId` a current member of `channel`? Fails closed: an unreadable table is not permission. */
 export type ChannelMemberLookup = (channel: string, userId: string) => Promise<boolean>;
 
-export const isChannelMember: ChannelMemberLookup = async (channel, userId) => {
-  if (!channel || !userId) return false;
-  try {
-    const res = await docClient.send(new GetCommand({ TableName: CHAT_MEMBERS_TABLE, Key: { channel, userId } }));
-    return !!res.Item && res.Item.removedAt === undefined;
-  } catch {
-    return false;
-  }
-};
+/** A direct message (`chat:dm:a:b`) or group DM (`chat:dmg:…`): its members are not in `chat-members`. */
+export function isDirectMessageChannel(channel: string): boolean {
+  return channel.startsWith('chat:dm:') || channel.startsWith('chat:dmg:');
+}
+
+type Get = (input: { TableName: string; Key: Record<string, string> }) => Promise<{ Item?: Record<string, unknown> }>;
+const ddbGet: Get = (input) => docClient.send(new GetCommand(input)) as Promise<{ Item?: Record<string, unknown> }>;
+
+/**
+ * NFR #151: a DM's members are the people the gateway's chat service keeps a
+ * conversation row for — `chat-conversations` `(userId, channel)`, written for
+ * every peer of the thread (`peers`). A room's are `chat-members` rows. The
+ * channel name alone is not trusted: the user must hold the row, be one of its
+ * `peers` when the row lists them, and for a two-person `chat:dm:a:b` also be
+ * one of the two names.
+ */
+export function makeChannelMemberLookup(get: Get = ddbGet): ChannelMemberLookup {
+  return async (channel, userId) => {
+    if (!channel || !userId) return false;
+    try {
+      if (isDirectMessageChannel(channel)) {
+        if (channel.startsWith('chat:dm:') && !channel.slice('chat:dm:'.length).split(':').includes(userId)) return false;
+        const res = await get({ TableName: CHAT_CONVERSATIONS_TABLE, Key: { userId, channel } });
+        if (!res.Item) return false;
+        const peers = res.Item.peers;
+        if (peers === undefined) return true;
+        const list = typeof peers === 'string' ? JSON.parse(peers) : peers;
+        return Array.isArray(list) && list.includes(userId);
+      }
+      const res = await get({ TableName: CHAT_MEMBERS_TABLE, Key: { channel, userId } });
+      return !!res.Item && res.Item.removedAt === undefined;
+    } catch {
+      return false;
+    }
+  };
+}
+
+export const isChannelMember: ChannelMemberLookup = makeChannelMemberLookup();
 
 /**
  * May `user` read this document — its revision list, slides, spec and file
