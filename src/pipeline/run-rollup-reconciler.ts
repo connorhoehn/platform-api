@@ -28,7 +28,15 @@ export interface RunCountReconcileDeps {
   now?: () => number;
   /** How long a row must have absorbed nothing before it is checked. Default 30 s. */
   quietMs?: number;
+  /**
+   * pipelineId → the row version last found correct. A row still at that
+   * version is not recounted: counting reads every run row of the pipeline,
+   * and DynamoDB Local holds each in heap. Default: this module's map.
+   */
+  verified?: Map<string, string>;
 }
+
+const verifiedRows = new Map<string, string>();
 
 export interface RunCountReconcileResult {
   checked: number;
@@ -46,19 +54,22 @@ export async function reconcileRunCounts(deps: RunCountReconcileDeps): Promise<R
   const now = (deps.now ?? Date.now)();
   const quietMs = deps.quietMs ?? 30_000;
   const result: RunCountReconcileResult = { checked: 0, corrected: [], busy: 0, lost: 0 };
+  const verified = deps.verified ?? verifiedRows;
   const rows = await deps.repo.listAll();
   for (const row of rows) {
     // The sentinel of a pipeline that never ran has nothing to count.
     if (!row.lastRunId) continue;
     const last = Date.parse(row.updatedAt);
     if (!Number.isFinite(last) || last > now - quietMs) { result.busy += 1; continue; }
+    if (verified.get(row.pipelineId) === row.updatedAt) continue;
     result.checked += 1;
     const cutoff = new Date(now - quietMs).toISOString();
     const actual = await deps.countRuns(row.pipelineId, cutoff);
-    if (actual === row.runCount) continue;
+    if (actual === row.runCount) { verified.set(row.pipelineId, row.updatedAt); continue; }
     const next: PipelineRunRollup = { ...row, runCount: actual, updatedAt: plusOneMs(row.updatedAt) };
     try {
       await deps.repo.putIfUnchanged(next, row);
+      verified.set(row.pipelineId, next.updatedAt);
       result.corrected.push({ pipelineId: row.pipelineId, from: row.runCount, to: actual });
       log.info({ pipelineId: row.pipelineId, from: row.runCount, to: actual }, 'rollup runCount corrected from the run table');
     } catch (err) {
