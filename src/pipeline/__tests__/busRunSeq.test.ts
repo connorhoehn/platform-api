@@ -39,6 +39,16 @@ describe('stampPipelineRunSeq', () => {
     ]);
   });
 
+  it('carries the run\'s owner from its start onto every later progress event', async () => {
+    const { bus, published } = fakeBus();
+    stampPipelineRunSeq(bus);
+    await bus.publish('pipeline:run:started', { runId: 'r1', triggeredBy: { userId: 'dev-connor', triggerType: 'manual', payload: {} } });
+    await bus.publish('pipeline:step:started', { runId: 'r1', stepId: 'a' });
+    await bus.publish('pipeline:run:started', { runId: 'r2', triggeredBy: { triggerType: 'schedule', payload: {} } });
+    await bus.publish('pipeline:step:started', { runId: 'r2', stepId: 'a' });
+    expect(published.map((e) => e.payload.runOwnerId)).toEqual(['dev-connor', 'dev-connor', undefined, undefined]);
+  });
+
   it('leaves events without a run, and an already-numbered event, alone', async () => {
     const { bus, published } = fakeBus();
     stampPipelineRunSeq(bus);
