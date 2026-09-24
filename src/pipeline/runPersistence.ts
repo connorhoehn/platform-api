@@ -51,6 +51,15 @@ import { workGraphPlanFromDefinition, workGraphPlanFromStoredRun, type RunWorkGr
  * else the steps its definition snapshot declares (named like the trigger
  * would), else what its checkpoint context says (an /agent plan).
  */
+function lifecycleFromSummary(summary: PipelineRunItem['stepsSummary']): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [stepId, step] of Object.entries(summary ?? {})) {
+    const status = (step as { status?: unknown } | undefined)?.status;
+    if (status === 'completed' || status === 'failed' || status === 'cancelled') out[stepId] = status;
+  }
+  return out;
+}
+
 function resumedWorkGraphPlan(item: PipelineRunItem): RunWorkGraphPlan | undefined {
   if (item.workGraph) return item.workGraph as RunWorkGraphPlan;
   const fromDefinition = workGraphPlanFromDefinition(item.definitionSnapshot);
@@ -860,9 +869,14 @@ export class RunPersistenceService {
       stepModelMap: {},
       stepInputMap: {},
       stepAttempts: {},
-      stepLifecycle: {},
+      // Steps that finished before the crash keep their outcome in the graph:
+      // an empty map let the terminal close-out mark them `cancelled` (NFR #189).
+      stepLifecycle: lifecycleFromSummary(item.stepsSummary),
       stepLifecycleAt: {},
       lastEventAt: new Date().toISOString(),
+      // The run's title in the graph is "<plan title> · <instruction>"; the
+      // instruction survives on the checkpoint context (NFR #189).
+      ...(workGraphPlanFromStoredRun(item).instruction ? { instruction: workGraphPlanFromStoredRun(item).instruction } : {}),
       checkpoint: item.checkpoint,
       definitionSnapshot: item.definitionSnapshot,
       interruptedAt: item.interruptedAt,
