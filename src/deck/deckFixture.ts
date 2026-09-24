@@ -23,6 +23,8 @@ import {
 } from './DeckSpec';
 import { readDocumentText } from './DeckSourcesStepHandler';
 import { DOCUMENTS_TABLE } from './presentationDocuments';
+import { getRedisClient } from '../lib/redis-client';
+import { contentKey, createSingleFlight, type SingleFlightRole, type SingleFlightStore } from './fixtureSingleFlight';
 
 export const FIXTURE_TITLE_PREFIX = '[deck-fixture]';
 export const FIXTURE_MODEL = process.env.DOCUMENT_AGENT_MODEL || 'haiku';
@@ -52,7 +54,22 @@ export interface DeckFixtureResult {
   material: FixtureMaterial;
   /** Which of the cited ids are transcripts — known from what was read, not from the id. */
   transcriptIds: string[];
+  /** Whether this caller asked the model or shared a concurrent identical draft (NFR #161). */
+  flight?: SingleFlightRole;
 }
+
+/** The part of a draft that is the model's answer — the rest is derived from the material. */
+type ModelDraft = { spec: DeckSpec; source: 'model' | 'fixture'; reason?: string };
+
+/**
+ * Concurrent identical drafts share one model call, on this replica and
+ * across replicas (main Redis: the lock is coordination state, never evicted).
+ */
+const fixtureFlight = createSingleFlight<ModelDraft>({
+  store: async () => (await getRedisClient()) as unknown as SingleFlightStore | null,
+  prefix: 'deck:fixture:flight',
+  lockTtlMs: FIXTURE_TIMEOUT_MS + 10_000,
+});
 
 /**
  * Material that was handed over and never cited.
@@ -360,6 +377,8 @@ export async function askModel(llm: LLMClient, prompt: string, timeoutMs: number
 export interface BuildFixtureOpts extends ReadMaterialDeps {
   llm?: LLMClient | null;
   timeoutMs?: number;
+  /** false: never share the model call with a concurrent identical draft. */
+  singleFlight?: boolean;
 }
 
 /**
@@ -415,7 +434,8 @@ export async function buildDeckFixture(
     }
   }
 
-  if (llm) {
+  const draft = async (): Promise<ModelDraft> => {
+    if (!llm) return { spec: fixtureSpec(material, deckTitle), source: 'fixture', reason: 'no model is configured on this deployment' };
     try {
       const answer = await askModel(llm, fixturePrompt(material, deckTitle, from.personId), opts.timeoutMs ?? FIXTURE_TIMEOUT_MS);
       const parsed = parseDeckSpecJson(answer);
@@ -427,24 +447,26 @@ export async function buildDeckFixture(
         .flatMap((slide) => slide.sources.map((source) => source.documentId))
         .find((documentId) => !citable.has(documentId));
       if (invented) throw new Error(`the model cited '${invented}', which is not one of the sources it was given`);
-      return {
-        spec: validation.spec,
-        source: 'model',
-        warnings: uncitedMaterialWarnings(validation.spec, material),
-        material,
-        transcriptIds: transcriptIdsOf(material),
-      };
+      return { spec: validation.spec, source: 'model' };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       log.warn({ reason }, 'deck fixture: falling back to the offline deck');
-      const spec = fixtureSpec(material, deckTitle);
-      return { spec, source: 'fixture', reason, warnings: uncitedMaterialWarnings(spec, material), material, transcriptIds: transcriptIdsOf(material) };
+      return { spec: fixtureSpec(material, deckTitle), source: 'fixture', reason };
     }
-  }
+  };
 
-  const spec = fixtureSpec(material, deckTitle);
+  // Only a real model call is shared: an injected client (tests) or no model runs alone.
+  let flight: SingleFlightRole = 'ran';
+  const answer = llm && opts.llm === undefined && opts.singleFlight !== false
+    ? await fixtureFlight(contentKey(FIXTURE_MODEL, fixturePrompt(material, deckTitle, from.personId)), draft, (role) => { flight = role; })
+    : await draft();
   return {
-    spec, source: 'fixture', reason: 'no model is configured on this deployment',
-    warnings: uncitedMaterialWarnings(spec, material), material, transcriptIds: transcriptIdsOf(material),
+    spec: answer.spec,
+    source: answer.source,
+    ...(answer.reason ? { reason: answer.reason } : {}),
+    warnings: uncitedMaterialWarnings(answer.spec, material),
+    material,
+    transcriptIds: transcriptIdsOf(material),
+    flight,
   };
 }

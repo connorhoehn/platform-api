@@ -99,7 +99,8 @@ deckRouter.post('/fixture', requireAuth, fixtureLimit, asyncHandler(async (req: 
 
   try {
     const result = await buildDeckFixture(from, title, {});
-    log.info({ from, source: result.source, slides: result.spec.slides.length, userId: req.user?.sub }, 'deck fixture built');
+    log.info({ from, source: result.source, slides: result.spec.slides.length, userId: req.user?.sub, flight: result.flight }, 'deck fixture built');
+    if (result.flight) res.setHeader('x-deck-fixture-flight', result.flight);
     res.status(200).json({
       spec: result.spec,
       source: result.source,
