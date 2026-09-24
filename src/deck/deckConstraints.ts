@@ -454,7 +454,15 @@ export function checkConstraints(constraints: Constraint[], before: DeckSpec, af
   // What the model's own summary claims ("made the title one word shorter",
   // parsed like an instruction) is measured too, and always listed: that is
   // the number the claim is checked against.
-  for (const claim of claims) factFor(claim.subject, claim.kind === 'unchanged' ? 'text' : claim.metric, claim.slide);
+  // A claim that names no slide ("renamed the slide title") is about the
+  // slide the instruction named, and one that names a part no slide holds
+  // (a slide-level part in a deck-wide run with no slide) measures nothing.
+  const named = constraints.find((c) => c.slide !== undefined)?.slide;
+  for (const claim of claims) {
+    const at = claim.subject === 'deck' ? undefined : claim.slide ?? named;
+    if (!scopeFor(at).slideId && (claim.subject === 'slide' || claim.subject === 'notes' || claim.subject === 'bullet')) continue;
+    factFor(claim.subject, claim.kind === 'unchanged' ? 'text' : claim.metric, at);
+  }
   // The default measures are facts too, but only worth a line when something moved.
   for (const [subject, metric] of defaultMeasures(scope)) {
     const key = `${scope.slideId ?? ''}:${subject}:${metric}`;

@@ -135,6 +135,9 @@ describe('the part an instruction names (#145)', () => {
     expect(check.violations).toEqual([]);
     expect(factLines(check.facts)).toEqual(['Title: 5 → 3 words']);
     expect(reconcileSummary('Shortened the title of slide 2.', check.facts, '')).toBe('Shortened the title of slide 2. Measured: Title: 5 → 3 words.');
+    // The model's own note names no slide: it is about the slide the instruction named.
+    const claimed = checkConstraints(parseConstraints('shorten the title of slide 2', {}), before, after, {}, parseConstraints('Renamed the slide title to three words. The notes are shorter.', {}));
+    expect(factLines(claimed.facts)).toEqual(['Title: 5 → 3 words', 'Notes: 5 → 5 words']);
     const exact = checkConstraints(parseConstraints('make the title of slide 2 one word shorter', {}), before, after, {});
     expect(exact.violations.map((v) => v.message)).toEqual(['Title has 3 words; before it had 5. Make it 4.']);
   });
