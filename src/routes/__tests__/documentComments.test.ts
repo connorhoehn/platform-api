@@ -13,6 +13,7 @@ const mockGetCommentsForDocument = jest.fn();
 const mockResolveThread = jest.fn();
 const mockUnresolveThread = jest.fn();
 const mockDeleteComment = jest.fn();
+const mockSetAnchor = jest.fn();
 
 jest.mock('../../repositories', () => ({
   documentCommentRepo: {
@@ -24,6 +25,7 @@ jest.mock('../../repositories', () => ({
     resolveThread: mockResolveThread,
     unresolveThread: mockUnresolveThread,
     deleteComment: mockDeleteComment,
+    setAnchor: mockSetAnchor,
   },
 }));
 
@@ -157,6 +159,7 @@ beforeEach(() => {
   mockResolveThread.mockReset().mockResolvedValue(undefined);
   mockUnresolveThread.mockReset().mockResolvedValue(undefined);
   mockDeleteComment.mockReset().mockResolvedValue(undefined);
+  mockSetAnchor.mockReset().mockImplementation(async (_d: string, id: string, anchor: unknown) => ({ documentId: DOC, commentId: id, anchor }));
 });
 
 describe('POST /api/documents/:documentId/comments', () => {
@@ -464,5 +467,34 @@ describe('NFR #154: the comment routes ask document:read', () => {
     const grant = { documentId: DOC, tenantId: 'assessment', sub: 'mallory', operations: ['read'] } as DocumentGrantClaims;
     expect((await run(buildApp(grant), 'GET', BASE, { userId: 'mallory' })).statusCode).toBe(200);
     expect(mockDocRow).not.toHaveBeenCalled();
+  });
+});
+
+describe('WS-J: PATCH { anchor } re-points a root comment', () => {
+  const anchor = { v: 1, key: 'body', start: 'AAE=', end: 'AAI=', quote: 'Publish the rollback procedure' };
+
+  it('the author may anchor their own document-wide comment', async () => {
+    mockGetComment.mockResolvedValue({ documentId: DOC, commentId: 'c-1', userId: 'tester', scope: 'document' });
+    const res = await run(buildApp(), 'PATCH', BASE + '/c-1', { body: { anchor } });
+    expect(res.statusCode).toBe(200);
+    expect(mockSetAnchor).toHaveBeenCalledWith(DOC, 'c-1', anchor);
+  });
+
+  it('the document owner may anchor a reader\'s comment; another reader may not', async () => {
+    mockGetComment.mockResolvedValue({ documentId: DOC, commentId: 'c-1', userId: 'tester' });
+    const app = buildApp();
+    expect((await run(app, 'PATCH', BASE + '/c-1', { userId: 'other', body: { anchor } })).statusCode).toBe(403);
+    expect((await run(app, 'PATCH', BASE + '/c-1', { userId: 'doc-owner', body: { anchor } })).statusCode).toBe(200);
+    expect(mockSetAnchor).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a reply, a malformed anchor, and anchor mixed with another change', async () => {
+    const app = buildApp();
+    mockGetComment.mockResolvedValue({ documentId: DOC, commentId: 'c-1', userId: 'tester', parentCommentId: 'c-0' });
+    expect((await run(app, 'PATCH', BASE + '/c-1', { body: { anchor } })).statusCode).toBe(400);
+    mockGetComment.mockResolvedValue({ documentId: DOC, commentId: 'c-1', userId: 'tester' });
+    expect((await run(app, 'PATCH', BASE + '/c-1', { body: { anchor: { v: 1 } } })).statusCode).toBe(400);
+    expect((await run(app, 'PATCH', BASE + '/c-1', { body: { anchor, resolved: true } })).statusCode).toBe(400);
+    expect(mockSetAnchor).not.toHaveBeenCalled();
   });
 });

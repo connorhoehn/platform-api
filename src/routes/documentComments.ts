@@ -184,15 +184,33 @@ documentCommentsRouter.get('/:documentId/comments', requireAuth, asyncHandler(as
   res.status(200).json({ comments: result.items, ...(result.lastEvaluatedKey ? { nextCursor: Buffer.from(JSON.stringify(result.lastEvaluatedKey)).toString('base64url') } : {}) });
 }));
 
-// PATCH /api/documents/:documentId/comments/:commentId — resolve/unresolve a thread
+// PATCH /api/documents/:documentId/comments/:commentId — resolve/unresolve a thread, edit text, or re-anchor
 documentCommentsRouter.patch('/:documentId/comments/:commentId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const { documentId, commentId } = req.params;
-  const { resolved, text } = req.body as { resolved?: boolean; text?: unknown };
+  const { resolved, text, anchor } = req.body as { resolved?: boolean; text?: unknown; anchor?: unknown };
   const userId = req.user!.sub;
-  await documentReadGate().assertCanRead(req, documentId);
+  const gate = documentReadGate();
+  const { ownerId } = await gate.assertCanRead(req, documentId);
 
   const existing = await documentCommentRepo.getComment(documentId, commentId);
   if (!existing) throw new NotFoundError('Comment not found');
+  // WS-J: re-point a root comment at the text it is about. The author, or the
+  // document's owner (who re-anchors seeded / imported document-wide threads).
+  if (anchor !== undefined) {
+    if (text !== undefined || resolved !== undefined) throw new ValidationError('Re-anchor in its own request');
+    if (existing.parentCommentId) throw new ValidationError('A reply is positioned by its thread and has no anchor');
+    const parsed = parseAnchor(anchor);
+    if (!parsed) throw new ValidationError('anchor is required');
+    if (existing.userId !== userId) {
+      const owner = ownerId ?? (req.documentGrant ? undefined : await gate.ownerOf(documentId));
+      if (!owner || owner !== userId) throw new ForbiddenError('Only the author or the document owner may move a comment');
+    }
+    const comment = await documentCommentRepo.setAnchor(documentId, commentId, parsed);
+    publishSignal(`doc-comments:${documentId}`, 'doc:comment_updated', { documentId, comment })
+      .catch((err: unknown) => log.error({ event: 'doc:comment_updated', err: err instanceof Error ? err.message : String(err) }, 'signal publish failed'));
+    res.status(200).json({ comment });
+    return;
+  }
   if (text !== undefined) {
     if (existing.userId !== userId) throw new ForbiddenError('Only the author may edit comment text');
     if (typeof text !== 'string' || !text.trim() || text.trim().length > 10000) {

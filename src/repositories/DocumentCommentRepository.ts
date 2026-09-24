@@ -155,6 +155,23 @@ export class DocumentCommentRepository extends BaseRepository {
     return result as unknown as DocumentComment;
   }
 
+  /**
+   * Re-points a ROOT comment at a span of text (WS-J). Drops `scope`, because a
+   * comment is on the whole document or on a span, never both. The caller has
+   * validated the anchor and checked who may move it.
+   */
+  async setAnchor(documentId: string, commentId: string, anchor: DocumentCommentAnchor): Promise<DocumentComment> {
+    const result = await this.updateItem({
+      Key: { documentId, commentId },
+      ConditionExpression: 'attribute_exists(commentId)',
+      UpdateExpression: 'SET anchor = :anchor, anchoredAt = :at REMOVE #scope',
+      ExpressionAttributeNames: { '#scope': 'scope' },
+      ExpressionAttributeValues: { ':anchor': anchor, ':at': new Date().toISOString() },
+      ReturnValues: 'ALL_NEW',
+    });
+    return result as unknown as DocumentComment;
+  }
+
   async resolveThread(
     documentId: string,
     commentId: string,
