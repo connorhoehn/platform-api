@@ -39,6 +39,11 @@ export interface Constraint {
   subject: ConstraintSubject;
   metric: ConstraintMetric;
   n?: number;
+  /**
+   * The slide the instruction names ("the title of slide 2" → 2), 1-based.
+   * Measured on that slide when the run itself is not slide-scoped (#145).
+   */
+  slide?: number;
   /** The fragment of the instruction it came from, for the person reading the run. */
   phrase: string;
 }
@@ -120,6 +125,45 @@ export function defaultSubject(scope: ConstraintScope): ConstraintSubject {
   return scope.slideId ? 'slide' : 'deck';
 }
 
+const SLIDE_NUM = '(\\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)';
+const ORDINALS = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth', 'eleventh', 'twelfth'];
+const LOCATOR = '(?:(of|on|in|for|from|to) )';
+
+interface SlideRef { slide: number; at: number }
+
+/**
+ * The slides an instruction names ("slide 2", "slide two", "the second
+ * slide"), and the instruction with every LOCATOR ("of slide 2", "on the
+ * second slide", "slide 2's") blanked out — same length, so match indices
+ * still line up — so "the title of slide 2" names the title, not the slide
+ * (#145). "Make slide 2 shorter" keeps its noun: there the slide is the subject.
+ */
+function slideRefs(text: string): { refs: SlideRef[]; nounText: string } {
+  const refs: SlideRef[] = [];
+  let nounText = text;
+  const blank = (at: number, length: number) => {
+    nounText = nounText.slice(0, at) + ' '.repeat(length) + nounText.slice(at + length);
+  };
+  for (const m of text.matchAll(new RegExp(`\\b${LOCATOR}?(?:the )?slide (?:#|no\\.? ?)?${SLIDE_NUM}('s)?\\b`, 'gi'))) {
+    const slide = numberOf(m[2]);
+    if (!slide) continue;
+    refs.push({ slide, at: m.index ?? 0 });
+    if (m[1] || m[3]) blank(m.index ?? 0, m[0].length);
+  }
+  for (const m of text.matchAll(new RegExp(`\\b${LOCATOR}?the (${ORDINALS.join('|')}) slide('s)?\\b`, 'gi'))) {
+    const slide = ORDINALS.indexOf(m[2]!.toLowerCase()) + 1;
+    refs.push({ slide, at: m.index ?? 0 });
+    if (m[1] || m[3]) blank(m.index ?? 0, m[0].length);
+  }
+  return { refs: refs.sort((a, b) => a.at - b.at), nounText };
+}
+
+/** The slide named nearest before `at`, else the first one named. */
+function slideNear(refs: SlideRef[], at: number): number | undefined {
+  const before = refs.filter((r) => r.at <= at);
+  return (before.length ? before[before.length - 1]! : refs[0])?.slide;
+}
+
 /** The noun the instruction names nearest BEFORE the phrase, else anywhere. */
 function subjectNear(instruction: string, at: number, scope: ConstraintScope): ConstraintSubject {
   const before = instruction.slice(0, at);
@@ -140,10 +184,11 @@ function subjectForMetric(subject: ConstraintSubject, metric: ConstraintMetric, 
 /** The measurable constraints an instruction states, in the order they appear. */
 export function parseConstraints(instruction: string, scope: ConstraintScope = {}): Constraint[] {
   const text = instruction.replace(/\s+/g, ' ').trim();
+  const { refs, nounText } = slideRefs(text);
   const out: Constraint[] = [];
   const seen = new Set<string>();
   const push = (c: Constraint) => {
-    const key = `${c.kind}:${c.subject}:${c.metric}:${c.n ?? ''}`;
+    const key = `${c.kind}:${c.subject}:${c.metric}:${c.n ?? ''}:${c.slide ?? ''}`;
     if (seen.has(key)) return;
     seen.add(key);
     out.push(c);
@@ -151,7 +196,10 @@ export function parseConstraints(instruction: string, scope: ConstraintScope = {
   const each = (re: RegExp, make: (m: RegExpExecArray) => Constraint | undefined) => {
     for (const m of text.matchAll(new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`))) {
       const c = make(m as RegExpExecArray);
-      if (c) push({ ...c, phrase: m[0] });
+      if (!c) continue;
+      // A deck-wide count ("add a slide") is not about one slide.
+      const slide = c.subject === 'deck' ? undefined : slideNear(refs, m.index ?? 0);
+      push({ ...c, ...(slide ? { slide } : {}), phrase: m[0] });
     }
   };
 
@@ -171,12 +219,12 @@ export function parseConstraints(instruction: string, scope: ConstraintScope = {
     (m) => {
       const metric = metricOfUnit(m[2]!);
       const n = numberOf(m[1]) ?? 1;
-      return { kind: 'delta', subject: metric === 'slides' ? 'deck' : subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n, phrase: '' };
+      return { kind: 'delta', subject: metric === 'slides' ? 'deck' : subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n, phrase: '' };
     });
   each(/\b(?:another|one more) (bullets?|bullet points?|points?|slides?)\b/gi,
     (m) => {
       const metric = metricOfUnit(m[1]!);
-      return { kind: 'delta', subject: metric === 'slides' ? 'deck' : subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: 1, phrase: '' };
+      return { kind: 'delta', subject: metric === 'slides' ? 'deck' : subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: 1, phrase: '' };
     });
 
   // remove a bullet / drop the last bullet / delete two bullets / cut a slide
@@ -184,7 +232,7 @@ export function parseConstraints(instruction: string, scope: ConstraintScope = {
     (m) => {
       const metric = metricOfUnit(m[2]!);
       const n = numberOf(m[1]) ?? 1;
-      return { kind: 'delta', subject: metric === 'slides' ? 'deck' : subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: -n, phrase: '' };
+      return { kind: 'delta', subject: metric === 'slides' ? 'deck' : subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: -n, phrase: '' };
     });
 
   // one word shorter / 2 bullets fewer / one word longer / a word shorter
@@ -193,7 +241,7 @@ export function parseConstraints(instruction: string, scope: ConstraintScope = {
       const metric = metricOfUnit(m[2]!);
       const n = numberOf(m[1]) ?? 1;
       const sign = /shorter|fewer|less/i.test(m[3]!) ? -1 : 1;
-      return { kind: 'delta', subject: subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: sign * n, phrase: '' };
+      return { kind: 'delta', subject: subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: sign * n, phrase: '' };
     });
   // shorter by one word / fewer by two bullets
   each(new RegExp(`\\b(shorter|fewer|longer|more) by ${NUM} ${UNIT}\\b`, 'i'),
@@ -201,7 +249,7 @@ export function parseConstraints(instruction: string, scope: ConstraintScope = {
       const metric = metricOfUnit(m[3]!);
       const n = numberOf(m[2]) ?? 1;
       const sign = /shorter|fewer/i.test(m[1]!) ? -1 : 1;
-      return { kind: 'delta', subject: subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: sign * n, phrase: '' };
+      return { kind: 'delta', subject: subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: sign * n, phrase: '' };
     });
 
   // 10 words or fewer / at most 40 characters / no more than three bullets / under 40 characters / within 12 words / max 8 words
@@ -210,28 +258,28 @@ export function parseConstraints(instruction: string, scope: ConstraintScope = {
       const metric = metricOfUnit(m[2]!);
       const strict = /^(under|below|less than|fewer than)/i.test(m[0]);
       const n = (numberOf(m[1]) ?? 0) - (strict ? 1 : 0);
-      return { kind: 'max', subject: subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: Math.max(0, n), phrase: '' };
+      return { kind: 'max', subject: subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: Math.max(0, n), phrase: '' };
     });
   each(new RegExp(`\\b${NUM} ${UNIT} (?:or fewer|or less|max(?:imum)?|tops|at most|or under)\\b`, 'i'),
     (m) => {
       const metric = metricOfUnit(m[2]!);
-      return { kind: 'max', subject: subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: numberOf(m[1]) ?? 0, phrase: '' };
+      return { kind: 'max', subject: subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: numberOf(m[1]) ?? 0, phrase: '' };
     });
   // at least 3 bullets / 3 bullets or more / more than 20 words
   each(new RegExp(`\\b(?:at least|no fewer than|not fewer than|minimum(?: of)?|min) ${NUM} ${UNIT}\\b`, 'i'),
     (m) => {
       const metric = metricOfUnit(m[2]!);
-      return { kind: 'min', subject: subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: numberOf(m[1]) ?? 0, phrase: '' };
+      return { kind: 'min', subject: subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: numberOf(m[1]) ?? 0, phrase: '' };
     });
   each(new RegExp(`\\b(?<!no |not )(?:more than|over|above) ${NUM} ${UNIT}\\b`, 'i'),
     (m) => {
       const metric = metricOfUnit(m[2]!);
-      return { kind: 'min', subject: subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: (numberOf(m[1]) ?? 0) + 1, phrase: '' };
+      return { kind: 'min', subject: subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: (numberOf(m[1]) ?? 0) + 1, phrase: '' };
     });
   each(new RegExp(`\\b${NUM} ${UNIT} or more\\b`, 'i'),
     (m) => {
       const metric = metricOfUnit(m[2]!);
-      return { kind: 'min', subject: subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: numberOf(m[1]) ?? 0, phrase: '' };
+      return { kind: 'min', subject: subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: numberOf(m[1]) ?? 0, phrase: '' };
     });
 
   // exactly three bullets / to 3 bullets / down to two words / make the title 2 words / a two-word title / 0 words
@@ -243,26 +291,26 @@ export function parseConstraints(instruction: string, scope: ConstraintScope = {
       if (!lead) return undefined;
       if (/^up to/i.test(m[0])) return undefined; // a max, taken above
       const metric = metricOfUnit(m[3]!);
-      return { kind: 'exact', subject: subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, n: numberOf(m[2]) ?? 0, phrase: '' };
+      return { kind: 'exact', subject: subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, n: numberOf(m[2]) ?? 0, phrase: '' };
     });
 
   // fewer bullets / more bullets / fewer slides (no number)
   each(/\b(fewer|less|more) (bullets?|bullet points?|points?|slides?)\b/gi,
     (m) => {
       const metric = metricOfUnit(m[2]!);
-      return { kind: /fewer|less/i.test(m[1]!) ? 'shorter' : 'longer', subject: metric === 'slides' ? 'deck' : subjectForMetric(subjectNear(text, m.index ?? 0, scope), metric, scope), metric, phrase: '' };
+      return { kind: /fewer|less/i.test(m[1]!) ? 'shorter' : 'longer', subject: metric === 'slides' ? 'deck' : subjectForMetric(subjectNear(nounText, m.index ?? 0, scope), metric, scope), metric, phrase: '' };
     });
 
   // shorter / briefer / more concise / tighter / trim / shorten / condense — and longer / expand
   each(/\b(shorter|briefer|more concise|concise|tighter|tighten|trim(?:med)?|shorten(?:ed)?|condense[d]?|cut down|pare down|terser|crisper|punchier|fewer words|less wordy)\b/gi,
-    (m) => ({ kind: 'shorter', subject: subjectNear(text, m.index ?? 0, scope), metric: 'words', phrase: '' }));
+    (m) => ({ kind: 'shorter', subject: subjectNear(nounText, m.index ?? 0, scope), metric: 'words', phrase: '' }));
   each(/\b(longer|expand(?:ed)?|elaborate|flesh out|more detail(?:ed)?|more words|lengthen)\b/gi,
-    (m) => ({ kind: 'longer', subject: subjectNear(text, m.index ?? 0, scope), metric: 'words', phrase: '' }));
+    (m) => ({ kind: 'longer', subject: subjectNear(nounText, m.index ?? 0, scope), metric: 'words', phrase: '' }));
 
   // A delta/max/exact on a subject makes the bare "shorter" on the same
   // subject redundant, and a bullet COUNT phrase must not also read as words.
-  const precise = new Set(out.filter((c) => c.kind === 'delta' || c.kind === 'max' || c.kind === 'exact' || c.kind === 'min').map((c) => `${c.subject}:${c.kind === 'delta' && c.n! < 0 ? 'shorter' : c.kind === 'delta' ? 'longer' : c.kind === 'max' ? 'shorter' : c.kind === 'min' ? 'longer' : 'exact'}`));
-  return out.filter((c) => !((c.kind === 'shorter' || c.kind === 'longer') && (precise.has(`${c.subject}:${c.kind}`) || precise.has(`${c.subject}:exact`))));
+  const precise = new Set(out.filter((c) => c.kind === 'delta' || c.kind === 'max' || c.kind === 'exact' || c.kind === 'min').map((c) => `${c.slide ?? ''}:${c.subject}:${c.kind === 'delta' && c.n! < 0 ? 'shorter' : c.kind === 'delta' ? 'longer' : c.kind === 'max' ? 'shorter' : c.kind === 'min' ? 'longer' : 'exact'}`));
+  return out.filter((c) => !((c.kind === 'shorter' || c.kind === 'longer') && (precise.has(`${c.slide ?? ''}:${c.subject}:${c.kind}`) || precise.has(`${c.slide ?? ''}:${c.subject}:exact`))));
 }
 
 // ---------------------------------------------------------------------------
@@ -379,28 +427,37 @@ function violationMessage(c: Constraint, fact: MeasuredFact): string | undefined
  */
 export function checkConstraints(constraints: Constraint[], before: DeckSpec, after: DeckSpec, scope: ConstraintScope = {}, claims: Constraint[] = []): ConstraintCheck {
   const facts = new Map<string, MeasuredFact>();
-  const factFor = (subject: ConstraintSubject, metric: ConstraintMetric | 'text'): MeasuredFact => {
-    const key = `${subject}:${metric}`;
+  // The slide the instruction names, when the run is not already scoped to
+  // one: a deck-wide "shorten the title of slide 2" measures slide 2's title,
+  // not the deck title (#145). A slide-scoped run can only change its slide.
+  const scopeFor = (slide: number | undefined): ConstraintScope => {
+    if (!slide || scope.slideId) return scope;
+    const named = before.slides[slide - 1];
+    return named ? { slideId: named.id } : scope;
+  };
+  const factFor = (subject: ConstraintSubject, metric: ConstraintMetric | 'text', slide?: number): MeasuredFact => {
+    const at = scopeFor(slide);
+    const key = `${at.slideId ?? ''}:${subject}:${metric}`;
     let fact = facts.get(key);
     if (!fact) {
-      fact = measureFact(before, after, scope, subject, metric);
+      fact = measureFact(before, after, at, subject, metric);
       facts.set(key, fact);
     }
     return fact;
   };
   const violations: ConstraintViolation[] = [];
   for (const c of constraints) {
-    const fact = factFor(c.subject, c.kind === 'unchanged' ? 'text' : c.metric);
+    const fact = factFor(c.subject, c.kind === 'unchanged' ? 'text' : c.metric, c.slide);
     const message = violationMessage(c, fact);
     if (message) violations.push({ constraint: c, fact, message });
   }
   // What the model's own summary claims ("made the title one word shorter",
   // parsed like an instruction) is measured too, and always listed: that is
   // the number the claim is checked against.
-  for (const claim of claims) factFor(claim.subject, claim.kind === 'unchanged' ? 'text' : claim.metric);
+  for (const claim of claims) factFor(claim.subject, claim.kind === 'unchanged' ? 'text' : claim.metric, claim.slide);
   // The default measures are facts too, but only worth a line when something moved.
   for (const [subject, metric] of defaultMeasures(scope)) {
-    const key = `${subject}:${metric}`;
+    const key = `${scope.slideId ?? ''}:${subject}:${metric}`;
     if (facts.has(key)) continue;
     const fact = measureFact(before, after, scope, subject, metric);
     if (fact.before !== fact.after) facts.set(key, fact);

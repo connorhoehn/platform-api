@@ -111,6 +111,44 @@ describe('checkConstraints', () => {
   });
 });
 
+describe('the part an instruction names (#145)', () => {
+  const pickSlide = (constraints: Constraint[]) => constraints.map(({ kind, subject, metric, n, slide: s }) => ({ kind, subject, metric, ...(n !== undefined ? { n } : {}), ...(s !== undefined ? { slide: s } : {}) }));
+
+  it.each<[string, ReturnType<typeof pickSlide>]>([
+    ['make the title of slide 2 one word shorter', [{ kind: 'delta', subject: 'title', metric: 'words', n: -1, slide: 2 }]],
+    ['shorten the title of slide 2', [{ kind: 'shorter', subject: 'title', metric: 'words', slide: 2 }]],
+    ['on slide two, trim the notes', [{ kind: 'shorter', subject: 'notes', metric: 'words', slide: 2 }]],
+    ['slide 2\'s bullets: at most two bullets', [{ kind: 'max', subject: 'bullets', metric: 'bullets', n: 2, slide: 2 }]],
+    ['tighten the bullets on the third slide', [{ kind: 'shorter', subject: 'bullets', metric: 'words', slide: 3 }]],
+    // The slide itself is the subject when it is not a locator.
+    ['make slide 2 shorter', [{ kind: 'shorter', subject: 'slide', metric: 'words', slide: 2 }]],
+    // A deck-wide count never carries a slide.
+    ['after slide 2, add a slide', [{ kind: 'delta', subject: 'deck', metric: 'slides', n: 1 }]],
+  ])('%s', (instruction, expected) => {
+    expect(pickSlide(parseConstraints(instruction, {}))).toEqual(expected);
+  });
+
+  it('a deck-wide run measures the named slide\'s title, not the whole slide (run 9eaee2c0)', () => {
+    const before = retitled('What we are reviewing today');
+    const after = retitled('Review agenda today');
+    const check = checkConstraints(parseConstraints('shorten the title of slide 2', {}), before, after, {}, parseConstraints('Shortened the title of slide 2.', {}));
+    expect(check.violations).toEqual([]);
+    expect(factLines(check.facts)).toEqual(['Title: 5 → 3 words']);
+    expect(reconcileSummary('Shortened the title of slide 2.', check.facts, '')).toBe('Shortened the title of slide 2. Measured: Title: 5 → 3 words.');
+    const exact = checkConstraints(parseConstraints('make the title of slide 2 one word shorter', {}), before, after, {});
+    expect(exact.violations.map((v) => v.message)).toEqual(['Title has 3 words; before it had 5. Make it 4.']);
+  });
+
+  it('a slide-scoped run keeps its own slide; an unscoped instruction keeps today\'s measure', () => {
+    const check = checkConstraints(parseConstraints('shorten the title of slide 5', slide), retitled('Agenda for today'), retitled('Agenda'), slide);
+    expect(factLines(check.facts)).toEqual(['Title: 3 → 1 word']);
+    const whole = checkConstraints(parseConstraints('one word shorter', slide), retitled('Agenda for today'), retitled('Today’s agenda'), slide);
+    expect(factLines(whole.facts)).toEqual(['Slide: 16 → 15 words', 'Title: 3 → 2 words']);
+    // Deck-wide with no slide named: the deck title, as before.
+    expect(factLines(checkConstraints(parseConstraints('shorten the title', {}), deck, { ...deck, title: 'Q4 review' }, {}).facts)).toEqual(['Deck title: 3 → 2 words']);
+  });
+});
+
 describe('reconcileSummary', () => {
   it('appends the measurements to the model\'s summary', () => {
     const check = checkConstraints(parseConstraints('make the title one word shorter', slide), retitled('Agenda for today'), retitled('Today’s agenda'), slide);
