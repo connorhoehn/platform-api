@@ -81,6 +81,7 @@ import type { DeadLetterQueue, Envelope } from 'distributed-core/messaging-queue
 import { createLLMClient } from './factories/LLMClientFactory';
 import { ExecutorAuditSubscriber } from './executor-audit-subscriber';
 import { startRunRollupSubscriber } from './run-rollup-subscriber';
+import { startCommentAgentResolver } from '../documents/commentAgentResolver';
 import { startApprovalForwarder } from './approval-forwarder';
 import { startRunControlForwarder } from './run-control-forwarder';
 import { auditRepo } from './audit-repository';
@@ -1395,6 +1396,8 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   }
   // The pipelines page's last-run rollup, fed by the same lifecycle events (run-rollup-subscriber.ts).
   const runRollupSubscriber = startRunRollupSubscriber({ eventBus, enabled: opts.pipelineRunRepository !== undefined });
+  // WS-J lane B: a comment handed to the agent gets its reply (and resolve) from the run's terminal event.
+  startCommentAgentResolver({ eventBus });
   // NFR #115: an approval decision taken on a replica that does not own the
   // run reaches the owner over the cluster pubsub (and the rollup row, for a
   // dead owner's resume). Always on: with one replica it costs one subscription.

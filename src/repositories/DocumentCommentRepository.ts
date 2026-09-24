@@ -74,6 +74,29 @@ export interface DocumentComment {
   resolved?: boolean;
   resolvedBy?: string;
   resolvedAt?: string;
+  /**
+   * WS-J lane B: the agent run this ROOT comment was handed to ("Ask agent").
+   * `pending` until the run settles; the settle is a compare-and-set on
+   * (`runId`, `pending`), so two replicas observing the same completion write
+   * one reply between them.
+   */
+  agentRequest?: DocumentCommentAgentRequest;
+}
+
+export type CommentAgentRequestState = 'pending' | 'addressed' | 'refused' | 'failed';
+
+export interface DocumentCommentAgentRequest {
+  runId: string;
+  pipelineId: string;
+  state: CommentAgentRequestState;
+  /** Resolve the thread when the run lands its edit ("Resolve when applied"). */
+  resolveOnApply: boolean;
+  requestedBy: string;
+  requestedByName: string;
+  at: string;
+  settledAt?: string;
+  /** The reply the settle wrote — pre-allocated so the claim names it. */
+  replyId?: string;
 }
 
 const TABLE_NAME = tableName('document-comments');
@@ -95,8 +118,10 @@ export class DocumentCommentRepository extends BaseRepository {
     timestamp: string;
     parentCommentId?: string;
     anchor?: DocumentCommentAnchor;
+    /** Pre-allocated id (an agent's settle reply); default a fresh ulid. */
+    commentId?: string;
   }): Promise<DocumentComment> {
-    const commentId = ulid();
+    const commentId = comment.commentId ?? ulid();
     // Spread, not assignment, so an absent optional stays ABSENT from the item.
     // Writing `sectionId: undefined` into a DynamoDB item is not the same as
     // omitting it — it either throws or persists a null, and a null sectionId
@@ -196,6 +221,46 @@ export class DocumentCommentRepository extends BaseRepository {
       ConditionExpression: 'attribute_exists(commentId)',
       UpdateExpression: 'REMOVE resolved, resolvedBy, resolvedAt',
     });
+  }
+
+  /** Hands a root comment to an agent run (replaces an earlier, settled or not). */
+  async setAgentRequest(documentId: string, commentId: string, request: DocumentCommentAgentRequest): Promise<DocumentComment> {
+    const result = await this.updateItem({
+      Key: { documentId, commentId },
+      ConditionExpression: 'attribute_exists(commentId)',
+      UpdateExpression: 'SET agentRequest = :req',
+      ExpressionAttributeValues: { ':req': request },
+      ReturnValues: 'ALL_NEW',
+    });
+    return result as unknown as DocumentComment;
+  }
+
+  /**
+   * Settles the agent request for `runId` exactly once: true when THIS caller
+   * moved it off `pending`, false when it was already settled (the other
+   * replica's copy of the event, a redelivery) or re-asked under another run.
+   */
+  async settleAgentRequest(
+    documentId: string,
+    commentId: string,
+    runId: string,
+    state: Exclude<CommentAgentRequestState, 'pending'>,
+    replyId: string,
+    settledAt: string,
+  ): Promise<boolean> {
+    try {
+      await this.updateItem({
+        Key: { documentId, commentId },
+        ConditionExpression: 'agentRequest.runId = :run AND agentRequest.#state = :pending',
+        UpdateExpression: 'SET agentRequest.#state = :state, agentRequest.settledAt = :at, agentRequest.replyId = :reply',
+        ExpressionAttributeNames: { '#state': 'state' },
+        ExpressionAttributeValues: { ':run': runId, ':pending': 'pending', ':state': state, ':at': settledAt, ':reply': replyId },
+      });
+      return true;
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return false;
+      throw err;
+    }
   }
 
   async deleteComment(documentId: string, commentId: string): Promise<void> {

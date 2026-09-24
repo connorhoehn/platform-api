@@ -12,19 +12,44 @@ import { buildDocumentAgentEditDefinition, buildDocumentTransformDefinition, DOC
 import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_ID, DEFAULT_HISTORY_LIMIT } from '../documents/conversationSummarizePipeline';
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
 import log from '../lib/logger';
+import { documentCommentRepo } from '../repositories';
+import { documentReadGate } from '../documents/documentReadGate';
+import { publishSignal } from '../lib/event-catalog';
+import { commentScopedInstruction, linkRunToComment } from '../documents/commentAgentRequests';
+import { getCommentAgentResolver } from '../documents/commentAgentResolver';
+import { NotFoundError } from '../middleware/error-handler';
 
 export const documentAgentEditRouter = Router();
 
 documentAgentEditRouter.post('/:documentId/agent-edit', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
-  const body = (req.body ?? {}) as { instruction?: unknown; chatChannel?: unknown; requestedByName?: unknown };
-  const instruction = typeof body.instruction === 'string' ? body.instruction.trim() : '';
+  const body = (req.body ?? {}) as { instruction?: unknown; chatChannel?: unknown; requestedByName?: unknown; commentId?: unknown; resolveOnApply?: unknown };
+  const typed = typeof body.instruction === 'string' ? body.instruction.trim() : '';
   if (!documentId) throw new ValidationError('documentId is required');
-  if (!instruction) throw new ValidationError('instruction is required');
-  if (instruction.length > 2000) throw new ValidationError('instruction must be 2000 characters or fewer');
+  if (!typed) throw new ValidationError('instruction is required');
+  if (typed.length > 2000) throw new ValidationError('instruction must be 2000 characters or fewer');
   const userId = req.user!.sub;
   const requestedByName = typeof body.requestedByName === 'string' && body.requestedByName ? body.requestedByName.slice(0, 80) : userId;
   const chatChannel = typeof body.chatChannel === 'string' ? body.chatChannel : undefined;
+
+  // WS-J lane B: a comment handed to the agent. The run answers it — the
+  // instruction carries the comment and its anchored text, and the comment is
+  // linked to the run so its completion replies to (and may resolve) it.
+  if (body.commentId !== undefined && (typeof body.commentId !== 'string' || !body.commentId.trim())) {
+    throw new ValidationError('commentId must be a non-empty string');
+  }
+  if (body.resolveOnApply !== undefined && typeof body.resolveOnApply !== 'boolean') {
+    throw new ValidationError('resolveOnApply must be a boolean');
+  }
+  const commentId = typeof body.commentId === 'string' ? body.commentId.trim() : undefined;
+  let instruction = typed;
+  if (commentId) {
+    await documentReadGate().assertCanRead(req, documentId);
+    const comment = await documentCommentRepo.getComment(documentId, commentId);
+    if (!comment || comment.documentId !== documentId) throw new NotFoundError('Comment not found in this document');
+    if (comment.parentCommentId) throw new ValidationError('Ask the agent about the thread, not a reply');
+    instruction = commentScopedInstruction(typed, comment);
+  }
 
   const bridge = getPipelineBridge();
   if (!bridge?.trigger) {
@@ -36,13 +61,28 @@ documentAgentEditRouter.post('/:documentId/agent-edit', requireAuth, asyncHandle
   const out = await Promise.resolve(bridge.trigger({
     pipelineId: DOCUMENT_AGENT_EDIT_PIPELINE_ID,
     definition: definition as never,
-    triggerPayload: { documentId, instruction, requestedBy: userId, requestedByName, ...(chatChannel ? { chatChannel } : {}), requestId: randomUUID() },
+    triggerPayload: { documentId, instruction, requestedBy: userId, requestedByName, ...(chatChannel ? { chatChannel } : {}), ...(commentId ? { commentId } : {}), requestId: randomUUID() },
     triggeredBy: { userId },
   } as never));
   const runId = (out as { runId: string }).runId;
   getRunPersistenceService()?.registerTrigger({ runId, pipelineId: DOCUMENT_AGENT_EDIT_PIPELINE_ID, userId, triggerType: 'manual', at: new Date().toISOString() });
-  log.info({ runId, documentId, userId }, 'document agent edit triggered');
-  res.status(202).json({ runId, pipelineId: DOCUMENT_AGENT_EDIT_PIPELINE_ID, documentId, agent: { userId: 'agent:haiku', displayName: 'Haiku' } });
+  let resolveOnApply: boolean | undefined;
+  if (commentId) {
+    resolveOnApply = body.resolveOnApply !== false;
+    const link = { documentId, commentId, pipelineId: DOCUMENT_AGENT_EDIT_PIPELINE_ID };
+    // Both before the answer: the run takes seconds (a model call), and the
+    // terminal event must find the link and a pending request.
+    getCommentAgentResolver()?.remember(runId, link);
+    await linkRunToComment(runId, link);
+    const comment = await documentCommentRepo.setAgentRequest(documentId, commentId, {
+      runId, pipelineId: DOCUMENT_AGENT_EDIT_PIPELINE_ID, state: 'pending', resolveOnApply,
+      requestedBy: userId, requestedByName, at: new Date().toISOString(),
+    });
+    publishSignal(`doc-comments:${documentId}`, 'doc:comment_updated', { documentId, comment })
+      .catch((err: unknown) => log.error({ event: 'doc:comment_updated', err: String(err) }, 'signal publish failed'));
+  }
+  log.info({ runId, documentId, userId, ...(commentId ? { commentId } : {}) }, 'document agent edit triggered');
+  res.status(202).json({ runId, pipelineId: DOCUMENT_AGENT_EDIT_PIPELINE_ID, documentId, ...(commentId ? { commentId, resolveOnApply } : {}), agent: { userId: 'agent:haiku', displayName: 'Haiku' } });
 }));
 
 // POST /api/documents/:documentId/transform-run — "Transform to <type>" as a
