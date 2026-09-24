@@ -49,7 +49,7 @@ describe('resolveStoredRun (NFR #136)', () => {
   });
 });
 
-describe('stored run detail carries the definition it ran (NFR #184)', () => {
+describe('stored run detail carries the definition it ran (NFR #186)', () => {
   const definitionSnapshot = { nodes: [{ id: 'trigger' }, { id: 'draft' }, { id: 'render' }], edges: [] };
 
   it('answers pipelineDefinitionSnapshot from the row, so a reader never needs the owner\'s definition', async () => {

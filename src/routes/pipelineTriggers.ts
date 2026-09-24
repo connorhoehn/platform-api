@@ -489,7 +489,7 @@ pipelineTriggersRouter.get(
  * but the owner, and for a chat-command pipeline (`deck-generate`) until its
  * first run since boot. In order: the platform's own pipeline, the run
  * owner's stored definition, the chat command that runs this pipeline.
- * The caller has already passed run access (NFR #184).
+ * The caller has already passed run access (NFR #186).
  */
 async function withRunDefinition(
   snap: Record<string, unknown>,

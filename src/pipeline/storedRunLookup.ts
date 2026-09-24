@@ -51,7 +51,7 @@ export async function resolveStoredRun(
  * already carries it). A card orders its steps by it; without it the client
  * read `GET /api/pipelines/:pipelineId`, which is the CALLER's definition —
  * a 404 for anyone but the owner, and for a command pipeline (`deck-generate`)
- * until its first run since the pod started (realtime-examples NFR #184).
+ * until its first run since the pod started (realtime-examples NFR #186).
  */
 export function storedRunDetail(item: PipelineRunItem): Record<string, unknown> {
   return {
