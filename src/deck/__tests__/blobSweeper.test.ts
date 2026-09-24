@@ -16,7 +16,8 @@ import {
   DdbPresentationDocumentStore, PresentationRevisionConflictError, PresentationRowTooLargeError,
   contentHash, slideContentKey, type PresentationDocumentRow,
 } from '../presentationDocuments';
-import { isSlideListKey } from '../presentationDocuments';
+import { DOCUMENTS_TABLE, isSlideListKey } from '../presentationDocuments';
+import { PRESENTATION_REVISIONS_TABLE } from '../presentationRevisionItems';
 import {
   DEFAULT_DECK_BLOB_GRACE_MS, collectBlobReferences, createDeckBlobSweepTask, sweepDeckBlobs, type LiveRowSource,
 } from '../blobSweeper';
@@ -467,7 +468,9 @@ describe('every reference shape survives a sweep; unknown shapes fail closed (NF
     const client = { async send(command: any) { sent.push(command.input); return { Items: [{ documentId: 'a' }] }; } } as unknown as DynamoDBDocumentClient;
     const rows = [];
     for await (const row of scanPresentationRows(client)()) rows.push(row);
-    expect(rows).toHaveLength(1);
-    expect(sent[0]!.FilterExpression).toBeUndefined();
+    // The document rows, then the revision items (NFR #188) — both unfiltered.
+    expect(rows).toHaveLength(2);
+    expect(sent.map((input) => input.TableName)).toEqual([DOCUMENTS_TABLE, PRESENTATION_REVISIONS_TABLE]);
+    expect(sent.every((input) => input.FilterExpression === undefined)).toBe(true);
   });
 });

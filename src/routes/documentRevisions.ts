@@ -36,6 +36,7 @@ import {
   PRESENTATION_DOCUMENT_TYPE,
   PresentationRevisionConflictError,
   type PresentationDocumentRow,
+  type RevisionPage,
   type StoredRevision,
   type StoredSlide,
 } from '../deck/presentationDocuments';
@@ -76,10 +77,14 @@ async function assertCanReadDocument(req: Request, row: PresentationDocumentRow,
 async function loadRevision(req: Request, documentId: string, revisionId: string): Promise<{ row: PresentationDocumentRow; revision: StoredRevision }> {
   if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
   if (!ID.test(revisionId)) throw new ValidationError('revisionId is invalid');
-  const row = await getPresentationDocumentStore().get(documentId);
+  const store = getPresentationDocumentStore();
+  // The head row, then the one revision (its item, NFR #188) — not every revision.
+  const row = store.getRow ? await store.getRow(documentId) : await store.get(documentId);
   if (!row) throw new NotFoundError('Document not found');
   await assertCanReadDocument(req, row, documentId);
-  const revision = (row.revisions ?? []).find((candidate) => candidate.id === revisionId);
+  const revision = store.getRevision
+    ? await store.getRevision(documentId, revisionId, row)
+    : (row.revisions ?? []).find((candidate) => candidate.id === revisionId);
   if (!revision) throw new NotFoundError('Revision not found');
   return { row, revision };
 }
@@ -121,35 +126,50 @@ function slideRefs(slides: readonly StoredSlide[] | null | undefined) {
  * slide manifests: the unpaged form reads one blob per older revision. An older
  * revision's slides come from `GET …/revisions/:revisionId`. Without `limit` the
  * answer is the full oldest-first list it always was (scripts, seeders).
+ *
+ * NFR #188: once a deck's revisions are items of `presentation-revisions`, a
+ * page is the head row's GetItem (auth, title, total) plus ONE Query, newest
+ * first (`Limit`, `ExclusiveStartKey`). A row still carrying its array is
+ * merged and sliced as before.
  */
 documentRevisionsRouter.get('/', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const documentId = String(req.params.documentId ?? '');
   if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
   const store = getPresentationDocumentStore();
-  const stored = await store.get(documentId);
+  const paged = req.query.limit !== undefined;
+  const stored = paged && store.getRow ? await store.getRow(documentId) : await store.get(documentId);
   if (!stored) throw new NotFoundError('Document not found');
   await assertCanReadDocument(req, stored, documentId);
-  if (req.query.limit !== undefined) {
+  if (paged) {
     const limit = Number(req.query.limit);
     if (!Number.isInteger(limit) || limit < 1 || limit > MAX_REVISION_PAGE) throw new ValidationError(`limit must be 1–${MAX_REVISION_PAGE}`);
     const before = typeof req.query.before === 'string' && req.query.before ? req.query.before : undefined;
     if (before !== undefined && !ID.test(before)) throw new ValidationError('before is invalid');
-    const all = stored.revisions ?? [];
-    const end = before === undefined ? all.length : all.findIndex((revision) => revision.id === before);
-    if (end === -1) throw new NotFoundError('Revision not found');
-    const start = Math.max(0, end - limit);
-    const head = all[all.length - 1];
-    const page = all.slice(start, end).reverse().map((revision) => ({
+    let listed: RevisionPage;
+    if (store.listRevisions) {
+      const answer = await store.listRevisions(documentId, { limit, ...(before !== undefined ? { before } : {}) }, stored);
+      if (!answer) throw new NotFoundError('Document not found');
+      if (answer.missingCursor) throw new NotFoundError('Revision not found');
+      listed = answer;
+    } else {
+      const all = stored.revisions ?? [];
+      const end = before === undefined ? all.length : all.findIndex((revision) => revision.id === before);
+      if (end === -1) throw new NotFoundError('Revision not found');
+      const start = Math.max(0, end - limit);
+      listed = { revisions: all.slice(start, end).reverse(), total: all.length, nextCursor: start > 0 ? all[start]!.id : null };
+    }
+    const headId = `v${listed.total}`;
+    const page = listed.revisions.map((revision) => ({
       ...revisionSummary(revision, stored.title),
-      ...(revision === head && Array.isArray(revision.slides) ? { slides: slideRefs(revision.slides) } : {}),
+      ...(revision.id === headId && Array.isArray(revision.slides) ? { slides: slideRefs(revision.slides) } : {}),
     }));
     res.status(200).json({
       documentId,
       title: stored.title ?? 'Untitled',
       type: stored.type ?? PRESENTATION_DOCUMENT_TYPE,
-      total: all.length,
+      total: listed.total,
       revisions: page,
-      nextCursor: start > 0 ? all[start]!.id : null,
+      nextCursor: listed.nextCursor,
     });
     return;
   }
@@ -189,11 +209,11 @@ deckRowSummariesRouter.get('/', requireAuth, asyncHandler(async (req: Request, r
   const store = getPresentationDocumentStore();
   const summaries: Record<string, { revisionLabel: string; slideCount: number }> = {};
   await Promise.all(ids.map(async (documentId) => {
-    const row = await store.get(documentId);
+    const row = store.getRow ? await store.getRow(documentId) : await store.get(documentId);
     if (!row) return;
     const decision = await canReadDocument(row, req.user, documentId);
     if (!decision.allow) return;
-    const head = (row.revisions ?? [])[(row.revisions ?? []).length - 1];
+    const head = row.headRevision ?? (row.revisions ?? [])[(row.revisions ?? []).length - 1];
     if (!head?.label) return;
     summaries[documentId] = { revisionLabel: head.label, slideCount: Number(head.slideCount ?? 0) };
   }));

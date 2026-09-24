@@ -22,8 +22,9 @@
 // VolumeImageBlobStore), which now stores assets as well as images.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { GetCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import { docClient as defaultDocClient } from '../lib/aws-clients';
+import { GetCommand, PutCommand, TransactWriteCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import type { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { docClient as defaultDocClient, ddbClient as defaultDdbClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
 import {
   DdbImageBlobStore, IMAGE_BLOB_SIZE_CAP_BYTES,
@@ -38,6 +39,11 @@ import { PPTX_CONTENT_TYPE } from './renderPptx';
 import { SVG_CONTENT_TYPE } from './renderSlideSvg';
 import { ChunkedBlobStore, assertChunkedBlobFits } from './chunkedBlobStore';
 import { PPTX_CONTENT_KEY, buildPptxOnce, pptxContentKey, recalledPptx, rememberPptx } from './pptxCache';
+import {
+  PRESENTATION_REVISIONS_TABLE, ensurePresentationRevisionsTable, getRevisionItem, mergeRevisions,
+  queryAllRevisionItems, queryRevisionPage, revKey, revisionCountOf, summarizeRevision, versionOf,
+  type HeadRevisionSummary, type RevisionItem,
+} from './presentationRevisionItems';
 
 export const DOCUMENTS_TABLE = tableName(process.env.DYNAMODB_DOCUMENTS_TABLE || 'crdt-documents');
 export const PRESENTATION_DOCUMENT_TYPE = 'presentation';
@@ -192,6 +198,24 @@ export interface PresentationDocumentRow {
    * its cover slide (`slideId`) and the bytes come from the slide's blob.
    */
   revisionPreviews?: Record<string, { contentType: string; body?: string; encoding?: string; slideId?: string }>;
+  /**
+   * How many revisions exist (NFR #188). Present once a revision was written
+   * as its own item in `presentation-revisions` (or the row was migrated);
+   * absent, `revisions[]` is the whole list.
+   */
+  revisionCount?: number;
+  /** The newest revision in one line, so a list chip needs no revision read. */
+  headRevision?: HeadRevisionSummary;
+}
+
+/** One page of revisions, newest first. */
+export interface RevisionPage {
+  revisions: StoredRevision[];
+  total: number;
+  /** The id to pass as `before` for the next older page; null on the last. */
+  nextCursor: string | null;
+  /** `before` named no revision of this document. */
+  missingCursor?: true;
 }
 
 export interface AppendRevisionInput {
@@ -248,11 +272,31 @@ export class PresentationRevisionConflictError extends Error {
   }
 }
 
-/** How many times an unconditioned append re-reads and takes the next id. */
-export const MAX_APPEND_ATTEMPTS = 5;
+/**
+ * How many times an unconditioned append re-reads and takes the next id.
+ * Each lost race means another writer landed, so N racing writers need at
+ * most N−1 retries; 30 covers the 20-at-once check with room (NFR #188).
+ */
+export const MAX_APPEND_ATTEMPTS = 30;
 
 function conditionFailed(error: unknown): boolean {
-  return (error as { name?: string })?.name === 'ConditionalCheckFailedException';
+  const name = (error as { name?: string })?.name;
+  if (name === 'ConditionalCheckFailedException') return true;
+  if (name !== 'TransactionCanceledException') return false;
+  // Either half of the append transaction refused: the version exists, or the
+  // head row's count moved — both mean another writer landed first. A
+  // TransactionConflict is two transactions on the same item at once: same.
+  const reasons = (error as { CancellationReasons?: Array<{ Code?: string }> }).CancellationReasons;
+  if (!reasons?.length) return /ConditionalCheckFailed|TransactionConflict/.test(String((error as Error).message));
+  return reasons.some((reason) => reason?.Code === 'ConditionalCheckFailed' || reason?.Code === 'TransactionConflict');
+}
+
+/** The head's id from the row alone: the summary, the array's last entry, or the count. */
+function headIdOf(row: PresentationDocumentRow | null): string | null {
+  if (!row) return null;
+  if (row.headRevision?.id) return row.headRevision.id;
+  if (row.revisionCount !== undefined) return row.revisionCount > 0 ? `v${row.revisionCount}` : null;
+  return headOf(row)?.id ?? null;
 }
 
 function headOf(row: PresentationDocumentRow | null): StoredRevision | null {
@@ -280,7 +324,14 @@ export interface SlidePreview {
 
 /** The document half of the store, so a test can hand the handler a fake. */
 export interface PresentationDocumentStore {
+  /** The row with EVERY revision in `revisions`, oldest first, wherever each is stored. */
   get(documentId: string): Promise<PresentationDocumentRow | null>;
+  /** The head row alone — one GetItem; `revisions` holds only what the row itself still carries. */
+  getRow?(documentId: string): Promise<PresentationDocumentRow | null>;
+  /** One revision: its item, else the row's array. */
+  getRevision?(documentId: string, revisionId: string, row?: PresentationDocumentRow | null): Promise<StoredRevision | null>;
+  /** One page, newest first: a single Query once the row's revisions are items. */
+  listRevisions?(documentId: string, opts: { limit: number; before?: string }, row?: PresentationDocumentRow | null): Promise<RevisionPage | null>;
   appendRevision(input: AppendRevisionInput): Promise<AppendRevisionResult>;
   /**
    * One slide's bytes: the row's own markup first, the blob store second.
@@ -450,7 +501,7 @@ export function slideBlobKey(documentId: string, revisionId: string, slideId: st
 }
 
 export function nextRevisionId(row: PresentationDocumentRow | null): string {
-  return `v${(row?.revisions?.length ?? 0) + 1}`;
+  return `v${revisionCountOf(row) + 1}`;
 }
 
 export interface DdbPresentationDocumentStoreOptions {
@@ -463,6 +514,15 @@ export interface DdbPresentationDocumentStoreOptions {
    */
   mirror?: AssetBlobStore | null;
   now?: () => Date;
+  /**
+   * Where revisions are written, one item each (NFR #188). Defaults to
+   * `presentation-revisions` for the process-wide client; a store handed its
+   * own `docClient` (a test's fake table) keeps the single-row array unless it
+   * names a table here. `null` = the array (also `PRESENTATION_REVISION_ITEMS=off`).
+   */
+  revisionTable?: string | null;
+  /** For creating the revisions table on first use. */
+  ddbClient?: DynamoDBClient;
 }
 
 export class DdbPresentationDocumentStore implements PresentationDocumentStore {
@@ -479,9 +539,17 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
    */
   private readonly mirror: AssetBlobStore | null;
   private readonly now: () => Date;
+  /** Null = revisions stay in the row's array (the pre-#188 layout). */
+  private readonly revisionTable: string | null;
+  private readonly ddbClient: DynamoDBClient | null;
+  private tableReady: Promise<void> | null = null;
 
   constructor(opts: DdbPresentationDocumentStoreOptions = {}) {
     this.docClient = opts.docClient ?? defaultDocClient;
+    this.revisionTable = process.env.PRESENTATION_REVISION_ITEMS === 'off'
+      ? null
+      : opts.revisionTable !== undefined ? opts.revisionTable : (opts.docClient ? null : PRESENTATION_REVISIONS_TABLE);
+    this.ddbClient = opts.ddbClient ?? (opts.docClient ? null : defaultDdbClient);
     // NFR #61: a DynamoDB-backed store holds a body over one item's cap as
     // several items (chunkedBlobStore.ts), so a large `.pptx` keeps its
     // durable copy instead of failing the save.
@@ -506,9 +574,67 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     }, 'presentation blobs will be written here');
   }
 
-  async get(documentId: string): Promise<PresentationDocumentRow | null> {
+  /** The revisions table exists before the first write names it (idempotent, once per process). */
+  private ready(): Promise<void> {
+    if (!this.revisionTable || !this.ddbClient) return Promise.resolve();
+    if (!this.tableReady) {
+      this.tableReady = ensurePresentationRevisionsTable(this.ddbClient, this.revisionTable)
+        .catch((error) => { this.tableReady = null; throw error; });
+    }
+    return this.tableReady;
+  }
+
+  /** True when this row's revisions (some or all) are items. */
+  private hasItems(row: PresentationDocumentRow | null): boolean {
+    return !!this.revisionTable && typeof row?.revisionCount === 'number';
+  }
+
+  async getRow(documentId: string): Promise<PresentationDocumentRow | null> {
     const result = await this.docClient.send(new GetCommand({ TableName: DOCUMENTS_TABLE, Key: { documentId } }));
     return (result.Item as PresentationDocumentRow | undefined) ?? null;
+  }
+
+  async get(documentId: string): Promise<PresentationDocumentRow | null> {
+    const row = await this.getRow(documentId);
+    if (!row || !this.hasItems(row)) return row;
+    const items = await queryAllRevisionItems(this.docClient, documentId, this.revisionTable!);
+    return { ...row, revisions: mergeRevisions(row.revisions, items) };
+  }
+
+  async getRevision(documentId: string, revisionId: string, rowIn?: PresentationDocumentRow | null): Promise<StoredRevision | null> {
+    const row = rowIn === undefined ? await this.getRow(documentId) : rowIn;
+    if (!row) return null;
+    const version = versionOf(revisionId);
+    if (this.hasItems(row) && version !== null) {
+      const item = await getRevisionItem(this.docClient, documentId, version, this.revisionTable!);
+      if (item) return item;
+    }
+    return row.revisions?.find((candidate) => candidate.id === revisionId) ?? null;
+  }
+
+  async listRevisions(documentId: string, opts: { limit: number; before?: string }, rowIn?: PresentationDocumentRow | null): Promise<RevisionPage | null> {
+    const row = rowIn === undefined ? await this.getRow(documentId) : rowIn;
+    if (!row) return null;
+    const total = revisionCountOf(row);
+    // Every revision an item (a new or migrated row): ONE Query, newest first.
+    if (this.hasItems(row) && !row.revisions?.length) {
+      const beforeVersion = opts.before === undefined ? undefined : versionOf(opts.before) ?? undefined;
+      if (opts.before !== undefined && (beforeVersion === undefined || beforeVersion > total)) return { revisions: [], total, nextCursor: null, missingCursor: true };
+      const page = await queryRevisionPage(this.docClient, documentId, { limit: opts.limit, ...(beforeVersion !== undefined ? { beforeVersion } : {}) }, this.revisionTable!);
+      const last = page.revisions[page.revisions.length - 1];
+      // Versions are 1..total with no gaps, so an older one exists exactly when
+      // the page's oldest is past v1 (a LastEvaluatedKey on an exact last page would say otherwise).
+      const lastVersion = versionOf(last?.id);
+      return { revisions: page.revisions, total, nextCursor: last && (lastVersion === null ? page.more : lastVersion > 1) ? last.id : null };
+    }
+    // The array still holds some (not yet migrated): merge, then slice.
+    const all = this.hasItems(row)
+      ? mergeRevisions(row.revisions, await queryAllRevisionItems(this.docClient, documentId, this.revisionTable!))
+      : row.revisions ?? [];
+    const end = opts.before === undefined ? all.length : all.findIndex((revision) => revision.id === opts.before);
+    if (end === -1) return { revisions: [], total: all.length, nextCursor: null, missingCursor: true };
+    const start = Math.max(0, end - opts.limit);
+    return { revisions: all.slice(start, end).reverse(), total: all.length, nextCursor: start > 0 ? all[start]!.id : null };
   }
 
   /**
@@ -518,22 +644,27 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
    * generates a deck unprompted may not).
    */
   async appendRevision(input: AppendRevisionInput): Promise<AppendRevisionResult> {
+    await this.ready();
     for (let attempt = 1; ; attempt += 1) {
-      const existing = await this.get(input.documentId);
-      if (input.expectedHead !== undefined && (headOf(existing)?.id ?? null) !== input.expectedHead) {
-        throw new PresentationRevisionConflictError(input.documentId, headOf(existing), existing?.revisions?.length ?? 0);
+      const existing = this.revisionTable ? await this.getRow(input.documentId) : await this.get(input.documentId);
+      if (input.expectedHead !== undefined && headIdOf(existing) !== input.expectedHead) {
+        throw new PresentationRevisionConflictError(input.documentId, await this.headRevisionOf(existing), revisionCountOf(existing));
       }
       let written: AppendRevisionResult;
       try {
-        written = await this.writeRevision(input, existing);
+        written = this.revisionTable
+          ? await this.writeRevisionItem(input, existing)
+          : await this.writeRevision(input, existing);
       } catch (error) {
         if (!conditionFailed(error)) throw error;
         // Someone else's revision took this id between our read and our write.
-        const current = await this.get(input.documentId);
-        log.info({ documentId: input.documentId, attempt, head: headOf(current)?.id ?? null }, 'presentation revision raced another save');
+        const current = this.revisionTable ? await this.getRow(input.documentId) : await this.get(input.documentId);
+        log.info({ documentId: input.documentId, attempt, head: headIdOf(current) }, 'presentation revision raced another save');
         if (input.expectedHead !== undefined || attempt >= MAX_APPEND_ATTEMPTS) {
-          throw new PresentationRevisionConflictError(input.documentId, headOf(current), current?.revisions?.length ?? 0);
+          throw new PresentationRevisionConflictError(input.documentId, await this.headRevisionOf(current), revisionCountOf(current));
         }
+        // A short jittered pause: N writers retrying in lockstep collide again.
+        await new Promise((resolve) => setTimeout(resolve, 5 + Math.floor(Math.random() * 25)));
         continue;
       }
       // NFR #15: every writer (a `/deck` run, a revise run, a save, an Undo)
@@ -552,6 +683,149 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
         .catch(() => { /* a signal never fails a write */ });
       return written;
     }
+  }
+
+  /** The newest revision in full (a conflict answer carries its spec for a rebase). */
+  private async headRevisionOf(row: PresentationDocumentRow | null): Promise<StoredRevision | null> {
+    const headId = headIdOf(row);
+    if (!row || !headId) return null;
+    return (await this.getRevision(row.documentId, headId, row).catch(() => null)) ?? headOf(row);
+  }
+
+  /**
+   * One attempt, one item per revision (NFR #188): new blobs, then ONE
+   * transaction — the revision item, only if its version does not exist, and
+   * the head row, only if it still counts the revisions this attempt read. The
+   * row no longer grows with each save; each revision keeps its own spec and
+   * slide list inline on its own item.
+   */
+  private async writeRevisionItem(input: AppendRevisionInput, existing: PresentationDocumentRow | null): Promise<AppendRevisionResult> {
+    const table = this.revisionTable!;
+    const at = this.now().toISOString();
+    const expected = revisionCountOf(existing);
+    const version = expected + 1;
+    const revisionId = `v${version}`;
+    if (!input.pptx && !input.spec) throw new Error('appendRevision: a revision with no .pptx needs its spec');
+    const pptxKey = input.spec ? pptxContentKey(input.spec) : pptxBlobKey(input.documentId, revisionId, randomUUID().slice(0, 8));
+    const pptxMeta = { contentType: PPTX_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId}.pptx` };
+    if (input.pptx && (this.mirror || this.blobStore instanceof ChunkedBlobStore)) {
+      assertChunkedBlobFits(pptxKey, input.pptx.byteLength, 'rendered deck (.pptx)');
+    }
+    const pptxAsset: BlobAsset = { key: pptxKey, contentType: PPTX_CONTENT_TYPE, sizeBytes: input.pptx?.byteLength ?? 0 };
+
+    // Slides the head already stored are the same blobs (content keys).
+    const head = expected > 0 ? await this.headRevisionOf(existing) : null;
+    const known = new Map<string, BlobAsset>();
+    for (const slide of head?.slides ?? []) {
+      if (slide?.sha256 && slide.asset?.key === slideContentKey(slide.sha256)) known.set(slide.sha256, slide.asset);
+    }
+    const pending = new Map<string, { key: string; body: Buffer; meta: { contentType: string; createdBy: string; label: string } }>();
+    const slides: StoredSlide[] = input.slides.map((slide, index) => {
+      const body = Buffer.from(slide.svg, 'utf8');
+      const sha256 = contentHash(body);
+      const asset = known.get(sha256) ?? { key: slideContentKey(sha256), contentType: SVG_CONTENT_TYPE, sizeBytes: body.byteLength };
+      if (!known.has(sha256) && !pending.has(asset.key)) {
+        pending.set(asset.key, { key: asset.key, body, meta: { contentType: SVG_CONTENT_TYPE, createdBy: input.createdBy, label: `${input.title} ${revisionId} ${slide.id}` } });
+      }
+      return { id: slide.id, index: index + 1, title: slide.title, previewHandle: deckPreviewHandle(input.documentId, revisionId, slide.id), asset, sha256 };
+    });
+
+    const revision: HeadRevision = {
+      id: revisionId,
+      label: input.label?.trim() ? input.label.trim().slice(0, 80) : revisionId,
+      createdAt: at,
+      createdBy: input.createdBy,
+      slideCount: slides.length,
+      asset: pptxAsset,
+      slides,
+      ...(input.spec ? { spec: input.spec } : {}),
+      ...(input.spec?.title?.trim() ? { heading: input.spec.title.trim().slice(0, 120) } : {}),
+      ...(input.producedBy ? { producedBy: input.producedBy } : {}),
+      ...(input.sources ?? (input.spec ? revisionSources(input.spec, input.transcriptIds) : undefined)
+        ? { sources: input.sources ?? revisionSources(input.spec!, input.transcriptIds) }
+        : {}),
+    };
+    const item: RevisionItem = { documentId: input.documentId, rev: revKey(version), version, revision };
+    const outline = slides.map((slide) => ({ id: slide.id, title: slide.title }));
+    const revisionPreviews = { ...(existing?.revisionPreviews ?? {}), ...firstSlidePreview(revisionId, slides) };
+    const headRevision = summarizeRevision(revision);
+
+    // Both items weighed before anything is stored.
+    const itemBytes = estimateItemBytes(item as unknown as Record<string, unknown>);
+    const rowBytes = estimateItemBytes({ ...(existing ?? {}), outline, pageCount: slides.length, revisionPreviews, revisionCount: version, headRevision, updatedAt: at });
+    const estimated = Math.max(itemBytes, rowBytes);
+    if (estimated > MAX_ROW_BYTES) {
+      log.error({ documentId: input.documentId, itemBytes, rowBytes, maxBytes: MAX_ROW_BYTES }, 'presentation save refused: the revision or the row would be over the size guard');
+      throw new PresentationRowTooLargeError(input.documentId, estimated);
+    }
+    if (estimated > WARN_ROW_BYTES) {
+      log.warn({ documentId: input.documentId, itemBytes, rowBytes, maxBytes: MAX_ROW_BYTES }, 'presentation revision or row is approaching the size guard');
+    }
+
+    if (input.pptx) {
+      if (this.mirror) await this.mirror.putBlob(pptxKey, input.pptx, pptxMeta);
+      await this.blobStore.putBlob(pptxKey, input.pptx, pptxMeta);
+      rememberPptx(pptxKey, input.pptx);
+    }
+    await Promise.all([...pending.values()].map(async (blob) => {
+      if (this.mirror) await this.mirror.putBlob(blob.key, blob.body, blob.meta);
+      await this.blobStore.putBlob(blob.key, blob.body, blob.meta);
+    }));
+
+    const putItem = {
+      Put: {
+        TableName: table,
+        Item: item,
+        ConditionExpression: 'attribute_not_exists(rev)',
+      },
+    };
+    const headWrite = !existing
+      ? {
+        Put: {
+          TableName: DOCUMENTS_TABLE,
+          Item: {
+            documentId: input.documentId,
+            title: input.title,
+            type: PRESENTATION_DOCUMENT_TYPE,
+            status: 'draft',
+            createdBy: input.createdBy,
+            createdAt: at,
+            updatedAt: at,
+            outline,
+            pageCount: slides.length,
+            revisionPreviews,
+            revisionCount: version,
+            headRevision,
+          },
+          ConditionExpression: 'attribute_not_exists(documentId)',
+        },
+      }
+      : {
+        Update: {
+          TableName: DOCUMENTS_TABLE,
+          Key: { documentId: input.documentId },
+          UpdateExpression: 'SET #type = :type, #title = :title, revisionPreviews = :revisionPreviews, outline = :outline, pageCount = :pageCount, updatedAt = :updatedAt, revisionCount = :count, headRevision = :head',
+          // The CAS on the version: the count this attempt read, wherever it
+          // was kept — `revisionCount`, or (a row not yet written this way)
+          // the array's length, where a missing array counts as 0.
+          ConditionExpression: 'attribute_exists(documentId) AND (revisionCount = :expected OR (attribute_not_exists(revisionCount) AND '
+            + (expected === 0 ? '(attribute_not_exists(revisions) OR size(revisions) = :expected)))' : 'size(revisions) = :expected))'),
+          ExpressionAttributeNames: { '#type': 'type', '#title': 'title' },
+          ExpressionAttributeValues: {
+            ':expected': expected,
+            ':type': PRESENTATION_DOCUMENT_TYPE,
+            ':title': existing.title || input.title,
+            ':revisionPreviews': revisionPreviews,
+            ':outline': outline,
+            ':pageCount': slides.length,
+            ':updatedAt': at,
+            ':count': version,
+            ':head': headRevision,
+          },
+        },
+      };
+    await this.docClient.send(new TransactWriteCommand({ TransactItems: [putItem, headWrite] }));
+    return { documentId: input.documentId, revision };
   }
 
   /**
@@ -762,8 +1036,8 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
    * depends only on whether the volume outlived the row.
    */
   async revisionFile(documentId: string, revisionId: string, rowIn?: PresentationDocumentRow | null): Promise<SlidePreview | null> {
-    const row = rowIn ?? await this.get(documentId).catch(() => null);
-    const revision = row?.revisions?.find((candidate) => candidate.id === revisionId);
+    const row = rowIn ?? await (this.revisionTable ? this.getRow(documentId) : this.get(documentId)).catch(() => null);
+    const revision = row ? await this.getRevision(documentId, revisionId, row).catch(() => null) : null;
     if (!revision?.asset?.key) return null;
     const key = revision.asset.key;
     const contentType = revision.asset.contentType || PPTX_CONTENT_TYPE;
@@ -808,9 +1082,9 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
    * one whose markup was too big to keep on the row.
    */
   async slidePreview(documentId: string, revisionId: string, slideId: string): Promise<SlidePreview | null> {
-    const row = await this.get(documentId).catch(() => null);
+    const row = await (this.revisionTable ? this.getRow(documentId) : this.get(documentId)).catch(() => null);
     if (!row) return null;
-    const revision = row.revisions?.find((candidate) => candidate.id === revisionId);
+    const revision = await this.getRevision(documentId, revisionId, row).catch(() => null);
     const recorded = [
       ...(revision ? (await resolveRevisionSlides(this, revision)) ?? [] : []),
       ...(row.revisionSlides?.[revisionId] ?? []),

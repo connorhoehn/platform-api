@@ -21,6 +21,7 @@ import {
   type StoredSlide,
 } from '../../deck/presentationDocuments';
 import { SVG_CONTENT_TYPE } from '../../deck/renderSlideSvg';
+import { mergeRevisions, queryAllRevisionItems } from '../../deck/presentationRevisionItems';
 import type { AssetBlobStore } from '../../pipeline/image/ImageBlobStore';
 import { getAssetBlobStore } from '../../pipeline/image/visionServices';
 import type {
@@ -541,8 +542,16 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       : anchors.length || undefined;
     // An older revision's slide list is a manifest off the row (NFR #36); put
     // it back in place so each revision still names its own slides.
+    // NFR #188: a row whose revisions are items (`revisionCount` set) gets
+    // them back from `presentation-revisions`, merged with any array left.
     const hydrated = await Promise.resolve()
-      .then(() => withRevisionSlides((this.deps.presentations ?? getPresentationDocumentStore)(), row as unknown as PresentationDocumentRow))
+      .then(async () => {
+        const base = row as unknown as PresentationDocumentRow;
+        if (typeof base.revisionCount !== 'number') return base;
+        const items = await queryAllRevisionItems(this.client, documentId);
+        return { ...base, revisions: mergeRevisions(base.revisions, items) };
+      })
+      .then((full) => withRevisionSlides((this.deps.presentations ?? getPresentationDocumentStore)(), full))
       .catch(() => row as unknown as PresentationDocumentRow);
     const revisions = storedRevisionFacts(hydrated as unknown as Row);
     return {

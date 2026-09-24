@@ -45,6 +45,7 @@ import {
 import { getAssetBlobStore } from '../pipeline/image/visionServices';
 import { DOCUMENTS_TABLE, isSlideListKey } from './presentationDocuments';
 import { ChunkedBlobStore } from './chunkedBlobStore';
+import { PRESENTATION_REVISIONS_TABLE } from './presentationRevisionItems';
 
 /** Every key a presentation stores starts with this; nothing else does. */
 export const DECK_BLOB_PREFIX = 'deck-';
@@ -154,6 +155,25 @@ export function scanPresentationRows(docClient: DynamoDBDocumentClient = default
         TableName: DOCUMENTS_TABLE,
         ...(startKey ? { ExclusiveStartKey: startKey } : {}),
       }));
+      for (const item of page.Items ?? []) yield item as Record<string, unknown>;
+      startKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (startKey);
+    // NFR #188: revisions are items of their own table now — each one names
+    // its .pptx, slide SVGs, spec and slide-list blobs. A missing table is
+    // the only thing tolerated (nothing written there yet); any other error
+    // throws, so the sweep deletes nothing on a partial mark.
+    startKey = undefined;
+    do {
+      let page;
+      try {
+        page = await docClient.send(new ScanCommand({
+          TableName: PRESENTATION_REVISIONS_TABLE,
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }));
+      } catch (error) {
+        if ((error as { name?: string })?.name === 'ResourceNotFoundException') return;
+        throw error;
+      }
       for (const item of page.Items ?? []) yield item as Record<string, unknown>;
       startKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
     } while (startKey);

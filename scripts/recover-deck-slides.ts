@@ -22,6 +22,7 @@ import { getAssetBlobStore } from '../src/pipeline/image/visionServices';
 import { ChunkedBlobStore } from '../src/deck/chunkedBlobStore';
 import { DOCUMENTS_TABLE, DdbPresentationDocumentStore, contentHash, type PresentationDocumentRow } from '../src/deck/presentationDocuments';
 import { applySlideRecovery, censusSlides } from '../src/deck/slideRecovery';
+import { mergeRevisions, queryAllRevisionItems } from '../src/deck/presentationRevisionItems';
 
 const args = process.argv.slice(2);
 const APPLY = args.includes('--apply');
@@ -38,6 +39,10 @@ async function scanAll(): Promise<PresentationDocumentRow[]> {
     rows.push(...((page.Items ?? []) as unknown as PresentationDocumentRow[]));
     ExclusiveStartKey = page.LastEvaluatedKey;
   } while (ExclusiveStartKey);
+  // NFR #188: a row whose revisions are items gets them back, merged.
+  for (const row of rows) {
+    if (typeof row.revisionCount === 'number') row.revisions = mergeRevisions(row.revisions, await queryAllRevisionItems(docClient, row.documentId));
+  }
   return rows;
 }
 
