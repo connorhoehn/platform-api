@@ -194,6 +194,11 @@ export interface DeckBlobSweepOptions {
    * and an unreadable manifest stops the sweep from deleting anything.
    */
   readBlob?: (key: string) => Promise<Buffer | null>;
+  /**
+   * Mark and list, change nothing: no expiry cleared, no delete. The keys a
+   * real sweep would try to delete come back in `wouldDelete` (Loop 31 ppt).
+   */
+  dryRun?: boolean;
 }
 
 export interface DeckBlobSweepResult {
@@ -210,6 +215,8 @@ export interface DeckBlobSweepResult {
   expiryCleared?: number;
   /** Set when the sweep deliberately deleted nothing. */
   skipped?: string;
+  /** Dry run only: the unreferenced candidates a real sweep would delete. */
+  wouldDelete?: string[];
 }
 
 function defaultBlobReader(stores: SweepableAssetStore[]): (key: string) => Promise<Buffer | null> {
@@ -296,7 +303,7 @@ export async function sweepDeckBlobs(opts: DeckBlobSweepOptions): Promise<DeckBl
   // legacy expiry (DDB ttlEpoch) on it. Done whatever the delete decision is —
   // it only ever keeps bytes.
   let expiryCleared = 0;
-  for (let index = 0; index < opts.stores.length; index += 1) {
+  for (let index = 0; !opts.dryRun && index < opts.stores.length; index += 1) {
     const store = opts.stores[index]!;
     if (!store.clearExpiry) continue;
     for (const key of expiring[index]!) {
@@ -324,6 +331,11 @@ export async function sweepDeckBlobs(opts: DeckBlobSweepOptions): Promise<DeckBl
     // scan of the wrong table (a prefix mismatch) than a store with no decks.
     result.skipped = 'no presentation rows found; refusing to treat every deck blob as unreferenced';
     log.warn({ candidates: candidates.length }, `deck blob sweep: ${result.skipped}`);
+    return result;
+  }
+
+  if (opts.dryRun) {
+    result.wouldDelete = candidates.filter((key) => !referenced.has(key)).slice(0, maxDeletes);
     return result;
   }
 

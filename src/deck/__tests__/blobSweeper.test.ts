@@ -135,6 +135,19 @@ describe('sweepDeckBlobs — mark and sweep over live rows', () => {
     expect(await keys(primary)).toContain(sharedKey);
   });
 
+  it('a dry run names what it would delete and deletes nothing', async () => {
+    const { clock, primary, mirror, docs, store } = setup();
+    await store.appendRevision({ documentId: 'deck-keep', title: 'K', createdBy: 'u', pptx: Buffer.from('PK-k'), slides: [shared] });
+    await primary.putBlob('deck-svg-orphan.svg', Buffer.from('<svg/>'), { contentType: 'image/svg+xml' });
+    clock.advance(DEFAULT_DECK_BLOB_GRACE_MS + 1);
+    const before = await keys(primary);
+
+    const result = await sweepDeckBlobs({ stores: [mirror, primary], rows: docs.liveRows, now: clock.now, dryRun: true });
+    expect(result.wouldDelete).toEqual(['deck-svg-orphan.svg']);
+    expect(result.deleted).toBe(0);
+    expect(await keys(primary)).toEqual(before);
+  });
+
   it('keeps a blob a save rewrote after the sweep listed it (conditional delete)', async () => {
     const { clock, primary, mirror, docs, store } = setup();
     await store.appendRevision({ documentId: 'deck-keep', title: 'K', createdBy: 'u', pptx: Buffer.from('PK-k'), slides: [] });
