@@ -307,10 +307,16 @@ export const MAX_INLINE_SLIDE_BYTES = 300 * 1024;
 /**
  * The most a presentation row may weigh, estimated the way DynamoDB counts an
  * item. DynamoDB refuses anything over 400 KB with a raw ValidationException
- * that says nothing about decks; 20 KB under it the save is refused here
- * instead, with a sentence a person can act on.
+ * that says nothing about decks; 100 KB under it the save is refused here
+ * instead, with a sentence a person can act on (Loop 26: was 380 KB, which
+ * left no room for the estimate's error or for fields other writers add).
+ * Every save already spills earlier revisions' specs and slide lists to blobs,
+ * so a row this large is the head revision alone, or a pre-diet row not yet
+ * stripped (scripts/backfill-revision-slides.ts).
  */
-export const MAX_ROW_BYTES = 380 * 1024;
+export const MAX_ROW_BYTES = 300 * 1024;
+/** Past this, a save still lands but says so in the log, once per save. */
+export const WARN_ROW_BYTES = 200 * 1024;
 
 /** A row too big to write. 413, with the sizes in the message. */
 export class PresentationRowTooLargeError extends AppError {
@@ -655,7 +661,13 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       revisions,
       revisionPreviews,
     });
-    if (estimated > MAX_ROW_BYTES) throw new PresentationRowTooLargeError(input.documentId, estimated);
+    if (estimated > MAX_ROW_BYTES) {
+      log.error({ documentId: input.documentId, estimatedBytes: estimated, maxBytes: MAX_ROW_BYTES }, 'presentation save refused: the row would be over the size guard');
+      throw new PresentationRowTooLargeError(input.documentId, estimated);
+    }
+    if (estimated > WARN_ROW_BYTES) {
+      log.warn({ documentId: input.documentId, estimatedBytes: estimated, maxBytes: MAX_ROW_BYTES }, 'presentation row is approaching the size guard');
+    }
 
     // The durable copy first: a revision recorded with bytes only on a volume
     // that may not come back is the failure this whole file keeps fixing.

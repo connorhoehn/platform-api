@@ -169,6 +169,19 @@ describe('a slide’s markup lives in the blob store, by content (NFR #4)', () =
     expect(puts.mock.calls.filter(([key]) => String(key).startsWith('deck-svg-'))).toHaveLength(0);
   });
 
+  it('refuses at ~300 KB, well before DynamoDB\'s 400 KB error, and lands a 250 KB row (Loop 26)', async () => {
+    expect(MAX_ROW_BYTES).toBe(300 * 1024);
+    const deckWithNotes = (bytes: number) => ({ ...sampleDeck(), slides: sampleDeck().slides.map((slide) => ({ ...slide, notes: 'n'.repeat(Math.floor(bytes / sampleDeck().slides.length)) })) });
+    const big = new DdbPresentationDocumentStore({ docClient: fakeClient().client, blobStore: new InMemoryImageBlobStore(), mirror: null });
+    // 330 KB: DynamoDB would still take it; the guard does not.
+    await expect(big.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides, spec: deckWithNotes(330 * 1024) }))
+      .rejects.toBeInstanceOf(PresentationRowTooLargeError);
+    const { client, written } = fakeClient();
+    const fits = new DdbPresentationDocumentStore({ docClient: client, blobStore: new InMemoryImageBlobStore(), mirror: null });
+    await fits.appendRevision({ documentId: 'doc-1', title: 'Deck', createdBy: 'u', pptx: Buffer.from('PK'), slides, spec: deckWithNotes(250 * 1024) });
+    expect(estimateItemBytes(written() as unknown as Record<string, unknown>)).toBeGreaterThan(250 * 1024);
+  });
+
   it('estimates an item the way DynamoDB counts it', () => {
     expect(estimateItemBytes({ a: 'xyz' })).toBe(4);
     expect(estimateItemBytes({ list: ['ab', 'c'] })).toBe(4 + 3 + 3 + 2);
