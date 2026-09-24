@@ -130,7 +130,8 @@ import {
   type SweepTask,
 } from '../lib/replicaLiveness';
 import { createDDBLeaseStore } from '../lib/ddb-lease-store';
-import { docClient as leaseDocClient } from '../lib/aws-clients';
+import { docClient as leaseDocClient, ddbClient as ttlSweepDdbClient } from '../lib/aws-clients';
+import { defaultTtlSweepOverrides, localTtlSweepEnabled, sweepTtlTables } from '../lib/localTtlSweep';
 import { tableName as ddbTableName } from '../lib/ddb-table-name';
 import { CHAT_AGENT_LOOP_PIPELINE_ID } from '../chat/agentLoopPlanner';
 import { buildDocumentAgentHandlers } from '../documents/documentAgentPipeline';
@@ -1314,6 +1315,38 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     } });
   }
 
+  // NFR #223: dev-only TTL stand-in (DynamoDB Local never expires rows) for
+  // every table whose own TTL is ENABLED, on the sweep leader only. Fired and
+  // not awaited, so a long paced pass never holds the orphan scan (#59) back;
+  // it stops between deletes once leadership is lost.
+  let clusterSweepLeader: () => boolean = () => false;
+  if (!IS_TEST_ENV && localTtlSweepEnabled()) {
+    const everyMs = Number(process.env.LOCAL_TTL_SWEEP_EVERY_MS) > 0 ? Number(process.env.LOCAL_TTL_SWEEP_EVERY_MS) : 10 * 60_000;
+    let inflight: Promise<void> | null = null;
+    let lastStartMs = 0;
+    clusterSweepTasks.push({ name: 'local-ttl-sweep', run: async () => {
+      if (inflight || Date.now() - lastStartMs < everyMs) return;
+      lastStartMs = Date.now();
+      const dryRun = process.env.LOCAL_TTL_SWEEP_DRY_RUN === 'true';
+      inflight = sweepTtlTables({
+        ddb: ttlSweepDdbClient,
+        docClient: leaseDocClient,
+        prefix: ddbTableName(''),
+        overrides: defaultTtlSweepOverrides(ddbTableName),
+        dryRun,
+        shouldContinue: () => clusterSweepLeader(),
+      })
+        .then((tables) => {
+          for (const t of tables) {
+            if (t.expired > 0 || t.skipped > 0) bootstrapLog.info({ ...t, dryRun }, 'local TTL sweep (expired rows by the table\'s own TTL)');
+          }
+          bootstrapLog.info({ tables: tables.length, deleted: tables.reduce((n, t) => n + t.deleted, 0), expired: tables.reduce((n, t) => n + t.expired, 0), dryRun, ms: Date.now() - lastStartMs }, 'local TTL sweep pass');
+        })
+        .catch((err) => bootstrapLog.warn({ err: String(err) }, 'local TTL sweep failed'))
+        .finally(() => { inflight = null; });
+    } });
+  }
+
   // NFR #26: one replica sweeps, every interval, cluster-wide.
   const clusterSweeper = new ClusterSweeper({
     store: sweepLeaseStore,
@@ -1322,6 +1355,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
       ? Number(process.env.PLATFORM_CLUSTER_SWEEP_INTERVAL_MS)
       : 60_000,
   });
+  clusterSweepLeader = () => clusterSweeper.isLeader();
   // NFR #65: a pod replaced under Tilt boots the last BUILT image until the
   // live_update replay restarts it; it must not win sweep leadership (and
   // resume runs) with that stale code.

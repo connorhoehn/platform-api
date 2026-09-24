@@ -1,5 +1,7 @@
 import { DeleteCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
-import { localTtlSweepEnabled, sweepExpiredProcessedRows, sweepExpiredWorkGraphRows } from '../localTtlSweep';
+import { DescribeTableCommand, DescribeTimeToLiveCommand, ListTablesCommand } from '@aws-sdk/client-dynamodb';
+import { outboxTerminalTtlSeconds } from '../../services/outbox-drainer';
+import { defaultTtlSweepOverrides, localTtlSweepEnabled, sweepExpiredProcessedRows, sweepExpiredWorkGraphRows, sweepTtlTables } from '../localTtlSweep';
 
 describe('local TTL sweep (NFR #73)', () => {
   it('runs only when asked and never in production', () => {
@@ -57,5 +59,67 @@ describe('local TTL sweep (NFR #73)', () => {
     const dels = sent.filter((c) => c instanceof DeleteCommand);
     expect(dels.map((d) => d.input.Key)).toEqual([{ PK: 'WG#org#u', SK: 'DELTA#1' }, { PK: 'WG#org#u', SK: 'DELTA#2' }]);
     expect(dels[0].input.ConditionExpression).toBe('#ttl < :now AND begins_with(#pk, :wg)');
+  });
+});
+
+describe('sweepTtlTables (NFR #223)', () => {
+  function fakeDdb(tables: Record<string, { ttl?: { status: string; attr?: string }; keys: Array<{ AttributeName: string; KeyType: 'HASH' | 'RANGE' }> }>) {
+    return {
+      send: jest.fn(async (cmd: unknown) => {
+        if (cmd instanceof ListTablesCommand) return { TableNames: Object.keys(tables) };
+        if (cmd instanceof DescribeTimeToLiveCommand) {
+          const t = tables[cmd.input.TableName!].ttl;
+          return { TimeToLiveDescription: t ? { TimeToLiveStatus: t.status, AttributeName: t.attr } : { TimeToLiveStatus: 'DISABLED' } };
+        }
+        if (cmd instanceof DescribeTableCommand) return { Table: { KeySchema: tables[cmd.input.TableName!].keys } };
+        throw new Error('unexpected');
+      }),
+    };
+  }
+
+  it('sweeps only tables whose own TTL is ENABLED, by that attribute and full key, with overrides', async () => {
+    const ddb = fakeDdb({
+      'p-social-outbox': { ttl: { status: 'ENABLED', attr: 'ttl' }, keys: [{ AttributeName: 'outboxId', KeyType: 'HASH' }] },
+      'p-claims': { ttl: { status: 'ENABLED', attr: 'expiresAt' }, keys: [{ AttributeName: 'sk', KeyType: 'RANGE' }, { AttributeName: 'pk', KeyType: 'HASH' }] },
+      'p-audit': { ttl: { status: 'DISABLED' }, keys: [{ AttributeName: 'id', KeyType: 'HASH' }] },
+      'other-claims': { ttl: { status: 'ENABLED', attr: 'ttl' }, keys: [{ AttributeName: 'id', KeyType: 'HASH' }] },
+    });
+    const sent: any[] = [];
+    const docClient = { send: jest.fn(async (cmd: any) => {
+      sent.push(cmd);
+      if (cmd instanceof ScanCommand) {
+        return cmd.input.TableName === 'p-claims'
+          ? { ScannedCount: 2, Items: [{ pk: 'a', sk: '1' }] }
+          : { ScannedCount: 1, Items: [{ outboxId: 'o1' }] };
+      }
+      return {};
+    }) };
+    const out = await sweepTtlTables({ ddb, docClient, prefix: 'p-', overrides: defaultTtlSweepOverrides((b) => `p-${b}`), nowSec: 1000, deletesPerSecond: 0 });
+    expect(out.map((t) => [t.table, t.ttlAttr, t.deleted])).toEqual([['p-social-outbox', 'ttl', 1], ['p-claims', 'expiresAt', 1]]);
+    const claimDel = sent.find((c) => c instanceof DeleteCommand && c.input.TableName === 'p-claims');
+    expect(claimDel.input.Key).toEqual({ pk: 'a', sk: '1' });
+    expect(claimDel.input.ExpressionAttributeNames['#ttl']).toBe('expiresAt');
+    const outboxDel = sent.find((c) => c instanceof DeleteCommand && c.input.TableName === 'p-social-outbox');
+    expect(outboxDel.input.ConditionExpression).toBe('#ttl < :now AND #status IN (:processed, :failed)');
+    expect(sent.some((c) => c.input.TableName === 'p-audit' || c.input.TableName === 'other-claims')).toBe(false);
+  });
+
+  it('dry run counts expired rows and deletes nothing; a lost lease stops the pass', async () => {
+    const ddb = fakeDdb({ t: { ttl: { status: 'ENABLED', attr: 'ttl' }, keys: [{ AttributeName: 'id', KeyType: 'HASH' }] } });
+    const docClient = { send: jest.fn(async (cmd: any) => (cmd instanceof ScanCommand ? { ScannedCount: 3, Items: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] } : {})) };
+    const dry = await sweepTtlTables({ ddb, docClient, dryRun: true });
+    expect(dry[0]).toMatchObject({ expired: 3, deleted: 0 });
+    expect(docClient.send.mock.calls.some(([c]) => c instanceof DeleteCommand)).toBe(false);
+    let leader = true;
+    const sleep = jest.fn(async () => { leader = false; });
+    const lost = await sweepTtlTables({ ddb, docClient, shouldContinue: () => leader, deletesPerSecond: 50, sleep });
+    expect(lost[0].deleted).toBe(1);
+    expect(sleep).toHaveBeenCalledWith(20);
+  });
+
+  it('outbox terminal rows: 1 h in local dev, 24 h otherwise, env overrides', () => {
+    expect(outboxTerminalTtlSeconds({ LOCAL_TTL_SWEEP: 'true', NODE_ENV: 'development' })).toBe(3600);
+    expect(outboxTerminalTtlSeconds({ NODE_ENV: 'production', LOCAL_TTL_SWEEP: 'true' })).toBe(86400);
+    expect(outboxTerminalTtlSeconds({ OUTBOX_TERMINAL_TTL_SECONDS: '600' })).toBe(600);
   });
 });

@@ -13,6 +13,15 @@
 //
 // NFR #77 extends it to the work-graph projection's `WG#` rows (1,176 past
 // their ttl on 2026-09-23): same rule, ttl passed re-checked per delete.
+//
+// NFR #223 (Loop 37) generalises it: `sweepTtlTables` finds every table whose
+// OWN TimeToLive is ENABLED, reads that attribute name from the table, and
+// deletes only rows whose value is a Number below now — exactly the rows AWS's
+// reaper would remove, nothing else. It runs as one ClusterSweeper task (one
+// replica, under the sweep-leader lease), pages the scan small, paces deletes
+// and stops the moment leadership is lost. Before it, both replicas scanned
+// the whole 100k-row outbox every 10 minutes, unleased.
+import { DescribeTableCommand, DescribeTimeToLiveCommand, ListTablesCommand, type DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DeleteCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
 export interface LocalTtlSweepResult {
@@ -39,12 +48,26 @@ export async function sweepExpiredRows(opts: {
   nowSec?: number;
   /** Stop after this many deletes; the next pass continues. */
   maxDeletes?: number;
+  /** The table's TTL attribute (default `ttl`). */
+  ttlAttr?: string;
+  /** Count what would be deleted; delete nothing. */
+  dryRun?: boolean;
+  /** Rows examined per Scan page (keeps each page small in the DynamoDB-Local JVM). */
+  pageLimit?: number;
+  /** Pace deletes to at most this many per second (0 = unpaced). */
+  deletesPerSecond?: number;
+  /** Checked between pages and deletes; false stops the pass (e.g. lease lost). */
+  shouldContinue?: () => boolean;
+  sleep?: (ms: number) => Promise<void>;
 }): Promise<LocalTtlSweepResult> {
   const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
   const maxDeletes = opts.maxDeletes ?? 2000;
+  const gapMs = opts.deletesPerSecond && opts.deletesPerSecond > 0 ? Math.ceil(1000 / opts.deletesPerSecond) : 0;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const keepGoing = opts.shouldContinue ?? (() => true);
   const out: LocalTtlSweepResult = { scanned: 0, expired: 0, deleted: 0, skipped: 0 };
   const condition = `#ttl < :now${opts.where ? ` AND ${opts.where.expression}` : ''}`;
-  const names: Record<string, string> = { '#ttl': 'ttl', ...(opts.where?.names ?? {}) };
+  const names: Record<string, string> = { '#ttl': opts.ttlAttr ?? 'ttl', ...(opts.where?.names ?? {}) };
   const values: Record<string, unknown> = { ':now': nowSec, ...(opts.where?.values ?? {}) };
   const keyNames: Record<string, string> = Object.fromEntries(opts.keyAttrs.map((k, i) => [`#k${i}`, k]));
   let cursor: Record<string, unknown> | undefined;
@@ -56,11 +79,17 @@ export async function sweepExpiredRows(opts: {
       ExpressionAttributeNames: { ...names, ...keyNames },
       ExpressionAttributeValues: values,
       ExclusiveStartKey: cursor,
+      ...(opts.pageLimit ? { Limit: opts.pageLimit } : {}),
     }));
     out.scanned += page.ScannedCount ?? 0;
     for (const item of page.Items ?? []) {
-      if (out.deleted >= maxDeletes) return out;
+      if (out.deleted >= maxDeletes || !keepGoing()) return out;
       out.expired += 1;
+      if (opts.dryRun) continue;
+      if (gapMs > 0 && out.deleted + out.skipped > 0) {
+        await sleep(gapMs);
+        if (!keepGoing()) return out;
+      }
       try {
         await opts.docClient.send(new DeleteCommand({
           TableName: opts.tableName,
@@ -76,8 +105,85 @@ export async function sweepExpiredRows(opts: {
       }
     }
     cursor = page.LastEvaluatedKey as Record<string, unknown> | undefined;
-  } while (cursor);
+  } while (cursor && keepGoing());
   return out;
+}
+
+export type TtlSweepWhere = { expression: string; names: Record<string, string>; values: Record<string, unknown> };
+
+/** Narrower rules for tables that share their TTL attribute with rows the reaper must not touch. */
+export function defaultTtlSweepOverrides(tableName: (base: string) => string): Record<string, TtlSweepWhere> {
+  return {
+    // Only terminal delivery rows; lease rows share this table (NFR #73).
+    [tableName('social-outbox')]: {
+      expression: '#status IN (:processed, :failed)',
+      names: { '#status': 'status' },
+      values: { ':processed': 'PROCESSED', ':failed': 'FAILED' },
+    },
+    // Only projection revision deltas, never grants (NFR #77).
+    [tableName('work-graph')]: { expression: 'begins_with(#pk, :wg)', names: { '#pk': 'PK' }, values: { ':wg': 'WG#' } },
+  };
+}
+
+export interface TtlTableSweep extends LocalTtlSweepResult {
+  table: string;
+  ttlAttr: string;
+  ms: number;
+}
+
+/**
+ * Every table (under `prefix`) whose own TimeToLive is ENABLED: delete rows
+ * whose TTL attribute is a Number below now, re-checked in each delete's
+ * condition. A String or millisecond value never matches, as in AWS.
+ */
+export async function sweepTtlTables(opts: {
+  ddb: Pick<DynamoDBClient, 'send'>;
+  docClient: Pick<DynamoDBDocumentClient, 'send'>;
+  prefix?: string;
+  overrides?: Record<string, TtlSweepWhere>;
+  dryRun?: boolean;
+  maxDeletesPerTable?: number;
+  deletesPerSecond?: number;
+  pageLimit?: number;
+  shouldContinue?: () => boolean;
+  nowSec?: number;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<TtlTableSweep[]> {
+  const keepGoing = opts.shouldContinue ?? (() => true);
+  const names: string[] = [];
+  let start: string | undefined;
+  do {
+    const page = await opts.ddb.send(new ListTablesCommand({ ExclusiveStartTableName: start }));
+    names.push(...(page.TableNames ?? []));
+    start = page.LastEvaluatedTableName;
+  } while (start);
+  const results: TtlTableSweep[] = [];
+  for (const table of names) {
+    if (!keepGoing()) break;
+    if (opts.prefix && !table.startsWith(opts.prefix)) continue;
+    const ttl = (await opts.ddb.send(new DescribeTimeToLiveCommand({ TableName: table }))).TimeToLiveDescription;
+    if (ttl?.TimeToLiveStatus !== 'ENABLED' || !ttl.AttributeName) continue;
+    const keySchema = (await opts.ddb.send(new DescribeTableCommand({ TableName: table }))).Table?.KeySchema ?? [];
+    const keyAttrs = [...keySchema].sort((a) => (a.KeyType === 'HASH' ? -1 : 1)).map((k) => k.AttributeName as string);
+    if (keyAttrs.length === 0) continue;
+    const startedAt = Date.now();
+    const swept = await sweepExpiredRows({
+      docClient: opts.docClient,
+      tableName: table,
+      keyAttrs,
+      ttlAttr: ttl.AttributeName,
+      where: opts.overrides?.[table],
+      dryRun: opts.dryRun,
+      maxDeletes: opts.maxDeletesPerTable ?? 2000,
+      deletesPerSecond: opts.deletesPerSecond ?? 50,
+      pageLimit: opts.pageLimit ?? 200,
+      shouldContinue: keepGoing,
+      nowSec: opts.nowSec,
+      sleep: opts.sleep,
+    });
+    results.push({ table, ttlAttr: ttl.AttributeName, ...swept, ms: Date.now() - startedAt });
+  }
+  return results;
 }
 
 /** social-outbox: PROCESSED rows past their ttl (NFR #73). */

@@ -16,7 +16,7 @@ import {
 } from '../lib/outbox-pending';
 import log from '../lib/logger';
 import { registerOutboxWake } from '../lib/outboxWake';
-import { localTtlSweepEnabled, sweepExpiredProcessedRows, sweepExpiredWorkGraphRows } from '../lib/localTtlSweep';
+import { localTtlSweepEnabled } from '../lib/localTtlSweep';
 import {
   recordOutboxLeaseAcquired,
   recordOutboxOldestPendingSeconds,
@@ -25,21 +25,28 @@ import {
 } from '../observability/metrics';
 
 const OUTBOX_TABLE = tableName('social-outbox');
-const WORK_GRAPH_TABLE = tableName('work-graph');
 const LOCK_KEY = 'OUTBOX_LOCK#drainer';
 const LEASE_TTL_MS = 30_000;
 
-/** 24 hours in seconds — shortened TTL for completed/failed rows (kept briefly for debugging). */
-const TERMINAL_TTL_SECONDS = 24 * 60 * 60;
+/**
+ * TTL for completed/failed rows (kept briefly for debugging; nothing reads
+ * them). 24 h in AWS. NFR #223: in local dev the outbox took ~100k rows/day
+ * (95% `work-graph.pipeline.lifecycle.v1` under run load), so 24 h of
+ * retention alone was 110 MB of a DynamoDB Local that ran out of heap — dev
+ * keeps 1 h. `OUTBOX_TERMINAL_TTL_SECONDS` overrides either.
+ */
+export function outboxTerminalTtlSeconds(env: NodeJS.ProcessEnv = process.env): number {
+  const explicit = Number(env.OUTBOX_TERMINAL_TTL_SECONDS);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
+  return localTtlSweepEnabled(env) ? 60 * 60 : 24 * 60 * 60;
+}
+const TERMINAL_TTL_SECONDS = outboxTerminalTtlSeconds();
 /** Rows examined per round trip while looking for pending ones. */
 const SCAN_PAGE_SIZE = 200;
 /** A cap so one poll cycle cannot walk an arbitrarily large table. */
 const MAX_SCAN_PAGES = 20;
 /** How often, while pending-index is not ACTIVE, to ask whether it is. */
 const INDEX_RECHECK_MS = 15_000;
-
-/** Dev-only TTL stand-in cadence (DynamoDB Local never expires rows; NFR #73). */
-const LOCAL_TTL_SWEEP_EVERY_MS = 10 * 60_000;
 
 const OWNER_ID = `${process.pid}@${hostname()}-${randomUUID()}`;
 
@@ -514,34 +521,9 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
     void poll();
   }, pollIntervalMs);
 
-  // Dev only: reap PROCESSED rows past their ttl, as AWS's TTL would. On its
-  // own timer, NOT inside poll(): the first live pass took 10.8 s for 2,000
-  // deletes, and inside the drain cycle that would have held every pending
-  // event back as long. No lease — each delete re-checks status + ttl in its
-  // condition, so two replicas sweeping at once only report `skipped`.
-  let sweepTimer: ReturnType<typeof setInterval> | null = null;
-  if (localTtlSweepEnabled()) {
-    let sweeping = false;
-    const sweep = async (): Promise<void> => {
-      if (sweeping || stopping) return;
-      sweeping = true;
-      const startedAt = Date.now();
-      try {
-        const swept = await sweepExpiredProcessedRows({ docClient, tableName: OUTBOX_TABLE, keyAttr: 'outboxId' });
-        log.info({ table: OUTBOX_TABLE, ...swept, ms: Date.now() - startedAt }, 'outbox-drainer: local TTL sweep (expired PROCESSED rows deleted)');
-        const wgStartedAt = Date.now();
-        const wg = await sweepExpiredWorkGraphRows({ docClient, tableName: WORK_GRAPH_TABLE });
-        log.info({ table: WORK_GRAPH_TABLE, ...wg, ms: Date.now() - wgStartedAt }, 'outbox-drainer: local TTL sweep (expired work-graph WG# rows deleted)');
-      } catch (err: unknown) {
-        log.warn({ errMessage: (err as { message?: string })?.message }, 'outbox-drainer: local TTL sweep failed');
-      } finally {
-        sweeping = false;
-      }
-    };
-    sweepTimer = setInterval(() => { void sweep(); }, LOCAL_TTL_SWEEP_EVERY_MS);
-    sweepTimer.unref?.();
-    setTimeout(() => { void sweep(); }, 60_000).unref?.();
-  }
+  // The dev-only TTL stand-in moved to the sweep leader (NFR #223,
+  // `local-ttl-sweep` in pipeline/bootstrap.ts): it used to run here on every
+  // replica, unleased, scanning the whole outbox every 10 minutes.
 
   void poll();
 
@@ -550,10 +532,6 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
       stopping = true;
       unregisterWake();
       if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
-      if (sweepTimer) {
-        clearInterval(sweepTimer);
-        sweepTimer = null;
-      }
       if (timer) {
         clearInterval(timer);
         timer = null;
