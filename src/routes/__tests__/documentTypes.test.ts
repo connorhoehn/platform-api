@@ -198,8 +198,8 @@ describe('document-types CRUD', () => {
   });
 
   test('GET / lists created types', async () => {
-    typeStore['t1'] = { typeId: 't1', name: 'A', fields: [] };
-    typeStore['t2'] = { typeId: 't2', name: 'B', fields: [] };
+    typeStore['t1'] = { createdBy: 'tester', typeId: 't1', name: 'A', fields: [] };
+    typeStore['t2'] = { createdBy: 'tester', typeId: 't2', name: 'B', fields: [] };
     const res = await run(buildApp(), 'GET', '/api/document-types');
     expect(res.statusCode).toBe(200);
     const body = res.body as { items: { typeId: string }[] };
@@ -207,7 +207,7 @@ describe('document-types CRUD', () => {
   });
 
   test('GET /:typeId 200 when found, 404 when missing', async () => {
-    typeStore['t1'] = { typeId: 't1', name: 'A', fields: [] };
+    typeStore['t1'] = { createdBy: 'tester', typeId: 't1', name: 'A', fields: [] };
     const ok = await run(buildApp(), 'GET', '/api/document-types/t1');
     expect(ok.statusCode).toBe(200);
 
@@ -216,7 +216,7 @@ describe('document-types CRUD', () => {
   });
 
   test('PUT updates name + fields and bumps updatedAt', async () => {
-    typeStore['t1'] = { typeId: 't1', name: 'A', fields: [], updatedAt: '2026-01-01' };
+    typeStore['t1'] = { createdBy: 'tester', typeId: 't1', name: 'A', fields: [], updatedAt: '2026-01-01' };
     const res = await run(buildApp(), 'PUT', '/api/document-types/t1', {
       body: { name: 'A2' },
     });
@@ -227,7 +227,7 @@ describe('document-types CRUD', () => {
   });
 
   test('DELETE returns 204', async () => {
-    typeStore['t1'] = { typeId: 't1', name: 'A', fields: [] };
+    typeStore['t1'] = { createdBy: 'tester', typeId: 't1', name: 'A', fields: [] };
     const res = await run(buildApp(), 'DELETE', '/api/document-types/t1');
     expect(res.statusCode).toBe(204);
     expect(typeStore['t1']).toBeUndefined();
@@ -263,14 +263,14 @@ describe('editorSchema round-trip', () => {
   });
 
   test('GET list includes editorSchema', async () => {
-    typeStore['t1'] = { typeId: 't1', name: 'A', fields: [], editorSchema: schema };
+    typeStore['t1'] = { createdBy: 'tester', typeId: 't1', name: 'A', fields: [], editorSchema: schema };
     const res = await run(buildApp(), 'GET', '/api/document-types');
     const body = res.body as { items: { editorSchema?: unknown }[] };
     expect(body.items[0].editorSchema).toEqual(schema);
   });
 
   test('PUT replaces editorSchema', async () => {
-    typeStore['t1'] = { typeId: 't1', name: 'A', fields: [], editorSchema: schema };
+    typeStore['t1'] = { createdBy: 'tester', typeId: 't1', name: 'A', fields: [], editorSchema: schema };
     const next = { ...schema, name: 'RFC v2' };
     const res = await run(buildApp(), 'PUT', '/api/document-types/t1', {
       body: { editorSchema: next },
@@ -599,7 +599,7 @@ describe('Phase C field types: enum + reference', () => {
   });
 
   test('POST instance rejects reference to non-existent document', async () => {
-    typeStore['people-type'] = { typeId: 'people-type', name: 'People', fields: [] };
+    typeStore['people-type'] = { createdBy: 'tester', typeId: 'people-type', name: 'People', fields: [] };
     typeStore['article-type'] = {
       typeId: 'article-type',
       name: 'Article',
@@ -614,7 +614,7 @@ describe('Phase C field types: enum + reference', () => {
   });
 
   test('POST instance rejects reference to document of wrong type', async () => {
-    typeStore['people-type'] = { typeId: 'people-type', name: 'People', fields: [] };
+    typeStore['people-type'] = { createdBy: 'tester', typeId: 'people-type', name: 'People', fields: [] };
     typeStore['article-type'] = {
       typeId: 'article-type',
       name: 'Article',
@@ -630,7 +630,7 @@ describe('Phase C field types: enum + reference', () => {
   });
 
   test('POST instance accepts reference to existing document of matching type', async () => {
-    typeStore['people-type'] = { typeId: 'people-type', name: 'People', fields: [] };
+    typeStore['people-type'] = { createdBy: 'tester', typeId: 'people-type', name: 'People', fields: [] };
     typeStore['article-type'] = {
       typeId: 'article-type',
       name: 'Article',
@@ -1367,7 +1367,7 @@ describe('PUT edge cases', () => {
   test('PUT /:typeId 400 when name is provided as empty string', async () => {
     typeStore['t-put'] = {
       typeId: 't-put', name: 'Original', description: '', icon: '📄',
-      fields: [], version: 1, createdBy: 'admin',
+      fields: [], version: 1, createdBy: 'tester',
       createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z',
     };
     const res = await run(buildApp(), 'PUT', '/api/document-types/t-put', {
@@ -1471,5 +1471,19 @@ describe('parseShowWhen edge cases', () => {
     });
     expect(res.statusCode).toBe(400);
     expect((res.body as { error: string }).error).toMatch(/showWhen\.equals must be a string, number, or boolean/);
+  });
+});
+
+// Loop 29c: a type is changed only by the person who created it.
+describe('document-types writes are the creator\'s (Loop 29c)', () => {
+  test('PUT and DELETE by someone else are 403 and change nothing', async () => {
+    typeStore['t-own'] = { createdBy: 'author', typeId: 't-own', name: 'Mine', fields: [] };
+    const put = await run(buildApp(), 'PUT', '/api/document-types/t-own', { body: { name: 'Hijacked' }, userId: 'someone-else' });
+    expect(put.statusCode).toBe(403);
+    const del = await run(buildApp(), 'DELETE', '/api/document-types/t-own', { userId: 'someone-else' });
+    expect(del.statusCode).toBe(403);
+    expect((typeStore['t-own'] as { name: string }).name).toBe('Mine');
+    const ok = await run(buildApp(), 'PUT', '/api/document-types/t-own', { body: { name: 'Mine 2' }, userId: 'author' });
+    expect(ok.statusCode).toBe(200);
   });
 });

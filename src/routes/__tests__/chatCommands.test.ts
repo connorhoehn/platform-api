@@ -9,6 +9,12 @@ const mockPostCard = jest.fn().mockResolvedValue(true);
 const mockTypeGet = jest.fn();
 const mockTypeList = jest.fn();
 
+// Loop 29c: the command's access check is covered in resourceAccess.routes.test.ts;
+// here every caller may read and edit, and is a member of every channel.
+jest.mock('../../documents/documentReadGate', () => ({
+  documentReadGate: () => ({ assertCanRead: async () => ({}), assertCanEdit: async () => ({}), ownerOf: async () => undefined }),
+}));
+jest.mock('../../deck/documentEditAccess', () => ({ ...jest.requireActual('../../deck/documentEditAccess'), isChannelMember: async () => true }));
 jest.mock('../../pipeline/runPersistence', () => ({
   getRunPersistenceService: () => ({ registerTrigger: mockRegisterTrigger }),
 }));

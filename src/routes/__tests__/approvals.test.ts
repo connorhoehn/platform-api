@@ -8,6 +8,11 @@ import express, { type NextFunction, type Request, type Response } from 'express
 interface FakeStore { [workflowId: string]: Record<string, unknown> }
 const store: FakeStore = {};
 
+// Loop 29c: the route's access gate is covered in resourceAccess.routes.test.ts;
+// here every caller may read and edit.
+jest.mock('../../documents/documentReadGate', () => ({
+  documentReadGate: () => ({ assertCanRead: async () => ({}), assertCanEdit: async () => ({}), ownerOf: async () => undefined }),
+}));
 jest.mock('../../repositories', () => ({
   approvalRepo: {
     create: jest.fn(async (item: Record<string, unknown>) => {
@@ -169,10 +174,16 @@ describe('GET /api/approvals', () => {
   });
 
   test('?status returns entries by decision via the GSI mapping', async () => {
-    const res = await run(buildApp(), 'GET', '/api/approvals?status=approved');
+    const res = await run(buildApp(), 'GET', '/api/approvals?status=approved', { userId: 'u' });
     expect(res.statusCode).toBe(200);
     const body = res.body as { items: unknown[] };
     expect(body.items).toHaveLength(2);
+  });
+
+  test('?status lists only the caller\'s own decisions (Loop 29c)', async () => {
+    const res = await run(buildApp(), 'GET', '/api/approvals?status=approved', { userId: 'someone-else' });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { items: unknown[] }).items).toHaveLength(0);
   });
 
   test('400 when neither documentId nor status is supplied', async () => {

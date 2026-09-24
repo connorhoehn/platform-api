@@ -90,7 +90,7 @@ export async function serve(mounts: Array<[string, Router]>): Promise<Replica> {
 export async function call(base: string, method: string, path: string, user: string | null, body?: unknown): Promise<{ status: number; body: any; headers: Headers }> {
   const res = await fetch(`${base}${path}`, {
     method,
-    headers: { 'content-type': 'application/json', ...(user ? { 'x-test-user': user } : {}) },
+    headers: { 'content-type': 'application/json', ...(user ? { 'x-test-user': user, authorization: 'Bearer test' } : {}) },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   const text = await res.text();

@@ -281,8 +281,8 @@ describe('Bulk update (operation=update)', () => {
       createdAt: '2026-05-04T10:00:00Z',
       updatedAt: '2026-05-04T10:00:00Z',
     };
-    docStore['doc-1'] = { documentId: 'doc-1', typeId: 'type-article', schemaVersion: 1, values: { 'f-title': 'Old Title 1' }, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'user' };
-    docStore['doc-2'] = { documentId: 'doc-2', typeId: 'type-article', schemaVersion: 1, values: { 'f-title': 'Old Title 2' }, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'user' };
+    docStore['doc-1'] = { documentId: 'doc-1', typeId: 'type-article', schemaVersion: 1, values: { 'f-title': 'Old Title 1' }, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'tester' };
+    docStore['doc-2'] = { documentId: 'doc-2', typeId: 'type-article', schemaVersion: 1, values: { 'f-title': 'Old Title 2' }, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'tester' };
 
     const res = await run(buildApp(), 'POST', '/api/typed-documents/bulk', {
       body: {
@@ -331,9 +331,9 @@ describe('Bulk update (operation=update)', () => {
 
 describe('Bulk delete (operation=delete)', () => {
   test('200 with valid documentIds list', async () => {
-    docStore['doc-1'] = { documentId: 'doc-1', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'user' };
-    docStore['doc-2'] = { documentId: 'doc-2', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'user' };
-    docStore['doc-3'] = { documentId: 'doc-3', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'user' };
+    docStore['doc-1'] = { documentId: 'doc-1', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'tester' };
+    docStore['doc-2'] = { documentId: 'doc-2', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'tester' };
+    docStore['doc-3'] = { documentId: 'doc-3', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'tester' };
 
     const res = await run(buildApp(), 'POST', '/api/typed-documents/bulk', {
       body: {
@@ -360,9 +360,9 @@ describe('Bulk delete (operation=delete)', () => {
   });
 
   test('200 deletes only specified IDs, leaves others intact', async () => {
-    docStore['doc-keep'] = { documentId: 'doc-keep', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'user' };
-    docStore['doc-delete-1'] = { documentId: 'doc-delete-1', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'user' };
-    docStore['doc-delete-2'] = { documentId: 'doc-delete-2', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'user' };
+    docStore['doc-keep'] = { documentId: 'doc-keep', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'tester' };
+    docStore['doc-delete-1'] = { documentId: 'doc-delete-1', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'tester' };
+    docStore['doc-delete-2'] = { documentId: 'doc-delete-2', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'tester' };
 
     const res = await run(buildApp(), 'POST', '/api/typed-documents/bulk', {
       body: {
@@ -468,5 +468,15 @@ describe('Bulk delete — empty / malformed inputs', () => {
     });
     expect(res.statusCode).toBe(400);
     expect((res.body as { error: string }).error).toMatch(/all documentIds must be strings/);
+  });
+});
+
+// Loop 29c: rows are changed only by the person who created them.
+describe('bulk writes are the rows\' creator\'s (Loop 29c)', () => {
+  test('bulk delete of someone else\'s row is 403 and deletes nothing', async () => {
+    docStore['doc-theirs'] = { documentId: 'doc-theirs', typeId: 'type-x', values: {}, createdAt: '2026-05-04T10:00:00Z', updatedAt: '2026-05-04T10:00:00Z', createdBy: 'someone-else' };
+    const res = await run(buildApp(), 'POST', '/api/typed-documents/bulk', { body: { operation: 'delete', documentIds: ['doc-theirs'] } });
+    expect(res.statusCode).toBe(403);
+    expect(docStore['doc-theirs']).toBeDefined();
   });
 });

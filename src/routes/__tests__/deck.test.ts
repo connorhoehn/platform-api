@@ -10,6 +10,11 @@ import { sampleDeck } from '../../deck/__tests__/fixtures';
 
 const buildDeckFixture = jest.fn();
 
+// Loop 29c: the route's access gate is covered in resourceAccess.routes.test.ts;
+// here every caller may read and edit.
+jest.mock('../../deck/deckSourceAccess', () => ({
+  requireDeckSourcesReadable: () => (_req: unknown, _res: unknown, next: () => void) => next(),
+}));
 jest.mock('../../deck/deckFixture', () => {
   const actual = jest.requireActual('../../deck/deckFixture');
   return { ...actual, buildDeckFixture: (...args: unknown[]) => buildDeckFixture(...args) };

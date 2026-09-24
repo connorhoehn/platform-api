@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth';
+import { requireDocumentEdit, requireDocumentRead } from '../middleware/resource-access';
 import { GetCommand } from '@aws-sdk/lib-dynamodb';
 import { docClient } from '../lib/aws-clients';
 import {
@@ -58,6 +59,7 @@ async function getDocumentMeta(documentId: string): Promise<DocumentMeta | null>
 documentImportExportRouter.get(
   '/export',
   requireAuth,
+  requireDocumentRead(),
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const { documentId } = req.params;
     const format = (req.query['format'] as string) ?? 'json';
@@ -103,6 +105,7 @@ documentImportExportRouter.get(
 documentImportExportRouter.post(
   '/import',
   requireAuth,
+  requireDocumentEdit(),
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const { documentId } = req.params;
     const { format, content } = req.body as { format?: string; content?: string };

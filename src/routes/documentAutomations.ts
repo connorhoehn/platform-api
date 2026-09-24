@@ -5,6 +5,7 @@ import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/error-handler';
+import { requireDocumentEdit } from '../middleware/resource-access';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { pipelineDefinitionsCache } from '../pipeline/definitions-cache';
 import { getPipelineBridge } from '../pipeline/bridge-types';
@@ -29,7 +30,7 @@ documentAutomationsRouter.get('/:documentId/automations', asyncHandler(async (re
   res.json({ automations: await listFor(userId, req.params.documentId) });
 }));
 
-documentAutomationsRouter.post('/:documentId/automations', asyncHandler(async (req: Request, res: Response) => {
+documentAutomationsRouter.post('/:documentId/automations', requireDocumentEdit(), asyncHandler(async (req: Request, res: Response) => {
   const userId = req.user!.sub;
   const documentId = req.params.documentId;
   const checked = validateAutomationInput(req.body);
@@ -59,7 +60,7 @@ documentAutomationsRouter.delete('/:documentId/automations/:automationId', async
 }));
 
 /** Fire it now — the same run the schedule would start, so a person can see what the bot does before waiting for it. */
-documentAutomationsRouter.post('/:documentId/automations/:automationId/run', asyncHandler(async (req: Request, res: Response) => {
+documentAutomationsRouter.post('/:documentId/automations/:automationId/run', requireDocumentEdit(), asyncHandler(async (req: Request, res: Response) => {
   const userId = req.user!.sub;
   const { documentId, automationId } = req.params;
   const def = await definitionsRepo.get(userId, automationId);

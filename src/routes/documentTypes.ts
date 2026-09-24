@@ -24,7 +24,7 @@ import type {
   DocumentTypeFieldDisplayModes,
   DocumentTypeVersionSnapshot,
 } from '../repositories';
-import { asyncHandler, ValidationError, NotFoundError } from '../middleware/error-handler';
+import { asyncHandler, ValidationError, NotFoundError, ForbiddenError } from '../middleware/error-handler';
 import { withContext } from '../lib/logger';
 import {
   recordDocumentTypeCreated,
@@ -284,12 +284,23 @@ documentTypesRouter.get('/:typeId', asyncHandler(async (req: Request, res: Respo
   res.status(200).json(item);
 }));
 
+/**
+ * Loop 29c: a type is a shared schema every signed-in person reads, but only
+ * the person who created it changes or deletes it (403 for anyone else).
+ */
+function assertTypeWriter(type: { createdBy?: string; typeId?: string }, req: Request): void {
+  if (!type.createdBy || type.createdBy !== req.user?.sub) {
+    throw new ForbiddenError(`document type ${type.typeId ?? ''} can only be changed by the person who created it`);
+  }
+}
+
 documentTypesRouter.put('/:typeId', asyncHandler(async (req: Request, res: Response) => {
   const params = req.params as { typeId: string };
   const body = (req.body ?? {}) as Record<string, unknown>;
 
   const existing = await documentTypeRepo.get(params.typeId);
   if (!existing) throw new NotFoundError(`document type ${params.typeId} not found`);
+  assertTypeWriter(existing, req);
 
   const patch: Partial<Pick<DocumentTypeItem, 'name' | 'description' | 'icon' | 'fields' | 'editorSchema'>> = {};
   if (typeof body.name === 'string') {
@@ -316,6 +327,7 @@ documentTypesRouter.put('/:typeId', asyncHandler(async (req: Request, res: Respo
 documentTypesRouter.delete('/:typeId', asyncHandler(async (req: Request, res: Response) => {
   const params = req.params as { typeId: string };
   const item = await documentTypeRepo.get(params.typeId);
+  if (item) assertTypeWriter(item, req);
   await documentTypeRepo.delete(params.typeId);
   recordDocumentTypeDeleted();
   log.warn({ typeId: params.typeId, name: item?.name, userId: req.user!.sub }, 'delete');

@@ -86,5 +86,22 @@ export function requireChannelMember(idOf: IdOf | string, opts: { optional?: boo
   }, 'channel:member');
 }
 
+/**
+ * A mount-level gate for a sub-router that hangs off one document: `modeOf`
+ * says which of read / edit the request needs (by method and sub-path).
+ */
+export function requireDocumentAccessFor(modeOf: (req: Request) => 'read' | 'edit', idOf: IdOf | string = 'documentId'): AccessMarkedHandler {
+  const read = requireDocumentRead(idOf);
+  const edit = requireDocumentEdit(idOf);
+  return markAccess((req: Request, res: Response, next: NextFunction) => {
+    (modeOf(req) === 'edit' ? edit : read)(req, res, next);
+  }, 'document:read|edit');
+}
+
+/** GET/HEAD read; everything else edit, except the sub-paths `readWrites` names (a reviewer's answer, a commenter's post). */
+export function readOnGet(readWrites: RegExp[] = []): (req: Request) => 'read' | 'edit' {
+  return (req) => (req.method === 'GET' || req.method === 'HEAD' || readWrites.some((re) => re.test(req.path)) ? 'read' : 'edit');
+}
+
 /** The body field `name`, as a string id, for the wrappers above. */
 export const bodyId = (name: string): IdOf => (req) => (req.body as Record<string, unknown> | undefined)?.[name];

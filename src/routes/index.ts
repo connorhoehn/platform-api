@@ -22,6 +22,7 @@ import { chatCommandsRouter } from './chatCommands';
 import { chatPanelsRouter } from './chatPanels';
 import { agentLoopsRouter } from './agentLoops';
 import { requireAuth, requirePrincipal } from '../middleware/auth';
+import { documentSubrouteGates } from './documentSubrouteGates';
 import { callLogRouter } from './callLog';
 import { workItemsRouter } from './workItems';
 import { documentWorkRouter, documentWorkListRouter } from './documentWork';
@@ -136,24 +137,24 @@ router.use('/documents', documentCommentsRouter);
 // Static segment BEFORE any `:documentId` mount — Express resolves mounts in
 // registration order, so `/documents/:documentId` would otherwise swallow it.
 router.use('/documents/lifecycle-schema', lifecycleSchemaRouter);
-router.use('/documents/:documentId/lifecycle', documentLifecycleRouter);
-router.use('/documents/:documentId/review-requests', documentReviewRequestsRouter);
-router.use('/documents/:documentId/sections/:sectionId/review-requests', sectionReviewRequestsRouter);
-router.use('/documents/:documentId/sections/:sectionId/reviews', sectionReviewsRouter);
-router.use('/documents/:documentId/reviews', documentReviewsRouter);
+router.use('/documents/:documentId/lifecycle', documentSubrouteGates.lifecycle, documentLifecycleRouter);
+router.use('/documents/:documentId/review-requests', documentSubrouteGates.reviewRequests, documentReviewRequestsRouter);
+router.use('/documents/:documentId/sections/:sectionId/review-requests', documentSubrouteGates.reviewRequests, sectionReviewRequestsRouter);
+router.use('/documents/:documentId/sections/:sectionId/reviews', documentSubrouteGates.reviews, sectionReviewsRouter);
+router.use('/documents/:documentId/reviews', documentSubrouteGates.reviews, documentReviewsRouter);
 router.use('/reviews', myReviewsRouter);
-router.use('/documents/:documentId/sections/:sectionId/items', sectionItemsRouter);
+router.use('/documents/:documentId/sections/:sectionId/items', documentSubrouteGates.sectionItems, sectionItemsRouter);
 router.use('/items', myItemsRouter);
 // Work items: the utterance -> proposal -> acceptance lane. Addressed by itemId
 // alone (not documentId/sectionId/itemId) because re-attaching an item moves it
 // between sections and a URL that encoded the section would break on every move.
 // Must precede the '/documents/:documentId' mount below, which would otherwise
 // swallow '/work-items' as a sub-path of the import/export router.
-router.use('/documents/:documentId/work-items', workItemsRouter);
+router.use('/documents/:documentId/work-items', documentSubrouteGates.workItems, workItemsRouter);
 // Work fields and run drafts (documents-detail PLAN §2.1/§2.2). Same reason: before
 // the '/documents/:documentId' mount below.
-router.use('/documents/:documentId/work', documentWorkRouter);
-router.use('/documents/:documentId/run-drafts', runDraftsRouter);
+router.use('/documents/:documentId/work', documentSubrouteGates.work, documentWorkRouter);
+router.use('/documents/:documentId/run-drafts', documentSubrouteGates.runDrafts, runDraftsRouter);
 router.use('/document-work', documentWorkListRouter);
 // A presentation's stored revisions: the .pptx and the per-slide SVG previews
 // the deck generator files. Same reason as work-items — it must precede the

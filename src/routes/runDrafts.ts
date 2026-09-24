@@ -51,6 +51,7 @@ import { AppError, ValidationError } from '../middleware/error-handler';
 import { resolveRunOverrides } from '../pipeline/runOverrides';
 import { handle } from './documentWork';
 import { requireDocumentAccess, type DocumentAccessDeps } from '../documents/documentAccess';
+import { makeDocumentReadGate } from '../documents/documentReadGate';
 import {
   RUN_DRAFT_MODELS,
   type RunDraft,
@@ -92,6 +93,8 @@ export interface RunDraftsDeps extends DocumentAccessDeps {
   ): Promise<IdempotentOutcome<T>>;
   publishSignal(channelId: string, eventName: string, payload: Record<string, unknown>): Promise<void>;
   now(): string;
+  /** Loop 29c: throws unless the caller may read a `document` source (the run reads it). Default: document:read via the gate. */
+  assertSourceReadable?(req: Request, documentId: string): Promise<unknown>;
   /** The run with this id, if pipeline-runs has it (`runId-index`). Absent → never adopts. */
   findRun?(runId: string): Promise<{ runId: string; status?: string } | null>;
   /** Is the replica that took the dispatch at `sinceMs` still running? Absent, or unreadable → treated as alive. */
@@ -216,6 +219,14 @@ function draftIdOf(req: Request): string {
 
 export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps()): Router {
   const router = Router({ mergeParams: true });
+  const sourceGate = makeDocumentReadGate({ getDocumentRow: deps.getDocumentRow, getLifecycleOwner: async (id) => (await deps.getLifecycle(id))?.ownerId });
+  const assertSource = deps.assertSourceReadable ?? ((req: Request, id: string) => sourceGate.assertCanRead(req, id));
+  /** Every `document` source must be readable by the caller: 404 otherwise, as for the document itself. */
+  async function assertSourcesReadable(req: Request, sources: RunDraftSource[] | undefined): Promise<void> {
+    for (const source of sources ?? []) {
+      if (source.kind === 'document') await assertSource(req, source.id);
+    }
+  }
 
   const signal = (d: RunDraft): void => {
     deps.publishSignal(`doc-work:${d.documentId}`, 'doc:run_draft_updated', {
@@ -251,6 +262,7 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
     const draftId = draftIdOf(req);
     const content = parseContent(req.body);
     await requireDocumentAccess(deps, req, documentId, 'edit');
+    await assertSourcesReadable(req, content.sources);
     const userId = req.user!.sub;
 
     for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt++) {
@@ -331,6 +343,9 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
     const userId = req.user!.sub;
 
     let draft = await deps.drafts.get(documentId, draftId);
+    // Loop 29c: the run reads the draft's document sources as the DISPATCHER,
+    // who may not be the person who listed them.
+    if (draft) await assertSourcesReadable(req, draft.sources);
     for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt++) {
       if (!draft) { res.status(404).json({ error: 'run draft not found', code: 'draft-not-found' }); return; }
       if (draft.organizationId && req.user?.orgId && draft.organizationId !== req.user.orgId) {

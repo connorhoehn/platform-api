@@ -26,10 +26,10 @@ export async function call(
   const res = mockRes();
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (!opts.anonymous) headers.authorization = 'Bearer t';
-  const [path, qs] = url.split('?');
+  const qs = url.split('?')[1];
   const query = Object.fromEntries(new URLSearchParams(qs ?? ''));
   const req = {
-    method, url, originalUrl: url, path, headers, query, body: opts.body ?? {},
+    method, url, originalUrl: url, headers, query, body: opts.body ?? {},
     user: opts.anonymous ? undefined : { sub: opts.userId ?? 'dev-owner', ...(opts.orgId ? { orgId: opts.orgId } : {}) },
     params: {}, get: (h: string) => headers[h.toLowerCase()], header: (h: string) => headers[h.toLowerCase()],
   } as unknown as Request;

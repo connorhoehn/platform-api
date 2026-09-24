@@ -35,6 +35,7 @@ import {
   type DocumentWorkView,
 } from '../documents/workBackfill';
 import { DocumentAccessError, requireDocumentAccess, type DocumentAccessDeps } from '../documents/documentAccess';
+import { makeDocumentReadGate } from '../documents/documentReadGate';
 import type { RunDraft } from '../repositories/RunDraftRepository';
 import type { RollupRecentRun } from '../pipeline/run-rollup';
 import log from '../lib/logger';
@@ -52,6 +53,8 @@ export interface DocumentWorkDeps extends DocumentAccessDeps {
   recentRuns(pipelineIds: readonly string[]): Promise<Map<string, RollupRecentRun[]>>;
   /** A dispatched run's recorded cost (undefined = none recorded). */
   runCost(pipelineId: string, runId: string): Promise<number | undefined>;
+  /** Loop 29c: throws unless the caller may read the document. Default: the document:read gate. */
+  assertCanRead?(req: Request, documentId: string): Promise<unknown>;
   publishSignal(channelId: string, eventName: string, payload: Record<string, unknown>): Promise<void>;
   publishDurable(eventName: string, payload: Record<string, unknown>): Promise<void>;
   now(): string;
@@ -121,6 +124,8 @@ export function createDocumentWorkRouters(deps: DocumentWorkDeps = defaultDocume
   const documentWorkRouter = Router({ mergeParams: true });
   // Mounted at /document-work.
   const documentWorkListRouter = Router();
+  const listGate = makeDocumentReadGate({ getDocumentRow: deps.getDocumentRow, getLifecycleOwner: async (id) => (await deps.getLifecycle(id))?.ownerId });
+  const assertRead = deps.assertCanRead ?? ((q: Request, id: string) => listGate.assertCanRead(q, id));
 
   documentWorkRouter.get('/', requireAuth, handle(async (req, res) => {
     const documentId = String(req.params.documentId ?? '');
@@ -174,8 +179,12 @@ export function createDocumentWorkRouters(deps: DocumentWorkDeps = defaultDocume
     const orgId = req.user?.orgId;
     // A type folder exists in every organisation: list only the caller's own org's rows.
     const typeScope = TYPE_SCOPE.test(scopeId);
-    const rows = (await deps.work.listByScope(scopeId))
+    const scoped = (await deps.work.listByScope(scopeId))
       .filter((r) => (typeScope ? (r.organizationId ?? '') === (orgId ?? '') : !orgMismatch(r, orgId)));
+    // Loop 29c: a row is listed only when the caller may read its document
+    // (#135 document:read, cached 60 s per document by the gate).
+    const readable = await mapLimit(scoped, SCOPE_CONCURRENCY, (r) => assertRead(req, r.documentId).then(() => true, () => false));
+    const rows = scoped.filter((_r, i) => readable[i]);
     const ids = rows.map((r) => r.documentId);
     const [lifecycles, draftsPerDoc] = await Promise.all([
       deps.getLifecycleMany(ids),

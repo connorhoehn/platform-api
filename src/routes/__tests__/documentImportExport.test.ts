@@ -7,6 +7,11 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 
 const mockDocClientSend = jest.fn();
+// Loop 29c: the route's access gate is covered in resourceAccess.routes.test.ts;
+// here every caller may read and edit.
+jest.mock('../../documents/documentReadGate', () => ({
+  documentReadGate: () => ({ assertCanRead: async () => ({}), assertCanEdit: async () => ({}), ownerOf: async () => undefined }),
+}));
 jest.mock('../../lib/aws-clients', () => ({
   docClient: { send: mockDocClientSend },
 }));

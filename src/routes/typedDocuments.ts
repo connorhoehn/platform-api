@@ -19,7 +19,7 @@ import type {
   TypedDocumentValue,
   DocumentTypeFieldItem,
 } from '../repositories';
-import { asyncHandler, ValidationError, NotFoundError } from '../middleware/error-handler';
+import { asyncHandler, ValidationError, NotFoundError, ForbiddenError } from '../middleware/error-handler';
 import { withContext } from '../lib/logger';
 import {
   recordTypedDocumentCreated,
@@ -298,6 +298,17 @@ typedDocumentsRouter.post('/', asyncHandler(async (req: Request, res: Response) 
   res.status(201).json(item);
 }));
 
+/**
+ * Loop 29c: a type's records are a shared table any signed-in person reads
+ * (the list and detail routes), but a row is changed only by the person who
+ * created it: 403 for everyone else, as a reader on a write.
+ */
+function assertTypedRowWriter(row: { createdBy?: string; documentId?: string }, req: Request): void {
+  if (!row.createdBy || row.createdBy !== req.user?.sub) {
+    throw new ForbiddenError(`typed document ${row.documentId ?? ''} can only be changed by the person who created it`);
+  }
+}
+
 typedDocumentsRouter.get('/', asyncHandler(async (req: Request, res: Response) => {
   const typeId = typeof req.query.typeId === 'string' ? req.query.typeId : '';
   if (!typeId) throw new ValidationError('typeId query parameter is required');
@@ -321,6 +332,7 @@ typedDocumentsRouter.patch('/:documentId', asyncHandler(async (req: Request, res
 
   const existing = await typedDocumentRepo.get(documentId);
   if (!existing) throw new NotFoundError(`typed document ${documentId} not found`);
+  assertTypedRowWriter(existing, req);
 
   const type = await documentTypeRepo.get(existing.typeId);
   if (!type) throw new NotFoundError(`document type ${existing.typeId} not found`);
@@ -615,6 +627,7 @@ typedDocumentsRouter.post(
         if (!existing) {
           throw new NotFoundError(`typed document ${documentId} not found`);
         }
+        assertTypedRowWriter(existing, req);
 
         const type = await documentTypeRepo.get(existing.typeId);
         if (!type) throw new NotFoundError(`document type ${existing.typeId} not found`);
@@ -667,6 +680,12 @@ typedDocumentsRouter.post(
         throw new ValidationError('all documentIds must be strings');
       }
 
+      // Loop 29c: only the rows' creator may delete them (a deleted row also
+      // clears the lifecycle creator the /ownership claim reads).
+      for (const id of documentIds as string[]) {
+        const row = await typedDocumentRepo.get(id);
+        if (row) assertTypedRowWriter(row, req);
+      }
       await typedDocumentRepo.bulkDelete(documentIds as string[]);
 
       const durationMs = Date.now() - startTime;

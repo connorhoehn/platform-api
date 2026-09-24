@@ -13,6 +13,7 @@ import { randomUUID } from 'crypto';
 import { approvalRepo } from '../repositories';
 import type { ApprovalEntry, ApprovalDecision } from '../repositories';
 import { asyncHandler, ValidationError } from '../middleware/error-handler';
+import { bodyId, requireDocumentRead } from '../middleware/resource-access';
 
 export const approvalsRouter = Router();
 
@@ -25,7 +26,9 @@ function parseDecision(raw: unknown): ApprovalDecision {
   return raw as ApprovalDecision;
 }
 
-approvalsRouter.post('/', asyncHandler(async (req: Request, res: Response) => {
+// Loop 29c: a reviewer is a reader (#135) — recording a decision on a document
+// takes document:read on the body's documentId.
+approvalsRouter.post('/', requireDocumentRead(bodyId('documentId'), { optional: true }), asyncHandler(async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
 
   const documentId = body.documentId;
@@ -57,7 +60,8 @@ approvalsRouter.post('/', asyncHandler(async (req: Request, res: Response) => {
   res.status(201).json(entry);
 }));
 
-approvalsRouter.get('/', asyncHandler(async (req: Request, res: Response) => {
+// Loop 29c: ?documentId= takes document:read; ?status= lists only the caller's own decisions.
+approvalsRouter.get('/', requireDocumentRead((req) => req.query.documentId, { optional: true }), asyncHandler(async (req: Request, res: Response) => {
   const documentId = typeof req.query.documentId === 'string' ? req.query.documentId : '';
   const status = typeof req.query.status === 'string' ? req.query.status : '';
 
@@ -67,7 +71,7 @@ approvalsRouter.get('/', asyncHandler(async (req: Request, res: Response) => {
     return;
   }
   if (status) {
-    const items = await approvalRepo.listByStatus(parseDecision(status));
+    const items = (await approvalRepo.listByStatus(parseDecision(status))).filter((item) => item.reviewerId === req.user?.sub);
     res.status(200).json({ items });
     return;
   }

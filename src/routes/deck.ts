@@ -34,6 +34,7 @@ import { claimDeckReviseRequest } from '../deck/deckReviseRequests';
 import { deckReviseChannelKey } from '../deck/deckReviseEvents';
 import { getPresentationDocumentStore, PRESENTATION_DOCUMENT_TYPE } from '../deck/presentationDocuments';
 import { canEditDocument, documentRoleOf, editRefusal } from '../deck/documentEditAccess';
+import { requireDeckSourcesReadable } from '../deck/deckSourceAccess';
 import type { DeckSpec } from '../deck/DeckSpec';
 
 export const deckRouter = Router();
@@ -82,7 +83,7 @@ deckRouter.post('/preview', requireAuth, previewLimit, asyncHandler(async (req: 
  * transcript. `source` says whether the model wrote it; when it did not, the
  * reason is returned with it.
  */
-deckRouter.post('/fixture', requireAuth, fixtureLimit, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+deckRouter.post('/fixture', requireAuth, fixtureLimit, requireDeckSourcesReadable(), asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const body = (req.body ?? {}) as { from?: unknown; title?: unknown };
   const raw = (body.from ?? {}) as Record<string, unknown>;
   const from: DeckFixtureFrom = {};
@@ -140,7 +141,7 @@ deckRouter.post('/fixture', requireAuth, fixtureLimit, asyncHandler(async (req: 
  * valid edit the answer is 502/503 with the reason — never an edit it did not
  * make. See `deck/deckRevise.ts`.
  */
-deckRouter.post('/revise', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+deckRouter.post('/revise', requireAuth, requireDeckSourcesReadable(), asyncHandler(async (req: Request, res: Response): Promise<void> => {
   // Kept for back-compat. It saves nothing, so it is not how a composer edit
   // changes a document any more — that is a `deck-revise` run.
   res.setHeader('Deprecation', 'true');
@@ -254,7 +255,7 @@ const REVISION_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
  * Contract: realtime-examples docs/design/documents-editor-handoff/REVIEW.md,
  * "Composer edits run as pipelines".
  */
-deckRouter.post('/revise-run', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+deckRouter.post('/revise-run', requireAuth, requireDeckSourcesReadable(), asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const body = (req.body ?? {}) as {
     documentId?: unknown; instruction?: unknown; slideId?: unknown; target?: unknown; sources?: unknown;
     requestId?: unknown; baseRevisionId?: unknown; spec?: unknown; requestedByName?: unknown;
