@@ -23,7 +23,7 @@ import { tableName } from '../lib/ddb-table-name';
 import { WorkGraphRepository, type WorkSourceKind } from '../repositories/WorkGraphRepository';
 import { authorizationEntityDigest, revisionExplainedByAdditions } from './authorizationRevision';
 import { publishProjectionChangedSignal } from '../services/work-graph-outbox-drainer';
-import { withAccessChangedSignal } from '../services/work-graph-access-signal';
+import { withAccessChangedSignal, publishAccessChangedSignal } from '../services/work-graph-access-signal';
 import { WorkSharingRepository, type SharingAudience } from '../repositories/WorkSharingRepository';
 import {
   WorkCollaborationRepository,
@@ -882,7 +882,12 @@ function cursorSecret(): string {
 export const workGraphOrchestrator = new WorkGraphOrchestrator({
   graph: graphRepository,
   // NFR #21: every committed grant write signals the gateways (this replica commits, this replica publishes).
-  sharing: withAccessChangedSignal(sharingRepository),
+  // NFR #196: the write also drops this replica's run-set answers for the owner,
+  // so the run a grant just added is not refused from a pass taken before it.
+  sharing: withAccessChangedSignal(sharingRepository, (change) => {
+    if (change.personId) forgetRunGraphsOf(change.organizationId, change.personId);
+    return publishAccessChangedSignal(change);
+  }),
   collaboration: collaborationRepository,
   directory,
   locator: { locate: (organizationId, target) => graphRepository.locateTarget(organizationId, target) },
@@ -1095,6 +1100,21 @@ function viewableRuns(viewer: AuthenticatedWorkGraphViewer, ownerId: string, sco
     if (oldest !== undefined) runGraphCache.delete(oldest);
   }
   return runs;
+}
+
+/** NFR #196: drop the cached run sets of `ownerId`'s graphs (every viewer, every day). */
+export function forgetRunGraphsOf(organizationId: string, ownerId: string): number {
+  let dropped = 0;
+  for (const key of [...runGraphCache.keys()]) {
+    const [org, , owner] = JSON.parse(key) as string[];
+    if (org === organizationId && owner === ownerId) { runGraphCache.delete(key); dropped += 1; }
+  }
+  return dropped;
+}
+
+/** Tests only: seed the run-set cache. */
+export function _rememberRunGraphForTest(organizationId: string, viewerId: string, ownerId: string, day: string, timezone: string): void {
+  runGraphCache.set(JSON.stringify([organizationId, viewerId, ownerId, day, timezone]), { at: Date.now(), runs: Promise.resolve(new Set()) });
 }
 
 const utcDay = (ms: number): string | null => (Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : null);
