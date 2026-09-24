@@ -1181,17 +1181,29 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
   const claimedNow = new Set(efforts.flatMap((effort) => effort.nodeIds));
   const looseDecks = nodes.filter((node) => node.kind === 'document' && !claimedNow.has(node.id)
     && details.get(node.id)?.artifact?.mediaKind === 'presentation');
-  if (looseDecks.length > 0 && efforts.length < WORK_GRAPH_V2_LIMITS.efforts) {
+  if (looseDecks.length > 0) {
     const deckIds = new Set(looseDecks.map((node) => node.id));
     const deckEdges = edges.filter((edge) => edge.relation === 'edited' && deckIds.has(edge.toId)
       && !claimedNow.has(edge.fromId) && index.byId.get(edge.fromId)?.kind === 'change');
     const revisionIds = new Set(deckEdges.map((edge) => edge.fromId));
-    efforts.push(...deriveWorkEfforts({
+    const anchorAt = (effort: ViewerWorkEffort) => instant(index.byId.get(effort.anchorNodeId)?.updatedAt);
+    // Newest first. A busy day already holds the effort limit (live: 50 of 50),
+    // so a deck saved just now takes the place of the OLDEST effort rather
+    // than being dropped behind a morning's worth of older ones.
+    for (const deck of deriveWorkEfforts({
       ...effortInput,
       nodes: nodes.filter((node) => deckIds.has(node.id) || revisionIds.has(node.id)),
       edges: deckEdges,
       anchorKinds: ['document'],
-    }).slice(0, Math.max(0, WORK_GRAPH_V2_LIMITS.efforts - efforts.length)));
+    })) {
+      if (efforts.length < WORK_GRAPH_V2_LIMITS.efforts) { efforts.push(deck); continue; }
+      let oldest = -1;
+      efforts.forEach((effort, position) => {
+        if (oldest < 0 || anchorAt(effort) < anchorAt(efforts[oldest])) oldest = position;
+      });
+      if (oldest < 0 || anchorAt(efforts[oldest]) >= anchorAt(deck)) break;
+      efforts[oldest] = deck;
+    }
   }
 
   // One run is one effort. Efforts holding nodes of the same pipeline run are
