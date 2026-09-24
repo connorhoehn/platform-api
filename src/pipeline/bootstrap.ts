@@ -169,6 +169,7 @@ import {
 } from './event-redis-relay';
 import log, { withContext } from '../lib/logger';
 import { sharedRedisUrl } from '../lib/redis-client';
+import { runModelProbe, startModelHealthGauges } from '../lib/modelHealth';
 import { publishDurable, catalog } from '../lib/event-catalog';
 import { createValidatingPublisher } from '@connorhoehn/event-catalog';
 
@@ -1347,6 +1348,15 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     } });
   }
 
+  // NFR #225: is the model reachable (DNS, TCP :443, mounted credentials — no
+  // tokens)? On the sweep leader, every interval; the result and the circuit
+  // breaker live in the cache Redis, and every replica mirrors them into its
+  // /internal/metrics gauges.
+  if (!IS_TEST_ENV && process.env.MODEL_PROBE !== 'off') {
+    clusterSweepTasks.push({ name: 'model-probe', run: async () => { await runModelProbe(); } });
+    startModelHealthGauges();
+  }
+
   // NFR #26: one replica sweeps, every interval, cluster-wide.
   const clusterSweeper = new ClusterSweeper({
     store: sweepLeaseStore,
@@ -1497,6 +1507,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   const auditSweeperEnabled = (() => {
     const raw = process.env.PIPELINE_AUDIT_SWEEPER_ENABLED;
     if (raw !== undefined) return raw.trim().toLowerCase() !== 'false';
+    // realtime-examples NFR #226: pipeline-audit now has table TTL on
+    // `ttlEpoch`, so the leased local TTL sweep (#227) reaps it; a second
+    // sweep of the same rows on the same leader is only extra Scans.
+    if (localTtlSweepEnabled()) return false;
     return !IS_TEST_ENV;
   })();
   let auditSweeperStop: (() => void) | null = null;

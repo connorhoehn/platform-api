@@ -421,6 +421,14 @@ export function createDeckReviseProposeHandler(opts: DeckReviseStepOpts = {}): D
           // A model that could not be reached is worth one more try; the
           // executor retries a failure whose message reads as transient.
           // Not when the model's credentials are the problem: another try is the same answer.
+          if (/^model unavailable:/.test(err.reason)) {
+            // The model circuit breaker is open (NFR #225): the step says
+            // "Model unavailable: <reason>" at once, and is not retried — the
+            // breaker would refuse the retry the same way.
+            const outcome = fail(runId, request, 503, err.message, 'model-unavailable');
+            log.warn({ runId, reason: err.reason, documentId: request.documentId }, 'deck revise run: model unavailable (breaker open)');
+            return outcome;
+          }
           if (MODEL_AUTH_RE.test(err.reason)) {
             // The model's login, not the edit: say so plainly, once, and never
             // retry (ModelAuth is terminal). The operator step is in the log.

@@ -24,7 +24,8 @@ import {
 import { readDocumentText } from './DeckSourcesStepHandler';
 import { DOCUMENTS_TABLE } from './presentationDocuments';
 import { getRedisClient } from '../lib/redis-client';
-import { withModelSlot, type ModelSlotRunner } from './modelSlots';
+import { ModelSlotTimeoutError, withModelSlot, type ModelSlotRunner } from './modelSlots';
+import { guardModelCall } from '../lib/modelHealth';
 import { contentKey, createSingleFlight, type SingleFlightRole, type SingleFlightStore } from './fixtureSingleFlight';
 
 export const FIXTURE_TITLE_PREFIX = '[deck-fixture]';
@@ -417,6 +418,14 @@ export async function askModel(llm: LLMClient, prompt: string, timeoutMs: number
   return text;
 }
 
+/**
+ * A real model call's slot, behind the model circuit breaker (NFR #225): an
+ * open breaker fails at once with "Model unavailable: <reason>" — before
+ * waiting for a slot — and the draft says so instead of waiting 30 s.
+ */
+export const guardedSlot: ModelSlotRunner = (run) =>
+  guardModelCall(() => withModelSlot(run), (err) => err instanceof ModelSlotTimeoutError);
+
 export interface BuildFixtureOpts extends ReadMaterialDeps {
   llm?: LLMClient | null;
   timeoutMs?: number;
@@ -495,7 +504,7 @@ export async function buildDeckFixture(
     if (!llm) return { spec: fixtureSpec(material, deckTitle), source: 'fixture', reason: 'no model is configured on this deployment' };
     try {
       // Injected clients (tests) take no slot, as they take no single-flight.
-      const answer = await askModel(llm, fixturePrompt(material, deckTitle, from.personId), opts.timeoutMs ?? FIXTURE_TIMEOUT_MS, opts.llm === undefined ? (run) => withModelSlot(run) : null);
+      const answer = await askModel(llm, fixturePrompt(material, deckTitle, from.personId), opts.timeoutMs ?? FIXTURE_TIMEOUT_MS, opts.llm === undefined ? guardedSlot : null);
       const parsed = parseDeckSpecJson(answer);
       if (parsed === undefined) throw new Error('the model answered with no JSON object');
       const validation = validateDeckSpec(liftSlideSubtitles(parsed));

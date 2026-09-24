@@ -5,6 +5,7 @@ import { ddbClient } from '../lib/aws-clients';
 import { getRedisClient } from '../lib/redis-client';
 import { tableName } from '../lib/ddb-table-name';
 import { buildFreshnessReadiness } from '../lib/buildFreshness';
+import { readModelHealth } from '../lib/modelHealth';
 
 const PROFILES_TABLE = tableName('social-profiles');
 const SERVICE_VERSION = process.env.SERVICE_VERSION ?? '0.1.0';
@@ -34,6 +35,17 @@ const buildCheck: HealthCheck = {
   check: async () => buildFreshnessReadiness(),
 };
 
+// NFR #225: the model's reachability (probe + circuit breaker, shared across
+// replicas). Degraded, never failing: the pod serves everything else.
+const modelCheck: HealthCheck = {
+  name: 'model',
+  check: async () => {
+    const health = await readModelHealth();
+    if (health.available) return { ok: true, ...(health.probe?.note ? { details: health.probe.note } : {}) };
+    return { ok: true, degraded: true, details: health.message };
+  },
+};
+
 const router = Router();
 
 router.get(
@@ -41,7 +53,7 @@ router.get(
   makeHealthHandler({
     service: 'platform-api',
     version: SERVICE_VERSION,
-    checks: [ddbCheck, redisCheck, buildCheck],
+    checks: [ddbCheck, redisCheck, buildCheck, modelCheck],
   }),
 );
 

@@ -23,6 +23,7 @@ import log from '../lib/logger';
 import { CALL_RECORDINGS_TABLE } from '../repositories/CallRecordingRepository';
 import { createLLMClient } from '../pipeline/createLLMClient';
 import { ModelSlotTimeoutError, withModelSlot } from './modelSlots';
+import { guardModelCall, ModelUnavailableError } from '../lib/modelHealth';
 import type { LLMClient } from '../pipeline/LLMClient';
 import {
   MAX_BULLETS_PER_SLIDE, MAX_BULLET_CHARS, MAX_NOTES_CHARS, MAX_SLIDES, MAX_SOURCES_PER_SLIDE, MAX_TITLE_CHARS,
@@ -113,6 +114,11 @@ export interface DeckReviseOpts extends ReadMaterialDeps {
    * injected client (tests), which may inject this instead. null: no slot.
    */
   modelSlot?: typeof withModelSlot | null;
+  /**
+   * Run the model call behind the model circuit breaker (lib/modelHealth.ts).
+   * Default: only for the real model (an injected `llm` skips it).
+   */
+  modelBreaker?: boolean;
 }
 
 /**
@@ -508,8 +514,15 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
     : null;
   if (!slot) phase('asking-model');
   try {
-    answer = await askModel(llm, revisePrompt(input, read), opts.timeoutMs ?? REVISE_TIMEOUT_MS, slot);
+    const ask = () => askModel(llm, revisePrompt(input, read), opts.timeoutMs ?? REVISE_TIMEOUT_MS, slot);
+    const guarded = opts.modelBreaker ?? opts.llm === undefined;
+    answer = guarded ? await guardModelCall(ask, (err) => err instanceof ModelSlotTimeoutError) : await ask();
   } catch (err) {
+    if (err instanceof ModelUnavailableError) {
+      // The breaker is open (or the probe saw the model's DNS / login fail):
+      // say why at once instead of waiting out the timeout.
+      throw new DeckReviseError(`Model unavailable: ${err.reason}. Nothing was changed.`, 503, `model unavailable: ${err.reason}`);
+    }
     if (err instanceof ModelSlotTimeoutError) {
       throw new DeckReviseError(
         `The agent is busy: no model slot came free within ${Math.round(err.waitedMs / 1000)} seconds, so nothing was changed. Try again in a minute.`,

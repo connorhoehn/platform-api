@@ -7,6 +7,7 @@ export type ErrorCategory =
   | 'Refused'
   | 'ModelAuth'
   | 'ModelBusy'
+  | 'ModelUnavailable'
   | 'UnknownError';
 
 export type Retryability = 'retryable' | 'terminal' | 'unknown';
@@ -23,6 +24,9 @@ const CATEGORY_RETRYABILITY: Record<ErrorCategory, Retryability> = {
   // Waited its turn for a fleet-wide model slot and none came free
   // (deck/modelSlots.ts): a retry joins the back of the same line.
   ModelBusy:        'terminal',
+  // The model circuit breaker is open (lib/modelHealth.ts): a retry is refused
+  // the same way until the cool-down ends.
+  ModelUnavailable: 'terminal',
   LLMError:         'retryable',  // refined by classifyRetryability for 4xx auth
   UnknownError:     'unknown',
 };
@@ -83,6 +87,9 @@ export function classifyRetryability(category: ErrorCategory, message: string): 
 /** A step that gave up waiting for a model slot: the `model-busy` code. */
 export const MODEL_BUSY_RE = /(?:^|: )[a-z][\w-]* model-busy: /;
 
+/** A step that failed fast on the open model breaker: the `model-unavailable` code. */
+export const MODEL_UNAVAILABLE_RE = /(?:^|: )[a-z][\w-]* model-unavailable: /;
+
 export const MODEL_AUTH_RE = /\bmodel-auth\b|not logged in|\/login\b|not authenticated|invalid[ _]api[ _]key|authentication_error|oauth token has expired/i;
 
 export function classifyPipelineError(message: string, stack?: string): ErrorCategory {
@@ -92,6 +99,7 @@ export function classifyPipelineError(message: string, stack?: string): ErrorCat
   // A model login/credential failure, before the keyword scans: the CLI's
   // "Please run /login" contains "lease" and read as a RegistryConflict
   // (Loop 28 ppt). Matched on the message only — a stack is not a reason.
+  if (MODEL_UNAVAILABLE_RE.test(message)) return 'ModelUnavailable';
   if (MODEL_AUTH_RE.test(message)) return 'ModelAuth';
   if (MODEL_BUSY_RE.test(message)) return 'ModelBusy';
 
