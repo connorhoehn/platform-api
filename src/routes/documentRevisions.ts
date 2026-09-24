@@ -22,6 +22,7 @@ import { PPTX_CONTENT_TYPE, renderPptx } from '../deck/renderPptx';
 import { platformWorkGraphSourcePublisher } from '../work-graph/sources/platformPublisher';
 import { workSourceAccountRepo } from '../repositories';
 import { SVG_CONTENT_TYPE } from '../deck/renderSlideSvg';
+import { getSlideReadCache } from '../deck/slideReadCache';
 import { previewDeckSpec } from '../deck/preview';
 import { healCitationTitles } from '../deck/citationTitles';
 import log from '../lib/logger';
@@ -396,40 +397,73 @@ documentRevisionsRouter.get('/:revisionId/slides', requireAuth, asyncHandler(asy
  * its own: no sniffing, no framing, nothing cached anywhere shared.
  */
 documentRevisionsRouter.get('/:revisionId/slides/:slideId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  // NFR #166: the slide requests in flight together share one row read and
+  // one read decision (nothing kept after); the slide list and bytes are kept
+  // once read (immutable) — the per-request cost the batch route avoids.
+  const started = Date.now();
   const documentId = String(req.params.documentId ?? '');
+  const revisionId = String(req.params.revisionId ?? '');
   const slideId = String(req.params.slideId ?? '').replace(/\.svg$/i, '');
-  const { revision } = await loadRevision(req, documentId, String(req.params.revisionId ?? ''));
+  if (!ID.test(documentId)) throw new ValidationError('documentId is invalid');
+  if (!ID.test(revisionId)) throw new ValidationError('revisionId is invalid');
   const store = getPresentationDocumentStore();
-  // Inline on the head; an older revision's list is a manifest in the blob store (NFR #36).
-  const revisionSlides = await resolveRevisionSlides(store, revision);
-  if (!revisionSlides) throw new NotFoundError('Slide preview not found');
-  const slide = revisionSlides.find((candidate) => candidate.id === slideId);
-  if (!slide) throw new NotFoundError('Slide not found');
-  // The row's own markup first, the blob second — a row outlives the volume it
-  // points at, and a preview that 404s after a pod replacement is the defect
-  // this order exists to prevent.
-  const stored = store.slidePreview
-    ? await store.slidePreview(documentId, revision.id, slideId)
-    : await getAssetBlobStore().getBlob(slide.asset.key)
-      .then((blob) => (blob ? { contentType: blob.asset.contentType, body: blob.body } : null));
-  if (!stored) throw new NotFoundError('Slide preview not found');
-  // A revision's slide never changes: the URL names (document, revision,
-  // slide) and a revision is immutable once written. So the browser may keep
-  // it for good (privately — it is someone's document), and a slide stored by
-  // content answers a revalidation by its hash.
-  const sha256 = (stored as { sha256?: string }).sha256 ?? slide.sha256;
-  if (sha256) {
-    const etag = `"${sha256.slice(0, 40)}"`;
-    res.setHeader('etag', etag);
-    if (req.headers['if-none-match'] === etag) { res.status(304).setHeader('cache-control', 'private, max-age=31536000, immutable').end(); return; }
+  const cache = getSlideReadCache();
+  const row = await cache.row(store, documentId);
+  if (!row) throw new NotFoundError('Document not found');
+  if (!req.documentGrant) {
+    if (!req.headers.authorization?.startsWith('Bearer ')) throw new AppError(401, 'Authorization required');
+    const allowed = await cache.canRead(`${req.user?.orgId ?? ''}\u0000${req.user?.sub ?? ''}\u0000${documentId}`,
+      async () => (await canReadDocument(row, req.user, documentId)).allow);
+    if (!allowed) {
+      log.warn({ documentId, userId: req.user?.sub ?? '', orgId: req.user?.orgId, route: req.path }, 'deck revision read refused: the caller may not read this document');
+      throw new NotFoundError('Document not found');
+    }
   }
+  const revision = (row.revisions ?? []).find((candidate) => candidate.id === revisionId);
+  if (!revision) throw new NotFoundError('Revision not found');
+  const loadedAt = Date.now();
+  // Inline on the head; an older revision's list is a manifest in the blob
+  // store (NFR #36); a legacy entry on the row last.
+  const slide = ((await cache.slides(store, documentId, revision)) ?? []).find((candidate) => candidate?.id === slideId)
+    ?? (row.revisionSlides?.[revision.id] ?? []).find((candidate) => candidate?.id === slideId);
+  if (!slide) throw new NotFoundError('Slide not found');
+  const cacheControl = 'private, max-age=31536000, immutable';
+  // A revision's slide never changes: the URL names (document, revision,
+  // slide), so the browser keeps it privately, and a revalidation is answered
+  // by the content hash before any bytes are read.
+  const recordedEtag = slide.sha256 ? `"${slide.sha256.slice(0, 40)}"` : undefined;
+  if (recordedEtag && req.headers['if-none-match'] === recordedEtag) {
+    res.status(304).setHeader('etag', recordedEtag).setHeader('cache-control', cacheControl)
+      .setHeader('server-timing', `load;dur=${loadedAt - started}`).end();
+    return;
+  }
+  // The row's own markup first, the blob (then its durable copy) second — a
+  // row outlives the volume it points at.
+  const body = await cache.slideBytes(`${documentId}\u0000${revision.id}\u0000${slideId}`, async () => {
+    if (slide.svg) return Buffer.from(slide.svg, 'utf8');
+    if (!slide.asset?.key) return null;
+    try {
+      if (store.readAsset) return await store.readAsset(slide.asset);
+      return (await getAssetBlobStore().getBlob(slide.asset.key))?.body ?? null;
+    } catch {
+      return null;
+    }
+  });
+  if (!body) {
+    log.warn({ documentId, revisionId: revision.id, slideId, key: slide.asset?.key }, 'a revision names slide bytes that are neither on the row nor in either blob store');
+    throw new NotFoundError('Slide preview not found');
+  }
+  const etag = recordedEtag ?? `"${createHash('sha256').update(body).digest('hex').slice(0, 40)}"`;
+  res.setHeader('etag', etag);
+  if (req.headers['if-none-match'] === etag) { res.status(304).setHeader('cache-control', cacheControl).end(); return; }
   res
     .status(200)
-    .setHeader('content-type', stored.contentType || slide.asset.contentType || SVG_CONTENT_TYPE)
-    .setHeader('content-length', String(stored.body.byteLength))
-    .setHeader('cache-control', 'private, max-age=31536000, immutable')
+    .setHeader('content-type', slide.asset?.contentType || SVG_CONTENT_TYPE)
+    .setHeader('content-length', String(body.byteLength))
+    .setHeader('cache-control', cacheControl)
     .setHeader('x-content-type-options', 'nosniff')
     .setHeader('content-disposition', 'inline')
     .setHeader('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox")
-    .send(stored.body);
+    .setHeader('server-timing', `load;dur=${loadedAt - started}, bytes;dur=${Date.now() - loadedAt}`)
+    .send(body);
 }));
