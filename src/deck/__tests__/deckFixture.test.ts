@@ -169,6 +169,8 @@ describe('buildDeckFixture', () => {
   it('a blank bullet or column entry is dropped, not a reason to fall back to the offline deck (Loop 33)', () => {
     expect(liftSlideSubtitles({ slides: [{ id: 'a', bullets: ['One', ' '], columns: [['L', ''], ['R']] }] }))
       .toEqual({ slides: [{ id: 'a', bullets: ['One'], columns: [['L'], ['R']] }] });
+    expect(liftSlideSubtitles({ slides: [{ id: 'a', eyebrow: ' ', title: 'T' }, { id: 'b', eyebrow: 'Scope' }] }))
+      .toEqual({ slides: [{ id: 'a', title: 'T' }, { id: 'b', eyebrow: 'Scope' }] });
   });
 
   it('a page outline reads as plain text, without the edit format’s block numbers (Loop 33)', () => {

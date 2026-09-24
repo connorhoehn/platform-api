@@ -453,6 +453,8 @@ export function liftSlideSubtitles(parsed: unknown): unknown {
       const tidy: Record<string, unknown> = { ...s };
       if (Array.isArray(s.bullets)) tidy.bullets = s.bullets.filter((b) => !blank(b));
       if (Array.isArray(s.columns)) tidy.columns = s.columns.map((col) => (Array.isArray(col) ? col.filter((b) => !blank(b)) : col));
+      // A blank eyebrow is a label left empty (live Loop 34: `slides[0].eyebrow`), dropped like a blank subtitle.
+      if (blank(s.eyebrow)) delete tidy.eyebrow;
       slide = tidy;
     }
     if (!slide || typeof slide !== 'object' || !('subtitle' in slide)) return slide;
