@@ -14,7 +14,7 @@
 // NFR #77 extends it to the work-graph projection's `WG#` rows (1,176 past
 // their ttl on 2026-09-23): same rule, ttl passed re-checked per delete.
 //
-// NFR #223 (Loop 37) generalises it: `sweepTtlTables` finds every table whose
+// NFR #227 (Loop 37) generalises it: `sweepTtlTables` finds every table whose
 // OWN TimeToLive is ENABLED, reads that attribute name from the table, and
 // deletes only rows whose value is a Number below now — exactly the rows AWS's
 // reaper would remove, nothing else. It runs as one ClusterSweeper task (one

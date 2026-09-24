@@ -30,7 +30,7 @@ const LEASE_TTL_MS = 30_000;
 
 /**
  * TTL for completed/failed rows (kept briefly for debugging; nothing reads
- * them). 24 h in AWS. NFR #223: in local dev the outbox took ~100k rows/day
+ * them). 24 h in AWS. NFR #227: in local dev the outbox took ~100k rows/day
  * (95% `work-graph.pipeline.lifecycle.v1` under run load), so 24 h of
  * retention alone was 110 MB of a DynamoDB Local that ran out of heap — dev
  * keeps 1 h. `OUTBOX_TERMINAL_TTL_SECONDS` overrides either.
@@ -521,7 +521,7 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
     void poll();
   }, pollIntervalMs);
 
-  // The dev-only TTL stand-in moved to the sweep leader (NFR #223,
+  // The dev-only TTL stand-in moved to the sweep leader (NFR #227,
   // `local-ttl-sweep` in pipeline/bootstrap.ts): it used to run here on every
   // replica, unleased, scanning the whole outbox every 10 minutes.
 

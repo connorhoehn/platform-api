@@ -62,7 +62,7 @@ describe('local TTL sweep (NFR #73)', () => {
   });
 });
 
-describe('sweepTtlTables (NFR #223)', () => {
+describe('sweepTtlTables (NFR #227)', () => {
   function fakeDdb(tables: Record<string, { ttl?: { status: string; attr?: string }; keys: Array<{ AttributeName: string; KeyType: 'HASH' | 'RANGE' }> }>) {
     return {
       send: jest.fn(async (cmd: unknown) => {

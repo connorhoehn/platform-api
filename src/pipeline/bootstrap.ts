@@ -1315,7 +1315,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     } });
   }
 
-  // NFR #223: dev-only TTL stand-in (DynamoDB Local never expires rows) for
+  // NFR #227: dev-only TTL stand-in (DynamoDB Local never expires rows) for
   // every table whose own TTL is ENABLED, on the sweep leader only. Fired and
   // not awaited, so a long paced pass never holds the orphan scan (#59) back;
   // it stops between deletes once leadership is lost.
