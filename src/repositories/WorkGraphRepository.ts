@@ -1,3 +1,4 @@
+import { wakeOutbox } from '../lib/outboxWake';
 import {
   DynamoDBDocumentClient,
   GetCommand,
@@ -793,6 +794,8 @@ export class WorkGraphRepository {
 
     try {
       await this.docClient.send(new TransactWriteCommand({ TransactItems: writes }));
+      // NFR #133: the commit carries a change row; publish it now.
+      wakeOutbox('work-graph');
       // NFR #202: the committed state is exactly META's new revision, so the
       // next commit (or read) on this partition proves it with one META Get.
       this.holdProjection(pk, next);

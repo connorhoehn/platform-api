@@ -1,5 +1,6 @@
 import { membershipProjection, withFreshMembership } from './membershipProjection';
 import { withBuildMemo } from './buildMemo';
+import { withContext } from '../lib/logger';
 import { createHash, randomUUID } from 'crypto';
 import {
   BatchGetCommand,
@@ -984,18 +985,17 @@ async function gatewayWorkGraphView(
   viewer: AuthenticatedWorkGraphViewer,
   query: GatewayWorkGraphQuery,
   requested: GatewayWorkGraphViewRequest,
+  /** A graph this request already built for the same viewer and query: the view reuses it (NFR #133). */
+  graph?: Awaited<ReturnType<typeof workGraphOrchestrator.getGraph>>,
 ): Promise<GatewayWorkGraphViewV2> {
-  const snapshot = await workGraphOrchestrator.getGraphV2(
-    viewer,
-    query.personId,
-    query.day,
-    query.timezone,
-    {
-      ...(requested.windowStart ? { windowStart: requested.windowStart } : {}),
-      ...(requested.windowEnd ? { windowEnd: requested.windowEnd } : {}),
-      ...(requested.mode ? { mode: requested.mode } : {}),
-    },
-  );
+  const input = {
+    ...(requested.windowStart ? { windowStart: requested.windowStart } : {}),
+    ...(requested.windowEnd ? { windowEnd: requested.windowEnd } : {}),
+    ...(requested.mode ? { mode: requested.mode } : {}),
+  };
+  const snapshot = graph
+    ? await workGraphOrchestrator.getGraphV2FromGraph(graph, viewer, query.personId, query.day, query.timezone, input)
+    : await workGraphOrchestrator.getGraphV2(viewer, query.personId, query.day, query.timezone, input);
   return {
     query: snapshot.query,
     temporal: snapshot.temporal,
@@ -1004,6 +1004,19 @@ async function gatewayWorkGraphView(
     operations: snapshot.operations,
     eventBuckets: snapshot.eventBuckets,
   };
+}
+
+const feedLog = withContext({ service: 'workGraphFeed' });
+/**
+ * NFR #133: where a live-feed answer spends its time, per phase, when it is
+ * slow enough to matter to "a new run shows in Active Now within 2 s".
+ */
+function logFeedTiming(marks: Array<[string, number]>, batches: number): void {
+  const total = marks[marks.length - 1][1] - marks[0][1];
+  if (total < 300) return;
+  const phases: Record<string, number> = {};
+  for (let i = 1; i < marks.length; i++) phases[marks[i][0]] = marks[i][1] - marks[i - 1][1];
+  feedLog.info({ totalMs: total, batches, ...phases }, 'work graph feed slow');
 }
 
 /** The allow answer for a graph the orchestrator just produced for this viewer. */
@@ -1195,7 +1208,15 @@ async function authorizeGatewayWorkGraphOnce(
   }
 }
 
-export async function replayGatewayWorkGraph(
+export function replayGatewayWorkGraph(
+  ...args: Parameters<typeof replayGatewayWorkGraphOnce>
+): ReturnType<typeof replayGatewayWorkGraphOnce> {
+  // One read memo spans the graph pass and the view derived from it, as
+  // `/authorize` already does (NFR #16, #133).
+  return withBuildMemo(() => replayGatewayWorkGraphOnce(...args));
+}
+
+async function replayGatewayWorkGraphOnce(
   organizationId: string,
   viewerId: string,
   query: GatewayWorkGraphQuery,
@@ -1254,7 +1275,10 @@ export async function replayGatewayWorkGraph(
   // partition from its own cursor and merges them (NFR #22). A cursor it
   // cannot split (issued before the packing) answers incomplete: one reset.
   const feed = request.feed === true;
+  const marks: Array<[string, number]> = [['start', Date.now()]];
+  const mark = (name: string) => { marks.push([name, Date.now()]); };
   const viewer = await directory.resolveViewerById(organizationId, viewerId);
+  mark('viewer');
   if (!viewer) return feed ? { batches: [], complete: true, access: DENIED } : { batches: [], complete: false };
   let current: Awaited<ReturnType<typeof workGraphOrchestrator.getGraph>>;
   try {
@@ -1270,8 +1294,10 @@ export async function replayGatewayWorkGraph(
     if (feed && error instanceof WorkGraphUnavailableError) return { batches: [], complete: true, access: DENIED };
     throw error;
   }
+  mark('graph');
   if (request.throughWatermark > current.snapshot.watermark) return { batches: [], complete: false };
   const access = feed ? await allowedAccess(organizationId, viewerId, viewer, query, current.snapshot) : undefined;
+  mark('access');
   const currentRevision = current.snapshot.scope.policyRevision;
   const advancing = request.fromPolicyRevision !== undefined && request.fromPolicyRevision !== currentRevision;
   // Proving an advance needs every entity created up to the state the current
@@ -1291,6 +1317,7 @@ export async function replayGatewayWorkGraph(
     throughWatermark,
     request.limit,
   );
+  mark('deltas');
   const visibleNodes = new Map(current.snapshot.nodes.map((node) => [node.id, node]));
   const visibleEdges = new Map(current.snapshot.edges.map((edge) => [edge.id, edge]));
   const authorizedNodes = new Map(current.authorization.nodes.map((node) => [node.id, node]));
@@ -1365,11 +1392,14 @@ export async function replayGatewayWorkGraph(
   if (feed) {
     // One view per answer, not one per batch plus one more: the gateway
     // attaches it to every batch it forwards, exactly as before.
-    const view = await gatewayWorkGraphView(viewer, query, requestedView);
+    const view = await gatewayWorkGraphView(viewer, query, requestedView, current);
+    mark('view');
     const encoded = await feedViewCache.encode({
       organizationId, viewerId, ...query,
       windowStart: requestedView.windowStart, windowEnd: requestedView.windowEnd, mode: requestedView.mode,
     }, view, request.baseViewId);
+    mark('encode');
+    logFeedTiming(marks, batches.length);
     return {
       batches,
       complete: safe,
@@ -1383,7 +1413,7 @@ export async function replayGatewayWorkGraph(
   // whole refreshed view, so effort membership can never drift away from the
   // node/edge state the same authorization decision produced. A zero-batch
   // replay still returns it, because a lease can expire with no mutation.
-  const view = await gatewayWorkGraphView(viewer, query, requestedView);
+  const view = await gatewayWorkGraphView(viewer, query, requestedView, current);
   return {
     batches: batches.map((batch) => ({ ...batch, view })),
     complete: safe,

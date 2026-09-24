@@ -189,6 +189,8 @@ function setup(options: {
   capability?: () => 'allow' | 'deny' | 'unavailable';
   /** The viewer's live grants (default: the one active grant). */
   grants?: () => StoredWorkGrant[];
+  /** Hands the test the orchestrator the router was built on. */
+  onOrchestrator?: (orchestrator: WorkGraphOrchestrator) => void;
 } = {}): express.Express {
   const capped = new Set(options.summaryKinds ?? []);
   const source: WorkSourceAclAdapter = {
@@ -240,7 +242,9 @@ function setup(options: {
     id: () => 'generation-1',
   };
   const app = express();
-  app.use('/api/work-graph', createWorkGraphRouter(new WorkGraphOrchestrator(deps), {
+  const orchestrator = new WorkGraphOrchestrator(deps);
+  options.onOrchestrator?.(orchestrator);
+  app.use('/api/work-graph', createWorkGraphRouter(orchestrator, {
     viewBaseStore: async () => options.viewBaseStore ?? null,
   }));
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
@@ -363,6 +367,21 @@ describe('work graph schemaVersion 2 route', () => {
     expect(body.operations.map((operation) => operation.edgeId).sort()).toEqual(['e-produced', 'e-terminal']);
     expect(body.eventBuckets.length).toBeGreaterThan(0);
     expect(body.temporal.mode).toBe('live');
+  });
+
+  it('builds the v2 body from a graph already authorized, identical to a fresh v2 build and with one ACL pass (NFR #133)', async () => {
+    let orchestrator!: WorkGraphOrchestrator;
+    const asked: string[][] = [];
+    setup({ onOrchestrator: (value) => { orchestrator = value; }, onDisclosure: (ids) => asked.push(ids) });
+    const viewer = { viewerId: 'frank', organizationId: 'org-1', conversationIds: [] };
+    const input = { windowStart: at('13:30'), windowEnd: at('13:45'), mode: 'live' as const };
+    const fresh = await orchestrator.getGraphV2(viewer, 'connor', DAY, 'America/New_York', input);
+    const passesPerBuild = asked.length;
+    asked.length = 0;
+    const graph = await orchestrator.getGraph(viewer, 'connor', DAY, 'America/New_York');
+    const reused = await orchestrator.getGraphV2FromGraph(graph, viewer, 'connor', DAY, 'America/New_York', input);
+    expect(asked.length).toBe(passesPerBuild);
+    expect({ ...reused, cursor: undefined }).toEqual({ ...fresh, cursor: undefined });
   });
 
   it('says a recording is pending when this viewer cannot read its transcript', async () => {

@@ -820,6 +820,46 @@ export class WorkGraphOrchestrator {
     return { snapshot, query, activity };
   }
 
+  /**
+   * The v2 snapshot for a graph this request has ALREADY built and authorized
+   * (NFR #133). The gateway's live feed needs both the v1 graph (to map delta
+   * batches and answer access) and the v2 view; building the view through
+   * `getGraphV2` ran the whole load + authorization pass a second time, and on
+   * a fresh revision each pass cost 0.4–0.9 s. Same activity layer, same
+   * contract check, from the one pass. Call it inside the caller's
+   * `withBuildMemo` so the activity layer reuses the ACL pass's reads.
+   */
+  async getGraphV2FromGraph(
+    graph: { snapshot: WorkGraphSnapshot; authorization: AuthorizedWorkGraph },
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    input: WorkGraphWindowInput = {},
+  ): Promise<WorkGraphSnapshotV2> {
+    const reader = this.deps.activityReader;
+    if (!reader) throw new WorkGraphInputError('Schema version 2 is not available on this deployment.');
+    const now = this.deps.now();
+    const query = this.resolveWindow(personId, day, timezone, input, now);
+    const activity = await buildWorkActivity({
+      query,
+      nodes: graph.snapshot.nodes,
+      edges: graph.snapshot.edges,
+      authorization: graph.authorization,
+      reader,
+      now,
+    });
+    const built = buildWorkGraphSnapshotV2({ snapshot: graph.snapshot as never, query, activity });
+    if (!built.ok) {
+      log.error({
+        personId, day, timezone, viewerId: viewer.viewerId, errors: built.errors,
+        efforts: activity.efforts.length, details: activity.details.length,
+      }, 'v2 work graph snapshot failed its own contract');
+      throw new WorkGraphUnavailableError('This work item is unavailable.');
+    }
+    return built.value;
+  }
+
   /** Assembles and strictly validates the browser-facing v2 snapshot body. */
   async getGraphV2(
     viewer: AuthenticatedWorkGraphViewer,

@@ -15,6 +15,7 @@ import {
   pendingShardFor,
 } from '../lib/outbox-pending';
 import log from '../lib/logger';
+import { registerOutboxWake } from '../lib/outboxWake';
 import { localTtlSweepEnabled, sweepExpiredProcessedRows, sweepExpiredWorkGraphRows } from '../lib/localTtlSweep';
 import {
   recordOutboxLeaseAcquired,
@@ -116,6 +117,20 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
   let indexCheckedAt = 0;
   let indexWaitLogged = false;
 
+  // NFR #133: a writer in this process wakes the drainer instead of waiting
+  // for the next tick. A wake during a poll is served right after it; wakes
+  // within a few ms share one poll (one lease round trip, not one per row).
+  let wakeAgain = false;
+  let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+  function wake(): void {
+    if (stopping) return;
+    if (running) { wakeAgain = true; return; }
+    if (wakeTimer) return;
+    wakeTimer = setTimeout(() => { wakeTimer = null; void poll(); }, 10);
+    wakeTimer.unref?.();
+  }
+  const unregisterWake = registerOutboxWake('platform-events', wake);
+
   async function poll(): Promise<void> {
     if (running || stopping) return;
     running = true;
@@ -180,6 +195,7 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
     } finally {
       activeLock = null;
       running = false;
+      if (wakeAgain) { wakeAgain = false; wake(); }
     }
   }
 
@@ -532,6 +548,8 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
   return {
     stop: () => {
       stopping = true;
+      unregisterWake();
+      if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
       if (sweepTimer) {
         clearInterval(sweepTimer);
         sweepTimer = null;

@@ -12,6 +12,7 @@ import { catalog } from '../lib/event-catalog';
 import { getRedisClient } from '../lib/redis-client';
 import { WORK_GRAPH_OUTBOX_SHARDS, WORK_GRAPH_TABLE, workGraphOutboxPartition } from '../lib/work-graph-dynamo';
 import log from '../lib/logger';
+import { registerOutboxWake } from '../lib/outboxWake';
 
 const OWNER = `${process.pid}@${hostname()}-${randomUUID()}`;
 const DEFAULT_LEASE_MS = 30_000;
@@ -246,16 +247,42 @@ export function startWorkGraphOutboxDrainer(options: Parameters<typeof createWor
 } = {}): { stop(): void; drainOnce(): Promise<number> } {
   const drainer = createWorkGraphOutboxDrainer(options);
   let running = false;
-  const timer = setInterval(() => {
-    if (running) return;
+  let stopped = false;
+  // NFR #133: a projection commit in this process wakes the drainer rather
+  // than leaving its change row for the next 2 s tick. A wake during a pass
+  // is served right after it; wakes within a few ms share one pass.
+  let wakeAgain = false;
+  let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+  const pass = (): void => {
+    if (running || stopped) return;
     running = true;
     void drainer.drainOnce()
       .catch((error) => log.error(
         { errMessage: error instanceof Error ? error.message : String(error) },
         'work-graph outbox scan failed',
       ))
-      .finally(() => { running = false; });
-  }, options.pollIntervalMs ?? 2_000);
+      .finally(() => {
+        running = false;
+        if (wakeAgain) { wakeAgain = false; wake(); }
+      });
+  };
+  function wake(): void {
+    if (stopped) return;
+    if (running) { wakeAgain = true; return; }
+    if (wakeTimer) return;
+    wakeTimer = setTimeout(() => { wakeTimer = null; pass(); }, 10);
+    wakeTimer.unref?.();
+  }
+  const unregisterWake = registerOutboxWake('work-graph', wake);
+  const timer = setInterval(pass, options.pollIntervalMs ?? 2_000);
   timer.unref?.();
-  return { stop: () => clearInterval(timer), drainOnce: drainer.drainOnce };
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(timer);
+      if (wakeTimer) clearTimeout(wakeTimer);
+      unregisterWake();
+    },
+    drainOnce: drainer.drainOnce,
+  };
 }

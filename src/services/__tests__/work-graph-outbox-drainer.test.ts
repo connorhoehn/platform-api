@@ -1,5 +1,6 @@
 import { DeleteCommand, DynamoDBDocumentClient, QueryCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
-import { createWorkGraphOutboxDrainer } from '../work-graph-outbox-drainer';
+import { createWorkGraphOutboxDrainer, startWorkGraphOutboxDrainer } from '../work-graph-outbox-drainer';
+import { wakeOutbox } from '../../lib/outboxWake';
 
 jest.mock('../../lib/work-graph-dynamo', () => ({
   WORK_GRAPH_TABLE: 'work-graph-test',
@@ -168,5 +169,27 @@ describe('NFR #27 — outbox shards are queried, the table scan retires', () => 
     for (let i = 0; i < 3; i++) await drainer.drainOnce();
     expect(send.mock.calls.filter(([c]) => c instanceof ScanCommand)).toHaveLength(1);
     expect(send.mock.calls.filter(([c]) => c instanceof QueryCommand)).toHaveLength(12);
+  });
+
+  it('drains at once when a commit wakes it, not at the next tick; one pass per burst (NFR #133)', async () => {
+    jest.useFakeTimers();
+    try {
+      const pages = [{ Items: [row] }, { Items: [] }];
+      const send = jest.fn(async (command: unknown) => command instanceof ScanCommand ? (pages.shift() ?? { Items: [] }) : {});
+      const publish = jest.fn().mockResolvedValue(undefined);
+      const handle = startWorkGraphOutboxDrainer({ client: { send } as unknown as DynamoDBDocumentClient, publish, signal: null, pollIntervalMs: 60_000 });
+      wakeOutbox('work-graph');
+      wakeOutbox('work-graph');
+      wakeOutbox('work-graph');
+      await jest.advanceTimersByTimeAsync(20);
+      expect(publish).toHaveBeenCalledTimes(1);
+      const scansAfterBurst = send.mock.calls.filter(([command]) => command instanceof ScanCommand).length;
+      handle.stop();
+      wakeOutbox('work-graph');
+      await jest.advanceTimersByTimeAsync(20);
+      expect(send.mock.calls.filter(([command]) => command instanceof ScanCommand).length).toBe(scansAfterBurst);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

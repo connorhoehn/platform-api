@@ -5,6 +5,7 @@
  * provides `publishSignal` for gateway-compatible Redis broadcasts,
  * and `publishDurable` for at-least-once message-queue delivery via DynamoDB outbox.
  */
+import { wakeOutbox } from './outboxWake';
 import {
   EventCatalog,
   pipelineRaftDeclarations,
@@ -841,4 +842,6 @@ export async function publishDurable(
       },
     }),
   );
+  // NFR #133: publish it now, not at the drainer's next 2 s tick.
+  wakeOutbox('platform-events');
 }
