@@ -42,6 +42,12 @@ export interface RunAccessDeps {
   /** The stored row; `pipelineId` may be unknown (runId-only routes). */
   storedRun(pipelineId: string | undefined, runId: string): Promise<RunFacts | null>;
   documentRow(documentId: string): Promise<EditableDocumentRow | null>;
+  /**
+   * realtime-examples NFR #172: the run's owner shows it to this user in their
+   * work graph (the graph's own pass, `runSharedThroughWorkGraph`) — so the
+   * run page "Open run" leads to opens, as the run's live channel does.
+   */
+  sharedThroughGraph?(user: { sub: string; orgId?: string }, runId: string): Promise<boolean>;
 }
 
 function str(value: unknown): string | undefined {
@@ -94,6 +100,11 @@ export const defaultRunAccessDeps: RunAccessDeps = {
       ExpressionAttributeNames: { '#channel': 'channel' },
     }));
     return (res.Item as EditableDocumentRow | undefined) ?? null;
+  },
+  async sharedThroughGraph(user, runId) {
+    const { workGraphOrchestrator, runSharedThroughWorkGraph } = require('../work-graph/runtime') as typeof import('../work-graph/runtime');
+    const viewer = await workGraphOrchestrator.resolveViewer(user.sub, user.orgId);
+    return !!viewer && (await runSharedThroughWorkGraph(viewer.organizationId, viewer.viewerId, runId)).allow;
   },
 };
 /* eslint-enable @typescript-eslint/no-require-imports */
@@ -155,6 +166,10 @@ export async function assertRunAccess(
   if (facts.documentId) {
     const row = await deps.documentRow(facts.documentId).catch(() => null);
     reader = !!row && (await canReadDocument(row, req.user, facts.documentId)).allow;
+  }
+  // NFR #172: a read of a run its owner's work graph shows this user.
+  if (!reader && mode === 'read' && deps.sharedThroughGraph && req.user) {
+    reader = await deps.sharedThroughGraph(req.user, runId).catch(() => false);
   }
   if (!reader) {
     log.warn({ runId, pipelineId: pid, userId, route: req.path }, 'run access refused: not the owner and cannot read its document');
