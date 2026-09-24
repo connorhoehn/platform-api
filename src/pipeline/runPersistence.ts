@@ -23,6 +23,7 @@
 //   - TTL on completed runs (configurable, default 90 days)
 //   - Full step outputs stored for replay, but limited to 100KB per step
 
+import { probeRunRetentionSeconds } from '../lib/probeRunRetention';
 import type { EventBus } from 'distributed-core';
 import { retryWithBackoff } from 'distributed-core';
 import type { PipelineEventMap, RunRejection } from 'distributed-core/applications/pipeline';
@@ -1460,7 +1461,8 @@ export class RunPersistenceService {
 
   private async persistRun(state: RunState): Promise<void> {
     const ttl = state.completedAt
-      ? Math.floor(Date.parse(state.completedAt) / 1000) + this.ttlSeconds
+      ? Math.floor(Date.parse(state.completedAt) / 1000)
+        + (probeRunRetentionSeconds(state.pipelineId) ?? this.ttlSeconds)
       : undefined;
 
     const item: PipelineRunItem = {

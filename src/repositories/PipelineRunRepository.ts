@@ -11,6 +11,7 @@ import type { PipelineRunStatus, PipelineStepStatus } from '@connorhoehn/pipelin
 import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
+import { probeRunRetentionSeconds } from '../lib/probeRunRetention';
 
 /**
  * How long a FINISHED run stays queryable, in days.
@@ -26,6 +27,11 @@ const DEFAULT_RUN_RETENTION_DAYS = 30;
 function runRetentionDays(): number {
   const raw = Number(process.env['PIPELINE_RUN_RETENTION_DAYS']);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_RUN_RETENTION_DAYS;
+}
+
+/** A finished run's ttl offset: a dev probe's configured hours (NFR #226), else the retention days. */
+function runRetentionSeconds(pipelineId: string | undefined): number {
+  return probeRunRetentionSeconds(pipelineId) ?? runRetentionDays() * 86_400;
 }
 
 /**
@@ -380,7 +386,7 @@ export class PipelineRunRepository extends BaseRepository {
     this.noteRunKey(item);
     const stamped =
       item.ttl === undefined && isTerminalRunStatus(item.status)
-        ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
+        ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionSeconds(item.pipelineId) }
         : item;
     const guard = terminalGuard(item);
     if (!guard) {
@@ -416,7 +422,7 @@ export class PipelineRunRepository extends BaseRepository {
     this.noteRunKey(item);
     const stamped =
       item.ttl === undefined && isTerminalRunStatus(item.status)
-        ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
+        ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionSeconds(item.pipelineId) }
         : item;
     const ownership =
       'attribute_not_exists(runId) OR attribute_not_exists(ownerNodeId) OR resumeClaimedBy = :owner '

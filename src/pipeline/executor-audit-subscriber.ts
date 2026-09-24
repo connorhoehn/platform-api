@@ -59,6 +59,8 @@ const DEFAULT_CHECKPOINT_SAMPLE_RATE = 5;
  *  `pipeline:run:failed` we evict. Cap at 10k entries as a defensive
  *  upper bound for very long-running deployments without terminal events. */
 const MAX_RUN_INDEX = 10_000;
+/** How long a lifecycle row waits for its run's run:started (NFR #226). */
+const WAIT_FOR_RUN_START_MS = 5_000;
 
 export interface ExecutorAuditSubscriberOptions {
   eventBus: EventBus<PipelineEventMap>;
@@ -72,6 +74,8 @@ export class ExecutorAuditSubscriber {
   private readonly auditRepo: Pick<AuditRepository, 'record'>;
   private readonly checkpointSampleRate: number;
   private readonly runIndex = new Map<string, string>(); // runId → pipelineId
+  /** Rows of a run whose run:started has not arrived yet (see `fireAndForget`). */
+  private readonly waiting = new Map<string, { events: AuditEvent[]; timer: NodeJS.Timeout }>();
   private subscriptionIds: string[] = [];
   private active = false;
 
@@ -531,6 +535,7 @@ export class ExecutorAuditSubscriber {
       }
     }
     this.subscriptionIds = [];
+    for (const runId of [...this.waiting.keys()]) this.flushWaiting(runId);
     this.runIndex.clear();
   }
 
@@ -548,6 +553,16 @@ export class ExecutorAuditSubscriber {
       if (firstKey) this.runIndex.delete(firstKey);
     }
     this.runIndex.set(runId, pipelineId);
+    this.flushWaiting(runId, pipelineId);
+  }
+
+  /** Write a run's held rows, filed under `pipelineId` when it is now known. */
+  private flushWaiting(runId: string, pipelineId?: string): void {
+    const held = this.waiting.get(runId);
+    if (!held) return;
+    clearTimeout(held.timer);
+    this.waiting.delete(runId);
+    for (const event of held.events) this.write(pipelineId ? { ...event, pipelineId } : event);
   }
 
   /**
@@ -559,7 +574,35 @@ export class ExecutorAuditSubscriber {
     return this.runIndex.get(runId) ?? (typeof hint === 'string' && hint ? hint : 'unknown');
   }
 
+  /**
+   * realtime-examples NFR #226 (Loop 38): a third of the audit rows (7.3k of
+   * 22k) were filed under pipelineId 'unknown' — a run's first step events
+   * reach this subscriber before its run:started (bridge.trigger emits that
+   * only after the route's audit write lands). Such rows now wait, up to
+   * WAIT_FOR_RUN_START_MS, for run:started to name the pipeline; that also
+   * lets a dev probe's rows take the probe's short retention.
+   */
   private fireAndForget(event: AuditEvent): void {
+    if (event.pipelineId !== 'unknown' || !event.runId) {
+      this.write(event);
+      return;
+    }
+    const runId = event.runId;
+    const held = this.waiting.get(runId);
+    if (held) {
+      held.events.push(event);
+      return;
+    }
+    if (this.waiting.size >= MAX_RUN_INDEX) {
+      this.write(event);
+      return;
+    }
+    const timer = setTimeout(() => this.flushWaiting(runId), WAIT_FOR_RUN_START_MS);
+    timer.unref?.();
+    this.waiting.set(runId, { events: [event], timer });
+  }
+
+  private write(event: AuditEvent): void {
     this.auditRepo.record(event).catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       log.warn(

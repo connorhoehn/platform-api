@@ -154,16 +154,38 @@ describe('ExecutorAuditSubscriber', () => {
     expect('systemPrompt' in (row!.trace as Record<string, unknown>)).toBe(false);
   });
 
-  it('records pipelineId="unknown" when no run:started was observed for the runId', async () => {
+  it('records pipelineId="unknown" when no run:started arrives within the wait', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    try {
+      const { bus, records } = makeSubscriber();
+      await bus.emit('pipeline:step:started', {
+        runId: 'orphan',
+        stepId: 's1',
+        nodeType: 'transform',
+        at: 't',
+      });
+      await flush();
+      expect(records).toHaveLength(0);
+      jest.advanceTimersByTime(5_000);
+      await flush();
+      expect(records[0]).toMatchObject({ pipelineId: 'unknown', runId: 'orphan' });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('files a step row that beat its run:started under the pipeline (NFR #226)', async () => {
     const { bus, records } = makeSubscriber();
-    await bus.emit('pipeline:step:started', {
-      runId: 'orphan',
-      stepId: 's1',
-      nodeType: 'transform',
-      at: 't',
-    });
+    await bus.emit('pipeline:step:started', { runId: 'late', stepId: 's1', nodeType: 'transform', at: 't' });
+    await bus.emit('pipeline:step:completed', { runId: 'late', stepId: 's1', durationMs: 1, at: 't' });
     await flush();
-    expect(records[0]).toMatchObject({ pipelineId: 'unknown', runId: 'orphan' });
+    expect(records).toHaveLength(0);
+    await bus.emit('pipeline:run:started', { runId: 'late', pipelineId: 'audit-rollup-probe', triggeredBy: { userId: 'u' }, at: 't' });
+    await flush();
+    expect(records.map((r) => [r.action, r.pipelineId])).toEqual([
+      ['pipeline.step.started', 'audit-rollup-probe'],
+      ['pipeline.step.completed', 'audit-rollup-probe'],
+    ]);
   });
 
   it('maps pipeline:step:completed → pipeline.step.completed (success)', async () => {

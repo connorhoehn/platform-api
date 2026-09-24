@@ -47,6 +47,7 @@ import { ulid } from 'ulid';
 import { BaseRepository } from '../repositories/BaseRepository';
 import { docClient } from '../lib/aws-clients';
 import { tableName } from '../lib/ddb-table-name';
+import { probeRunRetentionSeconds } from '../lib/probeRunRetention';
 
 const PIPELINE_AUDIT_TABLE = tableName('pipeline-audit');
 const ACTOR_TIME_INDEX = 'actor-time-index';
@@ -232,7 +233,7 @@ export class AuditRepository {
     const auditId = ulid();
     const nowMs = this.now();
     const timestamp = new Date(nowMs).toISOString();
-    const ttlEpoch = Math.floor(nowMs / 1000) + this.ttlSeconds;
+    const ttlEpoch = Math.floor(nowMs / 1000) + (probeRunRetentionSeconds(event.pipelineId) ?? this.ttlSeconds);
 
     const item: StoredAuditEvent = {
       auditId,

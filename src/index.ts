@@ -25,7 +25,7 @@ import { assertRequiredInProd } from 'distributed-core';
 import { createShutdownManager, drainHttpServer } from '@connorhoehn/service-runtime';
 import { RetryManager } from 'distributed-core/transport';
 import { catalog, connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
-import { ensureOutboxTTL, ensureVideoSessionsTTL, ensurePipelineRunsTTL } from './lib/dynamo-setup';
+import { ensureOutboxTTL, ensureVideoSessionsTTL, ensurePipelineRunsTTL, ensurePipelineAuditTTL, ensurePipelineDlqTTL } from './lib/dynamo-setup';
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
 import { whenBuildFresh } from './lib/buildFreshness';
@@ -186,6 +186,29 @@ void assertRequiredInProd(
   {
     name: 'ddb-pipeline-runs-ttl',
     ping: () => ensurePipelineRunsTTL(),
+  },
+  {
+    requiredEnvVar: 'DDB_TTL_REQUIRED',
+    logger: log,
+  },
+);
+
+// Pipeline audit trail (`ttlEpoch`) and dead letters (`ttl`): both stamped
+// +30 d at write, neither table had TTL on (realtime-examples NFR #226).
+void assertRequiredInProd(
+  {
+    name: 'ddb-pipeline-audit-ttl',
+    ping: () => ensurePipelineAuditTTL(),
+  },
+  {
+    requiredEnvVar: 'DDB_TTL_REQUIRED',
+    logger: log,
+  },
+);
+void assertRequiredInProd(
+  {
+    name: 'ddb-pipeline-dlq-ttl',
+    ping: () => ensurePipelineDlqTTL(),
   },
   {
     requiredEnvVar: 'DDB_TTL_REQUIRED',

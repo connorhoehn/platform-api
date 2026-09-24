@@ -10,6 +10,8 @@ import log from './logger';
 const OUTBOX_TABLE = tableName('social-outbox');
 const VIDEO_SESSIONS_TABLE = tableName('document-video-sessions');
 const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
+const PIPELINE_AUDIT_TABLE = tableName('pipeline-audit');
+const PIPELINE_DLQ_TABLE = tableName('pipeline-dlq');
 
 /**
  * Idempotent: enable the DDB native TTL on a table if it isn't already.
@@ -68,4 +70,20 @@ export async function ensureVideoSessionsTTL(): Promise<void> {
  */
 export async function ensurePipelineRunsTTL(): Promise<void> {
   await ensureTableTTL(PIPELINE_RUNS_TABLE);
+}
+
+/**
+ * realtime-examples NFR #226 (Loop 38): pipeline-audit rows carry `ttlEpoch`
+ * (+30 d) and pipeline-dlq rows `ttl` (+30 d), but neither table enabled TTL,
+ * so in AWS nothing reaped them and in dev only a per-table sweep did. Both
+ * are pure expiry stamps (an audit trail and failed-run dead letters), never
+ * a "last active" field, so enabling TTL removes exactly what the writers
+ * already meant to drop. It also brings both under the local TTL sweep.
+ */
+export async function ensurePipelineAuditTTL(): Promise<void> {
+  await ensureTableTTL(PIPELINE_AUDIT_TABLE, 'ttlEpoch');
+}
+
+export async function ensurePipelineDlqTTL(): Promise<void> {
+  await ensureTableTTL(PIPELINE_DLQ_TABLE);
 }
