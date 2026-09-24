@@ -119,6 +119,7 @@ describe('the part an instruction names (#145)', () => {
     ['shorten the title of slide 2', [{ kind: 'shorter', subject: 'title', metric: 'words', slide: 2 }]],
     ['on slide two, trim the notes', [{ kind: 'shorter', subject: 'notes', metric: 'words', slide: 2 }]],
     ['slide 2\'s bullets: at most two bullets', [{ kind: 'max', subject: 'bullets', metric: 'bullets', n: 2, slide: 2 }]],
+    ['shortened slide 2 title from 5 words to 3 words', [{ kind: 'exact', subject: 'title', metric: 'words', n: 3, slide: 2 }]],
     ['tighten the bullets on the third slide', [{ kind: 'shorter', subject: 'bullets', metric: 'words', slide: 3 }]],
     // The slide itself is the subject when it is not a locator.
     ['make slide 2 shorter', [{ kind: 'shorter', subject: 'slide', metric: 'words', slide: 2 }]],

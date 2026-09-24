@@ -128,6 +128,8 @@ export function defaultSubject(scope: ConstraintScope): ConstraintSubject {
 const SLIDE_NUM = '(\\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)';
 const ORDINALS = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth', 'eleventh', 'twelfth'];
 const LOCATOR = '(?:(of|on|in|for|from|to) )';
+/** "slide 2's" or "slide 2 title": the slide number is a possessive, a locator. */
+const POSSESSIVE = "('s|\\s(?=(?:title|heading|headline|notes?|speaker notes|bullets?|bullet points?)\\b))";
 
 interface SlideRef { slide: number; at: number }
 
@@ -144,13 +146,13 @@ function slideRefs(text: string): { refs: SlideRef[]; nounText: string } {
   const blank = (at: number, length: number) => {
     nounText = nounText.slice(0, at) + ' '.repeat(length) + nounText.slice(at + length);
   };
-  for (const m of text.matchAll(new RegExp(`\\b${LOCATOR}?(?:the )?slide (?:#|no\\.? ?)?${SLIDE_NUM}('s)?\\b`, 'gi'))) {
+  for (const m of text.matchAll(new RegExp(`\\b${LOCATOR}?(?:the )?slide (?:#|no\\.? ?)?${SLIDE_NUM}${POSSESSIVE}?\\b`, 'gi'))) {
     const slide = numberOf(m[2]);
     if (!slide) continue;
     refs.push({ slide, at: m.index ?? 0 });
     if (m[1] || m[3]) blank(m.index ?? 0, m[0].length);
   }
-  for (const m of text.matchAll(new RegExp(`\\b${LOCATOR}?the (${ORDINALS.join('|')}) slide('s)?\\b`, 'gi'))) {
+  for (const m of text.matchAll(new RegExp(`\\b${LOCATOR}?the (${ORDINALS.join('|')}) slide${POSSESSIVE}?\\b`, 'gi'))) {
     const slide = ORDINALS.indexOf(m[2]!.toLowerCase()) + 1;
     refs.push({ slide, at: m.index ?? 0 });
     if (m[1] || m[3]) blank(m.index ?? 0, m[0].length);
