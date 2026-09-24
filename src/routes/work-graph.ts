@@ -415,6 +415,22 @@ export function createWorkGraphRouter(
     res.status(200).json(result.snapshot);
   }));
 
+  // NFR #221: the nodes a snapshot held back under its cap (its
+  // `temporal.coverage.omitted`), one page at a time, newest first. `after` is
+  // the previous page's `next`.
+  router.get('/people/:personId/graph/omitted', handler(async (req, res, viewer) => {
+    const { after, limit: rawLimit, ...graphQuery } = req.query;
+    const query = parseGraphQuery({ params: req.params, query: graphQuery } as unknown as Request);
+    if (after !== undefined && (typeof after !== 'string' || !/^[A-Za-z0-9_-]{1,512}$/.test(after))) {
+      throw new WorkGraphInputError('Page key is invalid.');
+    }
+    const limit = rawLimit === undefined ? 25 : Number(rawLimit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new WorkGraphInputError('Page size must be 1 to 100.');
+    res.status(200).json(await orchestrator.pageOmitted(
+      viewer, query.personId, query.day, query.timezone, after as string | undefined, limit,
+    ));
+  }));
+
   router.get('/nodes/:id', handler(async (req, res, viewer) => {
     if (!isId(req.params.id)) throw new WorkGraphInputError('Node id is invalid.');
     const query = parseGraphQuery(req);

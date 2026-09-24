@@ -33,6 +33,7 @@ import {
 } from './policy';
 import type { WorkGraphCursorCodec } from './cursor';
 import { workGraphAuthorizationRevision } from './authorizationRevision';
+import { cutSnapshotNodes, pageOmittedNodes, PageKeyError } from './snapshotCut';
 import log from '../lib/logger';
 import {
   buildWorkActivity,
@@ -586,7 +587,7 @@ export class WorkGraphOrchestrator {
     timezone: string,
     previousCursor?: string,
     timing?: Record<string, number>,
-  ): Promise<{ snapshot: WorkGraphSnapshot; authorization: AuthorizedWorkGraph }> {
+  ): Promise<{ snapshot: WorkGraphSnapshot; authorization: AuthorizedWorkGraph; omitted: ViewerWorkNode[] }> {
     const started = Date.now();
     if (!await this.deps.directory.personBelongsToOrganization(viewer.organizationId, personId)) throw unavailable();
     if (timing) timing.person = Date.now() - started;
@@ -616,14 +617,13 @@ export class WorkGraphOrchestrator {
       expiresAt: new Date(Date.parse(now) + CURSOR_LIFETIME_MS).toISOString(),
     });
     // The contract holds 250 nodes and a day can authorize more (connor's
-    // 2026-09-23 had 159 revisions and 78 runs by 17:00 UTC). The cut used to
-    // be by id, which is a hash, so the run a reader was watching for was
-    // dropped by chance while a seeded revision from the morning was kept
-    // (NFR #128). Newest work first, with the id as the tiebreak so two
-    // replicas answer the same snapshot for the same authorization.
-    const nodes = authorization.nodes.slice()
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
-      .slice(0, 250);
+    // 2026-09-23 had 159 revisions and 78 runs by 17:00 UTC). A cut by id
+    // dropped the watched run by chance (NFR #128); newest-250 by `updatedAt`
+    // let future-dated seed rows outrank everything and a burst of runs push a
+    // just-saved deck out (NFR #221). `cutSnapshotNodes` keeps live work and
+    // recent made-or-met work first, deterministically; the rest is counted
+    // (`omitted`) and paged through `pageOmitted`.
+    const { kept: nodes, omitted } = cutSnapshotNodes(authorization.nodes, now);
     const nodeIds = new Set(nodes.map((node) => node.id));
     const edges = authorization.edges.slice()
       .sort((a, b) => a.id.localeCompare(b.id))
@@ -642,6 +642,7 @@ export class WorkGraphOrchestrator {
         partial: authorization.partial,
       },
       authorization,
+      omitted,
     };
   }
 
@@ -777,7 +778,7 @@ export class WorkGraphOrchestrator {
     input: WorkGraphWindowInput = {},
     previousCursor?: string,
     timing?: Record<string, number>,
-  ): Promise<{ snapshot: WorkGraphSnapshot; query: WorkGraphQueryV2; activity: WorkGraphActivityV2 }> {
+  ): Promise<{ snapshot: WorkGraphSnapshot; query: WorkGraphQueryV2; activity: WorkGraphActivityV2; omitted: number }> {
     const reader = this.deps.activityReader;
     if (!reader) throw new WorkGraphInputError('Schema version 2 is not available on this deployment.');
     const now = this.deps.now();
@@ -789,7 +790,7 @@ export class WorkGraphOrchestrator {
     const started = profiling ? Date.now() : 0;
     // One read memo for the whole build: the ACL pass and the activity layer
     // ask for the same runs and definitions (NFR #16).
-    const { snapshot, authorization, activity, authorized } = await withBuildMemo(async () => {
+    const { snapshot, authorization, activity, authorized, omitted } = await withBuildMemo(async () => {
       const graph = await this.getGraph(viewer, personId, day, timezone, previousCursor, timing);
       const at = profiling || timing ? Date.now() : 0;
       return {
@@ -817,7 +818,7 @@ export class WorkGraphOrchestrator {
         totalMs: Date.now() - started,
       }, 'work graph v2 phase timings');
     }
-    return { snapshot, query, activity };
+    return { snapshot, query, activity, omitted: omitted.length };
   }
 
   /**
@@ -830,7 +831,7 @@ export class WorkGraphOrchestrator {
    * `withBuildMemo` so the activity layer reuses the ACL pass's reads.
    */
   async getGraphV2FromGraph(
-    graph: { snapshot: WorkGraphSnapshot; authorization: AuthorizedWorkGraph },
+    graph: { snapshot: WorkGraphSnapshot; authorization: AuthorizedWorkGraph; omitted?: readonly ViewerWorkNode[] },
     viewer: AuthenticatedWorkGraphViewer,
     personId: string,
     day: string,
@@ -857,7 +858,7 @@ export class WorkGraphOrchestrator {
       }, 'v2 work graph snapshot failed its own contract');
       throw new WorkGraphUnavailableError('This work item is unavailable.');
     }
-    return built.value;
+    return withOmittedCount(built.value, graph.omitted?.length ?? 0);
   }
 
   /** Assembles and strictly validates the browser-facing v2 snapshot body. */
@@ -870,7 +871,7 @@ export class WorkGraphOrchestrator {
     previousCursor?: string,
     timing?: Record<string, number>,
   ): Promise<WorkGraphSnapshotV2> {
-    const { snapshot, query, activity } = await this.getActivity(
+    const { snapshot, query, activity, omitted } = await this.getActivity(
       viewer, personId, day, timezone, input, previousCursor, timing,
     );
     const built = buildWorkGraphSnapshotV2({ snapshot: snapshot as never, query, activity });
@@ -885,7 +886,30 @@ export class WorkGraphOrchestrator {
       }, 'v2 work graph snapshot failed its own contract');
       throw new WorkGraphUnavailableError('This work item is unavailable.');
     }
-    return built.value;
+    return withOmittedCount(built.value, omitted);
+  }
+
+  /**
+   * NFR #221: one page of the nodes the snapshot held back under its cap,
+   * newest first. The same authorization pass and the same cut as the graph,
+   * so a page never discloses a node the full graph would not.
+   */
+  async pageOmitted(
+    viewer: AuthenticatedWorkGraphViewer,
+    personId: string,
+    day: string,
+    timezone: string,
+    after: string | undefined,
+    limit: number,
+  ): Promise<{ total: number; nodes: ViewerWorkNode[]; next?: string }> {
+    const now = this.deps.now();
+    const { omitted } = await withBuildMemo(() => this.getGraph(viewer, personId, day, timezone));
+    try {
+      return { total: omitted.length, ...pageOmittedNodes(omitted, now, after, limit) };
+    } catch (error) {
+      if (error instanceof PageKeyError) throw new WorkGraphInputError(error.message);
+      throw error;
+    }
   }
 
   async getNode(
@@ -1572,4 +1596,21 @@ export class WorkGraphOrchestrator {
       dayThrough: day,
     };
   }
+}
+
+/**
+ * `temporal.coverage.omitted` (realtime-modules 0.95.6, NFR #221) is attached
+ * AFTER the strict validator: this deployment's pinned validator predates the
+ * field and rejects it, while the readers (the browser's hook) accept it. The
+ * count only ever describes nodes the same cut already held back.
+ */
+function withOmittedCount(snapshot: WorkGraphSnapshotV2, omitted: number): WorkGraphSnapshotV2 {
+  if (omitted <= 0) return snapshot;
+  return {
+    ...snapshot,
+    temporal: {
+      ...snapshot.temporal,
+      coverage: { ...snapshot.temporal.coverage, complete: false, omitted } as WorkGraphSnapshotV2['temporal']['coverage'],
+    },
+  };
 }
