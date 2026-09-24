@@ -164,6 +164,22 @@ export function eventsForRun(runId: string, request: DeckReviseRunRequest): RunE
   return entry;
 }
 
+/**
+ * Every model slot taken: the step says so in the run pane — a step frame,
+ * `pipeline:step:waiting` (wire `pipeline.step.waiting`), with its place in
+ * line — and once more with state 'granted' when its call starts.
+ */
+function modelSlotFrames(helpers: StepHandlerHelpers): NonNullable<DeckReviseOpts['onModelSlot']> {
+  const emit = helpers.emit as unknown as (event: string, payload: unknown) => Promise<void>;
+  return (slot) => {
+    void emit('pipeline:step:waiting', {
+      runId: helpers.runId, stepId: helpers.stepId, reason: 'model-slot', state: slot.state,
+      ...(slot.position !== undefined ? { position: slot.position } : {}),
+      waitedMs: slot.waitedMs, at: new Date().toISOString(),
+    }).catch(() => undefined);
+  };
+}
+
 /** Fail the step, and remember how, for the run's terminal `failed` event. */
 function fail(runId: string, request: DeckReviseRunRequest, status: number, reason: string, code?: string): StepOutcome {
   eventsForRun(runId, request).failure = { status, reason, ...(code ? { code } : {}) };
@@ -389,16 +405,7 @@ export function createDeckReviseProposeHandler(opts: DeckReviseStepOpts = {}): D
           {
             ...opts.reviseOpts,
             onPhase: (phase) => events.phase(phase),
-            // Every slot taken: the step says so in the run pane (a step frame,
-            // `pipeline.step.waiting`), with its place in line, until it runs.
-            onModelSlot: (slot) => {
-              const emit = helpers.emit as unknown as (event: string, payload: unknown) => Promise<void>;
-              void emit('pipeline:step:waiting', {
-                runId, stepId: helpers.stepId, reason: 'model-slot', state: slot.state,
-                ...(slot.position !== undefined ? { position: slot.position } : {}),
-                waitedMs: slot.waitedMs, at: new Date().toISOString(),
-              }).catch(() => undefined);
-            },
+            onModelSlot: modelSlotFrames(helpers),
           },
         );
         const output: ProposeOutput = {
@@ -500,7 +507,7 @@ export function createDeckReviseCheckHandler(opts: DeckReviseStepOpts = {}): Des
               ...(request.target ? { target: request.target } : {}),
               sources: request.sources,
             },
-            { ...opts.reviseOpts, onPhase: (phase) => events.phase(phase) },
+            { ...opts.reviseOpts, onPhase: (phase) => events.phase(phase), onModelSlot: modelSlotFrames(helpers) },
           );
           const secondCheck = checkConstraints(constraints, loaded.spec, again.spec, scope, claimsOf(again.summary));
           if (secondCheck.violations.length) {

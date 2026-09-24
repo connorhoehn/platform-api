@@ -96,6 +96,7 @@ function retitle(title: string) {
 const published: Array<{ type: string; payload: Record<string, unknown> }> = [];
 const durable: Array<{ name: string; payload: Record<string, unknown> }> = [];
 const produced: Array<Record<string, unknown>> = [];
+const waitingFrames: Array<Record<string, unknown>> = [];
 
 async function run(store: FakeStore, revise: jest.Mock, trigger: Record<string, unknown>) {
   const handlers = new Map<string, StepHandler>();
@@ -105,6 +106,8 @@ async function run(store: FakeStore, revise: jest.Mock, trigger: Record<string, 
   attachDeckReviseRunEvents(bus as never);
   await (bus as unknown as { subscribe: (type: string, h: (event: { payload: Record<string, unknown> }) => void) => Promise<unknown> })
     .subscribe('pipeline:step:deck:produced', (event) => { produced.push(event.payload); });
+  await (bus as unknown as { subscribe: (type: string, h: (event: { payload: Record<string, unknown> }) => void) => Promise<unknown> })
+    .subscribe('pipeline:step:waiting', (event) => { waitingFrames.push(event.payload); });
   const executor = new PipelineExecutor({
     definition: buildDeckReviseDefinition() as unknown as PipelineDefinition,
     ownerNodeId: 'test-node',
@@ -134,6 +137,7 @@ describe('deck-revise pipeline', () => {
     published.length = 0;
     durable.length = 0;
     produced.length = 0;
+    waitingFrames.length = 0;
     resetDeckReviseRuns();
     setDeckReviseRunEventDeps({
       publish: async (_channel, message) => { const event = JSON.parse(message); published.push({ type: event.type, payload: event.payload }); },
@@ -147,6 +151,31 @@ describe('deck-revise pipeline', () => {
     const def = getSystemPipeline(DECK_REVISE_PIPELINE_ID) as { nodes: Array<{ id: string }> } | null;
     expect(def?.nodes.map((node) => node.id)).toEqual(['trigger', 'load', 'propose', 'check', 'write']);
     expect(lintSystemPipeline(buildDeckReviseDefinition())).toEqual([]);
+  });
+
+  it('a propose step waiting for a model slot says so on its step, with its place in line (Loop 35 ppt)', async () => {
+    const inner = retitle('Tighter');
+    const revise = jest.fn(async (input: DeckReviseInput, opts?: { onModelSlot?: (s: unknown) => void; onPhase?: (p: never) => void }) => {
+      opts?.onModelSlot?.({ state: 'waiting', position: 1, held: 4, waitedMs: 0 });
+      opts?.onModelSlot?.({ state: 'granted', waitedMs: 800 });
+      return inner(input, opts as never);
+    });
+    const result = await run(store, revise as unknown as jest.Mock, { slideId, baseRevisionId: 'v1' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(result.status).toBe('completed');
+    expect(waitingFrames.map(({ stepId, reason, state, position }) => ({ stepId, reason, state, position }))).toEqual([
+      { stepId: 'propose', reason: 'model-slot', state: 'waiting', position: 1 },
+      { stepId: 'propose', reason: 'model-slot', state: 'granted', position: undefined },
+    ]);
+  });
+
+  it('a run that waited too long for a model slot fails model-busy once, with no retry', async () => {
+    const revise = jest.fn(async () => { throw new DeckReviseError('The agent is busy: no model slot came free within 120 seconds, so nothing was changed. Try again in a minute.', 503, 'model busy: no model slot came free within 120 s (6 in line, 4 slots)'); });
+    const result = await run(store, revise as unknown as jest.Mock, { slideId, baseRevisionId: 'v1' });
+    expect(result.status).toBe('failed');
+    expect(revise).toHaveBeenCalledTimes(1);
+    expect(String((result.steps.propose as { error?: unknown })?.error ?? '')).toMatch(/model-busy: The agent is busy/);
+    expect(store.rows.get(DOC)!.revisions!.at(-1)!.id).toBe('v1');
   });
 
   it('runs load → propose → write and the run writes the revision, not the caller', async () => {
