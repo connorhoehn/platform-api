@@ -971,6 +971,49 @@ describe('work graph schemaVersion 2 route', () => {
     }
   });
 
+  it('keeps a run-made deck in a frame on a day already at the effort limit (NFR #221, Loop 36)', async () => {
+    // A revise run made the deck, then sixty newer runs landed. The run's own
+    // frame is the oldest, so it used to be cut and the deck lost its frame.
+    const runs = Array.from({ length: 60 }, (_, i) => node(`burst-${i}`, 'run', 'Pipeline run', `run-burst-${i}`, 'pipeline',
+      new Date(Date.parse(at('13:35')) + i * 5_000).toISOString(), { status: 'completed' }));
+    const extraNodes = [
+      node('revise', 'run', 'Revise deck', 'run-revise', 'pipeline', at('13:33'), { status: 'completed' }),
+      node('made', 'document', 'Revised brief', 'doc-made', 'document', at('13:34')),
+      node('made-v2', 'change', 'Revised brief · revision', 'doc-made:v2', 'document', at('13:34')),
+      ...runs,
+    ];
+    const extraEdges = [
+      edge('e-made-v2', 'made-v2', 'made', 'edited'),
+      edge('e-revise-made', 'revise', 'made-v2', 'produced'),
+    ];
+    for (const item of extraNodes) projection.nodes[item.id] = item;
+    for (const item of extraEdges) projection.edges[item.id] = item;
+    const selection = grant.selection;
+    grant.selection = {
+      ...selection,
+      nodeIds: [...selection.nodeIds, ...extraNodes.map((item) => item.id)],
+      edgeIds: [...selection.edgeIds, ...extraEdges.map((item) => item.id)],
+    };
+    try {
+      const fallback = reader();
+      const made = reader({
+        artifact: async (documentId) => (documentId === 'doc-made'
+          ? { name: 'Revised brief', mediaKind: 'presentation' as const, revisions: [{ id: 'v2', label: 'v2', createdAt: at('13:34'), slideCount: 2, slides: deckSlides('Scope').slice(0, 2) }] }
+          : fallback.artifact(documentId)),
+      });
+      const body = (await get(setup({ activityReader: made }), v2)).body as WorkGraphSnapshotV2;
+      expect(validateWorkGraphSnapshotV2(body).ok).toBe(true);
+      expect(body.efforts.length).toBe(50);
+      const frame = body.efforts.find((effort) => effort.nodeIds.includes('made'));
+      expect(frame?.nodeIds).toEqual(expect.arrayContaining(['made', 'made-v2']));
+      expect(body.efforts.find((effort) => effort.anchorNodeId === 'meeting')).toBeDefined();
+    } finally {
+      for (const item of extraNodes) delete projection.nodes[item.id];
+      for (const item of extraEdges) delete projection.edges[item.id];
+      grant.selection = selection;
+    }
+  });
+
   it('refuses schemaVersion 2 on a deployment without an activity reader', async () => {
     const response = await get(setup({ activityReader: undefined }), v2);
     expect(response.statusCode).toBe(400);
