@@ -511,11 +511,19 @@ function indexGraph(nodes: ViewerWorkNode[], edges: ViewerWorkEdge[]): GraphInde
 
 /** The run that a source said produced this document, if the viewer sees it. */
 function producingRun(index: GraphIndex, documentId: string): ViewerWorkNode | undefined {
+  // The NEWEST producing run. A deck edited three times has four producing
+  // runs; taking the first edge read the oldest, so a failure from before
+  // v2–v4 were saved stayed on the card as "v5 failed" (NFR Loop 28).
+  let newest: ViewerWorkNode | undefined;
+  let newestAt = -Infinity;
   for (const edge of index.in.get(documentId) ?? []) {
     const from = index.byId.get(edge.fromId);
-    if (edge.relation === 'produced' && from && (from.kind === 'run' || from.kind === 'agent')) return from;
+    if (edge.relation !== 'produced' || !from || (from.kind !== 'run' && from.kind !== 'agent')) continue;
+    const at = Date.parse(from.startedAt ?? from.updatedAt);
+    const when = Number.isFinite(at) ? at : -Infinity;
+    if (!newest || when > newestAt) { newest = from; newestAt = when; }
   }
-  return undefined;
+  return newest;
 }
 
 /**

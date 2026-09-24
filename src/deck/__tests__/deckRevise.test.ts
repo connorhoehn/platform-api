@@ -281,7 +281,8 @@ describe('reviseDeck — a target inside one slide', () => {
     );
     expect(subtitle.spec.subtitle).toBe('Planning sync · 22 Sep');
     expect(subtitle.spec.slides).toEqual(bulletsDeck().slides);
-    expect(subtitle.changedSlideIds).toEqual([]);
+    // The title slide draws the deck subtitle (NFR Loop 28: was [] — "0 slides changed").
+    expect(subtitle.changedSlideIds).toEqual(['cover']);
   });
 
   it('keeps the part when the model answers null to an instruction that asked for no removal', async () => {
@@ -331,6 +332,8 @@ describe('reviseDeck — the title slide\'s subtitle (NFR Loop 28)', () => {
     expect(result.spec.subtitle).toBe('Risks and mitigations');
     expect('subtitle' in result.spec.slides[0]!).toBe(false);
     expect(result.spec.slides[1]).toEqual(withSubtitle().slides[1]);
+    // The title slide draws the deck subtitle, so it is the slide that changed.
+    expect(result.changedSlideIds).toEqual(['cover']);
   });
 
   it('says nothing about a subtitle on a bullets slide', async () => {

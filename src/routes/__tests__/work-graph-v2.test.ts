@@ -374,6 +374,31 @@ describe('work graph schemaVersion 2 route', () => {
     expect(body.details.some((detail) => detail.nodeId === 'transcript')).toBe(false);
   });
 
+  it('a deck produced by several runs reports the NEWEST run, not an older failure (NFR Loop 28)', async () => {
+    const savedNodes = projection.nodes;
+    const savedEdges = projection.edges;
+    const old = node('run-old', 'run', 'Presentation edit', 'run-old', 'pipeline', at('13:30'), { status: 'failed' });
+    // The old run's edge comes first, as the oldest edge does in the store.
+    projection.nodes = { ...savedNodes, [old.id]: old };
+    projection.edges = { 'e-a-produced-old': edge('e-a-produced-old', 'run-old', 'deck', 'produced'), ...savedEdges };
+    try {
+      const mixed = reader({
+        pipelineRun: async (runId) => (runId === 'run-old'
+          ? { runId, status: 'error' as const, attempt: 1, startedAt: at('13:30'), updatedAt: at('13:30'), tools: [], error: 'Subtitle has 5 words; before it had 5.' }
+          : { runId, status: 'running' as const, attempt: 3, startedAt: at('13:33'), updatedAt: at('13:42'), tools: ['Slides'] }),
+      });
+      const res = await get(setup({ activityReader: mixed }), v2);
+      if (!res.body.details) throw new Error(JSON.stringify(res.body).slice(0, 400));
+      const body = res.body as WorkGraphSnapshotV2;
+      const deck = body.details.find((detail) => detail.nodeId === 'deck');
+      expect(deck?.artifact?.pending).toMatchObject({ status: 'generating' });
+      expect(deck?.artifact?.pending?.message ?? '').not.toContain('Subtitle');
+    } finally {
+      projection.nodes = savedNodes;
+      projection.edges = savedEdges;
+    }
+  });
+
   it('reports a failed attempt with its sanitized message and an error run', async () => {
     const failing = reader({
       pipelineRun: async () => ({

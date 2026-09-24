@@ -330,7 +330,12 @@ export function changedSlides(before: DeckSpec, after: DeckSpec): string[] {
     sources: slide.sources.map((source) => `${source.documentId}#${source.anchor ?? ''}`),
   });
   const old = new Map(before.slides.map((slide) => [slide.id, key(slide)]));
-  return after.slides.filter((slide) => old.get(slide.id) !== key(slide)).map((slide) => slide.id);
+  // The deck's subtitle is drawn on its title slides: changing it changes
+  // them ("0 slides changed of 3" for a subtitle edit, NFR Loop 28).
+  const subtitleChanged = (before.subtitle ?? '') !== (after.subtitle ?? '');
+  return after.slides
+    .filter((slide) => old.get(slide.id) !== key(slide) || (subtitleChanged && slide.layout === 'title'))
+    .map((slide) => slide.id);
 }
 
 /**
