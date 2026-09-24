@@ -231,6 +231,7 @@ const MAX_FENCED_READ_ATTEMPTS = 6;
  * the burst's commit land between reads instead of inside one.
  */
 const FENCED_READ_BACKOFF_MS = [0, 15, 30, 60, 120, 200];
+const READER_FENCED_ATTEMPTS_WITH_FALLBACK = 2;
 export const WORK_GRAPH_TARGET_LOOKUP_INDEX = 'work-graph-target-lookup';
 /** How many days of one target's lookup rows a locate reads before giving up. */
 const MAX_TARGET_LOOKUP_DAYS = 32;
@@ -522,12 +523,13 @@ export class WorkGraphRepository {
     organizationId: string,
     actorId: string,
     day: string,
+    attempts = MAX_FENCED_READ_ATTEMPTS,
   ): Promise<WorkProjectionState | null> {
     const pk = partitionKey(organizationId, actorId, day);
     // A paginated Query is not a snapshot. Fence it with strongly-consistent
     // META reads so a browser never receives a mixed revision (which could
     // otherwise re-introduce an entity that a concurrent revocation removed).
-    for (let attempt = 0; attempt < MAX_FENCED_READ_ATTEMPTS; attempt += 1) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       const wait = FENCED_READ_BACKOFF_MS[attempt] ?? 0;
       if (wait > 0) await new Promise((resolve) => setTimeout(resolve, Math.round(wait * (0.5 + Math.random()))));
       const before = await this.readMeta(pk);
@@ -607,7 +609,11 @@ export class WorkGraphRepository {
     }
     let fresh: WorkProjectionState | null;
     try {
-      fresh = await this.loadProjection(organizationId, actorId, day);
+      // A reader holding a proven revision tries twice, then falls back to
+      // it: on a partition other replicas keep committing, six full reads
+      // per request are load on DynamoDB for a view one tick newer.
+      fresh = await this.loadProjection(organizationId, actorId, day,
+        serveLastGood && held ? READER_FENCED_ATTEMPTS_WITH_FALLBACK : MAX_FENCED_READ_ATTEMPTS);
     } catch (error) {
       if (!serveLastGood || !held || !(error instanceof WorkGraphConcurrencyError)) throw error;
       this.lastGoodServed += 1;
