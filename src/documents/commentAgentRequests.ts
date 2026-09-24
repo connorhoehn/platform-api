@@ -180,9 +180,11 @@ export async function settleCommentAgentRun(
 
   const resolve = state === 'addressed' && request.resolveOnApply && !root.resolved;
   if (resolve) {
-    await repo.resolveThread(link.documentId, link.commentId, COMMENT_AGENT.userId, now);
+    // `resolvedBy` is what the card prints ("Resolved by …"); the agent has no
+    // user record to look a name up from, so it is stored as its name.
+    await repo.resolveThread(link.documentId, link.commentId, COMMENT_AGENT.displayName, now);
     publish(`doc-comments:${link.documentId}`, 'doc:comment_resolved', {
-      documentId: link.documentId, commentId: link.commentId, resolved: true, resolvedBy: COMMENT_AGENT.userId, resolvedAt: now,
+      documentId: link.documentId, commentId: link.commentId, resolved: true, resolvedBy: COMMENT_AGENT.displayName, resolvedAt: now,
     }).catch((err: unknown) => log.error({ event: 'doc:comment_resolved', err: String(err) }, 'signal publish failed'));
   }
   log.info({ runId, documentId: link.documentId, commentId: link.commentId, state, resolved: resolve }, 'comment agent request settled');
