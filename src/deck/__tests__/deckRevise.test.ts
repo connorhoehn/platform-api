@@ -8,6 +8,7 @@ jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `tes
 
 import type { LLMClient } from '../../pipeline/LLMClient';
 import type { DeckSpec } from '../DeckSpec';
+import { ModelSlotTimeoutError, type ModelSlotOptions, type withModelSlot } from '../modelSlots';
 import { DeckReviseError, changedSlides, restatedBullets, reviseDeck, validateReviseInputSpec } from '../deckRevise';
 
 const TRANSCRIPT_ID = 'active-now-2026-09-22-planning-transcript';
@@ -312,6 +313,40 @@ describe('reviseDeck — a target inside one slide', () => {
       { ...deps, llm: scripted(JSON.stringify({ summary: 's', value: 'Release risks' })), onPhase: (phase) => phases.push(phase) },
     );
     expect(phases).toEqual(['reading-sources', 'asking-model', 'checking']);
+  });
+
+  it('says it is waiting for a model slot, with its place in line, before it asks (Loop 35 ppt)', async () => {
+    const phases: string[] = [];
+    const slots: unknown[] = [];
+    const modelSlot = (async (fn: () => Promise<unknown>, opts?: ModelSlotOptions) => {
+      opts?.onWaiting?.({ position: 2, held: 4, waitedMs: 0 });
+      opts?.onWaiting?.({ position: 0, held: 4, waitedMs: 900 });
+      opts?.onGranted?.(1200);
+      return fn();
+    }) as unknown as typeof withModelSlot;
+    await reviseDeck(
+      { spec: bulletsDeck(), instruction: 'x', slideId: 'risks', target: { field: 'title' } },
+      { ...deps, llm: scripted(JSON.stringify({ summary: 's', value: 'Release risks' })), modelSlot, onPhase: (phase) => phases.push(phase), onModelSlot: (s) => slots.push(s) },
+    );
+    expect(phases).toEqual(['reading-sources', 'waiting-for-model', 'asking-model', 'checking']);
+    expect(slots).toEqual([
+      { state: 'waiting', position: 2, held: 4, waitedMs: 0 },
+      { state: 'waiting', position: 0, held: 4, waitedMs: 900 },
+      { state: 'granted', waitedMs: 1200 },
+    ]);
+  });
+
+  it('fails plainly when no model slot comes free, and never asks the model', async () => {
+    const prompts: string[] = [];
+    const modelSlot = (async () => { throw new ModelSlotTimeoutError(120_000, 5, 4); }) as unknown as typeof withModelSlot;
+    const err = await reviseDeck(
+      { spec: bulletsDeck(), instruction: 'x', slideId: 'risks', target: { field: 'title' } },
+      { ...deps, llm: scripted(JSON.stringify({ summary: 's', value: 'Release risks' }), prompts), modelSlot },
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(DeckReviseError);
+    expect(err).toMatchObject({ status: 503, reason: expect.stringMatching(/^model busy: no model slot came free within 120 s \(6 in line, 4 slots\)/) });
+    expect(err.message).toMatch(/The agent is busy: no model slot came free within 120 seconds/);
+    expect(prompts).toHaveLength(0);
   });
 });
 

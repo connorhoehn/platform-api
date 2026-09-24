@@ -22,6 +22,7 @@ import { docClient } from '../lib/aws-clients';
 import log from '../lib/logger';
 import { CALL_RECORDINGS_TABLE } from '../repositories/CallRecordingRepository';
 import { createLLMClient } from '../pipeline/createLLMClient';
+import { ModelSlotTimeoutError, withModelSlot } from './modelSlots';
 import type { LLMClient } from '../pipeline/LLMClient';
 import {
   MAX_BULLETS_PER_SLIDE, MAX_BULLET_CHARS, MAX_NOTES_CHARS, MAX_SLIDES, MAX_SOURCES_PER_SLIDE, MAX_TITLE_CHARS,
@@ -60,10 +61,12 @@ export interface DeckReviseInput {
 
 /**
  * Where a revise is, for a progress line: the sources are being read, the
- * model is thinking (the long part — up to REVISE_TIMEOUT_MS), the answer is
- * being checked against the deck's rules. Reported in this order, each once.
+ * call is waiting for a fleet-wide model slot (only when every slot is taken —
+ * modelSlots.ts), the model is thinking (the long part — up to
+ * REVISE_TIMEOUT_MS), the answer is being checked against the deck's rules.
+ * Reported in this order, each once.
  */
-export type DeckRevisePhase = 'reading-sources' | 'asking-model' | 'checking';
+export type DeckRevisePhase = 'reading-sources' | 'waiting-for-model' | 'asking-model' | 'checking';
 
 export interface DeckReviseResult {
   spec: DeckSpec;
@@ -99,6 +102,17 @@ export interface DeckReviseOpts extends ReadMaterialDeps {
   findRecordingIdByTranscript?: (transcriptId: string) => Promise<string | null>;
   /** Told as the revise moves between phases. Must not throw; a throw is ignored. */
   onPhase?: (phase: DeckRevisePhase) => void;
+  /**
+   * Told while the model call waits for a fleet-wide model slot (its place in
+   * line), and once more with `granted` when it has one. Must not throw.
+   */
+  onModelSlot?: (state: { state: 'waiting' | 'granted'; position?: number; held?: number; waitedMs: number }) => void;
+  /**
+   * Runs the model call holding a model slot (modelSlots.ts). Default: the
+   * fleet-wide slot when the LLM client is the deployment's own; none for an
+   * injected client (tests), which may inject this instead. null: no slot.
+   */
+  modelSlot?: typeof withModelSlot | null;
 }
 
 /**
@@ -480,10 +494,28 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
   if (!llm) throw new DeckReviseError('The agent is unavailable, so nothing was changed.', 503, 'no model is configured on this deployment');
 
   let answer: string;
-  phase('asking-model');
+  const slotRunner = opts.modelSlot !== undefined ? opts.modelSlot : (opts.llm === undefined ? withModelSlot : null);
+  const slotSays = (state: Parameters<NonNullable<DeckReviseOpts['onModelSlot']>>[0]) => { try { opts.onModelSlot?.(state); } catch { /* progress only */ } };
+  let waited = false;
+  const slot = slotRunner
+    ? <T>(run: () => Promise<T>) => slotRunner(async () => { phase('asking-model'); return run(); }, {
+      onWaiting: (w) => {
+        if (!waited) { waited = true; phase('waiting-for-model'); }
+        slotSays({ state: 'waiting', position: w.position, held: w.held, waitedMs: w.waitedMs });
+      },
+      onGranted: (waitedMs) => slotSays({ state: 'granted', waitedMs }),
+    })
+    : null;
+  if (!slot) phase('asking-model');
   try {
-    answer = await askModel(llm, revisePrompt(input, read), opts.timeoutMs ?? REVISE_TIMEOUT_MS);
+    answer = await askModel(llm, revisePrompt(input, read), opts.timeoutMs ?? REVISE_TIMEOUT_MS, slot);
   } catch (err) {
+    if (err instanceof ModelSlotTimeoutError) {
+      throw new DeckReviseError(
+        `The agent is busy: no model slot came free within ${Math.round(err.waitedMs / 1000)} seconds, so nothing was changed. Try again in a minute.`,
+        503, `model busy: ${err.message}`,
+      );
+    }
     const reason = err instanceof Error ? err.message : String(err);
     throw new DeckReviseError('The agent could not answer, so nothing was changed.', 503, reason);
   }

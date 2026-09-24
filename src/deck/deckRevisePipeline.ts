@@ -386,7 +386,20 @@ export function createDeckReviseProposeHandler(opts: DeckReviseStepOpts = {}): D
             ...(request.target ? { target: request.target } : {}),
             sources: request.sources,
           },
-          { ...opts.reviseOpts, onPhase: (phase) => events.phase(phase) },
+          {
+            ...opts.reviseOpts,
+            onPhase: (phase) => events.phase(phase),
+            // Every slot taken: the step says so in the run pane (a step frame,
+            // `pipeline.step.waiting`), with its place in line, until it runs.
+            onModelSlot: (slot) => {
+              const emit = helpers.emit as unknown as (event: string, payload: unknown) => Promise<void>;
+              void emit('pipeline:step:waiting', {
+                runId, stepId: helpers.stepId, reason: 'model-slot', state: slot.state,
+                ...(slot.position !== undefined ? { position: slot.position } : {}),
+                waitedMs: slot.waitedMs, at: new Date().toISOString(),
+              }).catch(() => undefined);
+            },
+          },
         );
         const output: ProposeOutput = {
           spec: result.spec,
@@ -406,6 +419,13 @@ export function createDeckReviseProposeHandler(opts: DeckReviseStepOpts = {}): D
             // retry (ModelAuth is terminal). The operator step is in the log.
             const outcome = fail(runId, request, 503, 'The agent could not sign in to the model — its credentials have expired, so nothing was changed. Ask the operator to refresh them, then try again.', 'model-auth');
             log.warn({ runId, reason: err.reason, documentId: request.documentId }, 'deck revise run: model credentials rejected (tilt trigger claude-creds-extract)');
+            return outcome;
+          }
+          if (/^model busy:/.test(err.reason)) {
+            // Waited its turn for a model slot and none came free: say so, and
+            // do not retry — another try joins the back of the same line.
+            const outcome = fail(runId, request, 503, err.message, 'model-busy');
+            log.warn({ runId, reason: err.reason, documentId: request.documentId }, 'deck revise run: no model slot came free');
             return outcome;
           }
           const transient = err.status === 503 && !/authenticat|log ?in|credential|forbidden|permission/i.test(err.reason) ? ' (model unavailable)' : '';

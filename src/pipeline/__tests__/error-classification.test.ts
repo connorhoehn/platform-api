@@ -133,3 +133,12 @@ describe('ModelAuth (Loop 29 ppt)', () => {
     expect(classifyPipelineError('lease expired for node')).toBe('RegistryConflict');
   });
 });
+
+describe('ModelBusy (Loop 35 ppt)', () => {
+  it('a step that gave up waiting for a model slot is ModelBusy and terminal, not a retry', () => {
+    const msg = 'propose: deck-revise model-busy: The agent is busy: no model slot came free within 120 seconds, so nothing was changed. Try again in a minute.';
+    expect(classifyPipelineError(msg)).toBe('ModelBusy');
+    expect(classifyRetryability('ModelBusy', msg)).toBe('terminal');
+    expect(classifyPipelineError('the model was busy and answered late')).not.toBe('ModelBusy');
+  });
+});

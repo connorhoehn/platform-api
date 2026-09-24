@@ -6,6 +6,7 @@ export type ErrorCategory =
   | 'RegistryConflict'
   | 'Refused'
   | 'ModelAuth'
+  | 'ModelBusy'
   | 'UnknownError';
 
 export type Retryability = 'retryable' | 'terminal' | 'unknown';
@@ -19,6 +20,9 @@ const CATEGORY_RETRYABILITY: Record<ErrorCategory, Retryability> = {
   // The model's credentials are missing or expired: every retry fails the
   // same way until an operator refreshes them.
   ModelAuth:        'terminal',
+  // Waited its turn for a fleet-wide model slot and none came free
+  // (deck/modelSlots.ts): a retry joins the back of the same line.
+  ModelBusy:        'terminal',
   LLMError:         'retryable',  // refined by classifyRetryability for 4xx auth
   UnknownError:     'unknown',
 };
@@ -76,6 +80,9 @@ export function classifyRetryability(category: ErrorCategory, message: string): 
  * CLI's "Not logged in · Please run /login" / "claude is not authenticated",
  * an invalid or expired key.
  */
+/** A step that gave up waiting for a model slot: the `model-busy` code. */
+export const MODEL_BUSY_RE = /(?:^|: )[a-z][\w-]* model-busy: /;
+
 export const MODEL_AUTH_RE = /\bmodel-auth\b|not logged in|\/login\b|not authenticated|invalid[ _]api[ _]key|authentication_error|oauth token has expired/i;
 
 export function classifyPipelineError(message: string, stack?: string): ErrorCategory {
@@ -86,6 +93,7 @@ export function classifyPipelineError(message: string, stack?: string): ErrorCat
   // "Please run /login" contains "lease" and read as a RegistryConflict
   // (Loop 28 ppt). Matched on the message only — a stack is not a reason.
   if (MODEL_AUTH_RE.test(message)) return 'ModelAuth';
+  if (MODEL_BUSY_RE.test(message)) return 'ModelBusy';
 
   const lowerMsg = message.toLowerCase();
   const lowerStack = (stack || '').toLowerCase();

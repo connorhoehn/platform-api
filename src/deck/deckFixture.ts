@@ -24,6 +24,7 @@ import {
 import { readDocumentText } from './DeckSourcesStepHandler';
 import { DOCUMENTS_TABLE } from './presentationDocuments';
 import { getRedisClient } from '../lib/redis-client';
+import { withModelSlot, type ModelSlotRunner } from './modelSlots';
 import { contentKey, createSingleFlight, type SingleFlightRole, type SingleFlightStore } from './fixtureSingleFlight';
 
 export const FIXTURE_TITLE_PREFIX = '[deck-fixture]';
@@ -395,7 +396,12 @@ export function fixtureSpec(material: FixtureMaterial, title: string): DeckSpec 
   return validation.spec;
 }
 
-export async function askModel(llm: LLMClient, prompt: string, timeoutMs: number): Promise<string> {
+/**
+ * One model call. With `slot`, it runs holding a fleet-wide model slot
+ * (modelSlots.ts) — waiting for the slot is not part of `timeoutMs`.
+ */
+export async function askModel(llm: LLMClient, prompt: string, timeoutMs: number, slot?: ModelSlotRunner | null): Promise<string> {
+  if (slot) return slot(() => askModel(llm, prompt, timeoutMs));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let text = '';
@@ -488,7 +494,8 @@ export async function buildDeckFixture(
   const draft = async (): Promise<ModelDraft> => {
     if (!llm) return { spec: fixtureSpec(material, deckTitle), source: 'fixture', reason: 'no model is configured on this deployment' };
     try {
-      const answer = await askModel(llm, fixturePrompt(material, deckTitle, from.personId), opts.timeoutMs ?? FIXTURE_TIMEOUT_MS);
+      // Injected clients (tests) take no slot, as they take no single-flight.
+      const answer = await askModel(llm, fixturePrompt(material, deckTitle, from.personId), opts.timeoutMs ?? FIXTURE_TIMEOUT_MS, opts.llm === undefined ? (run) => withModelSlot(run) : null);
       const parsed = parseDeckSpecJson(answer);
       if (parsed === undefined) throw new Error('the model answered with no JSON object');
       const validation = validateDeckSpec(liftSlideSubtitles(parsed));
