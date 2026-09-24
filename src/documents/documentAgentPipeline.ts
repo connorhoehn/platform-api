@@ -11,7 +11,7 @@ import type { LLMClient } from 'distributed-core/applications/pipeline';
 import { createLLMClient } from '../pipeline/factories/LLMClientFactory';
 import { interpolateContext } from '../pipeline/agent/AgentStepHandler';
 import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
-import { applyOps, createSuggestionIdentity, ensureCanvasMeta, outlineOf, parseOps, type ApplyMode, type OutlineBlock } from './documentAgentOps';
+import { applyChangeIndex, applyOps, createSuggestionIdentity, runSuggestionIdentity, ensureCanvasMeta, outlineOf, parseOps, type ApplyMode, type OutlineBlock } from './documentAgentOps';
 import log from '../lib/logger';
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 
@@ -383,7 +383,7 @@ export function createDocumentApplyHandler(): DescribedStepHandler {
       'The write path into a document: joins as the agent, applies the operations through the collaboration channel, and leaves. The /doc edit, the transform and the call transcript all land through this one step.',
     reads: 'documentId and the operations to apply.',
     emits: 'What landed — the applied operations and the suggestion identity they were written under.',
-    async execute(node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
+    async execute(node: PipelineNode, context: Record<string, unknown>, helpers?: { runId?: string; stepId?: string }): Promise<StepOutcome> {
       const data = ((node as { data?: DocumentApplyNodeData }).data ?? {}) as DocumentApplyNodeData;
       const documentId = documentIdOf(context);
       if (!documentId) {
@@ -414,11 +414,21 @@ export function createDocumentApplyHandler(): DescribedStepHandler {
           origin: 'agent', sourceBlocks, mode,
           ...(mode === 'suggest'
             ? {
-              identity: createSuggestionIdentity(
-                identity.userId,
-                suggestionAuthorName(context.requestedByName, identity.displayName),
-                Date.now(),
-              ),
+              // NFR #213: one identity per run (and per apply arm), never the
+              // shared ten-minute bucket. A caller with no run id (a test, a
+              // direct call) keeps the chassis identity.
+              identity: helpers?.runId
+                ? runSuggestionIdentity(
+                  identity.userId,
+                  suggestionAuthorName(context.requestedByName, identity.displayName),
+                  helpers.runId,
+                  { change: applyChangeIndex(helpers.stepId) },
+                )
+                : createSuggestionIdentity(
+                  identity.userId,
+                  suggestionAuthorName(context.requestedByName, identity.displayName),
+                  Date.now(),
+                ),
             }
             : {}),
         });

@@ -48,6 +48,7 @@ import { buildDocumentReviewApplyDefinition, DOCUMENT_AGENT_REVIEW_PIPELINE_ID }
 import { documentReadGate } from '../documents/documentReadGate';
 import { DocumentEditForbiddenError } from '../deck/documentEditAccess';
 import { commentForRun, settleCommentSuggestionReview, type CommentRunLink } from '../documents/commentAgentRequests';
+import { suggestionKeyRunId } from '../documents/documentAgentOps';
 
 const log = withContext({ route: 'pipelineRunReview' });
 
@@ -113,6 +114,11 @@ pipelineRunReviewRouter.post(
       throw err;
     }
 
+    // NFR #213: a per-run key names its run; a verdict for run A must not
+    // carry run B's key (it would resolve B's marks server-side and record A).
+    const keyRun = suggestionKeyRunId(body.suggestionKey);
+    if (keyRun && keyRun !== runId) throw new ValidationError(`suggestionKey ${body.suggestionKey} belongs to another run`);
+
     const run = await getRunRepo().get(pipelineId, runId);
     if (!run) throw new NotFoundError(`run ${runId} not found for pipeline ${pipelineId}`);
     const link = await commentForRun(runId);
@@ -155,6 +161,13 @@ pipelineRunReviewRouter.post(
     }
 
     let applied: RunReviewResponse['applied'];
+    // A legacy key (`agent:haiku@<ten-minute bucket>`, before #213) is shared by
+    // every run in its bucket: resolving it server-side would resolve the other
+    // runs' marks too. Refuse; the margin (which resolves only what the reader
+    // clicked and records without applyServerSide) still works for them.
+    if (body.applyServerSide && !keyRun) {
+      throw new ConflictError('This suggestion predates per-run suggestions and may be shared with other runs; accept or reject it in the document.');
+    }
     if (body.applyServerSide) {
       const bridge = getPipelineBridge();
       if (!bridge?.trigger) { res.status(503).json({ error: 'pipeline engine is not available' } as never); return; }

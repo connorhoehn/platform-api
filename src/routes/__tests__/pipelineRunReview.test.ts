@@ -75,7 +75,7 @@ function buildApp(): express.Express {
 }
 
 const URL = '/pipelines/document-agent-edit/runs/run-1/review';
-const good = { decision: 'reject', suggestionKey: 'agent:haiku@1788000000000', documentId: 'doc-1', byName: 'Grace', comment: 'not needed' };
+const good = { decision: 'reject', suggestionKey: 'agent:haiku~run-1@1788000000123', documentId: 'doc-1', byName: 'Grace', comment: 'not needed' };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -181,6 +181,23 @@ describe('POST /pipelines/:pipelineId/runs/:runId/review', () => {
     expect((await post(app, URL, { ...good, suggestionKey: 'no-at-sign' })).statusCode).toBe(400);
     expect((await post(app, URL, { ...good, documentId: '' })).statusCode).toBe(400);
     expect(mockSetReview).not.toHaveBeenCalled();
+  });
+
+  // NFR #213: suggestion identity is per run.
+  it('400 when the key names another run; nothing recorded, nothing applied', async () => {
+    const res = await post(app, URL, { ...good, decision: 'accept', suggestionKey: 'agent:haiku~run-2@1788000000456', applyServerSide: true });
+    expect(res.statusCode).toBe(400);
+    expect(mockTrigger).not.toHaveBeenCalled();
+    expect(mockSetReview).not.toHaveBeenCalled();
+  });
+
+  it('a legacy shared key is recorded from the margin but never resolved server-side', async () => {
+    const legacy = { ...good, decision: 'accept', suggestionKey: 'agent:haiku@1788000000000' };
+    expect((await post(app, URL, { ...legacy, applyServerSide: true })).statusCode).toBe(409);
+    expect(mockTrigger).not.toHaveBeenCalled();
+    expect(mockSetReview).not.toHaveBeenCalled();
+    expect((await post(app, URL, legacy)).statusCode).toBe(200);
+    expect(mockSetReview).toHaveBeenCalledTimes(1);
   });
 
   // NFR #171: a verdict changes the document, so it takes document:edit.

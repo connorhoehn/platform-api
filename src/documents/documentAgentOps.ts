@@ -22,6 +22,53 @@ import {
 
 export { createSuggestionIdentity, readSuggestions, suggestionKey, type SuggestionIdentity, type SuggestionRun };
 
+/**
+ * NFR #213 — a run's suggestions carry the RUN in their identity.
+ *
+ * The chassis identity is `user@date` with `date` floored to ten minutes, which
+ * is right for a person typing and wrong for agent runs: every run in the same
+ * bucket wrote `agent:haiku@<bucket>`, so accepting one run's suggestion (by
+ * key, in the margin or server-side) resolved every other run's marks under
+ * that key — and their linked comments. The mark schema has exactly three
+ * attributes (`user`, `username`, `date`) shared by the editor, this writer and
+ * every stored document, so the run goes into `user` (`username` is what is
+ * displayed; `user` is only ever a key) and `date` is the apply time, unbucketed:
+ *
+ *     agent:haiku~<runId>@<epochMs>            one apply step
+ *     agent:haiku~<runId>.<n>@<epochMs>        the n-th arm of an apply step in a loop
+ *
+ * Still `user@date`, still starts with `agent:`, parsed back by `suggestionKeyRunId`.
+ * A key without `~` is LEGACY (shared across runs) and proves no run.
+ */
+export const SUGGESTION_RUN_SEPARATOR = '~';
+
+export function runSuggestionIdentity(
+  agentUserId: string,
+  username: string,
+  runId: string,
+  opts: { change?: number; nowMs?: number } = {},
+): SuggestionIdentity {
+  const change = opts.change && opts.change > 1 ? `.${opts.change}` : '';
+  return { user: `${agentUserId}${SUGGESTION_RUN_SEPARATOR}${runId}${change}`, username, date: opts.nowMs ?? Date.now() };
+}
+
+/** The run a suggestion key belongs to, or null for a legacy (shared, bucketed) key. */
+export function suggestionKeyRunId(key: string | undefined | null): string | null {
+  if (!key) return null;
+  const at = key.lastIndexOf('@');
+  const user = at >= 0 ? key.slice(0, at) : key;
+  const sep = user.lastIndexOf(SUGGESTION_RUN_SEPARATOR);
+  if (sep < 0) return null;
+  const run = user.slice(sep + 1).replace(/\.\d+$/, '');
+  return run || null;
+}
+
+/** The arm index of an apply step id (`apply:2` → 2), else undefined. */
+export function applyChangeIndex(stepId: string | undefined): number | undefined {
+  const m = stepId ? /:(\d+)$/.exec(stepId) : null;
+  return m ? Number(m[1]) : undefined;
+}
+
 /** The canvas body fragment and the metadata map — the same keys the editor uses. */
 export const CANVAS_BODY_KEY = 'body';
 export const CANVAS_META_KEY = 'meta';
