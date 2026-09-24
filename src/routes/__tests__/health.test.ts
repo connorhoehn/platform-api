@@ -27,7 +27,9 @@ jest.mock('../../lib/redis-client', () => {
 });
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const healthRouter = require('../health').default as express.Router;
+const healthModule = require('../health');
+const healthRouter = healthModule.default as express.Router;
+const livezHandler = healthModule.livezHandler as express.RequestHandler;
 
 interface HealthCheckReport {
   name: string;
@@ -65,6 +67,7 @@ async function getJson(server: http.Server, path: string): Promise<JsonResponse>
 function buildApp(): express.Application {
   const app = express();
   app.use('/api/health', healthRouter);
+  app.get('/livez', livezHandler);
   return app;
 }
 
@@ -149,5 +152,40 @@ describe('GET /api/health', () => {
     const res = await getJson(server, '/api/health');
     expect(typeof findCheck(res.body, 'dynamodb')?.durationMs).toBe('number');
     expect(typeof findCheck(res.body, 'redis')?.durationMs).toBe('number');
+  });
+});
+
+// /livez is the liveness probe target. It must answer 200 no matter what the
+// dependencies are doing — a DynamoDB outage that 503s /health once got both
+// replicas SIGTERMed into CrashLoopBackOff because liveness pointed at /health.
+describe('GET /livez', () => {
+  let server: http.Server;
+
+  beforeAll(async () => {
+    server = http.createServer(buildApp());
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('returns 200 while DynamoDB and Redis are both down, without calling either', async () => {
+    mockDdbSend.mockReset().mockRejectedValue(new Error('connection refused'));
+    mockRedisPing.mockReset().mockRejectedValue(new Error('ECONNREFUSED'));
+    mockGetRedisClient.mockReset().mockResolvedValue({ ping: mockRedisPing });
+
+    const health = await getJson(server, '/api/health');
+    expect(health.status).toBe(503);
+    mockDdbSend.mockClear();
+    mockGetRedisClient.mockClear();
+    mockRedisPing.mockClear();
+
+    const res = await getJson(server, '/livez');
+    expect(res.status).toBe(200);
+    expect((res.body as unknown as { status: string }).status).toBe('alive');
+    expect(mockDdbSend).not.toHaveBeenCalled();
+    expect(mockGetRedisClient).not.toHaveBeenCalled();
+    expect(mockRedisPing).not.toHaveBeenCalled();
   });
 });

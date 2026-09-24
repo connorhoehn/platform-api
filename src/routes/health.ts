@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { DescribeTableCommand } from '@aws-sdk/client-dynamodb';
 import { makeHealthHandler, type HealthCheck } from '@connorhoehn/service-runtime';
 import { ddbClient } from '../lib/aws-clients';
@@ -45,6 +45,22 @@ const modelCheck: HealthCheck = {
     return { ok: true, degraded: true, details: health.message };
   },
 };
+
+// Liveness — "is this process's event loop still turning?" and nothing else.
+// No DynamoDB, Redis, build or model call: a dependency outage must pull the
+// pod from the Service (readiness on /health), never get it SIGTERMed. When
+// /health doubled as the liveness probe, a DynamoDB Local outage 503'd it,
+// kubelet killed both replicas into CrashLoopBackOff, and they sat in backoff
+// for minutes after DynamoDB came back (realtime-examples, 2026-09-24).
+export function livezHandler(_req: Request, res: Response): void {
+  res.set('Cache-Control', 'no-store');
+  res.status(200).json({
+    status: 'alive',
+    service: 'platform-api',
+    version: SERVICE_VERSION,
+    uptimeSeconds: Math.round(process.uptime()),
+  });
+}
 
 const router = Router();
 

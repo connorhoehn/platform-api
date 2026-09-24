@@ -7,7 +7,7 @@ import { requestLogger } from './middleware/request-logger';
 import { httpMetrics } from './middleware/http-metrics';
 import { errorHandler } from './middleware/error-handler';
 import { pipelineReadRateLimit } from './middleware/rateLimit';
-import healthRouter from './routes/health';
+import healthRouter, { livezHandler } from './routes/health';
 import apiRouter from './routes/index';
 import { pipelineWebhooksRouter } from './routes/pipelineWebhooks';
 import { renderPrometheusText } from './observability/metrics';
@@ -98,6 +98,8 @@ export function createApp(): express.Application {
   // Both mounts use the same router so behaviour stays identical.
   app.use('/health', healthRouter);
   app.use('/api/health', healthRouter);
+  // Liveness probe target — process-only, no dependency calls (see health.ts).
+  app.get('/livez', livezHandler);
 
   // Prometheus scrape endpoint — distributed-core MetricsRegistry shadow.
   // Public (no auth) so a Prometheus server can scrape it; matches the

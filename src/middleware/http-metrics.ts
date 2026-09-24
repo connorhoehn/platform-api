@@ -34,7 +34,7 @@ export function httpMetrics(req: Request, res: Response, next: NextFunction): vo
  */
 export function deriveRouteGroup(url: string): string {
   const path = url.split('?')[0] ?? url;
-  if (path.startsWith('/health') || path === '/api/health') return 'health';
+  if (path.startsWith('/health') || path === '/api/health' || path === '/livez') return 'health';
   if (path.startsWith('/internal')) return 'internal';
   if (path.startsWith('/hooks/')) return 'hooks';
   if (path.startsWith('/api/admin/')) return 'api_admin';
