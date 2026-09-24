@@ -475,6 +475,45 @@ export function checkConstraints(constraints: Constraint[], before: DeckSpec, af
   return { constraints, facts: [...facts.values()], violations };
 }
 
+// ---------------------------------------------------------------------------
+// What moved, when nothing was counted
+// ---------------------------------------------------------------------------
+
+const SLIDE_PARTS: Array<[keyof DeckSlide, string]> = [
+  ['layout', 'layout'], ['eyebrow', 'eyebrow'], ['title', 'title'], ['bullets', 'bullets'], ['columns', 'columns'],
+  ['chart', 'chart'], ['quote', 'quote'], ['image', 'image'], ['notes', 'notes'], ['sources', 'sources'],
+];
+const sameValue = (a: unknown, b: unknown): boolean => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/**
+ * The parts an edit changed, as short factual phrases in slide order —
+ * "slide 1 subtitle", "slide 3 bullets", "slide 4 added", "deck title". The
+ * deck subtitle is drawn on the title slide, so it is named by that slide.
+ * Deterministic, from the two specs; never the model's word.
+ */
+export function describeChanges(before: DeckSpec, after: DeckSpec): string[] {
+  const out: string[] = [];
+  if ((before.title ?? '') !== (after.title ?? '')) out.push('deck title');
+  if ((before.subtitle ?? '') !== (after.subtitle ?? '')) {
+    const at = after.slides.findIndex((s) => s.layout === 'title');
+    out.push(at >= 0 ? `slide ${at + 1} subtitle` : 'deck subtitle');
+  }
+  if (!sameValue(before.theme, after.theme)) out.push('theme');
+  const beforeById = new Map(before.slides.map((s, i) => [s.id, { slide: s, index: i }]));
+  const afterIds = new Set(after.slides.map((s) => s.id));
+  let reordered = false;
+  after.slides.forEach((slide, i) => {
+    const prev = beforeById.get(slide.id);
+    if (!prev) { out.push(`slide ${i + 1} added`); return; }
+    if (prev.index !== i) reordered = true;
+    const parts = SLIDE_PARTS.filter(([key]) => !sameValue(prev.slide[key], slide[key])).map(([, label]) => label);
+    if (parts.length) out.push(`slide ${i + 1} ${parts.join(' and ')}`);
+  });
+  before.slides.forEach((slide, i) => { if (!afterIds.has(slide.id)) out.push(`slide ${i + 1} removed`); });
+  if (reordered && before.slides.length === after.slides.length) out.push('slide order');
+  return out;
+}
+
 /** The lines a run shows for its measurements: "Title: 3 → 2 words". */
 export const factLines = (facts: MeasuredFact[]): string[] => facts.map((fact) => fact.label);
 
@@ -491,7 +530,7 @@ const CLAIM_SENTENCE = /(?<=[.!?])\s+(?=[A-Z"“])/;
  * a direction the measurements contradict, then the measured facts. A summary
  * that loses every sentence falls back to a deterministic line.
  */
-export function reconcileSummary(summary: string, facts: MeasuredFact[], fallback: string): string {
+export function reconcileSummary(summary: string, facts: MeasuredFact[], fallback: string, changes: string[] = []): string {
   const numeric = facts.filter((f): f is MeasuredFact & { before: number; after: number } => typeof f.before === 'number' && typeof f.after === 'number');
   const measuredShorter = numeric.some((f) => f.after < f.before);
   const measuredLonger = numeric.some((f) => f.after > f.before);
@@ -504,7 +543,9 @@ export function reconcileSummary(summary: string, facts: MeasuredFact[], fallbac
   });
   const claim = kept.length ? kept.join(' ') : fallback;
   const dropped = kept.length < sentences.length;
-  const measured = facts.length ? ` Measured: ${factLines(facts).join('; ')}.` : '';
+  // Nothing countable → say plainly what moved instead ("Changed: slide 1 subtitle").
+  const measured = facts.length ? ` Measured: ${factLines(facts).join('; ')}.`
+    : changes.length ? ` Changed: ${changes.join(', ')}.` : '';
   const corrected = dropped ? ' The agent’s own note was left out where the numbers contradict it.' : '';
   return `${claim}${measured}${corrected}`.trim();
 }

@@ -3,7 +3,7 @@
 // constraints out; a before/after pair in, facts and violations out.
 
 import {
-  checkConstraints, factLines, parseConstraints, reconcileSummary, retryInstruction, type Constraint,
+  checkConstraints, describeChanges, factLines, parseConstraints, reconcileSummary, retryInstruction, type Constraint,
 } from '../deckConstraints';
 import type { DeckSpec } from '../DeckSpec';
 import { sampleDeck } from './fixtures';
@@ -180,5 +180,28 @@ describe('retryInstruction', () => {
     const again = retryInstruction('make the title one word shorter', check.violations);
     expect(again.startsWith('make the title one word shorter\n\n')).toBe(true);
     expect(again).toContain('- Title has 3 words; before it had 3. Make it 2.');
+  });
+});
+
+describe('describeChanges (Loop 29 ppt — a factual line when nothing was counted)', () => {
+  const deck = {
+    title: 'Release plan', subtitle: 'Q3',
+    slides: [
+      { id: 's1', layout: 'title' as const, title: 'Release plan', sources: [] },
+      { id: 's2', layout: 'bullets' as const, title: 'Risks', bullets: ['a', 'b'], sources: [] },
+    ],
+  };
+  it('names the title slide for a deck subtitle edit', () => {
+    expect(describeChanges(deck, { ...deck, subtitle: 'Q4 plan' })).toEqual(['slide 1 subtitle']);
+  });
+  it('names slide parts, added and removed slides', () => {
+    const after = { ...deck, slides: [deck.slides[0], { ...deck.slides[1], bullets: ['a'] }, { id: 's3', layout: 'bullets' as const, title: 'New', sources: [] }] };
+    expect(describeChanges(deck, after)).toEqual(['slide 2 bullets', 'slide 3 added']);
+    expect(describeChanges(deck, { ...deck, slides: [deck.slides[0]] })).toEqual(['slide 2 removed']);
+  });
+  it('reconcileSummary shows "Changed:" only when nothing was measured', () => {
+    expect(reconcileSummary('Updated the subtitle.', [], 'Changed 1 slide.', ['slide 1 subtitle'])).toBe('Updated the subtitle. Changed: slide 1 subtitle.');
+    const check = checkConstraints(parseConstraints('make the title one word shorter'), deck, { ...deck, title: 'Release' });
+    expect(reconcileSummary('Shortened.', check.facts, '', ['deck title'])).toMatch(/Measured:/);
   });
 });

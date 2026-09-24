@@ -159,7 +159,7 @@ describe('deck-revise pipeline', () => {
     expect(head.id).toBe('v2');
     expect(head.spec!.slides[1]!.title).toBe('Tighter');
     expect(head.producedBy).toEqual({ pipelineId: 'deck-revise', runId: result.id, requestId: 'req-1' });
-    expect(result.steps.write?.output).toMatchObject({ written: true, revisionId: 'v2', baseRevisionId: 'v1', changedSlideIds: [slideId], summary: `Retitled ${slideId}.` });
+    expect(result.steps.write?.output).toMatchObject({ written: true, revisionId: 'v2', baseRevisionId: 'v1', changedSlideIds: [slideId], summary: `Retitled ${slideId}. Changed: slide 2 title.`, changes: ["slide 2 title"] });
     expect(revise.mock.calls[0]![0].slideId).toBe(slideId);
   });
 

@@ -5,6 +5,7 @@ export type ErrorCategory =
   | 'LLMError'
   | 'RegistryConflict'
   | 'Refused'
+  | 'ModelAuth'
   | 'UnknownError';
 
 export type Retryability = 'retryable' | 'terminal' | 'unknown';
@@ -15,6 +16,9 @@ const CATEGORY_RETRYABILITY: Record<ErrorCategory, Retryability> = {
   ValidationError:  'terminal',
   RegistryConflict: 'terminal',
   Refused:          'terminal',
+  // The model's credentials are missing or expired: every retry fails the
+  // same way until an operator refreshes them.
+  ModelAuth:        'terminal',
   LLMError:         'retryable',  // refined by classifyRetryability for 4xx auth
   UnknownError:     'unknown',
 };
@@ -67,10 +71,21 @@ export function classifyRetryability(category: ErrorCategory, message: string): 
   return CATEGORY_RETRYABILITY[category];
 }
 
+/**
+ * A model that could not sign in: the step's `model-auth` code, the Claude
+ * CLI's "Not logged in · Please run /login" / "claude is not authenticated",
+ * an invalid or expired key.
+ */
+export const MODEL_AUTH_RE = /\bmodel-auth\b|not logged in|\/login\b|not authenticated|invalid[ _]api[ _]key|authentication_error|oauth token has expired/i;
+
 export function classifyPipelineError(message: string, stack?: string): ErrorCategory {
   // Before the keyword scans: `revision-conflict` reads as a conflict,
   // `invalid-request` as a validation error, and the other two as unknown.
   if (refusalCodeOf(message)) return 'Refused';
+  // A model login/credential failure, before the keyword scans: the CLI's
+  // "Please run /login" contains "lease" and read as a RegistryConflict
+  // (Loop 28 ppt). Matched on the message only — a stack is not a reason.
+  if (MODEL_AUTH_RE.test(message)) return 'ModelAuth';
 
   const lowerMsg = message.toLowerCase();
   const lowerStack = (stack || '').toLowerCase();
@@ -88,8 +103,8 @@ export function classifyPipelineError(message: string, stack?: string): ErrorCat
 
   if (
     combined.includes('conflict') ||
-    combined.includes('lock') ||
-    combined.includes('lease') ||
+    /\block/.test(combined) ||
+    /\blease/.test(combined) ||
     combined.includes('registry') ||
     combined.includes('version mismatch')
   ) {

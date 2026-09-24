@@ -38,10 +38,11 @@
 import type { PipelineNode, StepHandlerHelpers, StepOutcome } from 'distributed-core/applications/pipeline';
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import log from '../lib/logger';
+import { MODEL_AUTH_RE } from '../pipeline/error-classification';
 import { validateReviseTarget, type DeckReviseTarget, type DeckSlide, type DeckSpec } from './DeckSpec';
 import { DeckReviseError, reviseDeck, validateReviseInputSpec, type DeckReviseOpts, type DeckReviseSourceRef } from './deckRevise';
 import {
-  checkConstraints, factLines, parseConstraints, reconcileSummary, retryInstruction,
+  checkConstraints, describeChanges, factLines, parseConstraints, reconcileSummary, retryInstruction,
   type Constraint, type ConstraintCheck,
 } from './deckConstraints';
 import {
@@ -400,6 +401,13 @@ export function createDeckReviseProposeHandler(opts: DeckReviseStepOpts = {}): D
           // A model that could not be reached is worth one more try; the
           // executor retries a failure whose message reads as transient.
           // Not when the model's credentials are the problem: another try is the same answer.
+          if (MODEL_AUTH_RE.test(err.reason)) {
+            // The model's login, not the edit: say so plainly, once, and never
+            // retry (ModelAuth is terminal). The operator step is in the log.
+            const outcome = fail(runId, request, 503, 'The agent could not sign in to the model — its credentials have expired, so nothing was changed. Ask the operator to refresh them, then try again.', 'model-auth');
+            log.warn({ runId, reason: err.reason, documentId: request.documentId }, 'deck revise run: model credentials rejected (tilt trigger claude-creds-extract)');
+            return outcome;
+          }
           const transient = err.status === 503 && !/authenticat|log ?in|credential|forbidden|permission/i.test(err.reason) ? ' (model unavailable)' : '';
           const outcome = fail(runId, request, err.status, err.message, `model-${err.status === 400 ? 'refused' : 'failed'}`);
           log.warn({ runId, status: err.status, reason: err.reason, documentId: request.documentId }, 'deck revise run: the model step failed');
@@ -424,6 +432,8 @@ export interface CheckOutput {
   constraints: Constraint[];
   /** "Title: 3 → 2 words" — before the edit → after it. */
   facts: string[];
+  /** What moved, when nothing was counted too: "slide 1 subtitle", "slide 3 bullets". */
+  changes: string[];
   /** True when the first proposal missed a constraint and the model was asked once more. */
   retried: boolean;
 }
@@ -494,15 +504,17 @@ export function createDeckReviseCheckHandler(opts: DeckReviseStepOpts = {}): Des
         }
       }
       const fallback = changedSlideIds.length ? `Changed ${changedSlideIds.length} slide${changedSlideIds.length === 1 ? '' : 's'}.` : 'No slides changed.';
+      const changes = describeChanges(loaded.spec, spec);
       const output: CheckOutput = {
         documentId: request.documentId,
         spec,
-        summary: reconcileSummary(summary, check.facts, fallback),
+        summary: reconcileSummary(summary, check.facts, fallback, changes),
         changedSlideIds,
         warnings,
         changed: !same(spec, loaded.spec),
         constraints,
         facts: factLines(check.facts),
+        changes,
         retried,
       };
       return { status: 'completed', output: output as unknown as Record<string, unknown> };
@@ -522,6 +534,8 @@ export interface WriteOutput {
   warnings: string[];
   /** The check step's measurements: "Title: 3 → 2 words". */
   facts?: string[];
+  /** What the edit changed: "slide 1 subtitle". */
+  changes?: string[];
   /** True when the model was asked a second time to meet a constraint. */
   retried?: boolean;
   artifacts?: unknown[];
@@ -586,7 +600,7 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
         summary: proposed.summary,
         changedSlideIds: proposed.changedSlideIds,
         warnings: proposed.warnings,
-        ...(checked ? { facts: checked.facts, retried: checked.retried } : {}),
+        ...(checked ? { facts: checked.facts, changes: checked.changes ?? [], retried: checked.retried } : {}),
         result: { kind: 'document', documentId: request.documentId },
       };
       if (!proposed.changed) {

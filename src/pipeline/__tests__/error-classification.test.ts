@@ -120,3 +120,16 @@ describe('refusals (a step said no; the same inputs decide the same way)', () =>
     expect(classifyPipelineError('deck-revise failed: model unavailable (503)')).not.toBe('Refused');
   });
 });
+
+describe('ModelAuth (Loop 29 ppt)', () => {
+  it('a Claude CLI login failure is ModelAuth and terminal, not a RegistryConflict', () => {
+    const msg = 'deck-revise model-failed: The agent could not answer — claude is not authenticated in this environment: Not logged in · Please run /login';
+    expect(classifyPipelineError(msg)).toBe('ModelAuth');
+    expect(classifyRetryability('ModelAuth', msg)).toBe('terminal');
+    expect(classifyPipelineError('deck-revise model-auth: The agent could not sign in to the model')).toBe('ModelAuth');
+  });
+  it('"please" alone no longer reads as a lease conflict', () => {
+    expect(classifyPipelineError('Please try again later')).toBe('UnknownError');
+    expect(classifyPipelineError('lease expired for node')).toBe('RegistryConflict');
+  });
+});
