@@ -22,6 +22,16 @@
  * work queue, so with N gateway replicas exactly one receives each event and
  * broadcasts it cluster-wide — the Redis pattern hands every replica a copy.
  *
+ * WHEN: at publish, not on the bus's own delivery. dc `EventBus` hands an
+ * event to `subscribeAll` handlers only after every typed handler for its type
+ * has resolved, one after another — for `pipeline:run:started` that is run
+ * persistence, the rollup and the durable outbox, DynamoDB writes that took
+ * p50 45 / p95 299 ms, while a step's handlers take ~5 ms. So MQ-only the
+ * first event of every run reached the queue behind its own step events
+ * (NFR loop 30). The relay therefore wraps the bus's `publish` and queues the
+ * event as soon as the bus has accepted it; `subscribeAll` stays the fallback
+ * for a bus without a `publish` to wrap.
+ *
  * ORDER + BACKPRESSURE: one sender, in publish order; at most MAX_BACKLOG
  * events wait (oldest dropped and counted) so an MQ outage costs bounded
  * memory and never blocks or fails a run.
@@ -81,6 +91,8 @@ interface StartOpts {
   eventBus?: {
     subscribeAll(handler: (event: BusEvent) => Promise<void>): string;
     unsubscribe(subscriptionId: string): void;
+    /** Wrapped when present: the relay queues each event as `publish` resolves with it. */
+    publish?: (...args: any[]) => Promise<unknown>;
   };
   fetchImpl?: typeof fetch;
   serviceAuthSecret?: string;
@@ -166,7 +178,8 @@ export function startPipelineEventMqRelay(opts: StartOpts): PipelineEventMqRelay
   ensureQueue().catch((err: unknown) => {
     relayLog.warn({ err: err instanceof Error ? err.message : String(err) }, 'pipeline-events queue not ensured at start; retried on first send');
   });
-  const subscriptionId = opts.eventBus?.subscribeAll(async (event) => { publish(event); });
+  const untap = opts.eventBus ? tapPublish(opts.eventBus, publish) : null;
+  const subscriptionId = opts.eventBus && !untap ? opts.eventBus.subscribeAll(async (event) => { publish(event); }) : undefined;
   relayLog.info({ queue: LIVE_MQ_QUEUE, url: opts.url }, 'live pipeline events → MQ');
 
   return {
@@ -176,11 +189,41 @@ export function startPipelineEventMqRelay(opts: StartOpts): PipelineEventMqRelay
       while (pumping) await pumping;
     },
     async stop() {
+      untap?.();
       if (subscriptionId && opts.eventBus) {
         try { opts.eventBus.unsubscribe(subscriptionId); } catch { /* already gone */ }
       }
       await this.flush();
       stopped = true;
     },
+  };
+}
+
+/**
+ * Wrap `bus.publish` so `onEvent` gets each published BusEvent as soon as the
+ * bus resolves it (built, WAL-synced and handed to pub-sub), before the bus
+ * runs its typed handlers. Callbacks run in the order the publishes resolve —
+ * the order the executor emitted. Returns the undo, or null when the bus has no
+ * `publish` to wrap.
+ */
+function tapPublish(
+  bus: { publish?: (...args: any[]) => Promise<unknown> },
+  onEvent: (event: { id?: unknown; type?: unknown }) => void,
+): (() => void) | null {
+  if (typeof bus.publish !== 'function') return null;
+  const original = bus.publish;
+  let active = true;
+  const wrapped = function (this: unknown, ...args: any[]): Promise<unknown> {
+    const result = original.apply(this ?? bus, args);
+    Promise.resolve(result).then(
+      (event) => { if (active && event && typeof event === 'object') onEvent(event as { id?: unknown; type?: unknown }); },
+      () => { /* the publisher sees its own rejection */ },
+    );
+    return result;
+  };
+  bus.publish = wrapped;
+  return () => {
+    active = false;
+    if (bus.publish === wrapped) bus.publish = original;
   };
 }

@@ -61,6 +61,38 @@ describe('pipeline live events → MQ (NFR #35)', () => {
     await relay.stop();
   });
 
+  it('queues an event when the bus publish resolves, not after the bus runs its typed handlers (NFR loop 30)', async () => {
+    const mq = fakeMq();
+    let release!: () => void;
+    const slowTypedHandlers = new Promise<void>((r) => { release = r; });
+    const allHandlers: Array<(e: any) => Promise<void>> = [];
+    let n = 0;
+    const bus: any = {
+      subscribeAll: jest.fn((h) => { allHandlers.push(h); return 'sub'; }),
+      unsubscribe: jest.fn(),
+      // Resolves with the built event; delivery to subscribers happens later.
+      async publish(type: string, payload: unknown) {
+        const event = { id: `e${++n}`, type, payload, version: n, timestamp: n, sourceNodeId: 'n' };
+        void slowTypedHandlers.then(() => allHandlers.forEach((h) => h(event)));
+        return event;
+      },
+    };
+    const relay = startPipelineEventMqRelay({ url: 'http://mq:3000', fetchImpl: mq.fetchImpl, eventBus: bus });
+    expect(bus.subscribeAll).not.toHaveBeenCalled();
+    const returned = await bus.publish('pipeline:run:started', { runId: 'r1' });
+    expect(returned).toMatchObject({ id: 'e1' });
+    await bus.publish('pipeline:llm:token', { runId: 'r1' });
+    await bus.publish('pipeline:step:started', { runId: 'r1' });
+    await relay.flush();
+    const sent = () => mq.calls.filter((c) => c.method === 'POST').map((c) => JSON.parse(c.body.message_body).id);
+    expect(sent()).toEqual(['e1', 'e3']); // before the typed handlers were released
+    release();
+    await relay.stop();
+    await bus.publish('pipeline:run:completed', { runId: 'r1' });
+    await relay.flush();
+    expect(sent()).toEqual(['e1', 'e3']); // unwrapped on stop
+  });
+
   it('never throws into the run: failures are counted, and a missing queue is re-ensured', async () => {
     const mq = fakeMq((method, n) => (method === 'POST' && n === 1 ? 404 : 200));
     const relay = startPipelineEventMqRelay({ url: 'http://mq', fetchImpl: mq.fetchImpl });
