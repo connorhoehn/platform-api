@@ -125,8 +125,9 @@ export interface PipelineRunRollup {
   /** recent entries still pending | running | awaiting_approval | paused_at_breakpoint. */
   runningCount: number;
   /**
-   * Distinct runs this row has absorbed. Exact while events arrive in order;
-   * a replay older than the RECENT_LIMIT newest runs may count once more.
+   * Distinct runs this row has absorbed: +1 per run on its durable count
+   * claim (NFR #220); the sweep leader's reconciler corrects it from the run
+   * table when a claim was taken but its write lost (a crash in between).
    */
   runCount: number;
   /** Approval gates still waiting, keyed by (runId, stepId). Absent on rows written before it existed. */
@@ -171,6 +172,15 @@ export interface RunRollupEvent {
   control?: RollupRunControl;
   /** The holder applied (or refused) a control: release it from the row. */
   controlReleased?: { controlId: string };
+  /**
+   * NFR #220: whether this event's run is new to `runCount`, decided by a
+   * durable per-run claim (`new` = this caller took it, `known` = counted
+   * already). Absent: the legacy rule — a run inserted into `recent` counts —
+   * which drifts under concurrency because `recent` holds only RECENT_LIMIT
+   * runs (a late `started` outside the window is never counted; a terminal
+   * for an evicted run counts twice).
+   */
+  count?: 'new' | 'known';
 }
 
 function byStartedAtDesc(a: RollupRecentRun, b: RollupRecentRun): number {
@@ -290,6 +300,15 @@ export function emptyRollup(pipelineId: string, at: string): PipelineRunRollup {
  * caller can skip the write.
  */
 export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRollupEvent): PipelineRunRollup {
+  const next = applyRunEventCore(existing, event);
+  if (event.count !== 'new') return next;
+  // Counted by its claim, whatever else the event did to `recent`.
+  if (next !== existing) return { ...next, runCount: next.runCount + 1 };
+  const base = existing ?? emptyRollup(event.pipelineId, event.at);
+  return { ...base, runCount: base.runCount + 1, updatedAt: plusOneMs(base.updatedAt) };
+}
+
+function applyRunEventCore(existing: PipelineRunRollup | null, event: RunRollupEvent): PipelineRunRollup {
   const base = existing ?? emptyRollup(event.pipelineId, event.at);
   const approvalsBefore = base.approvals ?? [];
   const decisionsBefore = base.decisions ?? [];
@@ -378,7 +397,7 @@ export function applyRunEvent(existing: PipelineRunRollup | null, event: RunRoll
       ...(event.completedAt ? { completedAt: event.completedAt } : TERMINAL.has(status) ? { completedAt: event.at } : {}),
       ...(event.model ? { model: event.model } : {}),
     });
-    runCount += 1;
+    if (event.count === undefined) runCount += 1;
   }
   return touched();
 }

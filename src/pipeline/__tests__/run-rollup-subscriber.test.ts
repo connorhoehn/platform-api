@@ -216,3 +216,60 @@ describe('RunRollupSubscriber', () => {
     expect(getRunRollupSubscriber()).toBeNull();
   });
 });
+
+describe('runCount is counted once per run by a durable claim (NFR #220)', () => {
+  class Claims {
+    held = new Set<string>();
+    async claim(pipelineId: string, runId: string) { const k = `${pipelineId}:${runId}`; if (this.held.has(k)) return false; this.held.add(k); return true; }
+    async release(pipelineId: string, runId: string) { this.held.delete(`${pipelineId}:${runId}`); }
+  }
+  const counted = (table: SharedTable, claims: Claims) => {
+    const bus = new StubBus();
+    const sub = new RunRollupSubscriber({
+      eventBus: bus as unknown as EventBus<PipelineEventMap>,
+      repo: table,
+      lookupPipelineId: async () => 'p',
+      countClaims: claims,
+    });
+    sub.start();
+    return { bus, sub };
+  };
+
+  it('20 runs on two replicas, both seeing every event, late starts and evicted terminals: count 20', async () => {
+    const table = new SharedTable();
+    const claims = new Claims();
+    const a = counted(table, claims);
+    const b = counted(table, claims);
+    const runs = Array.from({ length: 20 }, (_, i) => `run-${String(i).padStart(2, '0')}`);
+    // Terminals first for half the runs (outside the 5-run window by the time
+    // their start lands), then starts in reverse order, then the rest.
+    const events: Array<[keyof PipelineEventMap, Record<string, unknown>]> = [];
+    runs.slice(10).forEach((runId, i) => events.push(['pipeline:run:started', { runId, pipelineId: 'p', at: t(20 + i) }]));
+    runs.slice(0, 10).forEach((runId, i) => events.push(['pipeline:run:completed', { runId, status: 'completed', at: t(40 + i) }]));
+    [...runs].reverse().forEach((runId, i) => events.push(['pipeline:run:started', { runId, pipelineId: 'p', at: t(i) }]));
+    runs.forEach((runId, i) => events.push(['pipeline:run:completed', { runId, status: 'completed', at: t(50 + (i % 9)) }]));
+    await Promise.all(events.flatMap(([name, payload], i) => [
+      a.bus.emit(name, payload, `e-${i}`),
+      b.bus.emit(name, payload, `e-${i}`),
+    ]));
+    await a.sub.idle(); await b.sub.idle();
+    expect(table.rows.get('p')?.runCount).toBe(20);
+    expect(a.sub.stats.counted + b.sub.stats.counted).toBe(20);
+  });
+
+  it('gives the claim back when the write is lost, so the next copy counts it', async () => {
+    const table = new SharedTable();
+    const claims = new Claims();
+    const { bus, sub } = counted(table, claims);
+    const put = table.putIfUnchanged.bind(table);
+    let fail = true;
+    table.putIfUnchanged = async (next, seen) => { if (fail) throw new Error('throttled'); return put(next, seen); };
+    await bus.emit('pipeline:run:started', { runId: 'r1', pipelineId: 'p', at: t(1) }, 'e1');
+    await sub.idle();
+    expect(claims.held.size).toBe(0);
+    fail = false;
+    await bus.emit('pipeline:run:completed', { runId: 'r1', status: 'completed', at: t(2) }, 'e2');
+    await sub.idle();
+    expect(table.rows.get('p')?.runCount).toBe(1);
+  });
+});

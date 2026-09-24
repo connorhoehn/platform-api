@@ -48,12 +48,18 @@ import {
 } from '../repositories/PipelineRunRollupRepository';
 import { applyRunEvent, type PipelineRunRollup, type RollupRunStatus, type RunRollupEvent } from './run-rollup';
 import { runOverridesFrom } from './runOverrides';
+import { DynamoClaimStore, type ClaimStore } from '../deck/deckReviseRequests';
 
 const log = withContext({ service: 'run-rollup-subscriber' });
 
 const MAX_RUN_INDEX = 10_000;
 const MAX_SEEN_EVENTS = 10_000;
-const CAS_ATTEMPTS = 4;
+const CAS_ATTEMPTS = 8;
+/** NFR #220: jittered waits between CAS attempts (ms ×0.5–1.5): four back-to-back re-reads lost to a 20-run burst. */
+const CAS_BACKOFF_MS = [0, 10, 20, 40, 80, 120, 160, 200];
+/** A run's count claim outlives any event its run can still produce (resumes included). */
+const COUNT_CLAIM_TTL_SECONDS = 30 * 24 * 60 * 60;
+const MAX_COUNTED_RUNS = 10_000;
 const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
 const RUN_ID_INDEX = 'runId-index';
 
@@ -66,7 +72,32 @@ export interface RunRollupSubscriberOptions {
   repo?: RollupStore;
   /** Resolves a run the process never saw start. Default: the `runId-index` GSI. */
   lookupPipelineId?: (runId: string) => Promise<string | null>;
+  /**
+   * NFR #220: the durable once-per-run claim behind `runCount`. Absent (unit
+   * tests of the merge): the legacy insert-into-`recent` rule.
+   */
+  countClaims?: RunCountClaims;
 }
+
+/** Once per (pipeline, run), across replicas and restarts. */
+export interface RunCountClaims {
+  /** True when this caller took the claim (the run is new to the count). */
+  claim(pipelineId: string, runId: string): Promise<boolean>;
+  /** Give it back after the count write was lost, so the next copy counts it. */
+  release(pipelineId: string, runId: string): Promise<void>;
+}
+
+/** The #97 claims table: `rollup-run-count:<pipelineId>:<runId>`, conditional put, 30-day TTL. */
+export function dynamoRunCountClaims(store: ClaimStore = new DynamoClaimStore(undefined, undefined, tableName('idempotency-claims'))): RunCountClaims {
+  const key = (pipelineId: string, runId: string) => `rollup-run-count:${pipelineId}:${runId}`;
+  return {
+    // Held as 'pending' for its whole life so `release` (pending-only) can undo it.
+    claim: (pipelineId, runId) => store.create(key(pipelineId, runId), 'pending', COUNT_CLAIM_TTL_SECONDS),
+    release: (pipelineId, runId) => store.release(key(pipelineId, runId)),
+  };
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 interface BusEventLike<T> { id?: string; payload: T }
 
@@ -97,16 +128,20 @@ export class RunRollupSubscriber {
   private readonly runIndex = new Map<string, { pipelineId: string; startedAt: string }>();
   private readonly seen = new Set<string>();
   private readonly lanes = new Map<string, Promise<void>>();
+  private readonly countClaims: RunCountClaims | null;
+  /** Runs this process has seen claimed (by anyone): no claim call for their later events. */
+  private readonly countedRuns = new Set<string>();
   private inFlight: Promise<void>[] = [];
   private subscriptionIds: string[] = [];
   private active = false;
   /** Counters a test or a health line can read. */
-  readonly stats = { applied: 0, unchanged: 0, duplicates: 0, unresolved: 0, conflicts: 0, errors: 0 };
+  readonly stats = { applied: 0, unchanged: 0, duplicates: 0, unresolved: 0, conflicts: 0, errors: 0, counted: 0, countReleased: 0 };
 
   constructor(options: RunRollupSubscriberOptions) {
     this.eventBus = options.eventBus;
     this.repo = options.repo ?? pipelineRunRollupRepo;
     this.lookup = options.lookupPipelineId ?? ((runId) => lookupPipelineIdByRunId(runId));
+    this.countClaims = options.countClaims ?? null;
   }
 
   /** Idempotent. */
@@ -256,17 +291,57 @@ export class RunRollupSubscriber {
    */
   async applyResolved(event: RunRollupEvent): Promise<PipelineRunRollup | null> {
     this.indexRun(event.runId, event.pipelineId, event.startedAt ?? event.at);
+    const counted = await this.countFor(event);
+    const merged: RunRollupEvent = counted ? { ...event, count: counted } : event;
     const prev = this.lanes.get(event.pipelineId) ?? Promise.resolve();
     let result: PipelineRunRollup | null = null;
-    const next = prev.then(async () => { result = await this.merge(event); }, async () => { result = await this.merge(event); });
+    const next = prev.then(async () => { result = await this.merge(merged); }, async () => { result = await this.merge(merged); });
     this.lanes.set(event.pipelineId, next);
-    await next;
-    if (this.lanes.get(event.pipelineId) === next) this.lanes.delete(event.pipelineId);
+    try {
+      await next;
+    } catch (err) {
+      if (counted === 'new') await this.releaseCount(event);
+      throw err;
+    } finally {
+      if (this.lanes.get(event.pipelineId) === next) this.lanes.delete(event.pipelineId);
+    }
     return result;
+  }
+
+  /**
+   * NFR #220: is this run new to the row's count? One conditional put per run
+   * (per process: later events of a run it has seen skip the call). Decision
+   * and control records are not run lifecycle and never count.
+   */
+  private async countFor(event: RunRollupEvent): Promise<'new' | 'known' | undefined> {
+    if (!this.countClaims || event.decision || event.control || event.controlReleased) return undefined;
+    const key = `${event.pipelineId}\u0000${event.runId}`;
+    if (this.countedRuns.has(key)) return 'known';
+    const took = await this.countClaims.claim(event.pipelineId, event.runId);
+    if (this.countedRuns.size >= MAX_COUNTED_RUNS) {
+      const oldest = this.countedRuns.values().next().value as string | undefined;
+      if (oldest !== undefined) this.countedRuns.delete(oldest);
+    }
+    this.countedRuns.add(key);
+    if (took) this.stats.counted += 1;
+    return took ? 'new' : 'known';
+  }
+
+  private async releaseCount(event: RunRollupEvent): Promise<void> {
+    this.countedRuns.delete(`${event.pipelineId}\u0000${event.runId}`);
+    try {
+      await this.countClaims?.release(event.pipelineId, event.runId);
+      this.stats.countReleased += 1;
+    } catch (err) {
+      // The reconciler corrects the row from the run table (NFR #220).
+      log.warn({ pipelineId: event.pipelineId, runId: event.runId, err: String(err) }, 'run count claim not released');
+    }
   }
 
   private async merge(event: RunRollupEvent): Promise<PipelineRunRollup | null> {
     for (let attempt = 1; attempt <= CAS_ATTEMPTS; attempt++) {
+      const wait = CAS_BACKOFF_MS[attempt - 1] ?? 0;
+      if (wait > 0) await sleep(Math.round(wait * (0.5 + Math.random())));
       const seen = await this.repo.get(event.pipelineId);
       const next = applyRunEvent(seen, event);
       if (next === seen) { this.stats.unchanged += 1; return seen; }
@@ -302,7 +377,7 @@ export function startRunRollupSubscriber(options: RunRollupSubscriberOptions): R
   const enabled = (process.env.PIPELINE_RUN_ROLLUP_ENABLED ?? 'true').trim().toLowerCase() !== 'false';
   if (!enabled) { log.info('run rollup subscriber DISABLED via PIPELINE_RUN_ROLLUP_ENABLED=false'); return null; }
   if (options.enabled === false) { log.info('run rollup subscriber DISABLED: no run table wired'); return null; }
-  const subscriber = new RunRollupSubscriber(options);
+  const subscriber = new RunRollupSubscriber({ ...options, countClaims: options.countClaims ?? dynamoRunCountClaims() });
   subscriber.start();
   current = subscriber;
   log.info('run rollup subscriber ENABLED');

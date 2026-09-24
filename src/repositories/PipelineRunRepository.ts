@@ -507,6 +507,29 @@ export class PipelineRunRepository extends BaseRepository {
     return total;
   }
 
+  /**
+   * NFR #220: runs of a pipeline started at or before `cutoff` (ISO) — the
+   * rollup reconciler's source count. A row without startedAt counts (it is
+   * older than any field that could exclude it).
+   */
+  async countByPipelineStartedBy(pipelineId: string, cutoff: string): Promise<number> {
+    let total = 0;
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const page = await this.docClient.send(new QueryCommand({
+        TableName: this.tableName,
+        KeyConditionExpression: 'pipelineId = :pipelineId',
+        FilterExpression: 'attribute_not_exists(startedAt) OR startedAt <= :cutoff',
+        ExpressionAttributeValues: { ':pipelineId': pipelineId, ':cutoff': cutoff },
+        Select: 'COUNT',
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      }));
+      total += page.Count ?? 0;
+      exclusiveStartKey = page.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    return total;
+  }
+
   /** Query the status-startedAt GSI. Most recent first. */
   async listByStatus(
     status: string,

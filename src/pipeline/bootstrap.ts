@@ -81,6 +81,8 @@ import type { DeadLetterQueue, Envelope } from 'distributed-core/messaging-queue
 import { createLLMClient } from './factories/LLMClientFactory';
 import { ExecutorAuditSubscriber } from './executor-audit-subscriber';
 import { startRunRollupSubscriber } from './run-rollup-subscriber';
+import { reconcileRunCounts } from './run-rollup-reconciler';
+import { pipelineRunRollupRepo } from '../repositories/PipelineRunRollupRepository';
 import { startRunRowCacheInvalidation } from '../work-graph/sources/runRowCache';
 import { startCommentAgentResolver } from '../documents/commentAgentResolver';
 import { startApprovalForwarder } from './approval-forwarder';
@@ -1298,6 +1300,18 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     } catch (err) {
       bootstrapLog.warn({ err: String(err) }, 'deck blob sweep not scheduled');
     }
+  }
+
+  // NFR #220: the rollup's runCount, corrected from the run table on the sweep leader.
+  if (opts.pipelineRunRepository && (process.env.PIPELINE_RUN_ROLLUP_ENABLED ?? 'true').trim().toLowerCase() !== 'false') {
+    const runRepoForCounts = opts.pipelineRunRepository;
+    clusterSweepTasks.push({ name: 'rollup-run-count-reconcile', run: async () => {
+      const out = await reconcileRunCounts({
+        repo: pipelineRunRollupRepo,
+        countRuns: (pipelineId, cutoff) => runRepoForCounts.countByPipelineStartedBy(pipelineId, cutoff),
+      });
+      if (out.corrected.length > 0 || out.lost > 0) bootstrapLog.info({ ...out }, 'rollup run counts reconciled');
+    } });
   }
 
   // NFR #26: one replica sweeps, every interval, cluster-wide.

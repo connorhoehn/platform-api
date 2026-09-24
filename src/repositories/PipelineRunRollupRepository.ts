@@ -132,6 +132,25 @@ export class PipelineRunRollupRepository {
    * (NFR #115). One row per pipeline, so a filtered Scan is the whole table
    * once and small; paged to the end.
    */
+  /** NFR #220: every row (one per pipeline, so small), for the count reconciler. Paged to the end. */
+  async listAll(): Promise<PipelineRunRollup[]> {
+    await this.tableReady();
+    const rows: PipelineRunRollup[] = [];
+    let startKey: Record<string, unknown> | undefined;
+    do {
+      const out = await this.client.send(new ScanCommand({
+        TableName: this.table,
+        ConsistentRead: true,
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      }));
+      for (const row of (out.Items ?? []) as PipelineRunRollup[]) {
+        if (typeof row.pipelineId === 'string') rows.push(row);
+      }
+      startKey = out.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (startKey);
+    return rows;
+  }
+
   async listWithOpenApprovals(): Promise<PipelineRunRollup[]> {
     await this.tableReady();
     const rows: PipelineRunRollup[] = [];
