@@ -1,4 +1,5 @@
 import { withBuildMemo } from './buildMemo';
+import { parsePipelineStepResourceId } from './sources/mapPipeline';
 import type {
   WorkProjectionState,
   WorkSourceKind,
@@ -371,6 +372,51 @@ export function narrowToDecks(projection: WorkProjectionState, deckIds: Readonly
 }
 
 /**
+ * The part of a day one action authorizes (realtime-examples NFR #215): the
+ * target itself — a node, or an edge and its two ends — plus exactly what a
+ * grant derives it from (`derivedNodeIds` in policy.ts): every step of the
+ * same run, and the documents the kept nodes edited or produced, with the
+ * edges among them. A pane open asked the source ACLs about every node of the
+ * day (a whole graph build per open); it now asks about these few. Each
+ * target's decision depends only on its own grants and its own source
+ * answers, so this can drop a node but never allow one the full pass refuses.
+ */
+export function narrowToTarget(
+  projection: WorkProjectionState,
+  target: { kind: 'node' | 'edge'; id: string },
+): WorkProjectionState {
+  const keep = new Set<string>();
+  if (target.kind === 'edge') {
+    const edge = projection.edges[target.id];
+    if (edge) { keep.add(edge.fromId); keep.add(edge.toId); }
+  } else if (projection.nodes[target.id]) {
+    keep.add(target.id);
+  }
+  const runOf = (id: string): string | undefined => {
+    const node = projection.nodes[id];
+    return node && node.kind === 'run' && node.sourceRef.source === 'pipeline'
+      ? parsePipelineStepResourceId(node.sourceRef.resourceId).runId
+      : undefined;
+  };
+  const runs = new Set([...keep].map(runOf).filter((id): id is string => !!id));
+  if (runs.size) {
+    for (const id of Object.keys(projection.nodes)) {
+      const run = runOf(id);
+      if (run && runs.has(run)) keep.add(id);
+    }
+  }
+  for (const edge of Object.values(projection.edges)) {
+    if (!edge.deletedAt && (edge.relation === 'edited' || edge.relation === 'produced') && keep.has(edge.fromId)) keep.add(edge.toId);
+  }
+  return {
+    ...projection,
+    nodes: Object.fromEntries(Object.entries(projection.nodes).filter(([id]) => keep.has(id))),
+    edges: Object.fromEntries(Object.entries(projection.edges)
+      .filter(([, edge]) => keep.has(edge.fromId) && keep.has(edge.toId))),
+  };
+}
+
+/**
  * A reader that answers a repeated call from the first one's promise. Scoped
  * to one request: it caches nothing across viewers or across time.
  */
@@ -402,6 +448,9 @@ function memoizedReader(reader: WorkActivityReader): WorkActivityReader {
     transcript: (transcriptId) => once(key('transcript', [transcriptId]), () => reader.transcript(transcriptId)),
     meeting: (meetingId) => once(key('meeting', [meetingId]), () => reader.meeting(meetingId)),
     attention: (documentId) => once(key('attention', [documentId]), () => reader.attention(documentId)),
+    ...(reader.excerpt
+      ? { excerpt: (documentId: string, title?: string) => once(key('excerpt', [documentId, title ?? null]), () => reader.excerpt!(documentId, title)) }
+      : {}),
   };
 }
 
@@ -1296,15 +1345,20 @@ export class WorkGraphOrchestrator {
     const now = this.deps.now();
     const located = await this.deps.locator.locate(viewer.organizationId, input.target);
     if (!located) throw unavailable();
-    const { snapshot, authorization } = await this.getGraph(
-      viewer,
-      located.personId,
-      located.day,
-      located.timezone,
-    );
+    // NFR #215: the day's authorization pass narrowed to this target (and
+    // what a grant derives it from), not a whole graph build per action —
+    // the same grants, adapters and `filterForViewer` decide it.
+    const [member, { authorization, sourceScope }] = await Promise.all([
+      this.deps.directory.personBelongsToOrganization(viewer.organizationId, located.personId),
+      this.authorizeDay(
+        viewer, located.personId, located.day, located.timezone, now,
+        (projection) => narrowToTarget(projection, input.target),
+      ),
+    ]);
+    if (!member) throw unavailable();
     const projected = input.target.kind === 'node'
-      ? snapshot.nodes.find((item) => item.id === input.target.id)
-      : snapshot.edges.find((item) => item.id === input.target.id);
+      ? authorization.nodes.find((item) => item.id === input.target.id)
+      : authorization.edges.find((item) => item.id === input.target.id);
     if (!projected?.capabilities.includes(input.capability)) {
       // Action denial is intentionally indistinguishable from a missing or
       // revoked target; unlike a request composer, this exchanges live access.
@@ -1313,12 +1367,8 @@ export class WorkGraphOrchestrator {
     const target = authorization.targets.get(input.target.id);
     if (!target) throw unavailable();
     const scope: WorkGraphPolicyScope = {
-      organizationId: viewer.organizationId,
-      viewerId: viewer.viewerId,
-      personId: located.personId,
-      day: located.day,
-      timezone: located.timezone,
-      policyRevision: snapshot.scope.policyRevision,
+      ...sourceScope,
+      policyRevision: workGraphAuthorizationRevision(sourceScope.policyRevision, authorization),
     };
     const capabilityDecision = await authorizeWorkCapability(
       scope,

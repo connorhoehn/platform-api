@@ -81,6 +81,7 @@ import type { DeadLetterQueue, Envelope } from 'distributed-core/messaging-queue
 import { createLLMClient } from './factories/LLMClientFactory';
 import { ExecutorAuditSubscriber } from './executor-audit-subscriber';
 import { startRunRollupSubscriber } from './run-rollup-subscriber';
+import { startRunRowCacheInvalidation } from '../work-graph/sources/runRowCache';
 import { startCommentAgentResolver } from '../documents/commentAgentResolver';
 import { startApprovalForwarder } from './approval-forwarder';
 import { startRunControlForwarder } from './run-control-forwarder';
@@ -1407,6 +1408,8 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   }
   // The pipelines page's last-run rollup, fed by the same lifecycle events (run-rollup-subscriber.ts).
   const runRollupSubscriber = startRunRollupSubscriber({ eventBus, enabled: opts.pipelineRunRepository !== undefined });
+  // The work graph's settled-run row cache (NFR #16, Loop 32): a lifecycle move holds the run's key.
+  startRunRowCacheInvalidation(eventBus as unknown as Parameters<typeof startRunRowCacheInvalidation>[0], ddbTableName('pipeline-runs'));
   // WS-J lane B: a comment handed to the agent gets its reply (and resolve) from the run's terminal event.
   startCommentAgentResolver({ eventBus });
   // NFR #115: an approval decision taken on a replica that does not own the

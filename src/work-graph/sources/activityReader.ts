@@ -37,6 +37,7 @@ import type {
 } from '../activity';
 import { parsePipelineStepResourceId } from './mapPipeline';
 import { runRowLocator } from './runRowLocator';
+import { readDocumentExcerpt } from './documentExcerpt';
 import { recordingLocator } from './recordingLocator';
 
 const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
@@ -727,6 +728,11 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
       recorded: typeof row.recordingId === 'string' && row.recordingId.length > 0,
       transcriptAvailable: row.transcriptStatus === 'ready',
     };
+  }
+
+  /** A page's opening words from its newest saved Y.Doc (NFR #209); null for anything else. */
+  excerpt(documentId: string, title?: string): Promise<string | null> {
+    return readDocumentExcerpt(this.client, documentId, title).catch(() => null);
   }
 
   async attention(documentId: string): Promise<DocumentAttentionFacts | null> {

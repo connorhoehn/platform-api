@@ -244,12 +244,18 @@ export interface WorkActivityReader {
   meeting(meetingId: string): Promise<MeetingFacts | null>;
   /** Authoritative human attention, with its own expiry. Never a socket. */
   attention(documentId: string): Promise<DocumentAttentionFacts | null>;
+  /**
+   * A page document's opening words (NFR #209), read only for a document the
+   * viewer may open. Optional: a reader without it gives no excerpt.
+   */
+  excerpt?(documentId: string, title?: string): Promise<string | null>;
 }
 
 /** A document's own record and its attention state, read once per build. */
 type DocumentFacts = [
   Awaited<ReturnType<WorkActivityReader['artifact']>>,
   Awaited<ReturnType<WorkActivityReader['attention']>>,
+  string | null,
 ];
 
 export interface BuildWorkActivityInput {
@@ -843,7 +849,7 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
     if (node.kind === 'document') {
       const documentId = stored?.sourceRef.resourceId;
       // Read, and the stored name applied, before any node was described.
-      const [facts, attention] = (documentId ? documentFacts.get(documentId) : undefined) ?? [null, null];
+      const [facts, attention, excerpt] = (documentId ? documentFacts.get(documentId) : undefined) ?? [null, null, null];
       const run = producingRun(index, node.id);
       // What each revision is actually made of, as its own source recorded it.
       // A revision the source has no record of keeps whatever the projected
@@ -912,7 +918,10 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
         const label = [trim(facts?.name) ?? node.title, newestRevision?.label, clock(newestRevision?.createdAt, query.timezone)]
           .filter((part): part is string => !!part)
           .join(' · ');
-        if (label) setDetail(node.id, { lines: [label] });
+        // What it says, for a viewer who may open it (NFR #209): the pane
+        // showed only this status line at every size and theme.
+        const opening = facts?.mediaKind === 'document' && node.capabilities.includes('view-document') ? trim(excerpt ?? undefined) : undefined;
+        if (label || opening) setDetail(node.id, { ...(label ? { lines: [label] } : {}), ...(opening ? { excerpt: opening } : {}) });
         return;
       }
       if (revisions.length === 0 && !facts) return;
@@ -1019,7 +1028,12 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
   for (const node of ordered) {
     const documentId = node.kind === 'document' ? storedNode(authorization, node.id)?.sourceRef.resourceId : undefined;
     if (documentId && !documentReads.has(documentId)) {
-      documentReads.set(documentId, Promise.all([reader.artifact(documentId), reader.attention(documentId)]));
+      // The excerpt only for a node the viewer may open, and only for the
+      // title the viewer is shown (its heading is not repeated as the excerpt).
+      const opening = reader.excerpt && node.disclosure === 'details' && !node.locked && node.capabilities.includes('view-document')
+        ? reader.excerpt(documentId, node.title).catch(() => null)
+        : Promise.resolve(null);
+      documentReads.set(documentId, Promise.all([reader.artifact(documentId), reader.attention(documentId), opening]));
     }
   }
   const documentFacts = new Map(await Promise.all(

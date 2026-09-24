@@ -19,6 +19,7 @@ import { BatchGetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient
 import log from '../../lib/logger';
 import { buildMemoActive, fullReadsRequested, memoHas, memoOnce } from '../buildMemo';
 import { runKeyStore, type RunKeyStore } from './runKeyMap';
+import { runRowCache, type RunRowCache } from './runRowCache';
 
 const memoKey = (table: string, runId: string): string => `run-row\u0000${table}\u0000${runId}`;
 
@@ -62,6 +63,18 @@ const GRAPH_RUN_PROJECTION = {
     '#ck': 'checkpoint', '#ctx': 'context', '#plan': 'plan',
   },
 };
+/**
+ * A row cut to what `GRAPH_RUN_PROJECTION` reads, whichever path read it (an
+ * index or Scan answer is a whole row): the row cache keeps exactly the
+ * projected shape a keyed build read would have seen.
+ */
+export function projectGraphRunRow(row: Row): Row {
+  const out: Row = {};
+  for (const name of GRAPH_RUN_ATTRIBUTES) if (row[name] !== undefined) out[name] = row[name];
+  const plan = ((row.checkpoint as Row | undefined)?.context as Row | undefined)?.plan;
+  if (plan !== undefined) out.checkpoint = { context: { plan } };
+  return out;
+}
 /** Rounds of `UnprocessedKeys` retried before those runs go back to the index. */
 const BATCH_GET_RETRIES = 4;
 
@@ -85,6 +98,7 @@ export class RunRowLocator {
   constructor(
     private readonly now: () => number = Date.now,
     private readonly keys: RunKeyStore | null = null,
+    private readonly rowCache: RunRowCache | null = null,
   ) {}
 
   /** For tests and logs: is this table currently served by the index? */
@@ -122,6 +136,30 @@ export class RunRowLocator {
     table: string,
     wanted: string[],
     projected = false,
+  ): Promise<Map<string, Row | null>> {
+    // A graph build's projected read (never the full-read drift check) takes
+    // settled runs from the shared row cache (`runRowCache`); only live or
+    // just-finished runs, and misses, go on to DynamoDB — whose settled
+    // answers are then kept for the next build on any replica.
+    const cached = projected && this.rowCache
+      ? await this.rowCache.get(table, wanted).catch(() => new Map<string, Row>())
+      : new Map<string, Row>();
+    const rest = wanted.filter((id) => !cached.has(id));
+    const found = new Map<string, Row | null>(cached);
+    if (!rest.length) return found;
+    const read = await this.readUncached(client, table, rest, projected);
+    for (const [runId, row] of read) found.set(runId, row);
+    if (projected && this.rowCache) {
+      void this.rowCache.fill(table, [...read.values()].filter((row): row is Row => !!row).map(projectGraphRunRow));
+    }
+    return found;
+  }
+
+  private async readUncached(
+    client: DynamoDBDocumentClient,
+    table: string,
+    wanted: string[],
+    projected: boolean,
   ): Promise<Map<string, Row | null>> {
     if (!this.keys || !this.usesIndex(table)) return this.readUnkeyed(client, table, wanted);
     const known = await this.keys.get(table, wanted).catch(() => new Map<string, string>());
@@ -272,4 +310,4 @@ function isIndexRow(item: Row): boolean {
  * One per process: it holds no rows, only whether each table has the index;
  * run keys live in the shared cache Redis (`runKeyMap`).
  */
-export const runRowLocator = new RunRowLocator(Date.now, runKeyStore);
+export const runRowLocator = new RunRowLocator(Date.now, runKeyStore, runRowCache);

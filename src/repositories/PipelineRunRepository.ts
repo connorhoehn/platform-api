@@ -6,6 +6,7 @@
 
 import { DynamoDBDocumentClient, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { runKeyStore } from '../work-graph/sources/runKeyMap';
+import { runRowCache } from '../work-graph/sources/runRowCache';
 import type { PipelineRunStatus, PipelineStepStatus } from '@connorhoehn/pipeline-runtime';
 import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { BaseRepository } from './BaseRepository';
@@ -382,7 +383,11 @@ export class PipelineRunRepository extends BaseRepository {
         ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
         : item;
     const guard = terminalGuard(item);
-    if (!guard) return this.putItem(stamped as unknown as Record<string, unknown>);
+    if (!guard) {
+      await this.putItem(stamped as unknown as Record<string, unknown>);
+      await this.holdRow(item);
+      return;
+    }
     try {
       await this.docClient.send(new PutCommand({
         TableName: this.tableName,
@@ -390,6 +395,7 @@ export class PipelineRunRepository extends BaseRepository {
         ConditionExpression: guard.expression,
         ExpressionAttributeValues: guard.values,
       }));
+      await this.holdRow(item);
     } catch (err) {
       // A later terminal write already landed; this older progress write is
       // dropped rather than turning a finished run back into a running one.
@@ -423,6 +429,7 @@ export class PipelineRunRepository extends BaseRepository {
         ConditionExpression: guard ? `(${ownership}) AND (${guard.expression})` : ownership,
         ExpressionAttributeValues: { ':owner': ownerNodeId, ...(guard?.values ?? {}) },
       }));
+      await this.holdRow(item);
       return true;
     } catch (err) {
       if ((err as { name?: string })?.name !== 'ConditionalCheckFailedException') throw err;
@@ -441,6 +448,19 @@ export class PipelineRunRepository extends BaseRepository {
    * different pipeline drops that memory. Fire-and-forget: never delays or
    * fails the write. An agent loop's person-day pointer row is not a run.
    */
+  /**
+   * The work graph keeps settled run rows in the shared cache
+   * (`work-graph/sources/runRowCache`); a write that can change one (a
+   * terminal row rewritten, a resume, a verdict, a delete) holds its key
+   * AFTER the write lands. A progress write of a live run changes nothing
+   * kept there — live runs are never cached — so it costs nothing.
+   */
+  private async holdRow(item: { pipelineId?: unknown; runId?: unknown; status?: unknown }, always = false): Promise<void> {
+    if (typeof item.runId !== 'string' || item.status === 'index') return;
+    if (!always && !isTerminalRunStatus(item.status as never)) return;
+    await runRowCache.hold(this.tableName, [item.runId]);
+  }
+
   private noteRunKey(item: PipelineRunItem): void {
     if ((item as { status?: unknown }).status === 'index') return;
     void runKeyStore.noteWrite(this.tableName, item.pipelineId, item.runId);
@@ -520,7 +540,8 @@ export class PipelineRunRepository extends BaseRepository {
 
   /** Remove a run. */
   async delete(pipelineId: string, runId: string): Promise<void> {
-    return this.deleteItem({ pipelineId, runId });
+    await this.deleteItem({ pipelineId, runId });
+    await this.holdRow({ pipelineId, runId }, true);
   }
 
   /**
@@ -560,6 +581,7 @@ export class PipelineRunRepository extends BaseRepository {
         },
         ReturnValues: 'ALL_NEW',
       });
+      await this.holdRow({ pipelineId, runId }, true);
       return (attributes as unknown as PipelineRunItem) ?? null;
     } catch (err) {
       if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
@@ -608,6 +630,7 @@ export class PipelineRunRepository extends BaseRepository {
         ConditionExpression: 'attribute_exists(runId) AND (attribute_not_exists(review) OR review.decision = :decision)',
         ExpressionAttributeValues: { ':review': review, ':decision': review.decision },
       });
+      await this.holdRow({ pipelineId, runId }, true);
       return true;
     } catch (err) {
       if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;

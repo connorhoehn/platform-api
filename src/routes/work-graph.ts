@@ -1,3 +1,4 @@
+import { runRowCacheCounters } from '../work-graph/sources/runRowCache';
 import { countDynamoCalls } from '../lib/aws-clients';
 import { createHash } from 'crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
@@ -374,6 +375,7 @@ export function createWorkGraphRouter(
     if (activity) {
       const started = Date.now();
       const phases: Record<string, number> = {};
+      const rowCacheBefore = { ...runRowCacheCounters };
       // `x-graph-full-read: 1` builds from whole rows (NFR #157's drift check).
       const build = () => orchestrator.getGraphV2(
         viewer, query.personId, query.day, query.timezone, activity, query.cursor, phases,
@@ -389,6 +391,9 @@ export function createWorkGraphRouter(
         `build;dur=${Date.now() - started}`,
         ...(Object.keys(phases).length ? [serverTiming(phases)] : []),
         `ddb;desc="calls=${reads} scans=${scans}"`,
+        // Settled run rows served from the shared cache vs read (Loop 32);
+        // process-wide counters, so exact only when builds do not overlap.
+        `runrow;desc="hits=${runRowCacheCounters.hits - rowCacheBefore.hits} misses=${runRowCacheCounters.misses - rowCacheBefore.misses}"`,
       ].join(', '));
       if (req.get('x-ddb-tally') === '1') res.setHeader('x-ddb-tally', [...tally.entries()].map(([k, n]) => `${k}=${n}`).join(' '));
       // NFR #85: only a reader that asked (it can seed its stream from this
