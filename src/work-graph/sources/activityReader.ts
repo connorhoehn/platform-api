@@ -21,7 +21,7 @@ import {
   type StoredSlide,
 } from '../../deck/presentationDocuments';
 import { SVG_CONTENT_TYPE } from '../../deck/renderSlideSvg';
-import { mergeRevisions, queryAllRevisionItems } from '../../deck/presentationRevisionItems';
+import { mergeRevisions, queryRevisionPage, revKey, versionOf } from '../../deck/presentationRevisionItems';
 import type { AssetBlobStore } from '../../pipeline/image/ImageBlobStore';
 import { getAssetBlobStore } from '../../pipeline/image/visionServices';
 import type {
@@ -65,6 +65,8 @@ function isInertSvg(markup: string): boolean {
 }
 const ERROR_SUMMARY_LENGTH = 160;
 const MAX_REVISIONS = 100;
+/** A deck's newest revisions in its activity detail (NFR #207); older ones page in the pane. */
+export const ACTIVITY_DECK_REVISIONS = 10;
 const MAX_SLIDES_PER_REVISION = 200;
 const MAX_SOURCES_PER_REVISION = 16;
 
@@ -545,12 +547,22 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
     // it back in place so each revision still names its own slides.
     // NFR #188: a row whose revisions are items (`revisionCount` set) gets
     // them back from `presentation-revisions`, merged with any array left.
+    // NFR #207: only the newest page — one Query of `ACTIVITY_DECK_REVISIONS`
+    // items and that many manifests, not every revision the deck ever had on
+    // every graph build. A reader who can open the deck pages older ones in
+    // the pane through the document's own revision routes.
     const [comments, hydrated] = await Promise.all([counted, Promise.resolve()
       .then(async () => {
         const base = row as unknown as PresentationDocumentRow;
-        if (typeof base.revisionCount !== 'number') return base;
-        const items = await queryAllRevisionItems(this.client, documentId);
-        return { ...base, revisions: mergeRevisions(base.revisions, items) };
+        if (typeof base.revisionCount !== 'number') {
+          return { ...base, revisions: base.revisions?.slice(-ACTIVITY_DECK_REVISIONS) };
+        }
+        const page = await queryRevisionPage(this.client, documentId, { limit: ACTIVITY_DECK_REVISIONS });
+        const items = page.revisions.flatMap((revision) => {
+          const version = versionOf(revision.id);
+          return version === null ? [] : [{ documentId, rev: revKey(version), version, revision }];
+        });
+        return { ...base, revisions: mergeRevisions(base.revisions, items).slice(-ACTIVITY_DECK_REVISIONS) };
       })
       .then((full) => withRevisionSlides((this.deps.presentations ?? getPresentationDocumentStore)(), full))
       .catch(() => row as unknown as PresentationDocumentRow)]);

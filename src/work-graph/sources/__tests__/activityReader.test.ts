@@ -14,7 +14,8 @@ function runIndexItems(command: unknown, rows: Array<Record<string, unknown>>): 
 }
 import { InMemoryImageBlobStore } from '../../../pipeline/image/ImageBlobStore';
 import type { PresentationDocumentRow, StoredSlide } from '../../../deck/presentationDocuments';
-import { DynamoWorkActivityReader, stepLabelsOf, triggerStepIds } from '../activityReader';
+import { ACTIVITY_DECK_REVISIONS, DynamoWorkActivityReader, stepLabelsOf, triggerStepIds } from '../activityReader';
+import { PRESENTATION_REVISIONS_TABLE, revKey } from '../../../deck/presentationRevisionItems';
 
 type Row = Record<string, unknown>;
 
@@ -178,7 +179,7 @@ describe('an older revision whose slide list moved to a manifest (NFR #36)', () 
 });
 
 describe('a deck with many revisions whose older lists moved off the row', () => {
-  it('names all 25 revisions, the older 24 from their manifests, in order', async () => {
+  it('names the newest page of revisions, older ones from their manifests, in order (NFR #207)', async () => {
     const blobs = new InMemoryImageBlobStore();
     const revisions: Row[] = [];
     for (let index = 1; index <= 25; index += 1) {
@@ -202,10 +203,10 @@ describe('a deck with many revisions whose older lists moved off the row', () =>
       blobs: () => blobs,
     });
     const facts = await reader.artifact('doc-deck');
-    expect(facts?.revisions?.map((revision) => revision.id)).toEqual(Array.from({ length: 25 }, (_, i) => `v${i + 1}`));
+    expect(facts?.revisions?.map((revision) => revision.id)).toEqual(Array.from({ length: ACTIVITY_DECK_REVISIONS }, (_, i) => `v${i + 26 - ACTIVITY_DECK_REVISIONS}`));
     expect(facts?.revisions?.every((revision) => revision.slides.length === 2)).toBe(true);
-    expect(facts?.revisions?.[0]?.slides[0]?.title).toBe('Cover r1');
-    expect(facts?.revisions?.[24]?.slides[0]?.title).toBe('Cover r25');
+    expect(facts?.revisions?.[0]?.slides[0]?.title).toBe(`Cover r${26 - ACTIVITY_DECK_REVISIONS}`);
+    expect(facts?.revisions?.[ACTIVITY_DECK_REVISIONS - 1]?.slides[0]?.title).toBe('Cover r25');
   });
 });
 
@@ -605,5 +606,42 @@ describe('stepLabelsOf — a run lists its steps by the names its plan gave them
     expect(ids.has('trigger')).toBe(true);
     expect(ids.has('load')).toBe(false);
     expect(triggerStepIds({ nodes: [{ id: 'kickoff', data: { type: 'trigger' } }] }).has('kickoff')).toBe(true);
+  });
+});
+
+describe('a deck with many revision items (NFR #207)', () => {
+  it('reads only the newest page of revisions, in one Query', async () => {
+    const total = 28;
+    const revision = (version: number) => ({
+      id: `v${version}`, label: `v${version}`, createdAt: new Date(Date.UTC(2026, 8, 23, 0, version)).toISOString(), createdBy: 'connor', slideCount: 1,
+      asset: { key: `deck-v${version}.pptx`, contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', sizeBytes: 10 },
+      slides: [slide('cover', 1, 'Sprint review', `deck-v${version}-cover.svg`)],
+    });
+    const head: Row = { ...deckRow, revisions: [], revisionSlides: undefined, revisionCount: total };
+    const queries: Array<Record<string, unknown>> = [];
+    const client = {
+      async send(command: unknown) {
+        if (command instanceof GetCommand) return { Item: head };
+        if (command instanceof QueryCommand) {
+          if (command.input.TableName !== PRESENTATION_REVISIONS_TABLE) return { Count: 0 };
+          queries.push(command.input as Record<string, unknown>);
+          const limit = Number(command.input.Limit ?? total);
+          const items = Array.from({ length: total }, (_, index) => total - index).slice(0, limit)
+            .map((version) => ({ documentId: 'doc-deck', rev: revKey(version), version, revision: revision(version) }));
+          return { Items: items, ...(limit < total ? { LastEvaluatedKey: { documentId: 'doc-deck', rev: revKey(total - limit + 1) } } : {}) };
+        }
+        return {};
+      },
+    } as unknown as DynamoDBDocumentClient;
+    const reader = new DynamoWorkActivityReader(client, {
+      presentations: () => ({ get: async () => null, appendRevision: async () => { throw new Error('not used'); } }),
+      blobs: () => new InMemoryImageBlobStore(),
+    });
+    const facts = await reader.artifact('doc-deck');
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toMatchObject({ Limit: ACTIVITY_DECK_REVISIONS, ScanIndexForward: false });
+    expect(facts?.revisions?.map((entry) => entry.id)).toEqual(
+      Array.from({ length: ACTIVITY_DECK_REVISIONS }, (_, index) => `v${total - ACTIVITY_DECK_REVISIONS + 1 + index}`),
+    );
   });
 });
