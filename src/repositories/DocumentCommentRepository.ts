@@ -83,7 +83,13 @@ export interface DocumentComment {
   agentRequest?: DocumentCommentAgentRequest;
 }
 
-export type CommentAgentRequestState = 'pending' | 'addressed' | 'refused' | 'failed';
+/**
+ * `pending` → the run is going. A run that wrote SUGGESTIONS settles to
+ * `suggested` (the change is on the page, awaiting a person's verdict) and then
+ * `accepted` / `declined` from the suggestion review; a direct edit settles to
+ * `addressed`. `refused` / `failed` leave the thread open.
+ */
+export type CommentAgentRequestState = 'pending' | 'suggested' | 'accepted' | 'declined' | 'addressed' | 'refused' | 'failed';
 
 export interface DocumentCommentAgentRequest {
   runId: string;
@@ -97,6 +103,12 @@ export interface DocumentCommentAgentRequest {
   settledAt?: string;
   /** The reply the settle wrote — pre-allocated so the claim names it. */
   replyId?: string;
+  /** `suggested`: the `${user}@${bucket}` key the run's marks carry — what an Accept / Reject in the margin names. */
+  suggestionKey?: string;
+  /** `accepted` / `declined`: who gave the verdict, and when. */
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewReplyId?: string;
 }
 
 const TABLE_NAME = tableName('document-comments');
@@ -247,14 +259,49 @@ export class DocumentCommentRepository extends BaseRepository {
     state: Exclude<CommentAgentRequestState, 'pending'>,
     replyId: string,
     settledAt: string,
+    suggestionKey?: string,
   ): Promise<boolean> {
     try {
       await this.updateItem({
         Key: { documentId, commentId },
         ConditionExpression: 'agentRequest.runId = :run AND agentRequest.#state = :pending',
-        UpdateExpression: 'SET agentRequest.#state = :state, agentRequest.settledAt = :at, agentRequest.replyId = :reply',
+        UpdateExpression: `SET agentRequest.#state = :state, agentRequest.settledAt = :at, agentRequest.replyId = :reply${suggestionKey ? ', agentRequest.suggestionKey = :key' : ''}`,
         ExpressionAttributeNames: { '#state': 'state' },
-        ExpressionAttributeValues: { ':run': runId, ':pending': 'pending', ':state': state, ':at': settledAt, ':reply': replyId },
+        ExpressionAttributeValues: {
+          ':run': runId, ':pending': 'pending', ':state': state, ':at': settledAt, ':reply': replyId,
+          ...(suggestionKey ? { ':key': suggestionKey } : {}),
+        },
+      });
+      return true;
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return false;
+      throw err;
+    }
+  }
+
+  /**
+   * Records a person's verdict on the run's suggestion exactly once: true when
+   * THIS caller moved the request from `suggested` (or still `pending` — a
+   * verdict can outrun the run's own terminal event) to `accepted` / `declined`.
+   */
+  async reviewAgentRequest(
+    documentId: string,
+    commentId: string,
+    runId: string,
+    state: 'accepted' | 'declined',
+    reviewedBy: string,
+    replyId: string,
+    reviewedAt: string,
+  ): Promise<boolean> {
+    try {
+      await this.updateItem({
+        Key: { documentId, commentId },
+        ConditionExpression: 'agentRequest.runId = :run AND agentRequest.#state IN (:pending, :suggested)',
+        UpdateExpression: 'SET agentRequest.#state = :state, agentRequest.reviewedBy = :by, agentRequest.reviewedAt = :at, agentRequest.reviewReplyId = :reply',
+        ExpressionAttributeNames: { '#state': 'state' },
+        ExpressionAttributeValues: {
+          ':run': runId, ':pending': 'pending', ':suggested': 'suggested', ':state': state, ':by': reviewedBy, ':at': reviewedAt, ':reply': replyId,
+        },
       });
       return true;
     } catch (err) {

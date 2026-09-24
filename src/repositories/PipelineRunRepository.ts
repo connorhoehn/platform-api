@@ -581,13 +581,19 @@ export class PipelineRunRepository extends BaseRepository {
   }
 
   /** Record a person's verdict on the run's suggestions. False when the run row does not exist. */
+  /**
+   * Writes the run's verdict. The FIRST verdict stands: the write is refused
+   * (false) when a different decision is already recorded — two replicas
+   * serving an Accept and a Reject at once cannot overwrite each other. The
+   * same decision again is allowed (the ordinary margin + card race).
+   */
   async setReview(pipelineId: string, runId: string, review: RunReview): Promise<boolean> {
     try {
       await this.updateItem({
         Key: { pipelineId, runId },
         UpdateExpression: 'SET review = :review',
-        ConditionExpression: 'attribute_exists(runId)',
-        ExpressionAttributeValues: { ':review': review },
+        ConditionExpression: 'attribute_exists(runId) AND (attribute_not_exists(review) OR review.decision = :decision)',
+        ExpressionAttributeValues: { ':review': review, ':decision': review.decision },
       });
       return true;
     } catch (err) {

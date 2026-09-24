@@ -33,6 +33,8 @@ import log from '../lib/logger';
 
 export const COMMENT_AGENT_LINK_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const COMMENT_AGENT = { userId: 'agent:haiku', displayName: 'Haiku', color: '#7c3aed' } as const;
+/** What a resolved card prints for a thread the agent itself resolved: "Resolved by Haiku agent". */
+export const COMMENT_AGENT_RESOLVER = `${COMMENT_AGENT.displayName} agent`;
 
 export interface CommentRunLink { documentId: string; commentId: string; pipelineId: string }
 
@@ -84,7 +86,7 @@ export function commentScopedInstruction(instruction: string, comment: Pick<Docu
 }
 
 interface ApplyOp { op?: string; index?: number; text?: string; kind?: string }
-export interface ApplyOutcome { applied?: number; skipped?: number; reason?: string; mode?: string; ops?: ApplyOp[] }
+export interface ApplyOutcome { applied?: number; skipped?: number; reason?: string; mode?: string; ops?: ApplyOp[]; suggestionKey?: string }
 
 function describeOp(op: ApplyOp): string {
   const text = typeof op.text === 'string' && op.text.trim() ? ` “${oneLine(op.text, 60)}”` : '';
@@ -120,7 +122,12 @@ export function runPath(pipelineId: string, runId: string): string {
 }
 
 /** The reply's words and the request's final state. Pure. */
-export function settlementReply(settlement: RunSettlement, pipelineId: string, runId: string): { state: Exclude<CommentAgentRequestState, 'pending'>; text: string } {
+export function settlementReply(
+  settlement: RunSettlement,
+  pipelineId: string,
+  runId: string,
+  opts: { resolveOnApply?: boolean } = {},
+): { state: Exclude<CommentAgentRequestState, 'pending' | 'accepted' | 'declined'>; text: string } {
   const link = `[run ${runId.slice(0, 8)}](${runPath(pipelineId, runId)})`;
   switch (settlement.kind) {
     case 'completed': {
@@ -128,6 +135,12 @@ export function settlementReply(settlement: RunSettlement, pipelineId: string, r
       if (settlement.outcome && typeof applied === 'number' && applied === 0) {
         const why = settlement.outcome.reason ? oneLine(settlement.outcome.reason, 200) : 'the agent proposed no change';
         return { state: 'refused', text: `Not changed by ${link} — ${why}. Left open.` };
+      }
+      // A SUGGESTION is not the edit landing: the thread waits for a person's
+      // Accept (which resolves it when "Resolve when applied" is on) or Reject.
+      if (settlement.outcome?.mode === 'suggest') {
+        const next = opts.resolveOnApply ? ' Accepting it resolves this thread.' : '';
+        return { state: 'suggested', text: `Addressed by ${link} — ${summarizeApply(settlement.outcome)}.${next}` };
       }
       return { state: 'addressed', text: `Addressed by ${link} — ${summarizeApply(settlement.outcome)}.` };
     }
@@ -141,6 +154,7 @@ export function settlementReply(settlement: RunSettlement, pipelineId: string, r
 }
 
 type SettleRepo = Pick<DocumentCommentRepository, 'getComment' | 'settleAgentRequest' | 'createComment' | 'resolveThread'>;
+type ReviewRepo = Pick<DocumentCommentRepository, 'getComment' | 'reviewAgentRequest' | 'createComment' | 'resolveThread'>;
 
 /**
  * Writes the settle reply (and the resolve) for one run, at most once across
@@ -159,10 +173,11 @@ export async function settleCommentAgentRun(
   const request = root?.agentRequest;
   if (!root || !request || request.runId !== runId || request.state !== 'pending') return 'skipped';
 
-  const { state, text } = settlementReply(settlement, request.pipelineId || link.pipelineId, runId);
+  const { state, text } = settlementReply(settlement, request.pipelineId || link.pipelineId, runId, { resolveOnApply: request.resolveOnApply });
   const replyId = ulid();
   // The exactly-once point: only the caller that moves (runId, pending) writes.
-  const won = await repo.settleAgentRequest(link.documentId, link.commentId, runId, state, replyId, now);
+  const key = state === 'suggested' && settlement.kind === 'completed' ? settlement.outcome?.suggestionKey : undefined;
+  const won = await repo.settleAgentRequest(link.documentId, link.commentId, runId, state, replyId, now, key);
   if (!won) return 'skipped';
 
   const reply = await repo.createComment({
@@ -178,15 +193,93 @@ export async function settleCommentAgentRun(
   publish(`doc-comments:${link.documentId}`, 'doc:comment_added', { documentId: link.documentId, comment: reply })
     .catch((err: unknown) => log.error({ event: 'doc:comment_added', err: String(err) }, 'signal publish failed'));
 
+  // The row now names the suggestion key: a margin that Accepts / Rejects it
+  // later needs `agentRequest` on the comment it holds, without a reload.
+  if (state === 'suggested') await publishRow(repo, publish, link);
+
   const resolve = state === 'addressed' && request.resolveOnApply && !root.resolved;
   if (resolve) {
     // `resolvedBy` is what the card prints ("Resolved by …"); the agent has no
     // user record to look a name up from, so it is stored as its name.
-    await repo.resolveThread(link.documentId, link.commentId, COMMENT_AGENT.displayName, now);
+    await repo.resolveThread(link.documentId, link.commentId, COMMENT_AGENT_RESOLVER, now);
     publish(`doc-comments:${link.documentId}`, 'doc:comment_resolved', {
-      documentId: link.documentId, commentId: link.commentId, resolved: true, resolvedBy: COMMENT_AGENT.displayName, resolvedAt: now,
+      documentId: link.documentId, commentId: link.commentId, resolved: true, resolvedBy: COMMENT_AGENT_RESOLVER, resolvedAt: now,
     }).catch((err: unknown) => log.error({ event: 'doc:comment_resolved', err: String(err) }, 'signal publish failed'));
   }
   log.info({ runId, documentId: link.documentId, commentId: link.commentId, state, resolved: resolve }, 'comment agent request settled');
   return resolve ? 'resolved' : 'settled';
+}
+
+/** Fans the root row out as `doc:comment_updated` (what lane A's PATCH emits) — best effort. */
+async function publishRow(repo: Pick<DocumentCommentRepository, 'getComment'>, publish: typeof publishSignal, link: CommentRunLink): Promise<void> {
+  try {
+    const row = await repo.getComment(link.documentId, link.commentId);
+    if (!row) return;
+    await publish(`doc-comments:${link.documentId}`, 'doc:comment_updated', { documentId: link.documentId, comment: row });
+  } catch (err) {
+    log.warn({ event: 'doc:comment_updated', err: String(err) }, 'signal publish failed');
+  }
+}
+
+/** A person's verdict on the suggestion a comment's run wrote (`pipeline:run:reviewed`). */
+export interface SuggestionVerdict {
+  decision: 'accept' | 'reject';
+  /** userId of the reviewer. */
+  by: string;
+  byName?: string;
+}
+
+/**
+ * Settles a comment whose run SUGGESTED its change, from the person's verdict:
+ * Accept → a one-line reply and, with "Resolve when applied" on, the thread is
+ * resolved (by the person who accepted); Reject → "Suggestion rejected by
+ * <name>" and the thread stays open. At most once across replicas: the write
+ * is a compare-and-set on (runId, suggested|pending).
+ */
+export async function settleCommentSuggestionReview(
+  link: CommentRunLink,
+  runId: string,
+  verdict: SuggestionVerdict,
+  deps: { repo?: ReviewRepo; publish?: typeof publishSignal; now?: () => string } = {},
+): Promise<'accepted' | 'resolved' | 'declined' | 'skipped'> {
+  const repo = deps.repo ?? documentCommentRepo;
+  const publish = deps.publish ?? publishSignal;
+  const now = (deps.now ?? (() => new Date().toISOString()))();
+  const root = await repo.getComment(link.documentId, link.commentId);
+  const request = root?.agentRequest;
+  if (!root || !request || request.runId !== runId || (request.state !== 'suggested' && request.state !== 'pending')) return 'skipped';
+
+  const state = verdict.decision === 'accept' ? 'accepted' : 'declined';
+  const who = (verdict.byName ?? '').trim() || verdict.by;
+  const replyId = ulid();
+  const won = await repo.reviewAgentRequest(link.documentId, link.commentId, runId, state, who, replyId, now);
+  if (!won) return 'skipped';
+
+  const text = state === 'accepted'
+    ? `Suggestion accepted by ${who}.`
+    : `Suggestion rejected by ${who}. Left open.`;
+  const reply = await repo.createComment({
+    commentId: replyId,
+    documentId: link.documentId,
+    parentCommentId: link.commentId,
+    text,
+    userId: COMMENT_AGENT.userId,
+    displayName: COMMENT_AGENT.displayName,
+    color: COMMENT_AGENT.color,
+    timestamp: now,
+  });
+  publish(`doc-comments:${link.documentId}`, 'doc:comment_added', { documentId: link.documentId, comment: reply })
+    .catch((err: unknown) => log.error({ event: 'doc:comment_added', err: String(err) }, 'signal publish failed'));
+
+  await publishRow(repo, publish, link);
+
+  const resolve = state === 'accepted' && request.resolveOnApply && !root.resolved;
+  if (resolve) {
+    await repo.resolveThread(link.documentId, link.commentId, who, now);
+    publish(`doc-comments:${link.documentId}`, 'doc:comment_resolved', {
+      documentId: link.documentId, commentId: link.commentId, resolved: true, resolvedBy: who, resolvedAt: now,
+    }).catch((err: unknown) => log.error({ event: 'doc:comment_resolved', err: String(err) }, 'signal publish failed'));
+  }
+  log.info({ runId, documentId: link.documentId, commentId: link.commentId, state, resolved: resolve }, 'comment agent suggestion reviewed');
+  return resolve ? 'resolved' : state;
 }

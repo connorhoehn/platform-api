@@ -18,6 +18,7 @@ import { CommentAgentResolver } from '../commentAgentResolver';
 import {
   commentScopedInstruction,
   settleCommentAgentRun,
+  settleCommentSuggestionReview,
   settlementReply,
   summarizeApply,
 } from '../commentAgentRequests';
@@ -40,10 +41,17 @@ function sharedTable(root: DocumentComment) {
     rows,
     repo: {
       getComment: jest.fn(async (_d: string, id: string) => (rows.get(id) ? JSON.parse(JSON.stringify(rows.get(id))) : null)),
-      settleAgentRequest: jest.fn(async (_d: string, id: string, runId: string, state: string, replyId: string, at: string) => {
+      settleAgentRequest: jest.fn(async (_d: string, id: string, runId: string, state: string, replyId: string, at: string, key?: string) => {
         const row = rows.get(id);
         if (!row?.agentRequest || row.agentRequest.runId !== runId || row.agentRequest.state !== 'pending') return false;
-        row.agentRequest = { ...row.agentRequest, state: state as never, replyId, settledAt: at };
+        row.agentRequest = { ...row.agentRequest, state: state as never, replyId, settledAt: at, ...(key ? { suggestionKey: key } : {}) };
+        return true;
+      }),
+      reviewAgentRequest: jest.fn(async (_d: string, id: string, runId: string, state: string, by: string, replyId: string, at: string) => {
+        const row = rows.get(id);
+        const cur = row?.agentRequest?.state;
+        if (!row?.agentRequest || row.agentRequest.runId !== runId || (cur !== 'suggested' && cur !== 'pending')) return false;
+        row.agentRequest = { ...row.agentRequest, state: state as never, reviewedBy: by, reviewedAt: at, reviewReplyId: replyId };
         return true;
       }),
       createComment: jest.fn(async (c: Partial<DocumentComment>) => { rows.set(c.commentId!, c as DocumentComment); return c as DocumentComment; }),
@@ -61,7 +69,8 @@ const root = (resolveOnApply = true): DocumentComment => ({
   agentRequest: { runId: 'run-12345678', pipelineId: 'document-agent-edit', state: 'pending', resolveOnApply, requestedBy: 'u-connor', requestedByName: 'Connor', at: 'x' },
 });
 const link = { documentId: 'doc-1', commentId: 'c-1', pipelineId: 'document-agent-edit' };
-const applyOutput = { applied: 1, skipped: 0, mode: 'suggest', ops: [{ op: 'replaceBlock', index: 7, text: 'Publish the rollback procedure (owner: Carol)' }] };
+const applyOutput = { applied: 1, skipped: 0, mode: 'suggest', suggestionKey: 'agent:haiku@2026-09-23T02:20', ops: [{ op: 'replaceBlock', index: 7, text: 'Publish the rollback procedure (owner: Carol)' }] };
+const directOutput = { applied: 1, skipped: 0, mode: 'direct', ops: [{ op: 'replaceBlock', index: 7, text: 'Publish the rollback procedure (owner: Carol)' }] };
 
 describe('commentScopedInstruction', () => {
   it('carries the comment and scopes the edit to the anchored text', () => {
@@ -76,9 +85,17 @@ describe('commentScopedInstruction', () => {
 });
 
 describe('settlementReply', () => {
-  it('addressed: links the run and says what changed in one line', () => {
+  it('a direct edit is addressed', () => {
+    expect(settlementReply({ kind: 'completed', outcome: directOutput }, 'p', 'r').state).toBe('addressed');
+  });
+  it('a suggestion is not the edit landing: it waits for a verdict', () => {
+    const r = settlementReply({ kind: 'completed', outcome: applyOutput }, 'p', 'r', { resolveOnApply: true });
+    expect(r.state).toBe('suggested');
+    expect(r.text).toMatch(/Accepting it resolves this thread\.$/);
+  });
+  it('suggested: links the run and says what changed in one line', () => {
     const r = settlementReply({ kind: 'completed', outcome: applyOutput }, 'document-agent-edit', 'run-12345678');
-    expect(r.state).toBe('addressed');
+    expect(r.state).toBe('suggested');
     expect(r.text).toBe('Addressed by [run run-1234](/pipelines/document-agent-edit/runs/run-12345678) — Suggested 1 change: rewrote block 7 to “Publish the rollback procedure (owner: Carol)” — review it on the page.');
   });
   it('a model that skipped is a refusal, with its reason', () => {
@@ -96,7 +113,7 @@ describe('settlementReply', () => {
 });
 
 describe('settleCommentAgentRun', () => {
-  it('replies and resolves once when two replicas settle the same run', async () => {
+  it('replies once and does NOT resolve when two replicas settle a suggesting run', async () => {
     const t = sharedTable(root());
     const publish = jest.fn(() => Promise.resolve());
     const settlement = { kind: 'completed' as const, outcome: applyOutput };
@@ -104,18 +121,30 @@ describe('settleCommentAgentRun', () => {
       settleCommentAgentRun(link, 'run-12345678', settlement, { repo: t.repo, publish }),
       settleCommentAgentRun(link, 'run-12345678', settlement, { repo: t.repo, publish }),
     ]);
-    expect(results.sort()).toEqual(['resolved', 'skipped']);
+    expect(results.sort()).toEqual(['settled', 'skipped']);
     expect(t.repo.createComment).toHaveBeenCalledTimes(1);
-    expect(t.repo.resolveThread).toHaveBeenCalledTimes(1);
-    expect(t.rows.get('c-1')!.agentRequest!.state).toBe('addressed');
+    expect(t.repo.resolveThread).not.toHaveBeenCalled();
+    expect(t.rows.get('c-1')!.agentRequest).toMatchObject({ state: 'suggested', suggestionKey: 'agent:haiku@2026-09-23T02:20' });
     const reply = t.repo.createComment.mock.calls[0][0];
     expect(reply).toMatchObject({ parentCommentId: 'c-1', userId: 'agent:haiku', commentId: t.rows.get('c-1')!.agentRequest!.replyId });
     // A redelivery later changes nothing.
     expect(await settleCommentAgentRun(link, 'run-12345678', settlement, { repo: t.repo, publish })).toBe('skipped');
   });
+  it('a direct edit resolves once, as "Haiku agent"', async () => {
+    const t = sharedTable(root());
+    const publish = jest.fn(() => Promise.resolve());
+    const settlement = { kind: 'completed' as const, outcome: directOutput };
+    const results = await Promise.all([
+      settleCommentAgentRun(link, 'run-12345678', settlement, { repo: t.repo, publish }),
+      settleCommentAgentRun(link, 'run-12345678', settlement, { repo: t.repo, publish }),
+    ]);
+    expect(results.sort()).toEqual(['resolved', 'skipped']);
+    expect(t.repo.resolveThread).toHaveBeenCalledTimes(1);
+    expect(t.rows.get('c-1')!.resolvedBy).toBe('Haiku agent');
+  });
   it('replies without resolving when "Resolve when applied" was off', async () => {
     const t = sharedTable(root(false));
-    expect(await settleCommentAgentRun(link, 'run-12345678', { kind: 'completed', outcome: applyOutput }, { repo: t.repo, publish: jest.fn(() => Promise.resolve()) })).toBe('settled');
+    expect(await settleCommentAgentRun(link, 'run-12345678', { kind: 'completed', outcome: directOutput }, { repo: t.repo, publish: jest.fn(() => Promise.resolve()) })).toBe('settled');
     expect(t.repo.resolveThread).not.toHaveBeenCalled();
   });
   it('a failed run replies and leaves the thread open', async () => {
@@ -157,5 +186,81 @@ describe('CommentAgentResolver', () => {
     await bus.emit('pipeline:run:completed', { runId: 'run-x', durationMs: 1, at: 'x', status: 'rejected', rejection: { stepId: 'approve', userId: 'u', comment: 'too big', at: 'x' } });
     await r.drain();
     expect(settle).toHaveBeenCalledWith(link, 'run-x', { kind: 'rejected', reason: 'too big' });
+  });
+});
+
+// Resolve on ACCEPT, not on suggest: the verdict (POST …/runs/:runId/review →
+// `pipeline:run:reviewed` on the pipeline bus) settles the comment.
+describe('suggestion verdict', () => {
+  const suggested = (resolveOnApply = true): DocumentComment => {
+    const r = root(resolveOnApply);
+    r.agentRequest = { ...r.agentRequest!, state: 'suggested', suggestionKey: 'agent:haiku@2026-09-23T02:20' };
+    return r;
+  };
+  const twoReplicas = (t: ReturnType<typeof sharedTable>, publish: jest.Mock) => {
+    const buses = [new StubBus(), new StubBus()];
+    const resolvers = buses.map((bus) => {
+      const r = new CommentAgentResolver({
+        eventBus: bus as unknown as EventBus<PipelineEventMap>,
+        lookup: async (runId) => (runId === 'run-12345678' ? link : null),
+        review: (l, runId, v) => settleCommentSuggestionReview(l, runId, v, { repo: t.repo, publish }),
+      });
+      r.start();
+      return r;
+    });
+    return { buses, resolvers };
+  };
+
+  it('2 replicas hear the same Accept: one reply, one resolve, by the person who accepted', async () => {
+    const t = sharedTable(suggested());
+    const publish = jest.fn(() => Promise.resolve());
+    const { buses, resolvers } = twoReplicas(t, publish);
+    const event = { runId: 'run-12345678', pipelineId: 'document-agent-edit', decision: 'accept', by: 'u-grace', byName: 'Grace', documentId: 'doc-1', suggestionKey: 'k', at: 'x' };
+    await Promise.all(buses.map((b) => b.emit('pipeline:run:reviewed' as keyof PipelineEventMap, event)));
+    await Promise.all(resolvers.map((r) => r.drain()));
+    expect(t.repo.reviewAgentRequest).toHaveBeenCalledTimes(2);
+    expect(t.repo.createComment).toHaveBeenCalledTimes(1);
+    expect(t.repo.createComment.mock.calls[0][0]).toMatchObject({ text: 'Suggestion accepted by Grace.', parentCommentId: 'c-1' });
+    expect(t.repo.resolveThread).toHaveBeenCalledTimes(1);
+    expect(t.rows.get('c-1')).toMatchObject({ resolved: true, resolvedBy: 'Grace', agentRequest: { state: 'accepted', reviewedBy: 'Grace' } });
+    expect(resolvers[0].stats.settled + resolvers[1].stats.settled).toBe(1);
+    expect(resolvers[0].stats.skipped + resolvers[1].stats.skipped).toBe(1);
+  });
+
+  it('Accept and Reject racing on 2 replicas: exactly one verdict lands', async () => {
+    const t = sharedTable(suggested());
+    const publish = jest.fn(() => Promise.resolve());
+    const { buses, resolvers } = twoReplicas(t, publish);
+    await Promise.all([
+      buses[0].emit('pipeline:run:reviewed' as keyof PipelineEventMap, { runId: 'run-12345678', decision: 'accept', by: 'u-grace', byName: 'Grace' }),
+      buses[1].emit('pipeline:run:reviewed' as keyof PipelineEventMap, { runId: 'run-12345678', decision: 'reject', by: 'u-frank', byName: 'Frank' }),
+    ]);
+    await Promise.all(resolvers.map((r) => r.drain()));
+    expect(t.repo.createComment).toHaveBeenCalledTimes(1);
+    expect(['accepted', 'declined']).toContain(t.rows.get('c-1')!.agentRequest!.state);
+  });
+
+  it('Reject leaves the thread open with "Suggestion rejected by <name>"', async () => {
+    const t = sharedTable(suggested());
+    const publish = jest.fn(() => Promise.resolve());
+    expect(await settleCommentSuggestionReview(link, 'run-12345678', { decision: 'reject', by: 'u-frank', byName: 'Frank' }, { repo: t.repo, publish })).toBe('declined');
+    expect(t.repo.createComment.mock.calls[0][0]).toMatchObject({ text: 'Suggestion rejected by Frank. Left open.' });
+    expect(t.repo.resolveThread).not.toHaveBeenCalled();
+    expect(t.rows.get('c-1')!.resolved).toBeUndefined();
+  });
+
+  it('Accept with "Resolve when applied" off replies but leaves it open', async () => {
+    const t = sharedTable(suggested(false));
+    expect(await settleCommentSuggestionReview(link, 'run-12345678', { decision: 'accept', by: 'u-grace' }, { repo: t.repo, publish: jest.fn(() => Promise.resolve()) })).toBe('accepted');
+    expect(t.repo.resolveThread).not.toHaveBeenCalled();
+  });
+
+  it('a verdict on a run the comment is not handed to, or already reviewed, writes nothing', async () => {
+    const t = sharedTable(suggested());
+    const publish = jest.fn(() => Promise.resolve());
+    expect(await settleCommentSuggestionReview(link, 'run-other', { decision: 'accept', by: 'u' }, { repo: t.repo, publish })).toBe('skipped');
+    await settleCommentSuggestionReview(link, 'run-12345678', { decision: 'accept', by: 'u' }, { repo: t.repo, publish });
+    expect(await settleCommentSuggestionReview(link, 'run-12345678', { decision: 'reject', by: 'u' }, { repo: t.repo, publish })).toBe('skipped');
+    expect(t.repo.createComment).toHaveBeenCalledTimes(1);
   });
 });

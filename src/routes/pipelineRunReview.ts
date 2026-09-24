@@ -159,7 +159,15 @@ pipelineRunReviewRouter.post(
       ...(applied ? { appliedByRunId: applied.runId } : {}),
     };
     const stored = await getRunRepo().setReview(pipelineId, runId, review);
-    if (!stored) throw new NotFoundError(`run ${runId} not found for pipeline ${pipelineId}`);
+    if (!stored) {
+      // Lost a race to the opposite verdict (another replica, another reader).
+      const now = await getRunRepo().get(pipelineId, runId);
+      if (!now) throw new NotFoundError(`run ${runId} not found for pipeline ${pipelineId}`);
+      const held = now.review;
+      throw new ConflictError(
+        `These suggestions were already ${held?.decision ?? 'review'}ed by ${held?.byName ?? held?.by ?? 'someone'}, so they are no longer in the document.`,
+      );
+    }
     const persistence = getRunPersistenceService();
     persistence?.setReview(runId, review);
 
