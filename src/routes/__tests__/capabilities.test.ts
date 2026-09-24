@@ -55,6 +55,7 @@ async function run(app: express.Express, method: string, url: string): Promise<M
     headers: {},
     query: {},
     params: {},
+    user: { sub: 'dev-alice' },
     body: undefined,
   } as unknown as Request;
   await new Promise<void>((resolve, reject) => {
@@ -90,7 +91,7 @@ function makeRepo(defs: PipelineDefinition[]): DefinitionsRepository {
 function buildApp(defs: PipelineDefinition[]): express.Express {
   const app = express();
   app.use(express.json());
-  app.use('/api/capabilities', createCapabilitiesRouter({ definitions: makeRepo(defs) }));
+  app.use('/api/capabilities', createCapabilitiesRouter({ definitions: makeRepo(defs), system: () => [] }));
   return app;
 }
 
@@ -215,5 +216,31 @@ describe('GET /api/capabilities/pipelines/:name', () => {
     const body = res.body as Record<string, unknown>;
     expect(body.steps).toBe(1);
     expect(body.triggers).toEqual([]);
+  });
+});
+
+// Loop 29c (NFR #174): the catalogue is the caller's own definitions plus the
+// system pipelines — never every user's (`listAll`).
+describe('capabilities — caller scope (NFR #174)', () => {
+  it('lists the caller\'s definitions and system pipelines, never listAll', async () => {
+    const repo = makeRepo([PIPELINE_A]);
+    const app = express();
+    app.use(express.json());
+    app.use('/api/capabilities', createCapabilitiesRouter({ definitions: repo, system: () => [{ id: 'sys-one', name: 'sys-one' }] }));
+    const res = await run(app, 'GET', '/api/capabilities/pipelines');
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { pipelines: Array<{ name: string }> }).pipelines.map((p) => p.name).sort()).toEqual(['pipeline-alpha', 'sys-one']);
+    expect(repo.list).toHaveBeenCalledWith('dev-alice');
+    expect(repo.listAll).not.toHaveBeenCalled();
+  });
+
+  it('another user\'s pipeline is 404 by name', async () => {
+    const repo = makeRepo([]);
+    const app = express();
+    app.use(express.json());
+    app.use('/api/capabilities', createCapabilitiesRouter({ definitions: repo, system: () => [] }));
+    const res = await run(app, 'GET', '/api/capabilities/pipelines/pipeline-alpha');
+    expect(res.statusCode).toBe(404);
+    expect(repo.listAll).not.toHaveBeenCalled();
   });
 });

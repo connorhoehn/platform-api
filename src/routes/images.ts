@@ -32,6 +32,7 @@ import { withContext } from '../lib/logger';
 import { getImageBlobStore } from '../pipeline/image/visionServices';
 import { IMAGE_BLOB_SIZE_CAP_BYTES } from '../pipeline/image/ImageBlobStore';
 import type { ImageMeta } from '../pipeline/image/types';
+import { requireImageAccess } from '../pipeline/image/imageAccess';
 
 const log = withContext({ route: 'images' });
 
@@ -401,6 +402,8 @@ imagesRouter.post(
 
 imagesRouter.get(
   '/:imageId',
+  // Loop 29c (NFR #174): an uploaded image is its uploader's (404 otherwise).
+  requireImageAccess(),
   asyncHandler<
     { imageId: string },
     Buffer | { error: string }
@@ -433,6 +436,8 @@ imagesRouter.get(
 
 imagesRouter.get(
   '/:imageId/metadata',
+  // Loop 29c (NFR #174): an uploaded image is its uploader's (404 otherwise).
+  requireImageAccess(),
   asyncHandler<
     { imageId: string },
     MetadataResponse | { error: string }

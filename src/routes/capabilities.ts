@@ -14,6 +14,7 @@
 
 import { Router } from 'express';
 import type { DefinitionsRepository, PipelineDefinition } from '../pipeline/definitions-repository';
+import { listSystemPipelines } from '../pipeline/systemPipelines';
 
 function asBool(v: unknown): boolean {
   return typeof v === 'boolean' ? v : false;
@@ -44,13 +45,23 @@ function detailOf(def: PipelineDefinition) {
   };
 }
 
-export function createCapabilitiesRouter(deps: { definitions: DefinitionsRepository }) {
+export function createCapabilitiesRouter(deps: { definitions: DefinitionsRepository; system?: () => Record<string, unknown>[] }) {
   const router = Router();
 
+  // Loop 29c (NFR #174): the caller's own definitions plus the system
+  // pipelines — never `listAll()`, which is every user's.
+  async function visible(req: { user?: { sub?: string } }): Promise<PipelineDefinition[]> {
+    const userId = req.user?.sub ?? '';
+    const own = userId ? await deps.definitions.list(userId) : [];
+    const system = (deps.system ?? listSystemPipelines)() as unknown as PipelineDefinition[];
+    const ids = new Set(own.map((d) => d.id));
+    return [...own, ...system.filter((d) => !ids.has(d.id))];
+  }
+
   // GET /api/capabilities/pipelines
-  router.get('/pipelines', async (_req, res) => {
+  router.get('/pipelines', async (req, res) => {
     try {
-      const all = await deps.definitions.listAll();
+      const all = await visible(req);
       res.json({ pipelines: all.map(summaryOf) });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -61,7 +72,7 @@ export function createCapabilitiesRouter(deps: { definitions: DefinitionsReposit
   // GET /api/capabilities/pipelines/:name
   router.get('/pipelines/:name', async (req, res) => {
     try {
-      const all = await deps.definitions.listAll();
+      const all = await visible(req);
       const name = req.params.name;
       // Match by name field or by id (the DDB SK)
       const def = all.find(

@@ -27,6 +27,7 @@ import { requireAuth } from '../middleware/auth';
 import { getImageBlobStore } from '../pipeline/image/visionServices';
 import { fetchPreviewImageFromUrl } from './pipeline-preview-image-fetch';
 import type { AdjustLayer } from '../pipeline/image/ImageAdjustLayerStepHandler';
+import { requireImageAccess } from '../pipeline/image/imageAccess';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -150,6 +151,8 @@ export const pipelinePreviewAdjustLayerRouter = Router({ mergeParams: true });
 
 pipelinePreviewAdjustLayerRouter.post(
   '/',
+  // Loop 29c (NFR #174): a stored `imageId` must be the caller's upload (or a pipeline output).
+  requireImageAccess((req) => (req.body as { imageId?: unknown } | undefined)?.imageId, { optional: true }),
   requireAuth,
   previewAdjustRateLimit,
   asyncHandler<

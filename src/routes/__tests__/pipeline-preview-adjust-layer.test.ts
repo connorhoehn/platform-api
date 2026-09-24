@@ -10,6 +10,12 @@
 //   7. 200 success via imageUrl (legacy fallback)
 //   8. 404 (passthrough) when only imageId is supplied and store misses
 
+// Loop 29c: image access has its own suite (imageAccess.test.ts).
+jest.mock('../../pipeline/image/imageAccess', () => {
+  const actual = jest.requireActual('../../pipeline/image/imageAccess');
+  return { ...actual, requireImageAccess: () => Object.assign((_q: unknown, _s: unknown, n: () => void) => n(), { accessPolicy: 'image:uploader' }) };
+});
+
 import express from 'express';
 import http from 'http';
 import { AddressInfo } from 'net';

@@ -19,6 +19,7 @@
 import { Router, type Response } from 'express';
 import type { QueueInspector } from 'distributed-core/messaging-queue';
 import { asyncHandler } from '../middleware/error-handler';
+import { filterVisibleRunItems, requireRunAccess } from '../pipeline/runAccess';
 import { getPipelineBridge } from './pipelineTriggers';
 import type { PipelineRunSnapshot } from './pipelineTriggers';
 
@@ -49,7 +50,8 @@ pipelineInspectorRouter.get('/pending', asyncHandler(async (req, res) => {
   const limit = parseLimit(query.limit);
   const cursor = typeof query.cursor === 'string' ? query.cursor : undefined;
   const page = await inspector.listPending({ limit, cursor });
-  res.status(200).json(page);
+  // Loop 29c (NFR #174): envelopes are run snapshots — only the caller's (or readable) runs.
+  res.status(200).json({ ...page, items: await filterVisibleRunItems(req, page.items ?? []) });
 }));
 
 pipelineInspectorRouter.get('/inflight', asyncHandler(async (req, res) => {
@@ -58,7 +60,7 @@ pipelineInspectorRouter.get('/inflight', asyncHandler(async (req, res) => {
   const query = req.query as Record<string, unknown>;
   const limit = parseLimit(query.limit);
   const items = await inspector.listInflight({ limit });
-  res.status(200).json({ items });
+  res.status(200).json({ items: await filterVisibleRunItems(req, items ?? []) });
 }));
 
 pipelineInspectorRouter.get('/summary', asyncHandler(async (_req, res) => {
@@ -68,7 +70,7 @@ pipelineInspectorRouter.get('/summary', asyncHandler(async (_req, res) => {
   res.status(200).json(summary);
 }));
 
-pipelineInspectorRouter.get('/peek/:runId', asyncHandler(async (req, res) => {
+pipelineInspectorRouter.get('/peek/:runId', requireRunAccess('read', (req) => req.params.runId, () => undefined), asyncHandler(async (req, res) => {
   const inspector = inspectorOr503(res);
   if (!inspector) return;
   const params = req.params as { runId: string };

@@ -45,6 +45,9 @@ import { Router, type Response } from 'express';
 import type { BusEvent as DCBusEvent } from 'distributed-core';
 import type { DeadLetterQueue } from 'distributed-core/messaging-queue';
 import { asyncHandler } from '../middleware/error-handler';
+import { assertItemRunAccess, filterVisibleRunItems } from '../pipeline/runAccess';
+import { markAccess } from '../middleware/resource-access';
+import type { Request, NextFunction } from 'express';
 import { pipelineWriteRateLimit } from '../middleware/rateLimit';
 import { getPipelineBridge } from './pipelineTriggers';
 import { forgetDeadLetters, getDeadLetterStore } from '../pipeline/deadLetterStore';
@@ -105,6 +108,35 @@ function escapeRegex(s: string): string {
  * `eventBusDeadLetterHandler` in bootstrap.ts). Returns null when no
  * prefix is parseable so callers can render "unknown" without crashing.
  */
+/**
+ * Loop 29c (NFR #174): a dead letter belongs to the run its event names. Peek
+ * takes read on that run; redrive / purge take the run's OWNER for every id
+ * (a reader 403, anything else — unknown id, no run, a stranger's — 404).
+ */
+function dlqEntryAccess(mode: 'read' | 'owner') {
+  return markAccess((req: Request, res: Response, next: NextFunction) => {
+    void (async () => {
+      const dlq = getPipelineBridge()?.getDLQ?.() ?? null;
+      if (!dlq) { next(); return; } // the handler answers 503
+      const ids = mode === 'read'
+        ? [String((req.params as { id?: string }).id ?? '')]
+        : (Array.isArray((req.body as { ids?: unknown } | undefined)?.ids) ? ((req.body as { ids: unknown[] }).ids.filter((x): x is string => typeof x === 'string')) : []);
+      for (const id of ids) {
+        const entry = await dlq.peek(id);
+        // An unknown id is the handler's (peek 404, preview `notFound`, a no-op redrive).
+        if (!entry) continue;
+        try {
+          await assertItemRunAccess(req, entry, mode);
+        } catch (err) {
+          if ((err as { status?: number }).status === 404) { res.status(404).json({ error: 'dlq entry not found', id }); return; }
+          throw err;
+        }
+      }
+      next();
+    })().catch(next);
+  }, mode === 'owner' ? 'run:owner' : 'run:read');
+}
+
 function deriveErrorKind(lastError: unknown): string | null {
   if (typeof lastError !== 'string') return null;
   const m = /^([A-Za-z][A-Za-z0-9_]{0,79}):/.exec(lastError);
@@ -162,13 +194,16 @@ pipelineDLQRouter.get('/', asyncHandler(async (req, res) => {
     ...(sinceMs !== undefined ? { sinceMs } : {}),
     ...(failureKindMatches ? { failureKindMatches } : {}),
   });
+  // Loop 29c (NFR #174): dead letters are every user's events — only those of
+  // runs the caller may read (owner, or a reader of the run's document).
+  const visible = await filterVisibleRunItems(req, page.items);
   res.status(200).json({
     ...page,
-    items: page.items.map((e) => enrichEntry(e)),
+    items: visible.map((e) => enrichEntry(e)),
   });
 }));
 
-pipelineDLQRouter.get('/peek/:id', asyncHandler(async (req, res) => {
+pipelineDLQRouter.get('/peek/:id', dlqEntryAccess('read'), asyncHandler(async (req, res) => {
   const dlq = dlqOr503(res);
   if (!dlq) return;
   const params = req.params as { id: string };
@@ -180,7 +215,7 @@ pipelineDLQRouter.get('/peek/:id', asyncHandler(async (req, res) => {
   res.status(200).json(enrichEntry(entry));
 }));
 
-pipelineDLQRouter.post('/redrive', writeLimiter, asyncHandler(async (req, res) => {
+pipelineDLQRouter.post('/redrive', writeLimiter, dlqEntryAccess('owner'), asyncHandler(async (req, res) => {
   const dlq = dlqOr503(res);
   if (!dlq) return;
   const body = (req.body ?? {}) as { resetAttempts?: unknown; preview?: unknown };
@@ -207,7 +242,7 @@ pipelineDLQRouter.post('/redrive', writeLimiter, asyncHandler(async (req, res) =
   res.status(200).json(result);
 }));
 
-pipelineDLQRouter.post('/purge', writeLimiter, asyncHandler(async (req, res) => {
+pipelineDLQRouter.post('/purge', writeLimiter, dlqEntryAccess('owner'), asyncHandler(async (req, res) => {
   const dlq = dlqOr503(res);
   if (!dlq) return;
   const body = (req.body ?? {}) as { preview?: unknown };

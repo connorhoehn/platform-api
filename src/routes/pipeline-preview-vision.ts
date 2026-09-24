@@ -27,6 +27,7 @@ import { requireAuth } from '../middleware/auth';
 import { getImageBlobStore, getVisionClient } from '../pipeline/image/visionServices';
 import { computeVisionCost } from '../pipeline/image/computeVisionCost';
 import { fetchPreviewImageFromUrl } from './pipeline-preview-image-fetch';
+import { requireImageAccess } from '../pipeline/image/imageAccess';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -93,6 +94,8 @@ export const pipelinePreviewVisionRouter = Router({ mergeParams: true });
 
 pipelinePreviewVisionRouter.post(
   '/',
+  // Loop 29c (NFR #174): a stored `imageId` must be the caller's upload (or a pipeline output).
+  requireImageAccess((req) => (req.body as { imageId?: unknown } | undefined)?.imageId, { optional: true }),
   requireAuth,
   previewVisionRateLimit,
   asyncHandler<

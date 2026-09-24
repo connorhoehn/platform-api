@@ -13,6 +13,22 @@
 //   - 11 rapid POSTs against /redrive     -> at least one 429 from the
 //                                            shared write rate limit bucket
 
+// Loop 29c: run access has its own suite (runAccess.test.ts); these tests
+// exercise the route behaviour behind it, so the gate passes here.
+jest.mock('../../pipeline/runAccess', () => {
+  const actual = jest.requireActual('../../pipeline/runAccess');
+  const pass = (policy: string) => Object.assign((_q: unknown, _s: unknown, n: () => void) => n(), { accessPolicy: policy });
+  return {
+    ...actual,
+    requireRunAccess: () => pass('run:read'),
+    requirePipelineVisible: () => pass('pipeline:owner'),
+    assertRunAccess: async () => ({ role: 'owner' }),
+    assertItemRunAccess: async () => undefined,
+    canSeeRun: async () => true,
+    filterVisibleRunItems: async (_r: unknown, items: unknown[]) => items,
+  };
+});
+
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { pipelineDLQRouter } from '../pipelineDLQ';
 import { setPipelineBridge, type PipelineBridge } from '../pipelineTriggers';
@@ -191,7 +207,8 @@ describe('POST /api/pipelines/dlq/redrive — preview mode', () => {
 
     expect(res.statusCode).toBe(200);
     expect(dlq.redrive).not.toHaveBeenCalled();
-    expect(dlq.peek).toHaveBeenCalledTimes(2);
+    // Loop 29c: the access gate peeks each id once before the preview does.
+    expect(dlq.peek).toHaveBeenCalledTimes(4);
 
     const body = res.body as {
       preview: true;
