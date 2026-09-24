@@ -89,6 +89,29 @@ interface FreshnessLogger {
 }
 
 let pending: Promise<void> | null = null;
+/** Set while the shared check has seen this process stale and not yet fresh. */
+let staleSince: number | null = null;
+
+/**
+ * How long a stale process reports itself not ready (realtime-examples NFR
+ * #210). Under Tilt a replaced pod boots the last BUILT image and runs it until
+ * the live_update replay restarts the process (~40 s). While it was Ready, a
+ * rollout sent it traffic and retired the old pod at once: runs started there
+ * but, with the outbox drainer held (#65), their work-graph events waited for
+ * the restart — the first `audit-rollup-probe` runs on a fresh pod reached the
+ * Activity page ~45 s late. Not ready while stale, the rollout keeps the old
+ * pod serving (and draining) until this one runs current source. Capped below
+ * the liveness window (initial 15 s + 5 × 15 s) so a pod Tilt never resyncs is
+ * degraded, as before, rather than restarted in a loop.
+ */
+export const STALE_NOT_READY_CAP_MS = 60_000;
+
+/** The `/health` view of the gate: not ok while stale, for at most the cap. */
+export function buildFreshnessReadiness(now: number = Date.now()): { ok: boolean; details?: string } {
+  if (staleSince === null) return { ok: true };
+  if (now - staleSince >= STALE_NOT_READY_CAP_MS) return { ok: true, details: 'stale build (cap reached)' };
+  return { ok: false, details: 'stale build: waiting for the live_update restart' };
+}
 
 /**
  * Resolves once this process runs the host's current source (at once when
@@ -119,10 +142,12 @@ export function whenBuildFresh(log: FreshnessLogger, opts: {
         result = { state: 'unchecked', reason: `check failed: ${String(err)}` };
       }
       if (result.state !== 'stale') {
+        staleSince = null;
         log.info({ ...result, waitedMs: Date.now() - startedAt }, 'build freshness: cluster leases enabled');
         resolve();
         return;
       }
+      if (staleSince === null) staleSince = startedAt;
       if (Date.now() - lastLog >= logEveryMs) {
         lastLog = Date.now();
         log.error(
@@ -142,6 +167,7 @@ export function whenBuildFresh(log: FreshnessLogger, opts: {
 /** Test hook: forget the shared check. */
 export function resetBuildFreshnessForTests(): void {
   pending = null;
+  staleSince = null;
 }
 
 if (require.main === module) {

@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import {
   checkBuildFreshness,
   resetBuildFreshnessForTests,
+  buildFreshnessReadiness,
+  STALE_NOT_READY_CAP_MS,
   sourceFingerprint,
   whenBuildFresh,
   type BuildFreshness,
@@ -69,5 +71,15 @@ describe('build freshness gate (NFR #65)', () => {
     expect(errors[0]).toContain('STALE BUILD');
     // Shared: a second holder does not re-run the check.
     expect(whenBuildFresh(log)).toBe(gate);
+  });
+
+  it('reports not ready while stale, for at most the cap, and ready once fresh (NFR #210)', async () => {
+    const results: BuildFreshness[] = [{ state: 'stale', built: 'old', host: 'new' }];
+    const log = { info: jest.fn(), error: jest.fn() };
+    const gate = whenBuildFresh(log, { pollMs: 5, logEveryMs: 0, check: () => results.shift() ?? { state: 'fresh', fingerprint: 'new' } });
+    expect(buildFreshnessReadiness().ok).toBe(false);
+    expect(buildFreshnessReadiness(Date.now() + STALE_NOT_READY_CAP_MS).ok).toBe(true);
+    await gate;
+    expect(buildFreshnessReadiness().ok).toBe(true);
   });
 });
