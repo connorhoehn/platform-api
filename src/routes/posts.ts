@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { roomRepo } from '../repositories';
 import { requireRoomMembership } from '../middleware/require-membership';
 import { asyncHandler } from '../middleware/error-handler';
 import * as postsService from '../services/posts-service';
@@ -43,7 +44,14 @@ postsRouter.get('/', requireRoomMembership, asyncHandler(async (req: Request, re
 export const userPostsRouter = Router();
 
 userPostsRouter.get('/', asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const userId = (req.query['userId'] as string) ?? req.user!.sub;
-  const posts = await postsService.listUserPosts(userId);
-  res.status(200).json({ posts });
+  const caller = req.user!.sub;
+  const userId = (req.query['userId'] as string) ?? caller;
+  const all = await postsService.listUserPosts(userId);
+  // NFR #175: someone else's posts only from rooms the CALLER is in — the
+  // room routes gate on membership, and this listing must not route around it.
+  if (userId === caller) { res.status(200).json({ posts: all }); return; }
+  const roomIds = [...new Set(all.map((p) => p.roomId))];
+  const memberOf = new Set<string>();
+  await Promise.all(roomIds.map(async (roomId) => { if (await roomRepo.isMember(roomId, caller)) memberOf.add(roomId); }));
+  res.status(200).json({ posts: all.filter((p) => memberOf.has(p.roomId)) });
 }));

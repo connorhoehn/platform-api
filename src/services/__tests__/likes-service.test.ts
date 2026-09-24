@@ -111,11 +111,18 @@ describe('listPostLikes', () => {
 describe('likeComment', () => {
   it('creates a like when comment exists', async () => {
     mockSend
+      .mockResolvedValueOnce({ Item: { roomId: 'r-1', postId: 'p-1' } }) // assertPostExists (NFR #175)
       .mockResolvedValueOnce({ Item: { postId: 'p-1', commentId: 'c-1' } })
       .mockResolvedValueOnce({});
     const result = await likeComment('r-1', 'p-1', 'c-1', 'u-1');
     expect(result.targetId).toBe('comment:c-1');
     expect(result.type).toBe('like');
+  });
+
+  it('NFR #175: a post that is not in this room is 404 — a member of room A cannot like a comment in room B', async () => {
+    mockSend.mockResolvedValueOnce({ Item: undefined }); // post (r-1, p-1) does not exist
+    await expect(likeComment('r-1', 'p-1', 'c-1', 'u-1')).rejects.toThrow(NotFoundError);
+    expect(mockSend).toHaveBeenCalledTimes(1);
   });
 
   it('throws NotFoundError when comment missing', async () => {

@@ -19,6 +19,9 @@ jest.mock('../../services/posts-service', () => ({
   listUserPosts: mockListUserPosts,
 }));
 
+const mockIsMember = jest.fn(async (..._a: unknown[]) => true);
+jest.mock('../../repositories', () => ({ roomRepo: { isMember: (...a: unknown[]) => mockIsMember(...a) } }));
+
 jest.mock('../../middleware/require-membership', () => ({
   requireRoomMembership: (_req: Request, _res: Response, next: NextFunction) => next(),
 }));
@@ -201,11 +204,23 @@ describe('GET /api/rooms/:roomId/posts', () => {
 
 describe('GET /api/posts — user posts', () => {
   it('returns posts for a specified userId', async () => {
-    mockListUserPosts.mockResolvedValue([{ postId: 'p-1' }]);
+    mockListUserPosts.mockResolvedValue([{ postId: 'p-1', roomId: 'r-1' }]);
     const res = await run(buildApp(), 'GET', '/api/posts?userId=user-abc');
     expect(res.statusCode).toBe(200);
     expect((res.body as { posts: unknown[] }).posts).toHaveLength(1);
     expect(mockListUserPosts).toHaveBeenCalledWith('user-abc');
+  });
+
+  it('NFR #175: another user\'s posts only from rooms the caller is a member of', async () => {
+    mockListUserPosts.mockResolvedValue([{ postId: 'p-1', roomId: 'r-mine' }, { postId: 'p-2', roomId: 'r-private' }]);
+    mockIsMember.mockImplementation(async (...a: unknown[]) => a[0] === 'r-mine');
+    const res = await run(buildApp(), 'GET', '/api/posts?userId=user-abc', { userId: 'me' });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { posts: Array<{ postId: string }> }).posts.map((p) => p.postId)).toEqual(['p-1']);
+    // Your own posts are all yours.
+    const own = await run(buildApp(), 'GET', '/api/posts?userId=me', { userId: 'me' });
+    expect((own.body as { posts: unknown[] }).posts).toHaveLength(2);
+    mockIsMember.mockImplementation(async () => true);
   });
 
   it('defaults to authenticated user when userId not specified', async () => {

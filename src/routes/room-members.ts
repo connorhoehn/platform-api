@@ -2,7 +2,7 @@ import { ulid } from 'ulid';
 import { Router, Request, Response } from 'express';
 import { publishSignal, publishDurable } from '../lib/event-catalog';
 import { getCachedRoom, setCachedRoom } from '../lib/cache';
-import { roomRepo } from '../repositories';
+import { groupRepo, roomRepo } from '../repositories';
 import type { RoomItem, RoomMemberItem } from '../repositories';
 import {
   asyncHandler,
@@ -24,6 +24,15 @@ roomMembersRouter.post('/join', asyncHandler(async (req: Request, res: Response)
       throw new NotFoundError('Room not found');
     }
     void setCachedRoom(req.params.roomId, roomItem);
+  }
+
+  // NFR #175: joining is what requireRoomMembership then trusts, so a DM room
+  // is never self-joinable and a group's room takes an active membership of
+  // that group. Refused as not-found — a stranger learns nothing.
+  if (roomItem.type === 'dm') throw new NotFoundError('Room not found');
+  if (roomItem.type === 'group') {
+    const gm = roomItem.groupId ? await groupRepo.getMembership(roomItem.groupId, req.user!.sub) : null;
+    if (!gm || (gm.status !== undefined && gm.status !== 'active')) throw new NotFoundError('Room not found');
   }
 
   // Check if caller is already a member

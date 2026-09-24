@@ -6,6 +6,21 @@ import express, { type NextFunction, type Request, type Response } from 'express
 
 const mockListByLobby = jest.fn();
 
+// NFR #175: lobby access is its own unit (lib/__tests__/lobbyAccess.test.ts);
+// here it allows unless a test says otherwise.
+const mockCanUseLobby = jest.fn(async (..._a: unknown[]) => true);
+jest.mock('../../lib/lobbyAccess', () => ({
+  lobbyAccess: () => ({
+    canUseLobby: (...a: unknown[]) => mockCanUseLobby(...a),
+    assertLobbyAccess: async (...a: unknown[]) => {
+      if (!(await mockCanUseLobby(...a))) {
+        const { NotFoundError } = jest.requireActual('../../middleware/error-handler');
+        throw new NotFoundError('Session not found');
+      }
+    },
+  }),
+}));
+
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
   optionalAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
@@ -131,6 +146,13 @@ describe('GET /api/video/reactions', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ reactions: [] });
     expect(mockListByLobby).toHaveBeenCalledWith('~', 'room:lounge', undefined, undefined);
+  });
+
+  it('NFR #175: a caller who may not use the lobby is 404 and nothing is read', async () => {
+    mockCanUseLobby.mockResolvedValueOnce(false);
+    const res = await run(buildApp(), '/api/video/reactions?lobbyName=dm%3Aana%3Abob');
+    expect(res.statusCode).toBe(404);
+    expect(mockListByLobby).not.toHaveBeenCalled();
   });
 
   it('400s when lobbyName is missing', async () => {

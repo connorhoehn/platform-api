@@ -15,6 +15,7 @@ const mockAddMemberWithOutbox = jest.fn();
 const mockRemoveMember = jest.fn();
 const mockGetRoomMembers = jest.fn();
 const mockGetRoomsByUser = jest.fn();
+const mockGroupMembership = jest.fn();
 
 jest.mock('../../repositories', () => ({
   roomRepo: {
@@ -25,6 +26,7 @@ jest.mock('../../repositories', () => ({
     getRoomMembers: mockGetRoomMembers,
     getRoomsByUser: mockGetRoomsByUser,
   },
+  groupRepo: { getMembership: (...a: unknown[]) => mockGroupMembership(...a) },
 }));
 
 jest.mock('../../lib/cache', () => ({
@@ -165,6 +167,26 @@ describe('POST /api/rooms/:roomId/join', () => {
     mockGetRoom.mockResolvedValue(null);
     const res = await run(buildApp(), 'POST', `/api/rooms/${ROOM}/join`);
     expect(res.statusCode).toBe(404);
+  });
+
+  it('NFR #175: a DM room is never self-joinable (404)', async () => {
+    mockGetRoom.mockResolvedValue({ roomId: ROOM, channelId: 'ch-1', type: 'dm' });
+    mockGetMembership.mockResolvedValue(null);
+    const res = await run(buildApp(), 'POST', `/api/rooms/${ROOM}/join`);
+    expect(res.statusCode).toBe(404);
+    expect(mockAddMemberWithOutbox).not.toHaveBeenCalled();
+  });
+
+  it('NFR #175: a group room takes an active membership of the group — stranger 404, invited 404, member 201', async () => {
+    mockGetRoom.mockResolvedValue({ roomId: ROOM, channelId: 'ch-1', type: 'group', groupId: 'g-1' });
+    mockGetMembership.mockResolvedValue(null);
+    mockGroupMembership.mockResolvedValueOnce(null);
+    expect((await run(buildApp(), 'POST', `/api/rooms/${ROOM}/join`)).statusCode).toBe(404);
+    mockGroupMembership.mockResolvedValueOnce({ groupId: 'g-1', userId: 'x', role: 'member', status: 'invited' });
+    expect((await run(buildApp(), 'POST', `/api/rooms/${ROOM}/join`)).statusCode).toBe(404);
+    expect(mockAddMemberWithOutbox).not.toHaveBeenCalled();
+    mockGroupMembership.mockResolvedValueOnce({ groupId: 'g-1', userId: 'x', role: 'member', status: 'active' });
+    expect((await run(buildApp(), 'POST', `/api/rooms/${ROOM}/join`)).statusCode).toBe(201);
   });
 
   it('returns 409 when already a member', async () => {

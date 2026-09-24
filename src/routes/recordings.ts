@@ -55,8 +55,9 @@ export const recordingsRouter = Router();
 // does this on its own; this is the operator's and the UI's "try again".
 recordingsRouter.post('/recordings/:recordingId/transcribe', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const recordingId = String(req.params.recordingId);
-  const rec = await callRecordingRepo.findByRecordingId(recordingId);
-  if (!rec) throw new NotFoundError('recording not found');
+  // NFR #175: a participant of the call only (`recording:read`, 404 otherwise),
+  // like every other /recordings/:recordingId route — not any logged-in user.
+  const rec = await requireOwnRecording(req, recordingId);
   await callRecordingRepo.updateTranscriptStatus(rec.callId, rec.recordingId, { status: 'pending', transcriptError: null });
   const runId = await startSystemRun(CALL_TRANSCRIPTION_PIPELINE_ID, buildCallTranscriptionDefinition(), {
     recordingId: rec.recordingId, callId: rec.callId, arn: rec.channelArn, lobbyName: rec.lobbyName, composedKey: rec.composedSegment?.key ?? null,

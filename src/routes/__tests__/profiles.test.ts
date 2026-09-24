@@ -199,6 +199,23 @@ describe('GET /api/profiles/:userId', () => {
   });
 });
 
+describe('GET /api/profiles/batch — NFR #175', () => {
+  it('a private profile of someone else shrinks to forwarding status; public and own rows are whole', async () => {
+    const rows: Record<string, unknown> = {
+      pub: { userId: 'pub', displayName: 'Pub', bio: 'hi', visibility: 'public' },
+      priv: { userId: 'priv', displayName: 'Secret', bio: 'hidden', visibility: 'private', callForwarding: { mode: 'voicemail' } },
+      tester: { userId: 'tester', displayName: 'Me', bio: 'mine', visibility: 'private' },
+    };
+    mockGetProfile.mockImplementation(async (id: string) => rows[id] ?? null);
+    const res = await run(buildApp(), 'GET', '/api/profiles/batch?ids=pub,priv,tester', { userId: 'tester' });
+    expect(res.statusCode).toBe(200);
+    const profiles = (res.body as { profiles: Array<Record<string, unknown>> }).profiles;
+    expect(profiles[0]).toMatchObject({ displayName: 'Pub', bio: 'hi' });
+    expect(profiles[1]).toEqual({ userId: 'priv', visibility: 'private', callForwarding: { mode: 'voicemail' } });
+    expect(profiles[2]).toMatchObject({ displayName: 'Me', bio: 'mine' });
+  });
+});
+
 describe('PUT /api/profiles', () => {
   it('returns 200 with updated profile', async () => {
     mockGetProfile.mockResolvedValue({ userId: 'tester', displayName: 'Old' });

@@ -38,6 +38,7 @@ import {
   AppError,
   ValidationError,
   NotFoundError,
+  ForbiddenError,
 } from '../middleware/error-handler';
 import log from '../lib/logger';
 import { startLiveCaptions, stopLiveCaptions } from '../recordings/liveCaptions';
@@ -51,6 +52,7 @@ import {
 // through to LVS's resolveRecordingProfile silent-degrade-to-'none' path.
 import { isRecordingProfile } from '@connorhoehn/event-catalog';
 import { tenantOf } from '../lib/tenant';
+import { lobbyAccess } from '../lib/lobbyAccess';
 // Re-export breaker test helpers from the shared module for back-compat
 // with existing test imports — see src/lib/sfu-breaker.ts for the canonical
 // definitions (extracted for hub task #1001).
@@ -70,6 +72,26 @@ export const videoSessionsRouter = Router();
 function resolveLobbyName(body: Record<string, unknown>): string | undefined {
   const raw = body.lobbyName ?? body.documentId;
   return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+}
+
+/**
+ * NFR #175: a body-supplied participantId must name the caller's own entry in
+ * the session (or, for /end, the caller started the session and may clear a
+ * stale entry). An id the mirror does not list is not refused — LVS validates
+ * it against the forwarded JWT — but the participant row that IS listed under
+ * someone else is 403.
+ */
+function assertOwnParticipant(
+  session: VideoSessionRecord,
+  participantId: string | undefined,
+  userId: string | undefined,
+  opts: { ownerMayAct?: boolean } = {},
+): void {
+  if (!participantId) return;
+  const entry = (session.participants ?? []).find((p) => p.participantId === participantId);
+  if (!entry || !entry.userId || entry.userId === userId) return; // a legacy entry with no userId cannot be attributed
+  if ((opts.ownerMayAct ?? true) && userId && session.startedBy === userId) return;
+  throw new ForbiddenError('That participant is not you');
 }
 
 /**
@@ -215,6 +237,8 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     const findOrCreate = body.findOrCreate === true;
     const userId = req.user!.sub;
     const organizationId = req.user!.orgId;
+    // NFR #175: only someone who may use this lobby opens (or finds) its call.
+    await lobbyAccess().assertLobbyAccess(req, lobbyName);
 
     // recordingConfiguration: hangoutRooms.ts's /join forwards
     // `room.settings.recordingEnabled`; DM/global calls default to enabled
@@ -465,6 +489,8 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
     if (!lobbyName) {
       throw new ValidationError('lobbyName (or documentId) is required in request body');
     }
+    // NFR #175: a media token only for someone who may use this lobby.
+    await lobbyAccess().assertLobbyAccess(req, lobbyName);
 
     const session = await videoSessionRepo.getSession(lobbyName, sessionId);
     if (!session) {
@@ -596,6 +622,8 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
     if (!lobbyName) {
       throw new ValidationError('lobbyName (or documentId) is required in request body');
     }
+    // NFR #175: the lobby's own people only.
+    await lobbyAccess().assertLobbyAccess(req, lobbyName);
 
     const session = await videoSessionRepo.getSession(lobbyName, sessionId);
     if (!session) {
@@ -616,10 +644,13 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
       ?? (clientId
         ? (session.participants ?? []).find((p) => p.clientId === clientId)?.participantId
         : undefined);
-    const userId =
-      req.user?.sub
-      ?? (typeof body.userId === 'string' ? body.userId : undefined);
+    // The caller, never a body-named user (app-level requireAuth always sets one).
+    const userId = req.user?.sub;
     const authHeader = req.headers.authorization;
+    // NFR #175: the participant must be the caller's own entry — or the caller
+    // started the session. Before this, any user could name another person's
+    // participantId and the admin-token reap would evict them.
+    assertOwnParticipant(session, participantId, userId);
 
     // Fast-path reap — close the departed participant's WHIP/WHEP transports
     // in ms (hub#1281). Fires on both the authoritative and fallback paths.
@@ -739,11 +770,14 @@ videoSessionsRouter.post('/sessions/:sessionId/refresh-token', requireAuth, asyn
     if (!participantId) {
       throw new ValidationError('participantId is required in request body');
     }
+    // NFR #175: lobby access, then the participant must be the caller's own.
+    await lobbyAccess().assertLobbyAccess(req, lobbyName);
 
     const session = await videoSessionRepo.getSession(lobbyName, sessionId);
     if (!session) {
       throw new NotFoundError('Session not found');
     }
+    assertOwnParticipant(session, participantId, req.user?.sub, { ownerMayAct: false });
 
     // LVS's sessionId === channelArn. Forward the caller's Cognito token so
     // LVS's cognitoAuth middleware validates the same identity that hit us.
@@ -804,6 +838,8 @@ videoSessionsRouter.post('/sessions/:sessionId/refresh-token', requireAuth, asyn
 videoSessionsRouter.get('/sessions/document/:documentId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {
     const { documentId } = req.params;
+    // NFR #175: a lobby's sessions (participants included) to its own people only.
+    await lobbyAccess().assertLobbyAccess(req, documentId);
     const sessions = await videoSessionRepo.getSessionsByDocument(documentId);
     res.status(200).json({ sessions });
   } catch (err) {
@@ -834,6 +870,8 @@ videoSessionsRouter.get('/sessions/:sessionId/recording', requireAuth, asyncHand
     if (!lobbyName) {
       throw new ValidationError('lobbyName (or documentId) query parameter is required');
     }
+    // NFR #175: the lobby's own people only.
+    await lobbyAccess().assertLobbyAccess(req, lobbyName);
 
     const session = await videoSessionRepo.getSession(lobbyName, sessionId);
     if (!session) {
@@ -934,6 +972,9 @@ videoSessionsRouter.get(
     try {
       const lobbyName = decodeURIComponent(req.params.lobbyName ?? '');
       if (!lobbyName) throw new ValidationError('lobbyName is required');
+      // NFR #175: channelArn (enough to watch the stream) and startedBy only
+      // for someone who may use the lobby.
+      await lobbyAccess().assertLobbyAccess(req, lobbyName);
 
       // "Nothing is live" is the ORDINARY answer here — most conversations,
       // most of the time — so it is a 200 with a plain no, not an error. As a
@@ -1043,6 +1084,17 @@ videoSessionsRouter.get(
 const PROBE_CONCURRENCY = 6;
 /** How long one computed answer serves every caller. */
 const CACHE_TTL_MS = 5_000;
+
+/**
+ * NFR #175: the live list is computed once for everyone (cached 5 s), then
+ * narrowed per caller to the lobbies they may use — it used to list every
+ * live call in every org, DM names and channelArns included.
+ */
+async function visibleLobbies(req: Request, lobbies: LiveLobby[]): Promise<LiveLobby[]> {
+  const access = lobbyAccess();
+  const keep = await Promise.all(lobbies.map((l) => access.canUseLobby(req, l.lobbyName).catch(() => false)));
+  return lobbies.filter((_, i) => keep[i]);
+}
 
 interface LiveLobby {
   lobbyName: string;
@@ -1206,11 +1258,11 @@ export function __resetLiveLobbyCacheForTests(): void {
 videoSessionsRouter.get(
   '/sessions/live',
   requireAuth,
-  asyncHandler(async (_req: Request, res: Response): Promise<void> => {
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
     try {
       const now = Date.now();
       if (liveCache && now - liveCache.at < CACHE_TTL_MS) {
-        res.status(200).json({ lobbies: liveCache.value, cached: true });
+        res.status(200).json({ lobbies: await visibleLobbies(req, liveCache.value), cached: true });
         return;
       }
       if (!liveInFlight) {
@@ -1223,7 +1275,7 @@ videoSessionsRouter.get(
             liveInFlight = null;
           });
       }
-      const lobbies = await liveInFlight;
+      const lobbies = await visibleLobbies(req, await liveInFlight);
       res.status(200).json({ lobbies, cached: false });
     } catch (err) {
       log.error({ err }, '[videoSessions] GET /sessions/live error');
@@ -1244,6 +1296,8 @@ videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async 
     if (!lobbyName) {
       throw new ValidationError('lobbyName (or documentId) query parameter is required');
     }
+    // NFR #175: the lobby's own people only.
+    await lobbyAccess().assertLobbyAccess(req, lobbyName);
 
     const session = await videoSessionRepo.getSession(lobbyName, sessionId);
     if (!session) {
@@ -1287,6 +1341,8 @@ videoSessionsRouter.get('/reactions', requireAuth, asyncHandler(async (req: Requ
   if (!lobbyName) {
     throw new ValidationError('lobbyName query parameter is required');
   }
+  // NFR #175: the lobby's own people only (was tenant-only).
+  await lobbyAccess().assertLobbyAccess(req, lobbyName);
   const from = typeof req.query.from === 'string' && req.query.from.length > 0 ? req.query.from : undefined;
   const to = typeof req.query.to === 'string' && req.query.to.length > 0 ? req.query.to : undefined;
   const reactions = await callReactionRepo.listByLobby(tenantOf(req.user?.orgId), lobbyName, from, to);
@@ -1304,6 +1360,13 @@ videoSessionsRouter.post('/captions', requireAuth, asyncHandler(async (req: Requ
   if (!channelArn || typeof enabled !== 'boolean') {
     throw new AppError(400, 'channelArn and enabled are required');
   }
+  // NFR #175: captions tap a call's audio, so only someone who may use the
+  // call's lobby toggles them. The channel is resolved to its session(s);
+  // an unknown channel is 404.
+  const sessionsOnChannel = await videoSessionRepo.findByChannelArn(channelArn);
+  const access = lobbyAccess();
+  const allowed = await Promise.all(sessionsOnChannel.map((x) => access.canUseLobby(req, x.documentId).catch(() => false)));
+  if (!allowed.some(Boolean)) throw new NotFoundError('Session not found');
   if (enabled) {
     const out = await startLiveCaptions({ channelArn, userId: req.user?.sub ?? 'system' });
     res.json({ enabled: true, runId: out.runId, pipelineId: out.pipelineId, reused: out.reused, ...(out.tapIds ? { tapIds: out.tapIds } : {}) });

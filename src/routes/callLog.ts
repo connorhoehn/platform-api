@@ -3,7 +3,8 @@
 import express, { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { requireAuth } from '../middleware/auth';
-import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
+import { asyncHandler, ForbiddenError, NotFoundError, ValidationError } from '../middleware/error-handler';
+import { dmLobbyParticipants } from '../lib/authorize';
 import { callLogRepo, voicemailRepo } from '../repositories';
 import { VOICEMAIL_MAX_BYTES, VOICEMAIL_MAX_DURATION_MS } from '../repositories/VoicemailRepository';
 import type { CallEvent, CallLogFilter } from '../repositories/CallLogRepository';
@@ -48,6 +49,15 @@ export const callLogRouter = Router();
 // POST /api/calls/log/events — idempotent; report as often as you like.
 callLogRouter.post('/log/events', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const event = parseEvent(req.body, req.user!.sub);
+  // NFR #175: a report writes rows into the caller's AND the targets' histories,
+  // so the reporter must be one of the parties — the caller or a target — and,
+  // for a DM lobby, one of the two people it names. Anyone else could forge
+  // calls into strangers' logs.
+  const reporter = req.user!.sub;
+  const dm = typeof event.lobbyName === 'string' ? dmLobbyParticipants(event.lobbyName) : null;
+  if ((event.callerId !== reporter && !event.targetUserIds.includes(reporter)) || (dm && !dm.includes(reporter))) {
+    throw new ForbiddenError('You can only report calls you are part of');
+  }
   const rows = await callLogRepo.applyEvent(event);
   const mine = rows.find((r) => r.userId === req.user!.sub) ?? null;
   res.status(200).json({ applied: rows.length, row: mine });

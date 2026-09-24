@@ -169,6 +169,9 @@ export async function likeComment(
   commentId: string,
   userId: string,
 ): Promise<LikeRecord> {
+  // NFR #175: the post must be in THIS room — requireRoomMembership checked
+  // :roomId, so a member of room A could otherwise like a comment in room B.
+  await assertPostExists(roomId, postId);
   await assertCommentExists(postId, commentId);
 
   const targetId = `comment:${commentId}`;

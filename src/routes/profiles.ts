@@ -155,7 +155,15 @@ profilesRouter.post('/', asyncHandler(async (req: Request, res: Response): Promi
 // forwarding status in one request rather than one per person.
 profilesRouter.get('/batch', asyncHandler(async (req: Request, res: Response): Promise<void> => {
   const ids = String(req.query.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 200);
-  const profiles = (await Promise.all(ids.map((id) => profileRepo.getProfile(id)))).filter((p): p is NonNullable<typeof p> => p !== null);
+  const caller = req.user!.sub;
+  const profiles = (await Promise.all(ids.map((id) => profileRepo.getProfile(id))))
+    .filter((p): p is NonNullable<typeof p> => p !== null)
+    // NFR #175: GET /:userId hides a private profile from everyone but its
+    // owner; the batch must not hand the same row out. The contacts list only
+    // needs forwarding status, so a private row shrinks to that.
+    .map((p) => (p.visibility === 'private' && p.userId !== caller
+      ? { userId: p.userId, visibility: p.visibility, ...(p.callForwarding ? { callForwarding: p.callForwarding } : {}) }
+      : p));
   res.status(200).json({ profiles });
 }));
 

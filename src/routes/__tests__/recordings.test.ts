@@ -26,6 +26,13 @@ const mockDocClientSend = jest.fn();
 const mockCallSfu = jest.fn();
 const mockMapSfuError = jest.fn();
 
+const mockUpdateTranscriptStatus = jest.fn(async (..._a: unknown[]) => undefined);
+const mockStartSystemRun = jest.fn(async (..._a: unknown[]) => 'run-t1');
+jest.mock('../../recordings/recordingPipelines', () => ({
+  ...jest.requireActual('../../recordings/recordingPipelines'),
+  startSystemRun: (...a: unknown[]) => mockStartSystemRun(...a),
+}));
+
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (req: Request, _res: Response, next: NextFunction) => {
     (req as unknown as { user: { sub: string } }).user = { sub: 'u-1' };
@@ -58,6 +65,7 @@ jest.mock('../../repositories', () => {
       },
       listByLobbyName: jest.fn(),
       deleteRecording: jest.fn(),
+      updateTranscriptStatus: (...args: unknown[]) => mockUpdateTranscriptStatus(...args),
     },
     videoSessionRepo: {
       getSessionsByDocument: (...args: unknown[]) => mockGetSessionsByDocument(...args),
@@ -739,5 +747,29 @@ describe('GET /api/recordings/:recordingId — what leaves the process', () => {
     };
     expect(body.participants.map((p) => p.userId).sort()).toEqual(['dev-bob', 'dev-hank']);
     expect(body.participantCount).toBe(2);
+  });
+});
+
+// NFR #175: re-running transcription is a participant's action, like every
+// other /recordings/:recordingId route — it used to take any logged-in user.
+describe('POST /api/recordings/:recordingId/transcribe — NFR #175', () => {
+  const rec = { recordingId: 'rec-t', callId: 'call-t', channelArn: 'arn:t', lobbyName: 'dm:u-1:u-2', startedAt: '2026-09-01T00:00:00Z', composedSegment: { key: 'k' } };
+  beforeEach(() => { mockUpdateTranscriptStatus.mockClear(); mockStartSystemRun.mockClear(); });
+
+  it('a participant starts the run (202)', async () => {
+    mockFindByRecordingId.mockResolvedValue(rec);
+    mockHasParticipantRow.mockResolvedValue(true);
+    const res = await run('POST', '/api/recordings/rec-t/transcribe');
+    expect(res.statusCode).toBe(202);
+    expect(mockStartSystemRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('a stranger is 404 and nothing is touched', async () => {
+    mockFindByRecordingId.mockResolvedValue(rec);
+    mockHasParticipantRow.mockResolvedValue(false);
+    const res = await run('POST', '/api/recordings/rec-t/transcribe');
+    expect(res.statusCode).toBe(404);
+    expect(mockUpdateTranscriptStatus).not.toHaveBeenCalled();
+    expect(mockStartSystemRun).not.toHaveBeenCalled();
   });
 });

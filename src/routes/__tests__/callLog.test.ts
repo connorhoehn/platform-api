@@ -146,6 +146,29 @@ describe('POST /api/calls/log/events', () => {
     expect(lastEvent()).toMatchObject({ action: 'missed', callerId: 'eve', targetUserIds: ['ana'] });
   });
 
+  it('NFR #175: a reporter who is neither the caller nor a target is 403, and nothing is written', async () => {
+    const res = await post(buildApp(), '/api/calls/log/events', {
+      callId: 'call-5', action: 'missed', callerId: 'ana', targetUserIds: ['bob'], lobbyName: 'global-hangout',
+    });
+    expect(res.statusCode).toBe(403);
+    expect(mockApplyEvent).not.toHaveBeenCalled();
+  });
+
+  it('NFR #175: a DM lobby the reporter is not named in is 403 even when the body lists them', async () => {
+    const res = await post(buildApp(), '/api/calls/log/events', {
+      callId: 'call-6', action: 'missed', callerId: 'ana', targetUserIds: ['eve'], lobbyName: 'dm:ana:bob',
+    });
+    expect(res.statusCode).toBe(403);
+    expect(mockApplyEvent).not.toHaveBeenCalled();
+  });
+
+  it('NFR #175: a target reporting the ring is accepted', async () => {
+    const res = await post(buildApp(), '/api/calls/log/events', {
+      callId: 'call-7', action: 'missed', callerId: 'ana', targetUserIds: ['eve'], lobbyName: 'dm:ana:eve',
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
   it('still refuses an action that is not part of the vocabulary', async () => {
     const res = await post(buildApp(), '/api/calls/log/events', {
       callId: 'call-4', action: 'wandered-in', callerId: 'eve',

@@ -20,8 +20,24 @@ const mockFindActiveByLobbyName = jest.fn().mockResolvedValue(null);
 const mockRemoveParticipant = jest.fn();
 const mockRemoveParticipantByUserId = jest.fn();
 const mockListActiveCandidates = jest.fn().mockResolvedValue([]);
+const mockFindByChannelArn = jest.fn().mockResolvedValue([{ documentId: 'room:standup' }]);
 // Profiles decide whether a DM records: both parties must have recordCalls on.
 const mockGetProfile = jest.fn().mockResolvedValue(null);
+
+// NFR #175: lobby access is its own unit (lib/__tests__/lobbyAccess.test.ts);
+// here it allows unless a test says otherwise.
+const mockCanUseLobby = jest.fn(async (..._a: unknown[]) => true);
+jest.mock('../../lib/lobbyAccess', () => ({
+  lobbyAccess: () => ({
+    canUseLobby: (...a: unknown[]) => mockCanUseLobby(...a),
+    assertLobbyAccess: async (...a: unknown[]) => {
+      if (!(await mockCanUseLobby(...a))) {
+        const { NotFoundError } = jest.requireActual('../../middleware/error-handler');
+        throw new NotFoundError('Session not found');
+      }
+    },
+  }),
+}));
 
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (_req: Request, _res: Response, next: NextFunction) => next(),
@@ -44,6 +60,7 @@ jest.mock('../../repositories', () => ({
     removeParticipant: (...args: unknown[]) => mockRemoveParticipant(...args),
     removeParticipantByUserId: (...args: unknown[]) => mockRemoveParticipantByUserId(...args),
     listActiveCandidates: (...args: unknown[]) => mockListActiveCandidates(...args),
+    findByChannelArn: (...args: unknown[]) => mockFindByChannelArn(...args),
   },
   profileRepo: {
     getProfile: (...args: unknown[]) => mockGetProfile(...args),
@@ -1381,7 +1398,8 @@ describe('POST /api/video/sessions/:sessionId/end — join/leave symmetry', () =
 
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
       body: { lobbyName: 'room:standup', clientId: 'tab-2' },
-      // No auth header — sendBeacon.
+      // No auth header — sendBeacon. NFR #175: the entry must be the caller's.
+      userId: 'alice',
     });
 
     expect(res.statusCode).toBe(200);
@@ -1752,5 +1770,93 @@ describe('POST /api/video/captions — the toggle is a pipeline run', () => {
     const b = await run(buildApp(), 'POST', '/api/video/captions', { body: { channelArn: 'arn:x', enabled: 'yes' } });
     expect(b.statusCode).toBe(400);
     expect(mockStartLiveCaptions).not.toHaveBeenCalled();
+  });
+});
+
+// NFR #175 (realtime-examples Loop 29c): every lobby-addressed route asks the
+// lobby check, and a body participantId must be the caller's own entry.
+describe('NFR #175 — lobby access and participant binding', () => {
+  const session = {
+    documentId: 'dm:alice:bob', sessionId: 'vs-9', channelArn: 'arn:lvs:9', status: 'active', startedBy: 'alice',
+    participants: [
+      { userId: 'alice', participantId: 'p-alice' },
+      { userId: 'bob', participantId: 'p-bob' },
+    ],
+  };
+  beforeEach(() => {
+    mockCanUseLobby.mockReset().mockImplementation(async (...a: unknown[]) => {
+      const req = a[0] as { user?: { sub?: string } };
+      return ['alice', 'bob'].includes(req.user?.sub ?? '');
+    });
+    mockGetSession.mockResolvedValue(session);
+    mockFindByChannelArn.mockReset().mockResolvedValue([{ documentId: 'dm:alice:bob' }]);
+  });
+  afterAll(() => { mockCanUseLobby.mockReset().mockResolvedValue(true); });
+
+  const auth = { authorization: 'Bearer t' };
+
+  it('a stranger is 404 on create, join, end, refresh-token, reads and captions — nothing reaches LVS', async () => {
+    const app = buildApp();
+    const as = { userId: 'eve', headers: auth };
+    const calls: Array<[string, string, unknown?]> = [
+      ['POST', '/api/video/sessions', { lobbyName: 'dm:alice:bob' }],
+      ['POST', '/api/video/sessions/vs-9/join', { lobbyName: 'dm:alice:bob' }],
+      ['POST', '/api/video/sessions/vs-9/end', { lobbyName: 'dm:alice:bob', participantId: 'p-bob' }],
+      ['POST', '/api/video/sessions/vs-9/refresh-token', { lobbyName: 'dm:alice:bob', participantId: 'p-bob' }],
+      ['GET', '/api/video/sessions/document/dm:alice:bob'],
+      ['GET', '/api/video/sessions/vs-9?lobbyName=dm:alice:bob'],
+      ['GET', '/api/video/sessions/vs-9/recording?lobbyName=dm:alice:bob'],
+      ['GET', `/api/video/sessions/by-lobby/${encodeURIComponent('dm:alice:bob')}`],
+      ['POST', '/api/video/captions', { channelArn: 'arn:lvs:9', enabled: true }],
+    ];
+    for (const [method, url, body] of calls) {
+      const res = await run(app, method, url, { ...as, body });
+      expect([url, res.statusCode]).toEqual([url, 404]);
+    }
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockStartLiveCaptions).not.toHaveBeenCalled();
+  });
+
+  it('a lobby member reads the session (200)', async () => {
+    const res = await run(buildApp(), 'GET', '/api/video/sessions/vs-9?lobbyName=dm:alice:bob', { userId: 'bob', headers: auth });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('join without a bearer is 401 even for a member', async () => {
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-9/join', { userId: 'bob', body: { lobbyName: 'dm:alice:bob' } });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('/end naming someone else\'s participant is 403 — and the session owner may clear it', async () => {
+    const other = await run(buildApp(), 'POST', '/api/video/sessions/vs-9/end', { userId: 'bob', headers: auth, body: { lobbyName: 'dm:alice:bob', participantId: 'p-alice' } });
+    expect(other.statusCode).toBe(403);
+    expect(mockFetch).not.toHaveBeenCalled();
+
+    mockFetch.mockResolvedValue(apiOk({ participantsRemaining: 1, endedAt: null }));
+    mockRemoveParticipant.mockResolvedValue({ remaining: 1 });
+    const own = await run(buildApp(), 'POST', '/api/video/sessions/vs-9/end', { userId: 'bob', headers: auth, body: { lobbyName: 'dm:alice:bob', participantId: 'p-bob' } });
+    expect(own.statusCode).toBe(200);
+    const owner = await run(buildApp(), 'POST', '/api/video/sessions/vs-9/end', { userId: 'alice', headers: auth, body: { lobbyName: 'dm:alice:bob', participantId: 'p-bob' } });
+    expect(owner.statusCode).toBe(200);
+  });
+
+  it('refresh-token for someone else\'s participant is 403, even for the session owner', async () => {
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-9/refresh-token', { userId: 'alice', headers: auth, body: { lobbyName: 'dm:alice:bob', participantId: 'p-bob' } });
+    expect(res.statusCode).toBe(403);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('/sessions/live lists only the lobbies the caller may use', async () => {
+    mockListActiveCandidates.mockResolvedValue([
+      { documentId: 'dm:alice:bob', sessionId: 's1', channelArn: 'arn:1', status: 'active', startedAt: new Date().toISOString(), startedBy: 'alice', participants: [{ userId: 'alice', participantId: 'p' }] },
+    ]);
+    mockFetch.mockResolvedValue(apiOk({ isLive: true, state: 'LIVE' }));
+    const bob = await run(buildApp(), 'GET', '/api/video/sessions/live', { userId: 'bob', headers: auth });
+    const eve = await run(buildApp(), 'GET', '/api/video/sessions/live', { userId: 'eve', headers: auth });
+    const names = (r: MockRes) => ((r.body as { lobbies: Array<{ lobbyName: string }> }).lobbies ?? []).map((l) => l.lobbyName);
+    expect(eve.statusCode).toBe(200);
+    expect(names(eve)).toEqual([]);
+    // Bob sees whatever the live computation produced — never less than eve.
+    expect(names(bob).length).toBeGreaterThanOrEqual(names(eve).length);
   });
 });
