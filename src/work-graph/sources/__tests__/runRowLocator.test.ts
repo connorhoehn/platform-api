@@ -1,6 +1,7 @@
 import { describe, it, expect } from '@jest/globals';
-import { QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { BatchGetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { PIPELINE_RUNS_RUN_ID_INDEX, RunRowLocator } from '../runRowLocator';
+import { RedisRunKeyStore } from '../runKeyMap';
 
 type Row = Record<string, unknown>;
 
@@ -11,11 +12,24 @@ function missingIndex(): Error {
 }
 
 /** A tiny pipeline-runs table: Scan pages two rows at a time; Query the runId index when it exists. */
-function table(rows: Row[], opts: { index?: boolean } = {}) {
+function table(rows: Row[], opts: { index?: boolean; unprocessedOnce?: boolean } = {}) {
   const calls: string[] = [];
-  const state = { index: opts.index ?? true };
+  const state = { index: opts.index ?? true, unprocessed: opts.unprocessedOnce ?? false };
   const client = {
     send: async (command: unknown) => {
+      if (command instanceof BatchGetCommand) {
+        calls.push('batch');
+        const [[name, request]] = Object.entries(command.input.RequestItems ?? {}) as [[string, { Keys: Row[] }]];
+        let keys = request.Keys;
+        let unprocessed: Row[] = [];
+        if (state.unprocessed && keys.length > 1) {
+          state.unprocessed = false;
+          unprocessed = keys.slice(1);
+          keys = keys.slice(0, 1);
+        }
+        const items = keys.flatMap((key) => rows.filter((row) => row.pipelineId === key.pipelineId && row.runId === key.runId));
+        return { Responses: { [name]: items }, ...(unprocessed.length ? { UnprocessedKeys: { [name]: { Keys: unprocessed } } } : {}) };
+      }
       if (command instanceof QueryCommand) {
         calls.push('query');
         if (!state.index || command.input.IndexName !== PIPELINE_RUNS_RUN_ID_INDEX) throw missingIndex();
@@ -124,5 +138,97 @@ describe('RunRowLocator inside one graph build (NFR #16)', () => {
     expect(t.calls.filter((call) => call === 'query')).toHaveLength(2);
     await withBuildMemo(() => locator.rows(t.client, 'pipeline-runs', ['r1']));
     expect(t.calls.filter((call) => call === 'query')).toHaveLength(3);
+  });
+});
+
+/** An in-memory stand-in for the cache Redis. */
+function memoryCache() {
+  const values = new Map<string, string>();
+  const client = {
+    mGet: async (keys: string[]) => keys.map((key) => values.get(key) ?? null),
+    get: async (key: string) => values.get(key) ?? null,
+    set: async (key: string, value: string) => { values.set(key, value); return 'OK'; },
+    del: async (keys: string | string[]) => { for (const key of [keys].flat()) values.delete(key); return 1; },
+  };
+  return { values, store: new RedisRunKeyStore(async () => client as never) };
+}
+
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+describe('RunRowLocator with remembered run keys (NFR #147)', () => {
+  it('reads a remembered run by its table key in one BatchGetItem, fresh, and the rest through the index', async () => {
+    const t = table([
+      { pipelineId: 'p1', runId: 'r1', status: 'running' },
+      { pipelineId: 'p2', runId: 'r2' },
+      { pipelineId: 'p2', runId: 'r3' },
+    ]);
+    const { store, values } = memoryCache();
+    const locator = new RunRowLocator(Date.now, store);
+    const first = await locator.rows(t.client, 'runs', ['r1', 'r2', 'missing']);
+    expect(t.calls).toEqual(['query', 'query', 'query']);
+    expect(first.get('missing')).toBeNull();
+    await flush();
+    expect([...values.keys()].sort()).toEqual(['wg:runkey:runs:r1', 'wg:runkey:runs:r2']);
+
+    t.calls.length = 0;
+    t.rows[0]!.status = 'completed';
+    const second = await locator.rows(t.client, 'runs', ['r1', 'r2', 'r3']);
+    expect(second.get('r1')?.status).toBe('completed');
+    expect(second.get('r3')?.pipelineId).toBe('p2');
+    expect(t.calls).toEqual(['batch', 'query']);
+  });
+
+  it('retries UnprocessedKeys', async () => {
+    const t = table([{ pipelineId: 'p', runId: 'a' }, { pipelineId: 'p', runId: 'b' }], { unprocessedOnce: true });
+    const { store, values } = memoryCache();
+    values.set('wg:runkey:runs:a', 'p');
+    values.set('wg:runkey:runs:b', 'p');
+    const found = await new RunRowLocator(Date.now, store).rows(t.client, 'runs', ['a', 'b']);
+    expect(found.get('a')?.runId).toBe('a');
+    expect(found.get('b')?.runId).toBe('b');
+    expect(t.calls).toEqual(['batch', 'batch']);
+  });
+
+  it('a remembered key whose row is gone goes back to the index and is forgotten', async () => {
+    const t = table([{ pipelineId: 'p2', runId: 'moved' }]);
+    const { store, values } = memoryCache();
+    values.set('wg:runkey:runs:gone', 'p1');
+    values.set('wg:runkey:runs:moved', 'p1');
+    const found = await new RunRowLocator(Date.now, store).rows(t.client, 'runs', ['gone', 'moved']);
+    expect(found.get('gone')).toBeNull();
+    expect(found.get('moved')?.pipelineId).toBe('p2');
+    await flush();
+    expect(values.get('wg:runkey:runs:gone')).toBeUndefined();
+    expect(values.get('wg:runkey:runs:moved')).toBe('p2');
+  });
+
+  it('never remembers an ambiguous id, and a write naming another pipeline drops a remembered key', async () => {
+    const t = table([{ pipelineId: 'p1', runId: 'dup' }, { pipelineId: 'p2', runId: 'dup' }]);
+    const { store, values } = memoryCache();
+    const locator = new RunRowLocator(Date.now, store);
+    expect((await locator.rows(t.client, 'runs', ['dup'])).get('dup')).toBeNull();
+    await flush();
+    expect(values.size).toBe(0);
+
+    values.set('wg:runkey:runs:solo', 'p1');
+    await store.noteWrite('runs', 'p1', 'solo');
+    expect(values.get('wg:runkey:runs:solo')).toBe('p1');
+    await store.noteWrite('runs', 'p9', 'solo');
+    expect(values.get('wg:runkey:runs:solo')).toBeUndefined();
+  });
+
+  it('never takes an agent loop pointer row for the run, even under a remembered key', async () => {
+    const t = table([{ pipelineId: 'loops-by-person#u1', runId: 'loop', status: 'index' }, { pipelineId: 'chat-agent-loop', runId: 'loop' }]);
+    const { store, values } = memoryCache();
+    values.set('wg:runkey:runs:loop', 'loops-by-person#u1');
+    const found = await new RunRowLocator(Date.now, store).rows(t.client, 'runs', ['loop']);
+    expect(found.get('loop')?.pipelineId).toBe('chat-agent-loop');
+  });
+
+  it('reads through the index when the cache is unreachable', async () => {
+    const t = table([{ pipelineId: 'p', runId: 'r' }]);
+    const locator = new RunRowLocator(Date.now, new RedisRunKeyStore(async () => null));
+    expect((await locator.rows(t.client, 'runs', ['r'])).get('r')?.pipelineId).toBe('p');
+    expect(t.calls).toEqual(['query']);
   });
 });

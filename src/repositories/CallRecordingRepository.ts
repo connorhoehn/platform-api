@@ -23,6 +23,7 @@
  * we don't surface dangling metadata for already-deleted media.
  */
 
+import { recordingLocator } from '../work-graph/sources/recordingLocator';
 import {
   DynamoDBDocumentClient,
   PutCommand,
@@ -613,6 +614,8 @@ export class CallRecordingRepository extends BaseRepository {
   async putRecording(rec: Omit<CallRecording, 'ttl'>): Promise<void> {
     const ttl = Math.floor(Date.now() / 1000) + RETENTION_DAYS * 86400;
     const full: CallRecording = { ...rec, ttl };
+    // The work graph remembers which row a transcript id lives in (NFR #148).
+    void recordingLocator.noteWrite(CALL_RECORDINGS_TABLE, rec as { transcriptId?: unknown; recordingId?: unknown });
 
     // Evict fan-out rows this recording left at a PREVIOUS `startedAt`.
     //
@@ -893,6 +896,7 @@ export class CallRecordingRepository extends BaseRepository {
    */
   async deleteRecording(callId: string, recordingId: string): Promise<void> {
     const rec = await this.getRecording(callId, recordingId);
+    void recordingLocator.noteWrite(CALL_RECORDINGS_TABLE, { ...(rec ?? {}), recordingId });
     if (rec) {
       // Mirror putRecording's fan-out set EXACTLY — same helper, so the
       // two can't drift. Any row putRecording wrote, this deletes; a

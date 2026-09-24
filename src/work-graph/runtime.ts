@@ -34,6 +34,7 @@ import { WorkSourceAccountRepository } from '../repositories/WorkSourceAccountRe
 import { createWorkGraphCursorCodec } from './cursor';
 import { parsePipelineStepResourceId } from './sources/mapPipeline';
 import { runRowLocator } from './sources/runRowLocator';
+import { recordingLocator } from './sources/recordingLocator';
 import { DynamoWorkActivityReader } from './sources/activityReader';
 import {
   WorkGraphOrchestrator,
@@ -341,7 +342,7 @@ async function computeSourceCall<T>(path: string, body: Record<string, unknown>)
 interface AclBatch {
   /** `runId` → its run row; absent when unknown or ambiguous. */
   runs: Map<string, Record<string, unknown> | null>;
-  /** Any of `callId` / `recordingId` / `transcriptId` → its recording row. */
+  /** A meeting-source resource id (`meeting:` / `recording:` / `transcript:`) → its recording row. */
   recordings: Map<string, Record<string, unknown> | null>;
   documents: Map<string, Record<string, unknown> | null>;
   /** `channel\u0000userId` → membership, memoized across targets. */
@@ -373,14 +374,6 @@ function indexRows(
   for (const id of wanted) if (!into.has(id)) into.set(id, null);
 }
 
-/** `id IN (:v0, :v1, …)`, chunked so one expression never exceeds DynamoDB's cap. */
-const MAX_IN_OPERANDS = 90;
-/**
- * `scanAll` pages at `min(100, maximum - read)`, so a small maximum walks the
- * table a couple of items per round trip — which is how one run lookup became
- * dozens of calls. A prefetch always asks for a full page.
- */
-const MIN_ACL_SCAN_ROWS = 100;
 
 function chunked<T>(values: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -467,16 +460,10 @@ export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
     }
 
     if (this.source === 'meeting') {
-      const ids = new Set(distinct.map((id) => id.replace(/^(meeting|recording|transcript):/, '')));
-      await Promise.all(chunked([...ids], MAX_IN_OPERANDS).map(async (chunk) => {
-        const values = Object.fromEntries(chunk.map((id, index) => [`:m${index}`, id]));
-        const names = Object.keys(values).join(', ');
-        const rows = await scanAll(this.client, {
-          TableName: RECORDINGS_TABLE,
-          FilterExpression: `callId IN (${names}) OR recordingId IN (${names}) OR transcriptId IN (${names})`,
-          ExpressionAttributeValues: values,
-        }, Math.max(chunk.length * 2, MIN_ACL_SCAN_ROWS));
-        indexRows(batch.recordings, rows, ['callId', 'recordingId', 'transcriptId'], new Set(chunk));
+      // Keyed reads by the id's kind (NFR #148) — a Query on `callId` or on
+      // `recordingId-index` — instead of a filtered Scan of the whole table.
+      await Promise.all(distinct.map(async (resourceId) => {
+        batch.recordings.set(resourceId, await recordingLocator.find(this.client, RECORDINGS_TABLE, resourceId));
       }));
       return batch;
     }
@@ -582,7 +569,7 @@ export class DynamoSourceAclAdapter implements WorkSourceAclAdapter {
     }
     if (this.source === 'meeting') {
       const meetingId = resourceId.replace(/^(meeting|recording|transcript):/, '');
-      const row = batch.recordings.get(meetingId) ?? undefined;
+      const row = batch.recordings.get(resourceId) ?? undefined;
       const people = new Set<string>([
         ...(Array.isArray(row?.participants)
           ? row.participants.flatMap((value) => value && typeof value === 'object' && typeof (value as { userId?: unknown }).userId === 'string'
@@ -695,12 +682,7 @@ export class DynamoSourceActionAdapter implements WorkSourceActionAdapter {
       return { decision: 'allow', descriptor: { kind: 'route', capability, path: `/pipelines/${encodeURIComponent(row.pipelineId)}/runs/${encodeURIComponent(row.runId)}` } };
     }
     if (this.source === 'meeting' && (capability === 'view-transcript' || capability === 'join-meeting')) {
-      const rows = await scanAll(this.client, {
-        TableName: RECORDINGS_TABLE,
-        FilterExpression: 'callId = :id OR recordingId = :id OR transcriptId = :id',
-        ExpressionAttributeValues: { ':id': resourceId.replace(/^(meeting|recording|transcript):/, '') },
-      }, 2);
-      const row = rows.length === 1 ? rows[0] : undefined;
+      const row = (await recordingLocator.find(this.client, RECORDINGS_TABLE, resourceId)) ?? undefined;
       if (typeof row?.recordingId !== 'string') return { decision: 'deny' };
       return { decision: 'allow', descriptor: { kind: 'route', capability, path: `/social/recordings/${encodeURIComponent(row.recordingId)}` } };
     }

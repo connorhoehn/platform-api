@@ -27,7 +27,10 @@ function respond(over: { room?: Record<string, unknown> | null; members?: unknow
       if (table.includes('hangout-rooms')) return { Items: over.room === null ? [] : [over.room ?? { roomId: ROOM, createdBy: 'dev-frank', name: 'Platform team sync' }] };
       return { Items: [] };
     }
-    if (cmd.constructor.name === QueryCommand.name) return { Items: over.members ?? [{ userId: 'dev-nina' }] };
+    if (cmd.constructor.name === QueryCommand.name) {
+      if (table.includes('video-call-recordings')) return { Items: [] };
+      return { Items: over.members ?? [{ userId: 'dev-nina' }] };
+    }
     if (cmd.constructor.name === GetCommand.name) {
       const userId = String((cmd.input.Key as { userId?: string } | undefined)?.userId ?? '');
       const label = (over.profiles ?? { 'dev-frank': 'Frank Castle', 'dev-nina': 'Nina Lopez' })[userId];

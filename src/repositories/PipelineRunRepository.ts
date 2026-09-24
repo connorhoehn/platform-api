@@ -5,6 +5,7 @@
 // `/api/pipelines/:pipelineId/runs` operator-facing surface.
 
 import { DynamoDBDocumentClient, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { runKeyStore } from '../work-graph/sources/runKeyMap';
 import type { PipelineRunStatus, PipelineStepStatus } from '@connorhoehn/pipeline-runtime';
 import { isTerminalRunStatus } from '@connorhoehn/pipeline-runtime';
 import { BaseRepository } from './BaseRepository';
@@ -362,6 +363,7 @@ export class PipelineRunRepository extends BaseRepository {
    * expiry without fighting this default.
    */
   async put(item: PipelineRunItem): Promise<void> {
+    this.noteRunKey(item);
     const stamped =
       item.ttl === undefined && isTerminalRunStatus(item.status)
         ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
@@ -392,6 +394,7 @@ export class PipelineRunRepository extends BaseRepository {
    * owner with a full-row put and erasing its fields.
    */
   async putOwned(item: PipelineRunItem, ownerNodeId: string): Promise<boolean | 'superseded'> {
+    this.noteRunKey(item);
     const stamped =
       item.ttl === undefined && isTerminalRunStatus(item.status)
         ? { ...item, ttl: Math.floor(Date.now() / 1000) + runRetentionDays() * 86_400 }
@@ -419,6 +422,17 @@ export class PipelineRunRepository extends BaseRepository {
   }
 
   /** Fetch a single run by composite key. */
+  /**
+   * The work graph remembers which pipeline a run id belongs to (NFR #147,
+   * `work-graph/sources/runKeyMap`); a row that names a remembered id under a
+   * different pipeline drops that memory. Fire-and-forget: never delays or
+   * fails the write. An agent loop's person-day pointer row is not a run.
+   */
+  private noteRunKey(item: PipelineRunItem): void {
+    if ((item as { status?: unknown }).status === 'index') return;
+    void runKeyStore.noteWrite(this.tableName, item.pipelineId, item.runId);
+  }
+
   async get(pipelineId: string, runId: string): Promise<PipelineRunItem | null> {
     return this.getItem<PipelineRunItem>({ pipelineId, runId });
   }

@@ -15,9 +15,10 @@
  * Every read returns the row as it is now; nothing is cached. More than one
  * row claiming an id resolves to null (ambiguous provenance discloses nothing).
  */
-import { QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { BatchGetCommand, QueryCommand, ScanCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import log from '../../lib/logger';
 import { buildMemoActive, memoHas, memoOnce } from '../buildMemo';
+import { runKeyStore, type RunKeyStore } from './runKeyMap';
 
 const memoKey = (table: string, runId: string): string => `run-row\u0000${table}\u0000${runId}`;
 
@@ -34,6 +35,10 @@ const MAX_SCANNED_ROWS = 20_000;
 const QUERY_CONCURRENCY = 16;
 /** How long a table found without the index is scanned before the index is tried again. */
 const INDEX_RECHECK_MS = 5 * 60_000;
+/** DynamoDB's cap on keys per `BatchGetItem`. */
+const BATCH_GET_KEYS = 100;
+/** Rounds of `UnprocessedKeys` retried before those runs go back to the index. */
+const BATCH_GET_RETRIES = 4;
 
 /** DynamoDB's answer when the named index does not exist on the table. */
 export function isMissingIndexError(err: unknown): boolean {
@@ -47,7 +52,15 @@ export class RunRowLocator {
   private readonly missingIndexAt = new Map<string, number>();
   private readonly warned = new Set<string>();
 
-  constructor(private readonly now: () => number = Date.now) {}
+  /**
+   * `keys` — remembered `runId → pipelineId` (NFR #147): a remembered run is
+   * read by its table key in a `BatchGetItem`, the rest by the index. Null
+   * reads every run through the index.
+   */
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly keys: RunKeyStore | null = null,
+  ) {}
 
   /** For tests and logs: is this table currently served by the index? */
   usesIndex(table: string): boolean {
@@ -80,6 +93,60 @@ export class RunRowLocator {
   }
 
   private async readRows(client: DynamoDBDocumentClient, table: string, wanted: string[]): Promise<Map<string, Row | null>> {
+    if (!this.keys || !this.usesIndex(table)) return this.readUnkeyed(client, table, wanted);
+    const known = await this.keys.get(table, wanted).catch(() => new Map<string, string>());
+    const found = new Map<string, Row | null>();
+    if (known.size) {
+      const byKey = await this.viaKeys(client, table, [...known].map(([runId, pipelineId]) => ({ pipelineId, runId })));
+      for (const [runId, row] of byKey) found.set(runId, row);
+    }
+    // Not remembered, or remembered and not where the key said (row gone,
+    // throttled past the retries): the index answers, and fills the map.
+    const rest = wanted.filter((id) => !found.has(id));
+    if (!rest.length) return found;
+    const read = await this.readUnkeyed(client, table, rest);
+    const fills: Array<[string, string]> = [];
+    const stale: string[] = [];
+    for (const [runId, row] of read) {
+      found.set(runId, row);
+      if (row && typeof row.pipelineId === 'string') fills.push([runId, row.pipelineId]);
+      else if (known.has(runId)) stale.push(runId);
+    }
+    if (this.usesIndex(table)) {
+      // Only an index answer proves a key unique; a Scan fallback fills nothing.
+      void this.keys.fill(table, fills);
+      void this.keys.drop(table, stale);
+    }
+    return found;
+  }
+
+  /** Remembered runs by their table key, 100 a call; `UnprocessedKeys` retried. */
+  private async viaKeys(
+    client: DynamoDBDocumentClient,
+    table: string,
+    keys: Array<{ pipelineId: string; runId: string }>,
+  ): Promise<Map<string, Row>> {
+    const found = new Map<string, Row>();
+    const pipelineOf = new Map(keys.map((key) => [key.runId, key.pipelineId]));
+    const chunks: Array<Array<Record<string, unknown>>> = [];
+    for (let index = 0; index < keys.length; index += BATCH_GET_KEYS) chunks.push(keys.slice(index, index + BATCH_GET_KEYS));
+    await Promise.all(chunks.map(async (chunk) => {
+      let pending: Array<Record<string, unknown>> | undefined = chunk;
+      for (let round = 0; pending?.length && round <= BATCH_GET_RETRIES; round += 1) {
+        if (round > 0) await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** round));
+        const result = await client.send(new BatchGetCommand({ RequestItems: { [table]: { Keys: pending } } }));
+        for (const item of (result?.Responses?.[table] ?? []) as Row[]) {
+          const runId = typeof item.runId === 'string' ? item.runId : undefined;
+          if (!runId || pipelineOf.get(runId) !== item.pipelineId || isIndexRow(item)) continue;
+          found.set(runId, item);
+        }
+        pending = result?.UnprocessedKeys?.[table]?.Keys as Array<Record<string, unknown>> | undefined;
+      }
+    }));
+    return found;
+  }
+
+  private async readUnkeyed(client: DynamoDBDocumentClient, table: string, wanted: string[]): Promise<Map<string, Row | null>> {
     if (this.usesIndex(table)) {
       try {
         const found = await this.viaIndex(client, table, wanted);
@@ -166,5 +233,8 @@ function isIndexRow(item: Row): boolean {
   return item.status === 'index';
 }
 
-/** One per process: it holds no rows, only whether each table has the index. */
-export const runRowLocator = new RunRowLocator();
+/**
+ * One per process: it holds no rows, only whether each table has the index;
+ * run keys live in the shared cache Redis (`runKeyMap`).
+ */
+export const runRowLocator = new RunRowLocator(Date.now, runKeyStore);

@@ -36,6 +36,7 @@ import type {
 } from '../activity';
 import { parsePipelineStepResourceId } from './mapPipeline';
 import { runRowLocator } from './runRowLocator';
+import { recordingLocator } from './recordingLocator';
 
 const PIPELINE_RUNS_TABLE = tableName('pipeline-runs');
 const RECORDINGS_TABLE = tableName('video-call-recordings');
@@ -639,12 +640,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
 
   async transcript(transcriptId: string): Promise<TranscriptFacts | null> {
     const id = transcriptId.replace(/^transcript:/, '');
-    const row = await scanOne(
-      this.client,
-      RECORDINGS_TABLE,
-      'transcriptId = :id OR recordingId = :id',
-      { ':id': id },
-    );
+    const row = (await recordingLocator.find(this.client, RECORDINGS_TABLE, `transcript:${id}`)) ?? undefined;
     if (!row || row.transcriptStatus !== 'ready' || typeof row.transcriptJson !== 'string') return null;
     let parsed: unknown;
     try {
@@ -683,7 +679,7 @@ export class DynamoWorkActivityReader implements WorkActivityReader {
 
   async meeting(meetingId: string): Promise<MeetingFacts | null> {
     const id = meetingId.replace(/^meeting:/, '');
-    const row = await scanOne(this.client, RECORDINGS_TABLE, 'callId = :id', { ':id': id });
+    const row = (await recordingLocator.find(this.client, RECORDINGS_TABLE, `meeting:${id}`)) ?? undefined;
     // A room that has not happened yet has no recording. It is still a real
     // meeting with real people expected on it, and saying nothing about it
     // left the card blank for the person who had just booked it.

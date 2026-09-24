@@ -56,6 +56,13 @@ function client(rows: Record<string, unknown>[]): { client: DynamoDBDocumentClie
       const runId = command.input.ExpressionAttributeValues?.[':r'];
       return { Items: rows.filter((row) => row.runId === runId) };
     }
+    if (command instanceof QueryCommand && String(command.input.TableName).includes('video-call-recordings')) {
+      // Keyed recording reads (NFR #148): the hash key, or the recordingId GSI.
+      counts.query += 1;
+      const attribute = command.input.IndexName === 'recordingId-index' ? 'recordingId' : 'callId';
+      const id = command.input.ExpressionAttributeValues?.[':id'];
+      return { Items: rows.filter((row) => row[attribute] === id) };
+    }
     if (command instanceof ScanCommand) {
       counts.scan += 1;
       return { Items: rows };
@@ -161,7 +168,7 @@ describe('source ACL authorization reads', () => {
     expect(decisions.get('t1')?.decision).toBe('deny');
   });
 
-  it('authorizes a meeting, its recording and its transcript with one scan', async () => {
+  it('authorizes a meeting, its recording and its transcript by keyed Queries (NFR #148)', async () => {
     const rows = [{
       callId: 'call-1',
       recordingId: 'rec-1',
@@ -172,9 +179,11 @@ describe('source ACL authorization reads', () => {
     const { client: ddb, counts } = client(rows);
     const decisions = await new DynamoSourceAclAdapter('meeting', ddb).authorizeDisclosure(scope, [
       node('m1', 'meeting', 'meeting', 'meeting:call-1'),
-      node('m2', 'transcript', 'meeting', 'transcript:tr-1'),
+      node('m2', 'transcript', 'meeting', 'transcript:rec-1'),
+      node('m3', 'recording', 'meeting', 'recording:rec-1'),
     ]);
-    expect(counts.scan).toBe(1);
+    expect(counts.scan).toBe(0);
+    expect(decisions.get('m3')?.decision).toBe('allow');
     expect(decisions.get('m1')?.decision).toBe('allow');
     expect(decisions.get('m2')?.capabilities).toEqual(['view-transcript']);
   });
