@@ -151,6 +151,7 @@ import { forgetDeadLetters, rehydrateDeadLetters, setDeadLetterStore } from './d
 import { getSystemPipeline } from './systemPipelines';
 import { getPipelineBridge } from '../routes/pipelineTriggers';
 import { describePipelineRecovery, runWalPreflight } from './WalPreflight';
+import { stampPipelineArtifactIds } from './busArtifactIds';
 import { resolveLiveMqConfig, startPipelineEventMqRelay, type PipelineEventMqRelay } from './event-mq-relay';
 import { setDeckReviseLiveSink } from '../deck/deckReviseEvents';
 import { createShutdown } from './ShutdownOrchestrator';
@@ -901,6 +902,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // ids, tenant ids, or pipeline ids.
   const runQueueMetrics = getQueueMetrics('run-queue');
   const eventBus = module.getEventBus();
+  // NFR #161: the documents a step declared ride its `pipeline:step:completed`
+  // and the run's `pipeline:run:completed` as `artifactIds`, on every lane
+  // (dc pub-sub, the Redis relay, the MQ relay all read this publish).
+  stampPipelineArtifactIds(eventBus);
 
   // --- Live pipeline signal transport (EventBus → Redis → gateway) ---
   //
