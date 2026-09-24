@@ -564,7 +564,7 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     const revisionId = nextRevisionId(existing);
     const writeId = randomUUID().slice(0, 8);
 
-    // The file is content-addressed by its spec (NFR #171): the same spec is
+    // The file is content-addressed by its spec (NFR #178): the same spec is
     // the same blob, and a revision with no bytes yet (a composer edit) names
     // the key its first download will build. A spec-less save keeps the old
     // per-attempt key.
@@ -767,7 +767,7 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
     if (!revision?.asset?.key) return null;
     const key = revision.asset.key;
     const contentType = revision.asset.contentType || PPTX_CONTENT_TYPE;
-    // Immutable bytes: a warm download is a memory read (NFR #171).
+    // Immutable bytes: a warm download is a memory read (NFR #178).
     const warm = recalledPptx(key);
     if (warm) return { contentType, body: warm, from: 'memory' };
     const primary = await this.blobStore.getBlob(key).catch(() => null);

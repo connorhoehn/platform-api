@@ -1,5 +1,5 @@
 /**
- * The `.pptx` of a revision, built once per content and kept (NFR #171,
+ * The `.pptx` of a revision, built once per content and kept (NFR #178,
  * realtime-examples Loop 29 ppt).
  *
  * A revision is immutable, so its file is a pure function of its spec and the

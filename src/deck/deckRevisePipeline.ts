@@ -629,7 +629,7 @@ export function createDeckReviseWriteHandler(opts: DeckReviseStepOpts = {}): Des
       for (let attempt = 0; ; attempt += 1) {
         try {
           // No .pptx now: most edits are never downloaded, and the first
-          // download builds it once (content key, pptxCache.ts, NFR #171).
+          // download builds it once (content key, pptxCache.ts, NFR #178).
           const slides = renderDeckSlides(spec);
           const { revision } = await store.appendRevision({
             documentId: request.documentId,

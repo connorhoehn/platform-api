@@ -104,7 +104,7 @@ export async function renderDeckFiles(spec: DeckSpec): Promise<{ pptx: Buffer; s
   return { pptx, slides: renderDeckSlides(spec) };
 }
 
-/** The slide SVGs alone — a composer edit's revision, whose `.pptx` is built on first download (NFR #171). */
+/** The slide SVGs alone — a composer edit's revision, whose `.pptx` is built on first download (NFR #178). */
 export function renderDeckSlides(spec: DeckSpec): Array<{ id: string; title: string; svg: string }> {
   const svgs = renderAllSlideSvgs(spec);
   // The renderers agree on slide order: the deck's own slides, then Sources.

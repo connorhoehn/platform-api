@@ -10,7 +10,7 @@ import { PPTX_CONTENT_KEY, buildPptxOnce, pptxBuildCount, pptxContentKey, recall
 
 const spec = { title: 'Release plan', slides: [{ id: 's1', layout: 'title' as const, title: 'Release plan', sources: [] }] };
 
-describe('pptxCache (NFR #171)', () => {
+describe('pptxCache (NFR #178)', () => {
   beforeEach(() => resetPptxCache());
 
   it('keys by content: same spec (any key order) → same key; a changed spec → a new key; sweepable name', () => {

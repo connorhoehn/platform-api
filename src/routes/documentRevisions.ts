@@ -309,7 +309,7 @@ documentRevisionsRouter.get('/:revisionId/file', requireAuth, asyncHandler(async
   const loadedAt = Date.now();
   // Memory, then the configured store, then the durable copy — a deck rendered
   // before a pod replacement is still downloadable — then, for a content key,
-  // one build across replicas (NFR #171). The row loadRevision read is reused.
+  // one build across replicas (NFR #178). The row loadRevision read is reused.
   const store = getPresentationDocumentStore();
   const stored = store.revisionFile
     ? await store.revisionFile(documentId, revision.id, row)
