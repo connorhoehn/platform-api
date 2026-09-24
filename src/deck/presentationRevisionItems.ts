@@ -126,6 +126,10 @@ export async function queryRevisionPage(
     ExpressionAttributeValues: { ':d': documentId },
     ScanIndexForward: false,
     Limit: opts.limit,
+    // Read-your-writes across replicas (Loop 31 ppt): a save on one replica,
+    // then this page from another, must list the new head — and agree with
+    // the head row's `revisionCount`, which is read consistently too.
+    ConsistentRead: true,
     ...(opts.beforeVersion !== undefined ? { ExclusiveStartKey: { documentId, rev: revKey(opts.beforeVersion) } } : {}),
   }));
   return {

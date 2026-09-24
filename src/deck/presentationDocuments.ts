@@ -590,7 +590,7 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
   }
 
   async getRow(documentId: string): Promise<PresentationDocumentRow | null> {
-    const result = await this.docClient.send(new GetCommand({ TableName: DOCUMENTS_TABLE, Key: { documentId } }));
+    const result = await this.docClient.send(new GetCommand({ TableName: DOCUMENTS_TABLE, Key: { documentId }, ConsistentRead: true }));
     return (result.Item as PresentationDocumentRow | undefined) ?? null;
   }
 

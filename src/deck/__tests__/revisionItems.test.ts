@@ -24,6 +24,7 @@ function fakeTables() {
   const rows = new Map<string, Record<string, any>>();
   const items = new Map<string, Record<string, any>>();
   const calls: string[] = [];
+  const reads: boolean[] = [];
   const itemKey = (key: Record<string, any>) => `${key.documentId}|${key.rev}`;
   const headOk = (row: Record<string, any> | undefined, input: Record<string, any>): boolean => {
     const expr: string = input.ConditionExpression ?? '';
@@ -58,6 +59,7 @@ function fakeTables() {
     async send(command: any) {
       const input = command.input;
       calls.push(`${command.constructor.name}:${input.TableName ?? 'tx'}`);
+      if (command instanceof GetCommand || command instanceof QueryCommand) reads.push(input.ConsistentRead === true);
       if (command instanceof GetCommand) {
         const found = input.TableName === REVS ? items.get(itemKey(input.Key)) : rows.get(input.Key.documentId);
         return { Item: found ? structuredClone(found) : undefined };
@@ -110,7 +112,7 @@ function fakeTables() {
       throw new Error(`unexpected ${command.constructor.name}`);
     },
   } as unknown as DynamoDBDocumentClient;
-  return { client, rows, items, calls };
+  return { client, rows, items, calls, reads };
 }
 
 const spec = (tag: string) => ({ title: `Deck ${tag}`, slides: [{ id: 'cover', layout: 'title', title: tag, sources: [] }] }) as any;
@@ -146,6 +148,8 @@ describe('revisions as items (NFR #188)', () => {
     tables.calls.length = 0;
     const first = await store.listRevisions('doc-1', { limit: 5 });
     expect(tables.calls).toEqual([`GetCommand:${DOCUMENTS_TABLE}`, `QueryCommand:${REVS}`]);
+    // Read-your-writes across replicas: both reads of a page are strongly consistent.
+    expect(tables.reads.slice(-2)).toEqual([true, true]);
     expect(first!.revisions.map((r) => r.id)).toEqual(['v12', 'v11', 'v10', 'v9', 'v8']);
     expect(first!.total).toBe(12);
     const second = await store.listRevisions('doc-1', { limit: 5, before: first!.nextCursor! });
