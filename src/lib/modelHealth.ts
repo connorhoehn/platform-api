@@ -271,6 +271,21 @@ export async function guardModelCall<T>(fn: () => Promise<T>, isNeutral: Neutral
   }
 }
 
+/**
+ * The breaker's verdict without taking a trial: throws ModelUnavailableError
+ * when a call would be refused right now. For a caller with slow work before
+ * its model call (a revise reads its sources first) to fail before that work.
+ */
+export async function assertModelAvailable(): Promise<void> {
+  const s = await readBreaker().catch(() => CLOSED);
+  const v = admit(s, Date.now(), breakerConfig());
+  if (!v.allow) {
+    gauges().rejected.inc(1);
+    rejected += 1;
+    throw new ModelUnavailableError(v.kind, v.reason, v.retryInMs);
+  }
+}
+
 /** Operator/test hook: force every replica's calls to fail fast (or clear it). */
 export async function forceBreaker(reason: string | null): Promise<BreakerState> {
   return update((s) => (reason ? { ...s, forced: { reason, at: Date.now() }, updatedAt: Date.now() } : { ...CLOSED, updatedAt: Date.now() }));

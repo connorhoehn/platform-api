@@ -23,7 +23,7 @@ import log from '../lib/logger';
 import { CALL_RECORDINGS_TABLE } from '../repositories/CallRecordingRepository';
 import { createLLMClient } from '../pipeline/createLLMClient';
 import { ModelSlotTimeoutError, withModelSlot } from './modelSlots';
-import { guardModelCall, ModelUnavailableError } from '../lib/modelHealth';
+import { assertModelAvailable, guardModelCall, ModelUnavailableError } from '../lib/modelHealth';
 import type { LLMClient } from '../pipeline/LLMClient';
 import {
   MAX_BULLETS_PER_SLIDE, MAX_BULLET_CHARS, MAX_NOTES_CHARS, MAX_SLIDES, MAX_SOURCES_PER_SLIDE, MAX_TITLE_CHARS,
@@ -484,6 +484,15 @@ export async function reviseDeck(input: DeckReviseInput, opts: DeckReviseOpts = 
   }
 
   const phase = (next: DeckRevisePhase) => { try { opts.onPhase?.(next); } catch { /* a progress line is not the edit */ } };
+  // An open model breaker fails the revise before the sources are read (NFR #225).
+  if (opts.modelBreaker ?? opts.llm === undefined) {
+    await assertModelAvailable().catch((err: unknown) => {
+      if (err instanceof ModelUnavailableError) {
+        throw new DeckReviseError(`Model unavailable: ${err.reason}. Nothing was changed.`, 503, `model unavailable: ${err.reason}`);
+      }
+      throw err;
+    });
+  }
   phase('reading-sources');
   const read = await Promise.all(refs.map((ref) => readSource(ref, titleOf.get(ref.id), opts)));
   const warnings = read
