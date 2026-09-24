@@ -578,6 +578,42 @@ describe('WorkGraphRepository', () => {
     });
   });
 
+  describe('fenced read under write load (NFR #219)', () => {
+    // META moves on every Get while `moving` is true: each fenced attempt
+    // straddles a commit.
+    const busy = () => {
+      const state = { revision: 1, moving: false };
+      const send: Send = jest.fn(async (command: unknown) => {
+        if (command instanceof GetCommand) {
+          if (state.moving) state.revision += 1;
+          return { Item: meta(state.revision) };
+        }
+        if (command instanceof QueryCommand) return { Items: [meta(state.revision)] };
+        return {};
+      });
+      return { state, repository: new WorkGraphRepository(client(send), reducer) };
+    };
+
+    it('a reader gets the last proven revision instead of an error; a writer still gets the error', async () => {
+      const { state, repository } = busy();
+      expect((await repository.loadProjectionForLocalDay('org-1', 'actor-1', '2026-09-20', 'UTC'))?.revision).toBe(1);
+      state.moving = true;
+      const read = await repository.loadProjectionForLocalDay('org-1', 'actor-1', '2026-09-20', 'UTC');
+      expect(read?.revision).toBe(1);
+      expect(repository.lastGoodServed).toBe(1);
+      await expect(repository.loadCurrentProjection('org-1', 'actor-1', '2026-09-20'))
+        .rejects.toBeInstanceOf(WorkGraphConcurrencyError);
+    });
+
+    it('waits between attempts, so a burst that settles mid-read is read fresh', async () => {
+      const { state, repository } = busy();
+      state.moving = true;
+      setTimeout(() => { state.moving = false; }, 40);
+      const read = await repository.loadProjection('org-1', 'actor-1', '2026-09-20');
+      expect(read?.revision).toBe(state.revision);
+    });
+  });
+
   describe('writer path (NFR #202)', () => {
     it('reads only projection items, reuses the caller\'s load, and holds the committed state', async () => {
       let revision = 0;

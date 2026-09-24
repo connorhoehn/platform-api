@@ -223,7 +223,14 @@ const EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const DELTA_RETENTION_SECONDS = 30 * 60;
 const MAX_APPLIED_EVENT_IDS = 1_000;
 const MAX_TRANSACTION_ITEMS = 100;
-const MAX_FENCED_READ_ATTEMPTS = 3;
+const MAX_FENCED_READ_ATTEMPTS = 6;
+/**
+ * NFR #219: waits between fenced attempts, ms (jittered ×0.5–1.5). Under 20
+ * concurrent runs a day partition commits every few tens of ms, so three
+ * back-to-back 2-page reads could all straddle a commit; a short pause lets
+ * the burst's commit land between reads instead of inside one.
+ */
+const FENCED_READ_BACKOFF_MS = [0, 15, 30, 60, 120, 200];
 export const WORK_GRAPH_TARGET_LOOKUP_INDEX = 'work-graph-target-lookup';
 /** How many days of one target's lookup rows a locate reads before giving up. */
 const MAX_TARGET_LOOKUP_DAYS = 32;
@@ -508,6 +515,8 @@ export class WorkGraphRepository {
 
   /** Read-path projections by partition, least recently used first (see loadProjectionAtRevision). */
   private readonly heldProjections = new Map<string, WorkProjectionState>();
+  /** NFR #219: reads answered with the last proven revision because the partition kept moving. */
+  lastGoodServed = 0;
 
   async loadProjection(
     organizationId: string,
@@ -519,6 +528,8 @@ export class WorkGraphRepository {
     // META reads so a browser never receives a mixed revision (which could
     // otherwise re-introduce an entity that a concurrent revocation removed).
     for (let attempt = 0; attempt < MAX_FENCED_READ_ATTEMPTS; attempt += 1) {
+      const wait = FENCED_READ_BACKOFF_MS[attempt] ?? 0;
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, Math.round(wait * (0.5 + Math.random()))));
       const before = await this.readMeta(pk);
       if (!before || before.erasing === true) return null;
       const items = await this.queryProjectionItems(pk);
@@ -571,6 +582,14 @@ export class WorkGraphRepository {
     organizationId: string,
     actorId: string,
     day: string,
+    /**
+     * NFR #219 (read path only): when the partition keeps moving through every
+     * fenced attempt, answer the revision this process last proved instead of
+     * a 500. It was a whole, consistent revision when META named it; the
+     * reader's next poll or push catches up. Writers never take it — their
+     * commit must be conditioned on the current revision.
+     */
+    serveLastGood = false,
   ): Promise<WorkProjectionState | null> {
     const pk = partitionKey(organizationId, actorId, day);
     const held = this.heldProjections.get(pk);
@@ -582,10 +601,18 @@ export class WorkGraphRepository {
         this.heldProjections.set(pk, held);
         return held;
       }
-      this.heldProjections.delete(pk);
-      if (!meta || meta.erasing === true) return null;
+      // Kept (not dropped) until a fresh read replaces it: it is the last
+      // proven revision a reader can fall back to (NFR #219).
+      if (!meta || meta.erasing === true) { this.heldProjections.delete(pk); return null; }
     }
-    const fresh = await this.loadProjection(organizationId, actorId, day);
+    let fresh: WorkProjectionState | null;
+    try {
+      fresh = await this.loadProjection(organizationId, actorId, day);
+    } catch (error) {
+      if (!serveLastGood || !held || !(error instanceof WorkGraphConcurrencyError)) throw error;
+      this.lastGoodServed += 1;
+      return held;
+    }
     if (fresh) this.holdProjection(pk, fresh);
     return fresh;
   }
@@ -608,6 +635,7 @@ export class WorkGraphRepository {
       organizationId,
       actorId,
       utcDay,
+      true,
     )));
     const projections = loaded.filter((projection): projection is WorkProjectionState => projection !== null);
     if (projections.length === 0) return null;
