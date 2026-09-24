@@ -14,9 +14,10 @@ jest.mock('../../lib/event-catalog', () => ({ publishSignal: jest.fn(() => Promi
 jest.mock('../../deck/deckReviseRequests', () => ({ DynamoClaimStore: class {} }));
 jest.mock('../../middleware/idempotency', () => ({ IDEMPOTENCY_CLAIMS_TABLE: 't' }));
 
-import { CommentAgentResolver } from '../commentAgentResolver';
+import { CommentAgentResolver, pickApplyOutput } from '../commentAgentResolver';
 import {
   commentScopedInstruction,
+  repairReviewedCommentRequests,
   settleCommentAgentRun,
   settleCommentSuggestionReview,
   settlementReply,
@@ -262,5 +263,60 @@ describe('suggestion verdict', () => {
     await settleCommentSuggestionReview(link, 'run-12345678', { decision: 'accept', by: 'u' }, { repo: t.repo, publish });
     expect(await settleCommentSuggestionReview(link, 'run-12345678', { decision: 'reject', by: 'u' }, { repo: t.repo, publish })).toBe('skipped');
     expect(t.repo.createComment).toHaveBeenCalledTimes(1);
+  });
+});
+
+// NFR #198: a run resumed on another replica skips its finished apply step, so
+// that replica never heard the apply output — it reads it from the run row.
+describe('resumed run (#198)', () => {
+  it('reads the apply output from the run row when this process did not see apply', async () => {
+    const settle = jest.fn(async () => 'settled' as const);
+    const bus = new StubBus();
+    const readApplyOutput = jest.fn(async () => applyOutput);
+    const r = new CommentAgentResolver({ eventBus: bus as unknown as EventBus<PipelineEventMap>, lookup: async () => link, settle, readApplyOutput });
+    r.start();
+    await bus.emit('pipeline:run:completed', { runId: 'run-resumed', durationMs: 1, at: 'x' });
+    await r.drain();
+    expect(readApplyOutput).toHaveBeenCalledWith(link.pipelineId, 'run-resumed');
+    expect(settle).toHaveBeenCalledWith(link, 'run-resumed', { kind: 'completed', outcome: applyOutput });
+  });
+  it('does not read the row when the apply output was heard here', async () => {
+    const settle = jest.fn(async () => 'settled' as const);
+    const bus = new StubBus();
+    const readApplyOutput = jest.fn(async () => null);
+    const r = new CommentAgentResolver({ eventBus: bus as unknown as EventBus<PipelineEventMap>, lookup: async () => link, settle, readApplyOutput });
+    r.start();
+    await bus.emit('pipeline:step:completed', { runId: 'run-a', stepId: 'apply', output: applyOutput, durationMs: 1, at: 'x' });
+    await bus.emit('pipeline:run:completed', { runId: 'run-a', durationMs: 1, at: 'x' });
+    await r.drain();
+    expect(readApplyOutput).not.toHaveBeenCalled();
+    expect(settle).toHaveBeenCalledWith(link, 'run-a', { kind: 'completed', outcome: applyOutput });
+  });
+  it('pickApplyOutput takes the latest apply summary, else the checkpoint context', () => {
+    expect(pickApplyOutput({ stepsSummary: { plan: { output: {} }, apply: { output: { applied: 1 } }, 'apply:2': { output: { applied: 2 } } } } as never)).toEqual({ applied: 2 });
+    expect(pickApplyOutput({ stepsSummary: { apply: { output: { truncated: true } } }, checkpoint: { context: { steps: { apply: { applied: 3 } } } } } as never)).toEqual({ applied: 3 });
+    expect(pickApplyOutput(null)).toBeNull();
+  });
+});
+
+// NFR #201: a verdict recorded on the run whose comment was never settled
+// (the replica died between the two writes) is finished from the comments list.
+describe('repairReviewedCommentRequests (#201)', () => {
+  it('settles a waiting thread from the run verdict once, and throttles re-checks', async () => {
+    const readReview = jest.fn(async () => ({ decision: 'accept' as const, by: 'u-carol', byName: 'Carol' }));
+    const waiting = [{ commentId: 'c-9', agentRequest: { runId: 'run-rep', pipelineId: 'p', state: 'suggested' } }] as never;
+    const n1 = await repairReviewedCommentRequests('doc-1', waiting, { readReview, now: () => 1_000_000 });
+    const n2 = await repairReviewedCommentRequests('doc-1', waiting, { readReview, now: () => 1_010_000 });
+    expect(readReview).toHaveBeenCalledTimes(1);
+    expect(n2).toBe(0);
+    expect(typeof n1).toBe('number');
+  });
+  it('ignores settled threads and threads with no run', async () => {
+    const readReview = jest.fn(async () => null);
+    await repairReviewedCommentRequests('doc-1', [
+      { commentId: 'a', agentRequest: { runId: 'r1', pipelineId: 'p', state: 'accepted' } },
+      { commentId: 'b' },
+    ] as never, { readReview });
+    expect(readReview).not.toHaveBeenCalled();
   });
 });

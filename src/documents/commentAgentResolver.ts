@@ -26,6 +26,8 @@
 import type { EventBus } from 'distributed-core';
 import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import { withContext } from '../lib/logger';
+import { PipelineRunRepository, type PipelineRunItem } from '../repositories/PipelineRunRepository';
+import { getDynamoClient } from '../lib/ddb-client';
 import {
   commentForRun,
   settleCommentAgentRun,
@@ -48,6 +50,8 @@ export interface CommentAgentResolverOptions {
   lookup?: (runId: string) => Promise<CommentRunLink | null>;
   settle?: typeof settleCommentAgentRun;
   review?: typeof settleCommentSuggestionReview;
+  /** NFR #198: the apply step's output from the durable run row, for a run this process did not see apply. */
+  readApplyOutput?: (pipelineId: string, runId: string) => Promise<ApplyOutcome | null>;
 }
 
 interface BusEventLike<T> { payload: T }
@@ -57,6 +61,7 @@ export class CommentAgentResolver {
   private readonly lookup: (runId: string) => Promise<CommentRunLink | null>;
   private readonly settle: typeof settleCommentAgentRun;
   private readonly review: typeof settleCommentSuggestionReview;
+  private readonly readApplyOutput: (pipelineId: string, runId: string) => Promise<ApplyOutcome | null>;
   /** runId → link, or null for "not a comment's run" (so ordinary runs cost one read). */
   private readonly links = new Map<string, CommentRunLink | null>();
   private readonly outcomes = new Map<string, ApplyOutcome>();
@@ -69,6 +74,7 @@ export class CommentAgentResolver {
     this.lookup = options.lookup ?? commentForRun;
     this.settle = options.settle ?? settleCommentAgentRun;
     this.review = options.review ?? settleCommentSuggestionReview;
+    this.readApplyOutput = options.readApplyOutput ?? applyOutputFromRunRow;
   }
 
   /** The route knows the link the moment it triggers; no read needed on this replica. */
@@ -99,7 +105,7 @@ export class CommentAgentResolver {
       const { runId, status, rejection } = event.payload;
       await this.finish(runId, status === 'rejected'
         ? { kind: 'rejected', ...(rejection?.comment ? { reason: rejection.comment } : {}) }
-        : { kind: 'completed', outcome: this.outcomes.get(runId) ?? null });
+        : { kind: 'completed', outcome: this.outcomes.get(runId) ?? null, needsRow: true });
     });
     on('pipeline:run:failed', async (event) => {
       await this.finish(event.payload.runId, { kind: 'failed', reason: event.payload.error?.message ?? '' });
@@ -132,11 +138,27 @@ export class CommentAgentResolver {
     if (result === 'skipped') this.stats.skipped += 1; else this.stats.settled += 1;
   }
 
-  private async finish(runId: string, settlement: RunSettlement): Promise<void> {
+  private async finish(runId: string, raw: RunSettlement | (RunSettlement & { needsRow: true })): Promise<void> {
     if (typeof runId !== 'string' || !runId) return;
     const link = await this.linkFor(runId);
     this.outcomes.delete(runId);
     if (!link) return;
+    let settlement: RunSettlement = raw;
+    if ('needsRow' in raw) {
+      const { needsRow: _n, ...rest } = raw;
+      settlement = rest as RunSettlement;
+      // NFR #198: a run resumed here after its owner died skips the finished
+      // apply step, so this process never heard its output. The run row has it
+      // (stepsSummary, written by whichever replica persisted the step event).
+      if (settlement.kind === 'completed' && !settlement.outcome && link.pipelineId) {
+        const fromRow = await this.readApplyOutput(link.pipelineId, runId).catch((err: unknown) => {
+          log.warn({ runId, err: String(err) }, 'apply output read failed');
+          return null;
+        });
+        log.info({ runId, found: !!fromRow }, 'comment run finished without a local apply outcome; read the run row');
+        settlement = { kind: 'completed', outcome: fromRow };
+      }
+    }
     const result = await this.settle(link, runId, settlement);
     if (result === 'skipped') this.stats.skipped += 1; else this.stats.settled += 1;
   }
@@ -156,6 +178,29 @@ export class CommentAgentResolver {
     for (const id of this.subscriptionIds) this.eventBus.unsubscribe(id);
     this.subscriptionIds = [];
   }
+}
+
+let runRepo: PipelineRunRepository | null = null;
+/** The `apply` step's output as the run row holds it (stepsSummary, else the checkpoint context). */
+export async function applyOutputFromRunRow(pipelineId: string, runId: string): Promise<ApplyOutcome | null> {
+  runRepo ??= new PipelineRunRepository(getDynamoClient());
+  const run = await runRepo.get(pipelineId, runId);
+  return pickApplyOutput(run);
+}
+
+/** Pure: the latest completed `apply` output on a run row. */
+export function pickApplyOutput(run: Pick<PipelineRunItem, 'stepsSummary' | 'checkpoint'> | null | undefined): ApplyOutcome | null {
+  if (!run) return null;
+  const summary = run.stepsSummary ?? {};
+  const keys = Object.keys(summary).filter((k) => k === 'apply' || /^apply:\d+$/.test(k));
+  keys.sort((a, b) => (Number(a.split(':')[1] ?? 1)) - (Number(b.split(':')[1] ?? 1)));
+  for (const k of keys.reverse()) {
+    const out = (summary[k] as { output?: unknown } | undefined)?.output;
+    if (out && typeof out === 'object' && !(out as { truncated?: unknown }).truncated) return out as ApplyOutcome;
+  }
+  const ctx = (run.checkpoint?.context as { steps?: Record<string, unknown> } | undefined)?.steps?.apply;
+  if (ctx && typeof ctx === 'object' && !(ctx as { truncated?: unknown }).truncated) return ctx as ApplyOutcome;
+  return null;
 }
 
 let current: CommentAgentResolver | null = null;

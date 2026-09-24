@@ -30,6 +30,8 @@ import { publishSignal } from '../lib/event-catalog';
 import { DynamoClaimStore, type ClaimStore } from '../deck/deckReviseRequests';
 import { IDEMPOTENCY_CLAIMS_TABLE } from '../middleware/idempotency';
 import log from '../lib/logger';
+import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
+import { getDynamoClient } from '../lib/ddb-client';
 
 export const COMMENT_AGENT_LINK_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const COMMENT_AGENT = { userId: 'agent:haiku', displayName: 'Haiku', color: '#7c3aed' } as const;
@@ -282,4 +284,51 @@ export async function settleCommentSuggestionReview(
   }
   log.info({ runId, documentId: link.documentId, commentId: link.commentId, state, resolved: resolve }, 'comment agent suggestion reviewed');
   return resolve ? 'resolved' : state;
+}
+
+const repairChecked = new Map<string, number>();
+const REPAIR_EVERY_MS = 30_000;
+
+/**
+ * NFR #201 repair: a comment still waiting on its suggestion (`suggested` /
+ * `pending`) whose run already carries a verdict — the verdict was recorded
+ * but the replica died before the reply — is settled from that verdict. Run
+ * from the comments list, fire-and-forget; one run-row read per waiting thread
+ * per 30 s per process. The settle is the same CAS, so it is safe everywhere.
+ */
+export function repairReviewedCommentRequests(
+  documentId: string,
+  comments: ReadonlyArray<Pick<DocumentComment, 'commentId' | 'agentRequest'>>,
+  deps: { readReview?: (pipelineId: string, runId: string) => Promise<{ decision: 'accept' | 'reject'; by: string; byName?: string } | null | undefined>; now?: () => number } = {},
+): Promise<number> {
+  const now = (deps.now ?? Date.now)();
+  const waiting = comments.filter((c) => {
+    const r = c.agentRequest;
+    if (!r?.runId || !r.pipelineId || (r.state !== 'suggested' && r.state !== 'pending')) return false;
+    if ((repairChecked.get(r.runId) ?? 0) > now - REPAIR_EVERY_MS) return false;
+    if (repairChecked.size > 5_000) repairChecked.clear();
+    repairChecked.set(r.runId, now);
+    return true;
+  });
+  if (waiting.length === 0) return Promise.resolve(0);
+  const readReview = deps.readReview ?? defaultReadReview;
+  return Promise.all(waiting.map(async (c) => {
+    const r = c.agentRequest!;
+    const review = await readReview(r.pipelineId, r.runId);
+    if (!review) return 0;
+    const out = await settleCommentSuggestionReview({ documentId, commentId: c.commentId, pipelineId: r.pipelineId }, r.runId,
+      { decision: review.decision, by: review.by, ...(review.byName ? { byName: review.byName } : {}) });
+    if (out !== 'skipped') log.info({ runId: r.runId, documentId, commentId: c.commentId, out }, 'comment agent request repaired from the run verdict');
+    return out === 'skipped' ? 0 : 1;
+  })).then((n) => n.reduce<number>((a, b) => a + b, 0)).catch((err: unknown) => {
+    log.warn({ documentId, err: String(err) }, 'comment agent repair failed');
+    return 0;
+  });
+}
+
+let runRepo: PipelineRunRepository | null = null;
+async function defaultReadReview(pipelineId: string, runId: string) {
+  runRepo ??= new PipelineRunRepository(getDynamoClient());
+  const run = await runRepo.get(pipelineId, runId);
+  return run?.review ?? null;
 }

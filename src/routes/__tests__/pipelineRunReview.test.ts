@@ -24,7 +24,11 @@ jest.mock('../../documents/documentReadGate', () => {
   return { ...actual, documentReadGate: () => mockGate };
 });
 const mockCommentForRun = jest.fn();
-jest.mock('../../documents/commentAgentRequests', () => ({ commentForRun: (...a: unknown[]) => mockCommentForRun(...a) }));
+const mockSettleReview = jest.fn();
+jest.mock('../../documents/commentAgentRequests', () => ({
+  commentForRun: (...a: unknown[]) => mockCommentForRun(...a),
+  settleCommentSuggestionReview: (...a: unknown[]) => mockSettleReview(...a),
+}));
 
 import { pipelineRunReviewRouter, RUN_REVIEWED_EVENT } from '../pipelineRunReview';
 import { errorHandler } from '../../middleware/error-handler';
@@ -78,6 +82,7 @@ beforeEach(() => {
   mockDocRow.mockResolvedValue({ documentId: 'doc-1', createdBy: 'dev-owner', editors: ['dev-grace'], viewers: ['dev-reader'] });
   mockGate = makeDocumentReadGate({ getDocumentRow: mockDocRow, getLifecycleOwner: async () => undefined });
   mockCommentForRun.mockResolvedValue(null);
+  mockSettleReview.mockResolvedValue('resolved');
   mockGet.mockResolvedValue({ pipelineId: 'document-agent-edit', runId: 'run-1', status: 'completed' });
   mockSetReview.mockResolvedValue(true);
   (getPipelineBridge as jest.Mock).mockReturnValue({ trigger: mockTrigger });
@@ -226,6 +231,30 @@ describe('POST /pipelines/:pipelineId/runs/:runId/review', () => {
       const res = await post(app, URL, { ...good, decision: 'accept' }, { userId: 'dev-grace' });
       expect(res.statusCode).toBe(200);
       expect(mockPublish).toHaveBeenCalledWith(RUN_REVIEWED_EVENT, expect.objectContaining({ runId: 'run-1', decision: 'accept', by: 'dev-grace' }));
+    });
+
+    // NFR #201: the replica that recorded the verdict settles the comment
+    // before answering — no open tab, no bus delivery needed.
+    it('settles the linked comment in the request, from the recorded verdict', async () => {
+      const link = { documentId: 'doc-1', commentId: 'c-1', pipelineId: 'document-agent-edit' };
+      mockCommentForRun.mockResolvedValue(link);
+      const res = await post(app, URL, { ...good, decision: 'accept', applyServerSide: true });
+      expect(res.statusCode).toBe(200);
+      expect(mockSettleReview).toHaveBeenCalledWith(link, 'run-1', { decision: 'accept', by: 'dev-grace', byName: 'Grace' });
+    });
+    it('a retry of the same verdict finishes a settle the first call never made; a settle error does not fail the verdict', async () => {
+      const link = { documentId: 'doc-1', commentId: 'c-1', pipelineId: 'document-agent-edit' };
+      mockCommentForRun.mockResolvedValue(link);
+      mockGet.mockResolvedValue({ pipelineId: 'document-agent-edit', runId: 'run-1', status: 'completed', review: { decision: 'reject', suggestionKey: good.suggestionKey, documentId: 'doc-1', by: 'dev-grace', at: 'x' } });
+      mockSettleReview.mockRejectedValue(new Error('ddb down'));
+      const res = await post(app, URL, good);
+      expect(res.statusCode).toBe(200);
+      expect(mockSettleReview).toHaveBeenCalledWith(link, 'run-1', { decision: 'reject', by: 'dev-grace' });
+    });
+    it('a run with no comment link settles nothing', async () => {
+      const res = await post(app, URL, good);
+      expect(res.statusCode).toBe(200);
+      expect(mockSettleReview).not.toHaveBeenCalled();
     });
   });
 });

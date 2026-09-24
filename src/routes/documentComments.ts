@@ -10,6 +10,7 @@ import {
   ForbiddenError,
 } from '../middleware/error-handler';
 import log from '../lib/logger';
+import { repairReviewedCommentRequests } from '../documents/commentAgentRequests';
 import { documentReadGate } from '../documents/documentReadGate';
 
 // ---------------------------------------------------------------------------
@@ -181,6 +182,8 @@ documentCommentsRouter.get('/:documentId/comments', requireAuth, asyncHandler(as
     result = await documentCommentRepo.getCommentsForDocument(documentId, limit, cursor);
   }
 
+  // NFR #201: finish a verdict whose comment reply was lost to a restart.
+  void repairReviewedCommentRequests(documentId, result.items);
   res.status(200).json({ comments: result.items, ...(result.lastEvaluatedKey ? { nextCursor: Buffer.from(JSON.stringify(result.lastEvaluatedKey)).toString('base64url') } : {}) });
 }));
 

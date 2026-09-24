@@ -47,7 +47,7 @@ import { getDynamoClient } from '../lib/ddb-client';
 import { buildDocumentReviewApplyDefinition, DOCUMENT_AGENT_REVIEW_PIPELINE_ID } from '../documents/documentAgentPipeline';
 import { documentReadGate } from '../documents/documentReadGate';
 import { DocumentEditForbiddenError } from '../deck/documentEditAccess';
-import { commentForRun } from '../documents/commentAgentRequests';
+import { commentForRun, settleCommentSuggestionReview, type CommentRunLink } from '../documents/commentAgentRequests';
 
 const log = withContext({ route: 'pipelineRunReview' });
 
@@ -143,6 +143,9 @@ pipelineRunReviewRouter.post(
       const held = run.review;
       const who = held.byName ?? held.by;
       if (held.decision === body.decision) {
+        // A retry after the first call recorded the verdict but died before the
+        // comment was settled (a restart mid-request) finishes that settle here.
+        if (link) await settleLinkedComment(link, runId, held);
         res.status(200).json({ runId, pipelineId, review: held });
         return;
       }
@@ -196,6 +199,13 @@ pipelineRunReviewRouter.post(
     const persistence = getRunPersistenceService();
     persistence?.setReview(runId, review);
 
+    // NFR #201: the linked comment's reply (and resolve, when asked) is written
+    // HERE, by the replica whose compare-and-set recorded the verdict, before
+    // the caller is answered — no open tab and no bus delivery needed. The
+    // `pipeline:run:reviewed` event below still reaches every replica's
+    // CommentAgentResolver; the comment row's own CAS makes that a no-op.
+    if (link) await settleLinkedComment(link, runId, review);
+
     // The bus is only reachable through the persistence service; without it
     // (persistence disabled) the row is the record and nobody is told live.
     const bus = persistence?.getEventBus();
@@ -210,3 +220,16 @@ pipelineRunReviewRouter.post(
     res.status(200).json({ runId, pipelineId, review, ...(applied ? { applied } : {}) });
   }),
 );
+
+/** Settles the comment a run answers from the recorded verdict; idempotent (the comment row's CAS). */
+async function settleLinkedComment(link: CommentRunLink, runId: string, review: Pick<RunReview, 'decision' | 'by' | 'byName'>): Promise<void> {
+  try {
+    const result = await settleCommentSuggestionReview(link, runId, {
+      decision: review.decision, by: review.by, ...(review.byName ? { byName: review.byName } : {}),
+    });
+    log.info({ runId, commentId: link.commentId, result }, 'linked comment settled from the verdict');
+  } catch (err) {
+    // The verdict stands; a retry of this route or the bus subscriber settles it.
+    log.warn({ runId, commentId: link.commentId, err: err instanceof Error ? err.message : String(err) }, 'linked comment settle failed');
+  }
+}
