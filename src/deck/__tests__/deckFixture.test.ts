@@ -10,7 +10,7 @@ import { validateDeckSpec } from '../DeckSpec';
 import {
   FIXTURE_TITLE_PREFIX, NoFixtureMaterialError,
   buildDeckFixture, citableSources, fixturePrompt, fixtureSpec, materialBlock, readFixtureMaterial, recordingTitle,
-  liftSlideSubtitles, transcriptIdsOf, uncitedMaterialWarnings,
+  liftSlideSubtitles, readableOutline, transcriptIdsOf, uncitedMaterialWarnings,
   type FixtureMaterial,
 } from '../deckFixture';
 
@@ -164,6 +164,25 @@ describe('buildDeckFixture', () => {
     });
     expect(result.source).toBe('model');
     expect('subtitle' in result.spec).toBe(false);
+  });
+
+  it('a blank bullet or column entry is dropped, not a reason to fall back to the offline deck (Loop 33)', () => {
+    expect(liftSlideSubtitles({ slides: [{ id: 'a', bullets: ['One', ' '], columns: [['L', ''], ['R']] }] }))
+      .toEqual({ slides: [{ id: 'a', bullets: ['One'], columns: [['L'], ['R']] }] });
+  });
+
+  it('a page outline reads as plain text, without the edit format’s block numbers (Loop 33)', () => {
+    const outline = 'title: Release plan\n#0 heading(h1): Release plan\n#1 paragraph: Scope and rollback.\n#2 bulletList: Tests\nDocs\n#3 paragraph: (empty)';
+    expect(readableOutline(outline, 1000)).toBe('# Release plan\nScope and rollback.\n- Tests\n- Docs');
+    expect(readableOutline('  plain   text ', 1000)).toBe('plain text');
+  });
+
+  it('the prompt keeps the material’s status and shapes the deck to the input (Loop 33)', () => {
+    const prompt = fixturePrompt({ document: { documentId: 'd', title: 'Plan', text: 'Tests are tracked.' } }, 'Plan');
+    expect(prompt).toContain('Keep the material\'s status and modality');
+    expect(prompt).toContain('A call transcript: slides for what was decided');
+    expect(prompt).toContain('never a claim or a status');
+    expect(prompt).toContain('No `section` divider slides unless the deck has more than 8 slides');
   });
 
   it('a slide subtitle never overrides the deck’s own, and other stray fields still fail', async () => {

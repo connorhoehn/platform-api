@@ -9,6 +9,9 @@
  * stale bytes. The key matches the blob sweeper's `deck-….pptx` pattern, so a
  * key a row names is referenced — never swept, and its store expiry is cleared
  * (#12) — and one nothing names is swept after the grace period like any other.
+ * A file named only by SUPERSEDED revisions counts as unnamed (Loop 33 ppt,
+ * `regenerablePptxKey` in blobSweeper.ts): it is rebuilt from the revision's
+ * spec on the next download, so old revisions do not pin their files forever.
  *
  * Built where:
  * - eagerly, at write, by the `/deck` step and `POST …/revisions` (they report

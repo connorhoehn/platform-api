@@ -18,7 +18,7 @@ import { requireAuth } from '../middleware/auth';
 import { DECK_FIXTURE_PER_MINUTE, DECK_PREVIEW_PER_MINUTE, perUserRateLimit } from '../middleware/rateLimit';
 import { asyncHandler, AppError, ValidationError } from '../middleware/error-handler';
 import { previewDeckSpec } from '../deck/preview';
-import { buildDeckFixture, NoFixtureMaterialError, type DeckFixtureFrom } from '../deck/deckFixture';
+import { buildDeckFixture, materialBlock, NoFixtureMaterialError, type DeckFixtureFrom } from '../deck/deckFixture';
 import {
   DeckReviseError, MAX_INSTRUCTION_CHARS, reviseDeck, validateReviseInputSpec, type DeckReviseSourceRef,
 } from '../deck/deckRevise';
@@ -84,7 +84,7 @@ deckRouter.post('/preview', requireAuth, previewLimit, asyncHandler(async (req: 
  * reason is returned with it.
  */
 deckRouter.post('/fixture', requireAuth, fixtureLimit, requireDeckSourcesReadable(), asyncHandler(async (req: Request, res: Response): Promise<void> => {
-  const body = (req.body ?? {}) as { from?: unknown; title?: unknown };
+  const body = (req.body ?? {}) as { from?: unknown; title?: unknown; includeMaterial?: unknown };
   const raw = (body.from ?? {}) as Record<string, unknown>;
   const from: DeckFixtureFrom = {};
   for (const key of ['documentId', 'recordingId', 'personId'] as const) {
@@ -112,6 +112,9 @@ deckRouter.post('/fixture', requireAuth, fixtureLimit, requireDeckSourcesReadabl
         ...(result.material.document ? { document: { documentId: result.material.document.documentId, title: result.material.document.title, characters: result.material.document.text.length, ...(result.material.document.unreadable ? { unreadable: result.material.document.unreadable } : {}) } } : {}),
         ...(result.material.transcript ? { transcript: { transcriptId: result.material.transcript.transcriptId, title: result.material.transcript.title, segments: result.material.transcript.segments.length } } : {}),
       },
+      // What the model read, verbatim — for a caller that checks the deck
+      // against it (deck-preview --check). Opt-in: the source can be long.
+      ...(body.includeMaterial === true ? { materialText: materialBlock(result.material) } : {}),
     });
   } catch (err) {
     if (err instanceof NoFixtureMaterialError) throw new ValidationError(err.message);

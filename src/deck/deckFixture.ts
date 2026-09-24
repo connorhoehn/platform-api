@@ -92,6 +92,39 @@ export function transcriptIdsOf(material: FixtureMaterial): string[] {
 
 export class NoFixtureMaterialError extends Error {}
 
+const OUTLINE_LINE = /^#\d+ ([A-Za-z]+)(?:\(h(\d)\))?(?:\([^)]*\))?: ?(.*)$/;
+
+/**
+ * A page's outline (`title: …` then `#<n> <kind>(h<level>): <text>` lines, the
+ * document agent's EDIT format) as plain reading text: headings as `#`, list
+ * items as `- `, one block per line, no block numbers. Loop 33 ppt: collapsed
+ * onto one line with its markers, the model titled a deck "Release plan #1".
+ * Text that is not an outline is only whitespace-tidied, as before.
+ */
+export function readableOutline(value: unknown, limit: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const lines = value.split('\n');
+  if (!lines.some((line) => OUTLINE_LINE.test(line))) return clean(value, limit);
+  const out: string[] = [];
+  let list = false;
+  for (const raw of lines) {
+    if (/^title: /.test(raw)) continue; // the document's title heads the material block already
+    const match = OUTLINE_LINE.exec(raw);
+    if (match) {
+      const [, kind, level, text] = match;
+      list = kind === 'bulletList' || kind === 'orderedList';
+      const body = (text ?? '').replace(/\s+/g, ' ').trim();
+      if (!body || body === '(empty)') continue;
+      out.push(kind === 'heading' ? `${'#'.repeat(Math.min(Number(level) || 1, 6))} ${body}` : list ? `- ${body}` : body);
+    } else if (raw.trim()) {
+      const body = raw.replace(/\s+/g, ' ').trim();
+      out.push(list ? `- ${body}` : body); // a list's next item, or a table's next row
+    }
+  }
+  const text = out.join('\n').trim();
+  return text ? text.slice(0, limit) : undefined;
+}
+
 function clean(value: unknown, limit: number): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.replace(/\s+/g, ' ').trim();
@@ -161,7 +194,7 @@ export async function readFixtureMaterial(from: DeckFixtureFrom, deps: ReadMater
       .map((entry) => clean(entry?.title, 160))
       .filter((value): value is string => !!value)
       .join('\n');
-    const text = clean(body.text, MAX_DOCUMENT_CHARS) ?? outlineText;
+    const text = readableOutline(body.text, MAX_DOCUMENT_CHARS) ?? outlineText;
     material.document = {
       documentId: from.documentId,
       title: clean(row?.title, 160) ?? from.documentId,
@@ -252,7 +285,11 @@ export function fixturePrompt(material: FixtureMaterial, title: string, requeste
     '- EVERY slide cites at least one source, using the exact documentId given below.',
     '- EVERY source listed below must be cited by at least one slide. Material you were given and did not use is material you were asked for and ignored: if a document and a transcript are both listed, the deck draws on both.',
     '- Only state what the material says. A quote must be something a named person actually said in it. A chart\'s numbers must appear in it. Name a person as the owner of something only when the material ties them to it.',
-    '- Open with a `title` slide. Speaker notes in `notes`. `subtitle` belongs to the deck, never to a slide.',
+    '- Keep the material\'s status and modality. Something the material says is tracked, needed, planned or under review is not "confirmed", "verified", "reviewed", "done", "assigned" or "defined" on a slide: "needs an owner" stays "needs an owner". The same goes for dates, owners and numbers: copy them, never round, extend or infer them.',
+    '- Shape the deck to the material. A call transcript: slides for what was decided, the actions with the person who took each in their own words ("Frank takes the rollback", not "owner assigned"), and what is still open — titled that plainly (Decisions, Actions, Open items). A plan or project brief: the outcome it aims for, what is in and out of scope, owners and milestones as written, how success is measured, risks and open questions — whichever of these the material has.',
+    '- No `section` divider slides unless the deck has more than 8 slides; a divider with nothing on it is padding.',
+    '- An `eyebrow` is a short label (the part of the material the slide comes from), never a claim or a status.',
+    '- Open with a `title` slide. Speaker notes in `notes`. `subtitle` belongs to the deck, never to a slide. Never write an empty string; leave a list shorter instead.',
     '',
     'Sources you may cite:',
     citableSources(material).map((source) => `- ${source.title} (documentId: ${source.documentId})`).join('\n'),
@@ -405,7 +442,19 @@ export function liftSlideSubtitles(parsed: unknown): unknown {
   // An empty or blank deck subtitle is dropped like a missing one.
   const { subtitle: given, ...deckRest } = deck;
   let subtitle = typeof given === 'string' && given.trim() ? given : undefined;
-  const slides = deck.slides.map((slide) => {
+  // A blank bullet or column entry (live 2026-09-24, Loop 33: `columns[0][3]: ""`)
+  // is a trailing slot the model left empty, not content — drop it rather than
+  // throwing the whole draft away for the offline deck.
+  const blank = (value: unknown): boolean => typeof value === 'string' && !value.trim();
+  const slides = deck.slides.map((input) => {
+    let slide = input;
+    if (slide && typeof slide === 'object' && !Array.isArray(slide)) {
+      const s = slide as Record<string, unknown>;
+      const tidy: Record<string, unknown> = { ...s };
+      if (Array.isArray(s.bullets)) tidy.bullets = s.bullets.filter((b) => !blank(b));
+      if (Array.isArray(s.columns)) tidy.columns = s.columns.map((col) => (Array.isArray(col) ? col.filter((b) => !blank(b)) : col));
+      slide = tidy;
+    }
     if (!slide || typeof slide !== 'object' || !('subtitle' in slide)) return slide;
     const { subtitle: own, ...rest } = slide as Record<string, unknown>;
     if (!subtitle && typeof own === 'string' && own.trim()) subtitle = own.trim().slice(0, 200);

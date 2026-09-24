@@ -25,7 +25,8 @@
 // cannot read makes the whole sweep delete nothing: the slides it names are
 // unknown, and an unknown reference has to be treated as a live one.
 //
-// What it cleans up: blobs of a deleted deck no other deck shares, `.pptx`
+// What it cleans up: content `.pptx` files named only by superseded revisions
+// (a rebuildable cache — `regenerablePptxKey`), blobs of a deleted deck no other deck shares, `.pptx`
 // files a raced or failed save wrote under its attempt-unique key, and content
 // blobs a losing attempt wrote that nobody adopted.
 //
@@ -46,6 +47,7 @@ import { getAssetBlobStore } from '../pipeline/image/visionServices';
 import { DOCUMENTS_TABLE, isSlideListKey } from './presentationDocuments';
 import { ChunkedBlobStore } from './chunkedBlobStore';
 import { PRESENTATION_REVISIONS_TABLE } from './presentationRevisionItems';
+import { PPTX_CONTENT_KEY } from './pptxCache';
 
 /** Every key a presentation stores starts with this; nothing else does. */
 export const DECK_BLOB_PREFIX = 'deck-';
@@ -70,17 +72,61 @@ const EMBEDDED_DECK_BLOB_KEY = /deck-[A-Za-z0-9._-]+?\.(?:pptx|svg|json)(?![A-Za
  * a key embedded in a longer string (a URL, a `.pptx~part-N` part key) counts
  * as a reference too.
  */
-export function collectBlobReferences(row: unknown, into: Set<string> = new Set()): Set<string> {
+export function collectBlobReferences(row: unknown, into: Set<string> = new Set(), except?: string): Set<string> {
   const stack: unknown[] = [row];
   while (stack.length) {
     const value = stack.pop();
     if (typeof value === 'string') {
+      if (value === except) continue;
       if (DECK_BLOB_KEY.test(value)) into.add(value);
       else if (value.includes(DECK_BLOB_PREFIX)) for (const match of value.match(EMBEDDED_DECK_BLOB_KEY) ?? []) into.add(match);
     } else if (Array.isArray(value)) stack.push(...value);
     else if (value && typeof value === 'object') stack.push(...Object.values(value as Record<string, unknown>));
   }
   return into;
+}
+
+/**
+ * The `.pptx` of a SUPERSEDED revision item that the sweeper may treat as a
+ * cache, or null (Loop 33 ppt).
+ *
+ * A content-keyed `.pptx` (`deck-pptx-<sha256>.pptx`, pptxCache.ts) is a pure
+ * function of its revision's spec, and the file route rebuilds it from that
+ * spec on the next download (NFR #178). Revision items are immutable and each
+ * names its file forever, so before this a superseded revision's `.pptx` could
+ * never be collected however long ago anyone downloaded it. Its own item does
+ * not mark it when all of these hold:
+ *   - the row is a `presentation-revisions` item (`rev` + `revision`);
+ *   - it is superseded: its version is below the head row's `revisionCount`,
+ *     as read earlier in the same scan (`headVersion`). A head not seen yet
+ *     (an unordered row source) means "head" — marked, as before;
+ *   - the rebuild can happen: the spec is inline on the item, or its
+ *     `specRef` blob is still listed in a store (`specListed`). A lost spec
+ *     keeps the file: it is the only copy.
+ * Any other row naming the same key (the head of this deck after a revert,
+ * another deck with the same content) still marks it. A legacy per-revision
+ * key (`deck-<doc>-<rev>-<attempt>.pptx`) is never rebuilt, so never a cache.
+ * A save racing the scan only makes the head look OLDER than it is (the row
+ * was read first), which keeps more, never less.
+ */
+export function regenerablePptxKey(
+  row: unknown,
+  headVersion: (documentId: string) => number | undefined,
+  specListed: (key: string) => boolean,
+): string | null {
+  if (!row || typeof row !== 'object') return null;
+  const item = row as { documentId?: unknown; rev?: unknown; version?: unknown; revision?: unknown };
+  if (typeof item.rev !== 'string' || typeof item.documentId !== 'string' || typeof item.version !== 'number') return null;
+  if (!item.revision || typeof item.revision !== 'object') return null;
+  const head = headVersion(item.documentId);
+  if (head === undefined || item.version >= head) return null;
+  const revision = item.revision as { asset?: { key?: unknown }; spec?: unknown; specRef?: { key?: unknown } };
+  const key = revision.asset?.key;
+  if (typeof key !== 'string' || !PPTX_CONTENT_KEY.test(key)) return null;
+  const inline = !!revision.spec && typeof revision.spec === 'object';
+  const specKey = revision.specRef?.key;
+  const stored = typeof specKey === 'string' && isDeckBlobKey(specKey) && specListed(specKey);
+  return inline || stored ? key : null;
 }
 
 /**
@@ -199,6 +245,12 @@ export interface DeckBlobSweepOptions {
    * real sweep would try to delete come back in `wouldDelete` (Loop 31 ppt).
    */
   dryRun?: boolean;
+  /**
+   * Mark a superseded revision's content-keyed `.pptx` like any other blob
+   * (the behaviour before Loop 33 ppt). Default false: it is a rebuildable
+   * cache — see `regenerablePptxKey`.
+   */
+  keepSupersededPptx?: boolean;
 }
 
 export interface DeckBlobSweepResult {
@@ -215,6 +267,8 @@ export interface DeckBlobSweepResult {
   expiryCleared?: number;
   /** Set when the sweep deliberately deleted nothing. */
   skipped?: string;
+  /** Superseded revision items whose `.pptx` was left unmarked as a rebuildable cache (Loop 33 ppt). */
+  supersededPptxUnmarked?: number;
   /** Dry run only: the unreferenced candidates a real sweep would delete. */
   wouldDelete?: string[];
 }
@@ -264,9 +318,18 @@ export async function sweepDeckBlobs(opts: DeckBlobSweepOptions): Promise<DeckBl
   // every delete below (fail closed).
   const referenced = new Set<string>();
   let unknownShape: string | null = null;
+  const specListed = (key: string): boolean => perStore.some((seen) => seen.has(key));
+  let cacheOnly = 0;
+  const headVersions = new Map<string, number>();
   for await (const row of opts.rows()) {
     result.rowsScanned += 1;
-    collectBlobReferences(row, referenced);
+    // `crdt-documents` rows come first in the scan: remember each head's version.
+    const count = (row as { revisionCount?: unknown }).revisionCount;
+    const rowId = (row as { documentId?: unknown }).documentId;
+    if (typeof count === 'number' && typeof rowId === 'string' && !('rev' in row)) headVersions.set(rowId, count);
+    const cache = opts.keepSupersededPptx ? null : regenerablePptxKey(row, (id) => headVersions.get(id), specListed);
+    if (cache) cacheOnly += 1;
+    collectBlobReferences(row, referenced, cache ?? undefined);
     if (!unknownShape) {
       const why = unknownReferenceShape(row, `row ${String((row as { documentId?: unknown }).documentId ?? '?')}`);
       if (why) unknownShape = why;
@@ -297,6 +360,7 @@ export async function sweepDeckBlobs(opts: DeckBlobSweepOptions): Promise<DeckBl
     }
   }
   result.manifestsRead = opened.size - (unreadable ? 1 : 0);
+  result.supersededPptxUnmarked = cacheOnly;
   result.referenced = referenced.size;
 
   // 3c. A referenced key must not age out on the store's own clock: clear any

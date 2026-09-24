@@ -487,3 +487,75 @@ describe('every reference shape survives a sweep; unknown shapes fail closed (NF
     expect(sent.every((input) => input.FilterExpression === undefined)).toBe(true);
   });
 });
+
+describe('a superseded revision’s .pptx is a rebuildable cache (Loop 33 ppt)', () => {
+  const pptx = (n: string) => `deck-pptx-${n.repeat(64).slice(0, 64)}.pptx`;
+  const item = (documentId: string, version: number, key: string, spec: 'inline' | string | null) => ({
+    documentId, rev: `v${String(version).padStart(6, '0')}`, version,
+    revision: {
+      id: `v${version}`, label: `v${version}`, createdAt: '2026-09-20T00:00:00.000Z', createdBy: 'u', slideCount: 1,
+      asset: { key, contentType: 'application/pptx', sizeBytes: 4 },
+      ...(spec === 'inline' ? { spec: { title: 'T', slides: [] } } : spec ? { specRef: { key: spec, contentType: 'application/json', sizeBytes: 2, sha256: 'x' } } : {}),
+    },
+  });
+  async function run(rows: Array<Record<string, unknown>>, extra: { keepSupersededPptx?: boolean } = {}) {
+    let now = T0;
+    const store = new InMemoryImageBlobStore({ now: () => now });
+    for (const key of [pptx('a'), pptx('b'), pptx('c'), pptx('d'), 'deck-spec-old.json']) {
+      await store.putBlob(key, Buffer.from('PK'), { contentType: 'application/octet-stream' });
+    }
+    now += DEFAULT_DECK_BLOB_GRACE_MS + 1;
+    const source: LiveRowSource = async function* () { for (const row of rows) yield row; };
+    return sweepDeckBlobs({ stores: [store], rows: source, now: () => now, dryRun: true, ...extra });
+  }
+
+  it('offers an older revision’s content .pptx to the sweep; the head’s stays', async () => {
+    const result = await run([
+      { documentId: 'deck-1', revisionCount: 3 },
+      item('deck-1', 1, pptx('a'), 'inline'),
+      item('deck-1', 2, pptx('b'), 'deck-spec-old.json'),
+      item('deck-1', 3, pptx('c'), 'inline'),
+      { documentId: 'deck-2', revisionCount: 1 }, item('deck-2', 1, pptx('d'), 'inline'),
+    ]);
+    expect(result.wouldDelete?.sort()).toEqual([pptx('a'), pptx('b')].sort());
+    expect(result.supersededPptxUnmarked).toBe(2);
+  });
+
+  it('keeps it when any other row names the same file (a revert, another deck)', async () => {
+    const result = await run([
+      { documentId: 'deck-1', revisionCount: 2 },
+      item('deck-1', 1, pptx('a'), 'inline'),
+      item('deck-1', 2, pptx('a'), 'inline'),
+      { documentId: 'deck-2', revisionCount: 2 }, item('deck-2', 1, pptx('b'), 'inline'),
+      { documentId: 'deck-3', revisionCount: 1 }, item('deck-3', 1, pptx('b'), 'inline'),
+    ]);
+    expect(result.wouldDelete?.sort()).toEqual([pptx('c'), pptx('d'), 'deck-spec-old.json'].sort());
+  });
+
+  it('keeps it when the spec it would be rebuilt from is gone, or the head is unknown', async () => {
+    const result = await run([
+      item('deck-0', 1, pptx('c'), 'inline'), // before its row: head unknown
+      { documentId: 'deck-1', revisionCount: 3 },
+      item('deck-1', 1, pptx('a'), 'deck-spec-lost.json'),
+      item('deck-1', 2, pptx('b'), null),
+      item('deck-1', 3, pptx('d'), 'inline'),
+      { documentId: 'deck-0', revisionCount: 2 },
+    ]);
+    expect(result.wouldDelete).toEqual(['deck-spec-old.json']);
+  });
+
+  it('keepSupersededPptx restores the old marking, and a legacy per-revision key is never a cache', async () => {
+    const legacy = await run([
+      { documentId: 'deck-1', revisionCount: 2 },
+      item('deck-1', 1, 'deck-deck-1-v1-abcd1234.pptx', 'inline'),
+      item('deck-1', 2, pptx('a'), 'inline'),
+    ]);
+    expect(legacy.supersededPptxUnmarked).toBe(0);
+    const kept = await run([
+      { documentId: 'deck-1', revisionCount: 2 },
+      item('deck-1', 1, pptx('b'), 'inline'),
+      item('deck-1', 2, pptx('a'), 'inline'),
+    ], { keepSupersededPptx: true });
+    expect(kept.wouldDelete).not.toContain(pptx('b'));
+  });
+});
