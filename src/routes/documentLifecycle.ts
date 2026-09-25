@@ -29,6 +29,7 @@ import { filterDocumentLifecycleActions } from '../middleware/document-policy';
 
 import { Router, type Request, type Response } from 'express';
 import { requireAuth, optionalAuth } from '../middleware/auth';
+import { publishSignal } from '../lib/event-catalog';
 import { asyncHandler, AppError } from '../middleware/error-handler';
 import {
   loadContext,
@@ -141,6 +142,14 @@ documentLifecycleRouter.post(
         userId,
         ...(reason !== undefined ? { reason } : {}),
       });
+
+      // A work row with no status of its own reads it from the lifecycle
+      // ("Approved" on a decision's chip), so a transition is a work change to
+      // anyone showing it — the Brief tab of every item that links here
+      // (realtime-examples NFR #137). Id-only; revision 0 always re-reads.
+      if (result.from !== result.to) {
+        publishSignal(`doc-work:${documentId}`, 'doc:work_updated', { documentId, revision: 0, fields: ['status'] }).catch(() => undefined);
+      }
 
       const ctx = await loadContext(documentId);
       res.status(200).json({

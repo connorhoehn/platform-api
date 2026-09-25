@@ -456,6 +456,14 @@ describe('POST /api/documents/:documentId/lifecycle/transitions — happy path',
     );
   });
 
+  it('signals doc-work:<id> so a linked item\'s chip re-reads its status (NFR #137)', async () => {
+    await seedOwnedDocument('draft');
+    await call('POST', `/api/documents/${DOC}/lifecycle/transitions`, {
+      as: 'alice', body: { action: 'submit_for_review' },
+    });
+    expect(mockEmit).toHaveBeenCalledWith(`doc-work:${DOC}`, 'doc:work_updated', { documentId: DOC, revision: 0, fields: ['status'] });
+  });
+
   it('designated reviewer approves once no required review is outstanding', async () => {
     await seedOwnedDocument('in_review');
     await seedReviewRequest('bob', { state: 'approved' });
