@@ -62,6 +62,8 @@ recordingsRouter.post('/recordings/:recordingId/transcribe', requireAuth, asyncH
   const runId = await startSystemRun(CALL_TRANSCRIPTION_PIPELINE_ID, buildCallTranscriptionDefinition(), {
     recordingId: rec.recordingId, callId: rec.callId, arn: rec.channelArn, lobbyName: rec.lobbyName, composedKey: rec.composedSegment?.key ?? null,
     startedAt: rec.startedAt, documentId: documentIdForLobby(rec.lobbyName), requestedBy: req.user!.sub,
+    // The Activity graph's transcript lifecycle needs both (NFR #159).
+    ...(rec.orgId ? { organizationId: rec.orgId } : {}), ...(rec.startedBy ? { startedBy: rec.startedBy } : {}),
   }, req.user!.sub);
   res.status(202).json({ runId, pipelineId: CALL_TRANSCRIPTION_PIPELINE_ID, recordingId: rec.recordingId });
 }));

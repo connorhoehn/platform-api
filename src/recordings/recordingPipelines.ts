@@ -490,6 +490,8 @@ function startTranscriptionHandler(deps: RecordingPipelineDeps = {}): DescribedS
       try {
         const runId = await startRun(CALL_TRANSCRIPTION_PIPELINE_ID, buildCallTranscriptionDefinition(), {
           recordingId, callId, arn: ctx.arn, lobbyName: ctx.lobbyName, composedKey: ctx.composedKey, startedAt: ctx.startedAt, documentId: ctx.documentId ?? null,
+          ...(str(ctx.organizationId) ? { organizationId: str(ctx.organizationId) } : {}),
+          ...(str(ctx.startedBy) ? { startedBy: str(ctx.startedBy) } : {}),
         }, 'system');
         return ok({ started: true, transcriptionRunId: runId });
       } catch (err) {
@@ -626,8 +628,13 @@ function storeHandler(): DescribedStepHandler {
       // The summary is the next two steps' business; say it is underway so a
       // reader can tell "not yet" from "this row predates the summary".
       await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', transcriptKey: 'inline', transcriptJson: json, summaryStatus: 'pending' } as never);
-      const organizationId = str(ctx.organizationId);
-      const startedBy = str(ctx.startedBy);
+      // The org and owner come from the recording's own row when the run's
+      // context does not carry them. Neither real starter does — the finalize
+      // pipeline's child run and POST /recordings/:id/transcribe — so without
+      // this the Activity graph never heard a transcript finish (NFR #159).
+      const row = str(ctx.organizationId) && str(ctx.startedBy) ? null : await Promise.resolve().then(() => callRecordingRepo.getRecording(callId, recordingId)).catch(() => null);
+      const organizationId = str(ctx.organizationId) ?? str(row?.orgId);
+      const startedBy = str(ctx.startedBy) ?? str(row?.startedBy);
       if (organizationId && startedBy) {
         const publication = await platformWorkGraphSourcePublisher.meeting({
           kind: 'transcript', meetingId: callId, recordingId, recordingOwnerId: startedBy,
