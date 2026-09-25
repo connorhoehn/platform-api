@@ -17,6 +17,7 @@
 // (NFR #57).
 
 import {
+  DeleteCommand,
   GetCommand,
   PutCommand,
   QueryCommand,
@@ -167,6 +168,16 @@ export class RunDraftRepository {
       Limit: 1,
     }));
     return ((res.Items ?? [])[0] as RunDraft | undefined) ?? null;
+  }
+
+  /**
+   * Remove one draft. Unconditional and idempotent (an absent row is fine):
+   * the only caller is the provisional-deck sweep, after the document the
+   * draft lived on has itself been deleted.
+   */
+  async delete(documentId: string, draftId: string): Promise<void> {
+    await this.tableReady();
+    await this.client.send(new DeleteCommand({ TableName: this.table, Key: { documentId, draftId } }));
   }
 
   /** Create only when absent. False when a draft with this id already exists. */

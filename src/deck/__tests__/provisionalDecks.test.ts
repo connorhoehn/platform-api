@@ -1,5 +1,7 @@
 jest.mock('../../lib/aws-clients', () => ({ docClient: { send: jest.fn() }, ddbClient: { send: jest.fn() } }));
 jest.mock('../../lib/ddb-table-name', () => ({ tableName: (name: string) => `test-${name}` }));
+const mockWarn = jest.fn();
+jest.mock('../../lib/logger', () => ({ __esModule: true, default: { info: jest.fn(), warn: (...args: unknown[]) => mockWarn(...args), error: jest.fn() } }));
 
 import { markProvisionalDeck, sweepProvisionalDecks } from '../provisionalDecks';
 
@@ -11,6 +13,24 @@ function client(handler: (cmd: Cmd) => unknown) {
 const conditionFailed = () => { throw Object.assign(new Error('failed'), { name: 'ConditionalCheckFailedException' }); };
 const HOUR = 60 * 60 * 1000;
 const T0 = Date.parse('2026-09-25T02:00:00.000Z');
+
+type DraftRow = { status: string; updatedAt: string };
+/** A run-drafts fake keyed `documentId/draftId`, recording deletes. */
+function draftStore(rows: Record<string, DraftRow>, opts: { failDelete?: (documentId: string, draftId: string) => boolean } = {}) {
+  const deleted: string[] = [];
+  return {
+    deleted,
+    get: async (doc: string, id: string) => rows[`${doc}/${id}`] ?? null,
+    listForDocument: async (doc: string) => Object.keys(rows).filter((k) => k.startsWith(`${doc}/`)).map((k) => ({ draftId: k.slice(doc.length + 1) })),
+    delete: async (doc: string, id: string) => {
+      if (opts.failDelete?.(doc, id)) throw new Error('ddb throttled');
+      deleted.push(`${doc}/${id}`);
+      delete rows[`${doc}/${id}`];
+    },
+  };
+}
+
+beforeEach(() => mockWarn.mockReset());
 
 describe('provisional decks', () => {
   it('marks only an empty presentation the same person just created', async () => {
@@ -37,14 +57,18 @@ describe('provisional decks', () => {
       { documentId: 'touched', provisional: { draftId: 'd', since: new Date(T0 - 3 * HOUR).toISOString() } },
     ];
     const { sent, docClient } = client((cmd) => (cmd.constructor.name === 'ScanCommand' ? { Items: rows } : {}));
-    const drafts = { get: async (_doc: string, id: string) => ({
-      a: { status: 'draft', updatedAt: new Date(T0 - 2 * HOUR).toISOString() },
-      b: { status: 'draft', updatedAt: new Date(T0 - 5 * 60_000).toISOString() },
-      c: { status: 'dispatching', updatedAt: new Date(T0 - 3 * HOUR).toISOString() },
-      d: { status: 'draft', updatedAt: new Date(T0 - 10 * 60_000).toISOString() },
-    } as Record<string, { status: string; updatedAt: string }>)[id] ?? null };
+    const drafts = draftStore({
+      'old/a': { status: 'draft', updatedAt: new Date(T0 - 2 * HOUR).toISOString() },
+      // A second, unmarked draft on the reaped deck goes with it.
+      'old/a2': { status: 'cancelled', updatedAt: new Date(T0 - 3 * HOUR).toISOString() },
+      'fresh/b': { status: 'draft', updatedAt: new Date(T0 - 5 * 60_000).toISOString() },
+      'busy/c': { status: 'dispatching', updatedAt: new Date(T0 - 3 * HOUR).toISOString() },
+      'touched/d': { status: 'draft', updatedAt: new Date(T0 - 10 * 60_000).toISOString() },
+    });
     const out = await sweepProvisionalDecks({ drafts, docClient, now: () => T0, ttlMs: HOUR });
-    expect(out).toEqual({ scanned: 4, reaped: ['old'], kept: 3 });
+    expect(out).toEqual({ scanned: 4, reaped: ['old'], kept: 3, draftsRemoved: 2, draftsFailed: 0 });
+    // The reaped deck's drafts are gone; every kept deck's draft stays.
+    expect(drafts.deleted.sort()).toEqual(['old/a', 'old/a2']);
     const del = sent.find((cmd) => cmd.constructor.name === 'DeleteCommand')!.input;
     expect(del.Key).toEqual({ documentId: 'old' });
     expect(del.ConditionExpression).toContain('provisional.draftId = :draftId');
@@ -56,7 +80,25 @@ describe('provisional decks', () => {
       if (cmd.constructor.name === 'ScanCommand') return { Items: [{ documentId: 'raced', provisional: { draftId: 'a', since: new Date(T0 - 2 * HOUR).toISOString() } }] };
       return conditionFailed();
     });
-    const out = await sweepProvisionalDecks({ drafts: { get: async () => null }, docClient, now: () => T0, ttlMs: HOUR });
-    expect(out).toEqual({ scanned: 1, reaped: [], kept: 1 });
+    const drafts = draftStore({ 'raced/a': { status: 'draft', updatedAt: new Date(T0 - 2 * HOUR).toISOString() } });
+    const out = await sweepProvisionalDecks({ drafts, docClient, now: () => T0, ttlMs: HOUR });
+    expect(out).toEqual({ scanned: 1, reaped: [], kept: 1, draftsRemoved: 0, draftsFailed: 0 });
+    // The document row survived, so its draft must too.
+    expect(drafts.deleted).toEqual([]);
+  });
+
+  it('a draft delete that throws still reports the deck reaped, logs, and the sweep goes on', async () => {
+    const since = new Date(T0 - 2 * HOUR).toISOString();
+    const { docClient } = client((cmd) => (cmd.constructor.name === 'ScanCommand'
+      ? { Items: [{ documentId: 'x', provisional: { draftId: 'a', since } }, { documentId: 'y', provisional: { draftId: 'b', since } }] }
+      : {}));
+    const drafts = draftStore({
+      'x/a': { status: 'draft', updatedAt: since },
+      'y/b': { status: 'draft', updatedAt: since },
+    }, { failDelete: (doc) => doc === 'x' });
+    const out = await sweepProvisionalDecks({ drafts, docClient, now: () => T0, ttlMs: HOUR });
+    expect(out).toEqual({ scanned: 2, reaped: ['x', 'y'], kept: 0, draftsRemoved: 1, draftsFailed: 1 });
+    expect(drafts.deleted).toEqual(['y/b']);
+    expect(mockWarn).toHaveBeenCalledWith(expect.objectContaining({ documentId: 'x', draftId: 'a' }), expect.stringContaining('not deleted'));
   });
 });

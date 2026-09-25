@@ -65,9 +65,45 @@ export async function markProvisionalDeck(input: {
 
 export interface ProvisionalDraftLookup {
   get(documentId: string, draftId: string): Promise<{ status: string; updatedAt?: string; dispatchedAt?: string; dispatchStartedAt?: string } | null>;
+  /** Every draft on the document, so a reaped deck leaves none behind. */
+  listForDocument(documentId: string): Promise<Array<{ draftId: string }>>;
+  delete(documentId: string, draftId: string): Promise<void>;
 }
 
-export interface ProvisionalSweepResult { scanned: number; reaped: string[]; kept: number }
+export interface ProvisionalSweepResult {
+  scanned: number;
+  reaped: string[];
+  kept: number;
+  /** Run drafts deleted along with their reaped deck. */
+  draftsRemoved: number;
+  /** Draft deletes that failed (logged; the deck still counts as reaped). */
+  draftsFailed: number;
+}
+
+/**
+ * After a reaped deck's row is gone, delete its run drafts: the marked one and
+ * any other listed for the document. Without this the draft stayed in
+ * `document-run-drafts` with no document to hang off (live 2026-09-25). Never
+ * throws; a failure is logged and counted, and the next sweep will not see the
+ * document again, so the draft is left for an operator.
+ */
+async function removeDraftsOf(drafts: ProvisionalDraftLookup, documentId: string, markedDraftId: string, result: ProvisionalSweepResult): Promise<void> {
+  const ids = new Set<string>([markedDraftId]);
+  try {
+    for (const d of await drafts.listForDocument(documentId)) if (d.draftId) ids.add(d.draftId);
+  } catch (err) {
+    log.warn({ documentId, draftId: markedDraftId, err: err instanceof Error ? err.message : String(err) }, 'provisional deck sweep: listing the reaped deck\'s drafts failed; deleting the marked one only');
+  }
+  for (const draftId of ids) {
+    try {
+      await drafts.delete(documentId, draftId);
+      result.draftsRemoved += 1;
+    } catch (err) {
+      result.draftsFailed += 1;
+      log.warn({ documentId, draftId, err: err instanceof Error ? err.message : String(err) }, 'provisional deck sweep: run draft of a reaped deck not deleted');
+    }
+  }
+}
 
 /**
  * One pass: every provisional row with no revision whose draft has been idle
@@ -82,7 +118,7 @@ export async function sweepProvisionalDecks(opts: {
   const client = opts.docClient ?? defaultDocClient;
   const ttlMs = opts.ttlMs ?? DEFAULT_PROVISIONAL_DECK_TTL_MS;
   const nowMs = (opts.now ?? Date.now)();
-  const result: ProvisionalSweepResult = { scanned: 0, reaped: [], kept: 0 };
+  const result: ProvisionalSweepResult = { scanned: 0, reaped: [], kept: 0, draftsRemoved: 0, draftsFailed: 0 };
   let startKey: Record<string, unknown> | undefined;
   do {
     const page = await client.send(new ScanCommand({
@@ -108,15 +144,17 @@ export async function sweepProvisionalDecks(opts: {
           ConditionExpression: `provisional.draftId = :draftId AND ${NO_REVISION}`,
           ExpressionAttributeValues: { ':draftId': mark.draftId, ':zero': 0 },
         }));
-        result.reaped.push(item.documentId);
       } catch (err) {
         if (!isConditionFailure(err)) throw err;
         result.kept += 1; // it got a revision (or a new mark) since the scan read it
+        continue; // and its drafts stay: only a deleted deck's drafts go
       }
+      result.reaped.push(item.documentId);
+      await removeDraftsOf(opts.drafts, item.documentId, mark.draftId, result);
     }
     startKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
   } while (startKey);
-  if (result.reaped.length) log.info({ reaped: result.reaped, kept: result.kept, ttlMs }, 'provisional deck sweep: empty abandoned decks deleted');
+  if (result.reaped.length) log.info({ reaped: result.reaped, kept: result.kept, draftsRemoved: result.draftsRemoved, draftsFailed: result.draftsFailed, ttlMs }, 'provisional deck sweep: empty abandoned decks deleted');
   return result;
 }
 
