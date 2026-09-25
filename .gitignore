@@ -15,3 +15,6 @@ coverage/
 .message-queue/
 .pipeline-runtime/
 .service-runtime/
+
+# LLVM coverage artifacts
+*.profraw
