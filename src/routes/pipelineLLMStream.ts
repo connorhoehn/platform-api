@@ -24,6 +24,7 @@ import { createLLMClient } from '../pipeline/createLLMClient';
 import { asyncHandler, ValidationError } from '../middleware/error-handler';
 import { createRateLimiter } from '../middleware/rateLimit';
 import { withContext } from '../lib/logger';
+import { gatedLLMClient } from '../lib/modelGate';
 
 // ---------------------------------------------------------------------------
 // AG-UI SSE event shapes
@@ -147,7 +148,7 @@ pipelineLLMStreamRouter.post(
     }
 
     try {
-      const client = createLLMClient();
+      const client = gatedLLMClient(createLLMClient(), 'pipeline');
       const modelId = resolveModelId(body.model);
       const stream = client.stream(modelId, body.systemPrompt, body.userPrompt, {
         temperature: body.temperature,

@@ -53,7 +53,7 @@ import { PipelineRunRepository } from '../repositories/PipelineRunRepository';
 import { docClient } from '../lib/aws-clients';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { idempotency } from '../middleware/idempotency';
-import { generateDraftDefinition, InvalidInstructionError } from '../pipeline/generate-definition';
+import { generateDraftDefinition, InvalidInstructionError, PlannerUnavailableError } from '../pipeline/generate-definition';
 import type { LoopPlan } from '../chat/agentLoopPlanner';
 
 const log = withContext({ route: 'pipelineDefinitions' });
@@ -255,6 +255,8 @@ interface GenerateBody {
   hints?: unknown;
   model?: unknown;
   contextBudgetTokens?: unknown;
+  /** Plan and build the definition, return it, persist and run nothing (NFR Loop 39: exercises the planner). */
+  dryRun?: unknown;
 }
 
 pipelineDefinitionsRouter.post(
@@ -296,10 +298,18 @@ pipelineDefinitionsRouter.post(
         res.status(422).json({ error: 'invalid_instruction', detail: e.detail });
         return;
       }
+      if (e instanceof PlannerUnavailableError) {
+        res.status(503).json({ error: 'model_unavailable', detail: e.message });
+        return;
+      }
       throw e;
     }
 
     const def = generated.definition;
+    if (body.dryRun === true) {
+      res.status(200).json({ dryRun: true, plan: generated.plan, definition: def });
+      return;
+    }
     if (mode === 'run') {
       def.status = 'published';
       def.publishedVersion = 1;

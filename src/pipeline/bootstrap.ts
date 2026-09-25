@@ -172,6 +172,7 @@ import { sharedRedisUrl } from '../lib/redis-client';
 import { runModelProbe, startModelHealthGauges } from '../lib/modelHealth';
 import { publishDurable, catalog } from '../lib/event-catalog';
 import { createValidatingPublisher } from '@connorhoehn/event-catalog';
+import { gatedLLMClient } from '../lib/modelGate';
 
 // ---------------------------------------------------------------------------
 // Test-mode helpers
@@ -674,7 +675,10 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   }
 
   // --- PipelineModule construction ---
-  const llmClient = opts.llmClient ?? createLLMClient();
+  // Every real model call goes through the model gate (NFR Loop 39): the
+  // breaker, then a slot from its purpose's pool. A test's client is used as is.
+  const rawLlmClient = opts.llmClient ?? createLLMClient();
+  const llmClient = opts.llmClient ?? gatedLLMClient(rawLlmClient, 'pipeline');
 
   // EventBus dead-letter handler (Stream 3 — BusDLQ). On by default — the
   // reasonable failure mode in production is to ALWAYS record dead letters
@@ -795,7 +799,7 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     customStepHandlers.set(key, handler);
   }
   // The chat's /doc command: read → plan (light model) → apply as a collaborator.
-  for (const [key, handler] of buildDocumentAgentHandlers({ llm: llmClient })) {
+  for (const [key, handler] of buildDocumentAgentHandlers({ llm: opts.llmClient ?? gatedLLMClient(rawLlmClient, 'document') })) {
     customStepHandlers.set(key, handler);
   }
   // The chat's /summarize and /diagram commands (read the conversation, draw the diagram, post the card).

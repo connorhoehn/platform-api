@@ -139,6 +139,18 @@ describe('planAndTrigger', () => {
     expect(rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`)!.status).not.toBe('failed');
     expect((rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`)!.checkpoint!.context.plan as LoopPlan).source).toBe('fallback');
   });
+
+  it('a model that is unavailable (breaker open) fails the loop with the reason and starts nothing (NFR Loop 39)', async () => {
+    const reason = 'Model unavailable: not logged in';
+    const plan: LoopPlan = { source: 'fallback', notice: `${reason} · not started`, unavailable: reason, steps: REAL_PLAN.steps };
+    const { deps, rows, rerun } = harness({ plan: async () => plan });
+    const request = requestFromInput(INPUT);
+    rows.set(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`, pendingRow('loop-1', request, AT));
+
+    await planAndTrigger('loop-1', request, INPUT, deps);
+    expect(rerun).not.toHaveBeenCalled();
+    expect(rows.get(`${CHAT_AGENT_LOOP_PIPELINE_ID}|loop-1`)).toMatchObject({ status: 'failed', error: reason });
+  });
 });
 
 describe('failOrphanedLoops — the restart path', () => {

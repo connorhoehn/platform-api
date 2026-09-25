@@ -205,6 +205,13 @@ export async function planAndTrigger(
 ): Promise<void> {
   try {
     const plan = await deps.plan(request);
+    // The model is unavailable (breaker open): the loop fails now, with the
+    // reason, rather than starting a single step that asks the same model.
+    if (plan.unavailable) {
+      log.warn({ loopId, reason: plan.unavailable }, 'agent loop not started: model unavailable');
+      await markLoopFailed(loopId, request, plan.unavailable, deps).catch(() => undefined);
+      return;
+    }
     // The plan in `extra` is what makes the start hook DECLINE on this pass,
     // so the real run goes down the same path as every other command.
     const executorRunId = await deps.rerun({

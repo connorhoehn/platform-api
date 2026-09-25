@@ -25,6 +25,9 @@ jest.mock('../../pipeline/createLLMClient', () => ({
   createLLMClient: () => ({ stream: mockStream }),
 }));
 
+// The model gate (breaker + slot pool) has its own tests (lib/__tests__/modelGate.test.ts).
+jest.mock('../../lib/modelGate', () => ({ gatedLLMClient: (client: unknown) => client }));
+
 import { errorHandler } from '../../middleware/error-handler';
 import { pipelineLLMStreamRouter } from '../pipelineLLMStream';
 

@@ -28,6 +28,7 @@ import { isSilentClaudeFailure } from '../pipeline/claudeCliErrors';
 import { routeSummary } from '../pipeline/definition-metadata';
 import type { DeckSpec } from '../deck/DeckSpec';
 import log from '../lib/logger';
+import { isModelUnavailable } from '../lib/modelGate';
 
 export const CHAT_AGENT_LOOP_PIPELINE_ID = 'chat-agent-loop';
 
@@ -123,6 +124,12 @@ export interface LoopPlan {
    * the card, never hidden behind an empty step list.
    */
   source: 'planner' | 'fallback' | 'pending';
+  /**
+   * Set when the model was unavailable (the breaker is open): "Model
+   * unavailable: <reason>". The run fails with it instead of running the
+   * single-step fallback, which would ask the same unavailable model.
+   */
+  unavailable?: string;
   /** Why it fell back, in a sentence a person can read. */
   notice?: string;
 }
@@ -487,6 +494,7 @@ export async function planAgentLoop(
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     log.warn({ durationMs: Date.now() - startedAt, err: reason }, 'agent loop planner threw');
+    if (isModelUnavailable(err)) return { ...fallbackPlan(request, `${reason} · not started`), unavailable: reason };
     return fallbackPlan(request, `Planner unavailable (${reason}) · single step`);
   }
   const durationMs = Date.now() - startedAt;

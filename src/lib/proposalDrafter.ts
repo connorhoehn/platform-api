@@ -36,6 +36,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { createLLMClient } from '../pipeline/createLLMClient';
+import { gatedLLMClient, isModelUnavailable } from './modelGate';
 import type { LLMClient } from '../pipeline/LLMClient';
 import type { Proposal, FieldChange, ProseEdit } from '../types/workItem';
 import log from './logger';
@@ -265,7 +266,8 @@ export function validate(
  */
 export async function draftProposal(
   input: DraftProposalInput,
-  client: LLMClient = createLLMClient(),
+  // Through the model gate (breaker, `drafter` slot pool, single-flight on identical input).
+  client: LLMClient = gatedLLMClient(createLLMClient(), 'drafter', { singleFlight: true }),
 ): Promise<Proposal | null> {
   const proposalId = randomUUID();
   const model = input.model ?? DEFAULT_MODEL;
@@ -280,6 +282,8 @@ export async function draftProposal(
     }
   } catch (err) {
     if ((err as Error)?.name === 'AbortError') throw err;
+    // An open breaker: the stored proposalError reads "Model unavailable: <reason>".
+    if (isModelUnavailable(err)) throw new ProposalProviderError(err.message);
     throw new ProposalProviderError(
       `the ${client.provider} provider could not be reached: ${
         err instanceof Error ? err.message : String(err)

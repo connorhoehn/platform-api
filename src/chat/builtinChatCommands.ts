@@ -27,6 +27,7 @@ import {
 } from './agentLoopPlanner';
 import { PENDING_PLAN, requestFromInput, startAgentLoop } from './agentLoopRunner';
 import { ClaudeCodeAgentClient } from '../pipeline/agent/ClaudeCodeAgentClient';
+import { gatedAgentClient } from '../lib/modelGate';
 import type { AgentClient } from '../pipeline/agent/types';
 
 export const HAIKU_CARD_AGENT = { userId: 'agent:haiku', displayName: 'Haiku' } as const;
@@ -43,7 +44,9 @@ export function setAgentLoopPlannerClient(client: AgentClient | null): void {
 }
 
 export function getAgentLoopPlannerClient(): AgentClient | null {
-  if (plannerAgentClient === undefined) plannerAgentClient = new ClaudeCodeAgentClient();
+  // Through the model gate (NFR Loop 39): an open breaker fails the plan at
+  // once, and the `planner` pool is its own, so deck revises cannot starve it.
+  if (plannerAgentClient === undefined) plannerAgentClient = gatedAgentClient(new ClaudeCodeAgentClient(), 'planner', { singleFlight: true });
   return plannerAgentClient;
 }
 

@@ -19,6 +19,7 @@ import { createAgentStepHandler } from './AgentStepHandler';
 import { ClaudeCodeAgentClient } from './ClaudeCodeAgentClient';
 import { DevboxAgentClient, devboxBaseUrl } from './DevboxAgentClient';
 import type { AgentClient } from './types';
+import { gatedAgentClient } from '../../lib/modelGate';
 
 export interface BuildAgentStepHandlersOpts {
   logger?: Logger;
@@ -33,7 +34,8 @@ export function buildAgentStepHandlers(
 ): Map<string, StepHandler> {
   const handlers = new Map<string, StepHandler>();
 
-  const agentClient = opts.agentClient ?? new ClaudeCodeAgentClient();
+  // A local CLI agent step is a model call: through the gate's `agent` pool.
+  const agentClient = opts.agentClient ?? gatedAgentClient(new ClaudeCodeAgentClient(), 'agent');
   const cwd = process.env['AGENT_STEP_CWD'];
   const defaultModel = process.env['AGENT_STEP_DEFAULT_MODEL'];
 

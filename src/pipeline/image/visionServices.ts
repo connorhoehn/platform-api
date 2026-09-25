@@ -17,6 +17,7 @@ import { AnthropicVisionClient } from './AnthropicVisionClient';
 import { VisionResultRepository } from './VisionResultRepository';
 import { DdbImageBlobStore, isAssetBlobStore, type AssetBlobStore, type ImageBlobStore } from './ImageBlobStore';
 import { VolumeImageBlobStore } from './VolumeImageBlobStore';
+import { withModelGate } from '../../lib/modelGate';
 
 let _imageBlobStore: ImageBlobStore | null = null;
 let _visionResultRepo: VisionResultRepository | null = null;
@@ -96,9 +97,11 @@ export function getVisionResultRepo(): VisionResultRepository {
 export function getVisionClient(): VisionClientLike {
   if (!_visionClient) {
     const mode = (process.env['VISION_CLIENT'] ?? 'anthropic').toLowerCase();
-    _visionClient = mode === 'cli'
+    const inner: VisionClientLike = mode === 'cli'
       ? new VisionClient()
       : new AnthropicVisionClient();
+    // Through the model gate's `vision` pool (NFR Loop 39).
+    _visionClient = { analyze: (input, onToken) => withModelGate('vision', () => inner.analyze(input, onToken)) };
   }
   return _visionClient;
 }

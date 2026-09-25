@@ -88,6 +88,11 @@ async function defaultPlan(request: AgentLoopRequest): Promise<LoopPlan> {
   return planAgentLoop(request, getAgentLoopPlannerClient());
 }
 
+/** The planner's model is unavailable (breaker open): "Model unavailable: <reason>". */
+export class PlannerUnavailableError extends Error {
+  constructor(message: string) { super(message); this.name = 'PlannerUnavailableError'; }
+}
+
 export function validateInstruction(raw: unknown): string {
   if (typeof raw !== 'string') throw new InvalidInstructionError('instruction must be a string');
   const instruction = raw.trim();
@@ -134,6 +139,7 @@ export async function generateDraftDefinition(input: GenerateDefinitionInput, de
   if (!request.instruction) throw new InvalidInstructionError('instruction has no text after its /hints and options');
 
   const plan = await (deps.plan ?? defaultPlan)(request);
+  if (plan.unavailable) throw new PlannerUnavailableError(plan.unavailable);
   const plannedAt = now();
   const base = buildAgentLoopDefinition(plan, request);
   const id = `agent-${slugFromInstruction(request.instruction)}-${suffix()}`;

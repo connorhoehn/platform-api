@@ -239,12 +239,19 @@ export type NeutralCheck = (err: unknown) => boolean;
 
 let rejected = 0;
 
+export interface ModelCallTicket {
+  /** The call answered: close the breaker if it was counting failures. */
+  succeeded(): Promise<void>;
+  /** The call failed: a transport failure counts toward opening; a neutral one (slot wait, abort) does not. */
+  failed(err: unknown, isNeutral?: NeutralCheck): Promise<void>;
+}
+
 /**
- * Runs `fn` (one model call) past the breaker. Open: throws
- * ModelUnavailableError at once. A transport failure counts toward opening
- * it; a success closes it. `isNeutral` errors neither count nor close.
+ * The breaker's admission for one model call, split from the call itself so
+ * a streaming caller (modelGate.ts) can hold it across an async generator.
+ * Open: throws ModelUnavailableError at once.
  */
-export async function guardModelCall<T>(fn: () => Promise<T>, isNeutral: NeutralCheck = () => false): Promise<T> {
+export async function admitModelCall(): Promise<ModelCallTicket> {
   const cfg = breakerConfig();
   let verdict: Admission | null = null;
   await update((s) => { verdict = admit(s, Date.now(), cfg); return verdict.next; }).catch(() => null);
@@ -254,19 +261,37 @@ export async function guardModelCall<T>(fn: () => Promise<T>, isNeutral: Neutral
     gauges().rejected.inc(1);
     throw new ModelUnavailableError(v.kind, v.reason, v.retryInMs);
   }
-  if (v?.allow && v.trial) log.info({ node: NODE }, 'model breaker: half-open trial call');
+  const trial = Boolean(v?.allow && v.trial);
+  if (trial) log.info({ node: NODE }, 'model breaker: half-open trial call');
+  return {
+    async succeeded() {
+      await update((s) => onSuccess(s, Date.now())).then((s) => { if (trial) log.info({ node: NODE, state: s.state }, 'model breaker: trial succeeded'); }).catch(() => undefined);
+    },
+    async failed(err: unknown, isNeutral: NeutralCheck = () => false) {
+      const failure = isNeutral(err) ? null : classifyModelFailure(err instanceof Error ? err.message : String(err));
+      if (failure) {
+        const after = await update((s) => onFailure(s, Date.now(), failure, cfg)).catch(() => null);
+        if (after?.state === 'open') log.warn({ node: NODE, kind: failure.kind, reason: failure.reason, failures: after.failures, untilMs: (after.until ?? 0) - Date.now() }, 'model breaker: open');
+      } else {
+        await update((s) => onNeutral(s, Date.now())).catch(() => undefined);
+      }
+    },
+  };
+}
+
+/**
+ * Runs `fn` (one model call) past the breaker. Open: throws
+ * ModelUnavailableError at once. A transport failure counts toward opening
+ * it; a success closes it. `isNeutral` errors neither count nor close.
+ */
+export async function guardModelCall<T>(fn: () => Promise<T>, isNeutral: NeutralCheck = () => false): Promise<T> {
+  const ticket = await admitModelCall();
   try {
     const out = await fn();
-    await update((s) => onSuccess(s, Date.now())).then((s) => { if (v?.allow && v.trial) log.info({ node: NODE, state: s.state }, 'model breaker: trial succeeded'); }).catch(() => undefined);
+    await ticket.succeeded();
     return out;
   } catch (err) {
-    const failure = isNeutral(err) ? null : classifyModelFailure(err instanceof Error ? err.message : String(err));
-    if (failure) {
-      const after = await update((s) => onFailure(s, Date.now(), failure, cfg)).catch(() => null);
-      if (after?.state === 'open') log.warn({ node: NODE, kind: failure.kind, reason: failure.reason, failures: after.failures, untilMs: (after.until ?? 0) - Date.now() }, 'model breaker: open');
-    } else {
-      await update((s) => onNeutral(s, Date.now())).catch(() => undefined);
-    }
+    await ticket.failed(err, isNeutral);
     throw err;
   }
 }

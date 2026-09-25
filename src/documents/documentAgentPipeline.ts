@@ -14,6 +14,7 @@ import { AgentCollaborator, HAIKU_AGENT } from './AgentCollaborator';
 import { applyChangeIndex, applyOps, createSuggestionIdentity, runSuggestionIdentity, ensureCanvasMeta, outlineOf, parseOps, type ApplyMode, type OutlineBlock } from './documentAgentOps';
 import log from '../lib/logger';
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
+import { gatedLLMClient } from '../lib/modelGate';
 
 export const DOCUMENT_AGENT_EDIT_PIPELINE_ID = 'document-agent-edit';
 export const DOCUMENT_TRANSFORM_PIPELINE_ID = 'document-transform';
@@ -503,7 +504,7 @@ export function createDocumentPlanHandler(llm: LLMClient): DescribedStepHandler 
 export function buildDocumentAgentHandlers(opts: { llm?: LLMClient } = {}): Map<string, StepHandler> {
   const m = new Map<string, StepHandler>();
   m.set(DOCUMENT_READ_KIND, createDocumentReadHandler());
-  m.set(DOCUMENT_PLAN_KIND, createDocumentPlanHandler(opts.llm ?? createLLMClient()));
+  m.set(DOCUMENT_PLAN_KIND, createDocumentPlanHandler(opts.llm ?? gatedLLMClient(createLLMClient(), 'document')));
   m.set(DOCUMENT_REVIEW_KIND, createDocumentReviewHandler());
   m.set(DOCUMENT_APPLY_KIND, createDocumentApplyHandler());
   return m;

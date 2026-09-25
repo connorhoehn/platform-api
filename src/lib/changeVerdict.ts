@@ -31,6 +31,7 @@
 import { createHash } from 'node:crypto';
 import { inspect } from 'node:util';
 import { createLLMClient } from '../pipeline/createLLMClient';
+import { gatedLLMClient, isModelUnavailable } from './modelGate';
 import type { LLMClient } from '../pipeline/LLMClient';
 import type { Proposal } from '../types/workItem';
 import type { ChangeVerdict, ChangeReviewVerdict } from '../types/changeVerdict';
@@ -404,7 +405,8 @@ export interface JudgeChangeResult {
  */
 export async function judgeChange(
   input: JudgeChangeInput,
-  client: LLMClient = createLLMClient(),
+  // Through the model gate (breaker, `verdict` slot pool, single-flight on identical input).
+  client: LLMClient = gatedLLMClient(createLLMClient(), 'verdict', { singleFlight: true }),
 ): Promise<JudgeChangeResult> {
   const model = input.model ?? DEFAULT_MODEL;
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -427,6 +429,8 @@ export async function judgeChange(
       if (chunk.done) response = chunk.response;
     }
   } catch (err) {
+    // An open breaker: say "Model unavailable: <reason>" at once, as it is.
+    if (isModelUnavailable(err)) throw new VerdictProviderError(err.message);
     if (timedOut) {
       throw new VerdictTimeoutError(
         `the ${client.provider} provider did not answer within ${timeoutMs}ms`,
