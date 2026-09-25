@@ -826,6 +826,48 @@ describe('work graph schemaVersion 2 route', () => {
       .toEqual(['Release plan · rev 6 · 09:08']);
   });
 
+  it('lists a deck revision once under its canonical id, and never a CRDT edit\'s hash (NFR #229)', async () => {
+    // The live Sprint review: the gateway projected a CRDT update of the deck's
+    // text as a change named by a content hash (labelled "rev 2" from its last
+    // digit); an older reference names v2 by its item key. The list must hold
+    // only ids the deck store resolves, each once.
+    const hash = '91ab332891270c17fabb87ee1da94ecac444319628c8c7c2';
+    const extra = [
+      node('deck-edit', 'change', 'Document change', `doc-deck:${hash}`, 'document', at('13:33')),
+      node('deck-v2-legacy', 'change', 'Document change', 'doc-deck:rev#00000002', 'document', at('13:31')),
+    ];
+    const extraEdges = [edge('e-edit', 'deck-edit', 'deck', 'edited'), edge('e-v2-legacy', 'deck-v2-legacy', 'deck', 'edited')];
+    const saved = { nodes: projection.nodes, edges: projection.edges, selection: grant.selection };
+    projection.nodes = { ...projection.nodes, ...Object.fromEntries(extra.map((item) => [item.id, item])) };
+    projection.edges = { ...projection.edges, ...Object.fromEntries(extraEdges.map((item) => [item.id, item])) };
+    grant.selection = { ...grant.selection, nodeIds: [...grant.selection.nodeIds, ...extra.map((item) => item.id)], edgeIds: [...grant.selection.edgeIds, ...extraEdges.map((item) => item.id)] };
+    try {
+      const body = (await get(setup({ activityReader: reader({
+        artifact: async (documentId) => (documentId === 'doc-deck'
+          ? {
+            name: 'Sprint review',
+            mediaKind: 'presentation' as const,
+            revisions: [
+              { id: 'v1', label: 'v1', createdAt: at('13:27'), slideCount: 3, slides: deckSlides('Release readiness') },
+              { id: 'v2', label: 'v2', createdAt: at('13:31'), slideCount: 3, slides: deckSlides('Owners') },
+            ],
+          }
+          : { name: 'Release plan', mediaKind: 'document' as const }),
+      }) }), v2)).body as WorkGraphSnapshotV2;
+      expect(validateWorkGraphSnapshotV2(body).ok).toBe(true);
+      const revisions = body.details.find((detail) => detail.nodeId === 'deck')?.artifact?.revisions ?? [];
+      expect(revisions.map((revision) => [revision.id, revision.label, revision.previewHandle])).toEqual([
+        ['v1', 'v1', 'deck.v1'], ['v2', 'v2', 'deck.v2'],
+      ]);
+      // A plain document keeps its own ids: nothing else resolves them.
+      expect(body.details.find((detail) => detail.nodeId === 'release-plan')?.lines).toEqual(['Release plan · rev 6 · 09:08']);
+    } finally {
+      projection.nodes = saved.nodes;
+      projection.edges = saved.edges;
+      grant.selection = saved.selection;
+    }
+  });
+
   it('dates a revision both records hold by the document row, so one clock orders the history', async () => {
     // The live Sprint review: v1/v2 are projected change nodes stamped by the
     // scenario's save events (13:27, 13:31), but the row wrote them at 05:07,

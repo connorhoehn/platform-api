@@ -51,10 +51,23 @@ export function revKey(version: number): string {
   return `rev#${String(version).padStart(8, '0')}`;
 }
 
-/** `v12` → 12. Every id the store has written is `v<n>`, n = its position. */
+/**
+ * `v12` → 12. Every id the store has written is `v<n>`, n = its position, and
+ * that is the one canonical form. The legacy forms a reference may still carry
+ * resolve to the same revision: the item's range key `rev#00000012`, a bare
+ * `12`, `rev 12` (NFR #229). Anything else — a gateway CRDT update's content
+ * hash above all — names no deck revision and is `null`.
+ */
 export function versionOf(revisionId: string | undefined): number | null {
-  const match = /^v(\d+)$/.exec(revisionId ?? '');
-  return match ? Number(match[1]) : null;
+  const match = /^(?:v|rev#|rev\s*)?(\d{1,9})$/i.exec((revisionId ?? '').trim());
+  const version = match ? Number(match[1]) : 0;
+  return version >= 1 ? version : null;
+}
+
+/** The canonical `v<n>` id for any accepted form, or `null` when it names no deck revision. */
+export function canonicalRevisionId(revisionId: string | undefined): string | null {
+  const version = versionOf(revisionId);
+  return version === null ? null : `v${version}`;
 }
 
 export function summarizeRevision(revision: StoredRevision): HeadRevisionSummary {

@@ -609,7 +609,8 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
       const item = await getRevisionItem(this.docClient, documentId, version, this.revisionTable!);
       if (item) return item;
     }
-    return row.revisions?.find((candidate) => candidate.id === revisionId) ?? null;
+    return row.revisions?.find((candidate) => candidate.id === revisionId
+      || (version !== null && versionOf(candidate.id) === version)) ?? null;
   }
 
   async listRevisions(documentId: string, opts: { limit: number; before?: string }, rowIn?: PresentationDocumentRow | null): Promise<RevisionPage | null> {

@@ -10,7 +10,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { InMemoryImageBlobStore } from '../../pipeline/image/ImageBlobStore';
 import { DdbPresentationDocumentStore, DOCUMENTS_TABLE, type PresentationDocumentRow, type StoredRevision } from '../presentationDocuments';
-import { canonicalJson, revKey } from '../presentationRevisionItems';
+import { canonicalJson, canonicalRevisionId, revKey, versionOf } from '../presentationRevisionItems';
 import { migrateRevisionRow } from '../revisionItemsMigration';
 
 const REVS = 'test-presentation-revisions';
@@ -139,6 +139,19 @@ describe('revisions as items (NFR #188)', () => {
     expect(row.headRevision.id).toBe('v20');
     const full = await store.get('doc-1');
     expect(full!.revisions!.map((r) => r.id)).toEqual(ids);
+  });
+
+  it('resolves every accepted form of a revision id to the one canonical v<n>, and a hash to nothing (NFR #229)', async () => {
+    expect(['v3', 'V3', 'rev#00000003', '3', 'rev 3', ' v3 '].map(versionOf)).toEqual([3, 3, 3, 3, 3, 3]);
+    expect(canonicalRevisionId('rev#00000012')).toBe('v12');
+    expect(['91ab332891270c17fabb87ee1da94ecac444319628c8c7c2', 'v0', '', undefined, 'rev-6', 'v1.2'].map(versionOf))
+      .toEqual([null, null, null, null, null, null]);
+    const tables = fakeTables();
+    const store = newStore(tables.client);
+    await store.appendRevision(input('first'));
+    await store.appendRevision(input('second'));
+    for (const id of ['v2', 'rev#00000002', '2']) expect((await store.getRevision('doc-1', id))?.id).toBe('v2');
+    expect(await store.getRevision('doc-1', '91ab332891270c17fabb87ee1da94ecac444319628c8c7c2')).toBeNull();
   });
 
   it('pages newest first with one Query per page', async () => {

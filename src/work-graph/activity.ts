@@ -27,6 +27,7 @@ import {
 } from '@connorhoehn/realtime-modules/work-graph';
 import type { StoredWorkNode } from '../repositories/WorkGraphRepository';
 import { distinctHeading } from '../deck/distinctHeading';
+import { canonicalRevisionId } from '../deck/presentationRevisionItems';
 import { parsePipelineStepResourceId } from './sources/mapPipeline';
 import type { AuthorizedWorkGraph, ViewerWorkEdge, ViewerWorkNode } from './policy';
 
@@ -857,12 +858,30 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
       // What each revision is actually made of, as its own source recorded it.
       // A revision the source has no record of keeps whatever the projected
       // change node said and gains nothing.
-      const storedRevisions = new Map((facts?.revisions ?? []).map((revision) => [revision.id, revision]));
+      const storedRevisions = new Map((facts?.revisions ?? [])
+        .map((revision) => [canonicalRevisionId(revision.id) ?? revision.id, revision] as const));
       // Two records of the same history: the projected `change` nodes, which
       // are what a save event writes, and the document's own revision list,
       // which is what a generator appends directly. Either one alone misses
       // half of them, so they are merged and de-duplicated by revision id.
-      const projected = documentId ? revisionsByDocument.get(documentId) ?? [] : [];
+      // One canonical id per revision (NFR #229). A deck's revisions are
+      // `v<n>` in its own store; a reference in a legacy form (`rev#0000000n`,
+      // a bare number) is the same revision under that id. A change the
+      // gateway projected from a CRDT update is named by a content hash: it is
+      // an edit of the deck's text, not one of its revisions, and listing it
+      // offered a "rev 2" whose preview and open both resolved to nothing. The
+      // change node itself stays; the pane opens it at the revision it edited.
+      const deckStore = facts?.mediaKind === 'presentation' && storedRevisions.size > 0;
+      const seen = new Set<string>();
+      const projected = (documentId ? revisionsByDocument.get(documentId) ?? [] : [])
+        .flatMap((revision) => {
+          const canonical = canonicalRevisionId(revision.id);
+          if (deckStore && !canonical) return [];
+          const id = canonical ?? revision.id;
+          if (seen.has(id)) return [];
+          seen.add(id);
+          return [canonical && canonical !== revision.id ? { ...revision, id, label: canonical } : revision];
+        });
       const listedIds = new Set(projected.map((revision) => revision.id));
       // When both records hold a revision, the document's own row says when
       // it was written: the change node's time is only when a save event
@@ -877,10 +896,10 @@ export async function buildWorkActivity(input: BuildWorkActivityInput): Promise<
             ? { ...revision, createdAt: new Date(Date.parse(written)).toISOString() }
             : revision;
         }),
-        ...[...storedRevisions.values()]
-          .filter((revision) => !listedIds.has(revision.id) && !!revision.createdAt)
-          .map((revision) => ({
-            id: revision.id,
+        ...[...storedRevisions.entries()]
+          .filter(([id, revision]) => !listedIds.has(id) && !!revision.createdAt)
+          .map(([id, revision]) => ({
+            id,
             label: trim(revision.label, WORK_GRAPH_LIMITS.labelLength) ?? revision.id,
             createdAt: new Date(Date.parse(revision.createdAt as string)).toISOString(),
           })),
