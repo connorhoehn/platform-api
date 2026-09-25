@@ -1,4 +1,4 @@
-import { DocumentSearchIndex, scoreDocument, tokenize, decodeCursor, encodeCursor, type DocumentRow, type DocumentSearchDeps } from '../documentSearch';
+import { DocumentSearchIndex, meaningfulDescription, scoreDocument, tokenize, decodeCursor, encodeCursor, type DocumentRow, type DocumentSearchDeps } from '../documentSearch';
 
 const rows: DocumentRow[] = [
   { documentId: 'rp', title: 'Release plan', type: 'page', createdBy: 'connor', updatedAt: '2026-09-24T10:00:00Z' },
@@ -29,6 +29,14 @@ function deps(over: Partial<DocumentSearchDeps> = {}) {
 const connor = { sub: 'connor', orgId: 'org' };
 const req = (q: string, extra: object = {}) => ({ q, sort: 'relevance' as const, filters: {}, offset: 0, limit: 30, ...extra });
 
+describe('meaningfulDescription', () => {
+  it('drops generic descriptions', () => {
+    expect(meaningfulDescription({ description: 'Project documents', title: 'X' })).toBeNull();
+    expect(meaningfulDescription({ description: 'Sprint review presentation', title: 'Sprint review' })).toBeNull();
+    expect(meaningfulDescription({ description: 'Release checks.', title: 'Launch checklist' })).toBe('Release checks.');
+  });
+});
+
 describe('scoreDocument', () => {
   it('ranks title over summary over body and needs every word', () => {
     const t = tokenize('release');
@@ -49,6 +57,7 @@ describe('DocumentSearchIndex', () => {
     expect(res.items.find((i) => i.id === 'secret')).toBeUndefined();
     expect(res.libraryTotal).toBe(6);
     expect(res.items[0]).toMatchObject({ folderName: 'Release assets', summary: 'Scope, readiness and rollback.', match: 'title' });
+    expect(res.items.find((i) => i.id === 'lc')!.summary).toBe('Release checks for rollout.');
     expect(res.items.find((i) => i.id === 'sr')).toMatchObject({ kind: 'presentation', summary: 'Previous release review.' });
     expect(res.facets.folders.map((f) => f.id)).not.toContain('fx');
     expect(res.facets.owners.map((o) => o.id).sort()).toEqual(['connor', 'frank']);

@@ -130,6 +130,20 @@ export function kindOf(type: string | undefined): SearchKind {
   return 'page';
 }
 
+/**
+ * The row's description when an author wrote one. Seeds and old create paths
+ * filled it with the type's folder name ("Project documents") or "<title>
+ * presentation"; those say nothing, and the page's opening sentence is better.
+ */
+export function meaningfulDescription(row: Pick<DocumentRow, 'description' | 'title' | 'type'>): string | null {
+  const d = row.description?.trim();
+  if (!d) return null;
+  const lower = d.toLowerCase();
+  const title = (row.title ?? '').trim().toLowerCase();
+  if (lower === 'project documents' || lower === title || lower === `${title} presentation` || lower === `${title} ${(row.type ?? '').toLowerCase()}`) return null;
+  return d;
+}
+
 export function tokenize(q: string): string[] {
   return [...new Set(q.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length > 0))].slice(0, 8);
 }
@@ -356,7 +370,7 @@ export class DocumentSearchIndex {
         title: row.title || 'Untitled',
         kind: kindOf(row.type),
         type: row.type ?? '',
-        summary: excerpt || row.description?.trim() || null,
+        summary: meaningfulDescription(row) ?? excerpt ?? null,
         folderId,
         folderName: folderId ? folderById.get(folderId)?.name ?? null : null,
         ownerId: row.createdBy ?? null,
