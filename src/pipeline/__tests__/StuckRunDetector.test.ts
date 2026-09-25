@@ -63,8 +63,8 @@ describe('StuckRunDetector (hub#1285)', () => {
     it('NFR loop 18: a stuck run reaches the rollup row and the bus as pipeline:run:stuck', async () => {
       const run = makeRun({ runId: 'r1', pipelineId: 'p1', lastEventAt: '2026-01-01T00:00:00.000Z' });
       const { repo } = stubRepo(run);
-      const applyResolved = jest.fn(async () => null);
-      const publish = jest.fn(async () => undefined);
+      const applyResolved = jest.fn(async (_resolved: unknown) => null);
+      const publish = jest.fn(async (_event: string, _payload: unknown) => undefined);
       const detector = new StuckRunDetector({
         runPersistence: stubPersistence([{ runId: 'r1', pipelineId: 'p1' }]),
         repository: repo,

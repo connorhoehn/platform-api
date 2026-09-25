@@ -89,12 +89,11 @@ describe('transform operations', () => {
 
 describe('horizontal rules', () => {
   it('parses and writes a divider with no text, after the title when asked', async () => {
-    const { parseOps, applyOps, outlineOf } = await import('../documentAgentOps');
-    const YT = require('yjs') as typeof import('yjs');
-    const doc = new YT.Doc();
+    const { parseOps, applyOps, outlineOf } = await import('../documentAgentOps.js');
+    const doc = new Y.Doc();
     const body = doc.getXmlFragment('body');
-    const h = new YT.XmlElement('heading'); h.setAttribute('level', '1'); const t = new YT.XmlText(); t.insert(0, 'Title'); h.insert(0, [t]);
-    const p = new YT.XmlElement('paragraph'); const pt = new YT.XmlText(); pt.insert(0, 'Body'); p.insert(0, [pt]);
+    const h = new Y.XmlElement('heading'); h.setAttribute('level', '1'); const t = new Y.XmlText(); t.insert(0, 'Title'); h.insert(0, [t]);
+    const p = new Y.XmlElement('paragraph'); const pt = new Y.XmlText(); pt.insert(0, 'Body'); p.insert(0, [pt]);
     body.insert(0, [h, p]);
     const ops = parseOps('[{"op":"insertBlock","index":1,"kind":"horizontalRule","text":""},{"op":"appendBlock","kind":"horizontalRule"}]');
     expect(ops).toHaveLength(2);

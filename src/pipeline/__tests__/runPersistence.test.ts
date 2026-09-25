@@ -45,7 +45,7 @@ describe('RunPersistenceService', () => {
   let cleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    mockRepository = { put: jest.fn().mockImplementation(() => Promise.resolve()), listByStatus: jest.fn().mockResolvedValue([]) };
+    mockRepository = { put: jest.fn().mockImplementation(() => Promise.resolve()), listByStatus: jest.fn<() => Promise<unknown[]>>().mockResolvedValue([]) };
     const fixture = new FixtureLLMClient(['ok']);
     const { shutdown } = await bootstrapPipeline({
       llmClient: fixture,

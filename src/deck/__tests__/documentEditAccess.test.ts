@@ -32,7 +32,7 @@ describe('document edit access', () => {
   });
 
   it('assertCanEditDocument throws a 403 forbidden naming the document, and passes owner/editor/new rows', async () => {
-    const { assertCanEditDocument, DocumentEditForbiddenError } = await import('../documentEditAccess');
+    const { assertCanEditDocument, DocumentEditForbiddenError } = await import('../documentEditAccess.js');
     const row = { createdBy: 'u-owner', editors: ['u-ed'], viewers: ['u-view'] };
     await expect(assertCanEditDocument(row, { sub: 'u-owner' }, 'd1')).resolves.toBeUndefined();
     await expect(assertCanEditDocument(row, { sub: 'u-ed' }, 'd1')).resolves.toBeUndefined();
@@ -72,7 +72,7 @@ describe('channel membership for document:read', () => {
   });
 
   it('DM and group-DM members are read from chat-conversations; a room from chat-members', async () => {
-    const { makeChannelMemberLookup } = await import('../documentEditAccess');
+    const { makeChannelMemberLookup } = await import('../documentEditAccess.js');
     const member = makeChannelMemberLookup(get);
     expect(await member(dm, 'dev-frank')).toBe(true);
     expect(await member(dm, 'dev-connor')).toBe(true);
@@ -86,7 +86,7 @@ describe('channel membership for document:read', () => {
   });
 
   it('a name that does not include the user is refused without a read; a failing table fails closed', async () => {
-    const { makeChannelMemberLookup } = await import('../documentEditAccess');
+    const { makeChannelMemberLookup } = await import('../documentEditAccess.js');
     get.mockClear();
     expect(await makeChannelMemberLookup(get)(dm, 'dev-mallory')).toBe(false);
     expect(get).not.toHaveBeenCalled();
@@ -95,7 +95,7 @@ describe('channel membership for document:read', () => {
   });
 
   it('canReadDocument: the other DM member reads a deck shared in the DM, a third user does not', async () => {
-    const { canReadDocument, makeChannelMemberLookup } = await import('../documentEditAccess');
+    const { canReadDocument, makeChannelMemberLookup } = await import('../documentEditAccess.js');
     const deck = { createdBy: 'dev-connor', channel: dm };
     const member = makeChannelMemberLookup(get);
     expect((await canReadDocument(deck, { sub: 'dev-frank' }, 'doc-dm', member)).allow).toBe(true);
@@ -105,7 +105,7 @@ describe('channel membership for document:read', () => {
   });
 
   it('NFR #155: a deck the owner filed in a DM stays readable to the other member after the conversation row expires', async () => {
-    const { canReadDocument, makeChannelMemberLookup, dmNamesAdmit } = await import('../documentEditAccess');
+    const { canReadDocument, makeChannelMemberLookup, dmNamesAdmit } = await import('../documentEditAccess.js');
     // The TTL deleted both conversation rows: the table has nothing for this DM.
     const expired = jest.fn(async () => ({ Item: undefined }));
     const member = makeChannelMemberLookup(expired);

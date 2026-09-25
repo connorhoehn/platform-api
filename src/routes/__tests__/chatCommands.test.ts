@@ -94,13 +94,13 @@ describe('GET /api/chat/commands', () => {
   it('lists the built-ins with what each one needs', async () => {
     const res = await run(buildApp(), 'GET', '/api/chat/commands');
     expect(res.statusCode).toBe(200);
-    const commands = (res.body as { commands: Array<{ trigger: string; pipelineId: string; requires?: unknown }> }).commands;
+    const commands = (res.body as { commands: Array<{ trigger: string; pipelineId: string; requires?: unknown; description: string }> }).commands;
     const byTrigger = Object.fromEntries(commands.map((c) => [c.trigger, c]));
     expect(byTrigger['/doc']).toMatchObject({ pipelineId: 'document-agent-edit', requires: { document: true, argumentText: true } });
     expect(byTrigger['/transform']).toMatchObject({ pipelineId: 'document-transform', requires: { document: true, argument: true, extra: ['sourceDocumentId'] } });
     expect(byTrigger['/summarize']).toMatchObject({ pipelineId: 'conversation-summarize', requires: { document: true } });
     expect(byTrigger['/diagram']).toMatchObject({ pipelineId: 'diagram-generate', requires: { document: true, argumentText: true } });
-    for (const c of commands) expect(typeof (c as { description: string }).description).toBe('string');
+    for (const c of commands) expect(typeof c.description).toBe('string');
   });
 
   it('carries each command\'s menu label and hint beside its description', async () => {

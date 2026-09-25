@@ -123,10 +123,10 @@ describe('ImageVariationStepHandler.execute', () => {
     expect(out.parentImageId).toBe('src_var');
 
     // Fan-out shape
-    const fo = (outcome as Record<string, unknown>).fanOut as Record<string, unknown>;
+    const fo = outcome.fanOut;
     expect(fo).toBeDefined();
-    expect((fo.items as unknown[]).length).toBe(2);
-    expect(fo.itemAlias).toBe('generatedImage');
+    expect(fo!.items.length).toBe(2);
+    expect(fo!.itemAlias).toBe('generatedImage');
 
     // Both stored
     for (const id of ids) {

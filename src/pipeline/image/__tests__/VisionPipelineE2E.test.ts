@@ -92,6 +92,7 @@ function makeEventBus(): EventBus<PipelineEventMap> {
 }
 
 const fakeLLMClient: LLMClient = {
+  provider: 'fake',
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   stream: () => ({ async *[Symbol.asyncIterator]() { /* none */ } }) as any,
 };

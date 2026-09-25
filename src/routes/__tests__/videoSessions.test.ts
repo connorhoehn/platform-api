@@ -119,6 +119,9 @@ function mockRes(): MockRes {
 
 interface RunOpts { body?: unknown; userId?: string; headers?: Record<string, string> }
 
+/** GET /api/video/sessions/by-lobby/:lobbyName */
+type ByLobbyBody = { lobbyName: string; live: boolean; channelArn: string | null };
+
 async function run(
   app: express.Express,
   method: string,
@@ -237,7 +240,7 @@ describe('POST /api/video/sessions — non-AppError outer catch', () => {
   it('returns 502 when fetch itself throws (network error → bad-gateway)', async () => {
     mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
-      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      body: { documentId: 'doc-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(502);
@@ -421,9 +424,9 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       // Whether or not anything is live, the answer is a 200 — what must NOT
       // happen is a session being created.
       expect(res.statusCode).toBe(200);
-      expect(res.body.live).toBe(true);
-      expect(res.body.channelArn).toBe('arn:channel:watch');
-      expect(res.body.lobbyName).toBe('room:asdf');
+      expect((res.body as ByLobbyBody).live).toBe(true);
+      expect((res.body as ByLobbyBody).channelArn).toBe('arn:channel:watch');
+      expect((res.body as ByLobbyBody).lobbyName).toBe('room:asdf');
       // A viewer gets what they need to watch and nothing more — no
       // participant list, no token. Watching is a weaker right than joining.
       expect(res.body).not.toHaveProperty('participants');
@@ -444,8 +447,8 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         userId: 'alice',
       });
       expect(res.statusCode).toBe(200);
-      expect(res.body.live).toBe(false);
-      expect(res.body.channelArn).toBeNull();
+      expect((res.body as ByLobbyBody).live).toBe(false);
+      expect((res.body as ByLobbyBody).channelArn).toBeNull();
     });
 
     // `status: 'active'` is a lifecycle flag, not evidence of a broadcast. It
@@ -465,7 +468,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         userId: 'alice',
       });
       expect(res.statusCode).toBe(200);
-      expect(res.body.live).toBe(false);
+      expect((res.body as ByLobbyBody).live).toBe(false);
     });
 
     it('reports not-live when the record predates participant tracking entirely', async () => {
@@ -478,7 +481,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         userId: 'alice',
       });
       expect(res.statusCode).toBe(200);
-      expect(res.body.live).toBe(false);
+      expect((res.body as ByLobbyBody).live).toBe(false);
     });
 
     // The roster cannot answer "is this watchable": a room call joins TWICE
@@ -509,7 +512,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
       });
       expect(res.statusCode).toBe(200);
-      expect(res.body.live).toBe(false);
+      expect((res.body as ByLobbyBody).live).toBe(false);
     });
 
     it('200s when the SFU says LIVE, even with an empty roster', async () => {
@@ -522,7 +525,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
       });
       expect(res.statusCode).toBe(200);
-      expect(res.body.channelArn).toBe('arn:channel:live');
+      expect((res.body as ByLobbyBody).channelArn).toBe('arn:channel:live');
     });
 
     // "Could not ask" is not "nothing is on". Telling a viewer a running
@@ -551,7 +554,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         headers: { authorization: 'Bearer user-jwt' }, userId: 'alice',
       });
       expect(res.statusCode).toBe(200);
-      expect(res.body.live).toBe(false);
+      expect((res.body as ByLobbyBody).live).toBe(false);
     });
 
     it('decodes the lobby name out of the path', async () => {
@@ -563,7 +566,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
         headers: { authorization: 'Bearer user-jwt' },
         userId: 'alice',
       });
-      expect(res.body.lobbyName).toBe('dm:alice:bob');
+      expect((res.body as ByLobbyBody).lobbyName).toBe('dm:alice:bob');
     });
   });
 
@@ -681,7 +684,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
   it('forwards 4xx from LVS without tripping the breaker', async () => {
     mockFetch.mockResolvedValue(apiFail(404));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
-      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      body: { documentId: 'doc-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(404);
@@ -690,7 +693,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
   it('forwards LVS 5xx (counted as breaker failure)', async () => {
     mockFetch.mockResolvedValue(apiFail(502));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
-      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      body: { documentId: 'doc-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(502);
@@ -713,7 +716,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
     mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:3'));
     mockCreateSession.mockRejectedValue(new Error('DDB error'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
-      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      body: { documentId: 'doc-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(201);
@@ -786,7 +789,7 @@ describe('POST /api/video/sessions/:sessionId/join (thin proxy → LVS)', () => 
   it('returns 404 when session not found in DB', async () => {
     mockGetSession.mockResolvedValue(null);
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
-      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      body: { documentId: 'doc-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(404);
@@ -796,7 +799,7 @@ describe('POST /api/video/sessions/:sessionId/join (thin proxy → LVS)', () => 
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockResolvedValue(apiFail(403));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
-      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      body: { documentId: 'doc-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(403);
@@ -810,7 +813,7 @@ describe('POST /api/video/sessions/:sessionId/join (thin proxy → LVS)', () => 
       text: async () => '',
     } as unknown as globalThis.Response);
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
-      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      body: { documentId: 'doc-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(410);
@@ -831,7 +834,7 @@ describe('POST /api/video/sessions/:sessionId/join (thin proxy → LVS)', () => 
     mockGetSession.mockResolvedValue(session);
     mockFetch.mockRejectedValue(new Error('network down'));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
-      body: { documentId: 'doc-1' }, headers: { authorization: 'Bearer u' },
+      body: { documentId: 'doc-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(502);

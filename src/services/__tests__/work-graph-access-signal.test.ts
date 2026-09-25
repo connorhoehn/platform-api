@@ -45,7 +45,7 @@ describe('work-graph access-changed signal (NFR #21)', () => {
   it('a pair write publishes for the current grant; a failed publish never fails the write', async () => {
     const publish = jest.fn().mockRejectedValue(new Error('redis down'));
     const store = {
-      async putGrant(next: typeof grant) { return next; },
+      async putGrant(next: typeof grant, _expectedRevision: number | null) { return next; },
       async putGrantPair(current: typeof grant, history: typeof grant) { return { current, history }; },
     };
     const wrapped = withAccessChangedSignal(store, publish);
@@ -57,7 +57,7 @@ describe('work-graph access-changed signal (NFR #21)', () => {
   });
 
   it('two platform replicas: only the one that commits publishes', async () => {
-    const backing = { async putGrant(next: typeof grant) { return next; } };
+    const backing = { async putGrant(next: typeof grant, _expectedRevision: number | null) { return next; } };
     const publishA = jest.fn().mockResolvedValue(undefined);
     const publishB = jest.fn().mockResolvedValue(undefined);
     const replicaA = withAccessChangedSignal(backing, publishA);

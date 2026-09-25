@@ -25,7 +25,7 @@ function def(over: Record<string, unknown>): Record<string, unknown> {
 }
 
 function makeBridge(): {
-  trigger: jest.Mock<Promise<{ runId: string }>, [unknown]>;
+  trigger: jest.Mock<(args: unknown) => Promise<{ runId: string }>>;
 } {
   let n = 0;
   return {
@@ -107,7 +107,7 @@ describe('dispatchPlatformEvent', () => {
   test('one failing pipeline does not stop siblings and never throws', async () => {
     const a = def({ id: 'pipe-a' });
     const b = def({ id: 'pipe-b' });
-    const trigger = jest.fn<Promise<{ runId: string }>, [unknown]>(
+    const trigger = jest.fn<(args: unknown) => Promise<{ runId: string }>>(
       async (args) => {
         if ((args as { pipelineId: string }).pipelineId === 'pipe-a') {
           throw new Error('boom');

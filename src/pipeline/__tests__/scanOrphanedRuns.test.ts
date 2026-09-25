@@ -65,8 +65,8 @@ describe('scanOrphanedRuns (hub#1282)', () => {
     const recentStart = new Date(NOW - 30 * 60 * 1000).toISOString();
     const run = makeRun({ runId: 'r-recent', startedAt: recentStart, ownerNodeId: 'node-a' });
     const { repo } = stubRepo([run]);
-    const applyResolved = jest.fn(async () => null);
-    const publish = jest.fn(async () => undefined);
+    const applyResolved = jest.fn(async (_resolved: unknown) => null);
+    const publish = jest.fn(async (_event: string, _payload: unknown) => undefined);
 
     const result = await scanOrphanedRuns({ repository: repo, now: () => NOW, rollup: { applyResolved }, publish });
 
@@ -94,13 +94,13 @@ describe('scanOrphanedRuns (hub#1282)', () => {
     const recentStart = new Date(NOW - 30 * 60 * 1000).toISOString();
     const run = makeRun({ runId: 'r-done', startedAt: recentStart });
     const { repo } = stubRepo([run]);
-    const applyResolved = jest.fn(async () => null);
-    const publish = jest.fn(async () => undefined);
+    const applyResolved = jest.fn(async (_resolved: unknown) => null);
+    const publish = jest.fn(async (_event: string, _payload: unknown) => undefined);
 
     const result = await scanOrphanedRuns({
       repository: repo,
       now: () => NOW,
-      terminalEvidence: async () => ({ status: 'completed', source: 'audit', detail: 'pipeline.run.completed row' }),
+      terminalEvidence: async () => ({ status: 'completed', at: '2026-05-06T11:45:00.000Z', source: 'audit', detail: 'pipeline.run.completed row' }),
       rollup: { applyResolved },
       publish,
     });

@@ -125,7 +125,7 @@ describe('RunRowLocator', () => {
 
 describe('RunRowLocator inside one graph build (NFR #16)', () => {
   it('reads each run once across the ACL pass and the activity layer, and fresh in the next build', async () => {
-    const { withBuildMemo } = await import('../../buildMemo');
+    const { withBuildMemo } = await import('../../buildMemo.js');
     const rows = [{ pipelineId: 'p', runId: 'r1' }, { pipelineId: 'p', runId: 'r2' }];
     const t = table(rows);
     const locator = new RunRowLocator();
@@ -252,7 +252,7 @@ describe('RunRowLocator projection inside a graph build (NFR #157)', () => {
   };
 
   it('a build reads remembered runs without the definition snapshot or the resume checkpoint', async () => {
-    const { withBuildMemo } = await import('../../buildMemo');
+    const { withBuildMemo } = await import('../../buildMemo.js');
     const { inputs, client } = recording();
     await withBuildMemo(() => new RunRowLocator(Date.now, keys).rows(client, 'pipeline-runs', ['r1']));
     const projection = String(inputs[0]!.ProjectionExpression);
@@ -263,7 +263,7 @@ describe('RunRowLocator projection inside a graph build (NFR #157)', () => {
   });
 
   it('whole rows outside a build, and inside one that asked for a full read', async () => {
-    const { withBuildMemo, withFullReads } = await import('../../buildMemo');
+    const { withBuildMemo, withFullReads } = await import('../../buildMemo.js');
     const { inputs, client } = recording();
     await new RunRowLocator(Date.now, keys).rows(client, 'pipeline-runs', ['r1']);
     await withFullReads(() => withBuildMemo(() => new RunRowLocator(Date.now, keys).rows(client, 'pipeline-runs', ['r1'])));

@@ -27,6 +27,7 @@ const SESSION: VideoSessionRecord = {
 
 const PARTICIPANT: VideoSessionParticipant = {
   userId: 'user-2',
+  participantId: 'user-2-tab1',
   displayName: 'Bob',
   joinedAt: '2026-01-01T10:05:00Z',
 };

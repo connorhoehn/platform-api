@@ -63,7 +63,7 @@ describe('model gate', () => {
     let calls = 0;
     const inner: AgentClient = {
       provider: 'test',
-      async *run() { calls += 1; await tick(20); yield { type: 'done', text: 'plan', stopReason: 'end_turn' } as AgentEvent; },
+      async *run() { calls += 1; await tick(20); yield { type: 'done', text: 'plan', turns: 1, tokensIn: 0, tokensOut: 0, model: 'test', stopReason: 'complete', toolCalls: [] } satisfies AgentEvent; },
     };
     const client = gatedAgentClient(inner, 'planner', { singleFlight: true });
     const [a, b] = await Promise.all([collect(client.run('same')), collect(client.run('same'))]);
@@ -75,7 +75,7 @@ describe('model gate', () => {
 
   it('the planner reports the model as unavailable instead of a single-step fallback', async () => {
     await forceBreaker('test: forced');
-    const inner: AgentClient = { provider: 'test', async *run() { yield { type: 'done', text: '{}', stopReason: 'end_turn' } as AgentEvent; } };
+    const inner: AgentClient = { provider: 'test', async *run() { yield { type: 'done', text: '{}', turns: 1, tokensIn: 0, tokensOut: 0, model: 'test', stopReason: 'complete', toolCalls: [] } satisfies AgentEvent; } };
     const request = { instruction: 'make a plan', hints: [], sources: [], chatChannel: 'c', requestedBy: 'u' } as unknown as AgentLoopRequest;
     const plan = await planAgentLoop(request, gatedAgentClient(inner, 'planner'));
     expect(plan.unavailable).toBe('Model unavailable: test: forced');

@@ -98,8 +98,9 @@ describe('DynamoSourceActionAdapter — view-run exchange (NFR #134)', () => {
   }
   function runTarget(runId: string): WorkAclTarget {
     const target = documentTarget(runId, 'run');
+    if (target.kind !== 'node') throw new Error('documentTarget returns a node target');
     const sourceRef = { source: 'pipeline' as const, resourceId: runId };
-    return { ...target, sourceRef, node: { ...target.node!, sourceRef } } as WorkAclTarget;
+    return { ...target, sourceRef, node: { ...target.node, sourceRef } };
   }
 
   it("routes an agent loop to its run, ignoring the loop's person-day pointer row, with one keyed read", async () => {

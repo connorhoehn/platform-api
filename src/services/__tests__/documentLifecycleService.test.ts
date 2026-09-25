@@ -245,13 +245,14 @@ describe('toPublicView redacts what toView exposes', () => {
 
   it('drops every field that names a person or carries free text', async () => {
     const ctx = await loadContext(DOC);
-    const pub = toPublicView(ctx) as Record<string, unknown>;
+    // Indexed by name on purpose: the fields checked are the ones the public type must NOT have.
+    const pub = toPublicView(ctx) as unknown as Record<string, unknown>;
     for (const field of ['history', 'ownerId', 'updatedBy', 'lastReason']) {
       expect(pub[field]).toBeUndefined();
     }
     expect(JSON.stringify(pub)).not.toMatch(/alice|rollback/);
     // ...all of which the authenticated view still carries.
-    const full = toView(ctx) as Record<string, unknown>;
+    const full = toView(ctx) as unknown as Record<string, unknown>;
     expect(full['ownerId']).toBe('alice');
     expect(full['history']).toHaveLength(1);
   });

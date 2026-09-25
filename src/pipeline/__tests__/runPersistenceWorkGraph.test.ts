@@ -33,7 +33,7 @@ const RUN = 'executor-run-1';
 function harness() {
   const handlers = new Map<string, Handler>();
   const eventBus = { subscribe: (name: string, handler: Handler) => { handlers.set(name, handler); return name; } };
-  const repository = { put: jest.fn(async () => undefined) };
+  const repository = { put: jest.fn(async (_item: unknown) => undefined) };
   const service = new RunPersistenceService({
     eventBus: eventBus as never,
     repository: repository as unknown as PipelineRunRepository,
@@ -644,7 +644,7 @@ describe('NFR #34 — an at-least-once bus never regresses a finished step', () 
   function idHarness() {
     const handlers = new Map<string, (event: Record<string, unknown>) => Promise<void>>();
     const eventBus = { subscribe: (name: string, handler: (e: Record<string, unknown>) => Promise<void>) => { handlers.set(name, handler); return name; } };
-    const repository = { put: jest.fn(async () => undefined) };
+    const repository = { put: jest.fn(async (_item: unknown) => undefined) };
     const service = new RunPersistenceService({
       eventBus: eventBus as never,
       repository: repository as unknown as PipelineRunRepository,

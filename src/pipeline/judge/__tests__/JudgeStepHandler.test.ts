@@ -6,7 +6,7 @@ import type {
   JudgeBudgetGuardLike,
 } from '../JudgeStepHandler';
 import type { LlmJudgeStepConfig, JudgmentResult } from '../types';
-import type { PipelineNode, StepHandlerHelpers } from 'distributed-core';
+import type { PipelineNode, StepHandlerHelpers } from 'distributed-core/applications/pipeline';
 
 // ── Test fixtures ───────────────────────────────────────────────────────
 
@@ -20,6 +20,7 @@ function buildHelpers(overrides: Partial<StepHandlerHelpers> = {}): {
       emitted.push({ event: event as string, payload });
     },
     runId: 'run-1',
+    stepId: 'judge-1',
     ownerNodeId: 'node-1',
     abortSignal: new AbortController().signal,
     sleep: async () => undefined,

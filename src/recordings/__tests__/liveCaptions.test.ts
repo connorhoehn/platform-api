@@ -35,7 +35,9 @@ const SINK = 'http://sidecar.test/pcm';
 const ARN = 'arn:lvs:channel/abc';
 const node = { id: 'x', type: 'x', position: { x: 0, y: 0 }, data: { type: 'x' } } as unknown as PipelineNode;
 
-type FetchMock = jest.Mock<Promise<Response>, [string, RequestInit?]>;
+// The module's `fetch` dep is `typeof fetch`, so the mock takes what fetch takes.
+type FetchInput = string | URL | Request;
+type FetchMock = jest.Mock<Promise<Response>, [FetchInput, RequestInit?]>;
 const jsonRes = (status: number, body: unknown): Response => ({ ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) } as unknown as Response);
 
 /** A fake LVS taps API: list / create / delete, remembering what exists. */
@@ -43,7 +45,8 @@ function fakeLvs(initial: Array<{ tapId: string; url: string }> = []) {
   const taps = [...initial];
   let n = 0;
   const calls: Array<{ method: string; url: string }> = [];
-  const fetchMock: FetchMock = jest.fn(async (url: string, init?: RequestInit) => {
+  const fetchMock: FetchMock = jest.fn(async (input: FetchInput, init?: RequestInit) => {
+    const url = String(input);
     const method = (init?.method ?? 'GET').toUpperCase();
     calls.push({ method, url });
     if (method === 'GET') return jsonRes(200, { taps: taps.map((t) => ({ tapId: t.tapId, destination: { url: t.url } })) });
@@ -87,11 +90,11 @@ describe('armCaptionTap / disarmCaptionTaps', () => {
     expect(lvs.calls.filter((c) => c.method === 'POST')).toHaveLength(0);
   });
   it('a 409 "no audio producer" is not a failure but a tap to arm later', async () => {
-    const fetchMock: FetchMock = jest.fn(async (_u: string, init?: RequestInit) => (init?.method === 'POST' ? jsonRes(409, { error: 'no audio producer in channel' }) : jsonRes(200, { taps: [] })));
+    const fetchMock: FetchMock = jest.fn(async (_u: FetchInput, init?: RequestInit) => (init?.method === 'POST' ? jsonRes(409, { error: 'no audio producer in channel' }) : jsonRes(200, { taps: [] })));
     expect(await armCaptionTap(ARN, { fetch: fetchMock, sinkUrl: SINK })).toEqual({ tapIds: [], created: false, waitingFor: 'audio' });
   });
   it('throws when LVS refuses the create', async () => {
-    const fetchMock: FetchMock = jest.fn(async (_u: string, init?: RequestInit) => (init?.method === 'POST' ? jsonRes(503, { error: 'no' }) : jsonRes(200, { taps: [] })));
+    const fetchMock: FetchMock = jest.fn(async (_u: FetchInput, init?: RequestInit) => (init?.method === 'POST' ? jsonRes(503, { error: 'no' }) : jsonRes(200, { taps: [] })));
     await expect(armCaptionTap(ARN, { fetch: fetchMock, sinkUrl: SINK })).rejects.toThrow(/LVS tap create failed \(503\)/);
   });
   it('removes the ids it is given AND any other tap at our sink, leaving other sinks alone', async () => {
@@ -102,15 +105,15 @@ describe('armCaptionTap / disarmCaptionTaps', () => {
     expect(lvs.taps.map((t) => t.tapId)).toEqual(['other']);
   });
   it('after a hang-up LVS has forgotten the channel and 403s the delete: the tap is reported orphaned, not removed', async () => {
-    const fetchMock: FetchMock = jest.fn(async (_u: string, init?: RequestInit) => (init?.method === 'DELETE' ? jsonRes(403, { error: 'invalid credentials' }) : jsonRes(200, { taps: [{ tapId: 'left-behind', destination: { url: SINK } }] })));
+    const fetchMock: FetchMock = jest.fn(async (_u: FetchInput, init?: RequestInit) => (init?.method === 'DELETE' ? jsonRes(403, { error: 'invalid credentials' }) : jsonRes(200, { taps: [{ tapId: 'left-behind', destination: { url: SINK } }] })));
     expect(await disarmCaptionTaps(ARN, ['left-behind'], { fetch: fetchMock, sinkUrl: SINK })).toEqual({ removed: [], orphaned: ['left-behind'], failed: [] });
   });
   it('any other refusal is reported as failed so the step can retry', async () => {
-    const fetchMock: FetchMock = jest.fn(async (_u: string, init?: RequestInit) => (init?.method === 'DELETE' ? jsonRes(503, {}) : jsonRes(200, { taps: [] })));
+    const fetchMock: FetchMock = jest.fn(async (_u: FetchInput, init?: RequestInit) => (init?.method === 'DELETE' ? jsonRes(503, {}) : jsonRes(200, { taps: [] })));
     expect(await disarmCaptionTaps(ARN, ['t1'], { fetch: fetchMock, sinkUrl: SINK })).toEqual({ removed: [], orphaned: [], failed: [{ tapId: 't1', status: 503 }] });
   });
   it('lists nothing when LVS cannot answer', async () => {
-    const fetchMock: FetchMock = jest.fn(async () => { throw new Error('ECONNREFUSED'); });
+    const fetchMock: FetchMock = jest.fn(async (_u: FetchInput, _init?: RequestInit): Promise<Response> => { throw new Error('ECONNREFUSED'); });
     expect(await listCaptionTaps(ARN, { fetch: fetchMock, sinkUrl: SINK })).toEqual([]);
   });
 });
@@ -239,13 +242,13 @@ describe('captions:arm / captions:disarm / captions:publish steps', () => {
     expect(lvs.taps).toEqual([]);
   });
   it('disarm fails (for the retry) when LVS refuses with something other than "channel gone"', async () => {
-    const fetchMock: FetchMock = jest.fn(async (_u: string, init?: RequestInit) => (init?.method === 'DELETE' ? jsonRes(503, {}) : jsonRes(200, { taps: [] })));
+    const fetchMock: FetchMock = jest.fn(async (_u: FetchInput, init?: RequestInit) => (init?.method === 'DELETE' ? jsonRes(503, {}) : jsonRes(200, { taps: [] })));
     const handlers = buildLiveCaptionsHandlers({ tap: { fetch: fetchMock, sinkUrl: SINK } });
     const out = await handlers.get(CAPTION_KINDS.disarm)!.execute(node, { channelArn: ARN, tapIds: ['t1'] }, { runId: 'r', stepId: 'disarm' } as unknown as StepHandlerHelpers);
     expect(out).toEqual({ status: 'failed', error: 'LVS refused to delete t1 (503)' });
   });
   it('arm completes as waiting when nobody publishes audio yet', async () => {
-    const fetchMock: FetchMock = jest.fn(async (_u: string, init?: RequestInit) => (init?.method === 'POST' ? jsonRes(409, { error: 'no audio producer in channel' }) : jsonRes(200, { taps: [] })));
+    const fetchMock: FetchMock = jest.fn(async (_u: FetchInput, init?: RequestInit) => (init?.method === 'POST' ? jsonRes(409, { error: 'no audio producer in channel' }) : jsonRes(200, { taps: [] })));
     const handlers = buildLiveCaptionsHandlers({ tap: { fetch: fetchMock, sinkUrl: SINK } });
     const out = await handlers.get(CAPTION_KINDS.arm)!.execute(node, { channelArn: ARN }, { runId: 'r', stepId: 'arm' } as unknown as StepHandlerHelpers);
     expect(out.status).toBe('completed');

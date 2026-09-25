@@ -1255,7 +1255,7 @@ describe('run controls on the replica that does not hold the run (NFR #120)', ()
     mockResolvePipelineId.mockReset();
     mockResolvePipelineId.mockResolvedValue('deck-revise');
     setRunControlForwarder({ forward, canApply, release } as unknown as RunControlForwarder);
-    setPipelineBridge({ getRun: async () => null, getHistory: async () => [], cancelRun, resolveBreakpoint });
+    setPipelineBridge({ getRun: async () => null, getHistory: async () => [], resolveApproval: async () => {}, cancelRun, resolveBreakpoint });
   });
   afterEach(() => setRunControlForwarder(null));
 
@@ -1303,7 +1303,7 @@ describe('run controls on the replica that does not hold the run (NFR #120)', ()
 
   test('cancel: the local path is untouched when this replica holds the run', async () => {
     canApply.mockReturnValue(true);
-    setPipelineBridge({ getRun: async () => ({ runId: 'run-1', pipelineId: 'deck-revise', status: 'cancelled' }) as never, getHistory: async () => [], cancelRun, resolveBreakpoint });
+    setPipelineBridge({ getRun: async () => ({ runId: 'run-1', pipelineId: 'deck-revise', status: 'cancelled' }) as never, getHistory: async () => [], resolveApproval: async () => {}, cancelRun, resolveBreakpoint });
     const res = await run(buildApp(), 'POST', '/pipelines/run-1/cancel', { body: {}, userId: 'alice' });
     expect(res.statusCode).toBe(200);
     expect(cancelRun).toHaveBeenCalledWith('run-1', 'alice');

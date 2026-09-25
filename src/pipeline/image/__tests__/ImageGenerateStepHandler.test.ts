@@ -133,7 +133,7 @@ describe('ImageGenerateStepHandler.execute', () => {
     expect(payload.stepId).toBe('step_generate');
 
     // No fanOut field in single-image mode
-    expect((outcome as Record<string, unknown>).fanOut).toBeUndefined();
+    expect(outcome.fanOut).toBeUndefined();
   });
 
   // ── {{path}} template interpolation ──────────────────────────────────────
@@ -182,11 +182,11 @@ describe('ImageGenerateStepHandler.execute', () => {
     expect((out.imageIds as string[]).length).toBe(2);
 
     // fanOut is present with 2 items
-    const fo = (outcome as Record<string, unknown>).fanOut as Record<string, unknown>;
+    const fo = outcome.fanOut;
     expect(fo).toBeDefined();
-    expect((fo.items as unknown[]).length).toBe(2);
-    expect(fo.itemAlias).toBe('generatedImage');
-    expect(fo.maxConcurrency).toBe(4);
+    expect(fo!.items.length).toBe(2);
+    expect(fo!.itemAlias).toBe('generatedImage');
+    expect(fo!.maxConcurrency).toBe(4);
 
     // Two emits — one per image
     const produced = emitted.filter((e) => e.event === 'pipeline:step:image:produced');

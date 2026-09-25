@@ -1,4 +1,4 @@
-import type { LLMClient, LLMChunk, LLMStreamOptions } from 'distributed-core/applications/pipeline';
+import type { LLMClient, LLMChunk, LLMStreamOptions, StepHandlerHelpers } from 'distributed-core/applications/pipeline';
 import { createDocumentPlanHandler, DOCUMENT_PLAN_KIND } from '../documentAgentPipeline';
 
 /** An LLM that answers with what it was given, and records how it was asked. */
@@ -22,6 +22,8 @@ function fakeLLM(answer: string, opts: { hang?: boolean } = {}) {
   return { client, calls };
 }
 
+// document:plan never touches the helpers; the StepHandler contract still takes them.
+const helpers = { runId: 'run-1', stepId: 'plan', emit: async () => undefined } as unknown as StepHandlerHelpers;
 const node = (data: Record<string, unknown>) => ({ id: 'plan', type: DOCUMENT_PLAN_KIND, position: { x: 0, y: 0 }, data: { type: DOCUMENT_PLAN_KIND, ...data } }) as never;
 
 describe('document:plan', () => {
@@ -30,7 +32,7 @@ describe('document:plan', () => {
     const h = createDocumentPlanHandler(client);
     const out = await h.execute(node({ prompt: 'Doc:\n{{ context.documentOutline }}\nDo: {{ context.instruction }}', model: 'haiku', temperature: 0 }), {
       documentId: 'd1', documentOutline: 'title: Untitled\n1. hello', instruction: 'add a title',
-    });
+    }, helpers);
     expect(out.status).toBe('completed');
     expect((out as { output: { text: string; temperature: number } }).output.text).toContain('setTitle');
     expect(calls).toHaveLength(1);
@@ -44,7 +46,7 @@ describe('document:plan', () => {
   it('stops at its own bound and says so, rather than waiting on the model', async () => {
     const { client } = fakeLLM('never', { hang: true });
     const h = createDocumentPlanHandler(client);
-    const out = await h.execute(node({ prompt: 'x', model: 'haiku', timeoutMs: 50 }), {});
+    const out = await h.execute(node({ prompt: 'x', model: 'haiku', timeoutMs: 50 }), {}, helpers);
     expect(out.status).toBe('failed');
     expect((out as { error: string }).error).toMatch(/timeout after 50ms/);
   });

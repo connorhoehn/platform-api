@@ -396,7 +396,7 @@ describe('work graph schemaVersion 2 route', () => {
   it('a deck produced by several runs reports the NEWEST run, not an older failure (NFR Loop 28)', async () => {
     const savedNodes = projection.nodes;
     const savedEdges = projection.edges;
-    const old = node('run-old', 'run', 'Presentation edit', 'run-old', 'pipeline', at('13:30'), { status: 'failed' });
+    const old = node('run-old', 'run', 'Presentation edit', 'run-old', 'pipeline', at('13:30'), { status: 'error' });
     // The old run's edge comes first, as the oldest edge does in the store.
     projection.nodes = { ...savedNodes, [old.id]: old };
     projection.edges = { 'e-a-produced-old': edge('e-a-produced-old', 'run-old', 'deck', 'produced'), ...savedEdges };
@@ -407,8 +407,8 @@ describe('work graph schemaVersion 2 route', () => {
           : { runId, status: 'running' as const, attempt: 3, startedAt: at('13:33'), updatedAt: at('13:42'), tools: ['Slides'] }),
       });
       const res = await get(setup({ activityReader: mixed }), v2);
-      if (!res.body.details) throw new Error(JSON.stringify(res.body).slice(0, 400));
       const body = res.body as WorkGraphSnapshotV2;
+      if (!body.details) throw new Error(JSON.stringify(res.body).slice(0, 400));
       const deck = body.details.find((detail) => detail.nodeId === 'deck');
       expect(deck?.artifact?.pending).toMatchObject({ status: 'generating' });
       expect(deck?.artifact?.pending?.message ?? '').not.toContain('Subtitle');
@@ -643,7 +643,7 @@ describe('work graph schemaVersion 2 route', () => {
     capability = 'unavailable';
     expect((await get(app, url)).statusCode).toBe(503);
     capability = 'allow';
-    grants = [{ ...grant, state: 'revoked' } as StoredWorkGrant];
+    grants = [{ ...grant, state: 'stopped' } as StoredWorkGrant];
     expect((await get(app, url)).statusCode).toBe(404);
     grants = [];
     expect((await get(app, url)).statusCode).toBe(404);

@@ -180,7 +180,9 @@ describe('source ACL authorization reads', () => {
     const decisions = await new DynamoSourceAclAdapter('meeting', ddb).authorizeDisclosure(scope, [
       node('m1', 'meeting', 'meeting', 'meeting:call-1'),
       node('m2', 'transcript', 'meeting', 'transcript:rec-1'),
-      node('m3', 'recording', 'meeting', 'recording:rec-1'),
+      // A recording has no node kind of its own: mapMeeting emits it as a meeting
+      // node addressed `recording:<id>`, and the locator keys off that prefix.
+      node('m3', 'meeting', 'meeting', 'recording:rec-1'),
     ]);
     expect(counts.scan).toBe(0);
     expect(decisions.get('m3')?.decision).toBe('allow');

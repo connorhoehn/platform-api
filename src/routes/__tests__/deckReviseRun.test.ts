@@ -22,7 +22,7 @@ import { sampleDeck } from '../../deck/__tests__/fixtures';
 
 const deck = sampleDeck();
 const rows = new Map<string, PresentationDocumentRow>();
-const trigger = jest.fn(async (_args: Record<string, unknown>) => ({ runId: `run-${trigger.mock.calls.length}` }));
+const trigger: jest.Mock<Promise<{ runId: string }>, [Record<string, unknown>]> = jest.fn(async (_args: Record<string, unknown>) => ({ runId: `run-${trigger.mock.calls.length}` }));
 
 /** A dev token (SKIP_AUTH decodes, never verifies) naming who is asking. */
 function as(sub: string): string {

@@ -283,7 +283,7 @@ describe('resumeInterruptedRuns', () => {
     const module = { resumeRun };
     const seedResumedRun = jest.fn();
     const runPersistence = { seedResumedRun };
-    const definitionsRepo = { get: jest.fn(async () => null) };
+    const definitionsRepo = { get: jest.fn(async (_userId: string, _pipelineId: string) => null) };
     return { repository, module, resumeRun, runPersistence, seedResumedRun, definitionsRepo };
   }
 
@@ -392,7 +392,7 @@ describe('PipelineRunRepository.claimForResume', () => {
   }
 
   it('returns the post-claim item when the condition holds', async () => {
-    const send = jest.fn(async () => ({
+    const send = jest.fn(async (_command: unknown) => ({
       Attributes: { pipelineId: 'p', runId: 'r', status: 'running', resumeClaimedBy: 'node-b', resumeCount: 1 },
     }));
     const repo = repoWithSend(send as jest.Mock);

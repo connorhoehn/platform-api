@@ -6,11 +6,15 @@
 // paragraph that is plainly a list is coerced into one, the same judgement
 // `rowsFromPipeText` already makes about pipes.
 
-import * as Y from 'yjs';
+// yjs ships ESM types; load it the way src/documents/documentAgentOps.ts does
+// (type-only import in import mode, CJS require at runtime).
+import type * as YT from 'yjs' with { 'resolution-mode': 'import' };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const Y = require('yjs') as typeof YT;
 import { parseOps, applyOps, outlineOf, listFromMarkerText, listItemsOf, CANVAS_BODY_KEY } from '../documentAgentOps';
 
-function blocks(doc: Y.Doc): Y.XmlElement[] {
-  return doc.getXmlFragment(CANVAS_BODY_KEY).toArray().filter((n): n is Y.XmlElement => n instanceof Y.XmlElement);
+function blocks(doc: YT.Doc): YT.XmlElement[] {
+  return doc.getXmlFragment(CANVAS_BODY_KEY).toArray().filter((n): n is YT.XmlElement => n instanceof Y.XmlElement);
 }
 
 describe('listFromMarkerText', () => {
@@ -53,9 +57,9 @@ describe('list blocks', () => {
     expect(list!.length).toBe(2);
     expect(listItemsOf(list!)).toEqual(['one', 'two']);
     // listItem > paragraph > text, which is what the editor's schema reads.
-    const first = list!.toArray()[0] as Y.XmlElement;
+    const first = list!.toArray()[0] as YT.XmlElement;
     expect(first.nodeName).toBe('listItem');
-    expect((first.toArray()[0] as Y.XmlElement).nodeName).toBe('paragraph');
+    expect((first.toArray()[0] as YT.XmlElement).nodeName).toBe('paragraph');
   });
 
   it('coerces the paragraph-with-bullets the model actually sends', () => {

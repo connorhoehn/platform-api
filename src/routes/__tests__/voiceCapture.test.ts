@@ -175,12 +175,12 @@ describe('GET /api/voice-capture/health', () => {
     sidecarFetch.mockRejectedValue(new Error('ECONNREFUSED'));
     const res = await realFetch(`${baseUrl}/api/voice-capture/health`);
     expect(res.status).toBe(200);
-    expect((await res.json()).available).toBe(false);
+    expect(((await res.json()) as { available: boolean }).available).toBe(false);
   });
 
   it('reports available:true when the sidecar answers healthz', async () => {
     sidecarFetch.mockResolvedValue({ ok: true, status: 200, text: async () => 'ok' });
     const res = await realFetch(`${baseUrl}/api/voice-capture/health`);
-    expect((await res.json()).available).toBe(true);
+    expect(((await res.json()) as { available: boolean }).available).toBe(true);
   });
 });

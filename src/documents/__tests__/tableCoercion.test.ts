@@ -1,4 +1,8 @@
-import * as Y from 'yjs';
+// yjs ships ESM types; load it the way src/documents/documentAgentOps.ts does
+// (type-only import in import mode, CJS require at runtime).
+import type * as YT from 'yjs' with { 'resolution-mode': 'import' };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const Y = require('yjs') as typeof YT;
 import { applyOps, parseOps, rowsFromPipeText, tableRowsOf, CANVAS_BODY_KEY } from '../documentAgentOps';
 
 describe('rowsFromPipeText', () => {
@@ -34,7 +38,7 @@ describe('replaceBlock on a table rebuilds the rows', () => {
     const second = parseOps(JSON.stringify([{ op: 'replaceBlock', index: 0, text: '| Name | Owner |\n|---|---|\n| Data access | Sarah Chen |' }]));
     const res = applyOps(doc, second);
     expect(res.applied).toBe(1);
-    const table = body.toArray().find((n) => n instanceof Y.XmlElement && n.nodeName === 'table') as Y.XmlElement;
+    const table = body.toArray().find((n) => n instanceof Y.XmlElement && n.nodeName === 'table') as YT.XmlElement;
     expect(tableRowsOf(table)).toEqual([['Name', 'Owner'], ['Data access', 'Sarah Chen']]);
   });
 });
