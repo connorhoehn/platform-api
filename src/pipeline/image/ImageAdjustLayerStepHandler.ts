@@ -11,16 +11,6 @@
 //   hue        → .modulate({ hue: degrees })        — 0 passthrough
 //   blur       → .blur(radiusPx)                    — sigma in pixels
 //
-//   Photo-editor kinds (realtime-examples media photo editor, lane E2):
-//   exposure, temperature, tint, highlights, shadows, whites, blacks,
-//   vibrance, curve, vignette → per-pixel on `raw()` bytes (adjustPixels.ts,
-//   the same math as the editor's live preview), then
-//   sharpen → .sharpen({ sigma }) and noise-reduction → .median(size).
-//   Any layer may carry `maskId` (resolved through `node.data.masks`) or
-//   `maskImageId`: it then applies inside that mask only (8-bit, blended).
-//   When a list uses only the five legacy kinds, the Sharp chain above is
-//   used unchanged (existing pipelines render byte-identical).
-//
 // Empty layers array is valid: image is re-encoded as PNG (new imageId)
 // without any transformation. This keeps the step contract uniform so
 // downstream steps always see a fresh imageId in output.
@@ -41,73 +31,15 @@ import type {
 import type { ImageBlobStore } from './ImageBlobStore';
 import type { ImageMeta } from './types';
 import { readPath } from './ScatterStepHandler';
-import { applyPixelLayers, type PixelLayer } from './adjustPixels';
-
-/**
- * The photo-editor path: every per-pixel layer on raw bytes (whole photo
- * first, then each mask's layers blended through that mask), then the
- * spatial ones (sharpen, noise reduction, blur) through Sharp. The order is
- * the live preview's fixed order, not list order.
- */
-export async function renderPhotoLayers(
-  input: Buffer,
-  layers: readonly AdjustLayer[],
-  masks: Record<string, string>,
-  store: Pick<ImageBlobStore, 'get'>,
-): Promise<{ data: Buffer; info: { width: number; height: number; format: string } }> {
-  const raw = await sharp(input).removeAlpha().raw().toBuffer({ resolveWithObject: true });
-  const { width, height, channels } = raw.info;
-  const pixels = raw.data;
-  const colour = layers.filter((l) => l.kind !== 'blur' && l.kind !== 'sharpen' && l.kind !== 'noise-reduction');
-  const groups = new Map<string, PixelLayer[]>();
-  for (const l of colour) {
-    const maskImage = l.maskImageId ?? (l.maskId ? masks[l.maskId] : '');
-    if (l.maskId && !maskImage) throw new Error(`mask '${l.maskId}' has no image`);
-    const key = maskImage ?? '';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(l as PixelLayer);
-  }
-  const whole = groups.get('');
-  if (whole) applyPixelLayers(pixels, width, height, channels, whole);
-  for (const [maskImageId, group] of groups) {
-    if (!maskImageId) continue;
-    const blob = await store.get(maskImageId);
-    if (!blob) throw new Error(`mask image '${maskImageId}' not found`);
-    const mask = await sharp(blob.body).resize(width, height, { fit: 'fill' }).greyscale().raw().toBuffer();
-    applyPixelLayers(pixels, width, height, channels, group, new Uint8Array(mask.buffer, mask.byteOffset, width * height));
-  }
-  let out = sharp(pixels, { raw: { width, height, channels } });
-  for (const l of layers) {
-    if (l.maskId || l.maskImageId) continue; // spatial ops are whole-photo only
-    if (l.kind === 'sharpen' && l.amount > 0) out = out.sharpen({ sigma: 0.5 + (Math.min(l.amount, 150) / 150) * 1.5 });
-    else if (l.kind === 'noise-reduction' && l.amount > 0) out = out.median(l.amount >= 60 ? 5 : 3);
-    else if (l.kind === 'blur' && l.radiusPx > 0) out = out.blur(Math.max(0.3, l.radiusPx));
-  }
-  const result = await out.png().toBuffer({ resolveWithObject: true });
-  return { data: result.data, info: { width: result.info.width, height: result.info.height, format: result.info.format } };
-}
 
 // ── Layer union type ───────────────────────────────────────────────────────
 
-export type AdjustLayer = (
+export type AdjustLayer =
   | { kind: 'brightness'; value: number }
   | { kind: 'contrast'; value: number }
   | { kind: 'saturation'; value: number }
   | { kind: 'hue'; degrees: number }
-  | { kind: 'blur'; radiusPx: number }
-  | { kind: 'exposure'; stops: number }
-  | { kind: 'highlights' | 'shadows' | 'whites' | 'blacks' | 'vibrance' | 'tint' | 'vignette'; amount: number }
-  | { kind: 'temperature'; kelvin: number }
-  | { kind: 'curve'; channel: 'rgb' | 'r' | 'g' | 'b'; points: Array<[number, number]> }
-  | { kind: 'sharpen'; amount: number }
-  | { kind: 'noise-reduction'; amount: number }
-) & { maskId?: string; maskImageId?: string };
-
-const LEGACY_KINDS = new Set(['brightness', 'contrast', 'saturation', 'hue', 'blur']);
-export const ADJUST_LAYER_KINDS = new Set([
-  ...LEGACY_KINDS, 'exposure', 'highlights', 'shadows', 'whites', 'blacks', 'vibrance', 'tint', 'vignette',
-  'temperature', 'curve', 'sharpen', 'noise-reduction',
-]);
+  | { kind: 'blur'; radiusPx: number };
 
 interface ImageAdjustLayerNodeData {
   type: 'image:adjust-layer';
@@ -118,8 +50,6 @@ interface ImageAdjustLayerNodeData {
   sourceImagePath?: string;
   /** Ordered list of layer adjustments to apply. */
   layers: AdjustLayer[];
-  /** maskId → imageId of its 8-bit mask, for layers that name a `maskId`. */
-  masks?: Record<string, string>;
 }
 
 export interface ImageAdjustLayerStepHandlerOpts {
@@ -168,8 +98,9 @@ export function createImageAdjustLayerStepHandler(
       }
 
       // ── Validate layer kinds before fetching bytes ───────────────────
+      const validKinds = new Set(['brightness', 'contrast', 'saturation', 'hue', 'blur']);
       for (const layer of layers) {
-        if (!layer || typeof layer !== 'object' || !ADJUST_LAYER_KINDS.has(layer.kind)) {
+        if (!layer || typeof layer !== 'object' || !validKinds.has(layer.kind)) {
           return {
             status: 'failed',
             error: `image:adjust-layer: unknown layer kind '${(layer as { kind?: unknown })?.kind ?? layer}'`,
@@ -189,19 +120,7 @@ export function createImageAdjustLayerStepHandler(
       // ── Apply layers in order ────────────────────────────────────────
       let outBytes: Buffer;
       let outInfo: { width: number; height: number; format: string };
-      const legacyOnly = layers.every((l) => LEGACY_KINDS.has(l.kind) && !l.maskId && !l.maskImageId);
-      if (!legacyOnly) {
-        try {
-          const out = await renderPhotoLayers(source.body, layers, data.masks ?? {}, opts.imageBlobStore);
-          outBytes = out.data;
-          outInfo = out.info;
-        } catch (err) {
-          return {
-            status: 'failed',
-            error: `image:adjust-layer: ${err instanceof Error ? err.message : String(err)}`,
-          };
-        }
-      } else try {
+      try {
         let pipeline = sharp(source.body);
 
         for (const layer of layers) {
@@ -220,8 +139,6 @@ export function createImageAdjustLayerStepHandler(
               break;
             case 'blur':
               pipeline = pipeline.blur(layer.radiusPx);
-              break;
-            default:
               break;
           }
         }

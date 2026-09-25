@@ -110,7 +110,6 @@ import { buildVisionStepHandlers } from './image/registerVisionHandlers';
 import { buildMemoryStepHandlers } from './memory/registerMemoryHandlers';
 import { buildAgentStepHandlers } from './agent/registerAgentHandlers';
 import { buildDeckStepHandlers } from '../deck/registerDeckHandlers';
-import { createPhotoProposeAdjustHandler } from '../media/photoAdjustPipeline';
 import { attachDeckReviseRunEvents, readRunRequest as readDeckReviseRequest } from '../deck/deckRevisePipeline';
 import { DECK_REVISE_PIPELINE_ID } from '../deck/deckReviseDefinition';
 import { getPresentationDocumentStore } from '../deck/presentationDocuments';
@@ -811,11 +810,6 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   // its per-slide previews into a presentation document's newest revision.
   for (const [key, handler] of buildDeckStepHandlers()) {
     customStepHandlers.set(key, handler);
-  }
-  // The photo editor's assistant: /adjust → proposed ops (photo-adjust).
-  {
-    const photo = createPhotoProposeAdjustHandler();
-    customStepHandlers.set(photo.kind, photo);
   }
   // An agent loop's plan: the meeting and agenda kinds are real capabilities,
   // not agent steps that describe one.

@@ -132,17 +132,6 @@ export function createInternalPipelineAccessRouter(deps: PipelineAccessDeps = de
     try {
       if (!authenticated(req, res)) return;
       const b = req.body as Record<string, unknown>;
-      // The media photo editor's live channel (`photo:<id>`): readers of the photo.
-      if (b && typeof b === 'object' && b.photoId !== undefined) {
-        const ok = typeof b.organizationId === 'string' && ID.test(b.organizationId)
-          && typeof b.userId === 'string' && ID.test(b.userId)
-          && typeof b.photoId === 'string' && /^[0-9a-f]{64}$/.test(b.photoId)
-          && Object.keys(b).every((k) => ['organizationId', 'userId', 'photoId'].includes(k));
-        if (!ok) { res.status(400).json({ error: 'INVALID_REQUEST' }); return; }
-        const { decidePhotoAccess } = require('../media/photoAccess') as typeof import('../media/photoAccess');
-        res.status(200).json(await decidePhotoAccess(b.photoId as string, b.userId as string));
-        return;
-      }
       const valid = b && typeof b === 'object'
         && typeof b.organizationId === 'string' && ID.test(b.organizationId)
         && typeof b.userId === 'string' && ID.test(b.userId)

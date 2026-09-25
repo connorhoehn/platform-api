@@ -85,7 +85,3 @@ mediaRouter.get('/catalog/files/:fileId', asyncHandler(async (req: Request, res:
   if (!row) throw new NotFoundError('file not found');
   res.json(row);
 }));
-
-// A photo's edits, versions and masks (the media photo editor).
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-mediaRouter.use('/edits', (require('./mediaEdits') as typeof import('./mediaEdits')).createMediaEditsRouter());

@@ -361,7 +361,7 @@ describe('ImageAdjustLayerStepHandler.execute', () => {
     const handler = createImageAdjustLayerStepHandler({ imageBlobStore: blob });
     const outcome = await handler.execute(
       // Cast to any to inject bad layer
-      makeNode({ layers: [{ kind: 'posterize', value: 2 }] as never }), // 'sharpen' became a real kind (photo editor)
+      makeNode({ layers: [{ kind: 'sharpen', value: 2 }] as never }),
       { scatter: { parentImageId: 'src_bad_layer' } },
       makeHelpers().helpers,
     );
