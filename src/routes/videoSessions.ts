@@ -283,14 +283,22 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     // room records what its setting says, anything else keeps the default.
     // Stamped on the row and returned to the caller so the call chrome can
     // show "armed" and the thread card can later say why there is none.
-    const recordingDecision = await decideRecording({
-      lobbyName,
-      requested: incomingRecordingConfig
-        ? { enabled: incomingRecordingConfig.enabled, reason: incomingRecordingConfig.reason }
-        : null,
-      callerId: userId,
-      getProfile: (id) => profileRepo.getProfile(id),
-    });
+    // In-document calls do NOT record unless someone asks: the start drawer
+    // has no record option and nothing in the call says "recording" (mockups
+    // 01–06), so the legacy default-on made every review record itself and
+    // post "No speech was found" transcripts. Only an explicit
+    // `recordingConfiguration.enabled: true` goes through the usual decision.
+    const documentCallNotRecorded = callFields && incomingRecordingConfig?.enabled !== true;
+    const recordingDecision: { enabled: boolean; reason: string } = documentCallNotRecorded
+      ? { enabled: false, reason: 'document-call-not-recorded' }
+      : await decideRecording({
+        lobbyName,
+        requested: incomingRecordingConfig
+          ? { enabled: incomingRecordingConfig.enabled, reason: incomingRecordingConfig.reason }
+          : null,
+        callerId: userId,
+        getProfile: (id) => profileRepo.getProfile(id),
+      });
     const profileFromBody = (() => {
       const raw = incomingRecordingConfig?.recordingProfile;
       if (raw === undefined) return undefined;

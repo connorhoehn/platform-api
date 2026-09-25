@@ -319,6 +319,45 @@ describe('POST /api/video/sessions — document review fields', () => {
   });
 });
 
+describe('POST /api/video/sessions — document calls do not record by default', () => {
+  function lvsBody() { return JSON.parse(mockFetch.mock.calls[0][1].body); }
+
+  it('a document review with no recording request is created not recording, and LVS is told so', async () => {
+    mockFetch.mockResolvedValueOnce(lvsSessionCreated());
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      userId: 'connor', headers: AUTH, body: { lobbyName: 'doc-auth', findOrCreate: true, kind: 'document-review', title: 'Review' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect((res.body as any).recording).toEqual({ enabled: false, reason: 'document-call-not-recorded' });
+    expect(lvsBody().recordingConfiguration.enabled).toBe(false);
+    expect(mockCreateSession.mock.calls[0][0].recording).toEqual({ enabled: false, reason: 'document-call-not-recorded' });
+    expect(mockGetProfile).not.toHaveBeenCalled();
+  });
+
+  it('a recording config without enabled:true still does not record', async () => {
+    mockFetch.mockResolvedValueOnce(lvsSessionCreated());
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      headers: AUTH, body: { lobbyName: 'doc-auth', kind: 'document-review', recordingConfiguration: { recordingProfile: 'hangout' } },
+    });
+    expect(lvsBody().recordingConfiguration.enabled).toBe(false);
+  });
+
+  it('records when someone explicitly asks', async () => {
+    mockFetch.mockResolvedValueOnce(lvsSessionCreated());
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      headers: AUTH, body: { lobbyName: 'doc-auth', kind: 'document-review', recordingConfiguration: { enabled: true, recordingProfile: 'hangout' } },
+    });
+    expect((res.body as any).recording.enabled).toBe(true);
+    expect(lvsBody().recordingConfiguration.enabled).toBe(true);
+  });
+
+  it('leaves every other call on its old default', async () => {
+    mockFetch.mockResolvedValueOnce(lvsSessionCreated());
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { headers: AUTH, body: { lobbyName: 'room:standup' } });
+    expect((res.body as any).recording).toEqual({ enabled: true, reason: 'default-on' });
+  });
+});
+
 describe('PATCH /api/video/sessions/:sessionId', () => {
   beforeEach(() => {
     mockGetSession.mockResolvedValue(reviewRow());
