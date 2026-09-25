@@ -781,7 +781,7 @@ export function createAgentLoopsRouter(deps: AgentLoopsDeps = defaultDeps): Rout
 
     res.status(200);
     res.setHeader('content-type', upstream.headers.get('content-type') || 'application/octet-stream');
-    res.setHeader('content-disposition', `attachment; filename="${fileId.replace(/[^\w.\-]/g, '_')}"`);
+    res.setHeader('content-disposition', `attachment; filename="${fileId.replace(/[^\w.-]/g, '_')}"`);
     res.setHeader('cache-control', 'private, no-store');
 
     if (!upstream.body) { res.end(); return; }

@@ -26,6 +26,8 @@ const budgetClient: AgentClient = {
 
 const neverCalled: AgentClient = {
   provider: 'test',
+  // A generator so the throw lands on first iteration, where the step would read it.
+  // eslint-disable-next-line require-yield
   async *run(): AsyncIterable<AgentEvent> { throw new Error('the step should not have started'); },
 };
 
