@@ -62,6 +62,18 @@ describe('DocumentSearchIndex', () => {
     expect(res.facets.folders.map((f) => f.id)).not.toContain('fx');
     expect(res.facets.owners.map((o) => o.id).sort()).toEqual(['connor', 'frank']);
   });
+  it('ranks an archived copy below the live one', async () => {
+    const { d } = deps({
+      scanRows: async () => [
+        { documentId: 'old', title: 'Release plan', type: 'page', createdBy: 'connor', updatedAt: '2026-09-25T00:00:00Z' },
+        { documentId: 'new', title: 'Release plan', type: 'page', createdBy: 'connor', updatedAt: '2026-09-20T00:00:00Z' },
+        { documentId: 'memo', title: 'Release memo', type: 'page', createdBy: 'connor', updatedAt: '2026-09-19T00:00:00Z' },
+      ],
+      listFolders: async () => ({ folders: [{ id: 'a', name: 'Archive', parentFolderId: 'r' }, { id: 'r', name: 'Research', parentFolderId: null }], placement: new Map([['old', 'a']]) }),
+    });
+    const res = await new DocumentSearchIndex(d).search(connor, req('release plan'));
+    expect(res.items.map((i) => i.id)).toEqual(['new', 'old']);
+  });
   it('filters by kind, folder subtree and owner; sorts by name; pages', async () => {
     const { d } = deps();
     const idx = new DocumentSearchIndex(d);

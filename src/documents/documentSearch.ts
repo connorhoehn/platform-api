@@ -159,6 +159,9 @@ function hasWordPrefix(hay: string, token: string): boolean {
   }
 }
 
+/** Enough to drop an archived title match below a live one, not below a body match. */
+export const ARCHIVE_PENALTY = 150;
+
 const FIELD_WEIGHT: Record<SearchMatch, number> = { title: 100, summary: 30, body: 10 };
 
 /**
@@ -327,6 +330,15 @@ export class DocumentSearchIndex {
       return false;
     };
 
+    // A document filed under a folder named "Archive" (at any depth) is an old
+    // copy someone put away: at equal relevance it ranks below a live one.
+    const archived = (id: string): boolean => {
+      for (let f = folderOf(id), guard = 0; f && guard < 32; f = folderById.get(f)?.parentFolderId ?? null, guard++) {
+        if (folderById.get(f)?.name.trim().toLowerCase() === 'archive') return true;
+      }
+      return false;
+    };
+
     const { kind, owner, folder, since } = req.filters;
     const filtered = readable.filter((r) =>
       (!kind?.length || kind.includes(kindOf(r.type)))
@@ -345,7 +357,7 @@ export class DocumentSearchIndex {
         const text = texts[i];
         const summary = [text?.excerpt ?? '', row.description ?? ''].join('\n');
         const hit = scoreDocument({ title: row.title ?? '', summary, body: text?.text ?? '' }, tokens, req.q);
-        if (hit) ranked.push({ row, ...hit, text });
+        if (hit) ranked.push({ row, ...hit, score: hit.score - (archived(row.documentId) ? ARCHIVE_PENALTY : 0), text });
       });
     } else {
       ranked = filtered.map((row) => ({ row }));
