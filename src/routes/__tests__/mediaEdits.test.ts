@@ -100,10 +100,11 @@ describe('media edits routes', () => {
 
   it('Keep → 201 + one signal; replay → 200 same version, no signal; stale parent → 409', async () => {
     await withServer(async (call) => {
-      const body = { ops: [{ kind: 'shadows', amount: 18 }], parentVersion: 0, suggestionId: 'sug-1', summary: 'Lift shadows', source: 'assistant' };
+      const body = { ops: [{ kind: 'shadows', amount: 18 }], parentVersion: null, suggestionId: 'sug-1', summary: 'Lift shadows', source: 'assistant' };
       const first = await call('POST', `/edits/${MINE}/versions`, body);
       expect(first.status).toBe(201);
       expect(first.json.version).toMatchObject({ version: 1, source: 'assistant' });
+      expect(first.json.head).toMatchObject({ currentVersion: 1 });
       expect(signals).toEqual([expect.objectContaining({ channel: photoChannelOf(MINE), event: 'photo:edit_kept', payload: expect.objectContaining({ version: 1, suggestionId: 'sug-1' }) })]);
       const again = await call('POST', `/edits/${MINE}/versions`, body);
       expect(again).toMatchObject({ status: 200, json: { replay: true, version: { version: 1 } } });

@@ -121,6 +121,7 @@ export function createMediaEditsRouter(repo: MediaEditRepository = mediaEditRepo
     const fileId = String(req.params.fileId);
     const b = (req.body ?? {}) as Record<string, unknown>;
     const ops = validateOps(b.ops);
+    if (b.parentVersion === null) b.parentVersion = 0; // "edited the original"
     if (typeof b.parentVersion !== 'number' || !Number.isInteger(b.parentVersion) || b.parentVersion < 0) throw new ValidationError('parentVersion must be the version you edited (0 = the original)');
     if (typeof b.suggestionId !== 'string' || !ID.test(b.suggestionId)) throw new ValidationError('suggestionId is required (one per proposal; a replay answers the same version)');
     const source = b.source === 'assistant' ? 'assistant' : 'user';
@@ -133,7 +134,7 @@ export function createMediaEditsRouter(repo: MediaEditRepository = mediaEditRepo
         userId: userOf(req),
       });
       if (!out.replay) await announceKept(fileId, out.version);
-      res.status(out.replay ? 200 : 201).json({ version: out.version, replay: out.replay });
+      res.status(out.replay ? 200 : 201).json({ head: publicHead(await repo.getHead(fileId)), version: out.version, replay: out.replay });
     } catch (err) {
       if (err instanceof PhotoEditConflict) { res.status(409).json({ error: 'version_conflict', currentVersion: err.currentVersion }); return; }
       throw err;
@@ -144,6 +145,7 @@ export function createMediaEditsRouter(repo: MediaEditRepository = mediaEditRepo
     const fileId = String(req.params.fileId);
     const b = (req.body ?? {}) as Record<string, unknown>;
     if (typeof b.version !== 'number' || !Number.isInteger(b.version) || b.version < 0) throw new ValidationError('version is required (0 = the original)');
+    if (b.parentVersion === null) b.parentVersion = 0;
     if (typeof b.parentVersion !== 'number' || !Number.isInteger(b.parentVersion)) throw new ValidationError('parentVersion is required');
     const from = b.version === 0 ? null : await repo.getVersion(fileId, b.version);
     if (b.version !== 0 && !from) throw new NotFoundError('version not found');
@@ -159,7 +161,7 @@ export function createMediaEditsRouter(repo: MediaEditRepository = mediaEditRepo
         userId: userOf(req),
       });
       if (!out.replay) await announceKept(fileId, out.version);
-      res.status(out.replay ? 200 : 201).json({ version: out.version, replay: out.replay });
+      res.status(out.replay ? 200 : 201).json({ head: publicHead(await repo.getHead(fileId)), version: out.version, replay: out.replay });
     } catch (err) {
       if (err instanceof PhotoEditConflict) { res.status(409).json({ error: 'version_conflict', currentVersion: err.currentVersion }); return; }
       throw err;
