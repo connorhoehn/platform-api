@@ -147,10 +147,40 @@ const lvsAuth = () => ({ Authorization: `Bearer ${process.env.LVS_ADMIN_TOKEN ??
 import { chatChannelForLobby } from './lobbyChannel';
 export { chatChannelForLobby };
 
-/** A call started from a document page uses the document id as its lobby. */
+/**
+ * A call started from a document page uses the document id as its lobby.
+ * This is the document the call is ABOUT — it lets the document's readers
+ * see the run (pipeline/runAccess) — not a document the transcript is
+ * written into; see `documentOpsFor` for that.
+ */
 export function documentIdForLobby(lobby: string | null | undefined): string | null {
   if (!lobby) return null;
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(lobby) ? lobby : null;
+}
+
+/**
+ * Why this run must not write into a document, or null when it may.
+ *
+ * A call never edits the document it was started from: a `document-review`
+ * call (docs/design/document-calls/SPEC.md) reviews its documents, it does
+ * not append to them, and the older document-page call is the same thing
+ * without the row saying so. Until this gate the apply step treated any
+ * UUID lobby as a transcript target and "Call transcript" sections landed
+ * in the body of the page under review. A document is written only when
+ * the run was started to produce one — `writeTranscriptToDocument: true`
+ * in its trigger payload, which no starter sets today — and never for a
+ * review, whatever the flag says.
+ */
+export function documentWriteSkipReason(ctx: Record<string, unknown>): string | null {
+  if (ctx.callKind === 'document-review') return 'a review call never edits the documents it reviews';
+  if (ctx.writeTranscriptToDocument !== true) return 'this call was not started to produce a transcript document';
+  return null;
+}
+
+/** The operations the document:apply step sees: the real ones when the run writes a document, else one `skip` carrying the reason. */
+export function documentOpsFor(ctx: Record<string, unknown>, ops: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const reason = documentWriteSkipReason(ctx);
+  return reason ? [{ op: 'skip', reason }] : ops;
 }
 
 const pos = (x: number) => ({ x, y: 0 });
@@ -184,7 +214,7 @@ export function buildCallTranscriptionDefinition(model = process.env.DOCUMENT_AG
     id: CALL_TRANSCRIPTION_PIPELINE_ID,
     name: 'Call transcription',
     workType: 'conversations', kind: 'call', route: ['Recording ready', 'Transcribe', 'Merge reactions', 'Store', 'Summarise', 'Publish'], origin: { kind: 'system' },
-    description: 'Transcribe the composed recording, merge in-call reactions by time, store the transcript, summarise it with a light model, publish it to the conversation and the call\'s document.',
+    description: 'Transcribe the composed recording, merge in-call reactions by time, store the transcript, summarise it with a light model, publish it to the conversation — and into a document only when the call was started to produce one.',
     version: 1, status: 'published', publishedVersion: 1,
     nodes: [
       { id: 'trigger', type: 'trigger', position: pos(0), data: { type: 'trigger', triggerType: 'platform', label: 'Recording ready' } },
@@ -199,7 +229,10 @@ export function buildCallTranscriptionDefinition(model = process.env.DOCUMENT_AG
       { id: 'store-summary', type: KINDS.storeSummary, position: pos(1000), data: { type: KINDS.storeSummary, label: 'Store the summary', retryPolicy: SUMMARY_RETRY } },
       // The one shared write path into a document — the same step kind /doc and
       // Transform use. Optional: a room call has no document to write into.
-      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1200), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the summary and transcript into the call document', opsFrom: 'transcriptOps', optional: true, agent: TRANSCRIPT_AGENT, retryPolicy: IO_RETRY } },
+      // The store steps hand it a `skip` instead of ops unless the run was
+      // started to produce a transcript document (`documentOpsFor`), so a
+      // review call's page is never appended to.
+      { id: 'apply', type: DOCUMENT_APPLY_KIND, position: pos(1200), data: { type: DOCUMENT_APPLY_KIND, label: 'Write the summary and transcript into a transcript document (opt-in)', opsFrom: 'transcriptOps', optional: true, agent: TRANSCRIPT_AGENT, retryPolicy: IO_RETRY } },
       { id: 'publish', type: KINDS.publish, position: pos(1400), data: { type: KINDS.publish, label: 'Publish to the conversation', retryPolicy: IO_RETRY } },
     ],
     edges: [edge('trigger', 'transcribe'), edge('transcribe', 'merge-reactions'), edge('merge-reactions', 'store'), edge('store', 'summarize'), edge('summarize', 'store-summary'), edge('store-summary', 'apply'), edge('apply', 'publish')],
@@ -274,7 +307,7 @@ function resolveHandler(): DescribedStepHandler {
       'Finds the video session behind a channel ARN — via the Redis index, falling back to a scan — and works out which call it belongs to.',
     reads: 'arn and recordingId.',
     emits:
-      'lobbyName, callId, sessionId, startedBy, the participant list, and the chat channel and document the lobby maps to.',
+      'lobbyName, callId, sessionId, startedBy, the participant list, the call kind (document-review or none), and the chat channel and document the lobby maps to.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const arn = str(ctx.arn); const recordingId = str(ctx.recordingId);
       if (!arn || !recordingId) return fail('arn and recordingId are required');
@@ -297,7 +330,10 @@ function resolveHandler(): DescribedStepHandler {
         const ids = lobbyName.slice(3).split(':').filter(Boolean);
         if (ids.length >= 2) participants = ids.map((userId) => ({ userId }));
       }
-      return ok({ lobbyName, callId, sessionId: session?.sessionId ?? null, startedBy: session?.startedBy ?? participants[0]?.userId ?? null, organizationId: session?.orgId ?? null, participants, chatChannel: chatChannelForLobby(lobbyName), documentId: documentIdForLobby(lobbyName) });
+      // `callKind` is what keeps the transcript out of a reviewed document
+      // (documentWriteSkipReason); the row carries it since document-review
+      // calls were given a kind on POST /api/video/sessions.
+      return ok({ lobbyName, callId, sessionId: session?.sessionId ?? null, startedBy: session?.startedBy ?? participants[0]?.userId ?? null, organizationId: session?.orgId ?? null, participants, callKind: str(session?.kind) ?? null, chatChannel: chatChannelForLobby(lobbyName), documentId: documentIdForLobby(lobbyName) });
     },
   };
 }
@@ -489,7 +525,7 @@ function startTranscriptionHandler(deps: RecordingPipelineDeps = {}): DescribedS
       await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'pending' });
       try {
         const runId = await startRun(CALL_TRANSCRIPTION_PIPELINE_ID, buildCallTranscriptionDefinition(), {
-          recordingId, callId, arn: ctx.arn, lobbyName: ctx.lobbyName, composedKey: ctx.composedKey, startedAt: ctx.startedAt, documentId: ctx.documentId ?? null,
+          recordingId, callId, arn: ctx.arn, lobbyName: ctx.lobbyName, composedKey: ctx.composedKey, startedAt: ctx.startedAt, documentId: ctx.documentId ?? null, callKind: ctx.callKind ?? null,
           ...(str(ctx.organizationId) ? { organizationId: str(ctx.organizationId) } : {}),
           ...(str(ctx.startedBy) ? { startedBy: str(ctx.startedBy) } : {}),
         }, 'system');
@@ -691,7 +727,10 @@ function storeHandler(): DescribedStepHandler {
       const text = transcriptText(transcript.segments);
       // `transcriptOps` is what the shared document:apply step writes; the
       // store-summary step puts the summary in front of it when there is one.
-      return ok({ stored: 'inline', bytes: json.length, segments: transcript.segments.length, transcriptText: text, hasSpeech: text.length > 0, transcriptOps: transcriptOps(transcript.segments) });
+      // A run that must not write a document gets a `skip` here instead, so
+      // the apply step reports why rather than touching the reviewed page.
+      const documentWrite = documentWriteSkipReason(ctx);
+      return ok({ stored: 'inline', bytes: json.length, segments: transcript.segments.length, transcriptText: text, hasSpeech: text.length > 0, documentWrite: documentWrite ? { skipped: documentWrite } : { allowed: true }, transcriptOps: documentOpsFor(ctx, transcriptOps(transcript.segments)) });
     },
   };
 }
@@ -724,7 +763,9 @@ function storeSummaryHandler(): DescribedStepHandler {
       }
       await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', summaryStatus: 'ready', summaryMarkdown, summaryError: null, transcriptGeneratedAt: now });
       const existing = Array.isArray(ctx.transcriptOps) ? (ctx.transcriptOps as Array<Record<string, unknown>>) : [];
-      return ok({ summaryStatus: 'ready', summaryChars: summaryMarkdown.length, transcriptOps: [...summaryOps(summaryMarkdown), ...existing] });
+      // The summary lands on the row above; it goes into a document only on
+      // the same terms as the transcript (a review call's page stays as it was).
+      return ok({ summaryStatus: 'ready', summaryChars: summaryMarkdown.length, transcriptOps: documentOpsFor(ctx, [...summaryOps(summaryMarkdown), ...existing]) });
     },
   };
 }
@@ -746,8 +787,9 @@ function publishHandler(): DescribedStepHandler {
         command: 'transcript', instruction: words ? `${words} words — “${preview}${preview.length >= 160 ? '…' : ''}”` : 'No speech was found in the recording',
         extra: { recordingId: ctx.recordingId, callId: ctx.callId },
       });
-      // The transcript reached the call's document (when there is one) in the
-      // document:apply step before this one — the same write path /doc uses.
+      // The transcript reached a transcript document (only when the run was
+      // started to produce one) in the document:apply step before this one —
+      // the same write path /doc uses. A review call's apply step skipped.
       const applied = ((ctx.steps as Record<string, { applied?: number }> | undefined)?.apply?.applied) ?? 0;
       return ok({ posted, appended: applied, words });
     },

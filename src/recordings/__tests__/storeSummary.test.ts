@@ -58,8 +58,14 @@ describe('transcript:store', () => {
     expect(updateTranscriptStatusMock).toHaveBeenCalledWith('c1', 'r1', expect.objectContaining({ status: 'ready', transcriptKey: 'inline', summaryStatus: 'pending' }));
   });
   it('reports no speech for a silent recording', async () => {
-    const out = await run(KINDS.store, { callId: 'c1', recordingId: 'r1', transcript: { segments: [] } });
+    const out = await run(KINDS.store, { callId: 'c1', recordingId: 'r1', writeTranscriptToDocument: true, transcript: { segments: [] } });
     expect(out.output).toMatchObject({ hasSpeech: false, transcriptText: '', transcriptOps: [] });
+  });
+  it('hands the apply step a skip, not the transcript, when the run was not started to produce a document', async () => {
+    const out = await run(KINDS.store, { callId: 'c1', recordingId: 'r1', transcript: { segments: spoken } });
+    expect(out.output).toMatchObject({ hasSpeech: true, documentWrite: { skipped: expect.stringContaining('not started to produce') }, transcriptOps: [{ op: 'skip', reason: expect.any(String) }] });
+    // The transcript itself is still on the row.
+    expect(updateTranscriptStatusMock).toHaveBeenCalledWith('c1', 'r1', expect.objectContaining({ status: 'ready', transcriptJson: JSON.stringify({ segments: spoken }) }));
   });
 });
 
@@ -67,7 +73,7 @@ describe('transcript:store-summary', () => {
   it('writes ready + the markdown (fences removed) and puts the summary ahead of the transcript ops', async () => {
     const transcriptOps = [{ op: 'appendBlock', kind: 'heading', level: 2, text: 'Call transcript' }];
     const out = await run(KINDS.storeSummary, {
-      callId: 'c1', recordingId: 'r1', hasSpeech: true, transcriptOps,
+      callId: 'c1', recordingId: 'r1', hasSpeech: true, transcriptOps, writeTranscriptToDocument: true,
       steps: { summarize: { text: '```\n## Summary\nWe shipped it.\n```' } },
     });
     expect(out.status).toBe('completed');
