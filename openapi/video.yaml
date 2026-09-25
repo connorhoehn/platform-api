@@ -126,6 +126,71 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /recordings/{recordingId}/transcribe:
+    parameters:
+      - $ref: '#/components/parameters/RecordingIdPath'
+    post:
+      tags: [recordings]
+      summary: (Re)run transcription for a recording
+      description: |
+        Starts the call-transcription system pipeline for a recording that
+        has a composed file. Participants of the call only.
+      operationId: transcribeRecording
+      responses:
+        '202':
+          description: Transcription run started
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runId, pipelineId, recordingId]
+                properties:
+                  runId: { type: string }
+                  pipelineId: { type: string }
+                  recordingId: { type: string }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /recordings/{recordingId}/expiry:
+    parameters:
+      - $ref: '#/components/parameters/RecordingIdPath'
+    patch:
+      tags: [recordings]
+      summary: Change or clear when a recording expires
+      description: |
+        `expiresAt` is an ISO date at least an hour and at most ten years
+        out, or `null` to keep the recording until it is deleted. Anyone
+        who was in the call may change it.
+      operationId: updateRecordingExpiry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expiresAt]
+              properties:
+                expiresAt: { type: string, format: date-time, nullable: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recordingId, expiresAt]
+                properties:
+                  recordingId: { type: string }
+                  expiresAt: { type: string, format: date-time, nullable: true }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /recordings/{recordingId}/playback-token:
     parameters:
       - $ref: '#/components/parameters/RecordingIdPath'
@@ -536,6 +601,34 @@ paths:
   /rooms/{slug}/members:
     parameters:
       - $ref: '#/components/parameters/HangoutRoomSlugPath'
+    get:
+      tags: [hangout-rooms]
+      summary: List a hangout room's members
+      description: |
+        The owner and members of a private room may list it; an
+        org-visible room has no roster and answers an empty list.
+      operationId: listHangoutRoomMembers
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: '#/components/schemas/HangoutRoomMember' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Private room, caller is not a member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
     post:
       tags: [hangout-rooms]
       summary: Add a member to a hangout room (owner only)
@@ -677,6 +770,64 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /video/sessions/live:
+    get:
+      tags: [video-sessions]
+      summary: Lobbies with a call that is actually broadcasting
+      description: |
+        Filtered to lobbies the caller may use; cached for a few seconds
+        (`cached: true`). If the answer cannot be computed the route still
+        answers 200 with an empty list and `degraded: true`.
+      operationId: listLiveVideoLobbies
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lobbies]
+                properties:
+                  lobbies:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+                  cached: { type: boolean }
+                  degraded: { type: boolean }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /video/sessions/by-lobby/{lobbyName}:
+    parameters:
+      - name: lobbyName
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [video-sessions]
+      summary: Is this lobby's call live, and on which channel
+      description: |
+        "Nothing is live" is a 200 with `live: false` and `channelArn: null`,
+        not a 404. Live means the SFU reports the channel publishing, not
+        just an `active` session row.
+      operationId: getVideoSessionByLobby
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lobbyName, live, channelArn]
+                properties:
+                  lobbyName: { type: string }
+                  live: { type: boolean }
+                  channelArn: { type: string, nullable: true }
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
   /video/sessions/{sessionId}:
     parameters:
       - $ref: '#/components/parameters/SessionIdPath'
@@ -701,6 +852,49 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [video-sessions]
+      summary: Change an in-document call's title and/or review list
+      description: |
+        Body carries `lobbyName` (or `documentId`). The caller must be in
+        the call; renaming is the host's alone. Ended calls are not edited
+        (409). The first PATCH makes a plain document call a review.
+      operationId: updateVideoSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                lobbyName: { type: string }
+                documentId: { type: string }
+                title: { type: string }
+                documentIds:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VideoSession' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is not in the call, or renames without being the host.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The call has ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
 
   /video/sessions/{sessionId}/join:
     parameters:

@@ -152,6 +152,35 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }
 
+  /profiles/batch:
+    get:
+      tags: [profiles]
+      summary: Fetch several profiles in one request
+      description: |
+        `ids` is a comma-separated list (at most 200 are read). Unknown ids
+        are dropped. A private profile that is not the caller's comes back
+        reduced to `userId`, `visibility` and `callForwarding`.
+      operationId: getProfilesBatch
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [profiles]
+                properties:
+                  profiles:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProfileItem' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
   /profiles/{userId}:
     parameters:
       - $ref: '#/components/parameters/UserIdPath'

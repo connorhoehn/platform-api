@@ -706,6 +706,57 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /documents/{documentId}/sections/{sectionId}/items/{itemId}/answer:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
+      - $ref: '#/components/parameters/SectionIdPath'
+      - $ref: '#/components/parameters/ItemIdPath'
+    post:
+      tags: [section-items]
+      summary: Answer a HITL callout addressed to the caller
+      description: |
+        Only for items with `category: hitl`, and only by the person the
+        callout is addressed to (`assigneeId`, falling back to `assignee`).
+        Sets `status: done`, `notes` to the answer, and `ackedBy`/`ackedAt`
+        in one update, then signals `section:item:answered` on the
+        document channel.
+      operationId: answerSectionItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answer]
+              properties:
+                answer: { type: string, minLength: 1 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [item]
+                properties:
+                  item: { $ref: '#/components/schemas/SectionItem' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is not the person the callout is addressed to (or it is addressed to nobody).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The callout is no longer waiting on an answer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
   /items/mine:
     get:
       tags: [section-items]
