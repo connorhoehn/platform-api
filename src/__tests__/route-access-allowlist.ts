@@ -49,6 +49,7 @@ export const ACCESS_ALLOWLIST: Record<string, string> = {
   ]),
   ...each('in handler: resolveViewer (verified sub + org -> memberships), then authorizeDay / grant owner / capability per read', [
     'GET /api/work-graph/people/:personId/graph',
+    'GET /api/work-graph/people/:personId/graph/omitted',
     'GET /api/work-graph/nodes/:id',
     'GET /api/work-graph/edges/:id',
     'PATCH /api/work-graph/sharing-grants/:id',
@@ -143,6 +144,7 @@ export const ACCESS_ALLOWLIST: Record<string, string> = {
     'GET /api/video/sessions/:sessionId/recording',
     'GET /api/video/sessions/by-lobby/:lobbyName',
     'GET /api/video/sessions/:sessionId',
+    'PATCH /api/video/sessions/:sessionId',
   ]),
   ...each('in handler: requireOwnRecording (recording:read, participant); DELETE also startedBy', [
     'POST /api/recordings/:recordingId/transcribe',
