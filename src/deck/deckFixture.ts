@@ -27,6 +27,7 @@ import { getRedisClient } from '../lib/redis-client';
 import { ModelSlotTimeoutError, withModelSlot, type ModelSlotRunner } from './modelSlots';
 import { guardModelCall } from '../lib/modelHealth';
 import { contentKey, createSingleFlight, type SingleFlightRole, type SingleFlightStore } from './fixtureSingleFlight';
+import { slideCountLine, statusDrift, statusDriftLine } from './draftRequest';
 
 export const FIXTURE_TITLE_PREFIX = '[deck-fixture]';
 export const FIXTURE_MODEL = process.env.DOCUMENT_AGENT_MODEL || 'haiku';
@@ -68,10 +69,35 @@ export interface DeckFixtureResult {
   transcriptIds: string[];
   /** Whether this caller asked the model or shared a concurrent identical draft (NFR #162). */
   flight?: SingleFlightRole;
+  /** Set when the drafter refused the asked slide count rather than pad: the caller must not save `spec`. */
+  refused?: string;
+  /** With an asked slide count: what was asked, drafted first and finally. */
+  slideCheck?: SlideCheck;
+  /** "Measured: slides 4 → 6 (asked 6)". */
+  measured?: string;
 }
 
 /** The part of a draft that is the model's answer — the rest is derived from the material. */
-type ModelDraft = { spec: DeckSpec; source: 'model' | 'fixture'; reason?: string };
+type ModelDraft = {
+  spec: DeckSpec; source: 'model' | 'fixture'; reason?: string;
+  /** The model said the sources cannot fill the asked slide count; nothing may be saved. */
+  refused?: string;
+  slideCheck?: SlideCheck;
+  /** Status words still not the material's after the corrective ask. */
+  driftWarnings?: string[];
+};
+
+/** The asked slide count, the first draft's and the final one's. */
+export interface SlideCheck { asked: number; first: number; final: number }
+
+/** `{"refused": "...", "supports": 4}` — the drafter's honest "these sources cannot fill N slides". */
+function refusalOf(parsed: unknown): { refused: string; supports?: number } | undefined {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const r = parsed as { refused?: unknown; supports?: unknown; slides?: unknown };
+  if (typeof r.refused !== 'string' || !r.refused.trim() || Array.isArray(r.slides)) return undefined;
+  const supports = typeof r.supports === 'number' && Number.isInteger(r.supports) && r.supports >= 0 ? r.supports : undefined;
+  return { refused: r.refused.trim().slice(0, 300), ...(supports !== undefined ? { supports } : {}) };
+}
 
 /**
  * Concurrent identical drafts share one model call, on this replica and
@@ -297,7 +323,10 @@ export function materialBlock(material: FixtureMaterial): string {
   return parts.join('\n\n');
 }
 
-export function fixturePrompt(material: FixtureMaterial, title: string, requestedBy?: string): string {
+export function fixturePrompt(material: FixtureMaterial, title: string, requestedBy?: string, slideCount?: number): string {
+  const countRule = slideCount
+    ? `- EXACTLY ${slideCount} slides, the opening title slide included — the person asked for ${slideCount}. Do not write a Sources slide; one is added after yours and is not counted. Each slide must say something the others do not, drawn from the material. If the material cannot fill ${slideCount} distinct slides without repeating itself or inventing, do NOT pad: answer ONLY {"refused":"<what the material is missing, in one sentence>","supports":<how many distinct slides it can fill>}. At most ${MAX_BULLETS_PER_SLIDE} bullets a slide, each under ${MAX_BULLET_CHARS} characters.`
+    : `- 6 to 10 slides when the material supports that many, never more than ${MAX_SLIDES}. A short source makes a short deck: never pad it with steps, procedures, dates, numbers or owners the material does not state. At most ${MAX_BULLETS_PER_SLIDE} bullets a slide, each under ${MAX_BULLET_CHARS} characters.`;
   return [
     'You draft a presentation from the material below. Answer with ONLY a JSON object, no prose, no code fence.',
     '',
@@ -307,12 +336,13 @@ export function fixturePrompt(material: FixtureMaterial, title: string, requeste
     '  "quote":{"text":"…","by":"…"},"image":{"alt":"…"},"notes":"…","sources":[{"documentId":"…","title":"…"}]}]}',
     '',
     'Rules:',
-    `- 6 to 10 slides when the material supports that many, never more than ${MAX_SLIDES}. A short source makes a short deck: never pad it with steps, procedures, dates, numbers or owners the material does not state. At most ${MAX_BULLETS_PER_SLIDE} bullets a slide, each under ${MAX_BULLET_CHARS} characters.`,
+    countRule,
     '- A slide carries only the payload its layout is named after; bullets may appear on any slide.',
     '- EVERY slide cites at least one source, using the exact documentId given below.',
     '- EVERY source listed below must be cited by at least one slide. Material you were given and did not use is material you were asked for and ignored: if a document and a transcript are both listed, the deck draws on both.',
     '- Only state what the material says. A quote must be something a named person actually said in it. A chart\'s numbers must appear in it. Name a person as the owner of something only when the material ties them to it.',
     '- Keep the material\'s status and modality. Something the material says is tracked, needed, planned or under review is not "confirmed", "verified", "reviewed", "done", "assigned" or "defined" on a slide: "needs an owner" stays "needs an owner". The same goes for dates, owners and numbers: copy them, never round, extend or infer them.',
+    '- Use the material\'s own status verbs, in titles, bullets AND speaker notes. If it says "shipped", write "shipped" — never swap in a synonym ("delivered", "launched", "released", "completed", "done", "landed"). A status word the material does not use is a claim it does not make.',
     '- Shape the deck to the material. A call transcript: slides for what was decided, the actions with the person who took each in their own words ("Frank takes the rollback", not "owner assigned"), and what is still open — titled that plainly (Decisions, Actions, Open items). A plan or project brief: the outcome it aims for, what is in and out of scope, owners and milestones as written, how success is measured, risks and open questions — whichever of these the material has.',
     '- No `section` divider slides unless the deck has more than 8 slides; a divider with nothing on it is padding.',
     '- An `eyebrow` is a short label (the part of the material the slide comes from), never a claim or a status.',
@@ -457,6 +487,10 @@ export interface BuildFixtureOpts extends ReadMaterialDeps {
   timeoutMs?: number;
   /** false: never share the model call with a concurrent identical draft. */
   singleFlight?: boolean;
+  /** Content slides the request asked for (`requestedSlideCount`); the Sources slide is extra. */
+  slideCount?: number;
+  /** The requester's own words: a status word they used is not a substitution. */
+  instruction?: string;
 }
 
 /**
@@ -526,21 +560,65 @@ export async function buildDeckFixture(
     }
   }
 
+  const prompt = fixturePrompt(material, deckTitle, from.personId, opts.slideCount);
+  const materialText = materialBlock(material);
+  const allowed = [deckTitle, ...(opts.instruction ? [opts.instruction] : [])];
   const draft = async (): Promise<ModelDraft> => {
     if (!llm) return { spec: fixtureSpec(material, deckTitle), source: 'fixture', reason: 'no model is configured on this deployment' };
     try {
       // Injected clients (tests) take no slot, as they take no single-flight.
-      const answer = await askModel(llm, fixturePrompt(material, deckTitle, from.personId), opts.timeoutMs ?? FIXTURE_TIMEOUT_MS, opts.llm === undefined ? guardedSlot : null);
-      const parsed = parseDeckSpecJson(answer);
-      if (parsed === undefined) throw new Error('the model answered with no JSON object');
-      const validation = validateDeckSpec(liftSlideSubtitles(parsed));
-      if (!validation.ok) throw new Error(validation.errors.slice(0, 4).join('; '));
-      const citable = new Set(sources.map((source) => source.documentId));
-      const invented = validation.spec.slides
-        .flatMap((slide) => slide.sources.map((source) => source.documentId))
-        .find((documentId) => !citable.has(documentId));
-      if (invented) throw new Error(`the model cited '${invented}', which is not one of the sources it was given`);
-      return { spec: validation.spec, source: 'model' };
+      const slot = opts.llm === undefined ? guardedSlot : null;
+      const timeoutMs = opts.timeoutMs ?? FIXTURE_TIMEOUT_MS;
+      const ask = async (text: string): Promise<{ spec: DeckSpec } | { refused: string; supports?: number }> => {
+        const parsed = parseDeckSpecJson(await askModel(llm!, text, timeoutMs, slot));
+        if (parsed === undefined) throw new Error('the model answered with no JSON object');
+        const refusal = refusalOf(parsed);
+        if (refusal) return refusal;
+        const validation = validateDeckSpec(liftSlideSubtitles(parsed));
+        if (!validation.ok) throw new Error(validation.errors.slice(0, 4).join('; '));
+        const citable = new Set(sources.map((source) => source.documentId));
+        const invented = validation.spec.slides
+          .flatMap((slide) => slide.sources.map((source) => source.documentId))
+          .find((documentId) => !citable.has(documentId));
+        if (invented) throw new Error(`the model cited '${invented}', which is not one of the sources it was given`);
+        return { spec: validation.spec };
+      };
+      const asked = opts.slideCount;
+      const refused = (answer: { refused: string; supports?: number }, first?: number): ModelDraft => ({
+        spec: fixtureSpec(material, deckTitle),
+        source: 'model',
+        refused: `asked for ${asked} slides; the sources support ${answer.supports ?? 'fewer'} distinct slides without inventing — ${answer.refused}`,
+        ...(asked ? { slideCheck: { asked, first: first ?? answer.supports ?? 0, final: answer.supports ?? 0 } } : {}),
+      });
+      // One draft, measured; one corrective second ask when it missed the
+      // count or swapped a status verb. Never a third: what is still off is said.
+      const first = await ask(prompt);
+      if ('refused' in first) return asked ? refused(first) : (() => { throw new Error(`the model refused: ${first.refused}`); })();
+      const problems = (spec: DeckSpec) => ({
+        count: asked && spec.slides.length !== asked ? spec.slides.length : undefined,
+        drift: statusDrift(spec, materialText, allowed),
+      });
+      let spec = first.spec;
+      let found = problems(spec);
+      if (found.count !== undefined || found.drift.length) {
+        const fixes = [
+          ...(found.count !== undefined ? [`- It has ${found.count} slides; the request is EXACTLY ${asked} (title slide included, no Sources slide). Write ${asked} distinct slides from the material, or refuse as the rules say — never pad.`] : []),
+          ...found.drift.map((drift) => `- ${statusDriftLine(drift)} Use the material's word.`),
+        ];
+        const second = await ask(`${prompt}\n\nYour first answer was:\n${JSON.stringify(first.spec)}\n\nIt has these problems:\n${fixes.join('\n')}\nAnswer again with the whole corrected JSON object.`);
+        if ('refused' in second) return asked ? refused(second, first.spec.slides.length) : { spec, source: 'model', driftWarnings: found.drift.map(statusDriftLine) };
+        spec = second.spec;
+        found = problems(spec);
+      }
+      if (asked && found.count !== undefined) {
+        return refused({ refused: `the draft came back with ${found.count} after being asked twice`, supports: Math.min(found.count, asked) }, first.spec.slides.length);
+      }
+      return {
+        spec,
+        source: 'model',
+        ...(asked ? { slideCheck: { asked, first: first.spec.slides.length, final: spec.slides.length } } : {}),
+        ...(found.drift.length ? { driftWarnings: found.drift.map(statusDriftLine) } : {}),
+      };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       log.warn({ reason }, 'deck fixture: falling back to the offline deck');
@@ -551,13 +629,19 @@ export async function buildDeckFixture(
   // Only a real model call is shared: an injected client (tests) or no model runs alone.
   let flight: SingleFlightRole = 'ran';
   const answer = llm && opts.llm === undefined && opts.singleFlight !== false
-    ? await fixtureFlight(contentKey(FIXTURE_MODEL, fixturePrompt(material, deckTitle, from.personId)), draft, (role) => { flight = role; })
+    ? await fixtureFlight(contentKey(FIXTURE_MODEL, prompt), draft, (role) => { flight = role; })
     : await draft();
+  const slideCheck = answer.slideCheck ?? (opts.slideCount && !answer.refused
+    ? { asked: opts.slideCount, first: answer.spec.slides.length, final: answer.spec.slides.length } : undefined);
+  const countWarning = answer.source === 'fixture' && slideCheck && slideCheck.final !== slideCheck.asked
+    ? [`The offline deck does not follow the asked slide count (${slideCheck.final} of ${slideCheck.asked}).`] : [];
   return {
     spec: answer.spec,
     source: answer.source,
     ...(answer.reason ? { reason: answer.reason } : {}),
-    warnings: uncitedMaterialWarnings(answer.spec, material),
+    ...(answer.refused ? { refused: answer.refused } : {}),
+    ...(slideCheck ? { slideCheck, measured: slideCountLine(slideCheck.asked, slideCheck.first, slideCheck.final) } : {}),
+    warnings: [...uncitedMaterialWarnings(answer.spec, material), ...(answer.driftWarnings ?? []), ...countWarning],
     material,
     transcriptIds: transcriptIdsOf(material),
     flight,

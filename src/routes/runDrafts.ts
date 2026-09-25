@@ -106,6 +106,12 @@ export interface RunDraftsDeps extends DocumentAccessDeps {
   releasePendingClaim?(opts: { scope: string; userId: string; key: string }): Promise<void>;
   /** The id a new run gets (default `randomUUID`). */
   newRunId?(): string;
+  /**
+   * `provisionalTarget: true` on a draft's first save: the client created the
+   * document for this draft (the All documents composer). Marks it provisional
+   * when the row agrees (provisionalDecks.ts); false when it does not.
+   */
+  markProvisionalTarget?(input: { documentId: string; draftId: string; userId: string; now: string }): Promise<boolean>;
 }
 
 export interface RunDraftView extends RunDraft {
@@ -274,6 +280,12 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
           ...(req.user?.orgId ? { organizationId: req.user.orgId } : {}),
         }, content);
         if (await deps.drafts.create(draft)) {
+          if ((req.body as { provisionalTarget?: unknown }).provisionalTarget === true && deps.markProvisionalTarget) {
+            // Best effort: an unmarked target is an ordinary deck, as before.
+            await deps.markProvisionalTarget({ documentId, draftId, userId, now }).catch((err: unknown) => {
+              log.warn({ documentId, draftId, err: err instanceof Error ? err.message : String(err) }, 'run draft: provisional mark failed');
+            });
+          }
           signal(draft);
           res.status(201).json({ draft, replayed: false });
           return;
@@ -558,6 +570,8 @@ export function defaultRunDraftsDeps(): RunDraftsDeps {
   /* eslint-enable @typescript-eslint/no-require-imports */
   return {
     getDocumentRow: (id) => getPresentationDocumentStore().get(id),
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    markProvisionalTarget: (input) => (require('../deck/provisionalDecks') as typeof import('../deck/provisionalDecks')).markProvisionalDeck(input),
     getLifecycle: async (id) => {
       const row = await repos.documentLifecycleRepo.get(id);
       return row ? { status: row.status, ownerId: row.ownerId } : null;

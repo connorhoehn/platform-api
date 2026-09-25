@@ -50,10 +50,14 @@ function fakeTables() {
       row.headRevision ??= v[':head'];
       return;
     }
-    for (const part of expr.replace(/^SET /, '').split(',')) {
+    // `SET a = :a, b = :b [REMOVE x, y]` — the head update clears `provisional` this way.
+    const [setClause, removeClause] = expr.replace(/^SET /, '').split(/\s+REMOVE\s+/);
+    for (const part of setClause!.split(',')) {
       const [lhs, rhs] = part.split('=').map((s) => s.trim());
+      if (!(rhs! in v)) throw new Error(`unknown value ${rhs} in ${expr}`);
       row[names[lhs!] ?? lhs!] = structuredClone(v[rhs!]);
     }
+    for (const attr of removeClause?.split(',') ?? []) delete row[names[attr.trim()] ?? attr.trim()];
   };
   const client = {
     async send(command: any) {
@@ -139,6 +143,21 @@ describe('revisions as items (NFR #188)', () => {
     expect(row.headRevision.id).toBe('v20');
     const full = await store.get('doc-1');
     expect(full!.revisions!.map((r) => r.id)).toEqual(ids);
+  });
+
+  it('the first revision into a provisional deck removes the mark (provisionalDecks.ts) and keeps every SET', async () => {
+    const tables = fakeTables();
+    tables.rows.set('doc-1', {
+      documentId: 'doc-1', title: 'Draft deck', type: 'presentation', createdBy: 'dev-connor', updatedAt: 't0',
+      provisional: { draftId: 'draft-1', by: 'dev-connor', since: 't0' },
+    });
+    const store = newStore(tables.client);
+    const { revision } = await store.appendRevision(input('first'));
+    const row = tables.rows.get('doc-1')!;
+    expect(row.provisional).toBeUndefined();
+    expect(revision.id).toBe('v1');
+    expect(row.revisionCount).toBe(1);
+    expect(row.headRevision.id).toBe('v1');
   });
 
   it('resolves every accepted form of a revision id to the one canonical v<n>, and a hash to nothing (NFR #229)', async () => {
