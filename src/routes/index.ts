@@ -35,6 +35,7 @@ import {
 } from './documentReviewRequests';
 import { documentImportExportRouter } from './documentImportExport';
 import { deckRowSummariesRouter, documentRevisionsRouter } from './documentRevisions';
+import { documentSearchRouter } from './documentSearch';
 import { deckRouter } from './deck';
 import { videoSessionsRouter } from './videoSessions';
 import { recordingsRouter } from './recordings';
@@ -158,6 +159,8 @@ router.use('/documents/:documentId/work-items', documentSubrouteGates.workItems,
 router.use('/documents/:documentId/work', documentSubrouteGates.work, documentWorkRouter);
 router.use('/documents/:documentId/run-drafts', documentSubrouteGates.runDrafts, runDraftsRouter);
 router.use('/document-work', documentWorkListRouter);
+// The Documents page's ranked, read-scoped search (NFR #230).
+router.use('/document-search', documentSearchRouter);
 // A presentation's stored revisions: the .pptx and the per-slide SVG previews
 // the deck generator files. Same reason as work-items — it must precede the
 // '/documents/:documentId' mount, which would otherwise swallow '/revisions'.

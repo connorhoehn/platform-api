@@ -28,7 +28,7 @@ export const EXCERPT_MAX = 160;
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 const REMEMBERED = 500;
 
-const remembered = new Map<string, { timestamp: number; excerpt: string | null }>();
+const remembered = new Map<string, { timestamp: number; excerpt: string | null; text: string }>();
 
 function textOf(node: YT.XmlElement | YT.XmlText): string {
   if (node instanceof Y.XmlText) {
@@ -69,11 +69,61 @@ function bytesOf(value: unknown): Uint8Array | null {
   return null;
 }
 
+/** The searchable text's length cap, in characters (NFR #230: document search). */
+export const TEXT_MAX = 20_000;
+
+/**
+ * Every block's words, one block per line — what document search matches a
+ * body against. Headings included (they are words the author chose); capped
+ * at `TEXT_MAX`.
+ */
+export function textOfUpdate(update: Uint8Array): string {
+  const doc = new Y.Doc();
+  try {
+    Y.applyUpdate(doc, update);
+    const lines: string[] = [];
+    let size = 0;
+    for (const node of doc.getXmlFragment(CANVAS_BODY_KEY).toArray()) {
+      if (!(node instanceof Y.XmlElement)) continue;
+      const text = textOf(node).replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      lines.push(text);
+      size += text.length + 1;
+      if (size >= TEXT_MAX) break;
+    }
+    return lines.join('\n').slice(0, TEXT_MAX);
+  } catch {
+    return '';
+  } finally {
+    doc.destroy();
+  }
+}
+
+export interface DocumentText {
+  /** The newest saved version's timestamp; null when the document has none. */
+  timestamp: number | null;
+  excerpt: string | null;
+  text: string;
+}
+
 export async function readDocumentExcerpt(
   client: DynamoDBDocumentClient,
   documentId: string,
   title?: string,
 ): Promise<string | null> {
+  return (await readDocumentText(client, documentId, title)).excerpt;
+}
+
+/**
+ * The excerpt and the searchable text of the newest saved version: one
+ * key-only Query, then (once per version) a Get + gunzip + decode that both
+ * readers share.
+ */
+export async function readDocumentText(
+  client: DynamoDBDocumentClient,
+  documentId: string,
+  title?: string,
+): Promise<DocumentText> {
   const channel = `doc:${documentId}`;
   const newest = await client.send(new QueryCommand({
     TableName: SNAPSHOTS_TABLE,
@@ -85,29 +135,31 @@ export async function readDocumentExcerpt(
     Limit: 1,
   }));
   const timestamp = Number(newest.Items?.[0]?.timestamp);
-  if (!Number.isFinite(timestamp)) return null;
+  if (!Number.isFinite(timestamp)) return { timestamp: null, excerpt: null, text: '' };
   const key = `${documentId}\u0000${title ?? ''}`;
   const known = remembered.get(key);
-  if (known && known.timestamp === timestamp) return known.excerpt;
+  if (known && known.timestamp === timestamp) return { timestamp, excerpt: known.excerpt, text: known.text };
   const item = (await client.send(new GetCommand({
     TableName: SNAPSHOTS_TABLE,
     Key: { documentId: channel, timestamp },
   }))).Item;
   let bytes = bytesOf(item?.snapshot);
   let excerpt: string | null = null;
+  let text = '';
   if (bytes && bytes.length <= MAX_SNAPSHOT_BYTES) {
     try {
       if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = gunzipSync(bytes);
       excerpt = excerptOfUpdate(bytes, title);
+      text = textOfUpdate(bytes);
     } catch {
       excerpt = null;
     }
   }
   remembered.delete(key);
-  remembered.set(key, { timestamp, excerpt });
+  remembered.set(key, { timestamp, excerpt, text });
   if (remembered.size > REMEMBERED) {
     const oldest = remembered.keys().next().value;
     if (oldest !== undefined) remembered.delete(oldest);
   }
-  return excerpt;
+  return { timestamp, excerpt, text };
 }
