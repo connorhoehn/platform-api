@@ -133,7 +133,16 @@ describe('GET /api/pipelines/defs', () => {
       approvals: [{ runId: 'x', stepId: 's', at: '2026-09-23T13:00:00.000Z' }],
       pendingApprovals: 1,
     };
-    mockGetMany.mockImplementation(async (ids: string[]) => new Map(ids.map((id) => [id, id === 'deck-revise' ? stored : id === 'document-agent-edit' ? gated : null])));
+    // Only `user-legacy` and `media-catalog` lack a row. With every other seed
+    // missing too, the seeds (no updatedAt, so "oldest") fill the per-request
+    // backfill cap once there are more than BACKFILL_PER_REQUEST of them, and
+    // the user row is deferred to a later request — by design, but not what
+    // this test is about.
+    const rowFor = (id: string) => (id === 'deck-revise' ? stored
+      : id === 'document-agent-edit' ? gated
+      : id === 'user-legacy' || id === 'media-catalog' ? null
+      : emptyRollup(id, '2026-09-23T13:00:00.000Z'));
+    mockGetMany.mockImplementation(async (ids: string[]) => new Map(ids.map((id) => [id, rowFor(id)])));
     mockListByPipeline.mockImplementation(async (id: string) => (id === 'user-legacy'
       ? [{ runId: 'r1', status: 'failed', startedAt: '2026-09-23T12:00:00.000Z', completedAt: '2026-09-23T12:00:30.000Z' }]
       : []));
@@ -154,7 +163,7 @@ describe('GET /api/pipelines/defs', () => {
     expect(mockPutIfNotNewer.mock.calls.length).toBeLessThanOrEqual(10);
     // A seed with no runs gets the sentinel, so it is not probed again.
     const sentinel = mockPutIfNotNewer.mock.calls.map((c) => c[0]).find((r) => r.pipelineId === 'media-catalog');
-    expect(sentinel ?? { recent: [] }).toMatchObject({ recent: [] });
+    expect(sentinel).toMatchObject({ recent: [] });
   });
 
   it('a rollup-store outage answers rollup:null rows, never a 500', async () => {
