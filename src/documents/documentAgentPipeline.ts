@@ -15,6 +15,7 @@ import { applyChangeIndex, applyOps, createSuggestionIdentity, runSuggestionIden
 import log from '../lib/logger';
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import { gatedLLMClient } from '../lib/modelGate';
+import { createDocumentCheckSourcesHandler, DOCUMENT_CHECK_SOURCES_KIND } from './DocumentCheckSourcesStep';
 
 export const DOCUMENT_AGENT_EDIT_PIPELINE_ID = 'document-agent-edit';
 export const DOCUMENT_TRANSFORM_PIPELINE_ID = 'document-transform';
@@ -78,7 +79,7 @@ export interface DocumentPipelineOptions {
 }
 
 /** The approval gate shared by both pipelines: skipped unless the review step says a person is needed. */
-function approvalNode(pos: { x: number; y: number }, opts: DocumentPipelineOptions): Record<string, unknown> {
+export function approvalNode(pos: { x: number; y: number }, opts: DocumentPipelineOptions): Record<string, unknown> {
   const approvers = opts.approverUserId
     ? [{ type: 'user', value: opts.approverUserId, userId: opts.approverUserId }]
     : [{ type: 'role', value: 'requester' }];
@@ -503,6 +504,7 @@ export function createDocumentPlanHandler(llm: LLMClient): DescribedStepHandler 
 
 export function buildDocumentAgentHandlers(opts: { llm?: LLMClient } = {}): Map<string, StepHandler> {
   const m = new Map<string, StepHandler>();
+  m.set(DOCUMENT_CHECK_SOURCES_KIND, createDocumentCheckSourcesHandler());
   m.set(DOCUMENT_READ_KIND, createDocumentReadHandler());
   m.set(DOCUMENT_PLAN_KIND, createDocumentPlanHandler(opts.llm ?? gatedLLMClient(createLLMClient(), 'document')));
   m.set(DOCUMENT_REVIEW_KIND, createDocumentReviewHandler());

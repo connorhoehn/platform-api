@@ -71,6 +71,8 @@ export function setRunSourceAccessDepsForTests(deps: RunSourceAccessDeps | null)
   gate = null;
 }
 function currentDeps(): RunSourceAccessDeps { return depsOverride ?? defaultDeps(); }
+/** The rows and policy the context form reads (the platform's, or the tests' override). */
+export function runSourceAccessDeps(): RunSourceAccessDeps { return currentDeps(); }
 function defaultGate(): DocumentReadGate {
   if (!gate) {
     const deps = currentDeps();
