@@ -11,6 +11,7 @@ import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '..
 import { buildMediaCatalogDefinition, MEDIA_CATALOG_PIPELINE_ID } from '../media/mediaCatalogPipeline';
 import { buildDeckReviseDefinition, DECK_REVISE_PIPELINE_ID } from '../deck/deckReviseDefinition';
 import { buildPresentationDeckDefinition, PRESENTATION_DECK_PIPELINE_ID } from '../deck/presentationDeckDefinition';
+import { buildPhotoAdjustDefinition, PHOTO_ADJUST_PIPELINE_ID } from '../media/photoAdjustPipeline';
 import { assertSystemPipelinesLint } from './systemPipelineLint';
 
 export interface SystemPipelineEntry {
@@ -36,6 +37,8 @@ const REGISTRY: SystemPipelineEntry[] = [
   { id: MEDIA_CATALOG_PIPELINE_ID, build: () => buildMediaCatalogDefinition() },
   { id: DECK_REVISE_PIPELINE_ID, build: () => buildDeckReviseDefinition() },
   { id: PRESENTATION_DECK_PIPELINE_ID, build: () => buildPresentationDeckDefinition(), draftable: true },
+  // The photo editor's /adjust (its step checks the photo and bounds the model's ops; writes nothing).
+  { id: PHOTO_ADJUST_PIPELINE_ID, build: () => buildPhotoAdjustDefinition(), draftable: true },
 ];
 
 // Retries and approvers are platform properties: a definition that forgets

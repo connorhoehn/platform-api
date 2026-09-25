@@ -43,10 +43,10 @@ import { getRedisClient } from '../lib/redis-client';
 import { getRegistry } from '../observability/metrics';
 import log from '../lib/logger';
 
-export type ModelPurpose = 'deck' | 'planner' | 'verdict' | 'drafter' | 'document' | 'pipeline' | 'agent' | 'vision' | 'other';
-export const MODEL_PURPOSES: readonly ModelPurpose[] = ['deck', 'planner', 'verdict', 'drafter', 'document', 'pipeline', 'agent', 'vision', 'other'];
+export type ModelPurpose = 'deck' | 'planner' | 'verdict' | 'drafter' | 'document' | 'pipeline' | 'agent' | 'vision' | 'photo' | 'other';
+export const MODEL_PURPOSES: readonly ModelPurpose[] = ['deck', 'planner', 'verdict', 'drafter', 'document', 'pipeline', 'agent', 'vision', 'photo', 'other'];
 
-const DEFAULT_LIMITS: Record<ModelPurpose, number> = { deck: 4, planner: 2, verdict: 2, drafter: 2, document: 2, pipeline: 4, agent: 4, vision: 2, other: 2 };
+const DEFAULT_LIMITS: Record<ModelPurpose, number> = { deck: 4, planner: 2, verdict: 2, drafter: 2, document: 2, pipeline: 4, agent: 4, vision: 2, photo: 2, other: 2 };
 
 export interface ModelSlotWait {
   /** 0-based place in line (0 = next). */
