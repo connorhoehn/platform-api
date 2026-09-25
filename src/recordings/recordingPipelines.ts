@@ -24,7 +24,7 @@
 import { execFile } from 'child_process';
 import { promises as fs } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, basename } from 'path';
 import { randomUUID } from 'crypto';
 import { QueryCommand } from '@aws-sdk/client-dynamodb';
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
@@ -511,6 +511,44 @@ function startTranscriptionHandler(deps: RecordingPipelineDeps = {}): DescribedS
 
 export interface TranscriptSegment { startMs: number; endMs: number; speakerId: string; speakerLabel: string; text: string }
 
+const SPEECH_TIMEOUT_MS = () => Number(process.env.SPEECH_TIMEOUT_MS) || 600_000;
+
+/** The engine as a local process: `SPEECH_CLI transcribe <file> --json` (OpenSuperWhisper by default). */
+function transcribeWithCli(file: string): Promise<string> {
+  const bin = process.env.SPEECH_CLI ?? '/Applications/OpenSuperWhisper.app/Contents/MacOS/opensuperwhisper';
+  return new Promise<string>((resolve, reject) => {
+    execFile(bin, ['transcribe', file, '--json'], { maxBuffer: 16 * 1024 * 1024, timeout: SPEECH_TIMEOUT_MS() }, (err, stdout, stderr) => {
+      if (err) reject(new Error(`speech engine failed: ${err.message}${stderr ? ` — ${String(stderr).slice(0, 200)}` : ''}`));
+      else resolve(String(stdout));
+    });
+  });
+}
+
+/**
+ * The engine behind an HTTP hop (`SPEECH_URL`): POST the media bytes, read the
+ * same whisper JSON back. The dev platform-api runs in an Alpine pod and the
+ * engine is a macOS app, so the step could never exec it there — every real
+ * recording's transcription dead-lettered on ENOENT. `scripts/speech-server.mjs`
+ * on the host is the other end.
+ */
+async function transcribeOverHttp(url: string, file: string): Promise<string> {
+  const body = await fs.readFile(file);
+  let res: globalThis.Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'x-filename': basename(file) },
+      body,
+      signal: AbortSignal.timeout(SPEECH_TIMEOUT_MS()),
+    });
+  } catch (err) {
+    throw new Error(`speech engine unreachable at ${url}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const text = await res.text();
+  if (!res.ok) throw new Error(`speech engine failed: HTTP ${res.status}${text ? ` — ${text.slice(0, 200)}` : ''}`);
+  return text;
+}
+
 /** Run the local speech engine on a file. Whisper JSON is `{ text }`; lines become segments spread over the media length. */
 /**
  * Whisper never returns nothing: on near-silence it hallucinates a stock
@@ -539,14 +577,11 @@ export function looksLikeSilence(text: string, durationMs: number): boolean {
 }
 
 export async function transcribeFile(file: string, durationMs: number): Promise<TranscriptSegment[]> {
-  const bin = process.env.SPEECH_CLI ?? '/Applications/OpenSuperWhisper.app/Contents/MacOS/opensuperwhisper';
-  const out = await new Promise<string>((resolve, reject) => {
-    execFile(bin, ['transcribe', file, '--json'], { maxBuffer: 16 * 1024 * 1024, timeout: Number(process.env.SPEECH_TIMEOUT_MS) || 600_000 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(`speech engine failed: ${err.message}${stderr ? ` — ${String(stderr).slice(0, 200)}` : ''}`));
-      else resolve(String(stdout));
-    });
-  });
+  const out = process.env.SPEECH_URL
+    ? await transcribeOverHttp(process.env.SPEECH_URL, file)
+    : await transcribeWithCli(file);
   const start = out.indexOf('{'); const end = out.lastIndexOf('}');
+  if (start < 0 || end < start) throw new Error(`speech engine returned no JSON: ${out.slice(0, 200)}`);
   const parsed = JSON.parse(out.slice(start, end + 1)) as { text?: string };
   const lines = String(parsed.text ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
   if (lines.length === 0) return [];
@@ -577,7 +612,17 @@ function transcribeHandler(): DescribedStepHandler {
       await fs.writeFile(file, Buffer.from(await res.arrayBuffer()));
       try {
         const durationMs = rec?.durationMs ?? 0;
-        const heard = await transcribeFile(file, durationMs);
+        let heard: TranscriptSegment[];
+        try {
+          heard = await transcribeFile(file, durationMs);
+        } catch (err) {
+          // The row must say why there is no transcript; "processing" forever
+          // (what a dead-lettered run used to leave behind) is the one answer
+          // nobody can act on. A retried attempt sets it back to processing.
+          const reason = err instanceof Error ? err.message : String(err);
+          await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'failed', transcriptError: reason }).catch(() => undefined);
+          return fail(reason);
+        }
         const text = heard.map((s) => s.text).join(' ');
         if (looksLikeSilence(text, durationMs)) {
           return ok({ segments: [], words: 0, discarded: text.slice(0, 80), reason: 'no speech — the engine returned a stock phrase for silence' });
