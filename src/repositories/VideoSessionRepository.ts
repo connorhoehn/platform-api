@@ -16,6 +16,7 @@ import {
   VideoSessionRecord,
   VideoSessionParticipant,
   VideoSessionStore,
+  DocumentCallFieldsPatch,
   computeEndedSessionTtl,
   participantSupersedes,
 } from './VideoSessionStore';
@@ -104,6 +105,51 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
     sessionId: string,
   ): Promise<VideoSessionRecord | null> {
     return this.getItem<VideoSessionRecord>({ documentId, sessionId });
+  }
+
+  async updateDocumentCallFields(
+    documentId: string,
+    sessionId: string,
+    patch: DocumentCallFieldsPatch,
+  ): Promise<VideoSessionRecord | null> {
+    const entries = Object.entries(patch).filter(([, v]) => v !== undefined);
+    const existing = await this.getSession(documentId, sessionId);
+    if (!existing) return null;
+    if (entries.length === 0) return existing;
+    const names: Record<string, string> = {};
+    const values: Record<string, unknown> = {};
+    const sets = entries.map(([k, v], i) => {
+      names[`#f${i}`] = k;
+      values[`:v${i}`] = v;
+      return `#f${i} = :v${i}`;
+    });
+    await this.updateItem({
+      Key: { documentId, sessionId },
+      UpdateExpression: `SET ${sets.join(', ')}`,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    });
+    return { ...existing, ...Object.fromEntries(entries) } as VideoSessionRecord;
+  }
+
+  async findActiveByReviewDocument(documentId: string): Promise<VideoSessionRecord[]> {
+    const { ScanCommand } = await import('@aws-sdk/lib-dynamodb');
+    const items: VideoSessionRecord[] = [];
+    let startKey: Record<string, unknown> | undefined;
+    do {
+      const out = await this.docClient.send(
+        new ScanCommand({
+          TableName: VIDEO_SESSIONS_TABLE,
+          FilterExpression: '#s = :active AND #k = :kind AND contains(documentIds, :doc)',
+          ExpressionAttributeNames: { '#s': 'status', '#k': 'kind' },
+          ExpressionAttributeValues: { ':active': 'active', ':kind': 'document-review', ':doc': documentId },
+          ExclusiveStartKey: startKey,
+        }),
+      );
+      items.push(...((out.Items ?? []) as VideoSessionRecord[]));
+      startKey = out.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (startKey);
+    return items.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
   }
 
   async getSessionsByDocument(documentId: string): Promise<VideoSessionRecord[]> {

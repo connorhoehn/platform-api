@@ -53,6 +53,13 @@ import {
 import { isRecordingProfile } from '@connorhoehn/event-catalog';
 import { tenantOf } from '../lib/tenant';
 import { lobbyAccess } from '../lib/lobbyAccess';
+import {
+  parseCreateFields,
+  parsePatchFields,
+  isCallParticipant,
+  hostOf,
+  withCallFields,
+} from '../lib/documentCall';
 // Re-export breaker test helpers from the shared module for back-compat
 // with existing test imports — see src/lib/sfu-breaker.ts for the canonical
 // definitions (extracted for hub task #1001).
@@ -239,6 +246,14 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     const organizationId = req.user!.orgId;
     // NFR #175: only someone who may use this lobby opens (or finds) its call.
     await lobbyAccess().assertLobbyAccess(req, lobbyName);
+    // In-document calls: `kind: 'document-review'` + title / documentIds /
+    // media. Null for every other caller, whose rows stay exactly as before.
+    const callFields = parseCreateFields(body, lobbyName, userId);
+    const callFieldsOut = (row?: VideoSessionRecord | null) => {
+      const src = row?.kind ? row : callFields;
+      if (!src) return {};
+      return { kind: src.kind, title: src.title, documentIds: src.documentIds, media: src.media, hostUserId: src.hostUserId };
+    };
 
     // recordingConfiguration: hangoutRooms.ts's /join forwards
     // `room.settings.recordingEnabled`; DM/global calls default to enabled
@@ -382,9 +397,23 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       const existing = await videoSessionRepo.findActiveByLobbyName(lobbyName);
       if (existing && existing.channelArn === channelArn) {
         log.info({ sessionId: existing.sessionId, lobbyName }, '[videoSessions] findOrCreate hit (LVS authoritative)');
+        // A document review started on a lobby whose call was begun without
+        // one (the old toolbar Call button) adopts the review fields once;
+        // an existing review keeps its own title, list and host.
+        let row: VideoSessionRecord | null = existing;
+        if (callFields && !existing.kind) {
+          try {
+            row = await videoSessionRepo.updateDocumentCallFields(lobbyName, existing.sessionId, {
+              ...callFields,
+              hostUserId: existing.startedBy,
+            });
+          } catch (patchErr) {
+            log.warn({ err: patchErr, sessionId: existing.sessionId }, '[videoSessions] adopting document-call fields failed');
+          }
+        }
         // The row that made the LVS session holds the decision that governs
         // it; a later joiner's own request did not change what LVS is doing.
-        res.status(200).json({ sessionId: existing.sessionId, reused: true, recording: existing.recording ?? recordingDecision });
+        res.status(200).json({ sessionId: existing.sessionId, reused: true, recording: existing.recording ?? recordingDecision, ...callFieldsOut(row) });
         return;
       }
     }
@@ -407,6 +436,9 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       ...(organizationId ? { orgId: organizationId } : {}),
       participants: [],
       recording: recordingDecision,
+      ...(callFields
+        ? Object.fromEntries(Object.entries(callFields).filter(([, v]) => v !== undefined))
+        : {}),
     };
 
     try {
@@ -460,7 +492,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       log.warn({ err: idxErr, channelArn }, '[videoSessions] arn-index write failed');
     }
 
-    res.status(reused ? 200 : 201).json({ sessionId, reused, recording: recordingDecision });
+    res.status(reused ? 200 : 201).json({ sessionId, reused, recording: recordingDecision, ...callFieldsOut() });
   } catch (err) {
     if (err instanceof AppError) throw err;
     log.error({ err }, '[videoSessions] POST /sessions error');
@@ -840,7 +872,22 @@ videoSessionsRouter.get('/sessions/document/:documentId', requireAuth, asyncHand
     const { documentId } = req.params;
     // NFR #175: a lobby's sessions (participants included) to its own people only.
     await lobbyAccess().assertLobbyAccess(req, documentId);
-    const sessions = await videoSessionRepo.getSessionsByDocument(documentId);
+    const own = await videoSessionRepo.getSessionsByDocument(documentId);
+    // In-document calls: a review hosted on ANOTHER document that lists this
+    // one shows here too (the "Migration brief" row's `Join · 3`). Only
+    // calls whose host document this caller may use — joining needs it.
+    let reviewing: VideoSessionRecord[] = [];
+    try {
+      const candidates = (await videoSessionRepo.findActiveByReviewDocument(documentId))
+        .filter((s) => s.documentId !== documentId);
+      const allowed = await Promise.all(
+        candidates.map((s) => lobbyAccess().canUseLobby(req, s.documentId).catch(() => false)),
+      );
+      reviewing = candidates.filter((_, i) => allowed[i]);
+    } catch (scanErr) {
+      log.warn({ err: scanErr, documentId }, '[videoSessions] review-document lookup failed');
+    }
+    const sessions = [...own, ...reviewing].map(withCallFields);
     res.status(200).json({ sessions });
   } catch (err) {
     if (err instanceof AppError) throw err;
@@ -1288,6 +1335,48 @@ videoSessionsRouter.get(
   }),
 );
 
+// PATCH /api/video/sessions/:sessionId — in-document calls: change the
+// title and/or the review list. Body { lobbyName|documentId, title?,
+// documentIds? }. The caller must be in the call (join list or host); the
+// title is the host's alone. Ended calls are not edited.
+videoSessionsRouter.patch('/sessions/:sessionId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sessionId } = req.params;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const lobbyName = resolveLobbyName(body)
+      ?? ((req.query.lobbyName ?? req.query.documentId) as string | undefined);
+    if (!lobbyName) {
+      throw new ValidationError('lobbyName (or documentId) is required');
+    }
+    await lobbyAccess().assertLobbyAccess(req, lobbyName);
+
+    const session = await videoSessionRepo.getSession(lobbyName, sessionId);
+    if (!session) throw new NotFoundError('Session not found');
+    if (session.status !== 'active') {
+      throw new AppError(409, 'This call has ended');
+    }
+    const userId = req.user!.sub;
+    if (!isCallParticipant(session, userId)) {
+      throw new ForbiddenError('Only people in the call can change it');
+    }
+    const patch = parsePatchFields(body, lobbyName);
+    if (patch.title !== undefined && hostOf(session) !== userId) {
+      throw new ForbiddenError('Only the host can rename the call');
+    }
+    const updated = await videoSessionRepo.updateDocumentCallFields(lobbyName, sessionId, {
+      ...patch,
+      // A PATCH is what makes a plain document call a review, if it was not one.
+      ...(session.kind ? {} : { kind: 'document-review' as const, hostUserId: session.startedBy }),
+    });
+    if (!updated) throw new NotFoundError('Session not found');
+    res.status(200).json(withCallFields(updated));
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    log.error({ err }, '[videoSessions] PATCH /sessions/:sessionId error');
+    throw new AppError(500, 'Failed to update video session');
+  }
+}));
+
 videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {
     const { sessionId } = req.params;
@@ -1304,7 +1393,7 @@ videoSessionsRouter.get('/sessions/:sessionId', requireAuth, asyncHandler(async 
       throw new NotFoundError('Session not found');
     }
 
-    res.status(200).json(session);
+    res.status(200).json(withCallFields(session));
   } catch (err) {
     if (err instanceof AppError) throw err;
     log.error({ err }, '[videoSessions] GET /sessions/:sessionId error');

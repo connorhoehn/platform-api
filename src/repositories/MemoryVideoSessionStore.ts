@@ -17,6 +17,7 @@ import {
   VideoSessionRecord,
   VideoSessionParticipant,
   VideoSessionStore,
+  DocumentCallFieldsPatch,
   computeEndedSessionTtl,
   participantSupersedes,
 } from './VideoSessionStore';
@@ -128,6 +129,32 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
   ): Promise<VideoSessionRecord | null> {
     const rec = this.readOrExpire(makeKey(documentId, sessionId));
     return rec ? (JSON.parse(JSON.stringify(rec)) as VideoSessionRecord) : null;
+  }
+
+  async updateDocumentCallFields(
+    documentId: string,
+    sessionId: string,
+    patch: DocumentCallFieldsPatch,
+  ): Promise<VideoSessionRecord | null> {
+    const key = makeKey(documentId, sessionId);
+    const rec = this.readOrExpire(key);
+    if (!rec) return null;
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === undefined) continue;
+      (rec as unknown as Record<string, unknown>)[k] = Array.isArray(v) ? [...v] : v;
+    }
+    return JSON.parse(JSON.stringify(rec)) as VideoSessionRecord;
+  }
+
+  async findActiveByReviewDocument(documentId: string): Promise<VideoSessionRecord[]> {
+    const out: VideoSessionRecord[] = [];
+    for (const key of [...this.sessions.keys()]) {
+      const live = this.readOrExpire(key);
+      if (!live || live.status !== 'active' || live.kind !== 'document-review') continue;
+      if (!(live.documentIds ?? []).includes(documentId)) continue;
+      out.push(JSON.parse(JSON.stringify(live)) as VideoSessionRecord);
+    }
+    return out.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
   }
 
   async getSessionsByDocument(documentId: string): Promise<VideoSessionRecord[]> {

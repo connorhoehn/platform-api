@@ -80,6 +80,12 @@ function makeFakeDocClient(): {
         ];
       } else if (expr.includes('participants = :participants')) {
         row.participants = (vals[':participants'] as VideoSessionRecord['participants']) ?? [];
+      } else if (expr.startsWith('SET #f0 = :v0')) {
+        // updateDocumentCallFields: SET #f0 = :v0, #f1 = :v1, ...
+        const names = (input.ExpressionAttributeNames ?? {}) as Record<string, string>;
+        for (const [alias, field] of Object.entries(names)) {
+          (row as unknown as Record<string, unknown>)[field] = vals[alias.replace('#f', ':v')];
+        }
       }
       return {};
     }
@@ -94,6 +100,8 @@ function makeFakeDocClient(): {
         if (row.ttl !== undefined && row.ttl * 1000 <= Date.now()) continue;
         if (filter.includes('#s = :active') && row.status !== vals[':active']) continue;
         if (filter.includes('channelArn = :arn') && row.channelArn !== vals[':arn']) continue;
+        if (filter.includes('#k = :kind') && row.kind !== vals[':kind']) continue;
+        if (filter.includes('contains(documentIds, :doc)') && !(row.documentIds ?? []).includes(vals[':doc'] as string)) continue;
         items.push({ ...row });
       }
       return { Items: items };
@@ -347,6 +355,31 @@ describe.each([withMemoryStore(), withDdbStore()])('VideoSessionStore contract â
 
       const all = await store.listActiveCandidates(60, { perLobby: false });
       expect(all.map((s) => s.sessionId)).toEqual(['new-1', 'old-1']);
+    });
+
+    it('updateDocumentCallFields writes only the named fields and survives a restart', async () => {
+      const store = factory.makeStore();
+      await store.createSession({
+        ...SAMPLE, kind: 'document-review', title: 'Review', documentIds: ['lobby-1'], media: 'video', hostUserId: 'user-1',
+      });
+      const updated = await store.updateDocumentCallFields(SAMPLE.documentId, SAMPLE.sessionId, {
+        documentIds: ['lobby-1', 'doc-2'],
+      });
+      expect(updated).toMatchObject({ title: 'Review', documentIds: ['lobby-1', 'doc-2'], media: 'video' });
+      const reloaded = await factory.makeRestart(store).getSession(SAMPLE.documentId, SAMPLE.sessionId);
+      expect(reloaded).toMatchObject({ kind: 'document-review', title: 'Review', documentIds: ['lobby-1', 'doc-2'] });
+      expect(await store.updateDocumentCallFields('nope', 'nope', { title: 'x' })).toBeNull();
+    });
+
+    it('findActiveByReviewDocument finds active reviews that list the document, and nothing else', async () => {
+      const store = factory.makeStore();
+      const review = { ...SAMPLE, kind: 'document-review' as const, documentIds: ['lobby-1', 'doc-2'] };
+      await store.createSession({ ...review, sessionId: 'live' });
+      await store.createSession({ ...review, sessionId: 'ended', status: 'ended' });
+      await store.createSession({ ...SAMPLE, sessionId: 'plain' });
+      await store.createSession({ ...review, documentId: 'lobby-9', sessionId: 'other', documentIds: ['lobby-9'] });
+      const found = await store.findActiveByReviewDocument('doc-2');
+      expect(found.map((s) => s.sessionId)).toEqual(['live']);
     });
 
     it('findActiveByLobbyName skips ended sessions', async () => {

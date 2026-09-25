@@ -115,12 +115,41 @@ export interface VideoSessionRecord {
    */
   recording?: { enabled: boolean; reason: string };
   /**
+   * In-document calls (docs/design/document-calls/SPEC.md §4.1 in
+   * realtime-examples). All optional: rows written by every other caller
+   * (DMs, rooms, the global hangout, older document calls) have none of them.
+   *
+   *   kind        — 'document-review' marks a call that belongs to a review.
+   *   title       — "Auth architecture review".
+   *   documentIds — the review list, HOST DOCUMENT FIRST. Stored as a DDB
+   *                 list (not a set) because order is shown to the user;
+   *                 `contains()` in a filter works on lists too.
+   *   media       — what the call was started as.
+   *   hostUserId  — who may retitle it and replace a presenter. Same as
+   *                 `startedBy` at create; kept separate so a future host
+   *                 hand-off does not rewrite history.
+   */
+  kind?: 'document-review';
+  title?: string;
+  documentIds?: string[];
+  media?: 'video' | 'audio';
+  hostUserId?: string;
+  /**
    * Epoch seconds. DynamoDB TTL attribute. When unset, records do not
    * auto-expire. `endSession` sets this automatically to endedAt + grace
    * window (default 7 days). The in-memory store filters expired records
    * out of reads to match DDB's eventual-consistency behaviour.
    */
   ttl?: number;
+}
+
+/** Fields a PATCH may change on a document call. */
+export interface DocumentCallFieldsPatch {
+  kind?: 'document-review';
+  title?: string;
+  documentIds?: string[];
+  media?: 'video' | 'audio';
+  hostUserId?: string;
 }
 
 /**
@@ -168,6 +197,24 @@ export interface VideoSessionStore {
     userId: string,
   ): Promise<{ remaining: number } | null>;
   getSession(documentId: string, sessionId: string): Promise<VideoSessionRecord | null>;
+  /**
+   * Change a document call's title and/or review list. Only the named fields
+   * are written. Returns the row as it is after the write, or null when the
+   * row does not exist.
+   */
+  updateDocumentCallFields(
+    documentId: string,
+    sessionId: string,
+    patch: DocumentCallFieldsPatch,
+  ): Promise<VideoSessionRecord | null>;
+  /**
+   * Active document calls whose review list contains `documentId` — a call
+   * hosted on another document that also reviews this one. A filtered scan
+   * (no GSI: adding one to a populated DynamoDB Local table breaks writes
+   * until a container restart), cheap because the table is TTL-bounded.
+   * Newest first.
+   */
+  findActiveByReviewDocument(documentId: string): Promise<VideoSessionRecord[]>;
   getSessionsByDocument(documentId: string): Promise<VideoSessionRecord[]>;
   findActiveByLobbyName(lobbyName: string): Promise<VideoSessionRecord | null>;
   /**
