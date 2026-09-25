@@ -15,7 +15,7 @@ jest.mock('../routes/index', () => {
   router.get('/profiles', (_req: any, res: any) => res.json({ private: true }));
   return { __esModule: true, default: router };
 });
-jest.mock('../routes/health', () => ({ __esModule: true, default: require('express').Router() }));
+jest.mock('../routes/health', () => ({ __esModule: true, default: require('express').Router(), livezHandler: (_req: any, res: any) => res.json({ status: 'alive' }) }));
 jest.mock('../routes/pipelineWebhooks', () => ({ pipelineWebhooksRouter: require('express').Router() }));
 jest.mock('../routes/internal-work-graph', () => ({ internalWorkGraphRouter: require('express').Router() }));
 jest.mock('../routes/capabilities', () => ({ createCapabilitiesRouter: () => require('express').Router() }));

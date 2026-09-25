@@ -23,7 +23,9 @@ jest.mock('../../lib/aws-clients', () => {
 jest.mock('../../lib/redis-client', () => {
   mockRedisPing = jest.fn().mockResolvedValue('PONG');
   mockGetRedisClient = jest.fn().mockResolvedValue({ ping: mockRedisPing });
-  return { getRedisClient: mockGetRedisClient };
+  // modelHealth (the 'model' check) reads its breaker through the cache client;
+  // null = no Redis, so it falls back to its in-process state (closed).
+  return { getRedisClient: mockGetRedisClient, getRedisCacheClient: jest.fn().mockResolvedValue(null) };
 });
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
