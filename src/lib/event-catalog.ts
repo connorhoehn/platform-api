@@ -251,6 +251,26 @@ catalog.declare({
 });
 
 catalog.declare({
+  name: 'photo:edit_kept',
+  transport: 'signal',
+  producer: 'platform-api',
+  description: 'A photo edit version was kept (Keep or Restore in the media photo editor); viewers re-read the edit head',
+  schema: {
+    type: 'object',
+    properties: {
+      fileId: { type: 'string' },
+      version: { type: 'number' },
+      parentVersion: { type: ['number', 'null'] },
+      source: { type: 'string' },
+      suggestionId: { type: ['string', 'null'] },
+      createdBy: { type: 'string' },
+      at: { type: 'string' },
+    },
+    required: ['fileId', 'version', 'source', 'at'],
+  },
+});
+
+catalog.declare({
   name: 'doc:section_updated',
   transport: 'signal',
   producer: 'platform-api',
