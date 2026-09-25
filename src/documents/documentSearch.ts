@@ -21,8 +21,8 @@
  *   probe is remembered for `TEXT_TTL_MS`, so a body edit reaches search
  *   within that window. Decks and diagrams are not probed (no page body).
  * - Access: every candidate goes through `canReadDocument` — owner, editor,
- *   viewer, or channel member — with the membership lookup memoised per
- *   request (one read per distinct channel, not per document). A document the
+ *   viewer, or channel member — with the membership lookup memoised for
+ *   `MEMBER_TTL_MS` (one read per distinct channel, not per document). A document the
  *   viewer may not read is never ranked, counted or faceted.
  *
  * Each replica holds its own caches; nothing here is shared state, so two
@@ -39,6 +39,12 @@ const FOLDERS_TABLE = tableName(process.env.DYNAMODB_DOCUMENT_FOLDERS_TABLE || '
 
 export const ROWS_TTL_MS = 10_000;
 export const TEXT_TTL_MS = 30_000;
+/**
+ * A channel-membership answer is reused this long, across requests: a removed
+ * member stops seeing a shared document in search within this window (the
+ * #135 read gate keeps its per-document answers 60 s).
+ */
+export const MEMBER_TTL_MS = 15_000;
 const PROBE_CONCURRENCY = 8;
 const ACCESS_CONCURRENCY = 16;
 
@@ -270,6 +276,7 @@ export class DocumentSearchIndex {
   private readonly rows = new Map<string, Cached<DocumentRow[]>>();
   private readonly folders = new Map<string, Cached<{ folders: FolderInfo[]; placement: Map<string, string | null> }>>();
   private readonly texts = new Map<string, Cached<DocumentText>>();
+  private readonly members = new Map<string, Cached<boolean>>();
 
   constructor(private readonly deps: DocumentSearchDeps) {}
 
@@ -289,13 +296,8 @@ export class DocumentSearchIndex {
     const t1 = this.deps.now();
 
     // Access first: nothing below sees a row the viewer may not read.
-    const members = new Map<string, Promise<boolean>>();
-    const lookup: ChannelMemberLookup = (channel, userId) => {
-      const key = `${channel}\u0000${userId}`;
-      let hit = members.get(key);
-      if (!hit) { hit = this.deps.memberLookup(channel, userId); members.set(key, hit); }
-      return hit;
-    };
+    const lookup: ChannelMemberLookup = (channel, userId) =>
+      cachedLoad(this.members, `${channel}\u0000${userId}`, MEMBER_TTL_MS, t0, () => this.deps.memberLookup(channel, userId));
     const inOrg = rows.filter((r) => r.documentId && (!r.organizationId || !user.orgId || r.organizationId === user.orgId));
     const allowed = await mapLimit(inOrg, ACCESS_CONCURRENCY, async (r) => (await canReadDocument(r, user, r.documentId, lookup)).allow);
     const readable = inOrg.filter((_r, i) => allowed[i]);

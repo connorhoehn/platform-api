@@ -69,7 +69,7 @@ describe('DocumentSearchIndex', () => {
     const idx = new DocumentSearchIndex(d);
     await Promise.all([idx.search(connor, req('r')), idx.search(connor, req('re')), idx.search(connor, req('rel'))]);
     expect(calls.scan).toBe(1);
-    expect(calls.member).toBe(3); // one per request, one channel
+    expect(calls.member).toBe(1); // one channel, remembered across the burst
     expect(calls.text).toBe(5); // each readable page once
   });
 });
