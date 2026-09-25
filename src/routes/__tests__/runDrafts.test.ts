@@ -335,6 +335,36 @@ describe('run drafts', () => {
     expect(ok.status).toBe(201);
   });
 
+  it('provisionalTarget: true marks the target once, on the first save only; a failing mark does not fail the save', async () => {
+    const marks: Array<Record<string, unknown>> = [];
+    const marking = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter({
+      ...depsFor(world, { node: 'node-a' }),
+      markProvisionalTarget: async (input) => { marks.push(input); return true; },
+    })]]);
+    const failing = await serve([['/api/documents/:documentId/run-drafts', createRunDraftsRouter({
+      ...depsFor(world, { node: 'node-b' }),
+      markProvisionalTarget: async () => { throw new Error('ddb down'); },
+    })]]);
+    try {
+      const first = await put(marking, 'dev-connor', { ...DRAFT, provisionalTarget: true });
+      expect(first.status).toBe(201);
+      expect(marks).toEqual([{ documentId: 'doc-1', draftId: 'req-1', userId: 'dev-connor', now: world.now }]);
+      const replay = await put(marking, 'dev-connor', { ...DRAFT, provisionalTarget: true });
+      expect(replay.status).toBe(200);
+      expect(replay.body.replayed).toBe(true);
+      // Without the flag a first save marks nothing.
+      expect((await put(marking, 'dev-connor', DRAFT, 'req-2')).status).toBe(201);
+      expect(marks).toHaveLength(1);
+
+      const saved = await put(failing, 'dev-connor', { ...DRAFT, provisionalTarget: true }, 'req-3');
+      expect(saved.status).toBe(201);
+      expect(saved.body.draft).toMatchObject({ draftId: 'req-3', status: 'draft' });
+    } finally {
+      await marking.close();
+      await failing.close();
+    }
+  });
+
   it('validates the draft', async () => {
     expect((await put(a, 'dev-connor', { instruction: 'x' })).status).toBe(400);
     expect((await put(a, 'dev-connor', { ...DRAFT, model: 'gpt' })).status).toBe(400);
