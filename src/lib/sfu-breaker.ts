@@ -14,6 +14,7 @@
 
 import { CircuitBreaker, CircuitState } from 'distributed-core/transport';
 import { AppError } from '../middleware/error-handler';
+import log from './logger';
 
 // 8s per-request abort budget. The SFU's POST /channels does an IVS channel
 // create round-trip; 8s is comfortably above its p99 (~500ms) but below what
@@ -100,8 +101,16 @@ export function mapSfuError(err: unknown): AppError {
     return new AppError(503, 'Video service temporarily unavailable');
   }
   if (err instanceof UpstreamServerError) {
+    // The mapped AppError is rethrown by the routes without logging, so
+    // this is the only place the LVS failure is ever written down. Without
+    // it a 500 from LVS shows up as a bare "status":500 request line.
+    log.error(
+      { status: err.response.status, url: err.response.url },
+      '[sfu] upstream 5xx from the video service',
+    );
     return new AppError(err.response.status, `Video API error: ${err.response.status}`);
   }
+  log.error({ err }, '[sfu] video service call failed');
   if (
     err instanceof Error
     && (err.name === 'AbortError'
