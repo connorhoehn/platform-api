@@ -68,7 +68,7 @@ describe('DocumentSearchIndex', () => {
     let scans = 0;
     const { d } = deps({
       now: () => now,
-      scanRows: async () => { scans++; if (scans > 1) await new Promise<void>((r) => { release = r; }); return rows; },
+      scanRows: async () => { scans++; if (scans === 2) await new Promise<void>((r) => { release = r; }); return rows; },
     });
     const idx = new DocumentSearchIndex(d);
     await idx.search(connor, req('release'));
@@ -79,6 +79,9 @@ describe('DocumentSearchIndex', () => {
     await idx.search(connor, req('release'));
     expect(scans).toBe(2);
     release?.();
+    await new Promise((r) => setTimeout(r, 0));
+    await idx.search(connor, { ...req('release'), fresh: true });
+    expect(scans).toBe(3);
   });
   it('ranks an archived copy below the live one', async () => {
     const { d } = deps({

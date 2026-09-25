@@ -4,6 +4,7 @@
 //
 //   ?q=release&sort=relevance|updated|name&kind=page,presentation
 //   &owner=dev-connor&folder=<folderId>|unfiled&since=<epoch ms>&limit=30&cursor=<next>
+//   &fresh=1 (skip the row cache — the list just changed)
 //
 // Not under /api/documents/:documentId — that mount's document-policy guard
 // would read "document-search" as a document id.
@@ -56,6 +57,7 @@ export function createDocumentSearchRouter(index = new DocumentSearchIndex(ddbSe
       },
       offset: decodeCursor(typeof req.query.cursor === 'string' ? req.query.cursor : undefined),
       limit,
+      fresh: req.query.fresh === '1',
     });
     const ms = Date.now() - started;
     res.setHeader('Server-Timing', `rows;dur=${result.timings.rowsMs}, access;dur=${result.timings.accessMs}, text;dur=${result.timings.textMs}, total;dur=${ms}`);

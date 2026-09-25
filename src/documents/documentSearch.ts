@@ -90,6 +90,12 @@ export interface SearchRequest {
   filters: SearchFilters;
   offset: number;
   limit: number;
+  /**
+   * Read the rows and folders now instead of from the cache — a client asks
+   * this right after the document list changed (a create, rename, delete), so
+   * its own new document is in the answer. Still single-flighted.
+   */
+  fresh?: boolean;
 }
 
 export interface SearchResultItem {
@@ -287,8 +293,13 @@ interface Cached<T> { at: number; value?: T; pending?: Promise<T> }
  * (stale-while-revalidate), so a refresh never lands on a reader's request —
  * only the very first load of a key does. A failed refresh keeps the old value.
  */
-function cachedLoad<T>(store: Map<string, Cached<T>>, key: string, ttl: number, now: number, load: () => Promise<T>): Promise<T> {
+function cachedLoad<T>(store: Map<string, Cached<T>>, key: string, ttl: number, now: number, load: () => Promise<T>, fresh = false): Promise<T> {
   const hit = store.get(key);
+  if (fresh) return hit?.pending ?? (() => {
+    const pending = load().then((value) => { store.set(key, { at: now, value }); return value; }, (err) => { if (hit?.value !== undefined) store.set(key, { at: hit.at, value: hit.value }); else store.delete(key); throw err; });
+    store.set(key, { ...(hit ?? { at: 0 }), pending });
+    return pending;
+  })();
   if (hit?.value !== undefined && now - hit.at < ttl) return Promise.resolve(hit.value);
   const start = () => {
     const pending = load().then(
@@ -323,8 +334,8 @@ export class DocumentSearchIndex {
     const t0 = this.deps.now();
     const orgId = user.orgId || 'default';
     const [rows, tree] = await Promise.all([
-      cachedLoad(this.rows, 'all', ROWS_TTL_MS, t0, () => this.deps.scanRows()),
-      cachedLoad(this.folders, orgId, ROWS_TTL_MS, t0, () => this.deps.listFolders(orgId)),
+      cachedLoad(this.rows, 'all', ROWS_TTL_MS, t0, () => this.deps.scanRows(), req.fresh),
+      cachedLoad(this.folders, orgId, ROWS_TTL_MS, t0, () => this.deps.listFolders(orgId), req.fresh),
     ]);
     const t1 = this.deps.now();
 
