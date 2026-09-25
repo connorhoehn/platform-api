@@ -12,7 +12,9 @@
  *
  * - Rows: one projected Scan of `crdt-documents` (140 rows locally, one page),
  *   shared by every request for `ROWS_TTL_MS` and single-flighted, so a burst
- *   of keystrokes costs one scan.
+ *   of keystrokes costs one scan. Past the TTL the old rows still answer while
+ *   one background load replaces them (stale-while-revalidate), so no
+ *   reader's request waits on a refresh — only a replica's first request does.
  * - Folders: one Query on the org's `crdt-document-folders` partition (the
  *   explorer's own read shape), same TTL.
  * - Words: a page's text lives only in its Y.Doc snapshot. `readDocumentText`
@@ -41,8 +43,8 @@ export const ROWS_TTL_MS = 10_000;
 export const TEXT_TTL_MS = 30_000;
 /**
  * A channel-membership answer is reused this long, across requests: a removed
- * member stops seeing a shared document in search within this window (the
- * #135 read gate keeps its per-document answers 60 s).
+ * member stops seeing a shared document in search within this window plus one
+ * refresh (the #135 read gate keeps its per-document answers 60 s).
  */
 export const MEMBER_TTL_MS = 15_000;
 const PROBE_CONCURRENCY = 8;
@@ -279,14 +281,28 @@ export function ddbSearchDeps(client: DynamoDBDocumentClient): DocumentSearchDep
 
 interface Cached<T> { at: number; value?: T; pending?: Promise<T> }
 
-/** One in-flight load per key; a value is reused for `ttl`. */
+/**
+ * One in-flight load per key. A fresh value (younger than `ttl`) is reused; a
+ * stale one is still answered at once while one background load replaces it
+ * (stale-while-revalidate), so a refresh never lands on a reader's request —
+ * only the very first load of a key does. A failed refresh keeps the old value.
+ */
 function cachedLoad<T>(store: Map<string, Cached<T>>, key: string, ttl: number, now: number, load: () => Promise<T>): Promise<T> {
   const hit = store.get(key);
   if (hit?.value !== undefined && now - hit.at < ttl) return Promise.resolve(hit.value);
-  if (hit?.pending) return hit.pending;
-  const pending = load().then((value) => { store.set(key, { at: now, value }); return value; }, (err) => { store.delete(key); throw err; });
-  store.set(key, { ...(hit ?? { at: 0 }), pending });
-  return pending;
+  const start = () => {
+    const pending = load().then(
+      (value) => { store.set(key, { at: now, value }); return value; },
+      (err) => { const cur = store.get(key); if (cur?.value !== undefined) store.set(key, { at: cur.at, value: cur.value }); else store.delete(key); throw err; },
+    );
+    store.set(key, { ...(hit ?? { at: 0 }), pending });
+    return pending;
+  };
+  if (hit?.value !== undefined) {
+    if (!hit.pending) start().catch(() => undefined);
+    return Promise.resolve(hit.value);
+  }
+  return hit?.pending ?? start();
 }
 
 export class DocumentSearchIndex {

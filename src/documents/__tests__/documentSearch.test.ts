@@ -62,6 +62,24 @@ describe('DocumentSearchIndex', () => {
     expect(res.facets.folders.map((f) => f.id)).not.toContain('fx');
     expect(res.facets.owners.map((o) => o.id).sort()).toEqual(['connor', 'frank']);
   });
+  it('answers from stale rows while one background load refreshes them', async () => {
+    let now = 1_000;
+    let release: (() => void) | undefined;
+    let scans = 0;
+    const { d } = deps({
+      now: () => now,
+      scanRows: async () => { scans++; if (scans > 1) await new Promise<void>((r) => { release = r; }); return rows; },
+    });
+    const idx = new DocumentSearchIndex(d);
+    await idx.search(connor, req('release'));
+    now += 60_000;
+    const res = await idx.search(connor, req('release'));
+    expect(res.items.length).toBeGreaterThan(0);
+    expect(scans).toBe(2);
+    await idx.search(connor, req('release'));
+    expect(scans).toBe(2);
+    release?.();
+  });
   it('ranks an archived copy below the live one', async () => {
     const { d } = deps({
       scanRows: async () => [
