@@ -20,6 +20,7 @@ import { buildDeckFixture, citableSources, documentsOf, readFixtureMaterial, typ
 import { unreadableSourcesFor, type RunSourceAccessDeps } from '../pipeline/runSourceAccess';
 import { MAX_SOURCE_DOCUMENTS } from './DeckSourcesStepHandler';
 import type { DeckSpec } from './DeckSpec';
+import { MAX_REQUESTED_SLIDES, requestedSlideCount } from './draftRequest';
 import log from '../lib/logger';
 
 export const DECK_DRAFT_FROM_SOURCES_KIND = 'deck:draft-from-sources';
@@ -76,7 +77,7 @@ export function createDeckDraftFromSourcesHandler(deps: DeckDraftFromSourcesDeps
     description:
       'Checks that the requester may read every source document, reads them all, and drafts one grounded DeckSpec citing each (deck model pool, behind the model breaker).',
     reads: 'sources ({kind:"document", id} or {documentId,title}), requestedBy, organizationId, instruction.',
-    emits: 'spec (the DeckSpec), source (model | fixture), reason (why the model\'s answer was not used), warnings, sources (ids + titles), sourceCount.',
+    emits: 'spec (the DeckSpec), source (model | fixture), reason (why the model\'s answer was not used), warnings, sources (ids + titles), sourceCount, slideCheck + measured ("Measured: slides 4 → 6 (asked 6)") when the instruction states a slide count.',
     async execute(_node: PipelineNode, context: Record<string, unknown>): Promise<StepOutcome> {
       const ids = sourceDocumentIds(context.sources);
       if (!ids.length) return refuse('deck: no source documents — a deck is only allowed to say what its inputs say');
@@ -112,11 +113,26 @@ export function createDeckDraftFromSourcesHandler(deps: DeckDraftFromSourcesDeps
       // 3. Draft: breaker + deck slot + invented-citation refusal inside.
       const sources = citableSources(material);
       const title = (str(context.instruction) ?? sources.map((source) => source.title).join(' · ')).slice(0, MAX_TITLE);
+      // An explicit count ("a 6-slide review") is the number of content
+      // slides; the Sources slide the render step adds is extra.
+      const instruction = str(context.instruction);
+      const slideCount = requestedSlideCount(instruction);
+      if (slideCount !== undefined && slideCount > MAX_REQUESTED_SLIDES) {
+        return refuse(`deck: ${slideCount} slides were asked for; a deck holds at most ${MAX_REQUESTED_SLIDES} besides its Sources slide — nothing was drafted`);
+      }
       let result: Awaited<ReturnType<typeof buildDeckFixture>>;
       try {
-        result = await draft({ documentIds: ids }, title, { ...deps.fixtureOpts, material });
+        result = await draft({ documentIds: ids }, title, {
+          ...deps.fixtureOpts, material,
+          ...(slideCount !== undefined ? { slideCount } : {}),
+          ...(instruction ? { instruction } : {}),
+        });
       } catch (err) {
         return refuse(`deck: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // The drafter said the sources cannot fill the asked count: say so, never pad.
+      if (result.refused) {
+        return refuse(`deck: ${result.refused}${result.measured ? `. ${result.measured}` : ''} — nothing was saved`);
       }
       const spec = citeEverySource(result.spec, sources);
       return {
@@ -128,6 +144,8 @@ export function createDeckDraftFromSourcesHandler(deps: DeckDraftFromSourcesDeps
           warnings: result.warnings,
           sources,
           sourceCount: sources.length,
+          ...(result.slideCheck ? { slideCheck: result.slideCheck } : {}),
+          ...(result.measured ? { measured: result.measured } : {}),
         },
       };
     },

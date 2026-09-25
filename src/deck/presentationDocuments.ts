@@ -805,7 +805,8 @@ export class DdbPresentationDocumentStore implements PresentationDocumentStore {
         Update: {
           TableName: DOCUMENTS_TABLE,
           Key: { documentId: input.documentId },
-          UpdateExpression: 'SET #type = :type, #title = :title, revisionPreviews = :revisionPreviews, outline = :outline, pageCount = :pageCount, updatedAt = :updatedAt, revisionCount = :count, headRevision = :head',
+          UpdateExpression: 'SET #type = :type, #title = :title, revisionPreviews = :revisionPreviews, outline = :outline, pageCount = :pageCount, updatedAt = :updatedAt, revisionCount = :count, headRevision = :head REMOVE provisional',
+          // The first revision makes a provisional target (provisionalDecks.ts) an ordinary deck.
           // The CAS on the version: the count this attempt read, wherever it
           // was kept — `revisionCount`, or (a row not yet written this way)
           // the array's length, where a missing array counts as 0.

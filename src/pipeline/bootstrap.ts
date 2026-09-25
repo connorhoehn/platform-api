@@ -1308,6 +1308,21 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
     }
   }
 
+  // Loop 38 ppt: an empty provisional deck (created for a run draft that was
+  // never dispatched, or whose run never wrote) is reaped after its TTL.
+  if (!IS_TEST_ENV && process.env.PROVISIONAL_DECK_SWEEP !== 'off') {
+    try {
+      /* eslint-disable @typescript-eslint/no-require-imports */
+      const { createProvisionalDeckSweepTask } = require('../deck/provisionalDecks') as typeof import('../deck/provisionalDecks');
+      const { runDraftRepo } = require('../repositories/RunDraftRepository') as typeof import('../repositories/RunDraftRepository');
+      /* eslint-enable @typescript-eslint/no-require-imports */
+      const ttl = Number(process.env.PROVISIONAL_DECK_TTL_MS);
+      clusterSweepTasks.push(createProvisionalDeckSweepTask({ drafts: runDraftRepo, ...(Number.isFinite(ttl) && ttl > 0 ? { ttlMs: ttl } : {}) }));
+    } catch (err) {
+      bootstrapLog.warn({ err: String(err) }, 'provisional deck sweep not scheduled');
+    }
+  }
+
   // NFR #220: the rollup's runCount, corrected from the run table on the sweep leader.
   if (opts.pipelineRunRepository && (process.env.PIPELINE_RUN_ROLLUP_ENABLED ?? 'true').trim().toLowerCase() !== 'false') {
     const runRepoForCounts = opts.pipelineRunRepository;
