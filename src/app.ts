@@ -16,6 +16,7 @@ import { createCapabilitiesRouter } from './routes/capabilities';
 import { definitionsRepo } from './pipeline/definitions-repository';
 import { internalWorkGraphRouter } from './routes/internal-work-graph';
 import { internalPipelineAccessRouter } from './routes/internal-pipeline-access';
+import { internalVideoSessionsRouter } from './routes/internal-video-sessions';
 
 /**
  * Which requests the GLOBAL `express.json()` is allowed to consume.
@@ -120,6 +121,9 @@ export function createApp(): express.Application {
   app.use('/internal/work-graph', internalWorkGraphRouter);
   // realtime-examples NFR #142: may this socket subscribe to a run channel?
   app.use('/internal/pipeline-access', internalPipelineAccessRouter);
+  // Document calls: the gateway reports a person gone / a call empty after
+  // the rejoin grace (tab closed without Leave).
+  app.use('/internal/video-sessions', internalVideoSessionsRouter);
 
   // Pipeline webhooks — public endpoints (no auth) for external systems to
   // fire pipelines. Mounted BEFORE requireAuth because webhook callers don't
