@@ -13,6 +13,7 @@ import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import { AgentCollaborator, HAIKU_AGENT } from '../documents/AgentCollaborator';
 import { outlineOf } from '../documents/documentAgentOps';
 import { readFixtureMaterial } from './deckFixture';
+import { documentSourceIds, unreadableSourcesFor } from '../pipeline/runSourceAccess';
 import log from '../lib/logger';
 
 export const DECK_READ_SOURCES_KIND = 'deck:read-sources';
@@ -85,12 +86,15 @@ export function sourcesBlock(
 
 export interface DeckReadSourcesOpts {
   readDocument?: typeof readDocumentText;
+  /** The ids the requester may not read (runSourceAccess.ts). */
+  unreadableFor?: typeof unreadableSourcesFor;
   readMaterial?: typeof readFixtureMaterial;
 }
 
 export function createDeckReadSourcesHandler(opts: DeckReadSourcesOpts = {}): DescribedStepHandler {
   const read = opts.readDocument ?? readDocumentText;
   const readMaterial = opts.readMaterial ?? readFixtureMaterial;
+  const unreadableFor = opts.unreadableFor ?? unreadableSourcesFor;
   return {
     kind: DECK_READ_SOURCES_KIND,
     description:
@@ -105,6 +109,26 @@ export function createDeckReadSourcesHandler(opts: DeckReadSourcesOpts = {}): De
         ...(Array.isArray(context.sources) ? context.sources : []),
         ...(context.agendaDocument ? [context.agendaDocument] : []),
       ]);
+      // The named sources are read as the agent, so the run's requester must
+      // be allowed to read each one (document:read) — whichever definition
+      // wired this step. A page this run wrote itself (the agenda) is not a
+      // named source. One refusal stops the step: nothing is read.
+      const named = documentSourceIds(context.sources).filter((id) => refs.some((ref) => ref.documentId === id));
+      if (named.length) {
+        const requestedBy = str(context.requestedBy);
+        if (!requestedBy) return { status: 'failed', error: 'deck: the run names no requester, so its sources cannot be checked — nothing was read', retry: false } as StepOutcome;
+        const orgId = str(context.organizationId);
+        let refused: string[];
+        try {
+          refused = await unreadableFor({ sub: requestedBy, ...(orgId ? { orgId } : {}) }, named);
+        } catch (err) {
+          return { status: 'failed', error: `deck: the sources could not be checked (${err instanceof Error ? err.message : String(err)})` };
+        }
+        if (refused.length) {
+          log.warn({ requestedBy, refused }, 'deck: a named source is not readable by the requester');
+          return { status: 'failed', error: `deck: source ${refused.length === 1 ? 'document' : 'documents'} ${refused.join(', ')} cannot be read by the requester — nothing was read`, retry: false } as StepOutcome;
+        }
+      }
       // `/deck --from transcript` names a recording: its transcript is the
       // source, and the chat text is not a substitute for it — when the
       // recording has none, the block says so and the deck cites nothing it

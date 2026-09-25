@@ -6,11 +6,11 @@ const helpers = { runId: 'run-1', stepId: 'read-sources', emit: async () => unde
 
 describe('the deck:read-sources step', () => {
   it('reads each referenced document into the prompt block', async () => {
-    const handler = createDeckReadSourcesHandler({
+    const handler = createDeckReadSourcesHandler({ unreadableFor: async () => [],
       readDocument: async (documentId) => ({ text: `the text of ${documentId}` }),
     });
     const outcome = await handler.execute(node, {
-      sources: [{ documentId: 'doc-a', title: 'Doc A' }, { id: 'doc-b', name: 'Doc B' }],
+      requestedBy: 'dev-connor', sources: [{ documentId: 'doc-a', title: 'Doc A' }, { id: 'doc-b', name: 'Doc B' }],
       conversationText: '[09:15] Frank: we should cut scope',
     }, helpers);
 
@@ -25,17 +25,17 @@ describe('the deck:read-sources step', () => {
   });
 
   it('says a document could not be read instead of dropping it', async () => {
-    const handler = createDeckReadSourcesHandler({
+    const handler = createDeckReadSourcesHandler({ unreadableFor: async () => [],
       readDocument: async () => ({ error: 'no snapshot arrived' }),
     });
-    const outcome = await handler.execute(node, { sources: [{ documentId: 'doc-a', title: 'Doc A' }] }, helpers);
+    const outcome = await handler.execute(node, { requestedBy: 'dev-connor', sources: [{ documentId: 'doc-a', title: 'Doc A' }] }, helpers);
     const output = outcome.output as Record<string, unknown>;
     expect(output.sourcesUnavailable).toBe(1);
     expect(output.sourcesBlock).toContain('could not be read: no snapshot arrived');
   });
 
   it('fails when there is nothing to ground the deck in', async () => {
-    const handler = createDeckReadSourcesHandler({ readDocument: async () => ({ text: '' }) });
+    const handler = createDeckReadSourcesHandler({ unreadableFor: async () => [], readDocument: async () => ({ text: '' }) });
     const outcome = await handler.execute(node, {}, helpers);
     expect(outcome.status).toBe('failed');
     expect(outcome.error).toContain('no sources');
@@ -55,7 +55,7 @@ describe('the deck:read-sources step, with a recording', () => {
   };
 
   it('prefers the named recording over the chat text, and cites it by its own id', async () => {
-    const handler = createDeckReadSourcesHandler({
+    const handler = createDeckReadSourcesHandler({ unreadableFor: async () => [],
       readDocument: async () => ({ text: '' }),
       readMaterial: async () => material,
     });
@@ -73,7 +73,7 @@ describe('the deck:read-sources step, with a recording', () => {
   });
 
   it('falls back to the conversation when the recording has no transcript', async () => {
-    const handler = createDeckReadSourcesHandler({
+    const handler = createDeckReadSourcesHandler({ unreadableFor: async () => [],
       readDocument: async () => ({ text: '' }),
       readMaterial: async () => ({}),
     });
@@ -86,12 +86,12 @@ describe('the deck:read-sources step, with a recording', () => {
 
 describe('a deck cites the page this run wrote', () => {
   it('reads the agenda an earlier step produced as a source', async () => {
-    const handler = createDeckReadSourcesHandler({
+    const handler = createDeckReadSourcesHandler({ unreadableFor: async () => [],
       readDocument: async (documentId) => ({ text: `the text of ${documentId}` }),
       readMaterial: async () => ({}),
     });
     const outcome = await handler.execute(node, {
-      sources: [{ documentId: 'doc-a', title: 'Doc A' }],
+      requestedBy: 'dev-connor', sources: [{ documentId: 'doc-a', title: 'Doc A' }],
       agendaDocument: { documentId: 'doc-agenda-1', title: 'Platform sync' },
     }, helpers);
     const output = outcome.output as Record<string, unknown>;
@@ -119,5 +119,25 @@ describe('sourcesBlock', () => {
 
   it('says so when there is nothing at all', () => {
     expect(sourcesBlock([])).toBe('(no sources were provided)');
+  });
+});
+
+describe('the deck:read-sources step checks the requester (runSourceAccess)', () => {
+  it('a named source the requester may not read fails the step and reads nothing', async () => {
+    const readDocument = jest.fn(async () => ({ text: 'secret' }));
+    const handler = createDeckReadSourcesHandler({ readDocument, unreadableFor: async (_user, ids) => ids.filter((id) => id === 'doc-secret') });
+    const outcome = await handler.execute(node, { requestedBy: 'dev-connor', sources: [{ documentId: 'doc-a', title: 'A' }, { documentId: 'doc-secret', title: 'S' }] }, helpers);
+    expect(outcome.status).toBe('failed');
+    expect(outcome.error).toContain('doc-secret');
+    expect((outcome as { retry?: boolean }).retry).toBe(false);
+    expect(readDocument).not.toHaveBeenCalled();
+  });
+
+  it('named sources with no requester fail; the check sees the requester', async () => {
+    const unreadableFor = jest.fn(async () => [] as string[]);
+    const handler = createDeckReadSourcesHandler({ readDocument: async () => ({ text: 'x' }), unreadableFor });
+    expect((await handler.execute(node, { sources: [{ documentId: 'doc-a', title: 'A' }] }, helpers)).status).toBe('failed');
+    await handler.execute(node, { requestedBy: 'dev-frank', organizationId: 'dev-org', sources: [{ documentId: 'doc-a', title: 'A' }] }, helpers);
+    expect(unreadableFor).toHaveBeenCalledWith({ sub: 'dev-frank', orgId: 'dev-org' }, ['doc-a']);
   });
 });

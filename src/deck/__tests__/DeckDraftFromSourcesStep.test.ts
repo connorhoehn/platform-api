@@ -29,8 +29,7 @@ function model(answer: string): LLMClient {
 }
 function handler(answer = '{}', extraRows: Record<string, { createdBy: string }> = {}) {
   return createDeckDraftFromSourcesHandler({
-    getDocumentRow: async (id) => ({ ...ROWS, ...extraRows }[id] ?? null),
-    getLifecycleOwner: async () => undefined,
+    access: { getDocumentRow: async (id) => ({ ...ROWS, ...extraRows }[id] ?? null), getLifecycleOwner: async () => undefined },
     readMaterial,
     fixtureOpts: { llm: model(answer) },
   });

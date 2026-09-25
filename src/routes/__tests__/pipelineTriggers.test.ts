@@ -256,6 +256,32 @@ describe('POST /pipelines/:pipelineId/runs (trigger)', () => {
     expect(body.runId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
+  test('refuses sources the caller cannot read, naming each, and starts nothing', async () => {
+    const { setRunSourceAccessDepsForTests } = require('../../pipeline/runSourceAccess') as typeof import('../../pipeline/runSourceAccess');
+    setRunSourceAccessDepsForTests({
+      getDocumentRow: async (id: string) => (id === 'own' ? { createdBy: 'user-1' } : id === 'other' ? { createdBy: 'user-9' } : null),
+      getLifecycleOwner: async () => undefined,
+    });
+    try {
+      const trigger = jest.fn(async () => ({ runId: 'bridge-run-x' }));
+      setPipelineBridge({ trigger, getRun: async () => null, getHistory: async () => [], resolveApproval: async () => {} } as PipelineBridge);
+      const app = buildApp();
+      const headers = { Authorization: 'Bearer t' };
+      const refused = await run(app, 'POST', '/pipelines/p1/runs', {
+        headers,
+        body: { triggerPayload: { sources: [{ kind: 'document', id: 'own' }, { kind: 'document', id: 'other' }, { documentId: 'gone', title: 'G' }] } },
+      });
+      expect(refused.statusCode).toBe(404);
+      expect(refused.body).toMatchObject({ code: 'source-unreadable', sourceIds: ['other', 'gone'] });
+      expect(trigger).not.toHaveBeenCalled();
+      const ok = await run(app, 'POST', '/pipelines/p1/runs', { headers, body: { triggerPayload: { sources: [{ kind: 'document', id: 'own' }] } } });
+      expect(ok.statusCode).toBe(202);
+      expect(trigger).toHaveBeenCalledTimes(1);
+    } finally {
+      setRunSourceAccessDepsForTests(null);
+    }
+  });
+
   test('forwards to bridge.trigger when wired', async () => {
     const trigger = jest.fn(async () => ({ runId: 'bridge-run-1' }));
     const bridge: PipelineBridge = {

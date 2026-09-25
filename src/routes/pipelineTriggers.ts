@@ -24,6 +24,8 @@ import { pipelineRunRollupRepo } from '../repositories/PipelineRunRollupReposito
 import type { InlinePipelineDefinition } from '../pipeline/http/contracts';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { pinRequester } from '../pipeline/pinRequester';
+import { assertRunSourcesReadable } from '../pipeline/runSourceAccess';
+import { DocumentAccessError } from '../documents/documentAccess';
 
 export { pinRequester };
 import { getRunPersistenceService } from '../pipeline/runPersistence';
@@ -228,6 +230,14 @@ pipelineTriggersRouter.post(
         userId,
         pipelineId,
       });
+      // The documents the run is told to read must be ones the caller may
+      // read — a step reading a source joins it as the agent, not as them.
+      try {
+        await assertRunSourcesReadable(req, (body.triggerPayload as { sources?: unknown } | undefined)?.sources, { what: 'nothing was started' });
+      } catch (err) {
+        if (err instanceof DocumentAccessError) { res.status(err.status).json(err.body as never); return; }
+        throw err;
+      }
       try {
         const response = await triggerPipelineRun({ pipelineId, userId, organizationId, body, reqLog });
         res.status(202).json(response);

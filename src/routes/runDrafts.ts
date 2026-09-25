@@ -50,8 +50,9 @@ import { requireAuth } from '../middleware/auth';
 import { AppError, ValidationError } from '../middleware/error-handler';
 import { resolveRunOverrides } from '../pipeline/runOverrides';
 import { handle } from './documentWork';
-import { DocumentAccessError, requireDocumentAccess, type DocumentAccessDeps } from '../documents/documentAccess';
+import { requireDocumentAccess, type DocumentAccessDeps } from '../documents/documentAccess';
 import { makeDocumentReadGate } from '../documents/documentReadGate';
+import { assertRunSourcesReadable } from '../pipeline/runSourceAccess';
 import {
   RUN_DRAFT_MODELS,
   type RunDraft,
@@ -221,27 +222,9 @@ export function createRunDraftsRouter(deps: RunDraftsDeps = defaultRunDraftsDeps
   const router = Router({ mergeParams: true });
   const sourceGate = makeDocumentReadGate({ getDocumentRow: deps.getDocumentRow, getLifecycleOwner: async (id) => (await deps.getLifecycle(id))?.ownerId });
   const assertSource = deps.assertSourceReadable ?? ((req: Request, id: string) => sourceGate.assertCanRead(req, id));
-  /**
-   * Every `document` source must be readable by the caller: 404 otherwise, as
-   * for the document itself. All of them are checked, and the refusal names
-   * every id that failed (ids only — the caller supplied them; a title would
-   * say something about a document they may not read). A 401 is passed on.
-   */
+  /** Every `document` source must be readable by the caller (runSourceAccess.ts): 404 `source-unreadable` naming each id otherwise. */
   async function assertSourcesReadable(req: Request, sources: RunDraftSource[] | undefined): Promise<void> {
-    const unreadable: string[] = [];
-    for (const source of sources ?? []) {
-      if (source.kind !== 'document') continue;
-      try {
-        await assertSource(req, source.id);
-      } catch (err) {
-        if (!(err instanceof AppError) || (err.status !== 404 && err.status !== 403)) throw err;
-        unreadable.push(source.id);
-      }
-    }
-    if (unreadable.length) {
-      const message = `Source ${unreadable.length === 1 ? 'document' : 'documents'} not readable: ${unreadable.join(', ')} — the run was not prepared`;
-      throw new DocumentAccessError(404, { error: message, code: 'source-unreadable', sourceIds: unreadable });
-    }
+    await assertRunSourcesReadable(req, sources, { assertOne: (r, id) => assertSource(r as Request, id) });
   }
 
   const signal = (d: RunDraft): void => {

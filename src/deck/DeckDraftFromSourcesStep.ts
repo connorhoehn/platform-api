@@ -17,8 +17,7 @@
 import type { PipelineNode, StepOutcome } from 'distributed-core/applications/pipeline';
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import { buildDeckFixture, citableSources, documentsOf, readFixtureMaterial, type BuildFixtureOpts, type FixtureMaterial } from './deckFixture';
-import { canReadDocument, type EditableDocumentRow } from './documentEditAccess';
-import { getPresentationDocumentStore } from './presentationDocuments';
+import { unreadableSourcesFor, type RunSourceAccessDeps } from '../pipeline/runSourceAccess';
 import { MAX_SOURCE_DOCUMENTS } from './DeckSourcesStepHandler';
 import type { DeckSpec } from './DeckSpec';
 import log from '../lib/logger';
@@ -60,25 +59,15 @@ export function citeEverySource(spec: DeckSpec, sources: Array<{ documentId: str
 }
 
 export interface DeckDraftFromSourcesDeps {
-  getDocumentRow?: (documentId: string) => Promise<EditableDocumentRow | null>;
-  getLifecycleOwner?: (documentId: string) => Promise<string | undefined>;
-  canRead?: typeof canReadDocument;
+  /** Rows and policy for the read check; the platform's by default. */
+  access?: RunSourceAccessDeps;
   readMaterial?: typeof readFixtureMaterial;
   draft?: typeof buildDeckFixture;
   /** Passed to the drafter (tests inject a model client here). */
   fixtureOpts?: BuildFixtureOpts;
 }
 
-function defaultLifecycleOwner(documentId: string): Promise<string | undefined> {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const repos = require('../repositories') as typeof import('../repositories');
-  return repos.documentLifecycleRepo.get(documentId).then((row) => row?.ownerId);
-}
-
 export function createDeckDraftFromSourcesHandler(deps: DeckDraftFromSourcesDeps = {}): DescribedStepHandler {
-  const getRow = deps.getDocumentRow ?? ((id: string) => getPresentationDocumentStore().get(id) as Promise<EditableDocumentRow | null>);
-  const lifecycleOwner = deps.getLifecycleOwner ?? defaultLifecycleOwner;
-  const canRead = deps.canRead ?? canReadDocument;
   const readMaterial = deps.readMaterial ?? readFixtureMaterial;
   const draft = deps.draft ?? buildDeckFixture;
   const refuse = (error: string): StepOutcome => ({ status: 'failed', error, retry: false } as StepOutcome);
@@ -96,21 +85,12 @@ export function createDeckDraftFromSourcesHandler(deps: DeckDraftFromSourcesDeps
       const orgId = str(context.organizationId);
       const user = { sub: requestedBy, ...(orgId ? { orgId } : {}) };
 
-      // 1. document:read on every source, as the requester.
-      const refused: string[] = [];
-      for (const id of ids) {
-        let row: EditableDocumentRow | null = null;
-        try {
-          row = await getRow(id);
-          if (!row) {
-            const owner = await lifecycleOwner(id);
-            row = owner ? { createdBy: owner } : null;
-          }
-        } catch (err) {
-          return refuse(`deck: source ${id} could not be checked (${err instanceof Error ? err.message : String(err)}) — nothing was drafted`);
-        }
-        const decision = row ? await canRead(row, user, id) : { allow: false };
-        if (!decision.allow) refused.push(id);
+      // 1. document:read on every source, as the requester (runSourceAccess.ts).
+      let refused: string[];
+      try {
+        refused = await unreadableSourcesFor(user, ids, deps.access);
+      } catch (err) {
+        return refuse(`deck: the sources could not be checked (${err instanceof Error ? err.message : String(err)}) — nothing was drafted`);
       }
       if (refused.length) {
         log.warn({ requestedBy, refused }, 'deck: a source document is not readable by the requester');
