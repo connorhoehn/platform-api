@@ -280,3 +280,41 @@ describe('a transcript is known by what read it', () => {
     expect(transcriptIdsOf({ document: { documentId: 'd', title: 'D', text: '' } })).toEqual([]);
   });
 });
+
+describe('several documents (WS-K presentation-deck)', () => {
+  const multi = {
+    readDocument: async (documentId: string) => ({ text: `Notes for ${documentId}. The ${documentId} work ships on Thursday.` }),
+    readDocumentRow: async (documentId: string) => ({ title: `Title ${documentId}` }),
+  };
+
+  it('reads every document in order, each citable, each on its own slide of the offline deck', async () => {
+    const material = await readFixtureMaterial({ documentIds: ['d1', 'd2', 'd3'] }, multi);
+    expect(material.documents?.map((d) => d.documentId)).toEqual(['d1', 'd2', 'd3']);
+    expect(material.document?.documentId).toBe('d1');
+    expect(citableSources(material).map((s) => s.documentId)).toEqual(['d1', 'd2', 'd3']);
+    const block = materialBlock(material);
+    for (const id of ['d1', 'd2', 'd3']) expect(block).toContain(`documentId: ${id}`);
+    const spec = fixtureSpec(material, 'Sprint review');
+    for (const id of ['d1', 'd2', 'd3']) {
+      expect(spec.slides.some((slide) => slide.layout === 'bullets' && slide.sources.length === 1 && slide.sources[0]!.documentId === id)).toBe(true);
+    }
+    expect(uncitedMaterialWarnings(spec, material)).toEqual([]);
+  });
+
+  it('a single documentId keeps the one-document shape', async () => {
+    const material = await readFixtureMaterial({ documentId: 'd1' }, multi);
+    expect(material.documents).toBeUndefined();
+    expect(material.document?.documentId).toBe('d1');
+  });
+
+  it('refuses a model deck that cites an id outside the sources, and uses the given material without reading again', async () => {
+    const material = await readFixtureMaterial({ documentIds: ['d1', 'd2'] }, multi);
+    const invented = { title: 'X', slides: [{ id: 'c', layout: 'title', title: 'X', sources: [{ documentId: 'd9', title: 'Other' }] }] };
+    const readDocument = jest.fn();
+    const result = await buildDeckFixture({ documentIds: ['d1', 'd2'] }, 'X', { material, readDocument, llm: scriptedModel(JSON.stringify(invented)) });
+    expect(readDocument).not.toHaveBeenCalled();
+    expect(result.source).toBe('fixture');
+    expect(result.reason).toContain("'d9'");
+    expect(result.spec.slides.flatMap((s) => s.sources.map((x) => x.documentId))).not.toContain('d9');
+  });
+});

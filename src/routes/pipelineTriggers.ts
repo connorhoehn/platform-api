@@ -327,6 +327,23 @@ export async function triggerPipelineRun(input: {
     const fromDb = await definitionsRepo.get(userId, pipelineId);
     if (fromDb) resolvedDefinition = fromDb;
   }
+  // A platform pipeline a run draft may start (`draftable`, e.g.
+  // presentation-deck): its steps check what the requester may read and
+  // write. Every other system pipeline stays reachable only through its route.
+  if (!resolvedDefinition) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { getDraftableSystemPipeline } = require('../pipeline/systemPipelines') as typeof import('../pipeline/systemPipelines');
+    const system = getDraftableSystemPipeline(pipelineId);
+    if (system) {
+      resolvedDefinition = system as unknown as typeof resolvedDefinition;
+      // Its steps check access as the requester, in the requester's
+      // organisation: that is the verified claim, never the payload's.
+      const payload = { ...(body.triggerPayload ?? {}) } as Record<string, unknown>;
+      if (organizationId) payload.organizationId = organizationId;
+      else delete payload.organizationId;
+      body.triggerPayload = payload as typeof body.triggerPayload;
+    }
+  }
 
   const bridge = getPipelineBridge();
 

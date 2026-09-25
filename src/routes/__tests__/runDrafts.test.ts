@@ -325,6 +325,16 @@ describe('run drafts', () => {
     expect((await call(a.url, 'PUT', '/api/documents/missing/run-drafts/req-1', 'dev-connor', DRAFT)).status).toBe(404);
   });
 
+  it('refuses sources the caller cannot read, naming every one, and prepares nothing (WS-K)', async () => {
+    const refused = await put(a, 'dev-erin', { ...DRAFT, sources: [{ kind: 'document', id: 'doc-1' }, { kind: 'document', id: 'doc-2' }, { kind: 'document', id: 'missing' }] });
+    expect(refused.status).toBe(404);
+    expect(refused.body).toMatchObject({ code: 'source-unreadable', sourceIds: ['doc-2', 'missing'] });
+    expect(refused.body.error).toContain('doc-2, missing');
+    expect((await call(a.url, 'GET', '/api/documents/doc-1/run-drafts/req-1', 'dev-connor')).status).toBe(404);
+    const ok = await put(a, 'dev-connor', { ...DRAFT, sources: [{ kind: 'document', id: 'doc-1' }, { kind: 'document', id: 'doc-2' }] });
+    expect(ok.status).toBe(201);
+  });
+
   it('validates the draft', async () => {
     expect((await put(a, 'dev-connor', { instruction: 'x' })).status).toBe(400);
     expect((await put(a, 'dev-connor', { ...DRAFT, model: 'gpt' })).status).toBe(400);

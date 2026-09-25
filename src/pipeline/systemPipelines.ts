@@ -10,11 +10,18 @@ import { buildConversationSummarizeDefinition, CONVERSATION_SUMMARIZE_PIPELINE_I
 import { buildDiagramGenerateDefinition, DIAGRAM_GENERATE_PIPELINE_ID } from '../documents/diagramGeneratePipeline';
 import { buildMediaCatalogDefinition, MEDIA_CATALOG_PIPELINE_ID } from '../media/mediaCatalogPipeline';
 import { buildDeckReviseDefinition, DECK_REVISE_PIPELINE_ID } from '../deck/deckReviseDefinition';
+import { buildPresentationDeckDefinition, PRESENTATION_DECK_PIPELINE_ID } from '../deck/presentationDeckDefinition';
 import { assertSystemPipelinesLint } from './systemPipelineLint';
 
 export interface SystemPipelineEntry {
   id: string;
   build: () => Record<string, unknown>;
+  /**
+   * A run draft (and so the generic trigger) may start it. Only for a pipeline
+   * whose own steps authorize what they read and write as the requester — the
+   * others are started by their own routes, which do the checking.
+   */
+  draftable?: true;
 }
 
 const REGISTRY: SystemPipelineEntry[] = [
@@ -28,6 +35,7 @@ const REGISTRY: SystemPipelineEntry[] = [
   { id: DIAGRAM_GENERATE_PIPELINE_ID, build: () => buildDiagramGenerateDefinition() },
   { id: MEDIA_CATALOG_PIPELINE_ID, build: () => buildMediaCatalogDefinition() },
   { id: DECK_REVISE_PIPELINE_ID, build: () => buildDeckReviseDefinition() },
+  { id: PRESENTATION_DECK_PIPELINE_ID, build: () => buildPresentationDeckDefinition(), draftable: true },
 ];
 
 // Retries and approvers are platform properties: a definition that forgets
@@ -46,6 +54,12 @@ export function registerSystemPipeline(entry: SystemPipelineEntry): void {
 
 export function getSystemPipeline(id: string): Record<string, unknown> | null {
   const e = REGISTRY.find((x) => x.id === id);
+  return e ? { ...e.build(), system: true } : null;
+}
+
+/** The system definition a run draft may start, or null (not a system pipeline, or not draftable). */
+export function getDraftableSystemPipeline(id: string): Record<string, unknown> | null {
+  const e = REGISTRY.find((x) => x.id === id && x.draftable === true);
   return e ? { ...e.build(), system: true } : null;
 }
 

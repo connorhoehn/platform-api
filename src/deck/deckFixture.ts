@@ -36,13 +36,23 @@ const MAX_DOCUMENT_CHARS = 6000;
 
 export interface DeckFixtureFrom {
   documentId?: string;
+  /**
+   * Several documents drafted from together (a run draft's `sources`, the All
+   * documents composer's chips). Read in order after `documentId`, deduped.
+   */
+  documentIds?: string[];
   recordingId?: string;
   personId?: string;
 }
 
 /** What was actually read, so the caller can see what the deck stands on. */
+export interface FixtureDocument { documentId: string; title: string; text: string; unreadable?: string }
+
 export interface FixtureMaterial {
-  document?: { documentId: string; title: string; text: string; unreadable?: string };
+  /** The first (or only) document — kept for the single-document callers. */
+  document?: FixtureDocument;
+  /** Every document read, in order, when more than one was named (`document` is `documents[0]`). */
+  documents?: FixtureDocument[];
   transcript?: { transcriptId: string; title: string; segments: Array<{ speaker: string; text: string; at?: string }> };
 }
 
@@ -85,6 +95,12 @@ export function uncitedMaterialWarnings(spec: DeckSpec, material: FixtureMateria
   return citableSources(material)
     .filter((source) => !cited.has(source.documentId))
     .map((source) => `${source.title} was provided but not cited.`);
+}
+
+/** Every document in the material, whichever field carries it. */
+export function documentsOf(material: FixtureMaterial): FixtureDocument[] {
+  if (material.documents?.length) return material.documents;
+  return material.document ? [material.document] : [];
 }
 
 /** The transcript among the material, by the id the reader gave it. */
@@ -190,19 +206,29 @@ export async function readFixtureMaterial(from: DeckFixtureFrom, deps: ReadMater
   const findRecording = deps.findRecording ?? ((recordingId: string) => callRecordingRepo.findByRecordingId(recordingId));
   const material: FixtureMaterial = {};
 
-  if (from.documentId) {
-    const [row, body] = await Promise.all([readRow(from.documentId), readDocument(from.documentId)]);
+  const readOne = async (documentId: string): Promise<FixtureDocument> => {
+    const [row, body] = await Promise.all([readRow(documentId), readDocument(documentId)]);
     const outlineText = (row?.outline ?? [])
       .map((entry) => clean(entry?.title, 160))
       .filter((value): value is string => !!value)
       .join('\n');
     const text = readableOutline(body.text, MAX_DOCUMENT_CHARS) ?? outlineText;
-    material.document = {
-      documentId: from.documentId,
-      title: clean(row?.title, 160) ?? from.documentId,
+    return {
+      documentId,
+      title: clean(row?.title, 160) ?? documentId,
       text: text ?? '',
       ...(body.error ? { unreadable: body.error } : {}),
     };
+  };
+  const ids = [...new Set([from.documentId, ...(from.documentIds ?? [])].filter((id): id is string => typeof id === 'string' && !!id))];
+  if (ids.length === 1 && !from.documentIds?.length) {
+    material.document = await readOne(ids[0]!);
+  } else if (ids.length) {
+    // One at a time: each read joins the document as a collaborator.
+    const documents: FixtureDocument[] = [];
+    for (const id of ids) documents.push(await readOne(id));
+    material.documents = documents;
+    material.document = documents[0];
   }
 
   if (from.recordingId) {
@@ -244,8 +270,7 @@ export async function readFixtureMaterial(from: DeckFixtureFrom, deps: ReadMater
 
 /** The sources a deck built from this material may cite, and nothing else. */
 export function citableSources(material: FixtureMaterial): DeckSource[] {
-  const sources: DeckSource[] = [];
-  if (material.document) sources.push({ documentId: material.document.documentId, title: material.document.title });
+  const sources: DeckSource[] = documentsOf(material).map((document) => ({ documentId: document.documentId, title: document.title }));
   if (material.transcript) sources.push({ documentId: material.transcript.transcriptId, title: material.transcript.title });
   return sources;
 }
@@ -253,12 +278,12 @@ export function citableSources(material: FixtureMaterial): DeckSource[] {
 /** The material as the model reads it. */
 export function materialBlock(material: FixtureMaterial): string {
   const parts: string[] = [];
-  if (material.document) {
+  for (const document of documentsOf(material)) {
     parts.push([
-      `### ${material.document.title}`,
-      `documentId: ${material.document.documentId}`,
-      material.document.text || (material.document.unreadable
-        ? `(this document could not be read: ${material.document.unreadable})`
+      `### ${document.title}`,
+      `documentId: ${document.documentId}`,
+      document.text || (document.unreadable
+        ? `(this document could not be read: ${document.unreadable})`
         : '(this document is empty)'),
     ].join('\n'));
   }
@@ -319,7 +344,6 @@ const sentences = (text: string, limit: number): string[] => text
 export function fixtureSpec(material: FixtureMaterial, title: string): DeckSpec {
   const sources = citableSources(material);
   if (!sources.length) throw new NoFixtureMaterialError('no readable document or transcript was named');
-  const documentSource = material.document ? [{ documentId: material.document.documentId, title: material.document.title }] : sources;
   const transcriptSource = material.transcript ? [{ documentId: material.transcript.transcriptId, title: material.transcript.title }] : sources;
   const slides: DeckSlide[] = [{
     id: 'cover',
@@ -329,18 +353,18 @@ export function fixtureSpec(material: FixtureMaterial, title: string): DeckSpec 
     sources,
   }];
 
-  if (material.document) {
-    const points = sentences(material.document.text, MAX_BULLETS_PER_SLIDE);
+  documentsOf(material).forEach((document, index) => {
+    const points = sentences(document.text, MAX_BULLETS_PER_SLIDE);
     slides.push({
-      id: 'document',
+      id: index === 0 ? 'document' : `document-${index + 1}`,
       layout: 'bullets',
-      title: material.document.title.slice(0, 120),
+      title: document.title.slice(0, 120),
       eyebrow: 'Project document',
       bullets: points.length ? points : ['(the document had no readable text)'],
       notes: 'Read straight from the document, unedited.',
-      sources: documentSource,
+      sources: [{ documentId: document.documentId, title: document.title }],
     });
-  }
+  });
 
   if (material.transcript) {
     const segments = material.transcript.segments;
@@ -427,6 +451,8 @@ export const guardedSlot: ModelSlotRunner = (run) =>
   guardModelCall(() => withModelSlot(run), (err) => err instanceof ModelSlotTimeoutError);
 
 export interface BuildFixtureOpts extends ReadMaterialDeps {
+  /** Material the caller already read (and checked) — the drafter does not read it again. */
+  material?: FixtureMaterial;
   llm?: LLMClient | null;
   timeoutMs?: number;
   /** false: never share the model call with a concurrent identical draft. */
@@ -485,7 +511,7 @@ export async function buildDeckFixture(
   title: string | undefined,
   opts: BuildFixtureOpts = {},
 ): Promise<DeckFixtureResult> {
-  const material = await readFixtureMaterial(from, opts);
+  const material = opts.material ?? await readFixtureMaterial(from, opts);
   const sources = citableSources(material);
   if (!sources.length) {
     throw new NoFixtureMaterialError('name a documentId or a recordingId that can be read — a deck is only allowed to say what its inputs say');
