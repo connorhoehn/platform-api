@@ -1272,6 +1272,14 @@ describe('POST /api/video/sessions/:sessionId/end — LVS authoritative path', (
     }
   });
 
+  it('a deferred LVS /end that finds the session gone (LVS restarted) ends the record', async () => {
+    mockGetSession.mockResolvedValue({ sessionId: 'vs-1', channelArn: 'arn:lvs:1', status: 'active', participants: [{ participantId: 'p-2' }] });
+    mockFetch.mockResolvedValueOnce(apiFail(404));
+    deferLvsEnd({ channelArn: 'arn:lvs:1', participantId: 'p-1', authHeader: 'Bearer user-jwt', sessionId: 'vs-1', lobbyName: 'doc-1' }, [1]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockEndSession).toHaveBeenCalledWith('doc-1', 'vs-1', expect.any(String));
+  });
+
   it('a deferred LVS /end retries until LVS answers', async () => {
     mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
     mockFetch.mockResolvedValueOnce(apiOk({ participantsRemaining: 0 }));

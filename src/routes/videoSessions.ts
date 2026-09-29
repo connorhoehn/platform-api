@@ -650,7 +650,7 @@ export function __setLvsEndRetryDelaysForTests(delays: readonly number[] | null)
   lvsEndRetryDelays = delays ?? LVS_END_RETRY_DELAYS_MS;
 }
 export function deferLvsEnd(
-  args: { channelArn: string; participantId: string; authHeader: string; sessionId: string },
+  args: { channelArn: string; participantId: string; authHeader: string; sessionId: string; lobbyName?: string },
   delays: readonly number[] = lvsEndRetryDelays,
 ): void {
   const attempt = (i: number): void => {
@@ -669,6 +669,22 @@ export function deferLvsEnd(
           },
         );
         log.info({ sessionId: args.sessionId, status: res.status, attempt: i + 1 }, '[videoSessions] deferred LVS /end delivered');
+        // LVS is the ref-count's source of truth: when it says nobody is
+        // left (or has forgotten the session — a restart), the record
+        // follows. The DDB splice done at hang-up time cannot know that
+        // on its own: two leaves racing the same read-modify-write each
+        // leave the other one behind.
+        if (args.lobbyName) {
+          const body = res.ok ? await res.json().catch(() => ({})) as { participantsRemaining?: number; endedAt?: string | null } : null;
+          const nobodyLeft = res.status === 404 || (body !== null && (body.participantsRemaining ?? 0) === 0);
+          if (nobodyLeft) {
+            const current = await videoSessionRepo.getSession(args.lobbyName, args.sessionId).catch(() => null);
+            if (current && current.status === 'active') {
+              await videoSessionRepo.endSession(args.lobbyName, args.sessionId, body?.endedAt || new Date().toISOString());
+              log.info({ sessionId: args.sessionId }, '[videoSessions] deferred LVS /end: session ended to match LVS');
+            }
+          }
+        }
       } catch {
         attempt(i + 1);
       }
@@ -774,7 +790,7 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
           { sessionId, status: mapped.status, err: mapped.message },
           '[videoSessions] LVS /end unreachable — ending the record here, LVS end deferred',
         );
-        deferLvsEnd({ channelArn: session.channelArn, participantId, authHeader, sessionId });
+        deferLvsEnd({ channelArn: session.channelArn, participantId, authHeader, sessionId, lobbyName });
         lvsDeferred = true;
       }
     }
