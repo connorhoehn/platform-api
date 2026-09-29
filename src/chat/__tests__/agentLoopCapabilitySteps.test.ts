@@ -4,11 +4,13 @@
 
 import {
   agendaLoopNodeId, agentLoopNodeId, buildAgentLoopDefinition, deckLoopNodeId, meetingLoopNodeId,
+  documentLoopNodeId, documentStepTitle, loopStepNodes,
   type AgentLoopRequest, type LoopPlan, type LoopStep,
 } from '../agentLoopPlanner';
 import { MEETING_STEP_KIND } from '../../loop/meetingStepHandler';
 import { AGENDA_STEP_KIND } from '../../loop/agendaStepHandler';
 import { DECK_STEP_KIND } from '../../deck/DeckStepHandler';
+import { DOCUMENT_CREATE_STEP_KIND } from '../../loop/documentCreateStepHandler';
 
 const step = (id: string, kind: LoopStep['kind'], title: string, dependsOn: string[] = []): LoopStep => ({
   id, kind, title, prompt: `do ${title}`, dependsOn, done: `${title} is done`,
@@ -95,5 +97,28 @@ describe('the fixture loop runs every kind with no model', () => {
   it('pins the team the instruction names, when it names one', () => {
     const nodesWithTeam = nodesOf(buildAgentLoopDefinition(plan, request('[deck-fixture] create a meeting with the platform team and a ppt')));
     expect(nodesWithTeam.find((candidate) => candidate.id === meetingLoopNodeId('s1'))!.data.team).toBe('platform');
+  });
+});
+
+describe('a document step creates a real page', () => {
+  const pizza: LoopStep = {
+    id: 's1', kind: 'document', title: 'Create pizza oven page', dependsOn: [],
+    prompt: "Create a new blank page and title it 'pizza oven'.", done: "A blank page with the title 'pizza oven' exists in the workspace.",
+  };
+  const definition = buildAgentLoopDefinition({ steps: [pizza] } as LoopPlan, request('Blank page title it pizza oven'));
+  const nodes = nodesOf(definition);
+
+  it('is a draft and a create, not an agent that says DONE', () => {
+    expect(nodes.map((n) => n.id)).toEqual(['trigger', agentLoopNodeId('s1'), documentLoopNodeId('s1')]);
+    const create = nodes.find((n) => n.id === documentLoopNodeId('s1'))!;
+    expect(create.type).toBe(DOCUMENT_CREATE_STEP_KIND);
+    expect(create.data).toMatchObject({ title: 'pizza oven', pageFrom: `$.steps.${agentLoopNodeId('s1')}.text`, loop: { kind: 'document', stepId: 's1', role: 'create' } });
+    expect(loopStepNodes(pizza).map((n) => n.nodeId)).toEqual([agentLoopNodeId('s1'), documentLoopNodeId('s1')]);
+  });
+
+  it('reads the page title off the step', () => {
+    expect(documentStepTitle(pizza)).toBe('pizza oven');
+    expect(documentStepTitle({ ...pizza, prompt: 'Write it.', title: 'Write launch notes document' })).toBe('launch notes');
+    expect(documentStepTitle({ ...pizza, prompt: 'Make a page called "Q3 plan"', title: 'Plan page' })).toBe('Q3 plan');
   });
 });

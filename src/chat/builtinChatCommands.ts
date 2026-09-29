@@ -378,6 +378,11 @@ export function registerBuiltinChatCommands(): void {
         chatChannel: request.chatChannel,
         requestedBy: request.requestedBy,
         requestedByName: request.requestedByName,
+        // The id the conversation's card carries (the client was answered
+        // with it before the plan existed). A step that turns the card into
+        // what the run produced finds the card by it — the executor's own
+        // run id is not on the card.
+        ...(typeof input.extra?.agentLoopId === 'string' ? { loopId: input.extra.agentLoopId } : {}),
         // Interpolated by a deck step's drafting prompt. Empty string rather
         // than absent, so the prompt reads as "no transcript" instead of
         // leaving a dangling template.

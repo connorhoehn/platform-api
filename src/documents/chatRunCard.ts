@@ -6,7 +6,7 @@
 // there is a page behind it, opens that page. Recording pipelines post the
 // same card from their lobby; this is the helper for a run that already
 // knows its channel.
-import { postChatMessage, PIPELINE_IDENTITY, ChatRefusedError, describeError, type ServiceIdentity } from '../gateway/GatewayServiceClient';
+import { postChatMessage, editChatMessage, readChatHistory, PIPELINE_IDENTITY, ChatRefusedError, describeError, type ChatHistoryMessage, type ServiceIdentity } from '../gateway/GatewayServiceClient';
 import log from '../lib/logger';
 
 export interface RunCardInput {
@@ -129,6 +129,109 @@ export async function postRunCard(input: RunCardInput): Promise<RunCardPostOutco
 /** `postRunCard`, as a boolean. */
 export async function postRunCardToChannel(input: RunCardInput): Promise<boolean> {
   return (await postRunCard(input)).posted;
+}
+
+// ─── The run card becomes the document card ─────────────────────────────
+//
+// A run that produced a document leaves ONE message in the conversation: the
+// run's own card, turned into the conversation's document card
+// (`kind: 'document'` — "<title> · Created by <name> · Open") with a `run`
+// summary under it, so "Open run" still reaches the run. A second message
+// saying the same thing is what the thread used to get, and the run card sat
+// beside it saying "Received".
+//
+// The card is edited AS ITS AUTHOR, because only the author may edit it: the
+// requester when the chat client posted it (clientPostsCard — and every DM
+// card), the pipeline when a step did. When no card is found (a run started
+// from an API caller) the document card is posted instead.
+
+export interface RunDocumentCardInput {
+  channel: string | null | undefined;
+  /** Every id the card may carry: the loop id the client was given, and the executor's. */
+  runIds: string[];
+  pipelineId: string;
+  documentId: string;
+  title: string;
+  icon?: string;
+  requester: { userId: string; displayName?: string };
+  /** The one line under the card: what was asked and for whom. */
+  summary?: string;
+}
+
+export interface RunDocumentCardOutcome {
+  /** `promoted`: the run card became the document card; `posted`: a new document card. */
+  outcome: 'promoted' | 'posted' | 'skipped' | 'failed';
+  messageId?: string;
+  error?: string;
+}
+
+export interface RunDocumentCardDeps {
+  readHistory?: typeof readChatHistory;
+  edit?: typeof editChatMessage;
+  post?: typeof postChatMessage;
+}
+
+/** The metadata of a conversation's document card, with the run that made it. */
+export function runDocumentCardMetadata(input: RunDocumentCardInput): Record<string, unknown> {
+  return {
+    kind: 'document',
+    documentId: input.documentId,
+    title: input.title,
+    ...(input.icon ? { icon: input.icon } : {}),
+    // The card says "Created by <createdBy>" and wants a name, never an id
+    // (DocumentActivityCard); the id rides beside it.
+    createdBy: input.requester.displayName ?? input.requester.userId,
+    createdById: input.requester.userId,
+    displayName: input.requester.displayName ?? input.requester.userId,
+    run: { runId: input.runIds[0], pipelineId: input.pipelineId, ...(input.summary ? { summary: input.summary } : {}) },
+  };
+}
+
+/** The newest card in `messages` naming one of `runIds`. */
+export function findRunCard(messages: ChatHistoryMessage[], runIds: string[]): ChatHistoryMessage | undefined {
+  const ids = new Set(runIds.filter(Boolean));
+  return [...messages].reverse().find((m) => {
+    const md = m.metadata ?? {};
+    return typeof m.id === 'string' && ids.has(md.runId as string) && (md.kind === 'agent-run' || md.kind === 'document');
+  });
+}
+
+/** Turn the run's card into the document card, or post one. Never throws. */
+export async function announceRunDocument(input: RunDocumentCardInput, deps: RunDocumentCardDeps = {}): Promise<RunDocumentCardOutcome> {
+  if (!input.channel) return { outcome: 'skipped' };
+  const channel = input.channel;
+  const readHistory = deps.readHistory ?? readChatHistory;
+  const edit = deps.edit ?? editChatMessage;
+  const post = deps.post ?? postChatMessage;
+  const requester: ServiceIdentity = {
+    userId: input.requester.userId,
+    displayName: input.requester.displayName ?? input.requester.userId,
+    kind: 'person',
+  };
+  const metadata = runDocumentCardMetadata(input);
+  const message = `${requester.displayName} created ${input.title || 'a document'}`;
+  try {
+    const card = findRunCard(await readHistory({ channel, identity: requester }), input.runIds);
+    if (card?.id) {
+      const author = card.userId === requester.userId ? requester : card.userId === PIPELINE_IDENTITY.userId ? PIPELINE_IDENTITY : null;
+      if (author) {
+        await edit({ channel, messageId: card.id, message, metadata, identity: author });
+        // The service does not ack an edit; read it back so "promoted" is a fact.
+        const after = (await readHistory({ channel, identity: requester })).find((m) => m.id === card.id);
+        if (after?.metadata?.kind === 'document' && after.metadata.documentId === input.documentId) {
+          return { outcome: 'promoted', messageId: card.id };
+        }
+        log.warn({ channel, messageId: card.id, documentId: input.documentId }, 'run card edit did not land; posting the document card instead');
+      }
+    }
+    // No card to turn (or it could not be turned): the document card on its own.
+    await post({ channel, message, metadata, ...(isMemberAddressedDm(channel) ? { identity: requester } : {}) });
+    return { outcome: 'posted' };
+  } catch (e) {
+    const error = describeError(e);
+    log.error({ err: error, channel, documentId: input.documentId }, 'could not put the run\'s document into the conversation');
+    return { outcome: 'failed', error };
+  }
 }
 
 export const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);

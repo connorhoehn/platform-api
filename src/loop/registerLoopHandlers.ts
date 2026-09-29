@@ -5,10 +5,11 @@
 import type { StepHandler } from 'distributed-core/applications/pipeline';
 import { createMeetingStepHandler } from './meetingStepHandler';
 import { createAgendaStepHandler } from './agendaStepHandler';
+import { createDocumentCreateStepHandler } from './documentCreateStepHandler';
 
 export function buildLoopStepHandlers(): Map<string, StepHandler> {
   const handlers = new Map<string, StepHandler>();
-  for (const handler of [createMeetingStepHandler(), createAgendaStepHandler()]) {
+  for (const handler of [createMeetingStepHandler(), createAgendaStepHandler(), createDocumentCreateStepHandler()]) {
     handlers.set(handler.kind, handler);
   }
   return handlers;

@@ -217,6 +217,37 @@ export async function postChatMessage(input: { channel: string; message: string;
 }
 
 /**
+ * Edit a message AS its author (the chat service lets only the author edit):
+ * the text is replaced and `metadata` is MERGED into the stored metadata, and
+ * everyone else on the channel gets the same `messageUpdated` an edit in the
+ * browser produces. The service does not ack the author, so a refusal is the
+ * only answer that comes back: a chat error within the wait throws
+ * `ChatRefusedError`, silence means the edit was applied. Callers that must
+ * know read the history back.
+ */
+export async function editChatMessage(input: { channel: string; messageId: string; message: string; metadata?: Record<string, unknown>; identity?: ServiceIdentity; gatewayUrl?: string; timeoutMs?: number }): Promise<void> {
+  const client = historyClientFactory(input.identity ?? PIPELINE_IDENTITY, input.gatewayUrl);
+  const timeoutMs = input.timeoutMs ?? 1500;
+  try {
+    await client.connect();
+  } catch (err) {
+    throw new Error(`gateway connection failed: ${describeError(err)}`);
+  }
+  try {
+    client.send({ service: 'chat', action: 'join', channel: input.channel });
+    const joined = await client.waitFor((f) => isChatFrame(f, 'joined', input.channel) || isChatFrame(f, 'history', input.channel) || !!chatErrorOf(f), timeoutMs);
+    const joinRefused = joined ? chatErrorOf(joined) : null;
+    if (joinRefused) throw new ChatRefusedError(input.channel, joinRefused.code, joinRefused.message, 'edit in');
+    client.send({ service: 'chat', action: 'edit', channel: input.channel, messageId: input.messageId, message: input.message, metadata: input.metadata ?? {} });
+    const reply = await client.waitFor((f) => !!chatErrorOf(f), timeoutMs);
+    const refused = reply ? chatErrorOf(reply) : null;
+    if (refused) throw new ChatRefusedError(input.channel, refused.code, refused.message, 'edit in');
+  } finally {
+    await client.close();
+  }
+}
+
+/**
  * Read a channel's durable history through the chat service, AS the identity
  * given — pass the person who asked, so the gateway's own gates (dm
  * membership, a closed channel's per-member history floor) decide what they

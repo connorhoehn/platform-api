@@ -34,6 +34,8 @@ export interface RunFacts {
   ownerId?: string;
   pipelineId?: string;
   documentId?: string;
+  /** The conversation the run was started from (`context.chatChannel`), when one was. */
+  chatChannel?: string;
 }
 
 export interface RunAccessDeps {
@@ -48,6 +50,13 @@ export interface RunAccessDeps {
    * run page "Open run" leads to opens, as the run's live channel does.
    */
   sharedThroughGraph?(user: { sub: string; orgId?: string }, runId: string): Promise<boolean>;
+  /**
+   * Is `userId` in the conversation the run was started from? A run a chat
+   * command started is the conversation's: its card sits in that thread for
+   * every member, and a card that 404s for all but the requester sat at
+   * "Received" for everyone else (the DM partner of an /agent loop).
+   */
+  conversationMember?(channel: string, ownerId: string | undefined, userId: string): Promise<boolean>;
 }
 
 function str(value: unknown): string | undefined {
@@ -64,6 +73,7 @@ export function factsFromSnapshot(snap: unknown): RunFacts | null {
     ownerId: str(trigger.userId) ?? (typeof s.triggeredBy === 'string' ? s.triggeredBy : undefined),
     pipelineId: str(s.pipelineId),
     documentId: str(payload.documentId) ?? str(s.context?.documentId),
+    chatChannel: str(payload.chatChannel) ?? str(s.context?.chatChannel),
   };
 }
 
@@ -87,7 +97,7 @@ export const defaultRunAccessDeps: RunAccessDeps = {
     const row = await pipelineRunRepo.get(pid, runId).catch(() => null);
     if (!row) return null;
     const ctx = ((row.checkpoint as { context?: Record<string, unknown> } | undefined)?.context ?? {}) as Record<string, unknown>;
-    return { ownerId: str(row.triggeredBy), pipelineId: row.pipelineId, documentId: str(ctx.documentId) };
+    return { ownerId: str(row.triggeredBy), pipelineId: row.pipelineId, documentId: str(ctx.documentId), chatChannel: str(ctx.chatChannel) };
   },
   async documentRow(documentId) {
     const { GetCommand } = require('@aws-sdk/lib-dynamodb') as typeof import('@aws-sdk/lib-dynamodb');
@@ -100,6 +110,10 @@ export const defaultRunAccessDeps: RunAccessDeps = {
       ExpressionAttributeNames: { '#channel': 'channel' },
     }));
     return (res.Item as EditableDocumentRow | undefined) ?? null;
+  },
+  async conversationMember(channel, ownerId, userId) {
+    const { dmNamesAdmit, isChannelMember } = require('../deck/documentEditAccess') as typeof import('../deck/documentEditAccess');
+    return dmNamesAdmit(channel, ownerId, userId) || isChannelMember(channel, userId);
   },
   async sharedThroughGraph(user, runId) {
     const { workGraphOrchestrator, runSharedThroughWorkGraph } = require('../work-graph/runtime') as typeof import('../work-graph/runtime');
@@ -157,7 +171,9 @@ export async function assertRunAccess(
   const stored = live?.ownerId && (!pid || !live.pipelineId || live.pipelineId === pid)
     ? null
     : await deps.storedRun(pid, runId).catch(() => null);
-  const facts: RunFacts | null = live?.ownerId ? { ...live, documentId: live.documentId ?? stored?.documentId } : stored ?? live;
+  const facts: RunFacts | null = live?.ownerId
+    ? { ...live, documentId: live.documentId ?? stored?.documentId, chatChannel: live.chatChannel ?? stored?.chatChannel }
+    : stored ?? live;
   if (!facts) throw new NotFoundError('run not found');
   const factPipeline = stored?.pipelineId ?? facts.pipelineId;
   if (pid && factPipeline && factPipeline !== pid) throw new NotFoundError('run not found');
@@ -166,6 +182,10 @@ export async function assertRunAccess(
   if (facts.documentId) {
     const row = await deps.documentRow(facts.documentId).catch(() => null);
     reader = !!row && (await canReadDocument(row, req.user, facts.documentId)).allow;
+  }
+  // A read of a run started from a conversation this user is in.
+  if (!reader && mode === 'read' && facts.chatChannel && deps.conversationMember) {
+    reader = await deps.conversationMember(facts.chatChannel, facts.ownerId, userId).catch(() => false);
   }
   // NFR #172: a read of a run its owner's work graph shows this user.
   if (!reader && mode === 'read' && deps.sharedThroughGraph && req.user) {

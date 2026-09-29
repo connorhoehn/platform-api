@@ -24,6 +24,7 @@ import type { AgentClient, AgentStopReason } from '../pipeline/agent/types';
 import { DECK_STEP_KIND } from '../deck/DeckStepHandler';
 import { MEETING_STEP_KIND, teamNameFrom } from '../loop/meetingStepHandler';
 import { AGENDA_STEP_KIND, type Agenda } from '../loop/agendaStepHandler';
+import { DOCUMENT_CREATE_STEP_KIND, type PageSpec } from '../loop/documentCreateStepHandler';
 import { isSilentClaudeFailure } from '../pipeline/claudeCliErrors';
 import { routeSummary } from '../pipeline/definition-metadata';
 import type { DeckSpec } from '../deck/DeckSpec';
@@ -322,6 +323,7 @@ export function plannerPrompt(request: AgentLoopRequest): string {
     `  - "kind" is exactly one of: ${LOOP_STEP_KINDS.join(', ')}.`,
     '  - "prompt" is the whole task for that step, written TO the agent doing it, in the second person. It may refer to what earlier steps left in the shared workspace.',
     '  - "dependsOn" lists ids of EARLIER steps only ("s2" may depend on "s1"; "s1" depends on nothing). Leave it empty when the step needs nothing from another.',
+    '  - kind "document" means the step\'s deliverable is a NEW page in the conversation\'s Documents (it is created for everyone in the conversation). Use it only for writing a page, one step per page.',
     '  - "done" is ONE sentence naming the acceptance: the concrete artefact or state that means this step is finished, in terms someone could check. Not "the task is complete" — name the file, the document, the deck, the answer.',
     '',
     hints,
@@ -567,6 +569,63 @@ export function agendaDraftPrompt(step: LoopStep, request: AgentLoopRequest): st
   ].join('\n');
 }
 
+/** `document:create:s1` — the node a `kind: 'document'` step writes its page through. */
+export function documentLoopNodeId(stepId: string): string {
+  return `${DOCUMENT_CREATE_STEP_KIND}:${stepId}`;
+}
+
+/**
+ * The page's title, read off the step before any model runs: a quoted name
+ * after "title(d) it" / "called" / "named" in the prompt or the title, else the
+ * step's title without its verb and its "page"/"document". "Create pizza oven
+ * page" with "…title it 'pizza oven'." → "pizza oven". The draft's own title
+ * wins when there is one; this is what a page is called when there is not.
+ */
+export function documentStepTitle(step: LoopStep): string {
+  for (const text of [step.prompt, step.title]) {
+    const quoted = /(?:\btitled?(?:\s+it)?|\bcalled|\bnamed)\s*[:-]?\s*["'“‘]([^"'”’]{1,120})["'”’]/i.exec(text);
+    if (quoted?.[1]?.trim()) return quoted[1].trim();
+  }
+  const bare = step.title
+    .replace(/^(?:create|write|draft|make|start|add|open)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:blank\s+)?/i, '')
+    .replace(/\s+(?:page|document|doc)$/i, '')
+    .trim();
+  return (bare || step.title).slice(0, 120);
+}
+
+export function documentDraftTitle(step: LoopStep): string {
+  return `Draft ${step.title}`.slice(0, 120);
+}
+
+/**
+ * What the page's drafting agent is told. The shape `document:create`
+ * validates; an empty `blocks` is a blank page, which is a legitimate answer.
+ */
+export function documentDraftPrompt(step: LoopStep, request: AgentLoopRequest): string {
+  return [
+    'You draft ONE page for a shared document. Answer with ONLY a JSON object, no prose, no code fence.',
+    '',
+    '{"title":"…","blocks":[{"kind":"heading","level":2,"text":"…"},{"kind":"paragraph","text":"…"},{"kind":"bulletList","text":"one item per line"}]}',
+    '',
+    'Rules:',
+    `- "title" is the page's name. Use "${documentStepTitle(step)}" unless the task names a different one.`,
+    '- "kind" is one of heading, paragraph, bulletList, orderedList. At most 40 blocks.',
+    '- When the task asks for a blank or empty page, answer with "blocks": [].',
+    '- Do not describe what you did; the JSON IS the page.',
+    '',
+    `The task: ${step.prompt}`,
+    `Acceptance: ${step.done}`,
+    `Requested by: ${request.requestedByName ?? request.requestedBy}`,
+    `The instruction: ${request.instruction}`,
+    'What the steps before you produced: {{ context.steps }}',
+  ].join('\n');
+}
+
+/** A page the fixture loop writes with no model: the title, and a line saying so. */
+export function documentFixture(step: LoopStep): PageSpec {
+  return { title: documentStepTitle(step), blocks: [{ kind: 'paragraph', text: 'Created by the fixture agent loop.' }] };
+}
+
 /** What the fixture loop pins on a meeting node: the team it names, and a fixed proposal. */
 export function meetingFixture(request: AgentLoopRequest): { team?: string; proposeInMinutes: number } {
   const team = teamNameFrom(request.instruction);
@@ -675,6 +734,11 @@ export function loopStepNodes(step: LoopStep): LoopStepNode[] {
       return [
         { nodeId: agentLoopNodeId(step.id), title: agendaDraftTitle(step), nodeKind: 'agent', role: 'draft' },
         { nodeId: agendaLoopNodeId(step.id), title: agendaWriteTitle(step), nodeKind: AGENDA_STEP_KIND, role: 'write' },
+      ];
+    case 'document':
+      return [
+        { nodeId: agentLoopNodeId(step.id), title: documentDraftTitle(step), nodeKind: 'agent', role: 'draft' },
+        { nodeId: documentLoopNodeId(step.id), title: step.title, nodeKind: DOCUMENT_CREATE_STEP_KIND, role: 'create' },
       ];
     case 'meeting':
       // No drafting agent: there is nothing for a model to write.
@@ -818,6 +882,34 @@ export function buildAgentLoopDefinition(plan: LoopPlan, request: AgentLoopReque
           loop: { kind: step.kind, stepId: step.id, role: 'write' },
           retryPolicy: LOOP_STEP_RETRY,
           ...(fixture ? { agenda: agendaFixture(step, request) } : {}),
+        },
+      });
+      continue;
+    }
+
+    if (step.kind === 'document') {
+      // Draft, then CREATE. A devbox agent cannot make a page — its tools are
+      // a shell in a scratch workspace — so a document step that was only an
+      // agent said DONE over a page that never existed. The agent drafts the
+      // page; `document:create` makes it, in this conversation, for everyone
+      // in it, and turns the run's card into the document's card.
+      nodes.push(agentNode(step, nodes.length, {
+        prompt: documentDraftPrompt(step, request),
+        label: documentDraftTitle(step),
+        loop: { kind: step.kind, stepId: step.id, role: 'draft', ...(step.dependsOn.length ? { dependsOn: step.dependsOn } : {}) },
+      }));
+      nodes.push({
+        id: documentLoopNodeId(step.id),
+        type: DOCUMENT_CREATE_STEP_KIND,
+        position: pos(nodes.length),
+        data: {
+          type: DOCUMENT_CREATE_STEP_KIND,
+          label: step.title,
+          pageFrom: `$.steps.${agentLoopNodeId(step.id)}.text`,
+          title: documentStepTitle(step),
+          loop: { kind: step.kind, stepId: step.id, role: 'create' },
+          retryPolicy: LOOP_STEP_RETRY,
+          ...(fixture ? { page: documentFixture(step) } : {}),
         },
       });
       continue;
