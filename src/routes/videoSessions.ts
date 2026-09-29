@@ -636,6 +636,49 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
   }
 }));
 
+/**
+ * Retry LVS `/end` for a leave that could not reach the SFU (A15). The
+ * record is already settled by the caller; this only lets LVS's own
+ * ref-count catch up once it answers again. Idempotent on LVS's side (an
+ * unknown session is 404, taken as done); gives up after the last attempt,
+ * leaving LVS's reaper to sweep. Exported for tests.
+ */
+export const LVS_END_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 30_000, 60_000, 120_000];
+let lvsEndRetryDelays: readonly number[] = LVS_END_RETRY_DELAYS_MS;
+/** Tests only: a retry firing into the next case would eat its fetch mocks. */
+export function __setLvsEndRetryDelaysForTests(delays: readonly number[] | null): void {
+  lvsEndRetryDelays = delays ?? LVS_END_RETRY_DELAYS_MS;
+}
+export function deferLvsEnd(
+  args: { channelArn: string; participantId: string; authHeader: string; sessionId: string },
+  delays: readonly number[] = lvsEndRetryDelays,
+): void {
+  const attempt = (i: number): void => {
+    if (i >= delays.length) {
+      log.warn({ sessionId: args.sessionId }, '[videoSessions] deferred LVS /end gave up — the LVS reaper will sweep');
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const res = await callSfu(
+          `${VIDEO_API_URL}/api/sessions/${encodeURIComponent(args.channelArn)}/end`,
+          {
+            method: 'POST',
+            headers: { Authorization: args.authHeader, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ participantId: args.participantId }),
+          },
+        );
+        log.info({ sessionId: args.sessionId, status: res.status, attempt: i + 1 }, '[videoSessions] deferred LVS /end delivered');
+      } catch {
+        attempt(i + 1);
+      }
+    }, delays[i]);
+    // Never hold the process open for a best-effort retry.
+    (timer as { unref?: () => void }).unref?.();
+  };
+  attempt(0);
+}
+
 // POST /api/video/sessions/:sessionId/end — ref-counted leave
 // Uses optionalAuth so sendBeacon (no auth header) works on tab close.
 //
@@ -707,8 +750,15 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
     // Authoritative path — forward to LVS sessionStore when we have a
     // user JWT to forward. LVS is the source of truth for participant
     // ref-count post Wave 4.
+    // A hang-up is the person's decision and it stands whether or not LVS can
+    // hear about it (A15): when the SFU is unreachable or answers 5xx, the
+    // record is settled here (the DDB path below) and LVS is told later,
+    // idempotently — its own /end treats an unknown session as gone. Before,
+    // the /end answered 503 and the session stayed `active`, so the lobby
+    // kept its Live badge after everyone had hung up.
+    let upstream: globalThis.Response | null = null;
+    let lvsDeferred = false;
     if (participantId && authHeader) {
-      let upstream: globalThis.Response;
       try {
         upstream = await callSfu(
           `${VIDEO_API_URL}/api/sessions/${encodeURIComponent(session.channelArn)}/end`,
@@ -719,9 +769,17 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
           },
         );
       } catch (sfuErr) {
-        throw mapSfuError(sfuErr);
+        const mapped = mapSfuError(sfuErr);
+        log.warn(
+          { sessionId, status: mapped.status, err: mapped.message },
+          '[videoSessions] LVS /end unreachable — ending the record here, LVS end deferred',
+        );
+        deferLvsEnd({ channelArn: session.channelArn, participantId, authHeader, sessionId });
+        lvsDeferred = true;
       }
+    }
 
+    if (upstream && participantId) {
       if (!upstream.ok && upstream.status !== 404) {
         // LVS 404 means "session already gone" — treat as hard-ended.
         // Any other non-2xx is a real upstream failure.
@@ -752,9 +810,10 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
       return;
     }
 
-    // Fallback path: no auth (sendBeacon) or no participantId (legacy
-    // body-userId only). DDB-direct ref-count. LVS sessionStore drifts
-    // until the reaper sweep — acceptable for tab-close.
+    // Fallback path: no auth (sendBeacon), no participantId (legacy
+    // body-userId only), or LVS unreachable (deferred above). DDB-direct
+    // ref-count. LVS sessionStore drifts until the deferred /end or the
+    // reaper sweep — acceptable for tab-close and for an SFU outage.
     let remaining = (session.participants ?? []).length;
     if (participantId) {
       const splice = await videoSessionRepo.removeParticipant(lobbyName, sessionId, participantId);
@@ -765,8 +824,8 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
     }
 
     if (remaining > 0) {
-      log.info({ userId: userId ?? '(anon)', sessionId, remaining }, '[videoSessions] participant left session (fallback)');
-      res.status(200).json({ remaining, ended: false });
+      log.info({ userId: userId ?? '(anon)', sessionId, remaining, lvsDeferred }, '[videoSessions] participant left session (fallback)');
+      res.status(200).json({ remaining, ended: false, ...(lvsDeferred ? { lvsDeferred } : {}) });
       return;
     }
 
@@ -778,7 +837,7 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
       log.error({ err: dbErr }, '[videoSessions] Failed to update local record on end');
     }
 
-    res.status(200).json({ remaining: 0, ended: true });
+    res.status(200).json({ remaining: 0, ended: true, ...(lvsDeferred ? { lvsDeferred } : {}) });
   } catch (err) {
     if (err instanceof AppError) throw err;
     log.error({ err }, '[videoSessions] POST /sessions/:id/end error');

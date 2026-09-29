@@ -86,6 +86,8 @@ import {
   __configureSfuBreakerForTests,
   reapLvsParticipant,
   reapStaleSessions,
+  deferLvsEnd,
+  __setLvsEndRetryDelaysForTests,
 } from '../videoSessions';
 import { errorHandler } from '../../middleware/error-handler';
 
@@ -1218,20 +1220,67 @@ describe('POST /api/video/sessions/:sessionId/end — LVS authoritative path', (
     expect(mockRemoveParticipant).toHaveBeenCalled();
   });
 
-  it('LVS upstream 5xx surfaces as 5xx error', async () => {
-    mockGetSession.mockResolvedValue({
-      sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
-      participants: [{ participantId: 'p-1' }],
-    });
-    mockFetch.mockResolvedValueOnce(apiOk({}));  // reap
-    mockFetch.mockResolvedValueOnce(apiFail(503));  // LVS /end 503
+  // A15: hanging up ends the call even when LVS cannot hear it. The record
+  // is settled here and LVS is told later (deferLvsEnd); before, the /end
+  // answered 503 and the session stayed `active` — Live after everyone left.
+  it('LVS upstream 5xx: the leave still settles the record (200), the LVS /end is deferred', async () => {
+    __setLvsEndRetryDelaysForTests([]);
+    try {
+      mockGetSession.mockResolvedValue({
+        sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+        participants: [{ participantId: 'p-1' }],
+      });
+      mockRemoveParticipant.mockResolvedValueOnce({ remaining: 0 });
+      mockFetch.mockResolvedValueOnce(apiOk({}));  // reap
+      mockFetch.mockResolvedValueOnce(apiFail(503));  // LVS /end 503
 
-    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
-      body: { documentId: 'doc-1', participantId: 'p-1' },
-      headers: { authorization: 'Bearer user-jwt' },
-    });
+      const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+        body: { documentId: 'doc-1', participantId: 'p-1' },
+        headers: { authorization: 'Bearer user-jwt' },
+      });
 
-    expect(res.statusCode).toBe(503);
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toMatchObject({ remaining: 0, ended: true, lvsDeferred: true });
+      expect(mockRemoveParticipant).toHaveBeenCalledWith('doc-1', 'vs-1', 'p-1');
+      expect(mockEndSession).toHaveBeenCalledWith('doc-1', 'vs-1', expect.any(String));
+    } finally {
+      __setLvsEndRetryDelaysForTests(null);
+    }
+  });
+
+  it('SFU refusing connections: one of two leaves, the other stays; 200 with the remaining count', async () => {
+    __setLvsEndRetryDelaysForTests([]);
+    try {
+      mockGetSession.mockResolvedValue({
+        sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
+        participants: [{ participantId: 'p-1' }, { participantId: 'p-2' }],
+      });
+      mockRemoveParticipant.mockResolvedValueOnce({ remaining: 1 });
+      mockFetch.mockResolvedValueOnce(apiOk({}));  // reap
+      mockFetch.mockRejectedValueOnce(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }));
+
+      const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
+        body: { documentId: 'doc-1', participantId: 'p-1' },
+        headers: { authorization: 'Bearer user-jwt' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toMatchObject({ remaining: 1, ended: false, lvsDeferred: true });
+      expect(mockEndSession).not.toHaveBeenCalled();
+    } finally {
+      __setLvsEndRetryDelaysForTests(null);
+    }
+  });
+
+  it('a deferred LVS /end retries until LVS answers', async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+    mockFetch.mockResolvedValueOnce(apiOk({ participantsRemaining: 0 }));
+    deferLvsEnd({ channelArn: 'arn:lvs:1', participantId: 'p-1', authHeader: 'Bearer user-jwt', sessionId: 'vs-1' }, [1, 1]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const [url, init] = mockFetch.mock.calls[1];
+    expect(url).toContain(`/api/sessions/${encodeURIComponent('arn:lvs:1')}/end`);
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({ participantId: 'p-1' });
   });
 });
 
