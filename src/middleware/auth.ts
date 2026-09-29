@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import jwksClient from 'jwks-rsa';
 import { readOrgClaim } from '../lib/org-claim';
 import { withContext } from '../lib/logger';
+import { isOrgiqCandidate, verifyOrgiqToken } from '../lib/orgiqRealtimeToken';
 
 // The SKIP_AUTH dev fallback: a request with no usable bearer runs as
 // `dev-user` with no organization. That identity owns nothing and projects
@@ -54,6 +55,31 @@ async function getPublicKey(kid: string): Promise<string> {
   return key.getPublicKey();
 }
 
+
+function bearerOf(req: Request): string | null {
+  const h = req.headers.authorization;
+  return h?.startsWith('Bearer ') ? h.slice(7) : null;
+}
+
+/**
+ * The OrgIQ realtime-token path (lib/orgiqRealtimeToken.ts), beside Cognito.
+ * Runs before the SKIP_AUTH branch on purpose: when REALTIME_JWT_SECRET is set,
+ * an HS256 bearer is verified even in dev, so a forged or expired OrgIQ token
+ * is refused rather than decoded. Returns the principal, or the 401 message.
+ */
+function orgiqPrincipal(req: Request, token: string): { user: NonNullable<Request['user']> } | { error: string } {
+  try {
+    return { user: verifyOrgiqToken(token) };
+  } catch (err) {
+    const expired = err instanceof Error && err.name === 'TokenExpiredError';
+    authLog.warn(
+      { route: `${req.method} ${(req.baseUrl || '') + (req.path || '')}`, reason: err instanceof Error ? err.message : String(err) },
+      'OrgIQ realtime token refused',
+    );
+    return { error: expired ? 'Token expired' : 'Invalid token' };
+  }
+}
+
 export async function requireAuth(
   req: Request,
   res: Response,
@@ -64,6 +90,14 @@ export async function requireAuth(
   if (req.documentGrant) { next(); return; }
   // A gateway call already verified by serviceOnBehalfOf (NFR #72).
   if (req.serviceActor && req.user) { next(); return; }
+  const orgiqBearer = bearerOf(req);
+  if (orgiqBearer && isOrgiqCandidate(orgiqBearer)) {
+    const outcome = orgiqPrincipal(req, orgiqBearer);
+    if ('error' in outcome) { res.status(401).json({ error: outcome.error }); return; }
+    req.user = outcome.user;
+    next();
+    return;
+  }
   // Skip auth in local development. We still try to extract the user
   // identity from the bearer when present — the FE's useAuth ships a
   // signed dev token whose `sub` is the actual dev userId (e.g. dev-bob
@@ -130,6 +164,14 @@ export async function optionalAuth(
   // This value is attached only after the document policy verifies signature,
   // current session epoch, tenant, document and operation on this request.
   if (req.documentGrant) { next(); return; }
+  const orgiqBearer = bearerOf(req);
+  if (orgiqBearer && isOrgiqCandidate(orgiqBearer)) {
+    // Invalid → proceed without a user, like an invalid Cognito token below.
+    const outcome = orgiqPrincipal(req, orgiqBearer);
+    if ('user' in outcome) req.user = outcome.user;
+    next();
+    return;
+  }
   if (process.env.SKIP_AUTH === 'true' && process.env.NODE_ENV !== 'production') {
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {

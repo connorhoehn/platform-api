@@ -52,7 +52,8 @@ import {
 // through to LVS's resolveRecordingProfile silent-degrade-to-'none' path.
 import { isRecordingProfile } from '@connorhoehn/event-catalog';
 import { tenantOf } from '../lib/tenant';
-import { lobbyAccess } from '../lib/lobbyAccess';
+import { lobbyAccess, tenantLobby } from '../lib/lobbyAccess';
+import { lvsSessionAuthHeader } from '../lib/lvsServiceAuth';
 import {
   parseCreateFields,
   parsePatchFields,
@@ -342,15 +343,17 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     // members, but it is the same product concept and rings exactly the same
     // way before anyone answers. Matching only `dm:` meant the large groups
     // kept recording their own ringing.
-    const isConversationCall = lobbyName.startsWith('dm:') || lobbyName.startsWith('dmg:');
+    // A tenant-prefixed lobby (`orgiq:dm:<ids>`) is the same shape under its prefix.
+    const lobbyShape = tenantLobby(lobbyName)?.rest ?? lobbyName;
+    const isConversationCall = lobbyShape.startsWith('dm:') || lobbyShape.startsWith('dmg:');
     const recordingConfigurationForLobby = isConversationCall
       ? { ...recordingConfiguration, startWhenParticipants: 2 }
       : recordingConfiguration;
 
-    // Forward the caller's Cognito Bearer so LVS validates the same
-    // identity that hit us. Without a header we can't proxy — platform-api
-    // requireAuth ensures one is present.
-    const authHeader = req.headers.authorization;
+    // LVS gates this route; platform-api calls it as a service
+    // (VIDEO_SERVICE_TOKEN, lib/lvsServiceAuth.ts) and the caller's bearer
+    // stays here. Legacy (unset): the caller's bearer is forwarded.
+    const authHeader = lvsSessionAuthHeader(req.headers.authorization);
     if (!authHeader) {
       throw new AppError(401, 'Authorization header required');
     }
@@ -538,7 +541,7 @@ videoSessionsRouter.post('/sessions/:sessionId/join', requireAuth, asyncHandler(
     }
 
     const userId = req.user!.sub;
-    const authHeader = req.headers.authorization;
+    const authHeader = lvsSessionAuthHeader(req.headers.authorization);
     if (!authHeader) {
       throw new AppError(401, 'Authorization header required');
     }
@@ -745,7 +748,7 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
         : undefined);
     // The caller, never a body-named user (app-level requireAuth always sets one).
     const userId = req.user?.sub;
-    const authHeader = req.headers.authorization;
+    const authHeader = lvsSessionAuthHeader(req.headers.authorization);
     // NFR #175: the participant must be the caller's own entry — or the caller
     // started the session. Before this, any user could name another person's
     // participantId and the admin-token reap would evict them.
@@ -763,9 +766,9 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
       recordLvsParticipantReap(reapOutcome);
     }
 
-    // Authoritative path — forward to LVS sessionStore when we have a
-    // user JWT to forward. LVS is the source of truth for participant
-    // ref-count post Wave 4.
+    // Authoritative path — tell LVS sessionStore, as a service when
+    // VIDEO_SERVICE_TOKEN is set (else with the caller's JWT, legacy). LVS is
+    // the source of truth for participant ref-count post Wave 4.
     // A hang-up is the person's decision and it stands whether or not LVS can
     // hear about it (A15): when the SFU is unreachable or answers 5xx, the
     // record is settled here (the DDB path below) and LVS is told later,
@@ -894,9 +897,10 @@ videoSessionsRouter.post('/sessions/:sessionId/refresh-token', requireAuth, asyn
     }
     assertOwnParticipant(session, participantId, req.user?.sub, { ownerMayAct: false });
 
-    // LVS's sessionId === channelArn. Forward the caller's Cognito token so
-    // LVS's cognitoAuth middleware validates the same identity that hit us.
-    const authHeader = req.headers.authorization;
+    // LVS's sessionId === channelArn. LVS's cognitoAuth gates this route; it
+    // gets platform-api's service token (lib/lvsServiceAuth.ts), or the
+    // caller's own bearer when none is configured (legacy).
+    const authHeader = lvsSessionAuthHeader(req.headers.authorization);
     if (!authHeader) {
       throw new AppError(401, 'Authorization header required');
     }

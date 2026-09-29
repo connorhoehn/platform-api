@@ -18,6 +18,21 @@
 //   anything else   an ad-hoc lobby with no owner (the global hangout, a
 //                   random-UUID call) — open to any logged-in user, as before
 //
+// Tenant-prefixed lobbies (OrgIQ, 2026-09-29). OrgIQ names a lobby
+// `<tenant>:<rest>` — `orgiq:dm:u-nora:u-vera` from
+// `dmLobbyName(ids, { prefix: 'orgiq:' })` — and its middleware gateway
+// (`lobbyGuard`, aws-agentcore middleware/src/lib/realtime-gateway.ts) allows
+// a lobby only under the caller's own `<org>:` prefix, and an `<org>:dm:<ids>`
+// lobby only for one of those ids. The same rule here:
+//   caller holds an OrgIQ realtime token (`authKind: 'orgiq-hs256'`)
+//                   → exactly `lobbyGuard`: the lobby must be `<org>:<rest>`
+//                     for the token's `org`; `<org>:dm:<ids>` for a listed id
+//                     only; anything else under the prefix is open to the
+//                     tenant. No unprefixed lobby (dm:, room:, a document id).
+//   any other caller naming a `<tenant>:dm:<ids>` lobby
+//                   → a listed id AND the caller's own org is `<tenant>`;
+//                     a tenant DM is never an open ad-hoc lobby.
+//
 // A refusal is 404: confirming that a DM or private room has a call is itself
 // a disclosure.
 
@@ -35,6 +50,44 @@ export interface LobbyAccessDeps {
   assertCanReadDocument(req: Request, documentId: string): Promise<void>;
 }
 
+/** The first segments that are lobby KINDS, never a tenant. */
+const LOBBY_KINDS = new Set(['dm', 'dmg', 'room', 'doc']);
+
+/**
+ * `<tenant>:<rest>` → `{ tenant, rest }`, or null when the name has no tenant
+ * prefix (no colon, or its first segment is a lobby kind like `dm`/`room`).
+ */
+export function tenantLobby(lobbyName: string): { tenant: string; rest: string } | null {
+  const i = lobbyName.indexOf(':');
+  if (i <= 0) return null;
+  const tenant = lobbyName.slice(0, i);
+  if (LOBBY_KINDS.has(tenant)) return null;
+  return { tenant, rest: lobbyName.slice(i + 1) };
+}
+
+/** A DM rest (`dm:<a>:<b>…`, or a bare `dm`) → its ids; null when not a DM. */
+function dmIds(rest: string): string[] | null {
+  if (rest !== 'dm' && !rest.startsWith('dm:')) return null;
+  return rest.slice(3).split(':').filter(Boolean);
+}
+
+/**
+ * The middleware gateway's `lobbyGuard`, verbatim in effect: only lobbies
+ * under the caller's own `<org>:` prefix; `<org>:dm:<ids>` only for one of
+ * the ids; anything else under the prefix is open to the tenant.
+ */
+export function orgiqLobbyGuard(user: { sub?: string; orgId?: string } | undefined, lobbyName: string): boolean {
+  const org = user?.orgId ?? '';
+  const userId = user?.sub ?? '';
+  if (!org || !userId) return false;
+  const prefix = `${org}:`;
+  if (!lobbyName.startsWith(prefix)) return false;
+  const rest = lobbyName.slice(prefix.length);
+  if (!rest) return false;
+  const ids = dmIds(rest);
+  return ids ? ids.includes(userId) : true;
+}
+
 function lookupOrg(req: Request): string {
   return req.user?.orgId ?? (process.env.SKIP_AUTH === 'true' ? 'default-org' : '');
 }
@@ -43,6 +96,10 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
   async function canUseLobby(req: Request, lobbyName: string): Promise<boolean> {
     const userId = req.user?.sub ?? '';
     if (!userId || !lobbyName) return false;
+    if (req.user?.authKind === 'orgiq-hs256') return orgiqLobbyGuard(req.user, lobbyName);
+    const tenanted = tenantLobby(lobbyName);
+    const tenantDm = tenanted ? dmIds(tenanted.rest) : null;
+    if (tenanted && tenantDm) return tenantDm.includes(userId) && req.user?.orgId === tenanted.tenant;
     const dm = dmLobbyParticipants(lobbyName);
     if (dm) return dm.includes(userId);
     if (lobbyName.startsWith('dm:')) return false; // a malformed DM name admits no one

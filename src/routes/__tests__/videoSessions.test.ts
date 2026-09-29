@@ -28,6 +28,7 @@ const mockGetProfile = jest.fn().mockResolvedValue(null);
 // here it allows unless a test says otherwise.
 const mockCanUseLobby = jest.fn(async (..._a: unknown[]) => true);
 jest.mock('../../lib/lobbyAccess', () => ({
+  tenantLobby: jest.requireActual('../../lib/lobbyAccess').tenantLobby,
   lobbyAccess: () => ({
     canUseLobby: (...a: unknown[]) => mockCanUseLobby(...a),
     assertLobbyAccess: async (...a: unknown[]) => {
@@ -1918,5 +1919,67 @@ describe('NFR #175 — lobby access and participant binding', () => {
     expect(names(eve)).toEqual([]);
     // Bob sees whatever the live computation produced — never less than eve.
     expect(names(bob).length).toBeGreaterThanOrEqual(names(eve).length);
+  });
+});
+
+// OrgIQ (2026-09-29): with VIDEO_SERVICE_TOKEN set, platform-api calls LVS's
+// session-lifecycle routes as a service and the caller's bearer stays here
+// (lib/lvsServiceAuth.ts). Unset, the legacy forward above still applies.
+describe('LVS lifecycle calls with VIDEO_SERVICE_TOKEN (no user bearer reaches the SFU)', () => {
+  const USER = 'Bearer user-jwt';
+  const SERVICE = 'svc-token-123';
+  const prior = process.env.VIDEO_SERVICE_TOKEN;
+  beforeEach(() => { process.env.VIDEO_SERVICE_TOKEN = SERVICE; });
+  afterAll(() => {
+    if (prior === undefined) delete process.env.VIDEO_SERVICE_TOKEN;
+    else process.env.VIDEO_SERVICE_TOKEN = prior;
+  });
+
+  function authOfEveryFetch(): string[] {
+    return mockFetch.mock.calls.map(([, init]) => String(((init as RequestInit).headers as Record<string, string>).Authorization));
+  }
+
+  it('create: LVS gets the service token, creatorId from req.user', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:svc'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'orgiq:dm:u-nora:u-vera', findOrCreate: true },
+      headers: { authorization: USER },
+      userId: 'u-vera',
+    });
+    expect(res.statusCode).toBe(201);
+    expect(authOfEveryFetch()).toEqual([`Bearer ${SERVICE}`]);
+    const sent = JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string);
+    expect(sent.creatorId).toBe('u-vera');
+    // A tenant-prefixed DM is a conversation call: LVS waits for the second party.
+    expect(sent.recordingConfiguration).toMatchObject({ startWhenParticipants: 2 });
+  });
+
+  it('create works with no caller bearer at all (the service token carries the call)', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:svc2'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', { body: { lobbyName: 'room-x' } });
+    expect(res.statusCode).toBe(201);
+    expect(authOfEveryFetch()).toEqual([`Bearer ${SERVICE}`]);
+  });
+
+  it('join, refresh-token and end: every LVS call carries the service token, none the user bearer', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:ch:svc', streamKey: '', status: 'active',
+      participants: [{ participantId: 'p-1', userId: 'tester' }, { participantId: 'p-2', userId: 'other' }],
+    });
+    mockFetch.mockResolvedValue(apiOk({ token: 't', participantId: 'p-1', participantsRemaining: 1, endedAt: null }));
+    mockRemoveParticipant.mockResolvedValue({ remaining: 1 });
+    const body = { lobbyName: 'orgiq:dm:other:tester', participantId: 'p-1', displayName: 'T' };
+    for (const path of ['join', 'refresh-token', 'end']) {
+      const res = await run(buildApp(), 'POST', `/api/video/sessions/vs-1/${path}`, { body, headers: { authorization: USER } });
+      expect([200, 201]).toContain(res.statusCode);
+    }
+    const auths = authOfEveryFetch();
+    expect(auths.length).toBeGreaterThanOrEqual(4); // join, refresh, reap DELETE, end
+    expect(auths).not.toContain(USER);
+    const lifecycle = mockFetch.mock.calls
+      .filter(([url, init]) => (init as RequestInit).method === 'POST' && /\/api\/sessions\//.test(String(url)))
+      .map(([, init]) => ((init as RequestInit).headers as Record<string, string>).Authorization);
+    expect(lifecycle.length).toBe(3);
+    expect(new Set(lifecycle)).toEqual(new Set([`Bearer ${SERVICE}`]));
   });
 });

@@ -29,6 +29,7 @@ const mockFindActiveByReviewDocument = jest.fn().mockResolvedValue([]);
 // here it allows unless a test says otherwise.
 const mockCanUseLobby = jest.fn(async (..._a: unknown[]) => true);
 jest.mock('../../lib/lobbyAccess', () => ({
+  tenantLobby: jest.requireActual('../../lib/lobbyAccess').tenantLobby,
   lobbyAccess: () => ({
     canUseLobby: (...a: unknown[]) => mockCanUseLobby(...a),
     assertLobbyAccess: async (...a: unknown[]) => {

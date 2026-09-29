@@ -49,4 +49,38 @@ describe('lobbyAccess', () => {
     await expect(a.assertLobbyAccess(req('eve'), 'dm:alice:bob')).rejects.toMatchObject({ status: 404 });
     await expect(a.assertLobbyAccess(req('bob'), 'dm:alice:bob')).resolves.toBeUndefined();
   });
+
+  describe('tenant-prefixed lobbies (OrgIQ lobbyGuard parity)', () => {
+    const orgiq = (sub: string, orgId = 'orgiq') => ({ user: { sub, orgId, authKind: 'orgiq-hs256' }, headers: {} }) as unknown as Request;
+    it('an OrgIQ caller: only its own <org>: prefix; <org>:dm: only for a listed id', async () => {
+      const a = access();
+      expect(await a.canUseLobby(orgiq('u-vera'), 'orgiq:dm:u-nora:u-vera')).toBe(true);
+      expect(await a.canUseLobby(orgiq('u-theo'), 'orgiq:dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(orgiq('u-vera'), 'orgiq:initiative:p-auth-migration')).toBe(true);
+      expect(await a.canUseLobby(orgiq('u-vera'), 'assessment:dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(orgiq('u-vera'), 'assessment:initiative:x')).toBe(false);
+      expect(await a.canUseLobby(orgiq('u-vera'), 'orgiq:')).toBe(false);
+      expect(await a.canUseLobby(orgiq('u-vera'), 'orgiq:dm')).toBe(false);
+    });
+    it('an OrgIQ caller gets no unprefixed lobby — not an ad-hoc one, not dm:, not a document', async () => {
+      const a = access();
+      expect(await a.canUseLobby(orgiq('u-vera'), 'global-hangout')).toBe(false);
+      expect(await a.canUseLobby(orgiq('u-vera'), 'dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(orgiq('reader'), 'doc-1')).toBe(false);
+    });
+    it('an OrgIQ token for another tenant does not reach this tenant', async () => {
+      const a = access();
+      expect(await a.canUseLobby(orgiq('u-vera', 'assessment'), 'orgiq:dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(orgiq('u-vera', 'assessment'), 'assessment:dm:u-nora:u-vera')).toBe(true);
+    });
+    it('any other caller: a <tenant>:dm: lobby needs a listed id AND that org — never an open ad-hoc lobby', async () => {
+      const a = access();
+      expect(await a.canUseLobby(req('u-vera', 'orgiq'), 'orgiq:dm:u-nora:u-vera')).toBe(true);
+      expect(await a.canUseLobby(req('u-vera', 'org-1'), 'orgiq:dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(req('eve', 'orgiq'), 'orgiq:dm:u-nora:u-vera')).toBe(false);
+      // Unchanged: unprefixed shapes keep their rules.
+      expect(await a.canUseLobby(req('alice'), 'dm:alice:bob')).toBe(true);
+      expect(await a.canUseLobby(req('anyone'), 'room:open')).toBe(true);
+    });
+  });
 });
