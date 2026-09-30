@@ -145,6 +145,9 @@ export function createApp(): express.Application {
   // callers are rejected.
   const { lvsAdminRouter } = require('./routes/lvsAdmin');
   app.use('/api/admin', lvsAdminRouter);
+  // The /agent document backfill (routes/agentDocumentsAdmin.ts), same secret.
+  const { agentDocumentsAdminRouter } = require('./routes/agentDocumentsAdmin');
+  app.use('/api/admin', agentDocumentsAdminRouter);
 
   // Verify document delegation before the generic Cognito boundary. These
   // grants use Ed25519 and intentionally are not Cognito login tokens.

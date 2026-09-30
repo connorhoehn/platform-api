@@ -156,11 +156,20 @@ export interface RunDocumentCardInput {
   requester: { userId: string; displayName?: string };
   /** The one line under the card: what was asked and for whom. */
   summary?: string;
+  /**
+   * Post a document card when no run card is found (default true). A repair of
+   * an old run passes false: a card it cannot find (older than the history
+   * window) is not a reason to add a second one.
+   */
+  postIfNoCard?: boolean;
 }
 
 export interface RunDocumentCardOutcome {
-  /** `promoted`: the run card became the document card; `posted`: a new document card. */
-  outcome: 'promoted' | 'posted' | 'skipped' | 'failed';
+  /**
+   * `promoted`: the run card became the document card; `posted`: a new
+   * document card; `already`: the card already is this document's card.
+   */
+  outcome: 'promoted' | 'posted' | 'already' | 'skipped' | 'failed';
   messageId?: string;
   error?: string;
 }
@@ -187,13 +196,19 @@ export function runDocumentCardMetadata(input: RunDocumentCardInput): Record<str
   };
 }
 
-/** The newest card in `messages` naming one of `runIds`. */
+/** The newest card in `messages` naming one of `runIds` (its own `runId`, or a document card's `run.runId`). */
 export function findRunCard(messages: ChatHistoryMessage[], runIds: string[]): ChatHistoryMessage | undefined {
   const ids = new Set(runIds.filter(Boolean));
   return [...messages].reverse().find((m) => {
     const md = m.metadata ?? {};
-    return typeof m.id === 'string' && ids.has(md.runId as string) && (md.kind === 'agent-run' || md.kind === 'document');
+    const run = md.run && typeof md.run === 'object' ? (md.run as Record<string, unknown>).runId : undefined;
+    return typeof m.id === 'string' && (ids.has(md.runId as string) || ids.has(run as string)) && (md.kind === 'agent-run' || md.kind === 'document');
   });
+}
+
+/** True when `card` already is the document card for `documentId`. */
+export function isDocumentCardFor(card: ChatHistoryMessage | undefined, documentId: string): boolean {
+  return card?.metadata?.kind === 'document' && card.metadata.documentId === documentId;
 }
 
 /** Turn the run's card into the document card, or post one. Never throws. */
@@ -211,8 +226,13 @@ export async function announceRunDocument(input: RunDocumentCardInput, deps: Run
   const metadata = runDocumentCardMetadata(input);
   const message = `${requester.displayName} created ${input.title || 'a document'}`;
   try {
-    const card = findRunCard(await readHistory({ channel, identity: requester }), input.runIds);
-    if (card?.id) {
+    const history = await readHistory({ channel, identity: requester });
+    const own = history.find((m) => typeof m.id === 'string' && isDocumentCardFor(m, input.documentId));
+    if (own?.id) return { outcome: 'already', messageId: own.id };
+    const card = findRunCard(history, input.runIds);
+    // A card that is already ANOTHER document's (a run with two pages) keeps
+    // it: the second page gets its own card below.
+    if (card?.id && card.metadata?.kind === 'agent-run') {
       const author = card.userId === requester.userId ? requester : card.userId === PIPELINE_IDENTITY.userId ? PIPELINE_IDENTITY : null;
       if (author) {
         await edit({ channel, messageId: card.id, message, metadata, identity: author });
@@ -224,7 +244,9 @@ export async function announceRunDocument(input: RunDocumentCardInput, deps: Run
         log.warn({ channel, messageId: card.id, documentId: input.documentId }, 'run card edit did not land; posting the document card instead');
       }
     }
-    // No card to turn (or it could not be turned): the document card on its own.
+    // No card to turn (or it could not be turned): the document card on its own
+    // — unless the caller is repairing an old run, which never adds a card.
+    if (input.postIfNoCard === false) return { outcome: 'skipped' };
     await post({ channel, message, metadata, ...(isMemberAddressedDm(channel) ? { identity: requester } : {}) });
     return { outcome: 'posted' };
   } catch (e) {

@@ -86,6 +86,7 @@ import { workGraphComputeSessionsRouter } from './work-graph-compute-sessions';
 import { createPipelineRouter } from '../pipeline/http/createPipelineRouter';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { resolveStoredRun } from '../pipeline/storedRunLookup';
+import { scheduleRunDocumentRepair } from '../loop/runDocumentRepair';
 import { pipelineRunRepo } from '../repositories';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { definitionsRepo } from '../pipeline/definitions-repository';
@@ -347,6 +348,12 @@ router.use(
           return ((await Promise.resolve(bridge.getRun(id))) as Record<string, unknown> | null) ?? null;
         },
       });
+      // A Done /agent card being read is the moment to repair a run from
+      // before its document was put into the conversation — in the
+      // background, once per run (loop/runDocumentRepair.ts).
+      if (found) {
+        void scheduleRunDocumentRepair(pipelineId, runId, found.status, { getRun: (p, r) => pipelineRunRepo.get(p, r) });
+      }
       return (found as unknown as PipelineRunDetailResponse | null) ?? null;
     },
   }),

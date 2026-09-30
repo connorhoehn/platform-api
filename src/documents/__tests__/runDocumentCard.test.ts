@@ -56,6 +56,16 @@ describe('announceRunDocument', () => {
     expect(gw.posts).toEqual([expect.objectContaining({ channel: input.channel, message: 'Dave Kim created pizza oven', identity: expect.objectContaining({ userId: 'dev-dave' }), metadata: expect.objectContaining({ kind: 'document', documentId: 'doc-pizza' }) })]);
   });
 
+  it('does not edit a card that already is this document\'s, and never repoints another document\'s card', async () => {
+    const already = fakeGateway([{ id: 'm-card', userId: 'dev-dave', metadata: { kind: 'document', documentId: 'doc-pizza', runId: 'loop-1' } }]);
+    await expect(announceRunDocument(input, already.deps)).resolves.toEqual({ outcome: 'already', messageId: 'm-card' });
+    expect(already.edits).toEqual([]);
+    const other = fakeGateway([{ id: 'm-card', userId: 'dev-dave', metadata: { kind: 'document', documentId: 'doc-first', run: { runId: 'loop-1' } } }]);
+    await expect(announceRunDocument(input, other.deps)).resolves.toEqual({ outcome: 'posted' });
+    expect(other.edits).toEqual([]);
+    await expect(announceRunDocument({ ...input, postIfNoCard: false }, fakeGateway([]).deps)).resolves.toEqual({ outcome: 'skipped' });
+  });
+
   it('never throws', async () => {
     const deps = { readHistory: jest.fn(async () => { throw new Error('gateway down'); }) } as never;
     await expect(announceRunDocument(input, deps)).resolves.toEqual({ outcome: 'failed', error: 'gateway down' });

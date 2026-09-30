@@ -33,6 +33,9 @@ import { applyOps, ensureCanvasMeta, BLOCK_KINDS, type BlockKind, type DocOp } f
 import { DOCUMENTS_TABLE } from '../deck/presentationDocuments';
 import { conversationMembers } from '../chat/conversationMembers';
 import { announceRunDocument, type RunDocumentCardInput, type RunDocumentCardOutcome } from '../documents/chatRunCard';
+import { putRunDocumentInConversation, namesLine } from './conversationDocument';
+
+export { namesLine };
 
 export const DOCUMENT_CREATE_STEP_KIND = 'document:create';
 export const CREATED_DOCUMENT_TYPE = 'page';
@@ -115,7 +118,7 @@ export interface DocumentCreateStepHandlerOpts {
 }
 
 /** The real write: join the document as the agent, apply the ops, leave. */
-async function writeThroughGateway(documentId: string, title: string, ops: DocOp[], requestedBy: string): Promise<number> {
+export async function writeThroughGateway(documentId: string, title: string, ops: DocOp[], requestedBy: string): Promise<number> {
   const agent = new AgentCollaborator({ documentId, identity: HAIKU_AGENT });
   try {
     await agent.join();
@@ -130,26 +133,50 @@ async function writeThroughGateway(documentId: string, title: string, ops: DocOp
   }
 }
 
-async function profileNames(userIds: string[]): Promise<Map<string, string>> {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { profileRepo } = require('../repositories') as typeof import('../repositories');
-  const profiles = await profileRepo.batchGetProfiles(userIds).catch(() => []);
-  return new Map(profiles.filter((p) => p.displayName).map((p) => [p.userId, p.displayName]));
+export interface ConversationPageRow {
+  documentId: string;
+  title: string;
+  requestedBy: string;
+  requestedByName?: string;
+  channel?: string;
+  editors: string[];
+  /** ISO time for createdAt / updatedAt. */
+  at: string;
+  /** The run that made it (`createdByRunId`). */
+  runId: string;
 }
 
-/** "Alice", "Alice & Grace", "Alice, Grace & 3 others". */
-export function namesLine(names: string[]): string {
-  if (names.length <= 1) return names[0] ?? '';
-  if (names.length === 2) return `${names[0]} & ${names[1]}`;
-  const rest = names.length - 2;
-  return `${names[0]}, ${names[1]} & ${rest === 1 ? '1 other' : `${rest} others`}`;
+/**
+ * The page's row: owned by the requester, on the conversation, every member an
+ * editor. Conditional on the id being new — a second write of the same id
+ * (a repair re-run) throws ConditionalCheckFailedException instead of
+ * clobbering the page.
+ */
+export async function putConversationPageRow(documents: { send: (command: unknown) => Promise<unknown> }, row: ConversationPageRow): Promise<void> {
+  await documents.send(new PutCommand({
+    TableName: DOCUMENTS_TABLE,
+    Item: {
+      documentId: row.documentId,
+      title: row.title,
+      type: CREATED_DOCUMENT_TYPE,
+      icon: CREATED_DOCUMENT_ICON,
+      status: 'draft',
+      createdBy: row.requestedBy,
+      ...(row.requestedByName ? { createdByName: row.requestedByName } : {}),
+      ...(row.channel ? { channel: row.channel } : {}),
+      editors: row.editors,
+      createdAt: row.at,
+      updatedAt: row.at,
+      createdByRunId: row.runId,
+    },
+    ConditionExpression: 'attribute_not_exists(documentId)',
+  }));
 }
 
 export function createDocumentCreateStepHandler(opts: DocumentCreateStepHandlerOpts = {}): DescribedStepHandler {
   const documents = opts.documents ?? (docClient as unknown as { send: (command: unknown) => Promise<unknown> });
   const writeBody = opts.writeBody ?? writeThroughGateway;
   const members = opts.members ?? ((channel: string, requester: string) => conversationMembers(channel, requester));
-  const names = opts.names ?? profileNames;
   const announce = opts.announce ?? ((input: RunDocumentCardInput) => announceRunDocument(input));
   const newDocumentId = opts.newDocumentId ?? (() => randomUUID());
   const now = opts.now ?? (() => new Date());
@@ -184,24 +211,9 @@ export function createDocumentCreateStepHandler(opts: DocumentCreateStepHandlerO
       const documentId = newDocumentId();
       const at = now().toISOString();
       try {
-        await documents.send(new PutCommand({
-          TableName: DOCUMENTS_TABLE,
-          Item: {
-            documentId,
-            title: page.title,
-            type: CREATED_DOCUMENT_TYPE,
-            icon: CREATED_DOCUMENT_ICON,
-            status: 'draft',
-            createdBy: requestedBy,
-            ...(requestedByName ? { createdByName: requestedByName } : {}),
-            ...(channel ? { channel } : {}),
-            editors,
-            createdAt: at,
-            updatedAt: at,
-            createdByRunId: helpers.runId,
-          },
-          ConditionExpression: 'attribute_not_exists(documentId)',
-        }));
+        await putConversationPageRow(documents, {
+          documentId, title: page.title, requestedBy, requestedByName, channel, editors, at, runId: helpers.runId,
+        });
       } catch (err) {
         return { status: 'failed', error: `document: the page could not be created: ${err instanceof Error ? err.message : String(err)}` };
       }
@@ -216,23 +228,24 @@ export function createDocumentCreateStepHandler(opts: DocumentCreateStepHandlerO
         log.warn({ documentId, err: String(err) }, 'document: the body could not be written through the collaboration channel');
       }
 
+      // The row went in with the channel and the editors; what is left is the
+      // card — the same function a repair of an old run calls
+      // (conversationDocument.ts), so create time and repair cannot drift.
       let card: RunDocumentCardOutcome = { outcome: 'skipped' };
       if (channel) {
-        const nameOf = await names(editors).catch(() => new Map<string, string>());
-        if (requestedByName) nameOf.set(requestedBy, requestedByName);
-        const who = namesLine(editors.map((id) => nameOf.get(id) ?? id));
-        const instruction = str(readPath(context, '$.instruction'), 160);
         const loopId = str(readPath(context, '$.loopId'));
-        card = await announce({
-          channel,
-          runIds: [loopId, helpers.runId].filter((id): id is string => !!id),
-          pipelineId: str(readPath(context, '$.pipelineId')) ?? 'chat-agent-loop',
+        ({ card } = await putRunDocumentInConversation({
           documentId,
           title: page.title,
           icon: CREATED_DOCUMENT_ICON,
+          channel,
           requester: { userId: requestedBy, ...(requestedByName ? { displayName: requestedByName } : {}) },
-          summary: [instruction ? `“${instruction}”` : undefined, `Created by the agent for ${who}`].filter(Boolean).join(' · '),
-        });
+          runIds: [loopId, helpers.runId].filter((id): id is string => !!id),
+          pipelineId: str(readPath(context, '$.pipelineId')) ?? 'chat-agent-loop',
+          instruction: str(readPath(context, '$.instruction'), 160),
+          editors,
+          rowAttached: true,
+        }, { ...(opts.names ? { names: opts.names } : {}), announce }));
         if (card.outcome === 'failed') notices.push(`The page was not announced in the conversation: ${card.error ?? 'unknown error'}`);
       }
 
