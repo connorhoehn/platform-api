@@ -140,3 +140,38 @@ describe('tables', () => {
     expect(outlineOf(doc).blocks.map((b) => b.kind)).toEqual(['heading', 'table', 'paragraph']);
   });
 });
+
+// Tiptap renders `h${levels.includes(level) ? level : levels[0]}`: a string
+// "2" in the Y.Doc fails includes() and every agent heading showed as h1.
+describe('heading levels are written as numbers', () => {
+  const headings = (doc: YT.Doc) => doc.getXmlFragment(CANVAS_BODY_KEY).toArray()
+    .filter((n): n is YT.XmlElement => n instanceof Y.XmlElement && n.nodeName === 'heading');
+
+  it('appendBlock / insertBlock write level 2 and 3 as numbers', () => {
+    const doc = seed();
+    applyOps(doc, [
+      { op: 'appendBlock', kind: 'heading', level: 2, text: 'Two' },
+      { op: 'insertBlock', index: 1, kind: 'heading', level: 3, text: 'Three' },
+    ]);
+    const [title, three, two] = headings(doc);
+    expect(title!.getAttribute('level')).toBe('1'); // the seed's own title, untouched
+    expect(three!.getAttribute('level')).toBe(3);
+    expect(two!.getAttribute('level')).toBe(2);
+    expect(outlineOf(doc).blocks.filter((b) => b.kind === 'heading').map((b) => b.level)).toEqual([1, 3, 2]);
+  });
+
+  it('a missing level is 2 (the h1 is the title); setTitle on an empty page writes 1', () => {
+    const doc = new Y.Doc();
+    applyOps(doc, [{ op: 'setTitle', text: 'T' }, { op: 'appendBlock', kind: 'heading', text: 'Body' }]);
+    expect(headings(doc).map((h) => h.getAttribute('level'))).toEqual([1, 2]);
+  });
+
+  it('parseOps reads a string level from the model ("2", "h3") and drops nonsense', () => {
+    const ops = parseOps(JSON.stringify({ ops: [
+      { op: 'appendBlock', kind: 'heading', level: '2', text: 'a' },
+      { op: 'appendBlock', kind: 'heading', level: 'h3', text: 'b' },
+      { op: 'appendBlock', kind: 'heading', level: 9, text: 'c' },
+    ] }));
+    expect(ops.map((o) => (o as { level?: number }).level)).toEqual([2, 3, undefined]);
+  });
+});

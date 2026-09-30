@@ -82,7 +82,7 @@ describe('applyOps in suggest mode', () => {
       'heading:Audit decide', 'heading:Context', 'paragraph:Staffing needs a second reader.', 'paragraph:',
       'paragraph:Thanks to the reviewers.', 'macro(decision):title: Ship it\nstatus: decided', 'macro(field):label: Owner\ntype: text',
     ]);
-    expect(b[1]!.getAttribute('level')).toBe('2');
+    expect(b[1]!.getAttribute('level')).toBe(2);
     const runs = runsOf(doc);
     expect(runs.map((r) => [r.block, r.markName, r.text])).toEqual([
       [1, SUGGESTION_INSERT_MARK, 'Context'],
@@ -350,5 +350,19 @@ describe('an empty page: everything a run writes is taken back by Reject', () =>
     expect(bareText(doc)).toEqual([]);
     applyOps(doc, [{ op: 'rejectSuggestion', key: KEY }], { origin: 'agent' });
     expect(blocks(doc)).toEqual([]);
+  });
+});
+
+describe('suggest mode heading levels are numbers', () => {
+  it('appendBlock / insertBlock level 2 and 3 land as numeric attrs', () => {
+    const doc = seed();
+    applyOps(doc, [
+      { op: 'appendBlock', kind: 'heading', level: 2, text: 'Two' },
+      { op: 'insertBlock', index: 1, kind: 'heading', level: 3, text: 'Three' },
+    ], { mode: 'suggest', identity: grace });
+    const hs = blocks(doc).filter((el) => el.nodeName === 'heading');
+    expect(hs.map((h) => [plain(h), h.getAttribute('level')])).toEqual([
+      ['Audit decide', '1'], ['Three', 3], ['Two', 2],
+    ]);
   });
 });

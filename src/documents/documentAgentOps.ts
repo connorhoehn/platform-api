@@ -275,12 +275,25 @@ export function normalizeTableRows(raw: unknown): string[][] | undefined {
   return rows.map((r) => [...r, ...Array.from({ length: width - r.length }, () => '')]);
 }
 
+/**
+ * The heading level as the editor stores it: a NUMBER 1–6. Tiptap's heading
+ * renders `h${levels.includes(level) ? level : levels[0]}`, so a string "2"
+ * (what a stringified write left in the Y.Doc) fails `includes` and every
+ * agent heading showed as h1. A missing or out-of-range level is 2 — the
+ * page's h1 is its title (setTitle), a body heading sits under it. (yjs types
+ * XmlElement attrs as strings by default; the value itself may be a number,
+ * which is what y-prosemirror writes for a heading typed in the editor.)
+ */
+export function headingLevel(level?: number): number {
+  return typeof level === 'number' && Number.isInteger(level) && level >= 1 && level <= 6 ? level : 2;
+}
+
 function makeBlock(kind: BlockKind, text: string, level?: number, rows?: string[][]): YT.XmlElement {
   if (kind === 'table') return makeTable(rows && rows.length > 0 ? rows : [['']]);
   if (kind === 'bulletList' || kind === 'orderedList') return makeList(kind, text);
   const el = new Y.XmlElement(kind);
   if (kind === 'horizontalRule') return el;
-  if (kind === 'heading') el.setAttribute('level', String(level && level >= 1 && level <= 6 ? level : 2));
+  if (kind === 'heading') (el as unknown as YT.XmlElement<{ level: number }>).setAttribute('level', headingLevel(level));
   const t = new Y.XmlText();
   t.insert(0, text);
   el.insert(0, [t]);
@@ -349,7 +362,9 @@ export function parseOps(text: string): DocOp[] {
     const blockText = kind === 'horizontalRule' || kind === 'table'
       ? ''
       : markerList && kind === markerList.kind ? markerList.text : text;
-    const level = typeof o.level === 'number' ? o.level : undefined;
+    // The model sometimes writes the level as a string ("2", "h2"); read the digit.
+    const rawLevel = typeof o.level === 'number' ? o.level : typeof o.level === 'string' ? Number(o.level.replace(/^h/i, '')) : NaN;
+    const level = Number.isInteger(rawLevel) && rawLevel >= 1 && rawLevel <= 6 ? rawLevel : undefined;
     const blockOk = kind === 'table' ? rows !== undefined : blockText !== undefined;
     switch (o.op) {
       case 'setTitle': if (text) ops.push({ op: 'setTitle', text }); break;
@@ -446,7 +461,7 @@ function primaryText(el: YT.XmlElement): YT.XmlText {
 /** An empty block of `kind`, to be filled by a suggested insertion once it is in the document. */
 function makeEmptyBlock(kind: 'paragraph' | 'heading' | 'macro', level?: number, macroName?: string): YT.XmlElement {
   const el = new Y.XmlElement(kind);
-  if (kind === 'heading') el.setAttribute('level', String(level && level >= 1 && level <= 6 ? level : 2));
+  if (kind === 'heading') (el as unknown as YT.XmlElement<{ level: number }>).setAttribute('level', headingLevel(level));
   if (kind === 'macro' && macroName) el.setAttribute('macroName', macroName);
   el.insert(0, [new Y.XmlText()]);
   return el;
