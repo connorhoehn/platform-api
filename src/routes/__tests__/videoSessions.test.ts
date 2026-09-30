@@ -120,7 +120,7 @@ function mockRes(): MockRes {
   return r;
 }
 
-interface RunOpts { body?: unknown; userId?: string; headers?: Record<string, string> }
+interface RunOpts { body?: unknown; userId?: string; headers?: Record<string, string>; user?: Record<string, unknown> }
 
 /** GET /api/video/sessions/by-lobby/:lobbyName */
 type ByLobbyBody = { lobbyName: string; live: boolean; channelArn: string | null };
@@ -146,7 +146,7 @@ async function run(
     headers: { 'content-type': 'application/json', ...(opts.headers || {}) },
     query,
     body: opts.body,
-    user: { sub: opts.userId ?? 'tester' },
+    user: opts.user ?? { sub: opts.userId ?? 'tester' },
     params: {},
     ip: '127.0.0.1',
   } as unknown as Request;
@@ -1981,5 +1981,30 @@ describe('LVS lifecycle calls with VIDEO_SERVICE_TOKEN (no user bearer reaches t
       .map(([, init]) => ((init as RequestInit).headers as Record<string, string>).Authorization);
     expect(lifecycle.length).toBe(3);
     expect(new Set(lifecycle)).toEqual(new Set([`Bearer ${SERVICE}`]));
+  });
+});
+
+// The call's partition (lib/partition.ts): a tenant-prefixed lobby the caller
+// may use — any tenant in its token's `tenants` — lives in that tenant.
+describe('POST /api/video/sessions — the session row carries the lobby partition', () => {
+  it('a social:dm lobby, for a token listing social, is stamped orgId social', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:social'));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'social:dm:bob:tester' },
+      headers: { authorization: 'Bearer user-jwt' },
+      user: { sub: 'tester', orgId: 'org-a', tenants: ['org-a', 'social'], authKind: 'orgiq-hs256' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateSession.mock.calls[0][0]).toMatchObject({ documentId: 'social:dm:bob:tester', orgId: 'social' });
+  });
+
+  it('a prefix the caller may not use never becomes the row org — the caller org stays', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:adhoc'));
+    await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'org-b:standup' },
+      headers: { authorization: 'Bearer user-jwt' },
+      user: { sub: 'tester', orgId: 'org-a' },
+    });
+    expect(mockCreateSession.mock.calls[0][0]).toMatchObject({ orgId: 'org-a' });
   });
 });

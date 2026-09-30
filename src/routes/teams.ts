@@ -23,6 +23,7 @@
  * path `/api/rooms/:slug/members` uses.
  */
 
+import { mayUsePartition, requestedPartition } from '../lib/partition';
 import { Router, Request, Response } from 'express';
 import {
   teamRepo,
@@ -56,9 +57,23 @@ const SLUG_RETRY_LIMIT = Number(process.env.TEAM_SLUG_RETRY_LIMIT ?? '5');
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Same posture as hangoutRooms.ts: dev falls back to the default org. */
+/**
+ * Same posture as hangoutRooms.ts: the team partition (the teams' `orgId`) is
+ * the one the request names (`?tenant=` / body `tenant`, lib/partition.ts)
+ * when the caller may use it — any tenant in its token's `tenants` claim,
+ * else its own org — or the caller's org when it names none; dev falls back
+ * to the default org. A named partition the caller may not use is refused as
+ * a team outside its org is today: 404 on a team route (`loadTeam` never
+ * finds it), 403 `TeamAccessDeniedError` on create/list.
+ */
 function resolveOrgId(req: Request): string {
-  const user = req.user as unknown as { sub: string; orgId?: string } | undefined;
+  const user = req.user as unknown as { sub: string; orgId?: string; tenants?: string[] } | undefined;
+  const named = requestedPartition(req);
+  if (named) {
+    if (mayUsePartition(user, named)) return named;
+    const teamId = req.params?.teamId;
+    throw teamId ? new TeamNotFoundError(teamId) : new TeamAccessDeniedError(named);
+  }
   if (user?.orgId) return user.orgId;
   if (process.env.SKIP_AUTH === 'true') return DEFAULT_ORG_ID;
   throw new ValidationError('orgId is required (missing from auth context)');

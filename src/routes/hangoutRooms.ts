@@ -23,6 +23,7 @@
  * the persistent-metadata layer on top.
  */
 
+import { mayUsePartition, requestedPartition } from '../lib/partition';
 import { Router, Request, Response } from 'express';
 import {
   hangoutRoomRepo,
@@ -138,15 +139,34 @@ function isRoomOwnerOrAdmin(room: HangoutRoom, userId: string): boolean {
 }
 
 /**
- * Resolve the orgId for the caller. In dev (SKIP_AUTH=true) defaults to
- * 'default-org' when the JWT doesn't carry one — keeps local-dev frictionless
- * without compromising prod isolation.
+ * Resolve the room partition (the rooms' `orgId`) for the request. A request
+ * may name one (`?tenant=` / body `tenant`, lib/partition.ts): allowed when
+ * the caller may use it — any tenant in its token's `tenants` claim, else its
+ * own org — and refused with the same 403 a room outside the caller's org
+ * gets from `assertCanAccess`. Naming none keeps the caller's org. In dev
+ * (SKIP_AUTH=true) defaults to 'default-org' when the JWT doesn't carry one —
+ * keeps local-dev frictionless without compromising prod isolation.
  */
 function resolveOrgId(req: Request): string {
-  const user = req.user as unknown as { sub: string; orgId?: string } | undefined;
+  const user = req.user as unknown as { sub: string; orgId?: string; tenants?: string[] } | undefined;
+  const named = requestedPartition(req);
+  if (named) {
+    if (!mayUsePartition(user, named)) throw new RoomAccessDeniedError(req.params?.slug ?? named);
+    return named;
+  }
   if (user?.orgId) return user.orgId;
   if (process.env.SKIP_AUTH === 'true') return DEFAULT_ORG_ID;
   throw new ValidationError('orgId is required (missing from auth context)');
+}
+
+/**
+ * The call lobby for a room. An OrgIQ caller's lobbies are always
+ * tenant-prefixed (lib/lobbyAccess.ts refuses an unprefixed one), so its room
+ * call is `<partition>:room:<slug>` — the partition keeps two tenants' rooms
+ * with one slug in separate calls. Every other caller keeps `room:<slug>`.
+ */
+function roomLobbyName(req: Request, orgId: string, slug: string): string {
+  return req.user?.authKind === 'orgiq-hs256' ? `${orgId}:room:${slug}` : `room:${slug}`;
 }
 
 function getUserId(req: Request): string {
@@ -645,7 +665,7 @@ hangoutRoomsRouter.post(
     const room = await loadActiveRoom(orgId, slug);
     await assertCanAccess(room, userId, orgId);
 
-    const lobbyName = `room:${slug}`;
+    const lobbyName = roomLobbyName(req, orgId, slug);
 
     // Per-tab key, forwarded to the video join so this bridge and the call
     // widget that follows it are recognised as the SAME client.
@@ -739,7 +759,7 @@ hangoutRoomsRouter.post(
     const room = await loadActiveRoom(orgId, slug);
     await assertCanAccess(room, userId, orgId);
 
-    const lobbyName = `room:${slug}`;
+    const lobbyName = roomLobbyName(req, orgId, slug);
     const end = await callSelf(req, `/api/video/sessions/${encodeURIComponent(body.sessionId)}/end`, {
       method: 'POST',
       body: {

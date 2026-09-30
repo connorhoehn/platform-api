@@ -98,7 +98,7 @@ function mockRes(): MockRes {
   return r;
 }
 
-interface RunOpts { body?: unknown; userId?: string }
+interface RunOpts { body?: unknown; userId?: string; user?: Record<string, unknown> }
 
 async function run(
   app: express.Express,
@@ -121,7 +121,7 @@ async function run(
     headers: { 'content-type': 'application/json' },
     query,
     body: opts.body,
-    user: { sub: opts.userId ?? 'tester' },
+    user: opts.user ?? { sub: opts.userId ?? 'tester' },
     params: {},
     ip: '127.0.0.1',
   } as unknown as Request;
@@ -640,5 +640,74 @@ describe('GET /api/rooms/:slug/members', () => {
     mockListMembers.mockResolvedValue([]);
     const res = await run(buildApp(), 'GET', '/api/rooms/team-standup/members', { userId: 'stranger' });
     expect(res.statusCode).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Partitions: the realtime token's `tenants` claim (lib/partition.ts)
+// ---------------------------------------------------------------------------
+
+describe('room partitions — any tenant in the token, not only org', () => {
+  const social = { sub: 'u-vera', orgId: 'org-a', tenants: ['org-a', 'social'], authKind: 'orgiq-hs256' };
+  const orgOnly = { sub: 'u-vera', orgId: 'org-a', authKind: 'orgiq-hs256' };
+  const realFetch = globalThis.fetch;
+  let calls: Array<{ url: string; body: Record<string, unknown> }>;
+
+  beforeEach(() => {
+    delete process.env.SKIP_AUTH;
+    calls = [];
+    (globalThis as unknown as { fetch: unknown }).fetch = jest.fn(async (url: string, init: RequestInit) => {
+      calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body as string) : {} });
+      const payload = String(url).includes('/join') ? { token: 'jwt', participantId: 'p-1' } : { sessionId: 'vs-1' };
+      return { status: 200, text: async () => JSON.stringify(payload) } as unknown as globalThis.Response;
+    });
+  });
+  afterEach(() => { (globalThis as unknown as { fetch: unknown }).fetch = realFetch; });
+
+  it('creates a room in a listed tenant (orgId social)', async () => {
+    const res = await run(buildApp(), 'POST', '/api/rooms', { user: social, body: { name: 'Lounge', tenant: 'social' } });
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateRoom).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'social' }));
+  });
+
+  it('joins a room whose orgId is social, on a social-prefixed lobby', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ orgId: 'social', slug: 'lounge' }));
+    const res = await run(buildApp(), 'POST', '/api/rooms/lounge/join?tenant=social', { user: social, body: {} });
+    expect(res.statusCode).toBe(200);
+    expect(mockGetRoomBySlug).toHaveBeenCalledWith('social', 'lounge');
+    expect(calls[0]!.body).toMatchObject({ lobbyName: 'social:room:lounge' });
+  });
+
+  it('refuses a tenant the token does not list (org-b) with the room 403', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ orgId: 'org-b', slug: 'lounge' }));
+    const join = await run(buildApp(), 'POST', '/api/rooms/lounge/join?tenant=org-b', { user: social, body: {} });
+    expect(join.statusCode).toBe(403);
+    expect(mockGetRoomBySlug).not.toHaveBeenCalled();
+    const create = await run(buildApp(), 'POST', '/api/rooms', { user: social, body: { name: 'X', tenant: 'org-b' } });
+    expect(create.statusCode).toBe(403);
+    expect(mockCreateRoom).not.toHaveBeenCalled();
+  });
+
+  it('a token without tenants keeps org-only: its org yes, social no', async () => {
+    const own = await run(buildApp(), 'POST', '/api/rooms', { user: orgOnly, body: { name: 'Mine', tenant: 'org-a' } });
+    expect(own.statusCode).toBe(201);
+    expect(mockCreateRoom).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org-a' }));
+    const other = await run(buildApp(), 'GET', '/api/rooms/lounge?tenant=social', { user: orgOnly });
+    expect(other.statusCode).toBe(403);
+  });
+
+  it('naming no partition keeps the caller org, as before', async () => {
+    const res = await run(buildApp(), 'POST', '/api/rooms', { user: social, body: { name: 'Plain' } });
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateRoom).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org-a' }));
+    // A room outside the caller's org still gets assertCanAccess's 403.
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ orgId: 'org-b', slug: 'lounge' }));
+    expect((await run(buildApp(), 'GET', '/api/rooms/lounge', { user: social })).statusCode).toBe(403);
+  });
+
+  it('a Cognito caller keeps the unprefixed room lobby', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ orgId: 'org-a', slug: 'lounge' }));
+    await run(buildApp(), 'POST', '/api/rooms/lounge/join', { user: { sub: 'tester', orgId: 'org-a' }, body: {} });
+    expect(calls[0]!.body).toMatchObject({ lobbyName: 'room:lounge' });
   });
 });

@@ -25,13 +25,16 @@
 // a lobby only under the caller's own `<org>:` prefix, and an `<org>:dm:<ids>`
 // lobby only for one of those ids. The same rule here:
 //   caller holds an OrgIQ realtime token (`authKind: 'orgiq-hs256'`)
-//                   → exactly `lobbyGuard`: the lobby must be `<org>:<rest>`
-//                     for the token's `org`; `<org>:dm:<ids>` for a listed id
-//                     only; anything else under the prefix is open to the
-//                     tenant. No unprefixed lobby (dm:, room:, a document id).
+//                   → exactly `lobbyGuard`: the lobby must be `<tenant>:<rest>`
+//                     for a tenant the caller may use — any one in the
+//                     token's `tenants` claim, or its `org` when the token
+//                     carries no `tenants` (lib/partition.ts);
+//                     `<tenant>:dm:<ids>` for a listed id only; anything else
+//                     under the prefix is open to the tenant. No unprefixed
+//                     lobby (dm:, room:, a document id).
 //   any other caller naming a `<tenant>:dm:<ids>` lobby
-//                   → a listed id AND the caller's own org is `<tenant>`;
-//                     a tenant DM is never an open ad-hoc lobby.
+//                   → a listed id AND the caller may use `<tenant>` (its own
+//                     org); a tenant DM is never an open ad-hoc lobby.
 //
 // A refusal is 404: confirming that a DM or private room has a call is itself
 // a disclosure.
@@ -39,6 +42,7 @@
 import type { Request } from 'express';
 import { NotFoundError } from '../middleware/error-handler';
 import { dmLobbyParticipants } from './authorize';
+import { mayUsePartition } from './partition';
 
 export interface LobbyAccessDeps {
   roomBySlug(orgId: string, slug: string): Promise<{ roomId: string; orgId: string; visibility?: string; createdBy?: string } | null>;
@@ -73,18 +77,20 @@ function dmIds(rest: string): string[] | null {
 
 /**
  * The middleware gateway's `lobbyGuard`, verbatim in effect: only lobbies
- * under the caller's own `<org>:` prefix; `<org>:dm:<ids>` only for one of
- * the ids; anything else under the prefix is open to the tenant.
+ * under a `<tenant>:` prefix the caller may use (any tenant in the token's
+ * `tenants`, else its `org`); `<tenant>:dm:<ids>` only for one of the ids;
+ * anything else under the prefix is open to the tenant.
  */
-export function orgiqLobbyGuard(user: { sub?: string; orgId?: string } | undefined, lobbyName: string): boolean {
-  const org = user?.orgId ?? '';
+export function orgiqLobbyGuard(
+  user: { sub?: string; orgId?: string; tenants?: string[] } | undefined,
+  lobbyName: string,
+): boolean {
   const userId = user?.sub ?? '';
-  if (!org || !userId) return false;
-  const prefix = `${org}:`;
-  if (!lobbyName.startsWith(prefix)) return false;
-  const rest = lobbyName.slice(prefix.length);
-  if (!rest) return false;
-  const ids = dmIds(rest);
+  if (!userId) return false;
+  const tenanted = tenantLobby(lobbyName);
+  if (!tenanted || !tenanted.rest) return false;
+  if (!mayUsePartition(user, tenanted.tenant)) return false;
+  const ids = dmIds(tenanted.rest);
   return ids ? ids.includes(userId) : true;
 }
 
@@ -99,7 +105,7 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
     if (req.user?.authKind === 'orgiq-hs256') return orgiqLobbyGuard(req.user, lobbyName);
     const tenanted = tenantLobby(lobbyName);
     const tenantDm = tenanted ? dmIds(tenanted.rest) : null;
-    if (tenanted && tenantDm) return tenantDm.includes(userId) && req.user?.orgId === tenanted.tenant;
+    if (tenanted && tenantDm) return tenantDm.includes(userId) && mayUsePartition(req.user, tenanted.tenant);
     const dm = dmLobbyParticipants(lobbyName);
     if (dm) return dm.includes(userId);
     if (lobbyName.startsWith('dm:')) return false; // a malformed DM name admits no one

@@ -114,7 +114,7 @@ function mockRes(): MockRes {
   return r;
 }
 
-interface RunOpts { body?: unknown; userId?: string }
+interface RunOpts { body?: unknown; userId?: string; user?: Record<string, unknown> }
 
 async function run(
   app: express.Express,
@@ -137,7 +137,7 @@ async function run(
     headers: { 'content-type': 'application/json' },
     query,
     body: opts.body,
-    user: { sub: opts.userId ?? 'dev-eve' },
+    user: opts.user ?? { sub: opts.userId ?? 'dev-eve' },
     params: {},
     ip: '127.0.0.1',
   } as unknown as Request;
@@ -555,5 +555,45 @@ describe('channelSlug', () => {
     expect(channelSlug('design', 'General')).toBe('design-general');
     expect(channelSlug('sales', 'General')).toBe('sales-general');
     expect(channelSlug('design', 'Weekly Standup!')).toBe('design-weekly-standup');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Partitions: the realtime token's `tenants` claim (lib/partition.ts)
+// ---------------------------------------------------------------------------
+
+describe('team partitions — any tenant in the token, not only org', () => {
+  const social = { sub: 'dev-eve', orgId: 'org-a', tenants: ['org-a', 'social'], authKind: 'orgiq-hs256' };
+  const orgOnly = { sub: 'dev-eve', orgId: 'org-a', authKind: 'orgiq-hs256' };
+
+  it('creates and reads a team in a listed tenant', async () => {
+    const created = await run(buildApp(), 'POST', '/api/teams', { user: social, body: { name: 'Book club', tenant: 'social' } });
+    expect(created.statusCode).toBe(201);
+    expect(mockCreateTeam).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'social' }));
+    mockListTeamsForUser.mockResolvedValue([]);
+    const listed = await run(buildApp(), 'GET', '/api/teams?tenant=social', { user: social });
+    expect(listed.statusCode).toBe(200);
+    expect(mockListTeamsForUser).toHaveBeenCalledWith('social', 'dev-eve');
+  });
+
+  it('refuses a tenant the token does not list: 404 on a team, 403 on create', async () => {
+    const team = await run(buildApp(), 'GET', '/api/teams/t-1?tenant=org-b', { user: social });
+    expect(team.statusCode).toBe(404);
+    expect(mockGetTeam).not.toHaveBeenCalled();
+    const created = await run(buildApp(), 'POST', '/api/teams', { user: social, body: { name: 'X', tenant: 'org-b' } });
+    expect(created.statusCode).toBe(403);
+    expect(mockCreateTeam).not.toHaveBeenCalled();
+  });
+
+  it('a token without tenants keeps org-only', async () => {
+    const own = await run(buildApp(), 'POST', '/api/teams', { user: orgOnly, body: { name: 'Mine', tenant: 'org-a' } });
+    expect(own.statusCode).toBe(201);
+    const other = await run(buildApp(), 'POST', '/api/teams', { user: orgOnly, body: { name: 'X', tenant: 'social' } });
+    expect(other.statusCode).toBe(403);
+  });
+
+  it('naming no partition keeps the caller org', async () => {
+    await run(buildApp(), 'POST', '/api/teams', { user: social, body: { name: 'Plain' } });
+    expect(mockCreateTeam).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org-a' }));
   });
 });

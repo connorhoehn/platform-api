@@ -5,6 +5,8 @@ declare namespace Express {
       sub: string;
       email?: string;
       orgId?: string;
+      /** An OrgIQ realtime token's `tenants` claim: every partition the caller may use (lib/partition.ts). */
+      tenants?: string[];
       /** From an OrgIQ realtime token only (lib/orgiqRealtimeToken.ts). */
       displayName?: string;
       /** Set when the principal came from an OrgIQ realtime token; absent for Cognito/dev. */

@@ -83,4 +83,35 @@ describe('lobbyAccess', () => {
       expect(await a.canUseLobby(req('anyone'), 'room:open')).toBe(true);
     });
   });
+
+  describe('the tenants claim partitions lobbies (any listed tenant, not only org)', () => {
+    const tok = (sub: string, over: Record<string, unknown> = {}) =>
+      ({ user: { sub, orgId: 'org-a', authKind: 'orgiq-hs256', ...over }, headers: {} }) as unknown as Request;
+    const social = (sub: string) => tok(sub, { tenants: ['org-a', 'social'] });
+    it('a token listing social may use a social:dm lobby it is in, and any social lobby', async () => {
+      const a = access();
+      expect(await a.canUseLobby(social('u-vera'), 'social:dm:u-nora:u-vera')).toBe(true);
+      expect(await a.canUseLobby(social('u-theo'), 'social:dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(social('u-vera'), 'social:room:lounge')).toBe(true);
+      expect(await a.canUseLobby(social('u-vera'), 'org-a:dm:u-nora:u-vera')).toBe(true);
+    });
+    it('refuses a tenant the token does not list (org-b), with the same 404', async () => {
+      const a = access();
+      expect(await a.canUseLobby(social('u-vera'), 'org-b:dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(social('u-vera'), 'org-b:room:lounge')).toBe(false);
+      await expect(a.assertLobbyAccess(social('u-vera'), 'org-b:dm:u-nora:u-vera')).rejects.toMatchObject({ status: 404 });
+    });
+    it('a token without tenants keeps org-only', async () => {
+      const a = access();
+      expect(await a.canUseLobby(tok('u-vera'), 'org-a:dm:u-nora:u-vera')).toBe(true);
+      expect(await a.canUseLobby(tok('u-vera'), 'social:dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(tok('u-vera', { tenants: [] }), 'social:room:x')).toBe(false);
+    });
+    it('a lobby with no partition keeps today\'s rule (unprefixed: refused to a token; open ad-hoc to others)', async () => {
+      const a = access();
+      expect(await a.canUseLobby(social('u-vera'), 'global-hangout')).toBe(false);
+      expect(await a.canUseLobby(social('u-vera'), 'dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(req('eve'), 'global-hangout')).toBe(true);
+    });
+  });
 });

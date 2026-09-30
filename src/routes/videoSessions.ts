@@ -53,6 +53,7 @@ import {
 import { isRecordingProfile } from '@connorhoehn/event-catalog';
 import { tenantOf } from '../lib/tenant';
 import { lobbyAccess, tenantLobby } from '../lib/lobbyAccess';
+import { mayUsePartition } from '../lib/partition';
 import { lvsSessionAuthHeader } from '../lib/lvsServiceAuth';
 import {
   parseCreateFields,
@@ -244,7 +245,11 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     const lobbyName = resolveLobbyName(body) ?? randomUUID();
     const findOrCreate = body.findOrCreate === true;
     const userId = req.user!.sub;
-    const organizationId = req.user!.orgId;
+    // The call's partition: a tenant-prefixed lobby (`social:dm:…`) lives in
+    // its tenant when the caller may use it (lib/partition.ts), else the
+    // caller's own org, as before.
+    const lobbyTenant = tenantLobby(lobbyName)?.tenant;
+    const organizationId = lobbyTenant && mayUsePartition(req.user, lobbyTenant) ? lobbyTenant : req.user!.orgId;
     // NFR #175: only someone who may use this lobby opens (or finds) its call.
     await lobbyAccess().assertLobbyAccess(req, lobbyName);
     // In-document calls: `kind: 'document-review'` + title / documentIds /

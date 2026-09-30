@@ -31,6 +31,12 @@ export interface OrgiqPrincipal {
   email?: string;
   /** The token's `org` — the OrgIQ tenant the user is acting in. */
   orgId: string;
+  /**
+   * The token's `tenants` — every partition the user may act in (`org` plus,
+   * e.g., `social`). Absent when the token carries none; then `org` alone
+   * partitions (lib/partition.ts).
+   */
+  tenants?: string[];
   displayName?: string;
   authKind: typeof ORGIQ_TOKEN_KIND;
 }
@@ -75,10 +81,14 @@ export function verifyOrgiqToken(token: string): OrgiqPrincipal {
   if (payload.tokenKind !== ORGIQ_TOKEN_KIND) throw new Error('not an orgiq realtime token');
   if (typeof payload.sub !== 'string' || !payload.sub) throw new Error('token has no subject');
   if (typeof payload.org !== 'string' || !payload.org.trim()) throw new Error('token has no org');
+  const tenants = Array.isArray(payload.tenants)
+    ? [...new Set((payload.tenants as unknown[]).filter((t): t is string => typeof t === 'string').map((t) => t.trim()).filter(Boolean))]
+    : [];
   return {
     sub: payload.sub,
     ...(typeof payload.email === 'string' && payload.email ? { email: payload.email } : {}),
     orgId: payload.org.trim(),
+    ...(tenants.length > 0 ? { tenants } : {}),
     ...(typeof payload.displayName === 'string' && payload.displayName ? { displayName: payload.displayName } : {}),
     authKind: ORGIQ_TOKEN_KIND,
   };

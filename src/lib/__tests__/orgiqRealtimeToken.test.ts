@@ -29,8 +29,13 @@ afterAll(() => { process.env = saved; });
 describe('verifyOrgiqToken', () => {
   it('maps sub / email / org / displayName onto the principal', () => {
     expect(verifyOrgiqToken(mint())).toEqual({
-      sub: 'u-vera', email: 'vera@example.com', orgId: 'orgiq', displayName: 'Vera Green', authKind: 'orgiq-hs256',
+      sub: 'u-vera', email: 'vera@example.com', orgId: 'orgiq', tenants: ['orgiq'], displayName: 'Vera Green', authKind: 'orgiq-hs256',
     });
+  });
+  it('carries the tenants claim (strings only, trimmed, deduped); none → no tenants', () => {
+    expect(verifyOrgiqToken(mint({ tenants: ['org-a', ' social ', 'org-a', 7, ''] })).tenants).toEqual(['org-a', 'social']);
+    expect(verifyOrgiqToken(mint({ tenants: undefined }))).not.toHaveProperty('tenants');
+    expect(verifyOrgiqToken(mint({ tenants: 'social' }))).not.toHaveProperty('tenants');
   });
   it.each([
     ['a wrong secret', () => mint({}, {}, 'forged')],
