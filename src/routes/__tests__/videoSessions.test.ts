@@ -20,6 +20,7 @@ const mockFindActiveByLobbyName = jest.fn().mockResolvedValue(null);
 const mockRemoveParticipant = jest.fn();
 const mockRemoveParticipantByUserId = jest.fn();
 const mockListActiveCandidates = jest.fn().mockResolvedValue([]);
+const mockAddGuests = jest.fn();
 const mockFindByChannelArn = jest.fn().mockResolvedValue([{ documentId: 'room:standup' }]);
 // Profiles decide whether a DM records: both parties must have recordCalls on.
 const mockGetProfile = jest.fn().mockResolvedValue(null);
@@ -65,6 +66,7 @@ jest.mock('../../repositories', () => ({
     removeParticipantByUserId: (...args: unknown[]) => mockRemoveParticipantByUserId(...args),
     listActiveCandidates: (...args: unknown[]) => mockListActiveCandidates(...args),
     findByChannelArn: (...args: unknown[]) => mockFindByChannelArn(...args),
+    addGuests: (...args: unknown[]) => mockAddGuests(...args),
   },
   profileRepo: {
     getProfile: (...args: unknown[]) => mockGetProfile(...args),
@@ -1674,6 +1676,49 @@ describe('POST /api/video/sessions/:sessionId/refresh-token', () => {
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(502);
+  });
+});
+
+// join-knock: someone allowed on a private lobby brings a third person into
+// its live call — the grant lib/lobbyAccess.ts honours while the call lasts.
+describe('POST /api/video/sessions/guests', () => {
+  beforeEach(() => {
+    mockAddGuests.mockReset().mockImplementation(async (_l: string, _s: string, ids: string[]) => ({ sessionId: 'vs-1', guests: ids }));
+    mockCanUseLobby.mockReset().mockImplementation(async () => true);
+  });
+
+  it('adds the guests to the lobby\'s ACTIVE session and answers them', async () => {
+    mockFindActiveByLobbyName.mockResolvedValue({ documentId: 'dm:carol:hank', sessionId: 'vs-1', status: 'active' });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/guests', {
+      userId: 'carol', body: { lobbyName: 'dm:carol:hank', userIds: ['bob', 'bob', 7] },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(mockAddGuests).toHaveBeenCalledWith('dm:carol:hank', 'vs-1', ['bob']);
+    expect(res.body).toEqual({ sessionId: 'vs-1', guests: ['bob'] });
+  });
+
+  it('refuses a caller who is not allowed on the lobby (404) and writes nothing', async () => {
+    mockCanUseLobby.mockImplementation(async () => false);
+    mockFindActiveByLobbyName.mockResolvedValue({ documentId: 'dm:carol:hank', sessionId: 'vs-1', status: 'active' });
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/guests', {
+      userId: 'eve', body: { lobbyName: 'dm:carol:hank', userIds: ['eve'] },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(mockAddGuests).not.toHaveBeenCalled();
+  });
+
+  it('404 when the lobby has no call in progress — there is nothing to be let into', async () => {
+    mockFindActiveByLobbyName.mockResolvedValue(null);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/guests', {
+      userId: 'carol', body: { lobbyName: 'dm:carol:hank', userIds: ['bob'] },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(mockAddGuests).not.toHaveBeenCalled();
+  });
+
+  it('400 without a lobby or without user ids', async () => {
+    expect((await run(buildApp(), 'POST', '/api/video/sessions/guests', { body: { userIds: ['bob'] } })).statusCode).toBe(400);
+    expect((await run(buildApp(), 'POST', '/api/video/sessions/guests', { body: { lobbyName: 'dm:a:b', userIds: [] } })).statusCode).toBe(400);
   });
 });
 

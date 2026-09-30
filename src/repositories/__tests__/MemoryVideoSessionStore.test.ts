@@ -189,3 +189,14 @@ describe('MemoryVideoSessionStore — TTL expiry on read', () => {
     expect(await store.findActiveByLobbyName('lobby-1')).toBeNull();
   });
 });
+
+describe('MemoryVideoSessionStore.addGuests (join-knock)', () => {
+  it('adds guests as a set and returns the row; unknown session → null', async () => {
+    const store = new MemoryVideoSessionStore();
+    await store.createSession(makeSession());
+    expect((await store.addGuests('lobby-1', 'sess-1', ['bob', 'bob']))?.guests).toEqual(['bob']);
+    expect((await store.addGuests('lobby-1', 'sess-1', ['bob', 'dave']))?.guests).toEqual(['bob', 'dave']);
+    expect((await store.getSession('lobby-1', 'sess-1'))?.guests).toEqual(['bob', 'dave']);
+    expect(await store.addGuests('lobby-1', 'nope', ['bob'])).toBeNull();
+  });
+});

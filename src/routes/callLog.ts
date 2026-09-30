@@ -4,6 +4,7 @@ import express, { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler, ForbiddenError, NotFoundError, ValidationError } from '../middleware/error-handler';
+import { lobbyAccess } from '../lib/lobbyAccess';
 import { dmLobbyParticipants } from '../lib/authorize';
 import { callLogRepo, voicemailRepo } from '../repositories';
 import { VOICEMAIL_MAX_BYTES, VOICEMAIL_MAX_DURATION_MS } from '../repositories/VoicemailRepository';
@@ -53,9 +54,14 @@ callLogRouter.post('/log/events', requireAuth, asyncHandler(async (req: Request,
   // so the reporter must be one of the parties — the caller or a target — and,
   // for a DM lobby, one of the two people it names. Anyone else could forge
   // calls into strangers' logs.
+  // A guest of the DM's live call (a third person let in or invited —
+  // lib/lobbyAccess.ts) is one of its parties too, or the ring and the join
+  // they report are refused and their history never shows the call.
   const reporter = req.user!.sub;
   const dm = typeof event.lobbyName === 'string' ? dmLobbyParticipants(event.lobbyName) : null;
-  if ((event.callerId !== reporter && !event.targetUserIds.includes(reporter)) || (dm && !dm.includes(reporter))) {
+  const dmParty = !dm || dm.includes(reporter)
+    || (await lobbyAccess().canUseLobby(req, event.lobbyName as string).catch(() => false));
+  if ((event.callerId !== reporter && !event.targetUserIds.includes(reporter)) || !dmParty) {
     throw new ForbiddenError('You can only report calls you are part of');
   }
   const rows = await callLogRepo.applyEvent(event);

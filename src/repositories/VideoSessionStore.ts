@@ -135,6 +135,13 @@ export interface VideoSessionRecord {
   media?: 'video' | 'audio';
   hostUserId?: string;
   /**
+   * People a party of the call brought in who are not otherwise allowed on
+   * the lobby (a third person in a DM's call: an admitted knock, a mid-call
+   * invite). Allowed on the lobby while THIS session is active — see
+   * lib/lobbyAccess.ts. Absent = none.
+   */
+  guests?: string[];
+  /**
    * Epoch seconds. DynamoDB TTL attribute. When unset, records do not
    * auto-expire. `endSession` sets this automatically to endedAt + grace
    * window (default 7 days). The in-memory store filters expired records
@@ -197,6 +204,11 @@ export interface VideoSessionStore {
     userId: string,
   ): Promise<{ remaining: number } | null>;
   getSession(documentId: string, sessionId: string): Promise<VideoSessionRecord | null>;
+  /**
+   * Add `userIds` to the session's guests (a set: ids already there are not
+   * repeated). Returns the row after the write, or null when it does not exist.
+   */
+  addGuests(documentId: string, sessionId: string, userIds: string[]): Promise<VideoSessionRecord | null>;
   /**
    * Change a document call's title and/or review list. Only the named fields
    * are written. Returns the row as it is after the write, or null when the

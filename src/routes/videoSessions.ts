@@ -516,6 +516,34 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
   }
 }));
 
+// POST /api/video/sessions/guests — bring a third person into a private call.
+// Body { lobbyName, userIds }. A DM's call admits the people its name lists;
+// someone already allowed on the lobby may add more — admitting a knock, or
+// inviting from the call's People control — and they are allowed on the lobby
+// while its ACTIVE session lasts (lib/lobbyAccess.ts, "Guests"). The caller
+// must be allowed on the lobby (404 otherwise, as every route here), and the
+// lobby must have an active call (404: there is nothing to be let into).
+// Idempotent. Answers { sessionId, guests }.
+const MAX_GUESTS_PER_REQUEST = 20;
+videoSessionsRouter.post('/sessions/guests', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const lobbyName = resolveLobbyName(body);
+  if (!lobbyName) throw new ValidationError('lobbyName is required');
+  const raw = body.userIds;
+  const userIds = Array.isArray(raw)
+    ? [...new Set(raw.filter((u): u is string => typeof u === 'string' && u.length > 0 && u.length <= 256))]
+    : [];
+  if (userIds.length === 0) throw new ValidationError('userIds must be a non-empty array of user ids');
+  if (userIds.length > MAX_GUESTS_PER_REQUEST) throw new ValidationError(`at most ${MAX_GUESTS_PER_REQUEST} userIds`);
+  await lobbyAccess().assertLobbyAccess(req, lobbyName);
+  const live = await videoSessionRepo.findActiveByLobbyName(lobbyName);
+  if (!live) throw new NotFoundError('No call in progress');
+  const updated = await videoSessionRepo.addGuests(lobbyName, live.sessionId, userIds);
+  if (!updated) throw new NotFoundError('No call in progress');
+  log.info({ lobbyName, sessionId: live.sessionId, by: req.user!.sub, guests: userIds }, '[videoSessions] guests added');
+  res.status(200).json({ sessionId: live.sessionId, guests: updated.guests ?? [] });
+}));
+
 // POST /api/video/sessions/:sessionId/join — thin proxy → LVS
 // POST /api/sessions/:arn/join. LVS mints the participant token (with
 // Wave-5 `sub` + `mid` claims) and registers the participant in its

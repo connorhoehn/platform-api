@@ -896,6 +896,50 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }
 
+  /video/sessions/guests:
+    post:
+      tags: [video-sessions]
+      summary: Bring a third person into a private call (admit a knock, or a mid-call invite)
+      description: |
+        A DM's call admits the people its lobby name lists. Someone already
+        allowed on the lobby may add guests: they are allowed on the lobby
+        (open/join its session, its recording state, reactions, captions)
+        while the lobby's ACTIVE session lasts. The grant dies with the call.
+        404 when the caller is not allowed on the lobby or the lobby has no
+        call in progress. Idempotent.
+      operationId: addVideoSessionGuests
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lobbyName, userIds]
+              properties:
+                lobbyName: { type: string }
+                userIds:
+                  type: array
+                  maxItems: 20
+                  items: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessionId: { type: string }
+                  guests:
+                    type: array
+                    items: { type: string }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /video/sessions/{sessionId}/join:
     parameters:
       - $ref: '#/components/parameters/SessionIdPath'

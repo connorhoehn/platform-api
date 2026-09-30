@@ -22,6 +22,23 @@ describe('lobbyAccess', () => {
     expect(await a.canUseLobby(req('eve'), 'dm:alice:bob')).toBe(false);
     expect(await a.canUseLobby(req('alice'), 'dm:alice')).toBe(false);
   });
+  it('join-knock: a guest of the lobby\'s live call is allowed on a dm:/dmg:/tenant dm lobby; nobody else is', async () => {
+    const guests: Record<string, string[]> = { 'dm:alice:bob': ['carol'], 'dmg:abc': ['carol'], 'org-1:dm:alice:bob': ['carol'] };
+    const a = access({ isLobbyGuest: async (lobby, userId) => (guests[lobby] ?? []).includes(userId) });
+    expect(await a.canUseLobby(req('carol'), 'dm:alice:bob')).toBe(true);
+    expect(await a.canUseLobby(req('eve'), 'dm:alice:bob')).toBe(false);
+    expect(await a.canUseLobby(req('carol'), 'dm:alice:dave')).toBe(false);
+    expect(await a.canUseLobby(req('carol'), 'dmg:abc')).toBe(true);
+    expect(await a.canUseLobby(req('carol'), 'org-1:dm:alice:bob')).toBe(true);
+    // A guest still needs the tenant.
+    expect(await a.canUseLobby(req('carol', 'org-2'), 'org-1:dm:alice:bob')).toBe(false);
+    // A malformed DM name admits no one, guest or not.
+    expect(await a.canUseLobby(req('carol'), 'dm:alice')).toBe(false);
+  });
+  it('join-knock: a guest lookup that fails is not a grant', async () => {
+    const a = access({ isLobbyGuest: async () => { throw new Error('ddb down'); } });
+    expect(await a.canUseLobby(req('carol'), 'dm:alice:bob')).toBe(false);
+  });
   it('dmg: a member of the group DM channel', async () => {
     const a = access();
     expect(await a.canUseLobby(req('member'), 'dmg:abc')).toBe(true);

@@ -131,6 +131,17 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
     return rec ? (JSON.parse(JSON.stringify(rec)) as VideoSessionRecord) : null;
   }
 
+  async addGuests(
+    documentId: string,
+    sessionId: string,
+    userIds: string[],
+  ): Promise<VideoSessionRecord | null> {
+    const rec = this.readOrExpire(makeKey(documentId, sessionId));
+    if (!rec) return null;
+    rec.guests = [...new Set([...(rec.guests ?? []), ...userIds])];
+    return JSON.parse(JSON.stringify(rec)) as VideoSessionRecord;
+  }
+
   async updateDocumentCallFields(
     documentId: string,
     sessionId: string,

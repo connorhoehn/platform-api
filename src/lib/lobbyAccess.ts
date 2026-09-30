@@ -9,9 +9,18 @@
 // The rules are the ones the rest of the platform already applies to the same
 // names (no new ACL model):
 //   dm:<a>:<b>[…]   the people the name lists (`dmLobbyParticipants`, as
-//                   `recording:listByLobby`)
+//                   `recording:listByLobby`) — or a GUEST of the lobby's live
+//                   call (below)
 //   dmg:<hash>      a member of the group DM's chat channel `chat:dmg:<hash>`
-//                   (`isChannelMember`, NFR #151)
+//                   (`isChannelMember`, NFR #151) — or a guest of its live call
+//
+// Guests (join-knock, 2026-09-30). A DM's call is private, but it is not
+// closed: someone already allowed on it may bring a third person in — by
+// admitting their knock or by inviting them from the call's People control.
+// That person is recorded as a guest on the lobby's ACTIVE session
+// (`POST /api/video/sessions/guests`, which only a person allowed on the lobby
+// may call) and is allowed on the lobby while that session is active. The
+// grant dies with the call: a new call on the same DM has no guests.
 //   room:<slug>     hangoutRooms' `assertCanAccess`: same org, and the room is
 //                   org-visible, or the caller created it or is a member
 //   <tenant>:room:<slug>
@@ -63,6 +72,11 @@ export interface LobbyAccessDeps {
   documentExists(documentId: string): Promise<boolean>;
   /** Throws (401/404) unless the caller may read the document. */
   assertCanReadDocument(req: Request, documentId: string): Promise<void>;
+  /**
+   * Whether `userId` is a guest of the lobby's active call — someone a person
+   * allowed on it admitted or invited. Absent → nobody is a guest.
+   */
+  isLobbyGuest?(lobbyName: string, userId: string): Promise<boolean>;
 }
 
 /**
@@ -140,6 +154,11 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
     return verdict;
   }
 
+  /** A guest of the lobby's live call (see the header). Failure = not a guest. */
+  function isGuest(lobbyName: string, userId: string): Promise<boolean> {
+    return deps.isLobbyGuest ? deps.isLobbyGuest(lobbyName, userId).catch(() => false) : Promise.resolve(false);
+  }
+
   /** The room slug of a `room:<slug>` rest, or null. */
   function roomSlug(rest: string): string | null {
     return rest.startsWith('room:') && rest.length > 'room:'.length ? rest.slice('room:'.length) : null;
@@ -161,7 +180,10 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
     }
 
     const tenantDm = tenanted ? dmIds(tenanted.rest) : null;
-    if (tenanted && tenantDm) return tenantDm.includes(userId) && mayUsePartition(req.user, tenanted.tenant);
+    if (tenanted && tenantDm) {
+      if (!mayUsePartition(req.user, tenanted.tenant)) return false;
+      return tenantDm.includes(userId) || (tenantDm.length > 0 && isGuest(lobbyName, userId));
+    }
     if (tenanted && tenantRoom) {
       const v = await roomVerdict(req, tenanted.tenant, tenantRoom, userId);
       if (v !== 'none') {
@@ -171,9 +193,11 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
       // No such room: today's rule (an ad-hoc lobby) below.
     }
     const dm = dmLobbyParticipants(lobbyName);
-    if (dm) return dm.includes(userId);
+    if (dm) return dm.includes(userId) || isGuest(lobbyName, userId);
     if (lobbyName.startsWith('dm:')) return false; // a malformed DM name admits no one
-    if (lobbyName.startsWith('dmg:')) return deps.isChannelMember(`chat:${lobbyName}`, userId).catch(() => false);
+    if (lobbyName.startsWith('dmg:')) {
+      return (await deps.isChannelMember(`chat:${lobbyName}`, userId).catch(() => false)) || isGuest(lobbyName, userId);
+    }
     if (lobbyName.startsWith('room:')) {
       const slug = lobbyName.slice('room:'.length);
       const v = await roomVerdict(req, lookupOrg(req), slug, userId);
@@ -220,6 +244,10 @@ export function lobbyAccess(): ReturnType<typeof makeLobbyAccess> {
     isChannelMember,
     documentExists: async (id) => (await documentReadGate().ownerOf(id)) !== undefined,
     assertCanReadDocument: async (req, id) => { await documentReadGate().assertCanRead(req, id); },
+    isLobbyGuest: async (lobbyName, userId) => {
+      const live = await repos.videoSessionRepo.findActiveByLobbyName(lobbyName);
+      return !!live?.guests?.includes(userId);
+    },
   });
   return defaultAccess;
 }

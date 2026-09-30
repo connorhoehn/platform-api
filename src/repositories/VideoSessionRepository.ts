@@ -107,6 +107,23 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
     return this.getItem<VideoSessionRecord>({ documentId, sessionId });
   }
 
+  async addGuests(
+    documentId: string,
+    sessionId: string,
+    userIds: string[],
+  ): Promise<VideoSessionRecord | null> {
+    const existing = await this.getSession(documentId, sessionId);
+    if (!existing) return null;
+    const guests = [...new Set([...(existing.guests ?? []), ...userIds])];
+    if (guests.length === (existing.guests ?? []).length) return existing;
+    await this.updateItem({
+      Key: { documentId, sessionId },
+      UpdateExpression: 'SET guests = :guests',
+      ExpressionAttributeValues: { ':guests': guests },
+    });
+    return { ...existing, guests };
+  }
+
   async updateDocumentCallFields(
     documentId: string,
     sessionId: string,

@@ -18,6 +18,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 
 const mockApplyEvent = jest.fn();
 const mockListForUser = jest.fn();
+const mockFindActiveByLobbyName = jest.fn();
 
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (req: Request, _res: Response, next: NextFunction) => {
@@ -34,6 +35,8 @@ jest.mock('../../repositories', () => ({
     markSeen: jest.fn(),
   },
   voicemailRepo: { save: jest.fn(), listForUser: jest.fn(), get: jest.fn(), markListened: jest.fn() },
+  // lib/lobbyAccess's guest rule reads the lobby's active session.
+  videoSessionRepo: { findActiveByLobbyName: (...a: unknown[]) => mockFindActiveByLobbyName(...a) },
 }));
 
 import { callLogRouter } from '../callLog';
@@ -160,6 +163,21 @@ describe('POST /api/calls/log/events', () => {
     });
     expect(res.statusCode).toBe(403);
     expect(mockApplyEvent).not.toHaveBeenCalled();
+  });
+
+  it('join-knock: a guest of the DM\'s live call (let in or invited) reports the ring like a party', async () => {
+    mockFindActiveByLobbyName.mockImplementation(async (lobby: string) =>
+      (lobby === 'dm:ana:bob' ? { sessionId: 's-1', status: 'active', guests: ['eve'] } : null));
+    const res = await post(buildApp(), '/api/calls/log/events', {
+      callId: 'call-6b', action: 'missed', callerId: 'ana', targetUserIds: ['eve'], lobbyName: 'dm:ana:bob',
+    });
+    expect(res.statusCode).toBe(200);
+    // The grant is the live call's: none on the lobby → 403 as before.
+    mockFindActiveByLobbyName.mockResolvedValue(null);
+    const refused = await post(buildApp(), '/api/calls/log/events', {
+      callId: 'call-6c', action: 'missed', callerId: 'ana', targetUserIds: ['eve'], lobbyName: 'dm:ana:bob',
+    });
+    expect(refused.statusCode).toBe(403);
   });
 
   it('NFR #175: a target reporting the ring is accepted', async () => {
