@@ -268,3 +268,87 @@ describe('a table as a suggestion', () => {
     expect(blocks(rejected).some((b) => b.nodeName === 'table')).toBe(false);
   });
 });
+
+// The live bug: a DM `/doc make sure to add your basic recipe style` against an
+// EMPTY page. The run's plan (captured from run c844cc8e) wrote a title, a
+// divider, two headings and two bullet lists; the lists and the divider went in
+// bare, so Reject took the headings back and left every bullet in the page.
+describe('an empty page: everything a run writes is taken back by Reject', () => {
+  const recipeRun = parseOps(JSON.stringify([
+    { op: 'setTitle', text: 'Basic Recipe Style Guide' },
+    { op: 'insertBlock', index: 1, kind: 'horizontalRule', text: '' },
+    { op: 'appendBlock', kind: 'heading', level: 2, text: 'Recipe Format' },
+    { op: 'appendBlock', kind: 'bulletList', text: 'Ingredients (with quantities and units)\nInstructions (numbered steps)' },
+    { op: 'appendBlock', kind: 'heading', level: 2, text: 'Writing Style' },
+    { op: 'appendBlock', kind: 'orderedList', text: 'Use imperative voice\nNumber steps clearly' },
+  ]));
+  const empty = () => { const d = new Y.Doc(); d.getXmlFragment(CANVAS_BODY_KEY); return d; };
+  const allTexts = (el: YT.XmlElement): YT.XmlText[] => el.toArray().flatMap((c) => (c instanceof Y.XmlText ? [c] : c instanceof Y.XmlElement ? allTexts(c) : []));
+  const bareText = (doc: YT.Doc) => blocks(doc).flatMap(allTexts).flatMap((t) => (t.toDelta() as Array<{ insert: unknown; attributes?: Record<string, unknown> }>)
+    .filter((d) => typeof d.insert === 'string' && !Object.keys(d.attributes ?? {}).some((k) => k.startsWith(SUGGESTION_INSERT_MARK)))
+    .map((d) => d.insert as string));
+
+  it('lists are written as marked insertions, every item, and a divider is not written at all', () => {
+    const doc = empty();
+    const r = suggest(doc, recipeRun);
+    expect(r).toEqual({ applied: 5, skipped: 1, title: 'Basic Recipe Style Guide', suggestionKey: KEY });
+    expect(blocks(doc).map((b) => b.nodeName)).toEqual(['heading', 'heading', 'bulletList', 'heading', 'orderedList']);
+    // Nothing in the body is unmarked text.
+    expect(bareText(doc)).toEqual([]);
+    const list = blocks(doc)[2]!;
+    expect(list.toArray().map((li) => (li as YT.XmlElement).nodeName)).toEqual(['listItem', 'listItem']);
+    expect(allTexts(list).flatMap((t) => readSuggestions(t)).map((x) => [x.markName, x.text])).toEqual([
+      [SUGGESTION_INSERT_MARK, 'Ingredients (with quantities and units)'],
+      [SUGGESTION_INSERT_MARK, 'Instructions (numbered steps)'],
+    ]);
+  });
+
+  it('rejectSuggestion leaves the page as empty as it was', () => {
+    const doc = empty();
+    suggest(doc, recipeRun);
+    applyOps(doc, [{ op: 'rejectSuggestion', key: KEY }], { origin: 'agent' });
+    expect(blocks(doc)).toEqual([]);
+  });
+
+  it('acceptSuggestion keeps it all, unmarked', () => {
+    const doc = empty();
+    suggest(doc, recipeRun);
+    applyOps(doc, [{ op: 'acceptSuggestion', key: KEY }], { origin: 'agent' });
+    expect(blocks(doc).map((b) => [b.nodeName, allTexts(b).map((t) => t.toString().replace(/<[^>]+>/g, '')).join('|')])).toEqual([
+      ['heading', 'Basic Recipe Style Guide'],
+      ['heading', 'Recipe Format'],
+      ['bulletList', 'Ingredients (with quantities and units)|Instructions (numbered steps)'],
+      ['heading', 'Writing Style'],
+      ['orderedList', 'Use imperative voice|Number steps clearly'],
+    ]);
+    expect(blocks(doc).flatMap(allTexts).flatMap((t) => readSuggestions(t))).toEqual([]);
+  });
+
+  it('a replace into an EMPTY block is a replace: Reject keeps the block, Accept fills it, no anchor survives', () => {
+    const doc = seed(); // block 2 is an empty paragraph
+    suggest(doc, [{ op: 'replaceBlock', index: 2, text: 'Filled in.' }]);
+    expect(runsOf(doc).map((x) => [x.block, x.markName, x.text])).toEqual([
+      [2, SUGGESTION_DELETE_MARK, ZERO_WIDTH_SPACE],
+      [2, SUGGESTION_INSERT_MARK, 'Filled in.'],
+    ]);
+    const rejected = Y.encodeStateAsUpdate(doc);
+    applyOps(doc, [{ op: 'rejectSuggestion', key: KEY }], { origin: 'agent' });
+    expect(blocks(doc).map(plain)).toEqual(['Audit decide', 'Staffing needs a second reader.', '']);
+    const again = new Y.Doc(); Y.applyUpdate(again, rejected);
+    applyOps(again, [{ op: 'acceptSuggestion', key: KEY }], { origin: 'agent' });
+    expect(blocks(again).map(plain)).toEqual(['Audit decide', 'Staffing needs a second reader.', 'Filled in.']);
+  });
+
+  it('copyBlock of a list is a marked list; of a divider, a skip', () => {
+    const doc = empty();
+    const r = applyOps(doc, [{ op: 'copyBlock', index: 0 }, { op: 'copyBlock', index: 1 }], {
+      mode: 'suggest', identity: grace,
+      sourceBlocks: [{ index: 0, kind: 'bulletList', text: 'a\nb' }, { index: 1, kind: 'horizontalRule', text: '' }],
+    });
+    expect(r).toMatchObject({ applied: 1, skipped: 1 });
+    expect(blocks(doc).map((b) => b.nodeName)).toEqual(['bulletList']);
+    expect(bareText(doc)).toEqual([]);
+    applyOps(doc, [{ op: 'rejectSuggestion', key: KEY }], { origin: 'agent' });
+    expect(blocks(doc)).toEqual([]);
+  });
+});

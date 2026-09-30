@@ -456,12 +456,63 @@ function makeEmptyBlock(kind: 'paragraph' | 'heading' | 'macro', level?: number,
 function suggestNewBlock(body: YT.XmlFragment, at: number, kind: 'paragraph' | 'heading' | 'macro', text: string, id: SuggestionIdentity, level?: number, macroName?: string): void {
   const el = makeEmptyBlock(kind, level, macroName);
   body.insert(at, [el]);
-  suggestInsertText(primaryText(el), 0, text, id);
+  // An empty proposed block still needs a mark, or it lands bare and outlives a Reject.
+  suggestInsertText(primaryText(el), 0, text || CELL_ANCHOR, id);
 }
 
-/** Suggest replacing a block's text: the last text run is rewritten, any others are delete-marked. */
+/**
+ * A list proposed as a suggestion: every item's text is insert-marked under the
+ * one key, the way `suggestNewTable` marks every cell. Before this a list went
+ * in through `makeBlock` — bare content in suggest mode — so rejecting a run
+ * that wrote bullets left the bullets in the page (an empty page asked for "a
+ * basic recipe style" kept all eight items after Reject). Rejecting empties
+ * every item and the list goes with them; the editor's reject removes the
+ * wholly inserted blocks the same way.
+ */
+function suggestNewList(body: YT.XmlFragment, at: number, kind: 'bulletList' | 'orderedList', text: string, id: SuggestionIdentity): void {
+  const items = text.split(/\r?\n/).map((l) => stripListMarker(l.trim())).filter((l) => l.length > 0);
+  // One empty item per line, filled once the list is in the document (a
+  // preliminary Yjs type cannot carry a formatted insert).
+  const skeleton = new Y.XmlElement(kind);
+  skeleton.insert(0, (items.length > 0 ? items : ['']).map(() => {
+    const li = new Y.XmlElement('listItem');
+    const para = new Y.XmlElement('paragraph');
+    para.insert(0, [new Y.XmlText()]);
+    li.insert(0, [para]);
+    return li;
+  }));
+  body.insert(at, [skeleton]);
+  const texts = textsOf(skeleton);
+  (items.length > 0 ? items : [CELL_ANCHOR]).forEach((item, i) => { const t = texts[i]; if (t) suggestInsertText(t, 0, item, id); });
+}
+
+/**
+ * A new block of any kind the agent may write, as a suggestion. Every kind that
+ * lands must land MARKED — a bare block is one Reject cannot take back. A
+ * divider has no text to carry a mark, so in suggest mode it is not written at
+ * all (false: the caller counts a skip) rather than written for good.
+ */
+function suggestNewKind(body: YT.XmlFragment, at: number, op: { kind: BlockKind; text: string; level?: number; rows?: string[][] }, id: SuggestionIdentity): boolean {
+  switch (op.kind) {
+    case 'table': suggestNewTable(body, at, op.rows ?? [['']], id); return true;
+    case 'bulletList': case 'orderedList': suggestNewList(body, at, op.kind, op.text, id); return true;
+    case 'paragraph': case 'heading': suggestNewBlock(body, at, op.kind, op.text, id, op.level); return true;
+    case 'horizontalRule': return false;
+  }
+}
+
+/**
+ * Suggest replacing a block's text: the last text run is rewritten, any others are delete-marked.
+ *
+ * A block with NO text (an empty title, an empty paragraph) gets a delete-marked
+ * zero-width anchor first, so the suggestion is a replace and not a wholly
+ * inserted block: rejecting it must leave the block where it was, and a block
+ * whose every run is an insertion is one the reject removes (here in
+ * `resolveSuggestion`, and in the editor).
+ */
 function suggestBlockText(el: YT.XmlElement, text: string, id: SuggestionIdentity): void {
   const texts = textsOf(el);
+  if (texts.every((t) => t.length === 0)) suggestDeleteRange(primaryText(el), 0, 0, id);
   for (const t of texts.slice(0, -1)) if (t.length > 0) suggestDeleteRange(t, 0, t.length, id);
   suggestReplaceText(primaryText(el), text, id);
 }
@@ -593,10 +644,8 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
           break;
         }
         case 'appendBlock':
-          // A divider has no text to carry a suggestion mark, so it lands directly even in suggest mode.
-          if (id && op.kind === 'table') suggestNewTable(body, body.length, op.rows ?? [['']], id);
-          else if (id && (op.kind === 'paragraph' || op.kind === 'heading')) suggestNewBlock(body, body.length, op.kind, op.text, id, op.level);
-          else body.insert(body.length, [makeBlock(op.kind, op.text, op.level, op.rows)]);
+          if (id && !suggestNewKind(body, body.length, op, id)) { result.skipped += 1; break; }
+          if (!id) body.insert(body.length, [makeBlock(op.kind, op.text, op.level, op.rows)]);
           result.applied += 1;
           break;
         case 'appendMacro':
@@ -611,6 +660,8 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
           if (id) {
             if (src.kind === 'macro' && src.macroName) suggestNewBlock(body, body.length, 'macro', src.text, id, undefined, src.macroName);
             else if (src.kind === 'table') suggestNewTable(body, body.length, normalizeTableRows(src.text.split('\n').map((line) => line.split(' | '))) ?? [['']], id);
+            else if (src.kind === 'bulletList' || src.kind === 'orderedList') suggestNewList(body, body.length, src.kind, src.text, id);
+            else if (src.kind === 'horizontalRule') { result.skipped += 1; break; }
             else suggestNewBlock(body, body.length, src.kind === 'heading' ? 'heading' : 'paragraph', src.text, id, src.level);
           } else body.insert(body.length, [materialize(src)]);
           result.applied += 1;
@@ -629,9 +680,8 @@ export function applyOps(doc: YT.Doc, ops: DocOp[], originOrOptions: unknown = '
           // Position in the FRAGMENT, which may hold non-element nodes too.
           const at = el ? body.toArray().indexOf(el) : -1;
           const pos = at < 0 ? body.length : at;
-          if (id && op.kind === 'table') suggestNewTable(body, pos, op.rows ?? [['']], id);
-          else if (id && (op.kind === 'paragraph' || op.kind === 'heading')) suggestNewBlock(body, pos, op.kind, op.text, id, op.level);
-          else body.insert(pos, [makeBlock(op.kind, op.text, op.level, op.rows)]);
+          if (id && !suggestNewKind(body, pos, op, id)) { result.skipped += 1; break; }
+          if (!id) body.insert(pos, [makeBlock(op.kind, op.text, op.level, op.rows)]);
           result.applied += 1;
           break;
         }
