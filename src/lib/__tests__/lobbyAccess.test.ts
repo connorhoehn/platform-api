@@ -114,4 +114,53 @@ describe('lobbyAccess', () => {
       expect(await a.canUseLobby(req('eve'), 'global-hangout')).toBe(true);
     });
   });
+
+  describe('a private room admits members only (rooms route or video API)', () => {
+    const rooms: Record<string, { roomId: string; orgId: string; visibility: string; createdBy: string }> = {
+      'social|den': { roomId: 'r-den', orgId: 'social', visibility: 'private', createdBy: 'u-owner' },
+      'social|lounge': { roomId: 'r-lounge', orgId: 'social', visibility: 'org', createdBy: 'u-owner' },
+      'org-1|den': { roomId: 'r-den1', orgId: 'org-1', visibility: 'private', createdBy: 'owner' },
+    };
+    const roomBySlug = jest.fn(async (orgId: string, slug: string) => rooms[`${orgId}|${slug}`] ?? null);
+    const isRoomMember = jest.fn(async (roomId: string, userId: string) => userId === 'u-member' && roomId === 'r-den');
+    const a = () => access({ roomBySlug, isRoomMember });
+    const tok = (sub: string) => ({ user: { sub, orgId: 'org-a', tenants: ['org-a', 'social'], authKind: 'orgiq-hs256' }, headers: {} }) as unknown as Request;
+    beforeEach(() => { roomBySlug.mockClear(); isRoomMember.mockClear(); });
+
+    it('private room: a member and the creator are allowed', async () => {
+      expect(await a().canUseLobby(tok('u-member'), 'social:room:den')).toBe(true);
+      expect(await a().canUseLobby(tok('u-owner'), 'social:room:den')).toBe(true);
+    });
+    it('private room: a listed-tenant non-member is refused with the rooms route 403', async () => {
+      expect(await a().canUseLobby(tok('u-stranger'), 'social:room:den')).toBe(false);
+      await expect(a().assertLobbyAccess(tok('u-stranger'), 'social:room:den'))
+        .rejects.toMatchObject({ status: 403, message: 'Access denied to room: den' });
+    });
+    it('public room: any listed tenant is allowed', async () => {
+      expect(await a().canUseLobby(tok('u-stranger'), 'social:room:lounge')).toBe(true);
+    });
+    it('unknown room: today\'s behaviour (open under a listed tenant; refused outside it)', async () => {
+      expect(await a().canUseLobby(tok('u-stranger'), 'social:room:nowhere')).toBe(true);
+      expect(await a().canUseLobby(tok('u-stranger'), 'org-b:room:den')).toBe(false);
+      expect(roomBySlug).not.toHaveBeenCalledWith('org-b', 'den');
+    });
+    it('a Cognito caller: its own tenant\'s private room is members-only; another tenant\'s room is 404; unknown stays ad-hoc', async () => {
+      await expect(a().assertLobbyAccess(req('u-stranger', 'social'), 'social:room:den')).rejects.toMatchObject({ status: 403 });
+      expect(await a().canUseLobby(req('u-member', 'social'), 'social:room:den')).toBe(true);
+      await expect(a().assertLobbyAccess(req('u-member', 'org-1'), 'social:room:den')).rejects.toMatchObject({ status: 404 });
+      expect(await a().canUseLobby(req('u-stranger', 'org-1'), 'social:room:nowhere')).toBe(true);
+    });
+    it('room:<slug>: a non-member gets 403; an unknown room stays 404', async () => {
+      await expect(a().assertLobbyAccess(req('eve'), 'room:den')).rejects.toMatchObject({ status: 403 });
+      await expect(a().assertLobbyAccess(req('eve'), 'room:ghost')).rejects.toMatchObject({ status: 404 });
+    });
+    it('reads the room once per request', async () => {
+      const access1 = a();
+      const r = tok('u-stranger');
+      await access1.canUseLobby(r, 'social:room:den');
+      await access1.assertLobbyAccess(r, 'social:room:den').catch(() => undefined);
+      expect(roomBySlug).toHaveBeenCalledTimes(1);
+      expect(isRoomMember).toHaveBeenCalledTimes(1);
+    });
+  });
 });

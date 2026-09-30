@@ -27,11 +27,14 @@ const mockGetProfile = jest.fn().mockResolvedValue(null);
 // NFR #175: lobby access is its own unit (lib/__tests__/lobbyAccess.test.ts);
 // here it allows unless a test says otherwise.
 const mockCanUseLobby = jest.fn(async (..._a: unknown[]) => true);
+// A test may put the REAL lobby rule (makeLobbyAccess over stub rooms) here.
+let mockRealLobbyAccess: { assertLobbyAccess: (...a: never[]) => Promise<void> } | null = null;
 jest.mock('../../lib/lobbyAccess', () => ({
   tenantLobby: jest.requireActual('../../lib/lobbyAccess').tenantLobby,
   lobbyAccess: () => ({
     canUseLobby: (...a: unknown[]) => mockCanUseLobby(...a),
     assertLobbyAccess: async (...a: unknown[]) => {
+      if (mockRealLobbyAccess) return mockRealLobbyAccess.assertLobbyAccess(...(a as never[]));
       if (!(await mockCanUseLobby(...a))) {
         const { NotFoundError } = jest.requireActual('../../middleware/error-handler');
         throw new NotFoundError('Session not found');
@@ -2006,5 +2009,51 @@ describe('POST /api/video/sessions — the session row carries the lobby partiti
       user: { sub: 'tester', orgId: 'org-a' },
     });
     expect(mockCreateSession.mock.calls[0][0]).toMatchObject({ orgId: 'org-a' });
+  });
+});
+
+// A private room admits members only, whether the call is reached through the
+// rooms route or straight at the video API: the real lobby rule, here.
+describe('POST /api/video/sessions — a private room lobby admits members only', () => {
+  const tok = (sub: string) => ({ sub, orgId: 'org-a', tenants: ['org-a', 'social'], authKind: 'orgiq-hs256' });
+  beforeEach(() => {
+    const { makeLobbyAccess } = jest.requireActual('../../lib/lobbyAccess') as typeof import('../../lib/lobbyAccess');
+    mockRealLobbyAccess = makeLobbyAccess({
+      roomBySlug: async (orgId, slug) => (orgId === 'social' && slug === 'den'
+        ? { roomId: 'r-den', orgId: 'social', visibility: 'private', createdBy: 'u-owner' }
+        : orgId === 'social' && slug === 'lounge' ? { roomId: 'r-lounge', orgId: 'social', visibility: 'org' } : null),
+      isRoomMember: async (roomId, userId) => roomId === 'r-den' && userId === 'u-member',
+      isChannelMember: async () => false,
+      documentExists: async () => false,
+      assertCanReadDocument: async () => undefined,
+    }) as never;
+  });
+  afterEach(() => { mockRealLobbyAccess = null; });
+
+  it('a listed-tenant non-member is refused 403 before any LVS call', async () => {
+    const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'social:room:den', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+      user: tok('u-stranger'),
+    });
+    expect(res.statusCode).toBe(403);
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockCreateSession).not.toHaveBeenCalled();
+  });
+
+  it('a member opens the call; a public room opens for any listed tenant', async () => {
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:den'));
+    const member = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'social:room:den', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+      user: tok('u-member'),
+    });
+    expect(member.statusCode).toBe(201);
+    const open = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'social:room:lounge', findOrCreate: true },
+      headers: { authorization: 'Bearer user-jwt' },
+      user: tok('u-stranger'),
+    });
+    expect(open.statusCode).toBe(201);
   });
 });

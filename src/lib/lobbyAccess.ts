@@ -14,6 +14,14 @@
 //                   (`isChannelMember`, NFR #151)
 //   room:<slug>     hangoutRooms' `assertCanAccess`: same org, and the room is
 //                   org-visible, or the caller created it or is a member
+//   <tenant>:room:<slug>
+//                   the room `<slug>` in partition `<tenant>` (a tenant the
+//                   caller may use): public → any caller of the tenant;
+//                   private → its creator and members only. No such room →
+//                   the lobby's rule as before. A private room's non-member
+//                   is refused with the rooms route's 403
+//                   (`RoomAccessDeniedError`), through the rooms route or the
+//                   video API alike.
 //   doc:<id> / <id> when a document by that id exists: #135 `document:read`
 //   anything else   an ad-hoc lobby with no owner (the global hangout, a
 //                   random-UUID call) — open to any logged-in user, as before
@@ -29,18 +37,21 @@
 //                     for a tenant the caller may use — any one in the
 //                     token's `tenants` claim, or its `org` when the token
 //                     carries no `tenants` (lib/partition.ts);
-//                     `<tenant>:dm:<ids>` for a listed id only; anything else
-//                     under the prefix is open to the tenant. No unprefixed
+//                     `<tenant>:dm:<ids>` for a listed id only;
+//                     `<tenant>:room:<slug>` by the room rule above; anything
+//                     else under the prefix is open to the tenant. No unprefixed
 //                     lobby (dm:, room:, a document id).
 //   any other caller naming a `<tenant>:dm:<ids>` lobby
 //                   → a listed id AND the caller may use `<tenant>` (its own
 //                     org); a tenant DM is never an open ad-hoc lobby.
 //
-// A refusal is 404: confirming that a DM or private room has a call is itself
-// a disclosure.
+// A refusal is 404: confirming that a DM has a call is itself a disclosure.
+// The one exception is a private room's non-member, who gets the 403 the
+// rooms route already gives them for that room (nothing new is disclosed).
 
 import type { Request } from 'express';
-import { NotFoundError } from '../middleware/error-handler';
+import { AppError, NotFoundError } from '../middleware/error-handler';
+import { RoomAccessDeniedError } from '../repositories/HangoutRoomRepository';
 import { dmLobbyParticipants } from './authorize';
 import { mayUsePartition } from './partition';
 
@@ -53,6 +64,13 @@ export interface LobbyAccessDeps {
   /** Throws (401/404) unless the caller may read the document. */
   assertCanReadDocument(req: Request, documentId: string): Promise<void>;
 }
+
+/**
+ * A room lobby's standing for this caller: no such room in the partition,
+ * open to the caller (public, or it is the creator / a member), or private
+ * to others.
+ */
+type RoomVerdict = 'none' | 'open' | 'private';
 
 /** The first segments that are lobby KINDS, never a tenant. */
 const LOBBY_KINDS = new Set(['dm', 'dmg', 'room', 'doc']);
@@ -99,23 +117,68 @@ function lookupOrg(req: Request): string {
 }
 
 export function makeLobbyAccess(deps: LobbyAccessDeps) {
-  async function canUseLobby(req: Request, lobbyName: string): Promise<boolean> {
+  /**
+   * One room lookup per (request, partition, slug): a route that checks the
+   * same lobby twice (assert, then a list filter) reads the room once.
+   */
+  const roomCache = new WeakMap<Request, Map<string, Promise<RoomVerdict>>>();
+
+  function roomVerdict(req: Request, partition: string, slug: string, userId: string): Promise<RoomVerdict> {
+    let perReq = roomCache.get(req);
+    if (!perReq) { perReq = new Map(); roomCache.set(req, perReq); }
+    const key = `${partition}|${slug}`;
+    let verdict = perReq.get(key);
+    if (!verdict) {
+      verdict = (async (): Promise<RoomVerdict> => {
+        const room = partition ? await deps.roomBySlug(partition, slug).catch(() => null) : null;
+        if (!room || room.orgId !== partition) return 'none';
+        if (room.visibility === 'org' || room.createdBy === userId) return 'open';
+        return (await deps.isRoomMember(room.roomId, userId).catch(() => false)) ? 'open' : 'private';
+      })();
+      perReq.set(key, verdict);
+    }
+    return verdict;
+  }
+
+  /** The room slug of a `room:<slug>` rest, or null. */
+  function roomSlug(rest: string): string | null {
+    return rest.startsWith('room:') && rest.length > 'room:'.length ? rest.slice('room:'.length) : null;
+  }
+
+  /** true = allowed; false = refused (404); an AppError = refused with that error. */
+  async function decide(req: Request, lobbyName: string): Promise<boolean | AppError> {
     const userId = req.user?.sub ?? '';
     if (!userId || !lobbyName) return false;
-    if (req.user?.authKind === 'orgiq-hs256') return orgiqLobbyGuard(req.user, lobbyName);
     const tenanted = tenantLobby(lobbyName);
+    const tenantRoom = tenanted ? roomSlug(tenanted.rest) : null;
+
+    if (req.user?.authKind === 'orgiq-hs256') {
+      if (!orgiqLobbyGuard(req.user, lobbyName)) return false;
+      if (!tenanted || !tenantRoom) return true;
+      // A tenant grant opens the tenant's public rooms, not its private ones.
+      const v = await roomVerdict(req, tenanted.tenant, tenantRoom, userId);
+      return v === 'private' ? new RoomAccessDeniedError(tenantRoom) : true;
+    }
+
     const tenantDm = tenanted ? dmIds(tenanted.rest) : null;
     if (tenanted && tenantDm) return tenantDm.includes(userId) && mayUsePartition(req.user, tenanted.tenant);
+    if (tenanted && tenantRoom) {
+      const v = await roomVerdict(req, tenanted.tenant, tenantRoom, userId);
+      if (v !== 'none') {
+        if (!mayUsePartition(req.user, tenanted.tenant)) return false;
+        return v === 'private' ? new RoomAccessDeniedError(tenantRoom) : true;
+      }
+      // No such room: today's rule (an ad-hoc lobby) below.
+    }
     const dm = dmLobbyParticipants(lobbyName);
     if (dm) return dm.includes(userId);
     if (lobbyName.startsWith('dm:')) return false; // a malformed DM name admits no one
     if (lobbyName.startsWith('dmg:')) return deps.isChannelMember(`chat:${lobbyName}`, userId).catch(() => false);
     if (lobbyName.startsWith('room:')) {
-      const orgId = lookupOrg(req);
-      const room = await deps.roomBySlug(orgId, lobbyName.slice('room:'.length)).catch(() => null);
-      if (!room || room.orgId !== orgId) return false;
-      if (room.visibility === 'org' || room.createdBy === userId) return true;
-      return deps.isRoomMember(room.roomId, userId).catch(() => false);
+      const slug = lobbyName.slice('room:'.length);
+      const v = await roomVerdict(req, lookupOrg(req), slug, userId);
+      if (v === 'none') return false;
+      return v === 'private' ? new RoomAccessDeniedError(slug) : true;
     }
     const documentId = lobbyName.startsWith('doc:') ? lobbyName.slice('doc:'.length) : lobbyName;
     if (await deps.documentExists(documentId).catch(() => false)) {
@@ -125,10 +188,18 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
   }
 
   return {
-    canUseLobby,
-    /** Throws 404 unless the caller may use the lobby. */
+    async canUseLobby(req: Request, lobbyName: string): Promise<boolean> {
+      return (await decide(req, lobbyName)) === true;
+    },
+    /**
+     * Throws unless the caller may use the lobby: 404 in general; a private
+     * room's non-member gets the rooms route's own 403 (`RoomAccessDeniedError`).
+     */
     async assertLobbyAccess(req: Request, lobbyName: string): Promise<void> {
-      if (!(await canUseLobby(req, lobbyName))) throw new NotFoundError('Session not found');
+      const verdict = await decide(req, lobbyName);
+      if (verdict === true) return;
+      if (verdict instanceof AppError) throw verdict;
+      throw new NotFoundError('Session not found');
     },
   };
 }
