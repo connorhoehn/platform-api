@@ -27,7 +27,8 @@
 // POST /api/admin/agent-documents/repair).
 
 import { createHash } from 'node:crypto';
-import { QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { GetCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { DOCUMENTS_TABLE } from '../deck/presentationDocuments';
 import { docClient } from '../lib/aws-clients';
 import log from '../lib/logger';
 import type { PipelineRunItem } from '../repositories/PipelineRunRepository';
@@ -171,7 +172,12 @@ export async function repairRunDocuments(
     documents.push({ documentId: doc.documentId, title: doc.title, created: false, document: out.document, card: out.card.outcome });
   }
   for (const doc of plan.missing) {
-    if (!apply) { documents.push({ documentId: doc.documentId, title: doc.title, created: true, document: 'missing', card: 'dry-run' }); continue; }
+    if (!apply) {
+      // A dry run still says whether an earlier repair already made the page.
+      const found = await (deps.documents ?? (docClient as unknown as { send: Send })).send(new GetCommand({ TableName: DOCUMENTS_TABLE, Key: { documentId: doc.documentId } })) as { Item?: unknown };
+      documents.push({ documentId: doc.documentId, title: doc.title, created: !found?.Item, document: found?.Item ? 'already' : 'missing', card: 'dry-run' });
+      continue;
+    }
     let created = false;
     const members = deps.members ?? ((channel: string, requester: string) => conversationMembers(channel, requester));
     const editors = await members(plan.channel, plan.requester.userId);
