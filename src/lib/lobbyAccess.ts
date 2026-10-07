@@ -54,6 +54,16 @@
 //                   → a listed id AND the caller may use `<tenant>` (its own
 //                     org); a tenant DM is never an open ad-hoc lobby.
 //
+// Per-resource authority (LOBBY_AUTHORITY_REQUIRED, 2026-10-06). The prefix
+// rule above cannot know whether the caller may use THAT initiative, team,
+// run or private channel. With LOBBY_AUTHORITY_REQUIRED=true an OrgIQ token's
+// lobby must ALSO be admitted by the OrgIQ BFF, asked per request
+// (lib/lobbyAuthority.ts; the caller's own bearer, POST LOBBY_AUTHORITY_URL).
+// Any failure refuses. While on, a lobby under one of the BFF's own tenant
+// prefixes (LOBBY_AUTHORITY_TENANTS, default orgiq/assessment/social/
+// pipelines) is refused to every non-OrgIQ caller. Off (default) = the prefix
+// rule alone, as before.
+//
 // A refusal is 404: confirming that a DM has a call is itself a disclosure.
 // The one exception is a private room's non-member, who gets the 403 the
 // rooms route already gives them for that room (nothing new is disclosed).
@@ -63,6 +73,7 @@ import { AppError, NotFoundError } from '../middleware/error-handler';
 import { RoomAccessDeniedError } from '../repositories/HangoutRoomRepository';
 import { dmLobbyParticipants } from './authorize';
 import { mayUsePartition } from './partition';
+import { askLobbyAuthority, lobbyAuthorityRequired, lobbyAuthorityTenants } from './lobbyAuthority';
 
 export interface LobbyAccessDeps {
   roomBySlug(orgId: string, slug: string): Promise<{ roomId: string; orgId: string; visibility?: string; createdBy?: string } | null>;
@@ -77,6 +88,17 @@ export interface LobbyAccessDeps {
    * allowed on it admitted or invited. Absent → nobody is a guest.
    */
   isLobbyGuest?(lobbyName: string, userId: string): Promise<boolean>;
+  /**
+   * The OrgIQ BFF's per-resource admission for an OrgIQ-token caller (see the
+   * header). Absent → no per-resource check (the prefix rule alone). Asked
+   * only after the prefix rule admits; a throw is a refusal.
+   */
+  orgiqLobbyAuthority?(req: Request, lobbyName: string): Promise<boolean>;
+  /**
+   * Is `<tenant>:` a partition only the OrgIQ BFF may admit to (see
+   * orgiqLobbyAuthority)? True → any other kind of caller is refused there.
+   */
+  governedTenant?(tenant: string): boolean;
 }
 
 /**
@@ -154,6 +176,20 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
     return verdict;
   }
 
+  /** One BFF question per (request, lobby): assert + list filter ask once. */
+  const authorityCache = new WeakMap<Request, Map<string, Promise<boolean>>>();
+  function orgiqAuthority(req: Request, lobbyName: string): Promise<boolean> {
+    if (!deps.orgiqLobbyAuthority) return Promise.resolve(true);
+    let perReq = authorityCache.get(req);
+    if (!perReq) { perReq = new Map(); authorityCache.set(req, perReq); }
+    let verdict = perReq.get(lobbyName);
+    if (!verdict) {
+      verdict = deps.orgiqLobbyAuthority(req, lobbyName).then((ok) => ok === true, () => false);
+      perReq.set(lobbyName, verdict);
+    }
+    return verdict;
+  }
+
   /** A guest of the lobby's live call (see the header). Failure = not a guest. */
   function isGuest(lobbyName: string, userId: string): Promise<boolean> {
     return deps.isLobbyGuest ? deps.isLobbyGuest(lobbyName, userId).catch(() => false) : Promise.resolve(false);
@@ -173,11 +209,18 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
 
     if (req.user?.authKind === 'orgiq-hs256') {
       if (!orgiqLobbyGuard(req.user, lobbyName)) return false;
+      if (!(await orgiqAuthority(req, lobbyName))) return false;
       if (!tenanted || !tenantRoom) return true;
       // A tenant grant opens the tenant's public rooms, not its private ones.
       const v = await roomVerdict(req, tenanted.tenant, tenantRoom, userId);
       return v === 'private' ? new RoomAccessDeniedError(tenantRoom) : true;
     }
+
+    // A lobby under a BFF-governed tenant prefix is reachable only through an
+    // OrgIQ token while the per-resource check is on: a Cognito or SKIP_AUTH
+    // dev bearer naming `orgiq:initiative:<id>` would otherwise fall through
+    // to the open ad-hoc rule below and skip the BFF entirely.
+    if (tenanted && deps.governedTenant?.(tenanted.tenant)) return false;
 
     const tenantDm = tenanted ? dmIds(tenanted.rest) : null;
     if (tenanted && tenantDm) {
@@ -248,6 +291,14 @@ export function lobbyAccess(): ReturnType<typeof makeLobbyAccess> {
       const live = await repos.videoSessionRepo.findActiveByLobbyName(lobbyName);
       return !!live?.guests?.includes(userId);
     },
+    // Read live, so the flag needs no restart-order games in tests; off →
+    // admitted here and the prefix rule alone decides (today's behaviour).
+    orgiqLobbyAuthority: async (req, lobbyName) => {
+      if (!lobbyAuthorityRequired()) return true;
+      const h = req.headers.authorization;
+      return askLobbyAuthority(h?.startsWith('Bearer ') ? h.slice(7) : '', lobbyName);
+    },
+    governedTenant: (tenant) => lobbyAuthorityRequired() && lobbyAuthorityTenants().includes(tenant),
   });
   return defaultAccess;
 }
