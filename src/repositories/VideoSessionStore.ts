@@ -60,6 +60,11 @@ export interface VideoSessionParticipant {
   joinedAt: string;
 }
 
+/** Authenticated attendance survives removal from the live ref-count roster. */
+export interface VideoSessionAttendance extends VideoSessionParticipant {
+  leftAt?: string;
+}
+
 /**
  * Does `incoming` represent the same client as `existing`, such that adding
  * `incoming` should REPLACE `existing` rather than append beside it?
@@ -105,6 +110,13 @@ export interface VideoSessionRecord {
   /** Verified tenant captured when the session was created. Optional for legacy rows. */
   orgId?: string;
   participants: VideoSessionParticipant[];
+  /**
+   * Exact SFU participantId → authenticated join identity, for THIS session.
+   * Live `participants` still drives leave/ref-counting; this history is what
+   * native recording finalization uses after everyone has left. It shares the
+   * session TTL and never derives user IDs from participantId strings.
+   */
+  participantHistory?: Record<string, VideoSessionAttendance>;
   transcriptStatus?: 'pending' | 'processing' | 'available' | 'failed';
   transcript?: string;
   aiSummary?: string;

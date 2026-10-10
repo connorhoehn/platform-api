@@ -786,6 +786,18 @@ describe('POST /api/video/sessions/:sessionId/join (thin proxy → LVS)', () => 
     });
   });
 
+  it('stores only the authenticated actor, ignoring a userId supplied in the join body', async () => {
+    mockGetSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValue(lvsJoinOk());
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
+      body: { documentId: 'doc-1', userId: 'unrelated-person', displayName: 'Nora' },
+      headers: { authorization: 'Bearer user-jwt' }, userId: 'u-nora',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(mockAddOrReplaceParticipant).toHaveBeenCalledWith('doc-1', 'vs-1', expect.objectContaining({ userId: 'u-nora', participantId: 'p-1' }));
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toMatchObject({ userId: 'u-nora' });
+  });
+
   it('returns 400 when documentId missing from body', async () => {
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/join', {
       body: {},

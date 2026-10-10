@@ -30,7 +30,7 @@ import { QueryCommand } from '@aws-sdk/client-dynamodb';
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { callRecordingRepo, videoSessionRepo, callReactionRepo, type CallRecordingParticipant } from '../repositories';
 import type { CallRecording, ComposeStatus } from '../repositories/CallRecordingRepository';
-import { deriveMediaDurationMs, reconcileParticipants, type TruthTrack } from '../lib/recording-truth';
+import { deriveMediaDurationMs, reconcileParticipants, recordingSessionParticipants, sessionOverlapsRecording, type TruthTrack } from '../lib/recording-truth';
 import { mergeReactionsIntoTranscript } from '../lib/transcript-reactions';
 import { callSfu } from '../lib/sfu-breaker';
 import { getRedisClient } from '../lib/redis-client';
@@ -311,6 +311,18 @@ function resolveHandler(): DescribedStepHandler {
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const arn = str(ctx.arn); const recordingId = str(ctx.recordingId);
       if (!arn || !recordingId) return fail('arn and recordingId are required');
+      const detail = (ctx.detail ?? {}) as Record<string, unknown>;
+      const window = { startedAt: str(detail.startedAt) ?? str(ctx.startedAt), endedAt: str(detail.endedAt) ?? str(ctx.endedAt),
+        tracks: Array.isArray(detail.tracks) ? detail.tracks as TruthTrack[] : [] };
+      const hasRecordedIdentities = window.tracks.some(track => track.participantId || track.userId);
+      const matchesRecording = (candidate: any): boolean => {
+        if (!candidate || !sessionOverlapsRecording(candidate, window)) return false;
+        if (hasRecordedIdentities) return recordingSessionParticipants(candidate, window).length > 0
+          || window.tracks.some(track => track.userId && track.userId === candidate.startedBy);
+        // With neither exact recorded identities nor a recording window we
+        // cannot pick the latest reused-session starter or expand a DM name.
+        return Number.isFinite(Date.parse(window.startedAt ?? '')) && Number.isFinite(Date.parse(window.endedAt ?? ''));
+      };
       let session: any = null;
       try {
         const redis = await getRedisClient();
@@ -320,13 +332,14 @@ function resolveHandler(): DescribedStepHandler {
           session = await videoSessionRepo.getSession?.(idx.lobbyName, idx.sessionId).catch(() => null);
         }
       } catch { /* fall through to the scan */ }
-      if (!session) {
-        try { const matches = await videoSessionRepo.findByChannelArn(arn); if (matches.length > 0) session = matches[0]; } catch { /* no session */ }
+      if (!matchesRecording(session)) {
+        session = null;
+        try { const matches = await videoSessionRepo.findByChannelArn(arn); session = matches.find(matchesRecording) ?? null; } catch { /* no session */ }
       }
       const lobbyName: string = session?.documentId ?? '';
       const callId = (lobbyName ? await resolveCallIdByLobby(lobbyName) : null) ?? `unknown-${arn}-${recordingId}`;
-      let participants: CallRecordingParticipant[] = (session?.participants ?? []).map((p: any) => ({ userId: p.userId, displayName: p.displayName, participantId: p.participantId, joinedAt: p.joinedAt }));
-      if (participants.length === 0 && lobbyName.startsWith('dm:')) {
+      let participants: CallRecordingParticipant[] = (session ? recordingSessionParticipants(session, window) : []).map((p) => ({ userId: p.userId, displayName: p.displayName, participantId: p.participantId, joinedAt: p.joinedAt }));
+      if (!hasRecordedIdentities && participants.length === 0 && lobbyName.startsWith('dm:')) {
         const ids = lobbyName.slice(3).split(':').filter(Boolean);
         if (ids.length >= 2) participants = ids.map((userId) => ({ userId }));
       }
@@ -701,14 +714,14 @@ function storeHandler(): DescribedStepHandler {
     reads: 'callId, recordingId and the merged transcript.',
     emits:
       'How it was stored, the byte and segment counts, the transcript as text, whether any speech was found, and the document operations for the apply step.',
-    async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
+    async execute(_n: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
       const callId = str(ctx.callId)!; const recordingId = str(ctx.recordingId)!;
       const transcript = (ctx.transcript ?? { segments: ctx.segments ?? [] }) as { segments: TranscriptSegment[] };
       const json = JSON.stringify(transcript);
       if (json.length > 350 * 1024) return fail(`transcript too large to store inline (${json.length} bytes)`);
       // The summary is the next two steps' business; say it is underway so a
       // reader can tell "not yet" from "this row predates the summary".
-      await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', transcriptKey: 'inline', transcriptJson: json, summaryStatus: 'pending' } as never);
+      await callRecordingRepo.updateTranscriptStatus(callId, recordingId, { status: 'ready', transcriptKey: 'inline', transcriptJson: json, summaryStatus: 'pending', summaryRunId: helpers.runId, summaryError: null });
       // The org and owner come from the recording's own row when the run's
       // context does not carry them. Neither real starter does — the finalize
       // pipeline's child run and POST /recordings/:id/transcribe — so without
@@ -730,7 +743,7 @@ function storeHandler(): DescribedStepHandler {
       // A run that must not write a document gets a `skip` here instead, so
       // the apply step reports why rather than touching the reviewed page.
       const documentWrite = documentWriteSkipReason(ctx);
-      return ok({ stored: 'inline', bytes: json.length, segments: transcript.segments.length, transcriptText: text, hasSpeech: text.length > 0, documentWrite: documentWrite ? { skipped: documentWrite } : { allowed: true }, transcriptOps: documentOpsFor(ctx, transcriptOps(transcript.segments)) });
+      return ok({ callId, recordingId, stored: 'inline', bytes: json.length, segments: transcript.segments.length, transcriptText: text, hasSpeech: text.length > 0, documentWrite: documentWrite ? { skipped: documentWrite } : { allowed: true }, transcriptOps: documentOpsFor(ctx, transcriptOps(transcript.segments)) });
     },
   };
 }

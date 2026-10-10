@@ -55,7 +55,7 @@ function makeFakeDocClient(): {
       if (row && row.ttl !== undefined && row.ttl * 1000 <= Date.now()) {
         return {};
       }
-      return row ? { Item: { ...row } } : {};
+      return row ? { Item: JSON.parse(JSON.stringify(row)) } : {};
     }
     if (name === 'UpdateCommand') {
       const k = input.Key as { documentId: string; sessionId: string };
@@ -67,7 +67,17 @@ function makeFakeDocClient(): {
       // a future expression change surfaces here as a test miss, not a
       // silent data-shape bug.
       const expr = input.UpdateExpression as string;
-      if (expr.includes('#status = :status') && expr.includes('endedAt = :endedAt')) {
+      if (input.ConditionExpression === 'participants = :current' && JSON.stringify(row.participants) !== JSON.stringify(vals[':current'])) {
+        throw Object.assign(new Error('participant snapshot changed'), { name: 'ConditionalCheckFailedException' });
+      }
+      if (expr.startsWith('SET #history')) {
+        const names = input.ExpressionAttributeNames as Record<string, string>;
+        row.participantHistory ??= JSON.parse(JSON.stringify(vals[':initial'] ?? {}));
+        if (names['#pid']) {
+          row.participantHistory![names['#pid']] ??= JSON.parse(JSON.stringify(vals[':attendance']));
+          if (names['#left']) row.participantHistory![names['#pid']].leftAt ??= vals[':leftAt'] as string;
+        }
+      } else if (expr.includes('#status = :status') && expr.includes('endedAt = :endedAt')) {
         row.status = vals[':status'] as 'active' | 'ended';
         row.endedAt = vals[':endedAt'] as string;
         if (expr.includes('#ttl = :ttl')) {
@@ -331,6 +341,49 @@ describe.each([withMemoryStore(), withDdbStore()])('VideoSessionStore contract â
         userId: 'u2', participantId: 'u2-a', displayName: 'B', joinedAt: '2026-01-01T10:01Z',
       });
       expect(second).toEqual({ displaced: [], remaining: 2 });
+    });
+
+    it('keeps authenticated attendance after both people leave, without keeping live ref-count slots', async () => {
+      const store = factory.makeStore();
+      await store.createSession({ ...SAMPLE, participants: [] });
+      const actors = [
+        { userId: 'u-vera', participantId: 'vera-exact-issued-id', displayName: 'Vera', joinedAt: '2026-01-01T10:00Z' },
+        { userId: 'u-nora', participantId: 'nora-exact-issued-id', displayName: 'Nora', joinedAt: '2026-01-01T10:01Z' },
+      ];
+      for (const actor of actors) await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, actor);
+      for (const actor of actors) await store.removeParticipant(SAMPLE.documentId, SAMPLE.sessionId, actor.participantId);
+      const ended = await factory.makeRestart(store).getSession(SAMPLE.documentId, SAMPLE.sessionId);
+      expect(ended!.participants).toEqual([]);
+      expect(Object.values(ended!.participantHistory!).map(p => p.userId).sort()).toEqual(['u-nora', 'u-vera']);
+      expect(Object.values(ended!.participantHistory!).every(p => !!p.leftAt)).toBe(true);
+    });
+
+    it('concurrent joins/leaves preserve both history entries and the live ref-count', async () => {
+      const store = factory.makeStore();
+      await store.createSession({ ...SAMPLE, participants: [] });
+      const actors = ['a', 'b'].map(id => ({ userId: id, participantId: `opaque-${id}`, displayName: id, joinedAt: '2026-01-01T10:00Z' }));
+      await Promise.all(actors.map(actor => store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, actor)));
+      let rec = await store.getSession(SAMPLE.documentId, SAMPLE.sessionId);
+      expect(rec!.participants.map(p => p.userId).sort()).toEqual(['a', 'b']);
+      expect(Object.keys(rec!.participantHistory!).sort()).toEqual(['opaque-a', 'opaque-b']);
+      await Promise.all(actors.map(actor => store.removeParticipant(SAMPLE.documentId, SAMPLE.sessionId, actor.participantId)));
+      rec = await factory.makeRestart(store).getSession(SAMPLE.documentId, SAMPLE.sessionId);
+      expect(rec!.participants).toEqual([]);
+      expect(Object.values(rec!.participantHistory!).every(p => !!p.leftAt)).toBe(true);
+    });
+
+    it('duplicate/rejoin requests retain the original leg identity and close only the displaced leg', async () => {
+      const store = factory.makeStore();
+      await store.createSession({ ...SAMPLE, participants: [] });
+      const first = { userId: 'u1', participantId: 'opaque-1', clientId: 'tab', displayName: 'A', joinedAt: '2026-01-01T10:00Z' };
+      await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, first);
+      await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, first);
+      await store.addOrReplaceParticipant(SAMPLE.documentId, SAMPLE.sessionId, { ...first, participantId: 'opaque-2', joinedAt: '2026-01-01T10:02Z' });
+      const rec = await store.getSession(SAMPLE.documentId, SAMPLE.sessionId);
+      expect(rec!.participants.map(p => p.participantId)).toEqual(['opaque-2']);
+      expect(Object.keys(rec!.participantHistory!).sort()).toEqual(['opaque-1', 'opaque-2']);
+      expect(rec!.participantHistory!['opaque-1'].leftAt).toBeDefined();
+      expect(rec!.participantHistory!['opaque-2'].leftAt).toBeUndefined();
     });
 
     it('returns null for a session that does not exist', async () => {

@@ -50,6 +50,60 @@ export interface TruthParticipant {
   joinedAt?: string;
 }
 
+interface SessionAttendanceSource {
+  startedAt?: string;
+  endedAt?: string;
+  participants?: TruthParticipant[];
+  participantHistory?: Record<string, TruthParticipant & { leftAt?: string }>;
+}
+
+interface RecordingAttendanceWindow {
+  startedAt?: string;
+  endedAt?: string;
+  tracks?: TruthTrack[];
+}
+
+/** Never attach a reused channel's newer/older session to this recording. */
+export function sessionOverlapsRecording(session: SessionAttendanceSource, recording: RecordingAttendanceWindow): boolean {
+  const sessionStart = parseIso(session.startedAt), sessionEnd = parseIso(session.endedAt);
+  const recordingStart = parseIso(recording.startedAt), recordingEnd = parseIso(recording.endedAt);
+  if (sessionStart != null && recordingEnd != null && sessionStart > recordingEnd) return false;
+  if (sessionEnd != null && recordingStart != null && sessionEnd < recordingStart) return false;
+  return true;
+}
+
+/**
+ * Resolve recorded legs to their authenticated join identities, even after
+ * Leave emptied the live roster. A participantId is only an exact lookup key;
+ * its spelling never supplies an identity. When legacy media has no leg IDs,
+ * attendance must overlap the recording's time window instead.
+ */
+export function recordingSessionParticipants(session: SessionAttendanceSource, recording: RecordingAttendanceWindow): TruthParticipant[] {
+  if (!sessionOverlapsRecording(session, recording)) return [];
+  const history = Object.values(session.participantHistory ?? {});
+  const candidates = [...history, ...(session.participants ?? [])];
+  const ids = new Set((recording.tracks ?? []).map(track => track.participantId).filter(Boolean));
+  const users = new Set((recording.tracks ?? []).map(track => track.userId).filter(Boolean));
+  const start = parseIso(recording.startedAt), end = parseIso(recording.endedAt);
+  const byParticipant = new Map<string, TruthParticipant>();
+  for (const participant of candidates) {
+    if (!participant?.userId) continue;
+    if (ids.size || users.size) {
+      if (!ids.has(participant.participantId) && !users.has(participant.userId)) continue;
+    } else {
+      const joined = parseIso(participant.joinedAt);
+      const left = parseIso((participant as TruthParticipant & { leftAt?: string }).leftAt);
+      if (end != null && joined != null && joined > end) continue;
+      if (start != null && left != null && left < start) continue;
+      // New history always has trusted times. Do not expand its entitlement
+      // when neither recorded legs nor timestamps can establish overlap.
+      if (session.participantHistory && (joined == null || start == null || end == null)) continue;
+    }
+    byParticipant.set(participant.participantId ?? participant.userId, participant);
+  }
+  return [...byParticipant.values()];
+}
+
 // --------------------------------------------------------------------
 // 1. Duration
 // --------------------------------------------------------------------

@@ -95,10 +95,11 @@ describe('VideoSessionRepository.endSession', () => {
 
 describe('VideoSessionRepository.addParticipant', () => {
   it('sends UpdateCommand using list_append expression', async () => {
+    mockSend.mockImplementation(async cmd => cmd.constructor.name === 'GetCommand' ? { Item: SESSION } : {});
     const repo = new VideoSessionRepository(docClient);
     await repo.addParticipant('doc-1', 'sess-1', PARTICIPANT);
 
-    const cmd = mockSend.mock.calls[0][0];
+    const cmd = mockSend.mock.calls.map(call => call[0]).find(command => command.input.UpdateExpression?.includes('list_append'));
     expect(cmd.input.Key).toEqual({ documentId: 'doc-1', sessionId: 'sess-1' });
     expect(cmd.input.UpdateExpression).toContain('list_append');
     expect(cmd.input.ExpressionAttributeValues[':participant']).toEqual([PARTICIPANT]);

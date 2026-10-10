@@ -1143,6 +1143,17 @@ export class RunPersistenceService {
       this.recordFailedStep(state, failedNodeId, event.error.message, event.at);
     }
     await this.persistRun(state);
+    // The summary agent can terminate the run before store-summary executes.
+    // Project that terminal fact on the recording's separate summary axis;
+    // the repository fences it to this run and leaves its transcript intact.
+    if (state.pipelineId === 'call-transcription' && (failedNodeId === 'summarize' || failedNodeId === 'store-summary')) {
+      const { settleRecordingSummaryFailure } = await import('../recordings/summaryFailure.js');
+      await settleRecordingSummaryFailure({
+        runId: state.runId,
+        context: state.checkpoint?.context ?? state.steps.store?.output,
+        error: event.error.message,
+      }).catch((err: unknown) => log.warn({ runId: state.runId, err: String(err) }, 'failed to settle recording summary'));
+    }
     await this.publishWorkGraphLifecycle(state, event.at);
     // A finished run leaves no step queueing work it will never do.
     await this.closeWorkGraphSteps(state, event.at);

@@ -290,6 +290,8 @@ export interface CallRecording {
    * value as "no summary attempt recorded".
    */
   summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed' | 'skipped';
+  /** Native run that owns the current summary attempt; fences late failures. */
+  summaryRunId?: string;
   /** Last-error string when `summaryStatus === 'failed'`. Truncated to 200 chars. */
   summaryError?: string;
   /** Blob-storage key (S3/R2) for the merged transcript JSON. Sparse. */
@@ -1270,6 +1272,7 @@ export class CallRecordingRepository extends BaseRepository {
       transcriptError?: string | null;
       /** `skipped`: the transcript is ready but there was no speech to summarise. */
       summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed' | 'skipped';
+      summaryRunId?: string;
       summaryError?: string | null;
       /** Override for the status clock. Tests only; production uses now. */
       statusAt?: string;
@@ -1285,6 +1288,10 @@ export class CallRecordingRepository extends BaseRepository {
     if (patch.summaryStatus !== undefined) {
       sets.push('summaryStatus = :ss');
       values[':ss'] = patch.summaryStatus;
+    }
+    if (patch.summaryRunId !== undefined) {
+      sets.push('summaryRunId = :sr');
+      values[':sr'] = patch.summaryRunId;
     }
     if (patch.summaryError === null) {
       removes.push('summaryError');
@@ -1332,6 +1339,29 @@ export class CallRecordingRepository extends BaseRepository {
         ConditionExpression: 'attribute_exists(callId)',
       }),
     );
+  }
+
+  /** Settle a terminal native summary failure without changing its transcript.
+   * The condition prevents a late failure from clobbering a newer attempt or
+   * a summary that has already settled. Missing/legacy ownership is untouched.
+   */
+  async failPendingSummary(callId: string, recordingId: string, runId: string, error: string): Promise<boolean> {
+    try {
+      await this.docClient.send(new UpdateCommand({
+        TableName: CALL_RECORDINGS_TABLE,
+        Key: { callId, recordingId },
+        UpdateExpression: 'SET summaryStatus = :failed, summaryError = :error',
+        ConditionExpression: 'summaryRunId = :run AND transcriptStatus = :ready AND summaryStatus IN (:pending, :processing)',
+        ExpressionAttributeValues: {
+          ':run': runId, ':ready': 'ready', ':pending': 'pending', ':processing': 'processing',
+          ':failed': 'failed', ':error': error.slice(0, 200),
+        },
+      }));
+      return true;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
   }
 }
 

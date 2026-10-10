@@ -56,6 +56,8 @@ describe('transcript:store', () => {
     expect(out.status).toBe('completed');
     expect(out.output).toMatchObject({ hasSpeech: true, transcriptText: transcriptText(spoken), segments: 2 });
     expect(updateTranscriptStatusMock).toHaveBeenCalledWith('c1', 'r1', expect.objectContaining({ status: 'ready', transcriptKey: 'inline', summaryStatus: 'pending' }));
+    expect(updateTranscriptStatusMock).toHaveBeenCalledWith('c1', 'r1', expect.objectContaining({ summaryRunId: 'run-1', summaryError: null }));
+    expect(out.output).toMatchObject({ callId: 'c1', recordingId: 'r1' });
   });
   it('reports no speech for a silent recording', async () => {
     const out = await run(KINDS.store, { callId: 'c1', recordingId: 'r1', writeTranscriptToDocument: true, transcript: { segments: [] } });

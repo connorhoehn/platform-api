@@ -59,7 +59,7 @@ describe('documentWriteSkipReason', () => {
 describe('a document-review call', () => {
   it('resolve carries the call kind alongside the document the call is about', async () => {
     findByChannelArnMock.mockResolvedValueOnce([reviewSession]);
-    const out = await run(KINDS.resolve, { arn: ARN, recordingId: 'rec-1' });
+    const out = await run(KINDS.resolve, { arn: ARN, recordingId: 'rec-1', detail: { startedAt: '2026-10-09T19:41:00Z', endedAt: '2026-10-09T19:42:00Z' } });
     expect(out.status).toBe('completed');
     expect(out.output).toMatchObject({ lobbyName: DOC, callId: 'call-1', callKind: 'document-review', documentId: DOC });
   });

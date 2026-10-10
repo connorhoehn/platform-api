@@ -78,6 +78,7 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
     // DDB's list_append doesn't dedupe; we match that behaviour. Callers
     // are responsible for idempotency (the route layer does this today).
     rec.participants = [...(rec.participants ?? []), { ...participant }];
+    this.rememberParticipants(rec, rec.participants);
   }
 
   /** See VideoSessionStore.addOrReplaceParticipant. */
@@ -91,6 +92,8 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
     if (!rec) return null;
     const current = rec.participants ?? [];
     const displaced = current.filter((p) => participantSupersedes(p, participant));
+    this.rememberParticipants(rec, [...current, participant]);
+    this.closeAttendance(rec, displaced.filter(p => p.participantId !== participant.participantId));
     const kept = current.filter((p) => !participantSupersedes(p, participant));
     rec.participants = [...kept, { ...participant }];
     return {
@@ -107,6 +110,8 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
     const key = makeKey(documentId, sessionId);
     const rec = this.sessions.get(key);
     if (!rec) return null;
+    this.rememberParticipants(rec, rec.participants ?? []);
+    this.closeAttendance(rec, (rec.participants ?? []).filter(p => p.participantId === participantId));
     rec.participants = (rec.participants ?? []).filter(p => p.participantId !== participantId);
     return { remaining: rec.participants.length };
   }
@@ -119,8 +124,26 @@ export class MemoryVideoSessionStore implements VideoSessionStore {
     const key = makeKey(documentId, sessionId);
     const rec = this.sessions.get(key);
     if (!rec) return null;
+    this.rememberParticipants(rec, rec.participants ?? []);
+    this.closeAttendance(rec, (rec.participants ?? []).filter(p => p.userId === userId));
     rec.participants = (rec.participants ?? []).filter(p => p.userId !== userId);
     return { remaining: rec.participants.length };
+  }
+
+  private rememberParticipants(rec: VideoSessionRecord, participants: VideoSessionParticipant[]): void {
+    rec.participantHistory ??= {};
+    for (const participant of participants) {
+      if (!participant.userId || !participant.participantId) continue;
+      rec.participantHistory[participant.participantId] ??= { ...participant };
+    }
+  }
+
+  private closeAttendance(rec: VideoSessionRecord, participants: VideoSessionParticipant[]): void {
+    const leftAt = new Date().toISOString();
+    for (const participant of participants) {
+      const attendance = rec.participantHistory?.[participant.participantId];
+      if (attendance) attendance.leftAt ??= leftAt;
+    }
   }
 
   async getSession(

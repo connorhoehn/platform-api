@@ -9,12 +9,13 @@
 //   `ensureVideoSessionsTTL()` in src/lib/dynamo-setup.ts enables it on
 //   the table at startup (idempotent).
 
-import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
 import {
   VideoSessionRecord,
   VideoSessionParticipant,
+  VideoSessionAttendance,
   VideoSessionStore,
   DocumentCallFieldsPatch,
   computeEndedSessionTtl,
@@ -64,6 +65,9 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
     sessionId: string,
     participant: VideoSessionParticipant,
   ): Promise<void> {
+    const session = await this.getSession(documentId, sessionId);
+    if (!session) return;
+    await this.rememberParticipants(documentId, sessionId, [...(session.participants ?? []), participant]);
     await this.updateItem({
       Key: { documentId, sessionId },
       UpdateExpression: 'SET participants = list_append(if_not_exists(participants, :empty), :participant)',
@@ -77,7 +81,7 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
   /**
    * See VideoSessionStore.addOrReplaceParticipant.
    *
-   * Read-modify-write rather than `list_append`, because appending is
+   * Conditional read-modify-write rather than `list_append`, because appending is
    * exactly the behaviour that leaks: a client that joins twice (a room
    * does) appends twice, and the second entry's participantId is a fresh
    * upstream-minted string that no /end will ever name.
@@ -87,24 +91,98 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
     sessionId: string,
     participant: VideoSessionParticipant,
   ): Promise<{ displaced: VideoSessionParticipant[]; remaining: number } | null> {
-    const session = await this.getSession(documentId, sessionId);
-    if (!session) return null;
-    const current = session.participants ?? [];
-    const displaced = current.filter((p) => participantSupersedes(p, participant));
-    const next = [...current.filter((p) => !participantSupersedes(p, participant)), participant];
+    return this.mutateParticipants(documentId, sessionId, current => {
+      const displaced = current.filter(p => participantSupersedes(p, participant));
+      const next = [...current.filter(p => !participantSupersedes(p, participant)), participant];
+      return { next, result: { displaced, remaining: next.length } };
+    });
+  }
+
+  /** Retry conflicting joins/leaves instead of resurrecting a stale live roster. */
+  private async mutateParticipants<T>(
+    documentId: string, sessionId: string,
+    change: (current: VideoSessionParticipant[]) => { next: VideoSessionParticipant[]; result: T },
+  ): Promise<T | null> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const session = await this.getSession(documentId, sessionId);
+      if (!session) return null;
+      const current = session.participants ?? [];
+      const { next, result } = change(current);
+      await this.rememberParticipants(documentId, sessionId, [...current, ...next]);
+      await this.closeAttendance(documentId, sessionId,
+        current.filter(p => !next.some(incoming => incoming.participantId === p.participantId)));
+      try {
+        await this.updateItem({
+          Key: { documentId, sessionId },
+          UpdateExpression: 'SET participants = :participants',
+          ConditionExpression: session.participants === undefined ? 'attribute_not_exists(participants)' : 'participants = :current',
+          ExpressionAttributeValues: { ':participants': next, ...(session.participants === undefined ? {} : { ':current': current }) },
+        });
+        return result;
+      } catch (error) {
+        if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
+      }
+    }
+    throw new Error('Concurrent video participant update did not settle');
+  }
+
+  /**
+   * History writes target individual map entries, rather than replacing a
+   * snapshot. Two joins (or a join and leave) cannot erase each other's
+   * authenticated attendance. if_not_exists keeps the first join/leave time
+   * when a request is retried. Seed live entries for pre-history rows before
+   * /end removes them; already-ended corrupt recordings are not backfilled.
+   */
+  private async rememberParticipants(
+    documentId: string, sessionId: string, participants: VideoSessionParticipant[],
+  ): Promise<void> {
+    const trusted = participants.filter(p => p.userId && p.participantId);
+    if (!trusted.length) return;
+    const initial: Record<string, VideoSessionAttendance> = Object.fromEntries(
+      trusted.map(p => [p.participantId, { ...p }]),
+    );
     await this.updateItem({
       Key: { documentId, sessionId },
-      UpdateExpression: 'SET participants = :participants',
-      ExpressionAttributeValues: { ':participants': next },
+      UpdateExpression: 'SET #history = if_not_exists(#history, :initial)',
+      ConditionExpression: 'attribute_exists(documentId)',
+      ExpressionAttributeNames: { '#history': 'participantHistory' },
+      ExpressionAttributeValues: { ':initial': initial },
     });
-    return { displaced, remaining: next.length };
+    for (const participant of trusted) {
+      await this.updateItem({
+        Key: { documentId, sessionId },
+        UpdateExpression: 'SET #history.#pid = if_not_exists(#history.#pid, :attendance)',
+        ConditionExpression: 'attribute_exists(documentId)',
+        ExpressionAttributeNames: { '#history': 'participantHistory', '#pid': participant.participantId },
+        ExpressionAttributeValues: { ':attendance': participant },
+      });
+    }
+  }
+
+  private async closeAttendance(
+    documentId: string, sessionId: string, participants: VideoSessionParticipant[],
+  ): Promise<void> {
+    const leftAt = new Date().toISOString();
+    for (const participant of participants) {
+      if (!participant.userId || !participant.participantId) continue;
+      await this.updateItem({
+        Key: { documentId, sessionId },
+        UpdateExpression: 'SET #history.#pid.#left = if_not_exists(#history.#pid.#left, :leftAt)',
+        ConditionExpression: 'attribute_exists(#history.#pid)',
+        ExpressionAttributeNames: { '#history': 'participantHistory', '#pid': participant.participantId, '#left': 'leftAt' },
+        ExpressionAttributeValues: { ':leftAt': leftAt },
+      });
+    }
   }
 
   async getSession(
     documentId: string,
     sessionId: string,
   ): Promise<VideoSessionRecord | null> {
-    return this.getItem<VideoSessionRecord>({ documentId, sessionId });
+    const result = await this.docClient.send(new GetCommand({
+      TableName: VIDEO_SESSIONS_TABLE, Key: { documentId, sessionId }, ConsistentRead: true,
+    }));
+    return (result.Item as VideoSessionRecord) ?? null;
   }
 
   async addGuests(
@@ -278,15 +356,10 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
     sessionId: string,
     participantId: string,
   ): Promise<{ remaining: number } | null> {
-    const session = await this.getSession(documentId, sessionId);
-    if (!session) return null;
-    const next = (session.participants ?? []).filter(p => p.participantId !== participantId);
-    await this.updateItem({
-      Key: { documentId, sessionId },
-      UpdateExpression: 'SET participants = :participants',
-      ExpressionAttributeValues: { ':participants': next },
+    return this.mutateParticipants(documentId, sessionId, current => {
+      const next = current.filter(p => p.participantId !== participantId);
+      return { next, result: { remaining: next.length } };
     });
-    return { remaining: next.length };
   }
 
   /**
@@ -299,14 +372,9 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
     sessionId: string,
     userId: string,
   ): Promise<{ remaining: number } | null> {
-    const session = await this.getSession(documentId, sessionId);
-    if (!session) return null;
-    const next = (session.participants ?? []).filter(p => p.userId !== userId);
-    await this.updateItem({
-      Key: { documentId, sessionId },
-      UpdateExpression: 'SET participants = :participants',
-      ExpressionAttributeValues: { ':participants': next },
+    return this.mutateParticipants(documentId, sessionId, current => {
+      const next = current.filter(p => p.userId !== userId);
+      return { next, result: { remaining: next.length } };
     });
-    return { remaining: next.length };
   }
 }
