@@ -20,6 +20,9 @@ import {
   DocumentCallFieldsPatch,
   computeEndedSessionTtl,
   participantSupersedes,
+  sameVideoCallBinding,
+  VideoCallBindingConflict,
+  type VideoParticipantCallBinding,
 } from './VideoSessionStore';
 
 export type {
@@ -33,6 +36,37 @@ export const VIDEO_SESSIONS_TABLE = tableName('document-video-sessions');
 export class VideoSessionRepository extends BaseRepository implements VideoSessionStore {
   constructor(docClient: DynamoDBDocumentClient) {
     super(VIDEO_SESSIONS_TABLE, docClient);
+  }
+
+  async bindCallParticipant(documentId: string, sessionId: string, participantId: string, channelArn: string,
+    binding: VideoParticipantCallBinding): Promise<VideoParticipantCallBinding | null> {
+    if (binding.sessionId !== sessionId || binding.channelArn !== channelArn || binding.lobbyName !== documentId) return null;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const session = await this.getSession(documentId, sessionId);
+      const attendance = session?.participantHistory?.[participantId];
+      if (!session || session.status !== 'active' || session.channelArn !== channelArn || session.orgId !== binding.tenant
+        || (session.ttl !== undefined && (!Number.isFinite(session.ttl) || session.ttl <= Math.floor(Date.now() / 1000)))
+        || !session.participants?.some(p => p.participantId === participantId && p.userId === binding.userId && p.clientId === binding.clientId)
+        || !attendance || attendance.leftAt || attendance.userId !== binding.userId || attendance.clientId !== binding.clientId) return null;
+      if (attendance.callBinding && !sameVideoCallBinding(attendance.callBinding, binding)) throw new VideoCallBindingConflict();
+      const value = attendance.callBinding ?? binding;
+      try {
+        await this.updateItem({ Key: { documentId, sessionId },
+          UpdateExpression: 'SET #history.#pid.#binding = :binding',
+          ConditionExpression: '#status = :active AND channelArn = :arn AND orgId = :tenant AND participants = :live'
+            + ' AND (attribute_not_exists(#ttl) OR #ttl > :now)'
+            + ' AND #history.#pid.#uid = :uid AND #history.#pid.#cid = :cid AND attribute_not_exists(#history.#pid.#left)'
+            + (attendance.callBinding ? ' AND #history.#pid.#binding = :previous' : ' AND attribute_not_exists(#history.#pid.#binding)'),
+          ExpressionAttributeNames: { '#history': 'participantHistory', '#pid': participantId, '#binding': 'callBinding', '#status': 'status', '#uid': 'userId', '#cid': 'clientId', '#left': 'leftAt', '#ttl': 'ttl' },
+          ExpressionAttributeValues: { ':binding': value, ':active': 'active', ':arn': channelArn, ':tenant': binding.tenant,
+            ':live': session.participants, ':uid': binding.userId, ':cid': binding.clientId, ':now': Math.floor(Date.now() / 1000), ...(attendance.callBinding ? { ':previous': attendance.callBinding } : {}) },
+        });
+        return value;
+      } catch (error) {
+        if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
+      }
+    }
+    throw new VideoCallBindingConflict();
   }
 
   async createSession(record: VideoSessionRecord): Promise<VideoSessionRecord> {
@@ -273,14 +307,23 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
    */
   async findByChannelArn(channelArn: string): Promise<VideoSessionRecord[]> {
     const { ScanCommand } = await import('@aws-sdk/lib-dynamodb');
-    const out = await this.docClient.send(
-      new ScanCommand({
-        TableName: VIDEO_SESSIONS_TABLE,
-        FilterExpression: 'channelArn = :arn',
-        ExpressionAttributeValues: { ':arn': channelArn },
-      }),
-    );
-    const items = (out.Items ?? []) as VideoSessionRecord[];
+    const items: VideoSessionRecord[] = [];
+    let cursor: Record<string, unknown> | undefined;
+    const seen = new Set<string>();
+    do {
+      const out = await this.docClient.send(new ScanCommand({
+        TableName: VIDEO_SESSIONS_TABLE, ConsistentRead: true,
+        FilterExpression: 'channelArn = :arn', ExpressionAttributeValues: { ':arn': channelArn },
+        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+      }));
+      items.push(...(out.Items ?? []) as VideoSessionRecord[]);
+      cursor = out.LastEvaluatedKey;
+      if (cursor) {
+        const key = JSON.stringify(cursor);
+        if (seen.has(key)) throw new Error('Video session pagination did not advance');
+        seen.add(key);
+      }
+    } while (cursor);
     return items.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
   }
 

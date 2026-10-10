@@ -28,9 +28,11 @@ const mockMapSfuError = jest.fn();
 
 const mockUpdateTranscriptStatus = jest.fn(async (..._a: unknown[]) => undefined);
 const mockStartSystemRun = jest.fn(async (..._a: unknown[]) => 'run-t1');
+const mockStartRecordingTranscription = jest.fn(async (..._a: unknown[]) => ({ runId: 'run-t1', processingAttemptId: 'attempt-1' }));
 jest.mock('../../recordings/recordingPipelines', () => ({
   ...jest.requireActual('../../recordings/recordingPipelines'),
   startSystemRun: (...a: unknown[]) => mockStartSystemRun(...a),
+  startRecordingTranscription: (...a: unknown[]) => mockStartRecordingTranscription(...a),
 }));
 
 jest.mock('../../middleware/auth', () => ({
@@ -92,7 +94,7 @@ jest.mock('../../lib/sfu-breaker', () => ({
 }));
 
 // Lazy import after mocks.
-import { recordingsRouter } from '../recordings';
+import { recordingsRouter, recordingArtifactContext, recordingStage } from '../recordings';
 import { errorHandler, AppError } from '../../middleware/error-handler';
 
 // --- helpers ----------------------------------------------------------------
@@ -633,6 +635,37 @@ describe('a failed summary does not hide a ready transcript', () => {
     expect(res.headers['x-summary-status']).toBe('ready');
   });
 
+  it.each(['pending', 'processing'])('summary %s returns progress after transcript is already ready', async summaryStatus => {
+    givenRecording(readyRow({ summaryStatus, summaryStatusAt: new Date().toISOString(), summaryRunId: 'run-current', processingAttemptId: 'attempt-current', summaryMarkdown: 'stale old summary' }));
+    const res = await run('GET', '/api/recordings/r-1/summary');
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ status: summaryStatus, transcriptStatus: 'ready', summaryStatus, summaryRunId: 'run-current', processingAttemptId: 'attempt-current', terminal: false });
+    expect(JSON.stringify(res.body)).not.toContain('stale old summary');
+    expect(res.headers['cache-control']).toBe('private, no-store');
+    expect(res.headers['access-control-expose-headers']).toContain('X-Summary-Status');
+  });
+
+  it('a stalled summary is terminal and uses its own native clock', async () => {
+    givenRecording(readyRow({ summaryStatus: 'processing', summaryStatusAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(), transcriptStatusAt: new Date().toISOString() }));
+    const res = await run('GET', '/api/recordings/r-1/summary');
+    expect(res.body).toMatchObject({ status: 'stalled', transcriptStatus: 'ready', summaryStatus: 'processing', terminal: true, retryAfterMs: null });
+  });
+
+  it('summary retry against an old recording uses a fresh summary clock', async () => {
+    givenRecording(readyRow({ summaryStatus: 'pending', endedAt: '2020-01-01T00:00:00Z', summaryStatusAt: new Date().toISOString() }));
+    const res = await run('GET', '/api/recordings/r-1/summary');
+    expect(res.body).toMatchObject({ status: 'pending', terminal: false });
+  });
+
+  it('missing/invalid native clocks stop polling without inventing a failed or stalled job', async () => {
+    givenRecording(readyRow({ summaryStatus: 'pending', summaryStatusAt: 'invalid', endedAt: 'invalid' }));
+    const summary = await run('GET', '/api/recordings/r-1/summary');
+    expect(summary.body).toMatchObject({ status: 'unavailable', summaryStatus: 'pending', terminal: true, retryAfterMs: null, waitedMs: null });
+    givenRecording(readyRow({ transcriptStatus: 'pending', transcriptStatusAt: 'invalid', endedAt: 'invalid' }));
+    const transcript = await run('GET', '/api/recordings/r-1/transcript');
+    expect(transcript.body).toMatchObject({ status: 'unavailable', terminal: true, retryAfterMs: null, waitedMs: null });
+  });
+
   it('a row from before the split still serves its summary', async () => {
     // No `summaryStatus` at all — every row written before this existed.
     givenRecording(readyRow({ summaryMarkdown: '## Summary\nLegacy row.' }));
@@ -754,14 +787,15 @@ describe('GET /api/recordings/:recordingId — what leaves the process', () => {
 // other /recordings/:recordingId route — it used to take any logged-in user.
 describe('POST /api/recordings/:recordingId/transcribe — NFR #175', () => {
   const rec = { recordingId: 'rec-t', callId: 'call-t', channelArn: 'arn:t', lobbyName: 'dm:u-1:u-2', startedAt: '2026-09-01T00:00:00Z', composedSegment: { key: 'k' } };
-  beforeEach(() => { mockUpdateTranscriptStatus.mockClear(); mockStartSystemRun.mockClear(); });
+  beforeEach(() => { mockUpdateTranscriptStatus.mockClear(); mockStartSystemRun.mockClear(); mockStartRecordingTranscription.mockClear(); });
 
   it('a participant starts the run (202)', async () => {
     mockFindByRecordingId.mockResolvedValue(rec);
     mockHasParticipantRow.mockResolvedValue(true);
     const res = await run('POST', '/api/recordings/rec-t/transcribe');
     expect(res.statusCode).toBe(202);
-    expect(mockStartSystemRun).toHaveBeenCalledTimes(1);
+    expect(mockStartRecordingTranscription).toHaveBeenCalledWith(rec, 'u-1');
+    expect(res.body).toMatchObject({ runId: 'run-t1', processingAttemptId: 'attempt-1', recordingId: 'rec-t' });
   });
 
   it('a stranger is 404 and nothing is touched', async () => {
@@ -771,5 +805,18 @@ describe('POST /api/recordings/:recordingId/transcribe — NFR #175', () => {
     expect(res.statusCode).toBe(404);
     expect(mockUpdateTranscriptStatus).not.toHaveBeenCalled();
     expect(mockStartSystemRun).not.toHaveBeenCalled();
+    expect(mockStartRecordingTranscription).not.toHaveBeenCalled();
+  });
+});
+
+describe('recording stage and context reflect native status and stored provenance', () => {
+  it('reports independent artifact failures without hiding a ready media compose', () => {
+    expect(recordingStage({ composeStatus: 'ok', transcriptStatus: 'failed' })).toBe('failed');
+    expect(recordingStage({ composeStatus: 'ok', transcriptStatus: 'ready', summaryStatus: 'failed' })).toBe('failed');
+    expect(recordingStage({ composeStatus: 'ok', transcriptStatus: 'ready', summaryStatus: 'processing' })).toBe('summarizing');
+  });
+  it('links only exact native initiative lobbies, not client title/work/deck guesses', () => {
+    expect(recordingArtifactContext('orgiq:initiative:p-observability')).toEqual({ tenant: 'orgiq', initiativeId: 'p-observability' });
+    for (const lobby of ['orgiq:initiative:p:work:w1', 'social:room:secret', 'assessment:team:TEAM-005', 'orgiq:initiative:', undefined]) expect(recordingArtifactContext(lobby)).toBeNull();
   });
 });

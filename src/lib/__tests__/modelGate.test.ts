@@ -6,7 +6,7 @@
 jest.mock('../redis-client', () => ({ getRedisCacheClient: async () => null, getRedisClient: async () => null }));
 import { FixtureLLMClient } from 'distributed-core/applications/pipeline';
 import { gatedAgentClient, gatedLLMClient, gateStream, resetModelGate, withModelGate } from '../modelGate';
-import { forceBreaker, ModelUnavailableError, resetModelHealth } from '../modelHealth';
+import { forceBreaker, ModelUnavailableError, resetModelHealth, runModelProbe } from '../modelHealth';
 import { resetModelSlots } from '../../deck/modelSlots';
 import { planAgentLoop, type AgentLoopRequest } from '../../chat/agentLoopPlanner';
 import type { AgentClient, AgentEvent } from '../../pipeline/agent/types';
@@ -28,6 +28,16 @@ describe('model gate', () => {
     expect(called).toBe(false);
     const llm = gatedLLMClient(new FixtureLLMClient(['hi']), 'drafter');
     await expect(collect(llm.stream('m', '', 'p'))).rejects.toBeInstanceOf(ModelUnavailableError);
+  });
+
+  it('forwards an explicit provider scope while retaining the global operator stop', async () => {
+    process.env.PIPELINE_LLM_PROVIDER = 'claude-code';
+    await runModelProbe({ env: { PIPELINE_LLM_PROVIDER: 'claude-code' }, readCredentials: async () => null,
+      lookup: async () => undefined, connect: async () => undefined });
+    const client = gatedLLMClient(new FixtureLLMClient(['summary']), 'pipeline', { breakerScope: 'codex' });
+    expect((await collect(client.stream('', '', 'speech'))).at(-1)).toMatchObject({ response: 'summary' });
+    await forceBreaker('operator stop');
+    await expect(collect(client.stream('', '', 'speech'))).rejects.toThrow('operator stop');
   });
 
   it('streams through unchanged when closed', async () => {

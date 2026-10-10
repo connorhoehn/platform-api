@@ -32,6 +32,8 @@
 export interface TruthTrack {
   userId?: string;
   participantId?: string;
+  /** Native verified WHIP JWT seat; media routing ids can vary for screen. */
+  tokenParticipantId?: string | null;
   legId?: string;
   startedAtMs?: number;
   endedAtMs?: number;

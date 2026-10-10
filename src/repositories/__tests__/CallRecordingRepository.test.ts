@@ -900,6 +900,20 @@ describe('CallRecordingRepository.listByUser — the compose/transcript join', (
     expect(items[0]?.composeStatus).toBeDefined();
   });
 
+  test('hydrates native processing intent and unresolved canonical association without claiming artifacts ready', async () => {
+    const send = strictDdb({ recordingId: 'active-now-2026-09-21-planning-recording', composeStatus: 'ok',
+      transcriptionRequested: true, callBindingStatus: 'unresolved', callBindingReason: 'unbound-recorded-participant' });
+    const repo = new CallRecordingRepository({ send } as unknown as DynamoDBDocumentClient);
+    const { items } = await repo.listByUser('u-frank');
+    expect(items[0]).toMatchObject({ transcriptionRequested: true, callBindingStatus: 'unresolved',
+      callBindingReason: 'unbound-recorded-participant' });
+    expect(items[0]?.transcriptStatus).toBeUndefined();
+    expect(items[0]?.summaryStatus).toBeUndefined();
+    const hydration = send.mock.calls.find(([command]) => (command as { input: { RequestItems?: unknown } }).input.RequestItems)?.[0];
+    const request = (hydration as { input: { RequestItems: Record<string, { ExpressionAttributeNames: Record<string, string> }> } }).input.RequestItems['test-video-call-recordings'];
+    expect(Object.values(request.ExpressionAttributeNames)).toEqual(expect.arrayContaining(['transcriptionRequested', 'callBindingStatus', 'callBindingReason']));
+  });
+
   test('still returns the page when the join fails, and says why', async () => {
     const logger = require('../../lib/logger').default as { warn: (...args: unknown[]) => void };
     const original = logger.warn;

@@ -4,7 +4,7 @@
 // Loop 36 ppt done-check in docs/design/nfr.
 jest.mock('../redis-client', () => ({ getRedisCacheClient: async () => null, getRedisClient: async () => null }));
 import {
-  admit, checkCredentials, classifyModelFailure, CLOSED, forceBreaker, guardModelCall, ModelUnavailableError,
+  admitModelCall, admit, checkCredentials, classifyModelFailure, CLOSED, forceBreaker, guardModelCall, ModelUnavailableError,
   onFailure, onProbeFailure, onProbeOk, onSuccess, probeModel, readBreaker, readModelHealth, rejectedCount,
   resetModelHealth, runModelProbe, type BreakerConfig,
 } from '../modelHealth';
@@ -162,5 +162,30 @@ describe('pipeline classification', () => {
     const msg = 'deck-revise model-unavailable: Model unavailable: not logged in. Nothing was changed.';
     expect(classifyPipelineError(msg)).toBe('ModelUnavailable');
     expect(classifyRetryability('ModelUnavailable', msg)).toBe('terminal');
+  });
+});
+
+
+describe('explicit provider breaker isolation', () => {
+  const env = { ...process.env };
+  beforeEach(() => { resetModelHealth(); process.env.PIPELINE_LLM_PROVIDER = 'claude-code'; process.env.MODEL_BREAKER_THRESHOLD = '1'; });
+  afterEach(() => { process.env = { ...env }; });
+  it('a failed Claude credential probe cannot disable Codex, and Codex success cannot clear it', async () => {
+    await runModelProbe({ env: { PIPELINE_LLM_PROVIDER: 'claude-code' }, readCredentials: async () => null,
+      lookup: async () => undefined, connect: async () => undefined });
+    await expect(admitModelCall('claude-code')).rejects.toBeInstanceOf(ModelUnavailableError);
+    const codex = await admitModelCall('codex'); await codex.succeeded();
+    expect(await readBreaker()).toMatchObject({ state: 'open', source: 'probe' });
+    expect(await readBreaker('codex')).toMatchObject({ state: 'closed', failures: 0 });
+  });
+  it('counts independent provider failures while preserving the global operator stop', async () => {
+    const codex = await admitModelCall('codex'); await codex.failed(new Error('Codex timed out'));
+    await expect(admitModelCall('codex')).rejects.toBeInstanceOf(ModelUnavailableError);
+    await expect(admitModelCall('bedrock')).resolves.toBeDefined();
+    expect(await readBreaker()).toMatchObject({ state: 'closed', failures: 0 });
+    await forceBreaker('maintenance');
+    await expect(admitModelCall('bedrock')).rejects.toThrow('maintenance');
+    await forceBreaker(null);
+    await expect(admitModelCall('codex')).rejects.toBeInstanceOf(ModelUnavailableError);
   });
 });

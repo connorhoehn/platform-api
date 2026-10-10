@@ -21,7 +21,7 @@ import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 
-const PORT = Number(process.env.PORT) || 14040;
+const PORT = process.env.PORT === '0' ? 0 : Number(process.env.PORT) || 14040;
 const BIN = process.env.SPEECH_CLI ?? '/Applications/OpenSuperWhisper.app/Contents/MacOS/opensuperwhisper';
 const TIMEOUT_MS = Number(process.env.SPEECH_TIMEOUT_MS) || 600_000;
 const MAX_BODY = 1024 * 1024 * 1024;
@@ -85,6 +85,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`[speech] listening on :${PORT}, engine ${BIN}`);
+server.listen(PORT, process.env.SPEECH_HOST, () => {
+  console.log(`[speech] listening on :${server.address().port}, engine ${BIN}`);
 });

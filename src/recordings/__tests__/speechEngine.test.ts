@@ -6,7 +6,7 @@ import http from 'http';
 import { promises as fs } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { transcribeFile } from '../recordingPipelines';
+import { parseSpeechResponse, transcribeFile } from '../recordingPipelines';
 
 describe('transcribeFile over SPEECH_URL', () => {
   let server: http.Server;
@@ -47,6 +47,23 @@ describe('transcribeFile over SPEECH_URL', () => {
     expect(segments.map((s) => s.text)).toEqual(['hello there', 'second line']);
     expect(segments[0]).toMatchObject({ startMs: 0, endMs: 10_000, speakerId: 'call' });
     expect(segments[1]).toMatchObject({ startMs: 10_000, endMs: 20_000 });
+    expect(segments.every(segment => segment.timestampSource === 'text-only')).toBe(true);
+  });
+
+  it('retains native timed JSON over HTTP, including quiet gaps and mixed Call attribution', async () => {
+    reply = { status: 200, body: JSON.stringify({ text: 'Legacy text should not replace segments.', timestampGranularity: 'segment', segments: [
+      { startMs: 1250, endMs: 2340, text: 'Raw recognized words.', speakerId: 'untrusted', speakerLabel: 'Someone' },
+      { startMs: 7125, endMs: 8875, text: 'Second line.' },
+    ] }) };
+    expect(await transcribeFile(file, 20_000)).toEqual([
+      { startMs: 1250, endMs: 2340, text: 'Raw recognized words.', speakerId: 'call', speakerLabel: 'Call', timestampSource: 'engine' },
+      { startMs: 7125, endMs: 8875, text: 'Second line.', speakerId: 'call', speakerLabel: 'Call', timestampSource: 'engine' },
+    ]);
+  });
+
+  it('does not silently turn malformed HTTP timed segments into an estimated transcript', async () => {
+    reply = { status: 200, body: JSON.stringify({ text: 'Plausible text.', segments: [{ startMs: 7000, endMs: 1000, text: 'Plausible text.' }] }) };
+    await expect(transcribeFile(file, 20_000)).rejects.toThrow('invalid segment timestamps');
   });
 
   it('reads an engine failure as one', async () => {
@@ -58,5 +75,51 @@ describe('transcribeFile over SPEECH_URL', () => {
     process.env.SPEECH_URL = 'http://127.0.0.1:1/';
     await expect(transcribeFile(file, 5_000)).rejects.toThrow(/speech engine unreachable at http:\/\/127\.0\.0\.1:1\//);
     process.env.SPEECH_URL = url;
+  });
+});
+
+describe('speech timing contract', () => {
+  it('preserves engine timing even if legacy recording duration is unknown', () => {
+    expect(parseSpeechResponse(JSON.stringify({ segments: [{ startMs: 250, endMs: 1250, text: 'Native timing.' }] }), 0)[0])
+      .toMatchObject({ startMs: 250, endMs: 1250, timestampSource: 'engine' });
+  });
+
+  it('keeps explicit engine silence without substituting stale text', () => {
+    expect(parseSpeechResponse('{"segments":[],"text":"stale text"}', 30_000)).toEqual([]);
+    expect(parseSpeechResponse('{"text":""}', 30_000)).toEqual([]);
+  });
+
+  it('preserves overlapping native segments and does not normalize recognized text', () => {
+    const segments = parseSpeechResponse(JSON.stringify({ segments: [
+      { startMs: 500, endMs: 1500, text: ' first ' }, { startMs: 1200, endMs: 2500, text: 'second' },
+    ] }), 3000);
+    expect(segments.map(segment => [segment.startMs, segment.endMs, segment.text])).toEqual([[500, 1500, ' first '], [1200, 2500, 'second']]);
+  });
+
+  it.each([
+    { segments: null }, { segments: {} }, { segments: [null] },
+    { segments: [{ startMs: '100', endMs: 200, text: 'words' }] },
+    { segments: [{ startMs: -1, endMs: 200, text: 'words' }] },
+    { segments: [{ startMs: 100, endMs: 99, text: 'words' }] },
+    { segments: [{ startMs: 100.5, endMs: 200, text: 'words' }] },
+    { segments: [{ startMs: 100, endMs: Number.MAX_SAFE_INTEGER + 1, text: 'words' }] },
+    { segments: [{ startMs: 100, endMs: 200, text: 123 }] },
+    { segments: [{ startMs: 1000, endMs: 2000, text: 'first' }, { startMs: 100, endMs: 300, text: 'second' }] },
+  ])('rejects malformed timed output without falling back: %j', body => {
+    expect(() => parseSpeechResponse(JSON.stringify({ text: 'fallback text', ...body }), 30_000)).toThrow(/invalid/);
+  });
+
+  it('rejects nonfinite values in native JSON', () => {
+    expect(() => parseSpeechResponse('{"segments":[{"startMs":1e999,"endMs":1e999,"text":"words"}]}', 30_000)).toThrow(/invalid/);
+  });
+
+  it('makes the text-only unknown-duration failure explicit', () => {
+    expect(() => parseSpeechResponse('{"text":"words"}', 0)).toThrow('positive media duration');
+  });
+
+  it('keeps a short text-only estimate ordered and bounded without claiming measured timing', () => {
+    const segments = parseSpeechResponse('{"text":"first\\nsecond\\nthird"}', 2);
+    expect(segments.map(segment => [segment.startMs, segment.endMs, segment.timestampSource]))
+      .toEqual([[0, 0, 'text-only'], [0, 1, 'text-only'], [1, 2, 'text-only']]);
   });
 });

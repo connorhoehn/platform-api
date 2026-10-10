@@ -88,7 +88,7 @@ describe('transcript:store-summary', () => {
     ]);
     expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(1);
     expect(updateTranscriptStatusMock).toHaveBeenCalledWith('c1', 'r1', expect.objectContaining({
-      status: 'ready', summaryStatus: 'ready', summaryMarkdown: '## Summary\nWe shipped it.', summaryError: null, transcriptGeneratedAt: expect.any(String),
+      status: 'ready', summaryStatus: 'ready', summaryMarkdown: '## Summary\nWe shipped it.', summaryError: null, summaryGeneratedAt: expect.any(String), expectedSummaryRunId: 'run-1',
     }));
   });
 
@@ -110,5 +110,17 @@ describe('transcript:store-summary', () => {
     expect(out.status).toBe('completed');
     expect(out.output).toMatchObject({ summaryStatus: 'failed', summaryChars: 0 });
     expect(updateTranscriptStatusMock).toHaveBeenCalledWith('c1', 'r1', expect.objectContaining({ status: 'ready', summaryStatus: 'failed', summaryError: expect.any(String) }));
+  });
+  it('refuses a stale completion before creating document operations or a publishable result', async () => {
+    updateTranscriptStatusMock.mockRejectedValueOnce(Object.assign(new Error('newer attempt owns summary'), { name: 'ConditionalCheckFailedException' }));
+    await expect(run(KINDS.storeSummary, { callId: 'c1', recordingId: 'r1', processingAttemptId: 'old-generation', hasSpeech: true,
+      writeTranscriptToDocument: true, steps: { summarize: { text: '## Summary\nObsolete answer.' } } })).rejects.toThrow('newer attempt owns summary');
+    expect(updateTranscriptStatusMock).toHaveBeenCalledWith('c1', 'r1', expect.objectContaining({ expectedSummaryRunId: 'run-1', expectedProcessingAttemptId: 'old-generation' }));
+  });
+  it('marks a malformed completion failed rather than announcing a successful summary', async () => {
+    const result = await run(KINDS.storeSummary, { callId: 'c1', recordingId: 'r1', hasSpeech: true,
+      steps: { summarize: { text: 'Please configure a model provider.' } } });
+    expect(result.output).toMatchObject({ summaryStatus: 'failed', summaryChars: 0 });
+    expect(updateTranscriptStatusMock).toHaveBeenCalledWith('c1', 'r1', expect.objectContaining({ status: 'ready', summaryStatus: 'failed', summaryError: expect.stringContaining('requested meeting summary structure') }));
   });
 });

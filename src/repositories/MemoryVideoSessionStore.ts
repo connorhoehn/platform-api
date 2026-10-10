@@ -20,6 +20,9 @@ import {
   DocumentCallFieldsPatch,
   computeEndedSessionTtl,
   participantSupersedes,
+  sameVideoCallBinding,
+  VideoCallBindingConflict,
+  type VideoParticipantCallBinding,
 } from './VideoSessionStore';
 
 /**
@@ -31,6 +34,19 @@ function makeKey(documentId: string, sessionId: string): string {
 }
 
 export class MemoryVideoSessionStore implements VideoSessionStore {
+  async bindCallParticipant(documentId: string, sessionId: string, participantId: string, channelArn: string,
+    binding: VideoParticipantCallBinding): Promise<VideoParticipantCallBinding | null> {
+    const rec = this.readOrExpire(makeKey(documentId, sessionId));
+    const attendance = rec?.participantHistory?.[participantId];
+    if (!rec || rec.status !== 'active' || rec.channelArn !== channelArn || rec.orgId !== binding.tenant
+      || (rec.ttl !== undefined && (!Number.isFinite(rec.ttl) || rec.ttl <= Math.floor(Date.now() / 1000)))
+      || binding.sessionId !== sessionId || binding.channelArn !== channelArn || binding.lobbyName !== documentId
+      || !rec.participants?.some(p => p.participantId === participantId && p.userId === binding.userId && p.clientId === binding.clientId)
+      || !attendance || attendance.leftAt || attendance.userId !== binding.userId || attendance.clientId !== binding.clientId) return null;
+    if (attendance.callBinding && !sameVideoCallBinding(attendance.callBinding, binding)) throw new VideoCallBindingConflict();
+    attendance.callBinding ??= JSON.parse(JSON.stringify(binding)) as VideoParticipantCallBinding;
+    return JSON.parse(JSON.stringify(attendance.callBinding)) as VideoParticipantCallBinding;
+  }
   private readonly sessions = new Map<string, VideoSessionRecord>();
 
   /**

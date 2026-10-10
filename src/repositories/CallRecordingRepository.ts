@@ -42,6 +42,7 @@ import {
   reconcileParticipants,
   type TruthTrack,
 } from '../lib/recording-truth';
+import { isGovernedRecordingLobby } from '../lib/recording-call-binding';
 
 export const CALL_RECORDINGS_TABLE = tableName('video-call-recordings');
 
@@ -55,7 +56,7 @@ export const CALL_RECORDINGS_TABLE = tableName('video-call-recordings');
  */
 const HYDRATE_ATTRIBUTES = [
   'recordingId', 'composeStatus', 'composedUrl', 'composedSegment',
-  'segments', 'tracks', 'transcriptStatus', 'summaryStatus', 'ttl',
+  'segments', 'tracks', 'transcriptStatus', 'summaryStatus', 'transcriptionRequested', 'callBindingStatus', 'callBindingReason', 'recordingGoverned', 'ttl',
 ] as const;
 const HYDRATE_PROJECTION = HYDRATE_ATTRIBUTES.map((name) => `#${name}`).join(', ');
 const HYDRATE_NAMES: Record<string, string> = Object.fromEntries(
@@ -99,6 +100,8 @@ export interface RecordingSegment {
  */
 export interface RecordingTrack {
   participantId?: string;
+  /** Native signed-token seat, separate from media routing participantId. */
+  tokenParticipantId?: string | null;
   userId?: string;
   key: string;
   url: string;
@@ -156,6 +159,11 @@ export interface CallRecording {
   channelArn: string;
   lobbyName: string;
   sessionId?: string;
+  /** Exact native recorded-seat association; absence is historical unknown. */
+  callBindingStatus?: 'bound' | 'unresolved' | 'legacy';
+  callBindingReason?: string;
+  /** Set only by the new governed native resolution path. Legacy rows are unchanged. */
+  recordingGoverned?: boolean;
   startedAt: string; // ISO
   endedAt: string; // ISO
   /**
@@ -257,6 +265,8 @@ export interface CallRecording {
    *   'failed'              — exhausted DLQ retries
    */
   transcriptStatus?: 'pending' | 'processing' | 'ready' | 'failed';
+  /** Native processing intent. Absent on legacy rows; never inferred by readers. */
+  transcriptionRequested?: boolean;
   /**
    * ISO timestamp of the last `transcriptStatus` write — i.e. when we last
    * observed forward progress on this job.
@@ -292,6 +302,11 @@ export interface CallRecording {
   summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed' | 'skipped';
   /** Native run that owns the current summary attempt; fences late failures. */
   summaryRunId?: string;
+  /** Trusted starter's generation token; fences overlapping transcription retries. */
+  processingAttemptId?: string;
+  /** Summary progress has its own clock; transcription can already be complete. */
+  summaryStatusAt?: string;
+  summaryGeneratedAt?: string;
   /** Last-error string when `summaryStatus === 'failed'`. Truncated to 200 chars. */
   summaryError?: string;
   /** Blob-storage key (S3/R2) for the merged transcript JSON. Sparse. */
@@ -320,6 +335,9 @@ export interface CallRecording {
  */
 export interface RecordingListRow {
   callId: string;
+  callBindingStatus?: CallRecording['callBindingStatus'];
+  callBindingReason?: string;
+  recordingGoverned?: boolean;
   recordingId: string;
   startedAt: string;
   endedAt: string;
@@ -357,9 +375,11 @@ export interface RecordingListRow {
   /**
    * Transcription pipeline state, when there is one. Sparse by nature —
    * only recordings that opted into transcription have it — so `undefined`
-   * here means "no transcript was ever asked for", NOT "still waiting".
+   * with transcriptionRequested=true means enqueue has not yet begun.
    */
   transcriptStatus?: 'pending' | 'processing' | 'ready' | 'failed';
+  transcriptionRequested?: boolean;
+  summaryStatus?: CallRecording['summaryStatus'];
 }
 
 const RETENTION_DAYS = Number(process.env.RECORDING_RETENTION_DAYS ?? 30);
@@ -386,6 +406,16 @@ export function fanoutSetFor(rec: {
   }
   if (rec.startedBy) ids.add(rec.startedBy);
   return ids;
+}
+
+function newGovernedRecording(rec: { callBindingStatus?: string; recordingGoverned?: boolean; lobbyName?: string }): boolean {
+  return rec.callBindingStatus !== undefined && (rec.recordingGoverned === true || isGovernedRecordingLobby(rec.lobbyName ?? ''));
+}
+
+function nativeRecordedUsers(rec: { tracks?: unknown }): Set<string> {
+  return new Set((Array.isArray(rec.tracks) ? rec.tracks : [])
+    .map((track: unknown) => track && typeof track === 'object' ? (track as { userId?: unknown }).userId : undefined)
+    .filter((userId: unknown): userId is string => typeof userId === 'string' && userId.trim().length > 0));
 }
 
 /**
@@ -637,10 +667,11 @@ export class CallRecordingRepository extends BaseRepository {
     // backfill, a replay, or a clock correction would all reopen it.
     //
     // One GetItem, and only on an actual change.
-    const prev = await this.getItem<CallRecording>({
-      callId: rec.callId,
-      recordingId: rec.recordingId,
-    }).catch(() => null);
+    const governed = newGovernedRecording(rec);
+    const prev = governed
+      ? ((await this.docClient.send(new GetCommand({ TableName: CALL_RECORDINGS_TABLE,
+          Key: { callId: rec.callId, recordingId: rec.recordingId }, ConsistentRead: true }))).Item as CallRecording | undefined) ?? null
+      : await this.getItem<CallRecording>({ callId: rec.callId, recordingId: rec.recordingId }).catch(() => null);
     if (prev && prev.startedAt && prev.startedAt !== rec.startedAt) {
       // Union of both fan-out sets: the roster can shift between writes,
       // and a stranded row under the OLD key is exactly what we're here to
@@ -665,7 +696,16 @@ export class CallRecordingRepository extends BaseRepository {
 
     await this.putItem(full as unknown as Record<string, unknown>);
 
-    const fanoutUserIds = fanoutSetFor(rec);
+    const recordedUsers = nativeRecordedUsers(rec);
+    const fanoutUserIds = new Set([...fanoutSetFor(rec)].filter(userId => !governed || recordedUsers.has(userId)));
+    if (governed && prev?.startedAt === rec.startedAt) {
+      // A same-key replay can reduce entitlement. The canonical primary is
+      // already fenced before these deletes; a stale/lost index never wins
+      // over its current native recorded users on the read path below.
+      await Promise.all([...fanoutSetFor(prev)].filter(userId => !fanoutUserIds.has(userId)).map(userId =>
+        this.docClient.send(new DeleteCommand({ TableName: this.participantsTable,
+          Key: { userId, startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}` } }))));
+    }
 
     // Fan out participant index rows. Promise.all is fine — DDB
     // PutItem is independent per row, and we want one round-trip-batch
@@ -683,6 +723,8 @@ export class CallRecordingRepository extends BaseRepository {
                 recordingId: rec.recordingId,
                 channelArn: rec.channelArn,
                 lobbyName: rec.lobbyName,
+                callBindingStatus: rec.callBindingStatus,
+                recordingGoverned: rec.recordingGoverned,
                 startedAt: rec.startedAt,
                 endedAt: rec.endedAt,
                 // Media length, not session lifetime. The fan-out row has
@@ -797,8 +839,17 @@ export class CallRecordingRepository extends BaseRepository {
     userId: string,
     recordingId: string,
   ): Promise<{ detail: CallRecording; isParticipant: boolean } | null> {
-    const detail = await this.findByRecordingId(recordingId);
+    let detail = await this.findByRecordingId(recordingId);
     if (!detail) return null;
+    if (isGovernedRecordingLobby(detail.lobbyName) || newGovernedRecording(detail)) {
+      // The GSI only finds the key. Strong-read the current primary so an
+      // old index projection cannot restore a revoked/replayed entitlement.
+      const current = await this.docClient.send(new GetCommand({ TableName: CALL_RECORDINGS_TABLE,
+        Key: { callId: detail.callId, recordingId }, ConsistentRead: true }));
+      if (!current.Item) return null;
+      detail = normalizeDuration(current.Item as CallRecording);
+      if (newGovernedRecording(detail) && !nativeRecordedUsers(detail).has(userId)) return { detail, isParticipant: false };
+    }
     const isParticipant = await this.hasParticipantRow(
       userId,
       detail.startedAt,
@@ -980,6 +1031,8 @@ export class CallRecordingRepository extends BaseRepository {
       sessionDurationMs: i.sessionDurationMs as number | undefined,
       channelArn: i.channelArn as string,
       lobbyName: i.lobbyName as string,
+      callBindingStatus: i.callBindingStatus as CallRecording['callBindingStatus'],
+      recordingGoverned: i.recordingGoverned as boolean | undefined,
       thumbnailUrl: i.thumbnailUrl as string | undefined,
       composedUrl: i.composedUrl as string | undefined,
       participantCount: i.participantCount as number | undefined,
@@ -991,7 +1044,7 @@ export class CallRecordingRepository extends BaseRepository {
         : undefined,
     }));
     // Two guards the fan-out index cannot provide on its own, in one pass.
-    const items = await this.hydrateComposeState(dedupeByRecordingId(rows));
+    const items = await this.hydrateComposeState(dedupeByRecordingId(rows), userId);
     const cursor = out.LastEvaluatedKey
       ? (out.LastEvaluatedKey.startedAtRecordingId as string)
       : undefined;
@@ -1015,6 +1068,7 @@ export class CallRecordingRepository extends BaseRepository {
    */
   private async hydrateComposeState(
     rows: RecordingListRow[],
+    userId: string,
   ): Promise<RecordingListRow[]> {
     if (rows.length === 0) return rows;
     // BatchGetItem caps at 100 keys per table per call; a page is ≤100 by
@@ -1023,7 +1077,7 @@ export class CallRecordingRepository extends BaseRepository {
     const chunks: RecordingListRow[][] = [];
     for (let i = 0; i < rows.length; i += 100) chunks.push(rows.slice(i, i + 100));
 
-    const byId = new Map<string, ComposableRecording & { transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus']; ttl?: number }>();
+    const byId = new Map<string, ComposableRecording & { transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus']; transcriptionRequested?: boolean; callBindingStatus?: CallRecording['callBindingStatus']; callBindingReason?: string; recordingGoverned?: boolean; ttl?: number }>();
     for (const chunk of chunks) {
       try {
         const res = await this.docClient.send(
@@ -1041,6 +1095,7 @@ export class CallRecordingRepository extends BaseRepository {
                 // track manifests across.
                 ProjectionExpression: HYDRATE_PROJECTION,
                 ExpressionAttributeNames: HYDRATE_NAMES,
+                ConsistentRead: true,
               },
             },
           }),
@@ -1064,18 +1119,23 @@ export class CallRecordingRepository extends BaseRepository {
       }
     }
 
-    return rows.map((r) => {
+    return rows.flatMap((r): RecordingListRow[] => {
       const primary = byId.get(r.recordingId);
-      if (!primary) return r;
-      return {
+      if (!primary) return newGovernedRecording(r) || isGovernedRecordingLobby(r.lobbyName) ? [] : [r];
+      if ((newGovernedRecording(primary) || newGovernedRecording(r)) && !nativeRecordedUsers(primary).has(userId)) return [];
+      return [{
         ...r,
         composeStatus: deriveComposeStatus(primary),
         transcriptStatus: primary.transcriptStatus,
         summaryStatus: primary.summaryStatus,
+        transcriptionRequested: primary.transcriptionRequested,
+        callBindingStatus: primary.callBindingStatus,
+        callBindingReason: primary.callBindingReason,
+        recordingGoverned: primary.recordingGoverned,
         // The primary's ttl is the expiry; the fan-out row mirrors it but the
         // primary is what PATCH /expiry writes first.
         ttl: typeof primary.ttl === 'number' ? primary.ttl : r.ttl,
-      };
+      }];
     });
   }
 
@@ -1147,6 +1207,11 @@ export class CallRecordingRepository extends BaseRepository {
         // "is this playable" question permanently unanswerable.
         composeStatus: deriveComposeStatus(i),
         transcriptStatus: i.transcriptStatus,
+        summaryStatus: i.summaryStatus,
+        transcriptionRequested: i.transcriptionRequested,
+        callBindingStatus: i.callBindingStatus,
+        callBindingReason: i.callBindingReason,
+        recordingGoverned: i.recordingGoverned,
         ttl: typeof i.ttl === 'number' ? (i.ttl as number) : undefined,
         // Distinct PEOPLE. Deliberately re-derived instead of reading the
         // stored scalar: legacy rows stored `participants.length`, which
@@ -1266,13 +1331,18 @@ export class CallRecordingRepository extends BaseRepository {
       transcriptKey?: string;
       /** The transcript itself, when stored on the row (`transcriptKey === 'inline'`). */
       transcriptJson?: string;
-      summaryKey?: string;
-      summaryMarkdown?: string;
+      summaryKey?: string | null;
+      summaryMarkdown?: string | null;
       transcriptGeneratedAt?: string;
       transcriptError?: string | null;
+      transcriptionRequested?: boolean;
       /** `skipped`: the transcript is ready but there was no speech to summarise. */
       summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed' | 'skipped';
-      summaryRunId?: string;
+      summaryRunId?: string | null;
+      processingAttemptId?: string;
+      expectedProcessingAttemptId?: string;
+      expectedSummaryRunId?: string;
+      summaryGeneratedAt?: string | null;
       summaryError?: string | null;
       /** Override for the status clock. Tests only; production uses now. */
       statusAt?: string;
@@ -1288,10 +1358,28 @@ export class CallRecordingRepository extends BaseRepository {
     if (patch.summaryStatus !== undefined) {
       sets.push('summaryStatus = :ss');
       values[':ss'] = patch.summaryStatus;
+      sets.push('summaryStatusAt = :ssa');
+      values[':ssa'] = patch.statusAt ?? new Date().toISOString();
     }
-    if (patch.summaryRunId !== undefined) {
+    if (patch.transcriptionRequested !== undefined) {
+      sets.push('transcriptionRequested = :tr');
+      values[':tr'] = patch.transcriptionRequested;
+    }
+    if (patch.summaryRunId === null) {
+      removes.push('summaryRunId');
+    } else if (patch.summaryRunId !== undefined) {
       sets.push('summaryRunId = :sr');
       values[':sr'] = patch.summaryRunId;
+    }
+    if (patch.processingAttemptId !== undefined) {
+      sets.push('processingAttemptId = :pa');
+      values[':pa'] = patch.processingAttemptId;
+    }
+    if (patch.summaryGeneratedAt === null) {
+      removes.push('summaryGeneratedAt');
+    } else if (patch.summaryGeneratedAt !== undefined) {
+      sets.push('summaryGeneratedAt = :sga');
+      values[':sga'] = patch.summaryGeneratedAt;
     }
     if (patch.summaryError === null) {
       removes.push('summaryError');
@@ -1307,11 +1395,15 @@ export class CallRecordingRepository extends BaseRepository {
       sets.push('transcriptJson = :tj');
       values[':tj'] = patch.transcriptJson;
     }
-    if (patch.summaryKey !== undefined) {
+    if (patch.summaryKey === null) {
+      removes.push('summaryKey');
+    } else if (patch.summaryKey !== undefined) {
       sets.push('summaryKey = :sk');
       values[':sk'] = patch.summaryKey;
     }
-    if (patch.summaryMarkdown !== undefined) {
+    if (patch.summaryMarkdown === null) {
+      removes.push('summaryMarkdown');
+    } else if (patch.summaryMarkdown !== undefined) {
       sets.push('summaryMarkdown = :sm');
       values[':sm'] = patch.summaryMarkdown;
     }
@@ -1329,6 +1421,24 @@ export class CallRecordingRepository extends BaseRepository {
     const updateExpression = removes.length
       ? `SET ${sets.join(', ')} REMOVE ${removes.join(', ')}`
       : `SET ${sets.join(', ')}`;
+    const conditions = ['attribute_exists(callId)'];
+    if (patch.expectedProcessingAttemptId !== undefined) {
+      conditions.push('processingAttemptId = :epa');
+      values[':epa'] = patch.expectedProcessingAttemptId;
+    }
+    if (patch.expectedSummaryRunId !== undefined) {
+      let unsettled = 'summaryStatus IN (:pending, :processing)';
+      // A successful DDB write can lose its response. The executor may replay
+      // that same result, but it must not change a settled result's contents.
+      const sameTerminal = patch.summaryStatus === 'ready' && typeof patch.summaryMarkdown === 'string'
+        ? 'summaryStatus = :ss AND summaryMarkdown = :sm'
+        : patch.summaryStatus === 'skipped' ? 'summaryStatus = :ss'
+        : patch.summaryStatus === 'failed' && typeof patch.summaryError === 'string' ? 'summaryStatus = :ss AND summaryError = :serr' : undefined;
+      if (sameTerminal) unsettled = `(${unsettled} OR (${sameTerminal}))`;
+      conditions.push('summaryRunId = :esr', 'transcriptStatus = :ready', unsettled);
+      values[':esr'] = patch.expectedSummaryRunId;
+      values[':ready'] = 'ready'; values[':pending'] = 'pending'; values[':processing'] = 'processing';
+    }
     await this.docClient.send(
       new UpdateCommand({
         TableName: CALL_RECORDINGS_TABLE,
@@ -1336,7 +1446,7 @@ export class CallRecordingRepository extends BaseRepository {
         UpdateExpression: updateExpression,
         ExpressionAttributeNames: Object.keys(names).length ? names : undefined,
         ExpressionAttributeValues: values,
-        ConditionExpression: 'attribute_exists(callId)',
+        ConditionExpression: conditions.join(' AND '),
       }),
     );
   }

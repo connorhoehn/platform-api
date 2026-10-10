@@ -41,13 +41,51 @@ export class BedrockLLMClient implements LLMClient {
         }
 
         // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } =
-          require('@aws-sdk/client-bedrock-runtime');
+        const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand, ConverseStreamCommand } =
+          require('@aws-sdk/client-bedrock-runtime') as typeof import('@aws-sdk/client-bedrock-runtime');
 
         const llmRegion = process.env['PIPELINE_LLM_AWS_REGION'] ?? process.env.AWS_REGION ?? 'us-east-1';
         const client = new BedrockRuntimeClient({
           region: llmRegion,
         });
+
+        // Nova uses Bedrock's model-independent Converse schema. Sending the
+        // legacy Anthropic envelope to Nova is not a provider switch.
+        if (model.includes('amazon.nova-')) {
+          try {
+            const response = await client.send(new ConverseStreamCommand({
+              modelId: model,
+              ...(systemPrompt ? { system: [{ text: systemPrompt }] } : {}),
+              messages: [{ role: 'user', content: [{ text: userPrompt }] }],
+              inferenceConfig: { maxTokens, ...(temperature !== undefined ? { temperature } : {}) },
+            }), { abortSignal: signal });
+            if (!response.stream) throw new Error('Bedrock returned no response stream');
+            let fullResponse = '';
+            let tokensIn: number | undefined;
+            let tokensOut: number | undefined;
+            for await (const event of response.stream) {
+              if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+              const failure = event.internalServerException ?? event.modelStreamErrorException
+                ?? event.validationException ?? event.throttlingException ?? event.serviceUnavailableException;
+              if (failure) throw new Error(`Bedrock stream failed: ${failure.message ?? 'provider error'}`);
+              const token = event.contentBlockDelta?.delta?.text;
+              if (typeof token === 'string') {
+                fullResponse += token;
+                yield { done: false, token };
+              }
+              if (event.metadata?.usage) {
+                tokensIn = event.metadata.usage.inputTokens;
+                tokensOut = event.metadata.usage.outputTokens;
+              }
+            }
+            yield { done: true, response: fullResponse,
+              tokensIn: tokensIn ?? Math.max(1, Math.round(userPrompt.length / 4)),
+              tokensOut: tokensOut ?? Math.max(1, Math.round(fullResponse.length / 4)) };
+          } finally {
+            client.destroy?.();
+          }
+          return;
+        }
 
         const body: Record<string, unknown> = {
           anthropic_version: 'bedrock-2023-05-31',
@@ -66,7 +104,7 @@ export class BedrockLLMClient implements LLMClient {
           accept: 'application/json',
         });
 
-        const response = await client.send(command);
+        const response = await client.send(command, { abortSignal: signal });
 
         let fullResponse = '';
         let tokensIn = 0;

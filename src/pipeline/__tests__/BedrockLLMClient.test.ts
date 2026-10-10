@@ -10,17 +10,19 @@ import { describe, it, expect, jest, beforeEach } from '@jest/globals';
 // Mock @aws-sdk/client-bedrock-runtime before importing module under test
 // ---------------------------------------------------------------------------
 
-const mockSend = jest.fn<(cmd: unknown) => Promise<unknown>>();
+const mockSend = jest.fn<(cmd: unknown, options?: unknown) => Promise<unknown>>();
 
 const MockBedrockRuntimeClient = jest.fn().mockImplementation(() => ({
   send: mockSend,
 }));
 
 const MockInvokeModelWithResponseStreamCommand = jest.fn().mockImplementation((params: unknown) => params);
+const MockConverseStreamCommand = jest.fn().mockImplementation((params: unknown) => params);
 
 jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
   BedrockRuntimeClient: MockBedrockRuntimeClient,
   InvokeModelWithResponseStreamCommand: MockInvokeModelWithResponseStreamCommand,
+  ConverseStreamCommand: MockConverseStreamCommand,
 }));
 
 import { BedrockLLMClient } from '../BedrockLLMClient';
@@ -67,6 +69,44 @@ beforeEach(() => {
   jest.resetAllMocks();
   MockBedrockRuntimeClient.mockImplementation(() => ({ send: mockSend }));
   MockInvokeModelWithResponseStreamCommand.mockImplementation((p: unknown) => p);
+  MockConverseStreamCommand.mockImplementation((p: unknown) => p);
+});
+
+describe('BedrockLLMClient Nova ConverseStream', () => {
+  const response = (events: unknown[]) => mockSend.mockResolvedValue({ stream: (async function* () { for (const event of events) yield event; })() });
+  it('sends Nova’s native schema and returns actual streamed text and usage', async () => {
+    response([{ contentBlockDelta: { delta: { text: '## Summary\n' } } },
+      { contentBlockDelta: { delta: { text: 'The team agreed.' } } },
+      { metadata: { usage: { inputTokens: 103, outputTokens: 18 } } }]);
+    const abort = new AbortController();
+    const chunks = await collectChunks(new BedrockLLMClient(), 'amazon.nova-pro-v1:0', 'summarise', 'Call: Agree', { maxTokens: 2048, temperature: 0.1, signal: abort.signal });
+    expect(MockConverseStreamCommand).toHaveBeenCalledWith({ modelId: 'amazon.nova-pro-v1:0',
+      system: [{ text: 'summarise' }], messages: [{ role: 'user', content: [{ text: 'Call: Agree' }] }],
+      inferenceConfig: { maxTokens: 2048, temperature: 0.1 } });
+    expect(MockInvokeModelWithResponseStreamCommand).not.toHaveBeenCalled();
+    expect(mockSend).toHaveBeenCalledWith(expect.anything(), { abortSignal: abort.signal });
+    expect(chunks.at(-1)).toEqual({ done: true, response: '## Summary\nThe team agreed.', tokensIn: 103, tokensOut: 18 });
+  });
+  it('supports a Nova inference profile without translating its identity', async () => {
+    response([{ metadata: { usage: { inputTokens: 0, outputTokens: 0 } } }]);
+    const chunks = await collectChunks(new BedrockLLMClient(), 'us.amazon.nova-pro-v1:0', '', 'hi');
+    expect(MockConverseStreamCommand).toHaveBeenCalledWith(expect.objectContaining({ modelId: 'us.amazon.nova-pro-v1:0' }));
+    expect((MockConverseStreamCommand.mock.calls[0][0] as Record<string, unknown>).system).toBeUndefined();
+    expect(chunks.at(-1)).toMatchObject({ tokensIn: 0, tokensOut: 0 });
+  });
+  it('fails when Bedrock never returned a stream', async () => {
+    mockSend.mockResolvedValue({});
+    await expect(collectChunks(new BedrockLLMClient(), 'amazon.nova-pro-v1:0')).rejects.toThrow('no response stream');
+  });
+  it.each(['internalServerException', 'modelStreamErrorException', 'validationException', 'throttlingException', 'serviceUnavailableException'])('does not turn %s into a successful empty summary', async (field) => {
+    response([{ [field]: { message: 'native inference refused' } }]);
+    await expect(collectChunks(new BedrockLLMClient(), 'amazon.nova-pro-v1:0')).rejects.toThrow('native inference refused');
+  });
+  it('propagates abort after response headers before consuming more output', async () => {
+    const abort = new AbortController();
+    mockSend.mockResolvedValue({ stream: (async function* () { abort.abort(); yield { contentBlockDelta: { delta: { text: 'discard' } } }; })() });
+    await expect(collectChunks(new BedrockLLMClient(), 'amazon.nova-pro-v1:0', '', 'hi', { signal: abort.signal })).rejects.toMatchObject({ name: 'AbortError' });
+  });
 });
 
 // ---------------------------------------------------------------------------

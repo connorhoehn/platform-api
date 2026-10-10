@@ -184,7 +184,15 @@ if ARGV[2] == '' then redis.call('DEL', KEYS[1]) else redis.call('SET', KEYS[1],
 return 1`;
 
 type Cmd = { sendCommand(args: string[]): Promise<unknown> };
-let localBreaker = '';
+const localBreakers = new Map<string, string>();
+export type ModelBreakerScope = 'anthropic' | 'bedrock' | 'codex' | 'claude-code';
+
+function breakerKey(scope?: ModelBreakerScope): string {
+  if (scope && !['anthropic', 'bedrock', 'codex', 'claude-code'].includes(scope)) throw new Error('Unknown model breaker scope');
+  // The default provider retains its proactive probe and existing operator controls.
+  return !scope || scope === (process.env.PIPELINE_LLM_PROVIDER || 'anthropic')
+    ? BREAKER_KEY : `${BREAKER_KEY}:${scope}`;
+}
 let localProbe = '';
 
 async function client(): Promise<Cmd | null> {
@@ -199,30 +207,32 @@ function parse(raw: string): BreakerState {
   } catch { return { ...CLOSED }; }
 }
 
-async function readRaw(): Promise<{ raw: string; redis: Cmd | null }> {
+async function readRaw(scope?: ModelBreakerScope): Promise<{ raw: string; redis: Cmd | null }> {
+  const key = breakerKey(scope);
   const redis = await client();
-  if (!redis) return { raw: localBreaker, redis: null };
-  const raw = await redis.sendCommand(['GET', BREAKER_KEY]).catch(() => null);
+  if (!redis) return { raw: localBreakers.get(key) || '', redis: null };
+  const raw = await redis.sendCommand(['GET', key]).catch(() => null);
   return { raw: typeof raw === 'string' ? raw : '', redis };
 }
 
-export async function readBreaker(): Promise<BreakerState> {
-  return parse((await readRaw()).raw);
+export async function readBreaker(scope?: ModelBreakerScope): Promise<BreakerState> {
+  return parse((await readRaw(scope)).raw);
 }
 
 /** Read → transition → compare-and-set, a few times over a concurrent writer. */
-async function update(step: (s: BreakerState) => BreakerState | null): Promise<BreakerState> {
+async function update(step: (s: BreakerState) => BreakerState | null, scope?: ModelBreakerScope): Promise<BreakerState> {
+  const key = breakerKey(scope);
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const { raw, redis } = await readRaw();
+    const { raw, redis } = await readRaw(scope);
     const cur = parse(raw);
     const next = step(cur);
     if (!next) return cur;
     const value = JSON.stringify({ ...next, node: NODE });
-    if (!redis) { localBreaker = value; return next; }
-    const ok = await redis.sendCommand(['EVAL', CAS, '1', BREAKER_KEY, raw, value, String(BREAKER_TTL_MS)]).catch(() => null);
+    if (!redis) { localBreakers.set(key, value); return next; }
+    const ok = await redis.sendCommand(['EVAL', CAS, '1', key, raw, value, String(BREAKER_TTL_MS)]).catch(() => null);
     if (Number(ok) === 1) return next;
   }
-  return readBreaker();
+  return readBreaker(scope);
 }
 
 // ── The guard every real model call goes through ────────────────────────────
@@ -251,10 +261,19 @@ export interface ModelCallTicket {
  * a streaming caller (modelGate.ts) can hold it across an async generator.
  * Open: throws ModelUnavailableError at once.
  */
-export async function admitModelCall(): Promise<ModelCallTicket> {
+export async function admitModelCall(scope?: ModelBreakerScope): Promise<ModelCallTicket> {
+  const scoped = breakerKey(scope) !== BREAKER_KEY;
+  // An operator's fleet-wide stop applies even to independently configured providers.
+  if (scoped) {
+    const global = await readBreaker();
+    if (global.forced) {
+      rejected += 1; gauges().rejected.inc(1);
+      throw new ModelUnavailableError('forced', global.forced.reason);
+    }
+  }
   const cfg = breakerConfig();
   let verdict: Admission | null = null;
-  await update((s) => { verdict = admit(s, Date.now(), cfg); return verdict.next; }).catch(() => null);
+  await update((s) => { verdict = admit(s, Date.now(), cfg); return verdict.next; }, scope).catch(() => null);
   const v = verdict as Admission | null;
   if (v && !v.allow) {
     rejected += 1;
@@ -262,18 +281,19 @@ export async function admitModelCall(): Promise<ModelCallTicket> {
     throw new ModelUnavailableError(v.kind, v.reason, v.retryInMs);
   }
   const trial = Boolean(v?.allow && v.trial);
-  if (trial) log.info({ node: NODE }, 'model breaker: half-open trial call');
+  if (trial) log.info({ node: NODE, provider: scope }, 'model breaker: half-open trial call');
   return {
     async succeeded() {
-      await update((s) => onSuccess(s, Date.now())).then((s) => { if (trial) log.info({ node: NODE, state: s.state }, 'model breaker: trial succeeded'); }).catch(() => undefined);
+      await update((s) => onSuccess(s, Date.now()), scope).then((s) => { if (trial) log.info({ node: NODE, provider: scope, state: s.state }, 'model breaker: trial succeeded'); }).catch(() => undefined);
     },
     async failed(err: unknown, isNeutral: NeutralCheck = () => false) {
       const failure = isNeutral(err) ? null : classifyModelFailure(err instanceof Error ? err.message : String(err));
       if (failure) {
-        const after = await update((s) => onFailure(s, Date.now(), failure, cfg)).catch(() => null);
-        if (after?.state === 'open') log.warn({ node: NODE, kind: failure.kind, reason: failure.reason, failures: after.failures, untilMs: (after.until ?? 0) - Date.now() }, 'model breaker: open');
+        if (scope && failure.kind === 'auth') failure.reason = `The configured ${scope} provider could not authenticate; check its login or bridge configuration.`;
+        const after = await update((s) => onFailure(s, Date.now(), failure, cfg), scope).catch(() => null);
+        if (after?.state === 'open') log.warn({ node: NODE, provider: scope, kind: failure.kind, reason: failure.reason, failures: after.failures, untilMs: (after.until ?? 0) - Date.now() }, 'model breaker: open');
       } else {
-        await update((s) => onNeutral(s, Date.now())).catch(() => undefined);
+        await update((s) => onNeutral(s, Date.now()), scope).catch(() => undefined);
       }
     },
   };
@@ -505,5 +525,5 @@ export function startModelHealthGauges(everyMs = 15_000): () => void {
 }
 
 /** Tests. */
-export function resetModelHealth(): void { localBreaker = ''; localProbe = ''; rejected = 0; }
+export function resetModelHealth(): void { localBreakers.clear(); localProbe = ''; rejected = 0; }
 export function rejectedCount(): number { return rejected; }

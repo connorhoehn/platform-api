@@ -25,7 +25,7 @@ describe('the transcription pipeline writes through document:apply', () => {
     expect(apply.data).toMatchObject({ opsFrom: 'transcriptOps', optional: true });
     expect(def.edges.map((e) => `${e.source}->${e.target}`)).toEqual([
       'trigger->transcribe', 'transcribe->merge-reactions', 'merge-reactions->store',
-      'store->summarize', 'summarize->store-summary', `store-summary->${apply.id}`, `${apply.id}->publish`,
+      'store->has-speech', 'has-speech->summarize', 'has-speech->store-summary', 'summarize->store-summary', `store-summary->${apply.id}`, `${apply.id}->publish`,
     ]);
   });
 

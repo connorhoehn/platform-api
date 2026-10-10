@@ -19,7 +19,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { startSystemRun, buildCallTranscriptionDefinition, CALL_TRANSCRIPTION_PIPELINE_ID, documentIdForLobby } from '../recordings/recordingPipelines';
+import { startRecordingTranscription, CALL_TRANSCRIPTION_PIPELINE_ID } from '../recordings/recordingPipelines';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
@@ -58,14 +58,8 @@ recordingsRouter.post('/recordings/:recordingId/transcribe', requireAuth, asyncH
   // NFR #175: a participant of the call only (`recording:read`, 404 otherwise),
   // like every other /recordings/:recordingId route — not any logged-in user.
   const rec = await requireOwnRecording(req, recordingId);
-  await callRecordingRepo.updateTranscriptStatus(rec.callId, rec.recordingId, { status: 'pending', transcriptError: null });
-  const runId = await startSystemRun(CALL_TRANSCRIPTION_PIPELINE_ID, buildCallTranscriptionDefinition(), {
-    recordingId: rec.recordingId, callId: rec.callId, arn: rec.channelArn, lobbyName: rec.lobbyName, composedKey: rec.composedSegment?.key ?? null,
-    startedAt: rec.startedAt, documentId: documentIdForLobby(rec.lobbyName), requestedBy: req.user!.sub,
-    // The Activity graph's transcript lifecycle needs both (NFR #159).
-    ...(rec.orgId ? { organizationId: rec.orgId } : {}), ...(rec.startedBy ? { startedBy: rec.startedBy } : {}),
-  }, req.user!.sub);
-  res.status(202).json({ runId, pipelineId: CALL_TRANSCRIPTION_PIPELINE_ID, recordingId: rec.recordingId });
+  const attempt = await startRecordingTranscription(rec, req.user!.sub);
+  res.status(202).json({ ...attempt, pipelineId: CALL_TRANSCRIPTION_PIPELINE_ID, recordingId: rec.recordingId });
 }));
 
 // --------------------------------------------------------------------
@@ -83,6 +77,7 @@ recordingsRouter.get(
     const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
     const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
     const lobbyName = typeof req.query.lobbyName === 'string' ? req.query.lobbyName : undefined;
+    res.setHeader('Cache-Control', 'private, no-store');
 
     // W6 — room-scoped filter for RoomAdminPage.
     //
@@ -150,10 +145,11 @@ recordingsRouter.get(
 );
 
 /** What a list row says beyond the stored fields: the stage and the expiry, as the detail does. */
-function withListView<T extends { ttl?: number; composeStatus?: ComposeStatus; transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus'] }>(rows: T[]): Array<T & { stage: ReturnType<typeof recordingStage>; expiresAt: string | null }> {
+function withListView<T extends { ttl?: number; lobbyName?: string; composeStatus?: ComposeStatus; transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus'] }>(rows: T[]): Array<T & { stage: ReturnType<typeof recordingStage>; expiresAt: string | null }> {
   return rows.map((r) => ({
     ...r,
     stage: recordingStage(r),
+    artifactContext: recordingArtifactContext(r.lobbyName),
     expiresAt: r.ttl ? new Date(r.ttl * 1000).toISOString() : null,
   }));
 }
@@ -452,6 +448,7 @@ recordingsRouter.get(
     const { recordingId } = req.params;
     const detail = await requireOwnRecording(req, recordingId);
     const media = await resolveMedia(detail);
+    res.setHeader('Cache-Control', 'private, no-store');
     res.json({ ...publicRecordingView(detail), ...mediaView(detail, media) });
   }),
 );
@@ -510,9 +507,18 @@ export function recordingStage(detail: Pick<CallRecording, 'composeStatus' | 'tr
   const compose = detail.composeStatus ?? 'queued';
   if (compose === 'queued' || compose === 'running') return 'saving';
   if (compose === 'failed') return 'failed';
+  if (detail.transcriptStatus === 'failed') return 'failed';
   if (detail.transcriptStatus === 'pending' || detail.transcriptStatus === 'processing') return 'transcribing';
+  if (detail.summaryStatus === 'failed') return 'failed';
   if (detail.summaryStatus === 'pending' || detail.summaryStatus === 'processing') return 'summarizing';
   return 'ready';
+}
+
+/** Link only the canonical stored page lobby. Recording a work item/deck does
+ * not prove a finer link unless that binding was actually persisted. */
+export function recordingArtifactContext(lobbyName: unknown): { tenant: 'orgiq'; initiativeId: string } | null {
+  const match = typeof lobbyName === 'string' ? /^orgiq:initiative:([^:\s]{1,200})$/.exec(lobbyName) : null;
+  return match ? { tenant: 'orgiq', initiativeId: match[1] } : null;
 }
 
 function publicRecordingView(detail: CallRecording): Record<string, unknown> {
@@ -528,6 +534,7 @@ function publicRecordingView(detail: CallRecording): Record<string, unknown> {
     participants: people.participants,
     participantCount: people.participantCount,
     stage: recordingStage(detail),
+    artifactContext: recordingArtifactContext(detail.lobbyName),
     // The row's ttl is when DynamoDB drops it — which is when the recording
     // expires, and what the card's "Set to expire" line says.
     expiresAt: detail.ttl ? new Date(detail.ttl * 1000).toISOString() : null,
@@ -850,7 +857,8 @@ function writeTranscriptProgress(
     (status === 'pending' || status === 'processing')
     && Number.isFinite(waitedMs)
     && waitedMs > TRANSCRIPT_STALL_MS;
-  const terminal = status === 'failed' || stalled;
+  const unclocked = !Number.isFinite(waitedMs);
+  const terminal = status === 'failed' || stalled || unclocked;
   // Backoff, not a fixed interval: a job that just started is worth asking
   // about soon, one that has been running ten minutes is not.
   const retryAfterMs = terminal
@@ -860,7 +868,7 @@ function writeTranscriptProgress(
     res.setHeader('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
   }
   res.status(202).json({
-    status: stalled ? 'stalled' : status,
+    status: stalled ? 'stalled' : unclocked && status !== 'failed' ? 'unavailable' : status,
     recordingId,
     terminal,
     retryAfterMs,
@@ -869,7 +877,7 @@ function writeTranscriptProgress(
     // seven-figure wait cannot tell a genuinely old job from the bug this
     // field was added alongside.
     waitedFrom: Number.isFinite(clockedFromMs) ? new Date(clockedFromMs).toISOString() : null,
-    error: detail.transcriptError ?? null,
+    error: detail.transcriptError ?? (unclocked ? 'Transcription status clock is unavailable' : null),
     generatedAt: detail.transcriptGeneratedAt ?? null,
     // The summary is a separate job over the transcript. It cannot be
     // further along than the transcript is, so while this endpoint is
@@ -877,7 +885,28 @@ function writeTranscriptProgress(
     // one shape carries both axes wherever a client looks.
     summaryStatus: detail.summaryStatus ?? null,
     summaryError: detail.summaryError ?? null,
+    summaryRunId: detail.summaryRunId ?? null,
+    processingAttemptId: detail.processingAttemptId ?? null,
   });
+}
+
+/** Summary has its own clock and terminal state; transcript readiness is not
+ * proof that a model call finished. Do not serve an old markdown placeholder
+ * as a successful summary while the current attempt is still running. */
+function writeSummaryProgress(res: Response, recordingId: string, detail: CallRecording): void {
+  const from = detail.summaryStatusAt ?? detail.transcriptStatusAt ?? detail.transcriptGeneratedAt ?? detail.endedAt;
+  const waitedMs = Date.now() - Date.parse(from);
+  const unclocked = !Number.isFinite(waitedMs);
+  const stalled = Number.isFinite(waitedMs) && waitedMs > TRANSCRIPT_STALL_MS;
+  const terminal = stalled || unclocked;
+  const retryAfterMs = terminal ? null : Math.min(60_000, Math.max(5_000, Math.round(waitedMs / 10) || 5_000));
+  if (retryAfterMs) res.setHeader('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+  res.status(202).json({ recordingId, callId: detail.callId, status: stalled ? 'stalled' : unclocked ? 'unavailable' : detail.summaryStatus,
+    transcriptStatus: 'ready', summaryStatus: detail.summaryStatus, summaryError: detail.summaryError ?? null,
+    error: detail.summaryError ?? (unclocked ? 'Summary status clock is unavailable' : null),
+    summaryRunId: detail.summaryRunId ?? null, processingAttemptId: detail.processingAttemptId ?? null,
+    terminal, retryAfterMs, waitedMs: Number.isFinite(waitedMs) ? Math.max(0, waitedMs) : null,
+    waitedFrom: Number.isFinite(Date.parse(from)) ? new Date(from).toISOString() : null });
 }
 
 // --------------------------------------------------------------------
@@ -907,6 +936,8 @@ recordingsRouter.get(
     const detail = await requireOwnRecording(req, recordingId);
 
     const status = detail.transcriptStatus;
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Access-Control-Expose-Headers', 'X-Summary-Status, Retry-After');
     if (status === undefined) {
       throw new NotFoundError('transcription not requested for this recording');
     }
@@ -1018,6 +1049,8 @@ recordingsRouter.get(
     const detail = await requireOwnRecording(req, recordingId);
 
     const status = detail.transcriptStatus;
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Access-Control-Expose-Headers', 'X-Summary-Status, Retry-After');
     if (status === undefined) {
       throw new NotFoundError('transcription not requested for this recording');
     }
@@ -1039,6 +1072,11 @@ recordingsRouter.get(
       'X-Summary-Status',
       detail.summaryStatus ?? (detail.summaryMarkdown ? 'ready' : 'none'),
     );
+
+    if (detail.summaryStatus === 'pending' || detail.summaryStatus === 'processing') {
+      writeSummaryProgress(res, recordingId, detail);
+      return;
+    }
 
     if (detail.summaryStatus === 'failed') {
       // The transcript is ready — this route only gets here when it is —

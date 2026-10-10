@@ -63,6 +63,23 @@ export interface VideoSessionParticipant {
 /** Authenticated attendance survives removal from the live ref-count roster. */
 export interface VideoSessionAttendance extends VideoSessionParticipant {
   leftAt?: string;
+  /** Immutable, server-proven signaling seat for this actual media leg. */
+  callBinding?: VideoParticipantCallBinding;
+}
+
+export interface VideoParticipantCallBinding {
+  callId: string; clientId: string; userId: string; tenant: string; epoch: number;
+  sessionId: string; channelArn: string; lobbyName: string;
+  actor?: { sub: string; epoch: number };
+  boundAt: string;
+}
+export class VideoCallBindingConflict extends Error {
+  constructor() { super('Media participant is already bound to another call identity'); this.name = 'VideoCallBindingConflict'; }
+}
+export function sameVideoCallBinding(a: VideoParticipantCallBinding, b: VideoParticipantCallBinding): boolean {
+  return a.callId === b.callId && a.clientId === b.clientId && a.userId === b.userId && a.tenant === b.tenant && a.epoch === b.epoch
+    && a.sessionId === b.sessionId && a.channelArn === b.channelArn && a.lobbyName === b.lobbyName
+    && a.actor?.sub === b.actor?.sub && a.actor?.epoch === b.actor?.epoch;
 }
 
 /**
@@ -178,6 +195,10 @@ export interface DocumentCallFieldsPatch {
  * the `VIDEO_SESSIONS_STORE` env flag.
  */
 export interface VideoSessionStore {
+  /** Bind only a currently seated native participant; identical retries retain
+   * the first timestamp, conflicting call/actor/socket identity never rewrites. */
+  bindCallParticipant(documentId: string, sessionId: string, participantId: string, channelArn: string,
+    binding: VideoParticipantCallBinding): Promise<VideoParticipantCallBinding | null>;
   createSession(record: VideoSessionRecord): Promise<VideoSessionRecord>;
   endSession(documentId: string, sessionId: string, endedAt: string): Promise<void>;
   addParticipant(

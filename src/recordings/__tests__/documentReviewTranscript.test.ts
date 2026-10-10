@@ -39,7 +39,7 @@ const applyNode = (buildCallTranscriptionDefinition() as { nodes: Array<{ type: 
 const apply = createDocumentApplyHandler();
 
 const spoken = [{ startMs: 0, endMs: 4000, speakerId: 'a', speakerLabel: 'Alice', text: 'sounds of the sound' }];
-const reviewSession = { sessionId: 's1', documentId: DOC, kind: 'document-review', documentIds: [DOC], startedBy: 'alice', orgId: 'org', participants: [{ userId: 'alice', displayName: 'Alice' }] };
+const reviewSession = { sessionId: 's1', channelArn: ARN, documentId: DOC, kind: 'document-review', documentIds: [DOC], startedBy: 'alice', orgId: 'org', participants: [{ userId: 'alice', displayName: 'Alice' }] };
 
 beforeEach(() => { updateTranscriptStatusMock.mockClear(); collaboratorCtor.mockClear(); startRun.mockClear(); process.env.TRANSCRIBE_EVERY_RECORDING = 'true'; });
 afterAll(() => { delete process.env.TRANSCRIBE_EVERY_RECORDING; });

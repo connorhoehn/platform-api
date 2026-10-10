@@ -2,8 +2,9 @@ import type { LLMClient } from '../LLMClient';
 import { AnthropicLLMClient } from '../AnthropicLLMClient';
 import { BedrockLLMClient } from '../BedrockLLMClient';
 import { ClaudeCodeLLMClient } from '../ClaudeCodeLLMClient';
+import { CodexLLMClient } from '../CodexLLMClient';
 
-export type LLMProvider = 'anthropic' | 'bedrock' | 'claude-code';
+export type LLMProvider = 'anthropic' | 'bedrock' | 'claude-code' | 'codex';
 
 export function createLLMClient(provider?: LLMProvider): LLMClient {
   const resolved: LLMProvider =
@@ -12,6 +13,8 @@ export function createLLMClient(provider?: LLMProvider): LLMClient {
     'anthropic';
 
   switch (resolved) {
+    case 'codex':
+      return new CodexLLMClient();
     case 'bedrock':
       return new BedrockLLMClient();
     case 'claude-code':

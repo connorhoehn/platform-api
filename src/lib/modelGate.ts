@@ -27,7 +27,7 @@ import os from 'os';
 import type { LLMChunk, LLMClient, LLMStreamOptions } from '../pipeline/LLMClient';
 import type { AgentClient, AgentEvent, AgentRunOptions } from '../pipeline/agent/types';
 import { acquireModelSlot, ModelSlotTimeoutError, type ModelPurpose, type ModelSlotOptions } from '../deck/modelSlots';
-import { admitModelCall, ModelUnavailableError } from './modelHealth';
+import { admitModelCall, ModelUnavailableError, type ModelBreakerScope } from './modelHealth';
 import { getRegistry } from '../observability/metrics';
 
 export type { ModelPurpose } from '../deck/modelSlots';
@@ -67,7 +67,7 @@ function timeoutFor(purpose: ModelPurpose): number {
 
 const neutral = (err: unknown) => err instanceof ModelSlotTimeoutError || (err as Error)?.name === 'AbortError';
 
-export type GateOptions = Omit<ModelSlotOptions, 'pool'>;
+export type GateOptions = Omit<ModelSlotOptions, 'pool'> & { breakerScope?: ModelBreakerScope };
 
 /**
  * Runs one model call as a stream through the gate. `open` gets the signal
@@ -81,7 +81,7 @@ export async function* gateStream<E>(
   const m = metrics(purpose);
   m.calls.inc(1);
   try {
-    const ticket = await admitModelCall();
+    const ticket = await admitModelCall(opts.breakerScope);
     let lease;
     try {
       lease = await acquireModelSlot({ ...opts, pool: purpose });
@@ -140,6 +140,8 @@ export function inputKey(...parts: unknown[]): string {
 export interface GatedClientOptions {
   /** Share one call between identical requests (buffers the answer; use where only the final text is read). */
   singleFlight?: boolean;
+  /** Isolate an explicit provider from failures of another configured provider. */
+  breakerScope?: ModelBreakerScope;
 }
 
 /** An LLMClient whose every stream goes through the gate under `purpose`. */
@@ -147,10 +149,10 @@ export function gatedLLMClient(inner: LLMClient, purpose: ModelPurpose, options:
   return {
     provider: inner.provider,
     stream(model: string, systemPrompt: string, userPrompt: string, opts: LLMStreamOptions = {}): AsyncIterable<LLMChunk> {
-      const run = () => gateStream<LLMChunk>(purpose, (signal) => inner.stream(model, systemPrompt, userPrompt, { ...opts, ...(signal ? { signal } : {}) }), opts.signal ? { signal: opts.signal } : {});
+      const run = () => gateStream<LLMChunk>(purpose, (signal) => inner.stream(model, systemPrompt, userPrompt, { ...opts, ...(signal ? { signal } : {}) }), { signal: opts.signal, breakerScope: options.breakerScope });
       if (!options.singleFlight) return run();
       const { signal: _s, ...rest } = opts;
-      return singleFlight(purpose, inputKey(inner.provider, model, systemPrompt, userPrompt, rest), run);
+      return singleFlight(purpose, inputKey(options.breakerScope, inner.provider, model, systemPrompt, userPrompt, rest), run);
     },
   };
 }
@@ -160,10 +162,10 @@ export function gatedAgentClient(inner: AgentClient, purpose: ModelPurpose, opti
   return {
     provider: inner.provider,
     run(prompt: string, opts: AgentRunOptions = {}): AsyncIterable<AgentEvent> {
-      const run = () => gateStream<AgentEvent>(purpose, (signal) => inner.run(prompt, { ...opts, ...(signal ? { signal } : {}) }), opts.signal ? { signal: opts.signal } : {});
+      const run = () => gateStream<AgentEvent>(purpose, (signal) => inner.run(prompt, { ...opts, ...(signal ? { signal } : {}) }), { signal: opts.signal, breakerScope: options.breakerScope });
       if (!options.singleFlight) return run();
       const { signal: _s, ...rest } = opts;
-      return singleFlight(purpose, inputKey(inner.provider, prompt, rest), run);
+      return singleFlight(purpose, inputKey(options.breakerScope, inner.provider, prompt, rest), run);
     },
   };
 }
