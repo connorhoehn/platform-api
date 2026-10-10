@@ -395,7 +395,7 @@ function resolveHandler(): DescribedStepHandler {
       // calls were given a kind on POST /api/video/sessions.
       const startedBy = session?.startedBy && (!governed || trustedTrackUsers.has(session.startedBy))
         ? session.startedBy : governed ? null : participants[0]?.userId ?? null;
-      return ok({ lobbyName, callId, callBindingStatus, callBindingReason, recordingGoverned: governed, sessionId: session?.sessionId ?? null, startedBy, organizationId: session?.orgId ?? null, participants, callKind: str(session?.kind) ?? null, chatChannel: chatChannelForLobby(lobbyName), documentId: documentIdForLobby(lobbyName) });
+      return ok({ lobbyName, callId, documentContext: bound && association.status === 'bound' ? association.documentContext ?? null : null, callBindingStatus, callBindingReason, recordingGoverned: governed, sessionId: session?.sessionId ?? null, startedBy, organizationId: session?.orgId ?? null, participants, callKind: str(session?.kind) ?? null, chatChannel: chatChannelForLobby(lobbyName), documentId: documentIdForLobby(lobbyName) });
     },
   };
 }
@@ -437,6 +437,9 @@ function persistHandler(): DescribedStepHandler {
         callBindingStatus: ctx.callBindingStatus === 'bound' || ctx.callBindingStatus === 'legacy' ? ctx.callBindingStatus : 'unresolved',
         callBindingReason: str(ctx.callBindingReason),
         ...(governed ? { recordingGoverned: true } : {}),
+        // Source association is emitted only by strict recorded-seat resolution,
+        // never by the webhook's detail or by the lobby hash alone.
+        ...(ctx.callBindingStatus === 'bound' && ctx.documentContext ? { documentContext: ctx.documentContext as CallRecording['documentContext'] } : {}),
         startedAt, endedAt, durationMs: mediaDurationMs, sessionDurationMs,
         totalBytes: Number(detail.totalSize ?? detail.totalBytes ?? 0),
         segments: Array.isArray(detail.segments) ? detail.segments : [],
@@ -450,7 +453,7 @@ function persistHandler(): DescribedStepHandler {
       return ok({ arn: saved.channelArn, callId: saved.callId, recordingId: saved.recordingId, sessionId: saved.sessionId,
         startedAt: saved.startedAt, endedAt: saved.endedAt, mediaDurationMs: saved.durationMs,
         participantCount: saved.participantCount ?? saved.participants.length, participants: saved.participants,
-        startedBy: saved.startedBy, organizationId: saved.orgId, lobbyName: saved.lobbyName,
+        startedBy: saved.startedBy, organizationId: saved.orgId, lobbyName: saved.lobbyName, documentContext: saved.documentContext,
         finalizationReplay: finalized.replay, finalizationAnnouncementPending: finalized.announcementPending });
     },
   };

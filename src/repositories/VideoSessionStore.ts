@@ -67,10 +67,13 @@ export interface VideoSessionAttendance extends VideoSessionParticipant {
   callBinding?: VideoParticipantCallBinding;
 }
 
+export interface DocumentCallContext { tenant: string; sourceId: string; lobbyName: string }
 export interface VideoParticipantCallBinding {
   callId: string; clientId: string; userId: string; tenant: string; epoch: number;
   sessionId: string; channelArn: string; lobbyName: string;
   actor?: { sub: string; epoch: number };
+  /** Original document source, independently verified by the owning BFF. */
+  documentContext?: DocumentCallContext;
   boundAt: string;
 }
 export class VideoCallBindingConflict extends Error {
@@ -79,7 +82,10 @@ export class VideoCallBindingConflict extends Error {
 export function sameVideoCallBinding(a: VideoParticipantCallBinding, b: VideoParticipantCallBinding): boolean {
   return a.callId === b.callId && a.clientId === b.clientId && a.userId === b.userId && a.tenant === b.tenant && a.epoch === b.epoch
     && a.sessionId === b.sessionId && a.channelArn === b.channelArn && a.lobbyName === b.lobbyName
-    && a.actor?.sub === b.actor?.sub && a.actor?.epoch === b.actor?.epoch;
+    && a.actor?.sub === b.actor?.sub && a.actor?.epoch === b.actor?.epoch
+    && a.documentContext?.tenant === b.documentContext?.tenant
+    && a.documentContext?.sourceId === b.documentContext?.sourceId
+    && a.documentContext?.lobbyName === b.documentContext?.lobbyName;
 }
 
 /**

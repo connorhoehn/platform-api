@@ -1,0 +1,200 @@
+{
+  "version": 1,
+  "recordedAt": "2026-10-10T17:46:06.929206+00:00",
+  "lane": "document-recording-backend",
+  "runtimeActivated": false,
+  "authority": "Current signed Assessment actor/tenant/epoch, accepted exact gateway socket for immutable bind; original source compared to first stored call channel and canonical lobby hash; participant and fresh source read for recordings/search. No policy or grant changes.",
+  "contract": {
+    "requestField": "documentSourceId",
+    "bindingField": "documentContext:{tenant,sourceId,lobbyName}",
+    "artifactDto": "artifactContext:{tenant:assessment,documentSourceId}",
+    "searchQuery": "/api/assessment/recordings/search and /records; documentSourceId, mutually exclusive with teamId",
+    "sourceNavigation": [
+      "workspace",
+      "enterprise",
+      "rules",
+      "prompts"
+    ]
+  },
+  "checks": [
+    {
+      "scope": "App source/hash/navigation, read-through search, Assessment query routes",
+      "cases": 65,
+      "status": "PASS"
+    },
+    {
+      "scope": "App accepted native store proof, native lobby callback, unchanged huddle lifecycle",
+      "cases": 35,
+      "status": "PASS",
+      "note": "Initial combined 29 passed; expanded lobby suite 18 replaces earlier 12."
+    },
+    {
+      "scope": "Native call seat callback + media binding routes",
+      "cases": 24,
+      "status": "PASS"
+    },
+    {
+      "scope": "Native binding memory/Dynamo command boundaries",
+      "cases": 14,
+      "status": "PASS"
+    },
+    {
+      "scope": "Native recording routes final document read/revocation checks",
+      "cases": 43,
+      "status": "PASS"
+    },
+    {
+      "scope": "Native lobby authority callback bounded read",
+      "cases": 17,
+      "status": "PASS"
+    },
+    {
+      "scope": "Isolated middleware typecheck",
+      "status": "PASS"
+    },
+    {
+      "scope": "Isolated native typecheck",
+      "status": "PASS"
+    },
+    {
+      "scope": "Both checkout diff whitespace checks",
+      "status": "PASS"
+    }
+  ],
+  "limitations": [
+    "Authority/source directory in tests are explicit fixtures; no live participant or live Cedar session acceptance is claimed.",
+    "No primary source edits, service restart, inspector, call, message, job, media or grant writes.",
+    "Only existing Assessment document call family; no speculative Work document policy or call surface.",
+    "Legacy calls with no immutable stored channel and legacy recordings without verified source remain unresolved/hidden.",
+    "Preexisting explicit share capability read contract remains unchanged.",
+    "Native raw asset recording-bound access candidate is separate and not activated by this lane."
+  ],
+  "files": [
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/lib/assessment-document-context.ts",
+      "baselineSha256": null,
+      "sourceSha256": "4e9f3988ad58dde5114daeef7cac0f3591b525042992d31514e2fc5e8cf48234"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/lib/__tests__/assessment-document-context.test.ts",
+      "baselineSha256": null,
+      "sourceSha256": "f9df26a98699c75926369bcbc2437659f775d724d0039db2aa8f36d349b13b06"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/lib/call-access.ts",
+      "baselineSha256": "79c57c7f685200fd43e4afd524a819b026fa4806eeb19f0d58f0e49e46beb054",
+      "sourceSha256": "7e3e4a2a42b1741b784056699e48b6a6ed52e89df29dd5fa20b97bd297cf1f0a"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/lib/call-media-proof.ts",
+      "baselineSha256": "8e79e7660d8e4b50a6a08c58b7c496e7390e43e48b57ae1aa7414426da61b3c3",
+      "sourceSha256": "02bfe0668238a45223003c547cdca4ac4174cca472c050557fed9d15bb8e907e"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/lib/__tests__/call-media-proof.test.ts",
+      "baselineSha256": "4207e51e4938e5f9f75fde52d1cf0d4f50cb057774bb45a2223163f87a25fb29",
+      "sourceSha256": "3103dd7545d3e94b4b5f1797385357855bb792a9aafb439f2270b80d59375f63"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/providers/recording-search.ts",
+      "baselineSha256": "e9013c6caee15a1f771c095fc13f436de927af3e268de86859b422f77b34721a",
+      "sourceSha256": "fa2948fbf90a280d23a4db339e82a0e95c003fedc4b7173f7bfc81d2d0b973ce"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/providers/__tests__/recording-search.test.ts",
+      "baselineSha256": "3a07498c8589aa66567e97bcdec1aaaa5f11cb17a91964a101c8b1791754840b",
+      "sourceSha256": "ca17907a16114985ffa73cba56522761b98d5e6d70329e5c9f068d7e108accd8"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/routes/assessment-recording-search.ts",
+      "baselineSha256": "d1ce367b37c1f126ae2dda4e2cbaafca726b6ea89437ea53ac898377fbf8d7cc",
+      "sourceSha256": "598921bcdfd10410b7636de1d933222fb8654ecc5cc80607b6acee406a9b31fd"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/routes/__tests__/assessment-recording-search.test.ts",
+      "baselineSha256": "ea97851f6ee98deb85e10a63a2075d1929bce913cca2e8488441eacc64b4cd02",
+      "sourceSha256": "7dc306b0ed437c0badc632d10d07f501a655e5b6804102be0f5928e7c17445ea"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/routes/realtime-lobby-access.ts",
+      "baselineSha256": "e79032b81ff795004583f7527c9070a073b43921a62dad9443af16472835689c",
+      "sourceSha256": "ca9a8a8f6b4a3dc350dc74fd03078d6837319647748d8602ad90eca93d95e431"
+    },
+    {
+      "checkout": "/private/tmp/meeting-recording-pipeline",
+      "path": "middleware/src/routes/__tests__/realtime-lobby-access.test.ts",
+      "baselineSha256": "fd7735f6fb64a3f02831a87fa16843bfd73f0a20bd8a7d7cfd2f1580a3d9c0f4",
+      "sourceSha256": "168e99fd466938daee2d360b31a83868d9c38ada23a83efefb362df49c3e5657"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/repositories/VideoSessionStore.ts",
+      "baselineSha256": "e3c6981a520a496924ca722337684f6c52b16cb320bffd7e151b14063bd8120e",
+      "sourceSha256": "fb5b42f89949c65e675d7fb49d8481eb670394b6bcb387995e5adbcaf996354f"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/repositories/__tests__/VideoSessionCallBinding.test.ts",
+      "baselineSha256": "984a5fbf5deb4b4a8a444c2d7d2e282d4c26a470b1f0e309a095105fda7e75b1",
+      "sourceSha256": "d03ae379c6188c0010f770af37abf52c809a773e4045d3fea44f03b505ad37c7"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/lib/callSeatAuthority.ts",
+      "baselineSha256": "e889f0f6c4b11ec3d7d941b144e8799dfff7d6f53c5ee8cea2d2d2e7ada00300",
+      "sourceSha256": "063dca4a8a52faf78c914f5a28bcd373209a7b62362c3b995e83947987b5b37a"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/lib/__tests__/callSeatAuthority.test.ts",
+      "baselineSha256": "3b206205fe71fb40902921b09a89def89ff33f4dbed32a0c5b0b48c9e01ee890",
+      "sourceSha256": "f5b16d08ba7bbc1efbcf8419c5d1af9ef838efcbd3dfb9205d0ea4cb4de66f24"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/lib/lobbyAuthority.ts",
+      "baselineSha256": "48e2685084330a2e7b759d0d0d00996f5d33fe44b1dad567bb12560697b0f063",
+      "sourceSha256": "33f6773cc92da7e7546cbe9230e4b0e16fcf4c83ab5a5e5bce527aaccce897f1"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/lib/__tests__/lobbyAuthority.test.ts",
+      "baselineSha256": "003f435496f01d46d411babe753b662ac60216a6946abb9fc5f6d8df88168f4c",
+      "sourceSha256": "3119180a2f5abbf9adfcf7b7ba13143f58b2a280f0a19fb2c715b168e829b2be"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/routes/videoSessions.ts",
+      "baselineSha256": "95840da2462e25cb84e6106454292e951cb00950133fb022130757f490e3bb5f",
+      "sourceSha256": "7fb18ca7f19de66962926959545f5ab6fbae4411d6719b04d04a73c89c7436e2"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/routes/__tests__/videoSessionCallBinding.test.ts",
+      "baselineSha256": "66e8bd69427190e4a1a19e510bb18ad24e41d71caecdac485976d9bdf1c74af3",
+      "sourceSha256": "c2c00d291bfef68441847c7f6b84510eccacce53f9382f5089ec2015c42b080e"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/routes/recordings.ts",
+      "baselineSha256": "76d06798d48975f4feea9efbd309e14cdafd74634db5063914db48789fe239e6",
+      "sourceSha256": "b060392f17a4b9df56e06b26a36cd170405fe8cb73272a405b067457dfdf28fb"
+    },
+    {
+      "checkout": "/private/tmp/platform-meeting-pipeline",
+      "path": "src/routes/__tests__/recordings.test.ts",
+      "baselineSha256": "c312a0ec31c36a2f5089b7be13c687e7e5e72d5df85a92e44fa458a91595585b",
+      "sourceSha256": "c4c2ccc57130f58e5899890fce9d665010b8f4c1adf727a9b3f5d2a19e9c1fd2"
+    }
+  ]
+}

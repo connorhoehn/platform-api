@@ -57,3 +57,23 @@ test('channel lookup traverses filtered empty pages consistently; refuses repeat
   send.mockReset().mockResolvedValue({ Items: [], LastEvaluatedKey: { documentId: 'x', sessionId: 'x' } });
   await expect(repo.findByChannelArn('arn-one')).rejects.toThrow('did not advance');
 });
+test('document source is immutable in memory and Dynamo idempotency checks, absent legacy context cannot be upgraded', async () => {
+  const documentContext = { tenant: 'assessment', sourceId: 'ec:standards/ci-cd.md', lobbyName: 'assessment:doc:h:abc' };
+  const docBinding = { ...binding, tenant: 'assessment', lobbyName: documentContext.lobbyName, documentContext };
+  const rec = { ...row(), documentId: docBinding.lobbyName, orgId: 'assessment' };
+  const mem = new MemoryVideoSessionStore(); await mem.createSession(rec);
+  const nativeBind = (value = docBinding) => mem.bindCallParticipant(rec.documentId, rec.sessionId, 'pid-one', rec.channelArn, value);
+  expect(await nativeBind()).toEqual(docBinding);
+  expect(await nativeBind({ ...docBinding, boundAt: '2026-10-10T12:02:00Z' })).toEqual(docBinding);
+  for (const change of [{ sourceId: 'other' }, { tenant: 'orgiq' }, { lobbyName: 'assessment:doc:other' }]) {
+    await expect(nativeBind({ ...docBinding, documentContext: { ...documentContext, ...change } })).rejects.toBeInstanceOf(VideoCallBindingConflict);
+    const prior = { ...rec, participantHistory: { 'pid-one': { ...participant, callBinding: docBinding } } };
+    const send = jest.fn().mockResolvedValue({ Item: prior });
+    const ddb = new VideoSessionRepository({ send } as unknown as DynamoDBDocumentClient);
+    await expect(ddb.bindCallParticipant(rec.documentId, rec.sessionId, 'pid-one', rec.channelArn, { ...docBinding, documentContext: { ...documentContext, ...change } })).rejects.toBeInstanceOf(VideoCallBindingConflict);
+    expect(send).toHaveBeenCalledTimes(1);
+  }
+  const legacy = { ...rec, participantHistory: { 'pid-one': { ...participant, callBinding: { ...docBinding, documentContext: undefined } } } };
+  await mem.createSession(legacy);
+  await expect(nativeBind()).rejects.toBeInstanceOf(VideoCallBindingConflict);
+});

@@ -138,3 +138,12 @@ describe('configuration', () => {
     expect(lobbyAuthorityTenants({ LOBBY_AUTHORITY_TENANTS: 'orgiq, social' } as NodeJS.ProcessEnv)).toEqual(['orgiq', 'social']);
   });
 });
+test('recorded source callback forwards exact bearer/source with redirect protection; oversized proof cancels', async () => {
+  const fetchImpl = jest.fn(async () => new Response('{"allowed":true}'));
+  expect(await askLobbyAuthority('synthetic', 'assessment:doc:h:abc', { url: URL_, fetchImpl, documentSourceId: 'ec:standards/ci.md' })).toBe(true);
+  expect(fetchImpl).toHaveBeenCalledWith(URL_, expect.objectContaining({ redirect: 'error', body: JSON.stringify({ lobbyName: 'assessment:doc:h:abc', documentSourceId: 'ec:standards/ci.md' }), headers: expect.objectContaining({ authorization: 'Bearer synthetic' }) }));
+  const cancel = jest.fn();
+  fetchImpl.mockResolvedValue(new Response(new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(5000)); }, cancel })));
+  expect(await askLobbyAuthority('synthetic', 'assessment:doc:h:abc', { url: URL_, fetchImpl, documentSourceId: 'source' })).toBe(false);
+  expect(cancel).toHaveBeenCalled();
+});

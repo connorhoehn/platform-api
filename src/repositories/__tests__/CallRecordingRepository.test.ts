@@ -935,3 +935,20 @@ describe('CallRecordingRepository.listByUser — the compose/transcript join', (
     expect(String(warned[0]?.[1])).toContain('join failed');
   });
 });
+
+describe('verified document context hydration', () => {
+  const context = { tenant: 'assessment', sourceId: 'page:100002', lobbyName: 'assessment:doc:opaque-hash' };
+  test.each([context, undefined])('uses current primary document context rather than stale index context (%j)', async documentContext => {
+    const send = jest.fn(async (command: unknown) => {
+      const input = (command as { input: Record<string, unknown> }).input;
+      if (input.RequestItems) {
+        const request = (input.RequestItems as Record<string, { ExpressionAttributeNames: Record<string, string> }>)['test-video-call-recordings'];
+        expect(Object.values(request.ExpressionAttributeNames)).toContain('documentContext');
+        return { Responses: { 'test-video-call-recordings': [{ recordingId: 'doc-rec', documentContext, tracks: [{ userId: 'reader' }], recordingGoverned: true }] } };
+      }
+      return { Items: [{ recordingId: 'doc-rec', callId: 'doc-call', lobbyName: context.lobbyName, documentContext: { ...context, sourceId: 'page:stale' } }] };
+    });
+    const repo = new CallRecordingRepository({ send } as unknown as DynamoDBDocumentClient);
+    expect((await repo.listByUser('reader')).items[0].documentContext).toEqual(documentContext);
+  });
+});

@@ -55,7 +55,7 @@ let warnedNoUrl = false;
 export async function askLobbyAuthority(
   bearer: string,
   lobbyName: string,
-  opts: { url?: string; fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+  opts: { url?: string; fetchImpl?: typeof fetch; timeoutMs?: number; documentSourceId?: string } = {},
 ): Promise<boolean> {
   const url = opts.url ?? lobbyAuthorityUrl();
   if (!url) {
@@ -70,15 +70,28 @@ export async function askLobbyAuthority(
   try {
     const res = await doFetch(url, {
       method: 'POST',
+      redirect: 'error',
       headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({ lobbyName }),
+      body: JSON.stringify({ lobbyName, ...(opts.documentSourceId !== undefined ? { documentSourceId: opts.documentSourceId } : {}) }),
       signal: AbortSignal.timeout(opts.timeoutMs ?? LOBBY_AUTHORITY_TIMEOUT_MS),
     });
     if (res.status !== 200) {
       if (res.status !== 403) log.warn({ status: res.status, lobbyName }, 'lobby authority refused (non-403)');
       return false;
     }
-    const body = (await res.json().catch(() => null)) as { allowed?: unknown } | null;
+    // The source-specific recording callback is still a tiny yes/no proof.
+    // Bound it before JSON parsing rather than trusting Content-Length.
+    if (!res.body) return false;
+    const reader = res.body.getReader(); const chunks: Uint8Array[] = []; let size = 0;
+    try {
+      for (;;) {
+        const part = await reader.read(); if (part.done) break;
+        size += part.value.byteLength;
+        if (size > 8192) { await reader.cancel(); return false; }
+        chunks.push(part.value);
+      }
+    } finally { reader.releaseLock(); }
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { allowed?: unknown } | null;
     return body?.allowed === true;
   } catch (err) {
     log.warn({ lobbyName, reason: err instanceof Error ? err.message : String(err) }, 'lobby authority unreachable — refused');

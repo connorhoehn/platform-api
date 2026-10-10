@@ -2,11 +2,13 @@
 // caller's bearer is forwarded unchanged; this callback creates no access.
 import { AppError } from '../middleware/error-handler';
 import { lobbyAuthorityUrl, LOBBY_AUTHORITY_TIMEOUT_MS } from './lobbyAuthority';
+import type { DocumentCallContext } from '../repositories/VideoSessionStore';
 
 export interface CallSeatProof {
   allowed: true; callId: string; lobbyName: string; clientId: string;
   userId: string; tenant: string; epoch: number;
   actor?: { sub: string; epoch: number };
+  documentContext?: DocumentCallContext;
 }
 export function callSeatAuthorityUrl(lobbyUrl = lobbyAuthorityUrl()): string {
   try {
@@ -20,7 +22,7 @@ export function callSeatAuthorityUrl(lobbyUrl = lobbyAuthorityUrl()): string {
 const id = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9:_-]{1,256}$/.test(value);
 const epoch = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 
-export async function askCallSeatAuthority(bearer: string, request: { callId: string; lobbyName: string; clientId: string },
+export async function askCallSeatAuthority(bearer: string, request: { callId: string; lobbyName: string; clientId: string; documentSourceId?: string },
   options: { url?: string; fetchImpl?: typeof fetch; timeoutMs?: number } = {}): Promise<CallSeatProof> {
   const url = options.url ?? callSeatAuthorityUrl();
   if (!url || !bearer) throw new AppError(503, 'Call seat authority is unavailable');
@@ -43,7 +45,11 @@ export async function askCallSeatAuthority(bearer: string, request: { callId: st
     const proof = JSON.parse(Buffer.concat(chunks).toString('utf8')) as CallSeatProof;
     if (proof?.allowed !== true || proof.callId !== request.callId || proof.clientId !== request.clientId || proof.lobbyName !== request.lobbyName
       || !id(proof.userId) || !id(proof.tenant) || !epoch(proof.epoch)
-      || (proof.actor !== undefined && (!id(proof.actor?.sub) || !epoch(proof.actor?.epoch)))) throw new AppError(503, 'Call seat authority is unavailable');
+      || (proof.actor !== undefined && (!id(proof.actor?.sub) || !epoch(proof.actor?.epoch)))
+      || (request.documentSourceId !== undefined
+        ? proof.tenant !== 'assessment' || proof.documentContext?.tenant !== proof.tenant
+          || proof.documentContext?.sourceId !== request.documentSourceId || proof.documentContext?.lobbyName !== request.lobbyName
+        : proof.documentContext !== undefined)) throw new AppError(503, 'Call seat authority is unavailable');
     return proof;
   } catch (error) {
     if (error instanceof AppError) throw error;

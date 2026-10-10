@@ -234,3 +234,46 @@ it('keeps a newer explicit label and never carries a label to another user shari
     { participantId: 'opaque-seat', userId: 'other' }] }, { tracks: [{ participantId: 'opaque-seat' }] }))
     .toEqual([{ participantId: 'opaque-seat', userId: 'other' }]);
 });
+
+it('persists verified document provenance through native finalize and ignores supplied webhook context', async () => {
+  const lobby = 'assessment:doc:opaque-source-hash', documentContext = { tenant: 'assessment', sourceId: 'page:100002', lobbyName: lobby };
+  await mockSessions.createSession({ ...session('document-actual'), documentId: lobby, orgId: 'assessment' });
+  for (const actor of [vera, nora]) {
+    const clientId = `tab-${actor.participantId}`;
+    await mockSessions.addOrReplaceParticipant(lobby, 'document-actual', { ...actor, clientId });
+    await mockSessions.bindCallParticipant(lobby, 'document-actual', actor.participantId, ARN, {
+      callId: 'exact-document-call', clientId, userId: actor.userId, tenant: 'assessment', epoch: 1,
+      sessionId: 'document-actual', channelArn: ARN, lobbyName: lobby, boundAt: START, documentContext,
+    });
+    await mockSessions.removeParticipant(lobby, 'document-actual', actor.participantId);
+  }
+  await mockSessions.endSession(lobby, 'document-actual', END);
+  const context = { arn: ARN, recordingId: 'document-recording', detail: { startedAt: START, endedAt: END, durationMs: 60_000,
+    documentContext: { tenant: 'assessment', sourceId: 'page:malicious', lobbyName: lobby },
+    tracks: [...[vera, nora].map(actor => ({ participantId: actor.participantId, tokenParticipantId: actor.participantId, userId: actor.userId })),
+      { participantId: 'opaque-screen', tokenParticipantId: nora.participantId, userId: nora.userId }] } };
+  const handlers = buildRecordingPipelineHandlers(), resolved = await handlers.get(KINDS.resolve)!.execute(node, context, {} as never);
+  expect(resolved.output).toMatchObject({ callId: 'exact-document-call', documentContext });
+  await handlers.get(KINDS.persist)!.execute(node, { ...context, ...resolved.output as Record<string, unknown> }, {} as never);
+  expect(await mockRecordings.findByRecordingId('document-recording')).toMatchObject({ documentContext, callBindingStatus: 'bound' });
+});
+
+it('does not persist document metadata from a webhook when no accepted source association exists', async () => {
+  const context = { arn: ARN, recordingId: 'unbound-document', lobbyName: 'assessment:doc:unknown', callId: 'unknown-call',
+    callBindingStatus: 'unresolved', detail: { startedAt: START, endedAt: END, durationMs: 60_000,
+      documentContext: { tenant: 'assessment', sourceId: 'page:100002', lobbyName: 'assessment:doc:unknown' } } };
+  await buildRecordingPipelineHandlers().get(KINDS.persist)!.execute(node, context, {} as never);
+  expect(await mockRecordings.findByRecordingId('unbound-document')).not.toHaveProperty('documentContext');
+});
+
+it('clears an inherited document context when recorded seats have no exact source association', async () => {
+  const lobby = 'assessment:doc:opaque-source-hash';
+  await mockSessions.createSession({ ...session('unbound-doc-context'), documentId: lobby, orgId: 'assessment',
+    participantHistory: { [vera.participantId]: vera } });
+  const context = { arn: ARN, recordingId: 'no-source-association', documentContext: { tenant: 'assessment', sourceId: 'page:stale', lobbyName: lobby },
+    detail: { startedAt: START, endedAt: END, durationMs: 60_000, tracks: [{ participantId: vera.participantId, userId: vera.userId }] } };
+  const handlers = buildRecordingPipelineHandlers(), resolved = await handlers.get(KINDS.resolve)!.execute(node, context, {} as never);
+  expect(resolved.output).toMatchObject({ documentContext: null });
+  await handlers.get(KINDS.persist)!.execute(node, { ...context, ...resolved.output as Record<string, unknown> }, {} as never);
+  expect(await mockRecordings.findByRecordingId(context.recordingId)).not.toHaveProperty('documentContext');
+});

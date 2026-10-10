@@ -1,4 +1,4 @@
-import type { VideoSessionRecord } from '../repositories/VideoSessionStore';
+import type { DocumentCallContext, VideoParticipantCallBinding, VideoSessionRecord } from '../repositories/VideoSessionStore';
 import type { TruthTrack } from './recording-truth';
 import { tenantOf, TENANTLESS } from './tenant';
 
@@ -10,7 +10,7 @@ export interface RecordedCallWindow {
 }
 
 export type RecordedCallBinding =
-  | { status: 'bound'; callId: string; session: VideoSessionRecord }
+  | { status: 'bound'; callId: string; session: VideoSessionRecord; documentContext?: DocumentCallContext }
   | { status: 'unresolved'; reason: 'missing-recording-window' | 'missing-recorded-participant'
       | 'unbound-recorded-participant' | 'mixed-call-bindings' | 'ambiguous-sessions' | 'no-exact-session' };
 
@@ -46,7 +46,7 @@ export function resolveRecordedCallBinding(sessions: VideoSessionRecord[], recor
   if (!recording.tracks.length || recording.tracks.some(track => !track || !recordedSeat(track))) {
     return { status: 'unresolved', reason: 'missing-recorded-participant' };
   }
-  const matched: Array<{ session: VideoSessionRecord; callId: string }> = [];
+  const matched: Array<{ session: VideoSessionRecord; callId: string; documentContext?: DocumentCallContext }> = [];
   let reason: Extract<RecordedCallBinding, { status: 'unresolved' }>['reason'] = 'no-exact-session';
   let conflictingExactSession = false;
   const uniqueSessions = new Map(sessions.map(session => [`${session.documentId}\u0000${session.sessionId}`, session]));
@@ -58,6 +58,7 @@ export function resolveRecordedCallBinding(sessions: VideoSessionRecord[], recor
     try { tenant = tenantOf(session.orgId); } catch { continue; }
     if (tenant === TENANTLESS || !text(session.sessionId) || !text(session.documentId)) continue;
     const callIds = new Set<string>();
+    const bindings: VideoParticipantCallBinding[] = [];
     const containsEveryRecordedSeat = recording.tracks.every(track => !!session.participantHistory?.[recordedSeat(track)!]);
     let complete = true;
     for (const track of recording.tracks) {
@@ -80,13 +81,32 @@ export function resolveRecordedCallBinding(sessions: VideoSessionRecord[], recor
         break;
       }
       callIds.add(binding.callId);
+      bindings.push(binding);
     }
     if (!complete) { conflictingExactSession ||= containsEveryRecordedSeat; continue; }
     if (callIds.size !== 1) { reason = 'mixed-call-bindings'; conflictingExactSession = true; continue; }
-    matched.push({ session, callId: [...callIds][0] });
+    const documentContext = agreedDocumentContext(session.documentId, tenant, bindings);
+    matched.push({ session, callId: [...callIds][0], ...(documentContext ? { documentContext } : {}) });
   }
   if (matched.length > 1) return { status: 'unresolved', reason: 'ambiguous-sessions' };
   if (matched.length && conflictingExactSession) return { status: 'unresolved', reason: 'ambiguous-sessions' };
   if (matched.length === 1) return { status: 'bound', ...matched[0] };
   return { status: 'unresolved', reason };
+}
+
+/** An accepted document association is independent of the call association.
+ * Every signed recorded seat must carry the same server-verified source.
+ * A hash-shaped lobby alone cannot identify a document, and webhook metadata
+ * is never source authority. Missing/mixed provenance leaves the call bound
+ * while deliberately omitting its document association.
+ */
+function agreedDocumentContext(lobbyName: string, tenant: string, bindings: VideoParticipantCallBinding[]): DocumentCallContext | undefined {
+  if (tenant !== 'assessment' || !lobbyName.startsWith('assessment:doc:') || !bindings.length) return undefined;
+  const context = bindings[0].documentContext;
+  if (!context || context.tenant !== tenant || context.lobbyName !== lobbyName || !text(context.sourceId)) return undefined;
+  if (bindings.some(binding => !binding.documentContext
+    || binding.documentContext.tenant !== context.tenant
+    || binding.documentContext.sourceId !== context.sourceId
+    || binding.documentContext.lobbyName !== context.lobbyName)) return undefined;
+  return { tenant: context.tenant, sourceId: context.sourceId, lobbyName: context.lobbyName };
 }

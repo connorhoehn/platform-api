@@ -122,3 +122,41 @@ it('protects both governed tenant families while retaining explicit legacy compa
   for (const lobby of ['orgiq:initiative:p-one', 'assessment:team:TEAM-005', 'assessment:doc:one']) expect(isGovernedRecordingLobby(lobby)).toBe(true);
   for (const lobby of ['dm:a:b', 'room:a', '']) expect(isGovernedRecordingLobby(lobby)).toBe(false);
 });
+
+function documentSession(): VideoSessionRecord {
+  const row = session(); row.documentId = 'assessment:doc:opaque-source-hash'; row.orgId = 'assessment';
+  for (const attendee of Object.values(row.participantHistory!)) {
+    attendee.callBinding!.tenant = 'assessment'; attendee.callBinding!.lobbyName = row.documentId;
+    attendee.callBinding!.documentContext = { tenant: 'assessment', sourceId: 'page:100002', lobbyName: row.documentId };
+  }
+  return row;
+}
+
+it('associates an Assessment document only from every signed recorded seat including screen parent', () => {
+  const row = documentSession();
+  const withScreen = { ...recording, tracks: [...recording.tracks, { participantId: 'opaque-screen', tokenParticipantId: 'opaque-seat-a', userId: 'actor-a' }] };
+  expect(resolveRecordedCallBinding([row], withScreen)).toMatchObject({ status: 'bound', callId: 'canonical-one',
+    documentContext: { tenant: 'assessment', sourceId: 'page:100002', lobbyName: row.documentId } });
+});
+
+it.each([
+  ['missing', (r: VideoSessionRecord) => { delete r.participantHistory!['opaque-seat-b'].callBinding!.documentContext; }],
+  ['mixed source', (r: VideoSessionRecord) => { r.participantHistory!['opaque-seat-b'].callBinding!.documentContext!.sourceId = 'page:other'; }],
+  ['wrong tenant', (r: VideoSessionRecord) => { r.participantHistory!['opaque-seat-a'].callBinding!.documentContext!.tenant = 'orgiq'; }],
+  ['wrong lobby', (r: VideoSessionRecord) => { r.participantHistory!['opaque-seat-a'].callBinding!.documentContext!.lobbyName = 'assessment:doc:other'; }],
+  ['blank source', (r: VideoSessionRecord) => { r.participantHistory!['opaque-seat-a'].callBinding!.documentContext!.sourceId = ' '; }],
+] as const)('keeps independently valid call binding but omits %s document provenance', (_name, change) => {
+  const row = documentSession(); change(row); const result = resolveRecordedCallBinding([row], recording);
+  expect(result).toMatchObject({ status: 'bound', callId: 'canonical-one' });
+  expect(result).not.toHaveProperty('documentContext');
+});
+
+it('does not turn a non-document lobby or missing historical context into a document association', () => {
+  for (const lobby of ['assessment:team:TEAM-005', 'orgiq:doc:unimplemented', 'room:ordinary']) {
+    const row = documentSession(); row.documentId = lobby;
+    for (const attendee of Object.values(row.participantHistory!)) { attendee.callBinding!.lobbyName = lobby; attendee.callBinding!.documentContext!.lobbyName = lobby; }
+    expect(resolveRecordedCallBinding([row], recording)).toMatchObject({ status: 'bound' });
+    expect(resolveRecordedCallBinding([row], recording)).not.toHaveProperty('documentContext');
+  }
+  expect(resolveRecordedCallBinding([session()], recording)).not.toHaveProperty('documentContext');
+});

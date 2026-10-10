@@ -25,6 +25,8 @@ const mockGetSessionsByDocument = jest.fn();
 const mockDocClientSend = jest.fn();
 const mockCallSfu = jest.fn();
 const mockMapSfuError = jest.fn();
+const mockDocumentAuthority = jest.fn();
+jest.mock('../../lib/lobbyAuthority', () => ({ askLobbyAuthority: (...args: unknown[]) => mockDocumentAuthority(...args) }));
 
 const mockUpdateTranscriptStatus = jest.fn(async (..._a: unknown[]) => undefined);
 const mockStartSystemRun = jest.fn(async (..._a: unknown[]) => 'run-t1');
@@ -37,7 +39,7 @@ jest.mock('../../recordings/recordingPipelines', () => ({
 
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (req: Request, _res: Response, next: NextFunction) => {
-    (req as unknown as { user: { sub: string } }).user = { sub: 'u-1' };
+    req.user = { sub: 'u-1', ...(req.headers['x-test-tenant'] === 'assessment' ? { orgId: 'assessment', authKind: 'orgiq-hs256' as const } : {}) };
     next();
   },
 }));
@@ -146,7 +148,7 @@ function mockRes(): MockRes {
   return r;
 }
 
-async function run(method: string, url: string, body?: unknown): Promise<MockRes> {
+async function run(method: string, url: string, body?: unknown, headers: Record<string, string> = {}): Promise<MockRes> {
   const app = buildApp();
   const res = mockRes();
   const req = {
@@ -154,8 +156,8 @@ async function run(method: string, url: string, body?: unknown): Promise<MockRes
     url,
     originalUrl: url,
     path: url.split('?')[0],
-    headers: { 'content-type': 'application/json' },
-    query: {},
+    headers: { 'content-type': 'application/json', ...headers },
+    query: Object.fromEntries(new URL(url, 'http://fixture.invalid').searchParams),
     body: body ?? {},
     params: {},
     ip: '127.0.0.1',
@@ -198,6 +200,7 @@ function givenRecording(detail: Record<string, unknown>, isParticipant = true): 
 }
 
 beforeEach(() => {
+  mockDocumentAuthority.mockReset().mockResolvedValue(true);
   mockListByUser.mockReset();
   mockGetRecording.mockReset();
   mockFindByRecordingId.mockReset().mockResolvedValue(null);
@@ -212,6 +215,52 @@ beforeEach(() => {
     if (e?.name === 'BreakerOpenError') return new AppError(503, 'breaker open');
     if (e?.name === 'TimeoutError') return new AppError(504, 'timeout');
     return new AppError(502, 'unreachable');
+  });
+});
+
+describe('native recorded document host authority', () => {
+  const lobbyName = 'assessment:doc:h:abc', sourceId = 'ec:standards/ci.md';
+  const documentContext = { tenant: 'assessment', sourceId, lobbyName };
+  const documentRow = { recordingId: 'doc-1', callId: 'call-1', channelArn: 'arn:1', lobbyName, documentContext,
+    startedAt: '2026-10-10T10:00:00Z', endedAt: '2026-10-10T10:01:00Z', composeStatus: 'skipped' };
+  const headers = { 'x-test-tenant': 'assessment', authorization: 'Bearer synthetic-participant' };
+  it('detail/playback check exact stored source using current participant bearer', async () => {
+    givenRecording(documentRow);
+    const detail = await run('GET', '/api/recordings/doc-1', undefined, headers);
+    expect(detail.statusCode).toBe(200); expect(detail.body).toMatchObject({ artifactContext: { tenant: 'assessment', documentSourceId: sourceId } });
+    expect(mockDocumentAuthority).toHaveBeenCalledWith('synthetic-participant', lobbyName, { documentSourceId: sourceId });
+    mockDocumentAuthority.mockResolvedValue(false);
+    expect((await run('POST', '/api/recordings/doc-1/playback-token', undefined, headers)).statusCode).toBe(404);
+    expect(mockCallSfu).not.toHaveBeenCalled();
+  });
+  it('unverified legacy source, another tenant, absent bearer, revoked participant and denied source cannot expose detail', async () => {
+    givenRecording({ ...documentRow, documentContext: undefined });
+    expect((await run('GET', '/api/recordings/doc-1', undefined, headers)).statusCode).toBe(404);
+    givenRecording(documentRow);
+    expect((await run('GET', '/api/recordings/doc-1')).statusCode).toBe(404);
+    expect((await run('GET', '/api/recordings/doc-1', undefined, { 'x-test-tenant': 'assessment' })).statusCode).toBe(404);
+    givenRecording(documentRow, false); expect((await run('GET', '/api/recordings/doc-1', undefined, headers)).statusCode).toBe(404);
+    expect(mockDocumentAuthority).not.toHaveBeenCalled();
+  });
+  it('both default and document-scoped lists check own membership and fresh source while retaining own cursor', async () => {
+    givenRecording(documentRow);
+    mockListByUser.mockResolvedValue({ items: [documentRow, { ...documentRow, recordingId: 'other-doc', lobbyName: 'assessment:doc:other' }], cursor: 'own-next' });
+    const scoped = await run('GET', `/api/recordings?lobbyName=${encodeURIComponent(lobbyName)}`, undefined, headers);
+    expect(scoped.statusCode).toBe(200); expect(scoped.body).toMatchObject({ items: [{ recordingId: 'doc-1' }], cursor: 'own-next' });
+    expect(mockListByUser).toHaveBeenCalledWith('u-1', { limit: 20, cursor: undefined });
+    mockDocumentAuthority.mockResolvedValue(false);
+    const denied = await run('GET', '/api/recordings', undefined, headers);
+    expect(denied.statusCode).toBe(200); expect(denied.body).toEqual({ items: [], cursor: 'own-next' });
+    givenRecording(documentRow, false); mockDocumentAuthority.mockResolvedValue(true);
+    expect((await run('GET', `/api/recordings?lobbyName=${encodeURIComponent(lobbyName)}`, undefined, headers)).body).toEqual({ items: [], cursor: 'own-next' });
+  });
+  it('host source revoked while native media I/O waits prevents late detail and list replies', async () => {
+    const pending = { ...documentRow, composeStatus: 'queued' };
+    givenRecording(pending); mockListByUser.mockResolvedValue({ items: [pending], cursor: 'own-next' });
+    mockCallSfu.mockImplementation(async () => { mockDocumentAuthority.mockResolvedValue(false); return lvsOk({ recordings: [] }); });
+    expect((await run('GET', '/api/recordings/doc-1', undefined, headers)).statusCode).toBe(404);
+    mockDocumentAuthority.mockResolvedValue(true);
+    expect((await run('GET', '/api/recordings', undefined, headers)).body).toEqual({ items: [], cursor: 'own-next' });
   });
 });
 
@@ -817,6 +866,11 @@ describe('recording stage and context reflect native status and stored provenanc
   });
   it('links only exact native initiative lobbies, not client title/work/deck guesses', () => {
     expect(recordingArtifactContext('orgiq:initiative:p-observability')).toEqual({ tenant: 'orgiq', initiativeId: 'p-observability' });
+    const lobbyName = 'assessment:doc:h:abc', context = { tenant: 'assessment', sourceId: 'ec:standards/ci.md', lobbyName };
+    expect(recordingArtifactContext(lobbyName, context)).toEqual({ tenant: 'assessment', documentSourceId: context.sourceId });
+    expect(recordingArtifactContext(lobbyName)).toBeNull();
+    expect(recordingArtifactContext(lobbyName, { ...context, lobbyName: 'assessment:doc:other' })).toBeNull();
+    expect(recordingArtifactContext(lobbyName, { ...context, tenant: 'orgiq' })).toBeNull();
     for (const lobby of ['orgiq:initiative:p:work:w1', 'social:room:secret', 'assessment:team:TEAM-005', 'orgiq:initiative:', undefined]) expect(recordingArtifactContext(lobby)).toBeNull();
   });
 });

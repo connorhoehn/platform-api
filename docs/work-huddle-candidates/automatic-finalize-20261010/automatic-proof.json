@@ -1,0 +1,92 @@
+{
+  "status": "passed",
+  "startsFromActualSignedWebhook": true,
+  "actualFinalizeExecutor": true,
+  "automaticNativeChild": true,
+  "recordingRowPreSeeded": false,
+  "manualTranscriptionHelperCalled": false,
+  "actualNativeDynamoTransactions": true,
+  "actualWhisper": true,
+  "actualCodexSubscription": true,
+  "simulatedModel": false,
+  "canonicalSignedParentMetadata": true,
+  "callId": "automatic-call-c84f0616-1bca-4830-9945-caac173483d2",
+  "recordingId": "automatic-recording-c84f0616-1bca-4830-9945-caac173483d2",
+  "lobbyName": "orgiq:initiative:p-observability",
+  "sessionId": "automatic-session-c84f0616-1bca-4830-9945-caac173483d2",
+  "parentRunId": "0be88361-37bd-4a00-b2bc-d435abba5e39",
+  "childRunId": "fe3146dd-465c-46b8-9331-566f1eb9a5e7",
+  "replayRunId": "9c507ea7-1804-4b17-97e8-aeeadb7a13ae",
+  "processingAttemptId": "b316141a-bb2b-47ce-bd95-8e6bf552e86c",
+  "acceptedRuns": [
+    {
+      "pipelineId": "recording-finalize",
+      "runId": "0be88361-37bd-4a00-b2bc-d435abba5e39"
+    },
+    {
+      "pipelineId": "call-transcription",
+      "runId": "fe3146dd-465c-46b8-9331-566f1eb9a5e7",
+      "processingAttemptId": "b316141a-bb2b-47ce-bd95-8e6bf552e86c"
+    },
+    {
+      "pipelineId": "recording-finalize",
+      "runId": "9c507ea7-1804-4b17-97e8-aeeadb7a13ae"
+    }
+  ],
+  "segments": 11,
+  "timestampGranularity": "segment",
+  "speakerAttribution": "Call: mixed composed media, no diarization",
+  "summaryChars": 1019,
+  "summarySHA256": "5a3ecae13f347786a21dcb70f1ddd8b290a968ce6eb94ab543b76c1cad7cb841",
+  "transcriptSHA256": "5dc6fb556d4da6f42ee7c7898453bb6431bd50e866434de612a4cd31ed922d56",
+  "immutableMediaSHA256": "0c2f7815ea36c0921b927192c2c58364e2f5d19c80eef352276572ac7a45c252",
+  "readResults": [
+    {
+      "userId": "automatic-reader-one",
+      "isParticipant": true,
+      "exactSummarySHA256": "5a3ecae13f347786a21dcb70f1ddd8b290a968ce6eb94ab543b76c1cad7cb841"
+    },
+    {
+      "userId": "automatic-reader-two",
+      "isParticipant": true,
+      "exactSummarySHA256": "5a3ecae13f347786a21dcb70f1ddd8b290a968ce6eb94ab543b76c1cad7cb841"
+    }
+  ],
+  "nonparticipantDenied": true,
+  "duplicateWebhookPreservesExactReadyRow": true,
+  "automaticGenerations": 1,
+  "fileReads": 1,
+  "composeReads": 2,
+  "cards": 0,
+  "graphEffects": 2,
+  "speechRequests": 1,
+  "modelRequests": 1,
+  "tablePrefix": "automatic_finalize_c84f06161bca48309945caac173483d2_",
+  "ddbEndpoint": "http://127.0.0.1:61468",
+  "redisPort": 61469,
+  "sourceFiles": {
+    "src/recordings/recordingPipelines.ts": "56c9660e390bcb960bab61438846027d16f8c7e4f876cf9d7df724e71d538940",
+    "src/repositories/CallRecordingRepository.ts": "1e472156fd7d223747f094a3592d0532d8bae0dba0008fc66a09aeab947c63c2",
+    "src/repositories/VideoSessionRepository.ts": "45674bf090494657006b30019131fe82aad8f5ac9494d264d0980c5142f4287b",
+    "src/repositories/VideoSessionStore.ts": "fb5b42f89949c65e675d7fb49d8481eb670394b6bcb387995e5adbcaf996354f",
+    "src/lib/recording-call-binding.ts": "f2d75acd8bbe5003a991f1003a47615f933efc37d71c7740e79de2fdd281356a",
+    "src/routes/lvsWebhooks.ts": "69bca816f4ca3b16c982e9e6089adf326907e291da8645e875a06bdeb61826e6",
+    "src/pipeline/CodexLLMClient.ts": "26bf0ce9bafe8d592393ca7b5a418d11982b8da68e2167015bd53e9dc73e28ce",
+    "scripts/meeting-finalize-automatic-acceptance.cjs": "fbe12146bdb1b1cfa885c6bf9d313d18b4dd90590a7e98da9c7a9e9b58007679"
+  },
+  "boundaries": [
+    "Owned bridge uses actual native PipelineExecutor/EventBus/WAL; production Raft bootstrap and RunPersistence not booted.",
+    "Accepted seat provenance fixtures are synthetic; actual repository binding/leave conditions and strict resolver run. No real gateway/browser/JWT mint ceremony.",
+    "Composition/file HTTP transport is declared immutable fixture; no actual SFU/ffmpeg/network recording.",
+    "Chat and work-graph delivery are intercepted only inside this owned fixture; no messages or external mutations.",
+    "Primary services, existing rows and original media remain unchanged."
+  ],
+  "notificationBoundary": {
+    "nativeChatCards": 0,
+    "reason": "native chatChannelForLobby does not map orgiq:initiative lobbies",
+    "actualPipelineLifecycleEventsObserved": true,
+    "gatewayDeliveryProven": false,
+    "productionUiRealtimeDeliveryProven": false,
+    "uiStatusPollingCoveredSeparately": true
+  }
+}

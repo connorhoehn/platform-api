@@ -47,6 +47,8 @@ import {
   ValidationError,
 } from '../middleware/error-handler';
 import log from '../lib/logger';
+import { askLobbyAuthority } from '../lib/lobbyAuthority';
+import type { RecordingListRow } from '../repositories/CallRecordingRepository';
 
 export const recordingsRouter = Router();
 
@@ -91,6 +93,16 @@ recordingsRouter.get(
     // member list, which we look up and hand to the policy. A lookup failure
     // yields no memberIds, and the policy denies — it never falls open.
     if (lobbyName) {
+      if (lobbyName.startsWith('assessment:doc:')) {
+        // A document's hash alone is not a source resource. Read only the
+        // caller's own index and verify each exact stored source context.
+        if (req.user?.orgId !== 'assessment' || req.user.authKind !== 'orgiq-hs256') throw new NotFoundError('recording not found');
+        const { items, cursor: next } = await callRecordingRepo.listByUser(userId, { limit, cursor });
+        const visible = await documentReadableList(req, items.filter(row => row.lobbyName === lobbyName));
+        const settled = await settleComposeForList(visible);
+        res.json({ items: withListView(await documentReadableList(req, settled)), cursor: next ?? null });
+        return;
+      }
       const tenant = tenantOf(req.user?.orgId);
       let memberIds: string[] | undefined;
       // Carried alongside membership: an org-visible room has no member rows,
@@ -140,16 +152,17 @@ recordingsRouter.get(
     }
 
     const { items, cursor: next } = await callRecordingRepo.listByUser(userId, { limit, cursor });
-    res.json({ items: withListView(await settleComposeForList(items)), cursor: next ?? null });
+    const settled = await settleComposeForList(await documentReadableList(req, items));
+    res.json({ items: withListView(await documentReadableList(req, settled)), cursor: next ?? null });
   }),
 );
 
 /** What a list row says beyond the stored fields: the stage and the expiry, as the detail does. */
-function withListView<T extends { ttl?: number; lobbyName?: string; composeStatus?: ComposeStatus; transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus'] }>(rows: T[]): Array<T & { stage: ReturnType<typeof recordingStage>; expiresAt: string | null }> {
+function withListView<T extends { ttl?: number; lobbyName?: string; documentContext?: CallRecording['documentContext']; composeStatus?: ComposeStatus; transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus'] }>(rows: T[]): Array<T & { stage: ReturnType<typeof recordingStage>; expiresAt: string | null }> {
   return rows.map((r) => ({
     ...r,
     stage: recordingStage(r),
-    artifactContext: recordingArtifactContext(r.lobbyName),
+    artifactContext: recordingArtifactContext(r.lobbyName, r.documentContext),
     expiresAt: r.ttl ? new Date(r.ttl * 1000).toISOString() : null,
   }));
 }
@@ -311,7 +324,39 @@ async function requireOwnRecording(
       attrs: { isParticipant: resolved.isParticipant },
     },
   });
+  await assertRecordingDocumentRead(req, resolved.detail);
   return resolved.detail;
+}
+
+async function assertRecordingDocumentRead(req: Request, row: Pick<CallRecording, 'lobbyName' | 'documentContext'>): Promise<void> {
+  if (!row.lobbyName?.startsWith('assessment:doc:')) return;
+  const context = recordingArtifactContext(row.lobbyName, row.documentContext);
+  const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7).trim() : '';
+  if (req.user?.authKind !== 'orgiq-hs256' || req.user.orgId !== 'assessment' || !bearer || context?.tenant !== 'assessment'
+    || !await askLobbyAuthority(bearer, row.lobbyName, { documentSourceId: context.documentSourceId })) throw new NotFoundError('recording not found');
+}
+async function recheckRecordingDocument(req: Request, row: CallRecording): Promise<void> {
+  if (!row.lobbyName?.startsWith('assessment:doc:')) return;
+  const latest = await requireOwnRecording(req, row.recordingId);
+  if (latest.lobbyName !== row.lobbyName || latest.documentContext?.sourceId !== row.documentContext?.sourceId) throw new NotFoundError('recording not found');
+}
+async function documentReadableList(req: Request, rows: RecordingListRow[]): Promise<RecordingListRow[]> {
+  const visible: RecordingListRow[] = [];
+  for (let offset = 0; offset < rows.length; offset += 4) {
+    const batch = await Promise.all(rows.slice(offset, offset + 4).map(async row => {
+      if (!row.lobbyName?.startsWith('assessment:doc:')) return row;
+      try {
+        // GSI metadata alone cannot prove current participant membership.
+        const own = await requireOwnRecording(req, row.recordingId);
+        return own.lobbyName === row.lobbyName && own.documentContext?.sourceId === row.documentContext?.sourceId ? row : null;
+      } catch (error) {
+        if (error instanceof AppError && [403, 404, 410].includes(error.status)) return null;
+        throw error;
+      }
+    }));
+    visible.push(...batch.filter((row): row is RecordingListRow => row !== null));
+  }
+  return visible;
 }
 
 /**
@@ -448,6 +493,7 @@ recordingsRouter.get(
     const { recordingId } = req.params;
     const detail = await requireOwnRecording(req, recordingId);
     const media = await resolveMedia(detail);
+    await recheckRecordingDocument(req, detail);
     res.setHeader('Cache-Control', 'private, no-store');
     res.json({ ...publicRecordingView(detail), ...mediaView(detail, media) });
   }),
@@ -516,9 +562,15 @@ export function recordingStage(detail: Pick<CallRecording, 'composeStatus' | 'tr
 
 /** Link only the canonical stored page lobby. Recording a work item/deck does
  * not prove a finer link unless that binding was actually persisted. */
-export function recordingArtifactContext(lobbyName: unknown): { tenant: 'orgiq'; initiativeId: string } | null {
+export function recordingArtifactContext(lobbyName: unknown, documentContext?: { tenant: string; sourceId: string; lobbyName: string }):
+  { tenant: 'orgiq'; initiativeId: string } | { tenant: 'assessment'; documentSourceId: string } | null {
   const match = typeof lobbyName === 'string' ? /^orgiq:initiative:([^:\s]{1,200})$/.exec(lobbyName) : null;
-  return match ? { tenant: 'orgiq', initiativeId: match[1] } : null;
+  if (match) return { tenant: 'orgiq', initiativeId: match[1] };
+  return typeof lobbyName === 'string' && /^assessment:doc:[A-Za-z0-9:_-]{1,256}$/.test(lobbyName)
+    && documentContext?.tenant === 'assessment' && documentContext.lobbyName === lobbyName
+    && typeof documentContext.sourceId === 'string' && documentContext.sourceId.length > 0 && documentContext.sourceId.length <= 1024
+    && !/[\u0000-\u001f\u007f]/.test(documentContext.sourceId)
+    ? { tenant: 'assessment', documentSourceId: documentContext.sourceId } : null;
 }
 
 function publicRecordingView(detail: CallRecording): Record<string, unknown> {
@@ -534,7 +586,7 @@ function publicRecordingView(detail: CallRecording): Record<string, unknown> {
     participants: people.participants,
     participantCount: people.participantCount,
     stage: recordingStage(detail),
-    artifactContext: recordingArtifactContext(detail.lobbyName),
+    artifactContext: recordingArtifactContext(detail.lobbyName, detail.documentContext),
     // The row's ttl is when DynamoDB drops it — which is when the recording
     // expires, and what the card's "Set to expire" line says.
     expiresAt: detail.ttl ? new Date(detail.ttl * 1000).toISOString() : null,
@@ -593,6 +645,7 @@ recordingsRouter.post(
     // and handing the client a URL anyway is precisely how three different
     // situations all became "Playback error."
     const media = await resolveMedia(detail);
+    await recheckRecordingDocument(req, detail);
     if (!media.playbackFilename) {
       res.json({
         ...mediaView(detail, media),
@@ -690,6 +743,7 @@ recordingsRouter.post(
     // `mediaView` builds the URL from the ONE filename `resolveMedia`
     // established actually exists. `playlistUrl` is kept alongside
     // `composedUrl` because RecordingPlayer reads that name.
+    await recheckRecordingDocument(req, detail);
     res.json({
       ...mediaView(detail, media),
       token: token || null,
@@ -1004,6 +1058,7 @@ recordingsRouter.get(
       // ("Connor reacted with 👍") for the recording's time window.
       // Best-effort: a reactions outage or a non-JSON transcript body
       // must not fail transcript serving — fall through to the raw text.
+      let mergedTranscript: ReturnType<typeof mergeReactionsIntoTranscript> | undefined;
       try {
         const doc = JSON.parse(text) as { segments?: Array<{ startMs: number; endMs: number; speakerId: string; speakerLabel: string; text: string }> };
         if (doc && Array.isArray(doc.segments)) {
@@ -1013,13 +1068,11 @@ recordingsRouter.get(
             detail.startedAt,
             detail.endedAt,
           );
-          const merged = mergeReactionsIntoTranscript(
+          mergedTranscript = mergeReactionsIntoTranscript(
             doc as { segments: Array<{ startMs: number; endMs: number; speakerId: string; speakerLabel: string; text: string }> },
             reactions,
             detail.startedAt,
           );
-          res.json(merged);
-          return;
         }
       } catch (mergeErr) {
         log.warn(
@@ -1027,7 +1080,9 @@ recordingsRouter.get(
           '[recordings] reaction merge failed — serving unmerged transcript',
         );
       }
-      res.type('application/json').send(text);
+      await recheckRecordingDocument(req, detail);
+      if (mergedTranscript) res.json(mergedTranscript);
+      else res.type('application/json').send(text);
     } catch (e) {
       if (e instanceof AppError) throw e;
       throw mapSfuError(e);

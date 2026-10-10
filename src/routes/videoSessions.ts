@@ -79,11 +79,13 @@ export const videoSessionsRouter = Router();
 videoSessionsRouter.post('/sessions/:sessionId/call-binding', requireAuth, asyncHandler(async (req, res): Promise<void> => {
   res.setHeader('Cache-Control', 'private, no-store');
   if (req.user?.authKind !== 'orgiq-hs256') throw new ForbiddenError('Signed call identity required');
-  const { lobbyName, callId, participantId, clientId } = req.body ?? {};
+  const { lobbyName, callId, participantId, clientId, documentSourceId } = req.body ?? {};
   const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9:_-]{1,256}$/.test(value);
   if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)
-    || Object.keys(req.body).some(key => !['lobbyName', 'callId', 'participantId', 'clientId'].includes(key))
-    || typeof lobbyName !== 'string' || !lobbyName || lobbyName.length > 256 || !validId(callId) || !validId(participantId) || !validId(clientId)) {
+    || Object.keys(req.body).some(key => !['lobbyName', 'callId', 'participantId', 'clientId', 'documentSourceId'].includes(key))
+    || typeof lobbyName !== 'string' || !lobbyName || lobbyName.length > 256 || !validId(callId) || !validId(participantId) || !validId(clientId)
+    || (documentSourceId !== undefined && (typeof documentSourceId !== 'string' || !documentSourceId || documentSourceId.length > 1024 || /[\u0000-\u001f\u007f]/.test(documentSourceId)))
+    || lobbyName.startsWith('assessment:doc:') !== (documentSourceId !== undefined)) {
     throw new ValidationError('Exact lobby, call, media participant and client identity required');
   }
   const sessionId = String(req.params.sessionId);
@@ -101,7 +103,7 @@ videoSessionsRouter.post('/sessions/:sessionId/call-binding', requireAuth, async
   };
   await lobbyAccess().assertLobbyAccess(req, lobbyName);
   const first = await ownSession();
-  const proof = await askCallSeatAuthority(bearer, { callId, lobbyName, clientId });
+  const proof = await askCallSeatAuthority(bearer, { callId, lobbyName, clientId, ...(documentSourceId !== undefined ? { documentSourceId } : {}) });
   if (proof.userId !== userId || proof.tenant !== req.user.orgId) throw new ForbiddenError('Accepted call seat required');
   await lobbyAccess().assertLobbyAccess(req, lobbyName);
   const latest = await ownSession();
@@ -110,10 +112,11 @@ videoSessionsRouter.post('/sessions/:sessionId/call-binding', requireAuth, async
     const value = await videoSessionRepo.bindCallParticipant(lobbyName, sessionId, participantId, latest.channelArn, {
       callId, clientId, userId, tenant: proof.tenant, epoch: proof.epoch,
       sessionId, channelArn: latest.channelArn, lobbyName,
-      ...(proof.actor ? { actor: proof.actor } : {}), boundAt: new Date().toISOString(),
+      ...(proof.actor ? { actor: proof.actor } : {}), ...(proof.documentContext ? { documentContext: proof.documentContext } : {}), boundAt: new Date().toISOString(),
     });
     if (!value) throw new NotFoundError('Active media participant not found');
-    res.json({ bound: true, callId: value.callId, sessionId, participantId, clientId: value.clientId, lobbyName, channelArn: value.channelArn });
+    res.json({ bound: true, callId: value.callId, sessionId, participantId, clientId: value.clientId, lobbyName, channelArn: value.channelArn,
+      ...(value.documentContext ? { documentContext: value.documentContext } : {}) });
   } catch (error) {
     if (error instanceof VideoCallBindingConflict) throw new AppError(409, 'Media participant is already bound to another call identity');
     throw error;

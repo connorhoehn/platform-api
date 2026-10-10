@@ -43,6 +43,7 @@ import {
   reconcileParticipants,
   type TruthTrack,
 } from '../lib/recording-truth';
+import type { DocumentCallContext } from './VideoSessionStore';
 import { isGovernedRecordingLobby } from '../lib/recording-call-binding';
 
 export const CALL_RECORDINGS_TABLE = tableName('video-call-recordings');
@@ -57,7 +58,7 @@ export const CALL_RECORDINGS_TABLE = tableName('video-call-recordings');
  */
 const HYDRATE_ATTRIBUTES = [
   'recordingId', 'composeStatus', 'composedUrl', 'composedSegment',
-  'segments', 'tracks', 'transcriptStatus', 'summaryStatus', 'transcriptionRequested', 'callBindingStatus', 'callBindingReason', 'recordingGoverned', 'ttl',
+  'segments', 'tracks', 'transcriptStatus', 'summaryStatus', 'transcriptionRequested', 'callBindingStatus', 'callBindingReason', 'recordingGoverned', 'documentContext', 'ttl',
 ] as const;
 const HYDRATE_PROJECTION = HYDRATE_ATTRIBUTES.map((name) => `#${name}`).join(', ');
 const HYDRATE_NAMES: Record<string, string> = Object.fromEntries(
@@ -165,6 +166,8 @@ export interface CallRecording {
   callBindingReason?: string;
   /** Set only by the new governed native resolution path. Legacy rows are unchanged. */
   recordingGoverned?: boolean;
+  /** Only a shared exact accepted document source from recorded JWT seats. */
+  documentContext?: DocumentCallContext;
   /** Internal finalize checkpoint: only initial index creation may be repaired. */
   finalizationState?: 'persisting' | 'persisted';
   /** Successful card/activity effect; a failed or interrupted effect can retry. */
@@ -343,6 +346,8 @@ export interface RecordingListRow {
   callBindingStatus?: CallRecording['callBindingStatus'];
   callBindingReason?: string;
   recordingGoverned?: boolean;
+  /** Only a shared exact accepted document source from recorded JWT seats. */
+  documentContext?: DocumentCallContext;
   recordingId: string;
   startedAt: string;
   endedAt: string;
@@ -799,6 +804,7 @@ export class CallRecordingRepository extends BaseRepository {
       lobbyName: rec.lobbyName,
       callBindingStatus: rec.callBindingStatus,
       recordingGoverned: rec.recordingGoverned,
+      documentContext: rec.documentContext,
       startedAt: rec.startedAt,
       endedAt: rec.endedAt,
       // Media length, not session lifetime. The fan-out row has
@@ -1104,6 +1110,7 @@ export class CallRecordingRepository extends BaseRepository {
       lobbyName: i.lobbyName as string,
       callBindingStatus: i.callBindingStatus as CallRecording['callBindingStatus'],
       recordingGoverned: i.recordingGoverned as boolean | undefined,
+      documentContext: i.documentContext as DocumentCallContext | undefined,
       thumbnailUrl: i.thumbnailUrl as string | undefined,
       composedUrl: i.composedUrl as string | undefined,
       participantCount: i.participantCount as number | undefined,
@@ -1148,7 +1155,7 @@ export class CallRecordingRepository extends BaseRepository {
     const chunks: RecordingListRow[][] = [];
     for (let i = 0; i < rows.length; i += 100) chunks.push(rows.slice(i, i + 100));
 
-    const byId = new Map<string, ComposableRecording & { transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus']; transcriptionRequested?: boolean; callBindingStatus?: CallRecording['callBindingStatus']; callBindingReason?: string; recordingGoverned?: boolean; ttl?: number }>();
+    const byId = new Map<string, ComposableRecording & { transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus']; transcriptionRequested?: boolean; callBindingStatus?: CallRecording['callBindingStatus']; callBindingReason?: string; recordingGoverned?: boolean; documentContext?: DocumentCallContext; ttl?: number }>();
     for (const chunk of chunks) {
       try {
         const res = await this.docClient.send(
@@ -1203,6 +1210,7 @@ export class CallRecordingRepository extends BaseRepository {
         callBindingStatus: primary.callBindingStatus,
         callBindingReason: primary.callBindingReason,
         recordingGoverned: primary.recordingGoverned,
+        documentContext: primary.documentContext,
         // The primary's ttl is the expiry; the fan-out row mirrors it but the
         // primary is what PATCH /expiry writes first.
         ttl: typeof primary.ttl === 'number' ? primary.ttl : r.ttl,
@@ -1283,6 +1291,7 @@ export class CallRecordingRepository extends BaseRepository {
         callBindingStatus: i.callBindingStatus,
         callBindingReason: i.callBindingReason,
         recordingGoverned: i.recordingGoverned,
+        documentContext: i.documentContext,
         ttl: typeof i.ttl === 'number' ? (i.ttl as number) : undefined,
         // Distinct PEOPLE. Deliberately re-derived instead of reading the
         // stored scalar: legacy rows stored `participants.length`, which

@@ -20,13 +20,13 @@ const body = { lobbyName: 'orgiq:initiative:p-observability', callId: 'call-one'
 const participant = { participantId: 'pid-one', userId: 'alice', clientId: 'client-one', displayName: 'Alice', joinedAt: '2026-10-10T12:00:00Z' };
 const row = (): VideoSessionRecord => ({ documentId: body.lobbyName, sessionId: 'sess-one', channelArn: 'arn-one', streamKey: '', orgId: 'orgiq', startedBy: 'alice', status: 'active', startedAt: participant.joinedAt, participants: [participant], participantHistory: { 'pid-one': { ...participant } } });
 const app = express().use(express.json()).use((req, _res, next) => {
-  req.user = { sub: 'alice', orgId: 'orgiq', ...(req.headers['x-test-auth-kind'] !== 'dev' ? { authKind: 'orgiq-hs256' as const } : {}) }; next();
+  req.user = { sub: 'alice', orgId: req.headers['x-test-tenant'] === 'assessment' ? 'assessment' : 'orgiq', ...(req.headers['x-test-auth-kind'] !== 'dev' ? { authKind: 'orgiq-hs256' as const } : {}) }; next();
 }).use('/api/video', videoSessionsRouter).use(errorHandler);
 let server: Server, base: string;
 beforeAll(async () => { await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', resolve); }); base = `http://127.0.0.1:${(server.address() as { port: number }).port}`; });
 afterAll(async () => { server.closeIdleConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); });
-const post = async (input: object = body, dev = false) => {
-  const res = await fetch(`${base}/api/video/sessions/sess-one/call-binding`, { method: 'POST', headers: { Authorization: 'Bearer fixture', 'Content-Type': 'application/json', ...(dev ? { 'x-test-auth-kind': 'dev' } : {}) }, body: JSON.stringify(input) });
+const post = async (input: object = body, dev = false, tenant = 'orgiq') => {
+  const res = await fetch(`${base}/api/video/sessions/sess-one/call-binding`, { method: 'POST', headers: { Authorization: 'Bearer fixture', 'Content-Type': 'application/json', 'x-test-tenant': tenant, ...(dev ? { 'x-test-auth-kind': 'dev' } : {}) }, body: JSON.stringify(input) });
   return { status: res.status, body: await res.json(), headers: Object.fromEntries(res.headers.entries()) };
 };
 beforeEach(async () => {
@@ -74,4 +74,27 @@ test('host authority revoked during callback and immutable conflict preserve pri
   mockLobby.mockReset().mockResolvedValue(undefined);
   jest.spyOn(mockStore, 'bindCallParticipant').mockRejectedValue(new VideoCallBindingConflict());
   expect((await post()).status).toBe(409);
+});
+test('verified document source survives genuine first binding/ACK and conflicting source cannot overwrite', async () => {
+  const lobbyName = 'assessment:doc:h:abc', sourceId = 'ec:standards/ci-cd.md';
+  const documentContext = { tenant: 'assessment', sourceId, lobbyName };
+  const docBody = { ...body, lobbyName, documentSourceId: sourceId };
+  await mockStore.createSession({ ...row(), documentId: lobbyName, orgId: 'assessment' });
+  mockAuthority.mockResolvedValue({ allowed: true, callId: body.callId, clientId: body.clientId, lobbyName, userId: 'alice', tenant: 'assessment', epoch: 2, documentContext });
+  const first = await post(docBody, false, 'assessment');
+  expect(first.status).toBe(200); expect(first.body).toMatchObject({ documentContext });
+  expect(mockAuthority).toHaveBeenCalledWith('fixture', { callId: body.callId, clientId: body.clientId, lobbyName, documentSourceId: sourceId });
+  const accepted = (await mockStore.getSession(lobbyName, 'sess-one'))!.participantHistory!['pid-one']!.callBinding;
+  expect(accepted?.documentContext).toEqual(documentContext);
+  expect((await post(docBody, false, 'assessment')).status).toBe(200);
+  mockAuthority.mockResolvedValue({ allowed: true, callId: body.callId, clientId: body.clientId, lobbyName, userId: 'alice', tenant: 'assessment', epoch: 2, documentContext: { ...documentContext, sourceId: 'other' } });
+  expect((await post({ ...docBody, documentSourceId: 'other' }, false, 'assessment')).status).toBe(409);
+  expect((await mockStore.getSession(lobbyName, 'sess-one'))!.participantHistory!['pid-one']!.callBinding).toEqual(accepted);
+});
+test('source hint is required only on existing Assessment document calls and cannot invent Work document family', async () => {
+  expect((await post({ ...body, documentSourceId: 'source' })).status).toBe(400);
+  expect((await post({ ...body, lobbyName: 'assessment:doc:h:abc' }, false, 'assessment')).status).toBe(400);
+  expect((await post({ ...body, lobbyName: 'orgiq:doc:source', documentSourceId: 'source' })).status).toBe(400);
+  expect((await post({ ...body, lobbyName: 'assessment:doc:h:abc', documentSourceId: 'a\u0000bad' }, false, 'assessment')).status).toBe(400);
+  expect(mockAuthority).not.toHaveBeenCalled();
 });

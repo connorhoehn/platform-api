@@ -29,3 +29,18 @@ test('redirect is refused rather than accepting proof from another endpoint', as
   fetchImpl.mockResolvedValue(new Response('', { status: 302, headers: { Location: 'http://elsewhere.invalid/call-seat' } }));
   await expect(ask()).rejects.toMatchObject({ status: 503 });
 });
+test('document callback forwards original source and accepts only exact validated context', async () => {
+  const docRequest = { ...request, lobbyName: 'assessment:doc:h:abc', documentSourceId: 'ec:standards/ci-cd.md' };
+  const context = { tenant: 'assessment', sourceId: docRequest.documentSourceId, lobbyName: docRequest.lobbyName };
+  const docProof = { ...proof, ...docRequest, tenant: 'assessment', documentContext: context };
+  const read = () => askCallSeatAuthority('fixture', docRequest, { url: 'http://bff.invalid/api/realtime/call-seat', fetchImpl });
+  fetchImpl.mockResolvedValue(new Response(JSON.stringify(docProof)));
+  expect(await read()).toEqual(docProof);
+  expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual(docRequest);
+  for (const documentContext of [undefined, { ...context, sourceId: 'other' }, { ...context, tenant: 'orgiq' }, { ...context, lobbyName: 'assessment:doc:other' }]) {
+    fetchImpl.mockResolvedValue(new Response(JSON.stringify({ ...docProof, documentContext })));
+    await expect(read()).rejects.toMatchObject({ status: 503 });
+  }
+  fetchImpl.mockResolvedValue(new Response(JSON.stringify({ ...proof, documentContext: context })));
+  await expect(ask()).rejects.toMatchObject({ status: 503 });
+});

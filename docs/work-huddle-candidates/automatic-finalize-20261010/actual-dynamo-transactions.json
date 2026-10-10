@@ -1,0 +1,63 @@
+{
+  "at": "2026-10-10T17:38:40.063Z",
+  "pass": true,
+  "sourceHashes": {
+    "src/repositories/CallRecordingRepository.ts": "1e472156fd7d223747f094a3592d0532d8bae0dba0008fc66a09aeab947c63c2",
+    "src/recordings/recordingPipelines.ts": "0baec74a0e5d974e684ff0284f978b7dc105bcc486cf5ca0bb35b23a10173954",
+    "src/lib/recording-truth.ts": "e7a623480114c1935b3d0ac28ad900a4d3c7a3884896fd78584b392576787c70",
+    "scripts/recording-finalize-acceptance.cjs": "50384a3f3e4e81c9387fe46f676e6c1915184272f6e9ebf06ff78e8ca4a732e9"
+  },
+  "resource": {
+    "name": "meeting-finalize-native-7f88c247-ddb",
+    "id": "65159076e0070111f97809828fa84e53b43b3fd37390b6a6ed6e860c27a66d08",
+    "image": "sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab",
+    "host": "127.0.0.1",
+    "port": 61468
+  },
+  "checks": [
+    {
+      "name": "actual-insert-once-ready-artifacts-completed-untag",
+      "pass": true,
+      "beforeHash": "2fa41a4eb595d4ea6662599b6c782c4bc3f37b80c43e8d674c3f0c85dccc15bf",
+      "afterHash": "2fa41a4eb595d4ea6662599b6c782c4bc3f37b80c43e8d674c3f0c85dccc15bf"
+    },
+    {
+      "name": "actual-transaction-rejects-late-repair-after-completed-untag",
+      "pass": true
+    },
+    {
+      "name": "actual-100-item-transaction-bound-and-partial-transport-repair",
+      "pass": true,
+      "participants": 150,
+      "transportFailureIsInjected": true
+    },
+    {
+      "name": "actual-single-automatic-claim-and-progress-aware-failure-fence",
+      "pass": true
+    },
+    {
+      "name": "actual-explicit-manual-regeneration-compatible",
+      "pass": true
+    },
+    {
+      "name": "actual-announcement-checkpoint-and-empty-index-completion",
+      "pass": true
+    }
+  ],
+  "cleanup": [
+    {
+      "table": "finalize_acceptance_d4a7479723e0414fbb56ac06ed59d26d_video-call-recordings",
+      "deleted": true
+    },
+    {
+      "table": "finalize_acceptance_d4a7479723e0414fbb56ac06ed59d26d_video-call-recording-participants",
+      "deleted": true
+    }
+  ],
+  "boundaries": [
+    "Actual native repository + actual Dynamo transactions/conditional writes, synthetic authority fixtures.",
+    "No engine/model/gateway/call/media/shared service actions.",
+    "Cache invalidation inert; large-index interruption is explicit transport fault injection.",
+    "No full webhook-to-paid-transcription orchestration claim."
+  ]
+}
