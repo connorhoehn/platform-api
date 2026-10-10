@@ -30,7 +30,7 @@ const findByChannelArnMock = jest.fn().mockResolvedValue([]);
 const updateTranscriptStatusMock = jest.fn().mockResolvedValue(undefined);
 jest.mock('../../repositories', () => ({
   callRecordingRepo: {
-    putRecording: putRecordingMock,
+    putFinalizedRecording: async (row: unknown) => { await putRecordingMock(row); return { recording: row, replay: false, announcementPending: true }; },
     updateTranscriptStatus: updateTranscriptStatusMock,
   },
   videoSessionRepo: {
@@ -232,6 +232,7 @@ describe('lvsWebhooks — POST /recording bare envelope normalization', () => {
         segments: [],
         totalSize: 0,
         durationMs: 5000,
+        startedAt: '2026-05-23T12:00:00.000Z', endedAt: '2026-05-23T12:00:05.000Z',
         destination: 'local',
       },
     };
@@ -559,6 +560,7 @@ describe('lvsWebhooks — what the persisted row is allowed to claim', () => {
         documentId: 'dm:dev-bob:dev-hank',
         sessionId: 'sess-1',
         channelArn: 'arn:caller',
+        startedAt: '2026-08-26T02:22:42.000Z', endedAt: '2026-08-26T02:23:42.558Z',
         startedBy: 'dev-hank',
         participants: [
           {
@@ -582,7 +584,7 @@ describe('lvsWebhooks — what the persisted row is allowed to claim', () => {
         destination: 'local',
         startedAt: '2026-08-26T02:23:24.679Z',
         endedAt: '2026-08-26T02:23:42.558Z',
-        tracks: [{ legId: 'leg-001', participantId: 'p-1', startedAtMs: 3, endedAtMs: 21_000 }],
+        tracks: [{ legId: 'leg-001', participantId: 'p-1', userId: 'dev-bob', startedAtMs: 3, endedAtMs: 21_000 }],
       },
     });
 
@@ -603,6 +605,7 @@ describe('lvsWebhooks — what the persisted row is allowed to claim', () => {
         documentId: 'dm:dev-bob:dev-hank',
         sessionId: 'sess-2',
         channelArn: 'arn:rejoin',
+        startedAt: '2026-08-24T22:07:20.000Z', endedAt: '2026-08-24T22:07:45.000Z',
         startedBy: 'dev-hank',
         participants: [
           { userId: 'dev-hank', displayName: 'Hank Hill', joinedAt: '2026-08-24T22:07:20.000Z' },
@@ -628,8 +631,8 @@ describe('lvsWebhooks — what the persisted row is allowed to claim', () => {
         startedAt: '2026-08-24T22:07:23.349Z',
         endedAt: '2026-08-24T22:07:45.000Z',
         tracks: [
-          { legId: 'leg-001', participantId: 'p-1', startedAtMs: 3, endedAtMs: 21_000 },
-          { legId: 'leg-002', participantId: 'p-2', startedAtMs: 8, endedAtMs: 21_100 },
+          { legId: 'leg-001', participantId: 'p-1', userId: 'dev-hank', startedAtMs: 3, endedAtMs: 21_000 },
+          { legId: 'leg-002', participantId: 'p-2', userId: 'dev-bob', startedAtMs: 8, endedAtMs: 21_100 },
         ],
       },
     });
@@ -648,6 +651,7 @@ describe('lvsWebhooks — what the persisted row is allowed to claim', () => {
         documentId: 'room:standup',
         sessionId: 'sess-3',
         channelArn: 'arn:stale',
+        startedAt: '2026-08-23T21:26:30.000Z', endedAt: '2026-08-23T21:27:10.000Z',
         startedBy: 'dev-hank',
         participants: [
           { userId: 'dev-hank', joinedAt: '2026-08-23T21:26:30.000Z' },
@@ -670,8 +674,8 @@ describe('lvsWebhooks — what the persisted row is allowed to claim', () => {
         startedAt: '2026-08-23T21:26:40.268Z',
         endedAt: '2026-08-23T21:27:10.000Z',
         tracks: [
-          { legId: 'leg-001', participantId: 'p-1', startedAtMs: 3, endedAtMs: 28_000 },
-          { legId: 'leg-002', participantId: 'p-2', startedAtMs: 9, endedAtMs: 28_100 },
+          { legId: 'leg-001', participantId: 'p-1', userId: 'dev-hank', startedAtMs: 3, endedAtMs: 28_000 },
+          { legId: 'leg-002', participantId: 'p-2', userId: 'dev-bob', startedAtMs: 9, endedAtMs: 28_100 },
         ],
       },
     });
@@ -758,7 +762,7 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
     // Exactly one status write: 'pending'. Nothing corrects a publish that
     // did not fail.
     expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(1);
-    expect(updateTranscriptStatusMock.mock.calls[0]![2]).toEqual({ status: 'pending' });
+    expect(updateTranscriptStatusMock.mock.calls[0]![2]).toMatchObject({ status: 'pending', onlyIfUnclaimed: true, processingAttemptId: expect.any(String), summaryStatus: 'pending', summaryMarkdown: null });
   });
 
   test('a publish that throws marks the row failed with the reason, not pending', async () => {
@@ -771,10 +775,11 @@ describe('lvsWebhooks — a transcription enqueue that fails says so on the row'
     expect(putRecordingMock).toHaveBeenCalledTimes(1);
 
     expect(updateTranscriptStatusMock).toHaveBeenCalledTimes(2);
-    expect(updateTranscriptStatusMock.mock.calls[0]![2]).toEqual({ status: 'pending' });
+    expect(updateTranscriptStatusMock.mock.calls[0]![2]).toMatchObject({ status: 'pending', onlyIfUnclaimed: true, processingAttemptId: expect.any(String), summaryStatus: 'pending', summaryMarkdown: null });
 
     const corrective = updateTranscriptStatusMock.mock.calls[1]![2];
     expect(corrective.status).toBe('failed');
+    expect(corrective.expectedProcessingAttemptId).toBe(updateTranscriptStatusMock.mock.calls[0]![2].processingAttemptId);
     // The reason travels with it. Without this the FE's only signal is the
     // stall timer, which cannot tell "the queue was down" from "the worker
     // is not running" — two different things to go and fix.

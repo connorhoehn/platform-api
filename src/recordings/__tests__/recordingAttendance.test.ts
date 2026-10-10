@@ -10,7 +10,7 @@ let mockSessions: MemoryVideoSessionStore;
 let mockRecordings: CallRecordingRepository;
 jest.mock('../../repositories', () => ({
   videoSessionRepo: { findByChannelArn: (arn: string) => mockSessions.findByChannelArn(arn) },
-  callRecordingRepo: { putRecording: (row: never) => mockRecordings.putRecording(row) },
+  callRecordingRepo: { putFinalizedRecording: (row: never) => mockRecordings.putFinalizedRecording(row) },
   callReactionRepo: {},
 }));
 jest.mock('../../lib/redis-client', () => ({ getRedisClient: jest.fn().mockResolvedValue(null) }));
@@ -38,6 +38,17 @@ function recordingClient(): DynamoDBDocumentClient {
       const key = row.userId ? { userId: row.userId, startedAtRecordingId: row.startedAtRecordingId }
         : { callId: row.callId, recordingId: row.recordingId };
       tables.set(input.TableName, [...rows.filter(existing => !matches(existing, key)), structuredClone(row)]);
+      return {};
+    }
+    if (command.constructor.name === 'TransactWriteCommand') {
+      const checkpoint = input.TransactItems[0].Update ?? input.TransactItems[0].ConditionCheck;
+      const row = (tables.get(checkpoint.TableName) ?? []).find(row => matches(row, checkpoint.Key));
+      if (!row || row.finalizationState !== 'persisting') throw new Error('invalid initial checkpoint');
+      for (const { Put } of input.TransactItems.slice(1)) {
+        const items = tables.get(Put.TableName) ?? [];
+        tables.set(Put.TableName, [...items.filter(item => !matches(item, { userId: Put.Item.userId, startedAtRecordingId: Put.Item.startedAtRecordingId })), structuredClone(Put.Item)]);
+      }
+      if (input.TransactItems[0].Update) row.finalizationState = 'persisted';
       return {};
     }
     if (command.constructor.name === 'QueryCommand') return { Items: rows.filter(row => row.recordingId === input.ExpressionAttributeValues[':r']) };
@@ -208,4 +219,18 @@ it('exact trusted recorded legs can identify the original session when times are
   }, {} as never);
   expect(resolved.output).toMatchObject({ sessionId: 'actual', startedBy: 'u-vera' });
   expect((resolved.output as any).participants.map((p: any) => p.userId).sort()).toEqual(['u-nora', 'u-vera']);
+});
+
+// Labels may be sparse across historical rejoin rows; this never adds users.
+it.each([undefined, '', '   '])('preserves a same-user attendance label when a rejoin label is %p', displayName => {
+  const people = recordingSessionParticipants({ participants: [{ userId: 'one', displayName: 'Known Person', joinedAt: START },
+    { userId: 'one', displayName, joinedAt: START }] }, { startedAt: START, endedAt: END, tracks: [{ userId: 'one' }] });
+  expect(people).toEqual([{ userId: 'one', displayName: 'Known Person', joinedAt: START }]);
+});
+it('keeps a newer explicit label and never carries a label to another user sharing an opaque seat', () => {
+  expect(recordingSessionParticipants({ participants: [{ userId: 'one', displayName: 'Before' }, { userId: 'one', displayName: 'After' }] },
+    { tracks: [{ userId: 'one' }] })).toEqual([{ userId: 'one', displayName: 'After' }]);
+  expect(recordingSessionParticipants({ participants: [{ participantId: 'opaque-seat', userId: 'one', displayName: 'Before' },
+    { participantId: 'opaque-seat', userId: 'other' }] }, { tracks: [{ participantId: 'opaque-seat' }] }))
+    .toEqual([{ participantId: 'opaque-seat', userId: 'other' }]);
 });

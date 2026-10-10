@@ -432,7 +432,7 @@ function persistHandler(): DescribedStepHandler {
       const transcribe = detail.transcribe === true || detail.transcribe === 'true';
       const profile = resolveRecordingProfile({ recordingProfile: str(detail.recordingProfile), transcribe,
         composePerPeer: detail.composePerPeer === true || detail.composePerPeer === 'true', overrides: transcribe ? { transcribe: true } : undefined });
-      await callRecordingRepo.putRecording({
+      const finalized = await callRecordingRepo.putFinalizedRecording({
         callId: str(ctx.callId)!, recordingId, channelArn: arn, lobbyName: str(ctx.lobbyName) ?? '', sessionId: str(ctx.sessionId),
         callBindingStatus: ctx.callBindingStatus === 'bound' || ctx.callBindingStatus === 'legacy' ? ctx.callBindingStatus : 'unresolved',
         callBindingReason: str(ctx.callBindingReason),
@@ -446,26 +446,12 @@ function persistHandler(): DescribedStepHandler {
         ...(str(ctx.organizationId) ? { orgId: str(ctx.organizationId) } : {}),
         thumbnailUrl: str(detail.thumbnailUrl), composedUrl: str(detail.composedUrl), tracks: rawTracks.length ? (rawTracks as unknown as CallRecording['tracks']) : undefined,
       });
-      // Only an organization captured in the authenticated session row can
-      // produce activity. Legacy/LVS-only rows intentionally remain private.
-      const organizationId = str(ctx.organizationId);
-      if (organizationId && startedBy) {
-        const publication = await platformWorkGraphSourcePublisher.meeting({
-          kind: 'recording',
-          meetingId: str(ctx.callId)!,
-          recordingId,
-          recordingOwnerId: startedBy,
-          eventType: 'sfu.recording.completed',
-          organizationId,
-          participantSubject: startedBy,
-          occurredAt: endedAt,
-          sourceSequence: `recording-ready:${recordingId}:${endedAt}`,
-        }, { organizationId, sourceSubject: startedBy });
-        if (!publication.published) {
-          log.warn({ recordingId, reason: publication.reason }, '[recording-pipeline] work graph recording lifecycle denied');
-        }
-      }
-      return ok({ startedAt, endedAt, mediaDurationMs, participantCount: reconciled.participantCount, startedBy, organizationId });
+      const saved = finalized.recording;
+      return ok({ arn: saved.channelArn, callId: saved.callId, recordingId: saved.recordingId, sessionId: saved.sessionId,
+        startedAt: saved.startedAt, endedAt: saved.endedAt, mediaDurationMs: saved.durationMs,
+        participantCount: saved.participantCount ?? saved.participants.length, participants: saved.participants,
+        startedBy: saved.startedBy, organizationId: saved.orgId, lobbyName: saved.lobbyName,
+        finalizationReplay: finalized.replay, finalizationAnnouncementPending: finalized.announcementPending });
     },
   };
 }
@@ -481,6 +467,14 @@ function awaitComposeHandler(): DescribedStepHandler {
       'composeStatus, and the composed file\'s key and size once there is one.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>): Promise<StepOutcome> {
       const arn = str(ctx.arn)!; const recordingId = str(ctx.recordingId)!; const callId = str(ctx.callId)!;
+      if (typeof ctx.finalizationReplay === 'boolean') {
+        const saved = await callRecordingRepo.getRecording(callId, recordingId, { consistentRead: true });
+        if (!saved || saved.channelArn !== arn) return fail('saved recording composition context is unavailable');
+        const savedKey = str(saved.composedSegment?.key) ?? str(saved.composedSegment?.url) ?? str(saved.composedUrl);
+        const savedStatus = saved.composeStatus ?? (savedKey ? 'ok' : undefined);
+        if (savedStatus && SETTLED_COMPOSE.has(savedStatus)) return ok({ composeStatus: savedStatus,
+          composedKey: savedKey ?? null, composedBytes: saved.composedSegment?.size ?? null, reusedSavedComposition: true });
+      }
       const res = await callSfu(`${VIDEO_API_URL}/api/channels/${encodeURIComponent(arn)}/recordings`, { method: 'GET', headers: lvsAuth() });
       if (!res.ok) return fail(`LVS listed recordings with ${res.status}`);
       const body = (await res.json()) as { recordings?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>;
@@ -563,14 +557,33 @@ function announceHandler(): DescribedStepHandler {
     emits:
       'Whether a card was posted, and to which channel.',
     async execute(_n: PipelineNode, ctx: Record<string, unknown>, helpers): Promise<StepOutcome> {
+      if (ctx.finalizationAnnouncementPending === false) return ok({ posted: false, channel: null, reason: 'already announced' });
+      if (ctx.finalizationAnnouncementPending === true) {
+        const saved = await callRecordingRepo.getRecording(str(ctx.callId)!, str(ctx.recordingId)!, { consistentRead: true });
+        if (!saved || saved.finalizationState !== 'persisted') return fail('recording announcement checkpoint is unavailable');
+        if (saved.finalizationAnnouncedAt) return ok({ posted: false, channel: null, reason: 'already announced' });
+      }
+      const organizationId = str(ctx.organizationId), startedBy = str(ctx.startedBy), endedAt = str(ctx.endedAt);
+      // Stable sourceSequence lets the native graph deduplicate a retry. Chat
+      // remains at-least-once across a lost acknowledgement/concurrent delivery.
+      if (organizationId && startedBy && endedAt) {
+        const publication = await platformWorkGraphSourcePublisher.meeting({ kind: 'recording', meetingId: str(ctx.callId)!,
+          recordingId: str(ctx.recordingId)!, recordingOwnerId: startedBy, eventType: 'sfu.recording.completed',
+          organizationId, participantSubject: startedBy, occurredAt: endedAt,
+          sourceSequence: `recording-ready:${str(ctx.recordingId)}:${endedAt}`,
+        }, { organizationId, sourceSubject: startedBy });
+        if (!publication.published) log.warn({ recordingId: ctx.recordingId, reason: publication.reason }, '[recording-pipeline] work graph recording lifecycle denied');
+      }
       const channel = chatChannelForLobby(str(ctx.lobbyName));
       if (!channel) {
         log.info({ lobbyName: ctx.lobbyName, runId: helpers.runId, reason: 'lobby has no conversation' }, '[recording-pipeline] recording card not posted');
+        if (ctx.finalizationAnnouncementPending === true) await callRecordingRepo.markFinalizationAnnounced(str(ctx.callId)!, str(ctx.recordingId)!);
         return ok({ posted: false, channel: null });
       }
       const card = recordingCardMetadata(ctx, helpers.runId);
       try {
         await postChatMessage({ channel, ...card });
+        if (ctx.finalizationAnnouncementPending === true) await callRecordingRepo.markFinalizationAnnounced(str(ctx.callId)!, str(ctx.recordingId)!);
         return ok({ posted: true, channel });
       } catch (e) {
         log.warn({ err: e instanceof Error ? e.message : String(e), channel }, '[recording-pipeline] could not post the recording card');
@@ -594,14 +607,30 @@ type TranscriptionSource = Pick<CallRecording, 'callId' | 'recordingId' | 'chann
 /** A trusted native starter claims a generation before dispatch. No user-supplied
  * token is accepted, and an old completion cannot replace this generation. */
 export async function startRecordingTranscription(rec: TranscriptionSource, userId: string, deps: RecordingPipelineDeps = {}): Promise<{ runId: string; processingAttemptId: string }> {
-  const definition = buildCallTranscriptionDefinition();
+  return (await startRecordingTranscriptionAttempt(rec, userId, deps, false))!;
+}
+
+async function startRecordingTranscriptionAttempt(rec: TranscriptionSource, userId: string, deps: RecordingPipelineDeps, automatic: boolean): Promise<{ runId: string; processingAttemptId: string } | null> {
+  // A completed automatic replay does not need current model configuration.
+  // Explicit requests still validate configuration before replacing artifacts.
+  const definition = automatic ? undefined : buildCallTranscriptionDefinition();
   const processingAttemptId = randomUUID();
-  await callRecordingRepo.updateTranscriptStatus(rec.callId, rec.recordingId, {
-    status: 'pending', processingAttemptId, transcriptError: null, transcriptionRequested: true,
-    summaryStatus: 'pending', summaryRunId: null, summaryError: null, summaryMarkdown: null, summaryKey: null, summaryGeneratedAt: null,
-  });
   try {
-    const runId = await (deps.startRun ?? startSystemRun)(CALL_TRANSCRIPTION_PIPELINE_ID, definition, {
+    await callRecordingRepo.updateTranscriptStatus(rec.callId, rec.recordingId, {
+      status: 'pending', processingAttemptId, transcriptError: null, transcriptionRequested: true,
+      summaryStatus: 'pending', summaryRunId: null, summaryError: null, summaryMarkdown: null, summaryKey: null, summaryGeneratedAt: null,
+      ...(automatic ? { onlyIfUnclaimed: true } : {}),
+    });
+  } catch (error) {
+    if (!automatic || !(error instanceof Error) || error.name !== 'ConditionalCheckFailedException') throw error;
+    const current = await callRecordingRepo.getRecording(rec.callId, rec.recordingId, { consistentRead: true });
+    if (!current || (!current.processingAttemptId && !current.transcriptStatus)) throw error;
+    return null;
+  }
+  // A process loss after this claim is bounded by the native status clock/stall
+  // response and requires explicit retry. We never risk duplicate paid enqueue.
+  try {
+    const runId = await (deps.startRun ?? startSystemRun)(CALL_TRANSCRIPTION_PIPELINE_ID, definition ?? buildCallTranscriptionDefinition(), {
       recordingId: rec.recordingId, callId: rec.callId, arn: rec.channelArn, lobbyName: rec.lobbyName,
       composedKey: rec.composedSegment?.key ?? null, startedAt: rec.startedAt,
       documentId: rec.documentId ?? documentIdForLobby(rec.lobbyName), callKind: rec.callKind ?? null,
@@ -613,7 +642,7 @@ export async function startRecordingTranscription(rec: TranscriptionSource, user
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     await callRecordingRepo.updateTranscriptStatus(rec.callId, rec.recordingId, {
-      status: 'failed', expectedProcessingAttemptId: processingAttemptId, transcriptError: `enqueue failed: ${reason}`,
+      status: 'failed', expectedProcessingAttemptId: processingAttemptId, expectedTranscriptStatus: 'pending', transcriptError: `enqueue failed: ${reason}`,
       summaryStatus: 'failed', summaryError: 'transcription could not be started',
     }).catch(() => undefined);
     throw error;
@@ -640,12 +669,13 @@ function startTranscriptionHandler(deps: RecordingPipelineDeps = {}): DescribedS
       if (ctx.composeStatus !== 'ok' && ctx.composeStatus !== 'degraded') return ok({ started: false, reason: `nothing to transcribe (compose ${String(ctx.composeStatus)})` });
       const callId = str(ctx.callId)!; const recordingId = str(ctx.recordingId)!;
       try {
-        const out = await startRecordingTranscription({
+        const out = await startRecordingTranscriptionAttempt({
           recordingId, callId, channelArn: str(ctx.arn) ?? '', lobbyName: str(ctx.lobbyName),
           composedSegment: str(ctx.composedKey) ? { key: str(ctx.composedKey)! } as CallRecording['composedSegment'] : undefined,
           startedAt: str(ctx.startedAt), documentId: str(ctx.documentId) ?? null, callKind: str(ctx.callKind) ?? null,
           orgId: str(ctx.organizationId), startedBy: str(ctx.startedBy),
-        }, 'system', deps);
+        }, 'system', deps, true);
+        if (!out) return ok({ started: false, reason: 'transcription already claimed' });
         return ok({ started: true, transcriptionRunId: out.runId, processingAttemptId: out.processingAttemptId });
       } catch (err) {
         // The row must say why there is no transcript; "pending" forever is the

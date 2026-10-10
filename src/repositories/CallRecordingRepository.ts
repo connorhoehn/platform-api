@@ -33,6 +33,7 @@ import {
   DeleteCommand,
   UpdateCommand,
   BatchGetCommand,
+  TransactWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
@@ -164,6 +165,10 @@ export interface CallRecording {
   callBindingReason?: string;
   /** Set only by the new governed native resolution path. Legacy rows are unchanged. */
   recordingGoverned?: boolean;
+  /** Internal finalize checkpoint: only initial index creation may be repaired. */
+  finalizationState?: 'persisting' | 'persisted';
+  /** Successful card/activity effect; a failed or interrupted effect can retry. */
+  finalizationAnnouncedAt?: string;
   startedAt: string; // ISO
   endedAt: string; // ISO
   /**
@@ -707,65 +712,131 @@ export class CallRecordingRepository extends BaseRepository {
           Key: { userId, startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}` } }))));
     }
 
-    // Fan out participant index rows. Promise.all is fine — DDB
-    // PutItem is independent per row, and we want one round-trip-batch
-    // not 5 serial calls for a 5-person call.
-    if (fanoutUserIds.size > 0) {
-      await Promise.all(
-        Array.from(fanoutUserIds).map((userId) =>
-          this.docClient.send(
-            new PutCommand({
-              TableName: this.participantsTable,
-              Item: {
-                userId,
-                startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}`,
-                callId: rec.callId,
-                recordingId: rec.recordingId,
-                channelArn: rec.channelArn,
-                lobbyName: rec.lobbyName,
-                callBindingStatus: rec.callBindingStatus,
-                recordingGoverned: rec.recordingGoverned,
-                startedAt: rec.startedAt,
-                endedAt: rec.endedAt,
-                // Media length, not session lifetime. The fan-out row has
-                // no tracks[] of its own, so this value cannot be re-derived
-                // on read — it is the reason the backfill script has to
-                // touch BOTH tables (scripts/backfill-recording-truth.ts).
-                durationMs: rec.durationMs,
-                sessionDurationMs: rec.sessionDurationMs,
-                // W8 — denormalize so list view doesn't need a join
-                // back to the primary table for thumbnail rendering.
-                thumbnailUrl: rec.thumbnailUrl,
-                // R2 — denormalize composedUrl onto the fan-out row so
-                // the list view can pick "playback target" without a
-                // join. tracks[] stays on the primary record (only the
-                // detail view needs the raw per-peer URLs).
-                composedUrl: rec.composedUrl,
-                // Denormalize the reconciled PEOPLE count for the chip
-                // render. `participants[]` has already been deduped by
-                // userId and scoped to this recording by the webhook, so
-                // the `.length` fallback is now a people count too — it
-                // used to be a join count (one entry per rejoin), which is
-                // how a 2-person DM rendered "7 👥".
-                participantCount: rec.participantCount ?? rec.participants?.length ?? 0,
-                // Denormalize identities so the list view can render
-                // "DM · Bob Martinez & Hank Hill" instead of splitting raw
-                // userIds out of the lobby string. Capped so a large room
-                // can't push the index row toward the 400KB item limit.
-                participants: (rec.participants ?? [])
-                  .slice(0, FANOUT_PARTICIPANT_CAP)
-                  .map((p) => ({ userId: p.userId, displayName: p.displayName })),
-                ttl,
-              },
-            }),
-          ),
-        ),
-      );
+    await this.writeParticipantIndex(full, fanoutUserIds);
+  }
+
+  /** Webhook finalization is insert-once, unlike an explicit metadata correction.
+   * Never replace existing processing/artifact fields or recreate completed
+   * index rows that a participant has untagged. A failed initial index batch
+   * retains its checkpoint so a retry can repair it from the stored row.
+   */
+  async putFinalizedRecording(rec: Omit<CallRecording, 'ttl'>): Promise<{ recording: CallRecording; replay: boolean; announcementPending: boolean }> {
+    const full: CallRecording = { ...rec, ttl: Math.floor(Date.now() / 1000) + RETENTION_DAYS * 86400, finalizationState: 'persisting' };
+    let stored = full;
+    let replay = false;
+    try {
+      await this.docClient.send(new PutCommand({ TableName: CALL_RECORDINGS_TABLE, Item: full,
+        ConditionExpression: 'attribute_not_exists(callId) AND attribute_not_exists(recordingId)' }));
+      void recordingLocator.noteWrite(CALL_RECORDINGS_TABLE, full);
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'ConditionalCheckFailedException') throw error;
+      const existing = await this.getRecording(rec.callId, rec.recordingId, { consistentRead: true });
+      if (!existing) throw new Error('finalized recording disappeared during replay');
+      stored = existing; replay = true;
+    }
+    if (stored.finalizationState === 'persisting') {
+      try {
+        await this.writeInitialParticipantIndex(stored);
+      } catch (error) {
+        // Another finalize may have completed first, or a successful transaction
+        // may lose its response. Only an authoritative completed checkpoint lets
+        // this writer recover; unfinished/storage failures remain failures.
+        const current = await this.getRecording(stored.callId, stored.recordingId, { consistentRead: true });
+        if (!current || current.finalizationState !== 'persisted') throw error;
+      }
+      // Read back all fields: an accepted child/manual attempt may have advanced
+      // while another finalize delivery repaired this initial index checkpoint.
+      const current = await this.getRecording(stored.callId, stored.recordingId, { consistentRead: true });
+      if (!current || current.finalizationState !== 'persisted') throw new Error('finalized recording index checkpoint is unavailable');
+      stored = current;
+    }
+    return { recording: stored, replay, announcementPending: !!stored.finalizationState && !stored.finalizationAnnouncedAt };
+  }
+
+  /** Effects stay at-least-once if a gateway response is lost or two initial
+   * deliveries overlap. A completed checkpoint suppresses later reannounces;
+   * no checkpoint is written for a failed native post.
+   */
+  async markFinalizationAnnounced(callId: string, recordingId: string): Promise<void> {
+    await this.docClient.send(new UpdateCommand({ TableName: CALL_RECORDINGS_TABLE, Key: { callId, recordingId },
+      UpdateExpression: 'SET finalizationAnnouncedAt = :at', ConditionExpression: 'attribute_exists(callId)',
+      ExpressionAttributeValues: { ':at': new Date().toISOString() } }));
+  }
+
+  /** Every repair batch is fenced by the same primary checkpoint. The final
+   * batch atomically completes it. No late initial writer can restore an index
+   * after completion/untag, even if a previous repair lost its response.
+   * 99 index puts + one checkpoint fit Dynamo's 100-item transaction bound.
+   */
+  private async writeInitialParticipantIndex(rec: CallRecording): Promise<void> {
+    const items = this.participantIndexItems(rec);
+    for (let offset = 0; offset < Math.max(1, items.length); offset += 99) {
+      const final = offset + 99 >= items.length;
+      const checkpoint = { TableName: CALL_RECORDINGS_TABLE, Key: { callId: rec.callId, recordingId: rec.recordingId },
+        ConditionExpression: '#fs = :pending', ExpressionAttributeNames: { '#fs': 'finalizationState' },
+        ExpressionAttributeValues: { ':pending': 'persisting', ...(final ? { ':done': 'persisted' } : {}) } };
+      await this.docClient.send(new TransactWriteCommand({ TransactItems: [
+        final ? { Update: { ...checkpoint, UpdateExpression: 'SET #fs = :done' } } : { ConditionCheck: checkpoint },
+        ...items.slice(offset, offset + 99).map(Item => ({ Put: { TableName: this.participantsTable, Item } })),
+      ] }));
     }
   }
 
-  async getRecording(callId: string, recordingId: string): Promise<CallRecording | null> {
-    const rec = await this.getItem<CallRecording>({ callId, recordingId });
+  private async writeParticipantIndex(rec: CallRecording, userIds?: Set<string>): Promise<void> {
+    await Promise.all(this.participantIndexItems(rec, userIds).map(Item =>
+      this.docClient.send(new PutCommand({ TableName: this.participantsTable, Item }))));
+  }
+
+  private participantIndexItems(rec: CallRecording, userIds?: Set<string>): Array<Record<string, unknown>> {
+    const governed = newGovernedRecording(rec), recordedUsers = nativeRecordedUsers(rec);
+    const fanoutUserIds = userIds ?? new Set([...fanoutSetFor(rec)].filter(userId => !governed || recordedUsers.has(userId)));
+    return Array.from(fanoutUserIds).map(userId => ({
+      userId,
+      startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}`,
+      callId: rec.callId,
+      recordingId: rec.recordingId,
+      channelArn: rec.channelArn,
+      lobbyName: rec.lobbyName,
+      callBindingStatus: rec.callBindingStatus,
+      recordingGoverned: rec.recordingGoverned,
+      startedAt: rec.startedAt,
+      endedAt: rec.endedAt,
+      // Media length, not session lifetime. The fan-out row has
+      // no tracks[] of its own, so this value cannot be re-derived
+      // on read — it is the reason the backfill script has to
+      // touch BOTH tables (scripts/backfill-recording-truth.ts).
+      durationMs: rec.durationMs,
+      sessionDurationMs: rec.sessionDurationMs,
+      // W8 — denormalize so list view doesn't need a join
+      // back to the primary table for thumbnail rendering.
+      thumbnailUrl: rec.thumbnailUrl,
+      // R2 — denormalize composedUrl onto the fan-out row so
+      // the list view can pick "playback target" without a
+      // join. tracks[] stays on the primary record (only the
+      // detail view needs the raw per-peer URLs).
+      composedUrl: rec.composedUrl,
+      // Denormalize the reconciled PEOPLE count for the chip
+      // render. `participants[]` has already been deduped by
+      // userId and scoped to this recording by the webhook, so
+      // the `.length` fallback is now a people count too — it
+      // used to be a join count (one entry per rejoin), which is
+      // how a 2-person DM rendered "7 👥".
+      participantCount: rec.participantCount ?? rec.participants?.length ?? 0,
+      // Denormalize identities so the list view can render
+      // "DM · Bob Martinez & Hank Hill" instead of splitting raw
+      // userIds out of the lobby string. Capped so a large room
+      // can't push the index row toward the 400KB item limit.
+      participants: (rec.participants ?? [])
+        .slice(0, FANOUT_PARTICIPANT_CAP)
+        .map((p) => ({ userId: p.userId, displayName: p.displayName })),
+      ttl: rec.ttl,
+    }));
+  }
+
+  async getRecording(callId: string, recordingId: string, options: { consistentRead?: boolean } = {}): Promise<CallRecording | null> {
+    const rec = options.consistentRead
+      ? (await this.docClient.send(new GetCommand({ TableName: CALL_RECORDINGS_TABLE, Key: { callId, recordingId }, ConsistentRead: true }))).Item as CallRecording | undefined
+      : await this.getItem<CallRecording>({ callId, recordingId });
     return rec ? normalizeDuration(rec) : null;
   }
 
@@ -1340,7 +1411,11 @@ export class CallRecordingRepository extends BaseRepository {
       summaryStatus?: 'pending' | 'processing' | 'ready' | 'failed' | 'skipped';
       summaryRunId?: string | null;
       processingAttemptId?: string;
+      /** Automatic finalize may only create the first attempt; manual retries omit this. */
+      onlyIfUnclaimed?: boolean;
       expectedProcessingAttemptId?: string;
+      /** Dispatch failure may settle only a claim that has not progressed. */
+      expectedTranscriptStatus?: 'pending';
       expectedSummaryRunId?: string;
       summaryGeneratedAt?: string | null;
       summaryError?: string | null;
@@ -1422,6 +1497,11 @@ export class CallRecordingRepository extends BaseRepository {
       ? `SET ${sets.join(', ')} REMOVE ${removes.join(', ')}`
       : `SET ${sets.join(', ')}`;
     const conditions = ['attribute_exists(callId)'];
+    if (patch.onlyIfUnclaimed) conditions.push('attribute_not_exists(processingAttemptId)', 'attribute_not_exists(transcriptStatus)');
+    if (patch.expectedTranscriptStatus !== undefined) {
+      conditions.push('transcriptStatus = :ets');
+      values[':ets'] = patch.expectedTranscriptStatus;
+    }
     if (patch.expectedProcessingAttemptId !== undefined) {
       conditions.push('processingAttemptId = :epa');
       values[':epa'] = patch.expectedProcessingAttemptId;

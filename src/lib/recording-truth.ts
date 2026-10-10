@@ -101,7 +101,13 @@ export function recordingSessionParticipants(session: SessionAttendanceSource, r
       // when neither recorded legs nor timestamps can establish overlap.
       if (session.participantHistory && (joined == null || start == null || end == null)) continue;
     }
-    byParticipant.set(participant.participantId ?? participant.userId, participant);
+    const key = participant.participantId ?? participant.userId;
+    const prior = byParticipant.get(key);
+    // A later rejoin can omit a display label. Preserve only the same user's
+    // known label; empty/whitespace labels are missing, never another identity.
+    const displayName = typeof participant.displayName === 'string' && participant.displayName.trim()
+      ? participant.displayName : prior?.userId === participant.userId ? prior.displayName : undefined;
+    byParticipant.set(key, { ...participant, ...(displayName ? { displayName } : {}) });
   }
   return [...byParticipant.values()];
 }
