@@ -19,6 +19,7 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { installRecordingStatusRoute } from './recordingStatus';
 import { startRecordingTranscription, CALL_TRANSCRIPTION_PIPELINE_ID } from '../recordings/recordingPipelines';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
@@ -51,6 +52,7 @@ import { askLobbyAuthority } from '../lib/lobbyAuthority';
 import type { RecordingListRow } from '../repositories/CallRecordingRepository';
 
 export const recordingsRouter = Router();
+installRecordingStatusRoute(recordingsRouter, { authorize: requireOwnRecording });
 
 // POST /api/recordings/:recordingId/transcribe — (re)run transcription as a
 // pipeline for a recording that has a composed file. The finalize pipeline

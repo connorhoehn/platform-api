@@ -126,6 +126,49 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /recordings/{recordingId}/status:
+    parameters:
+      - $ref: '#/components/parameters/RecordingIdPath'
+    get:
+      tags: [recordings]
+      summary: Observe participant-authorized recording processing status
+      description: |
+        Returns only processing identity and states. Supply the previous revision
+        to wait up to 25 seconds for a native pipeline event or a bounded resync.
+        Token validity, participation and current host access are checked again
+        after waiting. Events contain no artifact text. Clients retain normal
+        detail reads and a finite polling fallback if events are unavailable.
+      operationId: getRecordingStatus
+      parameters:
+        - in: query
+          name: after
+          schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+      responses:
+        '200':
+          description: Current authorized processing state (private, no-store)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recordingId, callId, revision]
+                properties:
+                  recordingId: { type: string }
+                  callId: { type: string }
+                  lobbyName: { type: string }
+                  revision: { type: string, pattern: '^[a-f0-9]{64}$' }
+                  composeStatus: { type: string, nullable: true }
+                  transcriptStatus: { type: string, nullable: true }
+                  summaryStatus: { type: string, nullable: true }
+                  processingAttemptId: { type: string, nullable: true }
+                  summaryRunId: { type: string, nullable: true }
+                  transcriptionRequested: { type: boolean }
+        '400':
+          description: Invalid revision
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /recordings/{recordingId}/transcribe:
     parameters:
       - $ref: '#/components/parameters/RecordingIdPath'
@@ -979,6 +1022,62 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /video/sessions/{sessionId}/call-binding:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdPath'
+    post:
+      tags: [video-sessions]
+      summary: Bind an authenticated media participant to an accepted gateway call seat
+      description: |
+        Requires a signed OrgIQ identity, current lobby access, a matching live
+        media participant and a fresh accepted-seat proof from the owning BFF.
+        The immutable association links finalized media to its exact call.
+        Assessment document lobbies also require their original document source.
+      operationId: bindVideoSessionCall
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [lobbyName, callId, participantId, clientId]
+              properties:
+                lobbyName: { type: string, maxLength: 256 }
+                callId: { type: string, pattern: '^[A-Za-z0-9:_-]{1,256}$' }
+                participantId: { type: string, pattern: '^[A-Za-z0-9:_-]{1,256}$' }
+                clientId: { type: string, pattern: '^[A-Za-z0-9:_-]{1,256}$' }
+                documentSourceId: { type: string, maxLength: 1024 }
+      responses:
+        '200':
+          description: Exact media/call association confirmed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bound, callId, sessionId, participantId, clientId, lobbyName, channelArn]
+                properties:
+                  bound: { type: boolean, enum: [true] }
+                  callId: { type: string }
+                  sessionId: { type: string }
+                  participantId: { type: string }
+                  clientId: { type: string }
+                  lobbyName: { type: string }
+                  channelArn: { type: string }
+                  documentContext: { type: object }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Signed identity or accepted seat required
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Media session changed or participant already bound to another call
+        '503':
+          description: Call seat authority unavailable
 
   /video/sessions/{sessionId}/end:
     parameters:

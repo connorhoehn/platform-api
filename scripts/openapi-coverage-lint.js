@@ -81,6 +81,7 @@ const PREFIXES = {
       // recordingsRouter is mounted at '/' inside apiRouter; routes already
       // begin with '/recordings'.
       { file: 'recordings.ts', routers: { recordingsRouter: '' } },
+      { file: 'recordingStatus.ts', routers: { router: '' } },
       // hangoutRoomsRouter is mounted at '/api/rooms' in app.ts (intercepts
       // BEFORE the apiRouter so its handlers run first).
       { file: 'hangoutRooms.ts', routers: { hangoutRoomsRouter: '/rooms' } },
