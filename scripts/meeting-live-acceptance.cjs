@@ -6,10 +6,25 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'); const fsp = require('node:fs/promises');
 const path = require('node:path'); const http = require('node:http'); const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
+const { setTimeout: delay } = require('node:timers/promises');
+const { cleanupAll, listen, closeServer, forwardingServer } = require('./lib/acceptance-lifecycle.cjs');
+const controller = new AbortController();
+const fetch = (url, options = {}) => globalThis.fetch(url, { ...options,
+  signal: AbortSignal.any([controller.signal, options.signal ?? AbortSignal.timeout(30_000)]) });
+const sleep = ms => delay(ms, undefined, { signal: controller.signal });
+// Attach a rejection handler immediately to background work, retaining its
+// outcome for the normal ordered assertions without unhandled rejections.
+const observeOutcome = promise => promise.then(value => ({ value }), error => ({ error }));
+const unwrap = async promise => { const outcome = await promise; if (outcome.error) throw outcome.error; return outcome.value; };
 if (process.env.MEETING_ACCEPTANCE_OPT_IN !== 'owned-native-services') throw new Error('Explicit owned native services opt-in required');
 const resources = JSON.parse(fs.readFileSync(process.env.MEETING_ACCEPTANCE_RESOURCES_JSON, 'utf8'));
 assert.equal(resources.isolated, true);
-for (const service of Object.values(resources.services)) { assert.match(service.name, /^meeting-(?:pipeline|finalize)-native-/); assert.equal(service.host, '127.0.0.1'); }
+for (const kind of ['ddb', 'redis']) {
+  const service = resources.services[kind];
+  assert.match(service.name, /^meeting-(?:pipeline|finalize)-native-/);
+  assert.equal(service.host, '127.0.0.1');
+  assert(Number.isInteger(service.port) && service.port > 0 && service.port < 65536);
+}
 const privateConfig = JSON.parse(fs.readFileSync(process.env.MEETING_ACCEPTANCE_PRIVATE_CONFIG, 'utf8'));
 assert.equal(typeof privateConfig.env.CODEX_EXEC_TOKEN, 'string'); assert.match(privateConfig.env.CODEX_EXEC_URL, /^http:\/\/127\.0\.0\.1:/);
 Object.assign(process.env, privateConfig.env);
@@ -22,25 +37,17 @@ Object.assign(process.env, { DDB_TABLE_PREFIX: prefix, LOCAL_DDB_ENDPOINT: `http
   REALTIME_JWT_SECRET: crypto.randomBytes(32).toString('hex'), SKIP_AUTH: 'false' });
 const hashValue = value => crypto.createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 const hashFile = async file => { const hash = crypto.createHash('sha256'); for await (const c of fs.createReadStream(file)) hash.update(c); return hash.digest('hex'); };
-const write = async (name, value) => fsp.writeFile(path.join(output, name), typeof value === 'string' ? value : JSON.stringify(value, null, 2)+'\n');
-let webhookServer, modelProxy, speechProxy, bus, pubsub, ddbClient, browser;
-let arn, recordingId;
+const write = async (name, value) => fsp.writeFile(path.join(output, name), typeof value === 'string' ? value : JSON.stringify(value, null, 2)+'\n', { mode: 0o600 });
+let webhookServer, modelProxy, speechProxy, bus, pubsub, ddbClient, browser, bridge, redis;
+let arn, recordingId, ownsOutput = false;
 const nativeOrigin = process.env.VIDEO_API_URL;
 assert.match(nativeOrigin, /^http:\/\/127\.0\.0\.1:\d+$/);
 const statusReads = [], webhookReceipts = [];
 const tables = [], executors = [], running = [], cards = [], graphEffects = [], modelRequests = [], speechRequests = [];
-function forwardingServer(upstream, seen) {
-  return http.createServer((req, res) => {
-    if (req.method !== 'POST') { res.writeHead(404).end(); return; }
-    seen.push({ method: req.method, at: new Date().toISOString() });
-    const target = new URL(upstream);
-    const request = http.request({ hostname: target.hostname, port: target.port, path: target.pathname, method: req.method, headers: req.headers }, response => { res.writeHead(response.statusCode, response.headers); response.pipe(res); });
-    request.on('error', () => { if (!res.headersSent) res.writeHead(502).end(); else res.destroy(); }); req.pipe(request);
-  });
-}
-const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 async function main() {
-  await fsp.mkdir(output, { recursive: true });
+  await fsp.mkdir(output, { recursive: true, mode: 0o700 });
+  assert.equal((await fsp.readdir(output)).length, 0, 'Use a fresh output directory for each acceptance run');
+  ownsOutput = true;
   assert.match(process.env.NODE_ID ?? '', /^meeting-live-/);
   const health = await fetch(nativeOrigin+'/api/health', {signal:AbortSignal.timeout(5_000)});
   assert.equal(health.status, 200);
@@ -52,11 +59,12 @@ async function main() {
     assert(response.ok, `Native ${method} ${pathname}: ${response.status}`); return response.json();
   };
   // Count actual HTTP inference requests without changing the input or response.
-  modelProxy=forwardingServer(new URL('/complete',process.env.CODEX_EXEC_URL).toString(),modelRequests);await listen(modelProxy);process.env.CODEX_EXEC_URL=`http://127.0.0.1:${modelProxy.address().port}`;
-  speechProxy=forwardingServer(process.env.SPEECH_URL,speechRequests);await listen(speechProxy);process.env.SPEECH_URL=`http://127.0.0.1:${speechProxy.address().port}/`;
+  modelProxy=forwardingServer(new URL('/complete',process.env.CODEX_EXEC_URL).toString(),modelRequests,controller.signal);await listen(modelProxy);process.env.CODEX_EXEC_URL=`http://127.0.0.1:${modelProxy.address().port}`;
+  speechProxy=forwardingServer(process.env.SPEECH_URL,speechRequests,controller.signal);await listen(speechProxy);process.env.SPEECH_URL=`http://127.0.0.1:${speechProxy.address().port}/`;
   require('ts-node/register/transpile-only');
   const {CreateTableCommand,DescribeTableCommand}=require('@aws-sdk/client-dynamodb');
   ({ddbClient}=require('../src/lib/aws-clients'));
+  redis=require('../src/lib/redis-client');
   const {callRecordingRepo,videoSessionRepo}=require('../src/repositories');
   // These are declared external delivery fixtures, not a real chat/work-graph.
   require('../src/gateway/GatewayServiceClient').postChatMessage=async input=>{cards.push({channel:input.channel,kind:input.metadata?.kind,runId:input.metadata?.runId,recordingId:input.metadata?.recordingId});};
@@ -64,18 +72,20 @@ async function main() {
   const {PipelineExecutor}=require('distributed-core/applications/pipeline'),{RedisPubSubManager,EventBus}=require('distributed-core');
   const {buildRecordingPipelineHandlers,CALL_TRANSCRIPTION_PIPELINE_ID,RECORDING_FINALIZE_PIPELINE_ID}=require('../src/recordings/recordingPipelines');
   const {createDocumentApplyHandler,DOCUMENT_APPLY_KIND}=require('../src/documents/documentAgentPipeline');
-  const {setPipelineBridge}=require('../src/pipeline/bridge-types');
+  bridge=require('../src/pipeline/bridge-types');
+  const {setPipelineBridge}=bridge;
   const specs=[['video-call-recordings','callId','recordingId',true],['video-call-recording-participants','userId','startedAtRecordingId'],['document-video-sessions','documentId','sessionId'],['call-reactions','lobbyKey','sk']];
-  for(const [name,pk,sk,index] of specs){const table=prefix+name;await ddbClient.send(new CreateTableCommand({TableName:table,KeySchema:[{AttributeName:pk,KeyType:'HASH'},{AttributeName:sk,KeyType:'RANGE'}],AttributeDefinitions:[{AttributeName:pk,AttributeType:'S'},{AttributeName:sk,AttributeType:'S'}],BillingMode:'PAY_PER_REQUEST',...(index?{GlobalSecondaryIndexes:[{IndexName:'recordingId-index',KeySchema:[{AttributeName:'recordingId',KeyType:'HASH'}],Projection:{ProjectionType:'ALL'}}]}:{})}));tables.push(table);assert.equal((await ddbClient.send(new DescribeTableCommand({TableName:table}))).Table.TableStatus,'ACTIVE');}
+  for(const [name,pk,sk,index] of specs){const table=prefix+name;await ddbClient.send(new CreateTableCommand({TableName:table,KeySchema:[{AttributeName:pk,KeyType:'HASH'},{AttributeName:sk,KeyType:'RANGE'}],AttributeDefinitions:[{AttributeName:pk,AttributeType:'S'},{AttributeName:sk,AttributeType:'S'}],BillingMode:'PAY_PER_REQUEST',...(index?{GlobalSecondaryIndexes:[{IndexName:'recordingId-index',KeySchema:[{AttributeName:'recordingId',KeyType:'HASH'}],Projection:{ProjectionType:'ALL'}}]}:{})}), { abortSignal: controller.signal });tables.push(table);assert.equal((await ddbClient.send(new DescribeTableCommand({TableName:table}), { abortSignal: controller.signal })).Table.TableStatus,'ACTIVE');}
   pubsub=new RedisPubSubManager({localNodeId:'owned-automatic-finalize',url:process.env.REDIS_CACHE_URL,channelPrefix:prefix+':events:'});await pubsub.start();
   bus=new EventBus(pubsub,'owned-automatic-finalize',{topic:prefix+'pipeline-events',walFilePath:path.join(output,'pipeline-events.wal'),awaitFanOut:true});await bus.start();
   const observed=[];bus.subscribeAll(async e=>{observed.push({type:e.type,runId:e.payload?.runId,stepId:e.payload?.stepId,at:e.payload?.at});});
   const handlers=buildRecordingPipelineHandlers();handlers.set(DOCUMENT_APPLY_KIND,createDocumentApplyHandler());
   const accepted=[];
   setPipelineBridge({trigger(input){
+    controller.signal.throwIfAborted();
     const executor=new PipelineExecutor({definition:input.definition,ownerNodeId:'owned-automatic-finalize',eventBus:bus,llmClient:{provider:'not-used',stream(){throw new Error('Unexpected built-in model node');}},customStepHandlers:handlers,triggerPayload:input.triggerPayload,triggeredBy:input.triggeredBy,failureRateLLM:0,failureRateOther:0,simulateUnsupportedConditions:false,speedMultiplier:0.02});
     executors.push(executor);accepted.push({pipelineId:input.pipelineId,runId:executor.runId,processingAttemptId:input.triggerPayload.processingAttemptId});
-    running.push(executor.run());return {runId:executor.runId};
+    running.push(observeOutcome(executor.run()));return {runId:executor.runId};
   }});
   const express=require('express'),{lvsWebhooksRouter,getRecentDeliveries}=require('../src/routes/lvsWebhooks');
   const app=express();
@@ -130,7 +140,7 @@ async function main() {
   // Begin speech only once BOTH native transports are connected.
   for(const page of publishers) await page.evaluate(async()=>{await window.owned.audio.resume();window.owned.source.start();window.owned.started=true;});
   const captureDeadline=Date.now()+30_000;
-  while(Date.now()<captureDeadline) await new Promise(r=>setTimeout(r,500));
+  while(Date.now()<captureDeadline) await sleep(500);
   const captureStats=[];
   for(const page of publishers) captureStats.push(await page.evaluate(async()=>{const rows=[];for(const s of(await window.owned.pc.getStats()).values())if(s.type==='outbound-rtp')rows.push({kind:s.kind,bytesSent:s.bytesSent,packetsSent:s.packetsSent});return rows;}));
   assert(captureStats.every(rows=>rows.some(r=>r.kind==='audio'&&r.bytesSent>1000)&&rows.some(r=>r.kind==='video'&&r.bytesSent>1000)));
@@ -140,22 +150,22 @@ async function main() {
   for(let n=0;n<participants.length;n++)await videoSessionRepo.removeParticipant(lobbyName,sessionId,seats[n].participantId);
   await videoSessionRepo.endSession(lobbyName,sessionId,new Date().toISOString());
   const deadline=Date.now()+90_000;
-  while(!accepted.length && Date.now()<deadline)await new Promise(r=>setTimeout(r,200));
+  while(!accepted.length && Date.now()<deadline)await sleep(200);
   assert.equal(accepted[0]?.pipelineId,RECORDING_FINALIZE_PIPELINE_ID,'native completion webhook must start finalize');
   const parentRunId=accepted[0].runId;
-  while(!recordingId && Date.now()<deadline){const rows=await native('/api/channels/'+encodeURIComponent(arn)+'/recordings',null,'GET');recordingId=(Array.isArray(rows)?rows:rows.recordings)?.[0]?.recordingId;if(!recordingId)await new Promise(r=>setTimeout(r,200));}
+  while(!recordingId && Date.now()<deadline){const rows=await native('/api/channels/'+encodeURIComponent(arn)+'/recordings',null,'GET');recordingId=(Array.isArray(rows)?rows:rows.recordings)?.[0]?.recordingId;if(!recordingId)await sleep(200);}
   assert(recordingId);
-  const observe=async()=>{let revision;while(Date.now()<deadline+180_000){const at=Date.now();const response=await fetch(httpOrigin+'/recordings/'+encodeURIComponent(recordingId)+'/status'+(revision?'?after='+revision:''),{headers:{authorization:'Bearer '+bearers[0]},signal:AbortSignal.timeout(30_000)});if(response.status===404){await new Promise(r=>setTimeout(r,100));continue;}assert.equal(response.status,200);const row=await response.json();statusReads.push({...row,waitMs:Date.now()-at});revision=row.revision;if(row.summaryStatus==='ready'||row.summaryStatus==='failed')return; }throw new Error('Status never reached terminal summary');};
-  const observing=observe();
+  const observe=async()=>{let revision;while(Date.now()<deadline+180_000){const at=Date.now();const response=await fetch(httpOrigin+'/recordings/'+encodeURIComponent(recordingId)+'/status'+(revision?'?after='+revision:''),{headers:{authorization:'Bearer '+bearers[0]},signal:AbortSignal.timeout(30_000)});if(response.status===404){await sleep(100);continue;}assert.equal(response.status,200);const row=await response.json();statusReads.push({...row,waitMs:Date.now()-at});revision=row.revision;if(row.summaryStatus==='ready'||row.summaryStatus==='failed')return; }throw new Error('Status never reached terminal summary');};
+  const observing=observeOutcome(observe());
   // Parent completion can precede child completion; await every accepted actual
   // executor, including automatically added children, without manual start.
-  for(let n=0;n<running.length;n++){const result=await running[n];await write('run-'+accepted[n].pipelineId+'-'+n+'.json',result);assert.equal(result.status,'completed');}
+  for(let n=0;n<running.length;n++){const result=await unwrap(running[n]);await write('run-'+accepted[n].pipelineId+'-'+n+'.json',result);assert.equal(result.status,'completed');}
   const ready=await callRecordingRepo.getRecording(callId,recordingId,{consistentRead:true});
   assert.equal(ready.callBindingStatus,'bound');assert.equal(ready.recordingGoverned,true);assert.equal(ready.tracks.length,2);assert.equal(ready.participantCount,2);
   assert.equal(ready.transcriptionRequested,true);assert.equal(ready.transcriptStatus,'ready');assert.equal(ready.summaryStatus,'ready');
   const children=accepted.filter(r=>r.pipelineId===CALL_TRANSCRIPTION_PIPELINE_ID);assert.equal(children.length,1);assert.equal(ready.processingAttemptId,children[0].processingAttemptId);assert.equal(ready.summaryRunId,children[0].runId);
   const transcript=JSON.parse(ready.transcriptJson);assert(transcript.segments.length>=2);assert.equal(transcript.timestampGranularity,'segment');for(const s of transcript.segments){assert.equal(s.timestampSource,'engine');assert.equal(s.speakerId,'call');assert(s.endMs>=s.startMs);}assert.match(ready.summaryMarkdown,/^## Summary\n/);
-  await observing;
+  await unwrap(observing);
   assert(statusReads.length>=2); assert.equal(statusReads.at(-1).summaryStatus,'ready');
   assert(statusReads.some(r=>r.summaryStatus!=='ready'));
   const denied=await fetch(httpOrigin+'/recordings/'+encodeURIComponent(recordingId)+'/status',{headers:{authorization:'Bearer '+bearerFor('not-recorded')}});assert.equal(denied.status,404);
@@ -174,16 +184,54 @@ async function main() {
   await write('native-media-proof.json',{recordingId,sha256:await hashFile(mediaFile),bytes:mediaBytes.length,probe,composeStatus:nativeRecord.composeStatus,allInputsRetained:true,allSeatsNativeSigned:true});
   const reads=[];for(const user of participants){const result=await callRecordingRepo.resolveForUser(user,recordingId);assert.equal(result.isParticipant,true);assert.equal(result.detail.summaryMarkdown,after.summaryMarkdown);reads.push({userId:user,isParticipant:true,exactSummarySHA256:hashValue(result.detail.summaryMarkdown)});}assert.equal((await callRecordingRepo.resolveForUser('not-recorded',recordingId)).isParticipant,false);
   await write('status-transitions.json',statusReads); await write('native-webhook-receipts.json',webhookReceipts);await write('recording-ready.private.json',after);await write('transcript.private.json',transcript);await write('summary.private.md',after.summaryMarkdown);await write('observed-lifecycle.json',observed);await write('native-deliveries.json',getRecentDeliveries());
-  const proof={status:'passed',sourceSHA256:await hashFile(__filename),mediaSHA256:await hashFile(mediaFile),mediaBytes:mediaBytes.length,composeStatus:nativeRecord.composeStatus,actualBrowserRTP:true,actualNativeSignedMediaSeats:true,actualSFUCapture:true,actualNativeCompletionWebhook:true,actualFinalizeExecutor:true,automaticNativeChild:true,actualNativeDynamoTransactions:true,actualWhisper:true,actualCodexSubscription:true,actualNativeEventBusStatusHTTP:true,recordingRowPreSeeded:false,manualTranscriptionHelperCalled:false,
+  assert(modelRequests.length > 0, 'Summary must use the observed Codex bridge');
+  assert(speechRequests.length > 0, 'Transcript must use the observed speech service');
+  controller.signal.throwIfAborted();
+  const proof={status:'passed',modelHTTPRequests:modelRequests.length,speechHTTPRequests:speechRequests.length,sourceSHA256:await hashFile(__filename),mediaSHA256:await hashFile(mediaFile),mediaBytes:mediaBytes.length,composeStatus:nativeRecord.composeStatus,actualBrowserRTP:true,actualNativeSignedMediaSeats:true,actualSFUCapture:true,actualNativeCompletionWebhook:true,actualFinalizeExecutor:true,automaticNativeChild:true,actualNativeDynamoTransactions:true,actualWhisper:true,actualCodexSubscription:true,actualNativeEventBusStatusHTTP:true,recordingRowPreSeeded:false,manualTranscriptionHelperCalled:false,
     callId,recordingId,lobbyName,sessionId,parentRunId,childRunId:children[0].runId,processingAttemptId:ready.processingAttemptId,segments:transcript.segments.length,summaryChars:after.summaryMarkdown.length,transcriptSHA256:hashValue(transcript),summarySHA256:hashValue(after.summaryMarkdown),statusResponses:statusReads.length,readResults:reads,nonparticipantDenied:true,
     boundaries:['Browser capture uses prepared speech WAV and animated canvas; no physical devices.','Native JWT seats and media are actual; accepted gateway call provenance and host directory authority are explicitly isolated fixtures.','Actual native PipelineExecutor/EventBus/Redis/WAL and DynamoDB run; production Raft and RunPersistence bootstrap are not exercised.','Chat/work-graph delivery is intercepted; primary application card rendering and search are not exercised in this harness.','Primary application, original media and existing services remain unchanged.']};
-  await write('proof.json',proof);console.log(JSON.stringify({status:proof.status,recordingId,segments:proof.segments,statusResponses:proof.statusResponses,output}));
+  return proof;
 
 }
-const deadline=setTimeout(()=>{console.error('Owned automatic finalizer acceptance deadline reached');process.exit(2);},360_000);
-main().catch(async error=>{await fsp.mkdir(output,{recursive:true});await write('failure.json',{status:'failed',name:error.name,error:error.message,modelHTTPRequests:modelRequests.length,speechHTTPRequests:speechRequests.length,ownedTables:tables});console.error(error.name,error.message);process.exitCode=1;}).finally(async()=>{
-  clearTimeout(deadline);require('../src/pipeline/bridge-types').setPipelineBridge(null);
-  if(bus)await bus.stop();if(pubsub)await pubsub.stop();if(browser)await browser.close();for(const s of [webhookServer,modelProxy,speechProxy])if(s)await new Promise(resolve=>s.close(resolve));
-  const {getRedisClient,getRedisCacheClient}=require('../src/lib/redis-client');for(const client of new Set(await Promise.all([getRedisClient(),getRedisCacheClient()])))if(client?.isOpen)await client.quit();
-  const cleanup=[];if(ddbClient){const {DeleteTableCommand}=require('@aws-sdk/client-dynamodb');for(const table of tables){await ddbClient.send(new DeleteTableCommand({TableName:table}),{abortSignal:AbortSignal.timeout(10_000)});cleanup.push({table,deleted:true});}ddbClient.destroy();}await write('cleanup.json',{ownedTables:cleanup,sharedResourcesChanged:false});
-});
+// A deadline cancels owned work first, then follows the same cleanup path as
+// a failed assertion. Never exit directly from the timer and skip cleanup.
+function cancelWork() {
+  controller.abort(new Error('Owned acceptance cancelled or deadline reached'));
+  for (const executor of executors) executor.cancel();
+  if (browser) void browser.close().catch(() => {});
+}
+const deadline = setTimeout(cancelWork, 360_000);
+process.once('SIGTERM', cancelWork); process.once('SIGINT', cancelWork);
+async function run() {
+  let proof, failure;
+  try { proof = await main(); } catch (error) { failure = error; }
+  clearTimeout(deadline);
+  cancelWork();
+  const cleanup = await cleanupAll([
+    ['bridge', () => bridge?.setPipelineBridge(null)],
+    ['executors', () => Promise.all(running)],
+    ['browser', () => browser?.close()],
+    ...[webhookServer, modelProxy, speechProxy].filter(Boolean).map((server, i) => ['http-'+i, () => closeServer(server)]),
+    ['event-bus', () => bus?.stop()],
+    ['pubsub', () => pubsub?.stop()],
+    ['redis', () => redis?.closeRedisClients()],
+    ...tables.map(table => [table, async () => {
+      const { DeleteTableCommand } = require('@aws-sdk/client-dynamodb');
+      await ddbClient.send(new DeleteTableCommand({ TableName: table }), { abortSignal: AbortSignal.timeout(8000) });
+    }]),
+    ['dynamodb-client', () => ddbClient?.destroy()],
+  ]);
+  process.removeListener('SIGTERM', cancelWork); process.removeListener('SIGINT', cancelWork);
+  if (!ownsOutput) { console.error(failure?.message ?? 'Output directory unavailable'); process.exitCode = 1; return; }
+  await write('cleanup.json', { steps: cleanup, sharedResourcesChanged: false });
+  if (!failure && cleanup.some(step => !step.closed)) failure = new Error('Owned resource cleanup incomplete; see cleanup.json');
+  if (failure) {
+    await write('failure.json', { status: 'failed', name: failure.name, error: failure.message,
+      modelHTTPRequests: modelRequests.length, speechHTTPRequests: speechRequests.length, ownedTables: tables });
+    console.error(failure.name, failure.message); process.exitCode = 1;
+  } else {
+    await write('proof.json', proof);
+    console.log(JSON.stringify({ status: proof.status, recordingId, segments: proof.segments, statusResponses: proof.statusResponses, output }));
+  }
+}
+run().catch(error => { console.error(error.name, error.message); process.exitCode = 1; });

@@ -44,3 +44,25 @@ Gateway acceptance and host directory authorization are explicit fixtures.
 Production Raft/RunPersistence bootstrap, the application's rendered post-call
 card, and application search are separate acceptance boundaries. This harness
 does not activate or reset the primary application.
+
+## October 12 reliability audit
+
+Status requests now detect disconnects during the initial authority read, and
+release their event subscription even if the subsequent authority/database read
+stalls. Final responses still reauthorize the caller. Regression tests reproduce
+both leaks before the fix, including a late rejected read after cancellation.
+
+The live acceptance runner now separates HTTP and cleanup lifecycle helpers,
+handles background promise failures immediately, cancels HTTP/inference work on
+SIGINT/SIGTERM or its deadline, and attempts every cleanup independently with
+bounded waits. Redis shutdown closes existing connections without dialing new
+ones. Each run requires an empty output directory, writes private artifacts with
+owner-only permissions, and publishes a passed proof only after cleanup succeeds.
+The proof asserts and reports observed inference requests. Failure-path tests use
+only owned HTTP fixtures and verify cancellation, failed ownership checks,
+preservation of prior evidence, and cleanup after rejected or stalled closers.
+
+Validation: 68 recording/status/Redis Jest checks, six Node lifecycle/failure
+checks, and the platform build pass. These changes were not activated in the
+preserved primary session. The prior live media run remains the end-to-end
+capture/transcription/summary evidence; this audit did not repeat paid inference.

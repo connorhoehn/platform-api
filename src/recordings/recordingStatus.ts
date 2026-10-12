@@ -48,8 +48,14 @@ export async function waitForRecordingChange(options: {
       unsubscribe = () => source.unsubscribe(id);
     }
     timer = setTimeout(finish, options.timeoutMs ?? 25_000);
-    if (signal.aborted || recordingStatus(await read()).revision !== revision) finish();
-    await ready;
+    // An authority/database read can outlive a disconnected client. Race its
+    // recheck against the wake-up so neither it nor a late rejection retains
+    // the bus subscription. The route still authorizes its final response.
+    const recheck = async () => {
+      if (!signal.aborted && recordingStatus(await read()).revision !== revision) finish();
+      await ready;
+    };
+    await Promise.race([ready, recheck()]);
   } finally {
     clearTimeout(timer); signal.removeEventListener('abort', finish); unsubscribe?.();
   }

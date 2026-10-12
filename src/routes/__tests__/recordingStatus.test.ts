@@ -1,6 +1,6 @@
 import express from 'express';
 import { EventBus } from 'distributed-core';
-import type { Server } from 'http';
+import { get as httpGet, type Server } from 'http';
 import jwt from 'jsonwebtoken';
 import { installRecordingStatusRoute } from '../recordingStatus';
 import { recordingStatus, type RecordingEvent, type RecordingEventSource } from '../../recordings/recordingStatus';
@@ -91,4 +91,21 @@ it('an actual native EventBus publication wakes the authenticated HTTP status re
     const response = await pending;
     expect(response.status).toBe(200); expect(response.body.summaryStatus).toBe('processing'); expect(h.listeners.size).toBe(0);
   } finally { await bus.stop(); }
+});
+
+it('does not subscribe when the client disconnected during its initial authority read', async () => {
+  const h = harness();
+  let release!: (row: CallRecording) => void;
+  h.authorize.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  const url = (await h.url) + `/recordings/recording-one/status?after=${recordingStatus(initial).revision}`;
+  const request = httpGet(url, { headers: { Authorization: `Bearer ${token()}` } });
+  request.on('error', () => {});
+  await waitFor(() => h.authorize.mock.calls.length === 1);
+  const closed = new Promise<void>(resolve => request.once('close', resolve));
+  request.destroy(); await closed;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  release(initial);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(h.authorize).toHaveBeenCalledTimes(1);
+  expect(h.listeners.size).toBe(0);
 });

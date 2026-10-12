@@ -31,6 +31,8 @@ export function installRecordingStatusRoute(router: Router, options: {
       const after = req.query.after;
       if (after !== undefined && (typeof after !== 'string' || !/^[a-f0-9]{64}$/.test(after))) throw new ValidationError('Invalid recording revision');
       const row = await read(req);
+      // The socket may have closed while the first authority read was pending.
+      if (res.destroyed) return;
       if (after === recordingStatus(row).revision) {
         const abort = new AbortController();
         const close = () => abort.abort();

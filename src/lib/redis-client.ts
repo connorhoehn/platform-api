@@ -100,3 +100,14 @@ export async function getRedisCacheClient(): Promise<RedisClientType | null> {
     cacheConnecting = false;
   }
 }
+
+/** Close only existing connections; shutdown must never dial a new server. */
+export async function closeRedisClients(): Promise<void> {
+  const clients = new Set([client, cacheClient]);
+  client = null; cacheClient = null;
+  // Used after owned work has settled/cancelled; do not hang shutdown waiting
+  // for an unavailable Redis server to acknowledge QUIT.
+  const results = await Promise.allSettled([...clients].filter(c => c?.isOpen).map(async c => c!.destroy()));
+  const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'Redis shutdown failed');
+}

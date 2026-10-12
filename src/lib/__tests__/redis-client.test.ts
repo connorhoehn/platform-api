@@ -179,3 +179,27 @@ test('uses REDIS_PORT env var when building the Redis URL', async () => {
 
   delete process.env.REDIS_PORT;
 });
+
+test('shutdown does not initialize unused Redis connections', async () => {
+  const { closeRedisClients } = require('../redis-client');
+  await closeRedisClients();
+  expect(mockCreateClient).not.toHaveBeenCalled();
+});
+
+test('shutdown still closes the cache when the primary disconnect fails', async () => {
+  const oldCache = process.env.REDIS_CACHE_URL;
+  process.env.REDIS_CACHE_URL = 'redis://owned-cache:6379';
+  try {
+    const primary = { ...makeMockClient(true), isOpen: true, destroy: jest.fn(() => { throw new Error('offline'); }) };
+    const cache = { ...makeMockClient(true), isOpen: true, destroy: jest.fn() };
+    mockCreateClient.mockReturnValueOnce(primary).mockReturnValueOnce(cache);
+    const { getRedisClient, getRedisCacheClient, closeRedisClients } = require('../redis-client');
+    await getRedisClient(); await getRedisCacheClient();
+    await expect(closeRedisClients()).rejects.toThrow('Redis shutdown failed');
+    expect(primary.destroy).toHaveBeenCalledTimes(1); expect(cache.destroy).toHaveBeenCalledTimes(1);
+    await closeRedisClients();
+    expect(mockCreateClient).toHaveBeenCalledTimes(2);
+  } finally {
+    if (oldCache === undefined) delete process.env.REDIS_CACHE_URL; else process.env.REDIS_CACHE_URL = oldCache;
+  }
+});

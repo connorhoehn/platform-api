@@ -45,3 +45,17 @@ it('releases timers and subscription on disconnect, read failure and bounded res
   await waitForRecordingChange({ source: h.bus, row, revision: recordingStatus(row).revision, read: async () => row, signal: new AbortController().signal, timeoutMs: 5 });
   expect(h.listeners.size).toBe(0);
 });
+
+it.each(['abort', 'timeout'])('releases a subscription on %s even when the recheck is stalled', async reason => {
+  const h = source(), abort = new AbortController();
+  let rejectRead!: (error: Error) => void;
+  const stalled = new Promise<CallRecording>((_resolve, reject) => { rejectRead = reject; });
+  const pending = waitForRecordingChange({ source: h.bus, row, revision: recordingStatus(row).revision,
+    read: () => stalled, signal: abort.signal, timeoutMs: 5 });
+  if (reason === 'abort') abort.abort();
+  await pending;
+  expect(h.listeners.size).toBe(0);
+  // A late dependency rejection must still have an attached handler.
+  rejectRead(new Error('late read failure'));
+  await Promise.resolve();
+});
