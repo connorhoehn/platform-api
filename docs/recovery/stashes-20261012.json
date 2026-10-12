@@ -1,0 +1,31 @@
+{
+  "date": "2026-10-12",
+  "purpose": "Preserve original stash commits, index, and any untracked-file parent before cleanup. Recovery tags are pushed with main.",
+  "restore": "Fetch the recovery tag, then git stash apply <recoveryTag> in a clean disposable checkout of <recoveryTag>^1. Original untracked files are retained in the third parent where present.",
+  "stashes": [
+    {
+      "commit": "5e67a7d10b99d91133849f8ef75e3acb242a42e3",
+      "recoveryTag": "recovery/2026-10-12/stash-0-5e67a7d1",
+      "subject": "WIP on main: 9dcafcc feat(work-graph): project a run's steps and its originating conversation",
+      "disposition": "Integrated: chat command organization and planning lifecycle, workGraphPlan, persisted agent telemetry, and agentLoopProjection tests remain in main with subsequent enhancements."
+    },
+    {
+      "commit": "7389d380e866ef857235d21a6e1bd82d6daddea8",
+      "recoveryTag": "recovery/2026-10-12/stash-1-7389d380",
+      "subject": "On main: ec-refactor WIP",
+      "disposition": "Historical WIP retained exactly in recovery tag. Not activated: its declaration-array refactor includes ingest events intentionally removed by bbd8f78. Main keeps newer recording, document, and work-graph declarations."
+    },
+    {
+      "commit": "6d107d22a291c155c52f86481e4b974aca2d042b",
+      "recoveryTag": "recovery/2026-10-12/stash-2-6d107d22",
+      "subject": "WIP on wave9-d-platform-api: 071212f chore(platform-api): pin Node >=20 engine constraint (wave8-e)",
+      "disposition": "Superseded: public transport imports and service-runtime correlation helper are in main; dependencies have advanced beyond the stashed versions."
+    },
+    {
+      "commit": "d54c2bd382da071a167d10e5b8e1bd7b4ca19346",
+      "recoveryTag": "recovery/2026-10-12/stash-3-d54c2bd3",
+      "subject": "WIP on wave9-a-dc-bump: 022d270 refactor(platform-api): drop local raft declarations; use EC v0.3.4 package shipment (wave9-d)",
+      "disposition": "Superseded: public transport adoption is in main; the video route no longer uses the former circuit breaker."
+    }
+  ]
+}
