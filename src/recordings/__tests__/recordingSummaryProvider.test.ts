@@ -55,6 +55,8 @@ describe('native recording inference handler', () => {
     expect(stream).not.toHaveBeenCalled(); expect(update).not.toHaveBeenCalled();
   });
   it('propagates provider unavailability, without producing a substitute summary', async () => {
+    // A generator that fails before its first yield, as a dead provider stream does.
+    // eslint-disable-next-line require-yield
     stream.mockReturnValue((async function* () { throw new Error('native provider unavailable'); })());
     await expect(run(speech)).rejects.toThrow('native provider unavailable');
     expect(update).toHaveBeenCalledTimes(1);

@@ -55,7 +55,9 @@ function collect(stack: any[], prefix: string, inherited: Mid[], out: RouteInfo[
     if (layer.route) {
       const methods = Object.keys(layer.route.methods).filter((m) => m !== '_all').map((m) => m.toUpperCase());
       const path = `${prefix}${layer.route.path}`;
-      const own: Mid[] = layer.route.stack.map((l: any) => ({ name: l.handle?.name ?? l.name, policy: l.handle?.accessPolicy, matches: () => true }));
+      // Only layers BEFORE the final handler count: a guard placed after the
+      // handler has already let it run.
+      const own: Mid[] = layer.route.stack.slice(0, -1).map((l: any) => ({ name: l.handle?.name ?? l.name, policy: l.handle?.accessPolicy, matches: () => true }));
       for (const method of methods.length ? methods : ['ALL']) out.push({ key: `${method} ${path}`, path, mids: [...mids, ...own] });
     } else if (layer.handle?.stack) {
       collect(layer.handle.stack, prefix + mountPath(layer), mids, out, opaque);
@@ -126,5 +128,8 @@ describe('route access guard', () => {
     ]) expect([key, policies(key)]).toEqual([key, ['document:read|edit']]);
     expect(policies('POST /api/chat/commands/:trigger/run')).toEqual(['chat-command:document+sources']);
     expect(policies('POST /api/deck/revise-run')).toEqual(['deck:sources-read']);
+    // P1 2026-10-14: the two recording-era routes guard at registration.
+    expect(policies('POST /api/video/sessions/:sessionId/call-binding')).toEqual(['call-lobby:own-media-participant']);
+    expect(policies('GET /api/recordings/:recordingId/status')).toEqual(['recording:read+lobby-authority']);
   });
 });

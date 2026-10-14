@@ -1,6 +1,7 @@
-import type { Request, Router } from 'express';
+import type { NextFunction, Request, Response, Router } from 'express';
 import type { CallRecording } from '../repositories/CallRecordingRepository';
 import { requireAuth } from '../middleware/auth';
+import { markAccess } from '../middleware/resource-access';
 import { asyncHandler, NotFoundError, ValidationError } from '../middleware/error-handler';
 import { askLobbyAuthority } from '../lib/lobbyAuthority';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
@@ -26,13 +27,19 @@ export function installRecordingStatusRoute(router: Router, options: {
     }
     return row;
   };
-  router.get('/recordings/:recordingId/status', requireAuth,
+  // The access guard, at registration: participant + current host authority
+  // before the handler parses anything or subscribes to the event bus, so a
+  // refused caller allocates no listener, timer or subscription.
+  const guard = markAccess((req: Request, res: Response, next: NextFunction) => {
+    read(req).then((row) => { res.locals.recordingStatusRow = row; next(); }, next);
+  }, 'recording:read+lobby-authority');
+  router.get('/recordings/:recordingId/status', requireAuth, guard,
     asyncHandler(async (req, res, next) => {
+      // The socket may have closed while the guard's authority read was pending.
+      if (res.destroyed) return;
       const after = req.query.after;
       if (after !== undefined && (typeof after !== 'string' || !/^[a-f0-9]{64}$/.test(after))) throw new ValidationError('Invalid recording revision');
-      const row = await read(req);
-      // The socket may have closed while the first authority read was pending.
-      if (res.destroyed) return;
+      const row = res.locals.recordingStatusRow as CallRecording;
       if (after === recordingStatus(row).revision) {
         const abort = new AbortController();
         const close = () => abort.abort();

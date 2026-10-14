@@ -54,6 +54,8 @@ import { isRecordingProfile } from '@connorhoehn/event-catalog';
 import { tenantOf } from '../lib/tenant';
 import { lobbyAccess, tenantLobby } from '../lib/lobbyAccess';
 import { mayUsePartition } from '../lib/partition';
+import { markAccess } from '../middleware/resource-access';
+import { hasControlChar } from '../lib/controlChars';
 import { lvsSessionAuthHeader } from '../lib/lvsServiceAuth';
 import { askCallSeatAuthority } from '../lib/callSeatAuthority';
 import { VideoCallBindingConflict } from '../repositories/VideoSessionStore';
@@ -74,39 +76,64 @@ export {
 
 export const videoSessionsRouter = Router();
 
+interface CallBindingClaim {
+  lobbyName: string; callId: string; participantId: string; clientId: string;
+  documentSourceId?: string; bearer: string; first: VideoSessionRecord;
+}
+
+/** The caller's own active media participant in `sessionId`, or 404. */
+async function ownActiveMediaLeg(req: Request, claim: Omit<CallBindingClaim, 'first' | 'bearer'>, sessionId: string): Promise<VideoSessionRecord> {
+  const session = await videoSessionRepo.getSession(claim.lobbyName, sessionId);
+  if (!session || session.status !== 'active' || session.orgId !== req.user!.orgId
+    || (session.ttl !== undefined && (!Number.isFinite(session.ttl) || session.ttl <= Math.floor(Date.now() / 1000)))
+    || !session.participants.some(p => p.participantId === claim.participantId && p.userId === req.user!.sub && p.clientId === claim.clientId)) {
+    throw new NotFoundError('Active media participant not found');
+  }
+  return session;
+}
+
+/**
+ * Access guard for call-binding, at registration so it runs before any seat
+ * callback or write. Only a verified OrgIQ realtime token (requireAuth has
+ * already refused a forged or expired one) that may use the lobby — the
+ * prefix rule plus, with LOBBY_AUTHORITY_REQUIRED, the BFF's fresh answer,
+ * which refuses a revoked session epoch — and that names its OWN active media
+ * participant in this session. Everyone else gets 403 (wrong identity kind)
+ * or 404 (not a participant: an outsider learns nothing).
+ */
+export const requireCallBindingParticipant = markAccess((req: Request, res: Response, next) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  (async (): Promise<void> => {
+    if (req.user?.authKind !== 'orgiq-hs256') throw new ForbiddenError('Signed call identity required');
+    const { lobbyName, callId, participantId, clientId, documentSourceId } = req.body ?? {};
+    const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9:_-]{1,256}$/.test(value);
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)
+      || Object.keys(req.body).some(key => !['lobbyName', 'callId', 'participantId', 'clientId', 'documentSourceId'].includes(key))
+      || typeof lobbyName !== 'string' || !lobbyName || lobbyName.length > 256 || !validId(callId) || !validId(participantId) || !validId(clientId)
+      || (documentSourceId !== undefined && (typeof documentSourceId !== 'string' || !documentSourceId || documentSourceId.length > 1024 || hasControlChar(documentSourceId)))
+      || lobbyName.startsWith('assessment:doc:') !== (documentSourceId !== undefined)) {
+      throw new ValidationError('Exact lobby, call, media participant and client identity required');
+    }
+    const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : '';
+    if (!bearer) throw new ForbiddenError('Signed call identity required');
+    const claim = { lobbyName, callId, participantId, clientId, ...(documentSourceId !== undefined ? { documentSourceId: documentSourceId as string } : {}) };
+    await lobbyAccess().assertLobbyAccess(req, lobbyName);
+    const first = await ownActiveMediaLeg(req, claim, String(req.params.sessionId));
+    res.locals.callBinding = { ...claim, bearer, first } satisfies CallBindingClaim;
+  })().then(() => next(), next);
+}, 'call-lobby:own-media-participant');
+
 /** Bind only an authenticated live media leg to its current accepted gateway
  * seat. Attendance owns the immutable association after the call has ended. */
-videoSessionsRouter.post('/sessions/:sessionId/call-binding', requireAuth, asyncHandler(async (req, res): Promise<void> => {
-  res.setHeader('Cache-Control', 'private, no-store');
-  if (req.user?.authKind !== 'orgiq-hs256') throw new ForbiddenError('Signed call identity required');
-  const { lobbyName, callId, participantId, clientId, documentSourceId } = req.body ?? {};
-  const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9:_-]{1,256}$/.test(value);
-  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)
-    || Object.keys(req.body).some(key => !['lobbyName', 'callId', 'participantId', 'clientId', 'documentSourceId'].includes(key))
-    || typeof lobbyName !== 'string' || !lobbyName || lobbyName.length > 256 || !validId(callId) || !validId(participantId) || !validId(clientId)
-    || (documentSourceId !== undefined && (typeof documentSourceId !== 'string' || !documentSourceId || documentSourceId.length > 1024 || /[\u0000-\u001f\u007f]/.test(documentSourceId)))
-    || lobbyName.startsWith('assessment:doc:') !== (documentSourceId !== undefined)) {
-    throw new ValidationError('Exact lobby, call, media participant and client identity required');
-  }
+videoSessionsRouter.post('/sessions/:sessionId/call-binding', requireAuth, requireCallBindingParticipant, asyncHandler(async (req, res): Promise<void> => {
+  const { lobbyName, callId, participantId, clientId, documentSourceId, bearer, first } = res.locals.callBinding as CallBindingClaim;
   const sessionId = String(req.params.sessionId);
-  const userId = req.user.sub;
-  const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : '';
-  if (!bearer) throw new ForbiddenError('Signed call identity required');
-  const ownSession = async (): Promise<VideoSessionRecord> => {
-    const session = await videoSessionRepo.getSession(lobbyName, sessionId);
-    if (!session || session.status !== 'active' || session.orgId !== req.user!.orgId
-      || (session.ttl !== undefined && (!Number.isFinite(session.ttl) || session.ttl <= Math.floor(Date.now() / 1000)))
-      || !session.participants.some(p => p.participantId === participantId && p.userId === userId && p.clientId === clientId)) {
-      throw new NotFoundError('Active media participant not found');
-    }
-    return session;
-  };
-  await lobbyAccess().assertLobbyAccess(req, lobbyName);
-  const first = await ownSession();
+  const userId = req.user!.sub;
   const proof = await askCallSeatAuthority(bearer, { callId, lobbyName, clientId, ...(documentSourceId !== undefined ? { documentSourceId } : {}) });
-  if (proof.userId !== userId || proof.tenant !== req.user.orgId) throw new ForbiddenError('Accepted call seat required');
+  if (proof.userId !== userId || proof.tenant !== req.user!.orgId) throw new ForbiddenError('Accepted call seat required');
+  // The seat callback is a network round trip: re-check lobby and media leg.
   await lobbyAccess().assertLobbyAccess(req, lobbyName);
-  const latest = await ownSession();
+  const latest = await ownActiveMediaLeg(req, { lobbyName, callId, participantId, clientId }, sessionId);
   if (latest.channelArn !== first.channelArn) throw new AppError(409, 'Media session changed');
   try {
     const value = await videoSessionRepo.bindCallParticipant(lobbyName, sessionId, participantId, latest.channelArn, {

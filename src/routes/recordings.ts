@@ -49,6 +49,7 @@ import {
 } from '../middleware/error-handler';
 import log from '../lib/logger';
 import { askLobbyAuthority } from '../lib/lobbyAuthority';
+import { hasControlChar } from '../lib/controlChars';
 import type { RecordingListRow } from '../repositories/CallRecordingRepository';
 
 export const recordingsRouter = Router();
@@ -571,7 +572,7 @@ export function recordingArtifactContext(lobbyName: unknown, documentContext?: {
   return typeof lobbyName === 'string' && /^assessment:doc:[A-Za-z0-9:_-]{1,256}$/.test(lobbyName)
     && documentContext?.tenant === 'assessment' && documentContext.lobbyName === lobbyName
     && typeof documentContext.sourceId === 'string' && documentContext.sourceId.length > 0 && documentContext.sourceId.length <= 1024
-    && !/[\u0000-\u001f\u007f]/.test(documentContext.sourceId)
+    && !hasControlChar(documentContext.sourceId)
     ? { tenant: 'assessment', documentSourceId: documentContext.sourceId } : null;
 }
 
