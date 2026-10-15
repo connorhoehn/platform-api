@@ -42,6 +42,10 @@ messages remain the detailed record.
 - **Recording-status heap soak (lane P1).** `scripts/soak/recording-status-soak.ts`
   drives the real long-poll route in-process (woken, deadline, changed,
   refused, expired and aborted cycles) and writes
-  `docs/soak/<date>-recording-status.md`; see that record for the verdict.
+  `docs/soak/<date>-recording-status.md`. First run
+  (`docs/soak/2026-10-14-recording-status.md`): 125 minutes, 673,845 cycles
+  (about 5,400 a minute), post-warm-up heap slope +0.12 MB/h against a 1 MB/h
+  bound, no orphaned bus subscription — `verdict: pass`. Local only; the
+  deployed media stack is still unconfirmed (cloud blocked).
 - **Docs (lane P1).** CLAUDE.md and ROADMAP.md no longer point at the retired
   websocket-gateway name or its private memory paths.
