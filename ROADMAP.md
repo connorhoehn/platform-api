@@ -1,8 +1,9 @@
 # platform-api Roadmap
 
 > Drafted 2026-05-13 alongside the 6-project audit that established the M1–M4
-> platform milestones. See audit memories at
-> `~/.claude/projects/-Users-connorhoehn-Projects-websocket-gateway/memory/`.
+> platform milestones. That audit lived in one operator's local agent memory
+> under the retired websocket-gateway repo (now realtime-examples) and is not
+> part of this tree; this file is the surviving record.
 
 ## Charter (one paragraph)
 
@@ -18,7 +19,8 @@ primitives into application-level video "sessions" tied to documents.
 ## Platform context
 
 platform-api is one of seven services in the platform target topology
-(see `~/.claude/projects/-Users-connorhoehn-Projects-websocket-gateway/memory/platform-target-topology.md`).
+(drafted in the same 2026-05-13 audit; the realtime gateway it feeds is now
+the realtime-examples gateway on realtime-modules, formerly websocket-gateway).
 Two of today's responsibilities are extraction candidates at scale:
 
 | Today | Future | Milestone | Trigger |
@@ -47,9 +49,9 @@ What's working:
 
 What's not:
 
-- ⚠ Schedule evaluator (`src/services/scheduleEvaluator.ts:158`) is a
-  process-singleton `setInterval`; 2 replicas would fire each cron pipeline
-  twice. **The single biggest blocker to running platform-api 2-replica.**
+- ✅ (2026-10-14) Schedule evaluator is single-flight across replicas on a
+  fenced lease plus a per-fire claim (P2.1); it was a per-tick lock that two
+  offset replicas could both win in the same minute.
 - ⚠ `publishSignal()` in `src/lib/event-catalog.ts:430` bypasses the event-
   catalog library and writes directly to Redis — schemas aren't validated on
   the WS-bound path.
@@ -81,14 +83,19 @@ What's not:
 **Goal:** platform-api can run with 2 replicas behind a load balancer without
 duplicate work. **The cheapest meaningful scaling win.**
 
-- [ ] **P2.1 — Leader-elect `scheduleEvaluator`.** Wrap the tick in a
-  `DistributedLock` (from `distributed-core`) or copy the
-  `outbox-drainer.ts:65-92` DDB-lease pattern. Heartbeat-renewed lease;
-  failover within ~30s. ~80 LOC.
-- [ ] **P2.2 — Pipeline definitions cache invalidation.** Today
-  `definitions-cache.ts:65` polls DDB every 60s. Replace with EntityRegistry
-  invalidation events (already used elsewhere); push-based, sub-second
-  freshness. ~120 LOC.
+- [x] **P2.1 — Leader-elect `scheduleEvaluator`.** Done 2026-10-14 (lane P1):
+  `src/services/scheduler-fenced-leadership.ts` holds a distributed-core
+  `FencedLease` (renewed every 10 s, 30 s lease) and claims every fire with an
+  atomic "still my lease + first fire of this minute" script, so two replicas
+  or a mid-minute failover never double-fire. Contracts:
+  `scheduleEvaluator.fenced-leadership.test.ts` (fake Redis) and the opt-in
+  real-Redis `scheduler-fenced-leadership.redis.test.ts`.
+- [x] **P2.2 — Pipeline definitions cache invalidation.** Done 2026-10-14
+  (lane P1): every definition write (including document automations)
+  publishes on `platform-api:pipeline-definitions:invalidate`; while that
+  subscription is live the cache's DynamoDB Scan drops from 60 s to a 15-minute
+  safety poll, a dropped subscription restores the 60 s poll, and the
+  reconnect refreshes once. Contracts: `definitions-cache.event-driven.test.ts`.
 - [ ] **P2.3 — Idempotency cache: require Redis in prod.** Today
   `src/middleware/idempotency.ts:135` falls back to in-memory `memFallback`
   when Redis is unavailable. Add a startup check that fails fast in prod

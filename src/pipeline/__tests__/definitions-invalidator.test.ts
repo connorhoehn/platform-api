@@ -67,6 +67,7 @@ describe('startInvalidationSubscriber', () => {
   function makeFakeCache(): PipelineDefinitionsCache & { refreshCalls: number } {
     const stub = {
       refreshCalls: 0,
+      setEventDriven: jest.fn(),
       refresh: jest.fn(function (this: { refreshCalls: number }) {
         this.refreshCalls += 1;
         return Promise.resolve();

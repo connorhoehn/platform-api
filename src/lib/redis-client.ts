@@ -23,6 +23,19 @@ const RETRY_INTERVAL_MS = 5_000;
 let client: RedisClientType | null = null;
 let connecting = false;
 let lastAttempt = 0;
+/**
+ * The client whose connect() is still pending. It retries on its own
+ * (reconnectStrategy) for a few seconds, so shutdown must be able to reach it:
+ * before lane P1 (2026-10-14) a caller that gave up, or a test file that ended,
+ * left it dialling `redis` once a second with nothing holding it.
+ */
+let pendingClient: RedisClientType | null = null;
+let pendingCacheClient: RedisClientType | null = null;
+
+/** Close a client that never became the shared one; never throws. */
+function discard(c: RedisClientType): void {
+  try { if (c.isOpen) c.destroy(); } catch { /* already closed */ }
+}
 
 export async function getRedisClient(): Promise<RedisClientType | null> {
   if (client?.isReady) return client;
@@ -33,8 +46,9 @@ export async function getRedisClient(): Promise<RedisClientType | null> {
 
   connecting = true;
   lastAttempt = now;
+  let c: RedisClientType | null = null;
   try {
-    const c = createClient({
+    c = createClient({
       url: REDIS_URL,
       socket: {
         connectTimeout: 3000,
@@ -45,14 +59,25 @@ export async function getRedisClient(): Promise<RedisClientType | null> {
       log.warn({ err: err.message }, '[redis-client] Redis error');
       client = null;
     });
-    await c.connect();
+    pendingClient = c;
+    try {
+      await c.connect();
+    } finally {
+      if (pendingClient === c) pendingClient = null;
+    }
+    // Shutdown destroyed it mid-connect (node-redis then resolves connect()).
+    if (c.isOpen === false) throw new Error('Redis client closed during connect');
     client = c;
     connecting = false;
     return c;
   } catch (err) {
-    log.warn({ err: (err as Error).message }, '[redis-client] Redis connect failed');
+    // node-redis can reject connect() on the first socket error while the
+    // client keeps reconnecting in the background; nothing would own it.
+    // Close it before anything else here can throw.
+    if (c) discard(c);
     client = null;
     connecting = false;
+    log.warn({ err: (err as Error).message }, '[redis-client] Redis connect failed');
     return null;
   }
 }
@@ -80,8 +105,9 @@ export async function getRedisCacheClient(): Promise<RedisClientType | null> {
   if (now - cacheLastAttempt < RETRY_INTERVAL_MS) return null;
   cacheConnecting = true;
   cacheLastAttempt = now;
+  let c: RedisClientType | null = null;
   try {
-    const c = createClient({
+    c = createClient({
       url,
       socket: { connectTimeout: 3000, reconnectStrategy: (retries) => retries < 3 ? 1000 : false },
     }) as RedisClientType;
@@ -89,12 +115,19 @@ export async function getRedisCacheClient(): Promise<RedisClientType | null> {
       log.warn({ err: err.message }, '[redis-client] cache Redis error');
       cacheClient = null;
     });
-    await c.connect();
+    pendingCacheClient = c;
+    try {
+      await c.connect();
+    } finally {
+      if (pendingCacheClient === c) pendingCacheClient = null;
+    }
+    if (c.isOpen === false) throw new Error('Redis cache client closed during connect');
     cacheClient = c;
     return c;
   } catch (err) {
-    log.warn({ err: (err as Error).message }, '[redis-client] cache Redis connect failed');
+    if (c) discard(c);
     cacheClient = null;
+    log.warn({ err: (err as Error).message }, '[redis-client] cache Redis connect failed');
     return null;
   } finally {
     cacheConnecting = false;
@@ -103,6 +136,10 @@ export async function getRedisCacheClient(): Promise<RedisClientType | null> {
 
 /** Close only existing connections; shutdown must never dial a new server. */
 export async function closeRedisClients(): Promise<void> {
+  // A connect still retrying is cancelled too (its connect() then rejects and
+  // its caller sees null), so nothing is left dialling after shutdown.
+  for (const pending of [pendingClient, pendingCacheClient]) if (pending) discard(pending);
+  pendingClient = null; pendingCacheClient = null;
   const clients = new Set([client, cacheClient]);
   client = null; cacheClient = null;
   // Used after owned work has settled/cancelled; do not hang shutdown waiting

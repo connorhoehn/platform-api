@@ -6,7 +6,8 @@ const tracingShutdown = startTracing();
 
 import { createApp } from './app';
 import { createScheduleEvaluator } from './services/scheduleEvaluator';
-import { createDDBSchedulerLeaderLock } from './services/scheduler-leader-lock';
+import { createFencedSchedulerLeadership, createLeaseRedisGetter } from './services/scheduler-fenced-leadership';
+import { sharedRedisUrl } from './lib/redis-client';
 import { pipelineDefinitionsCache } from './pipeline/definitions-cache';
 import { startInvalidationSubscriber } from './pipeline/definitions-invalidator';
 import { startMembershipInvalidationSubscriber } from './work-graph/membershipProjection';
@@ -449,6 +450,9 @@ interface ScheduledPipelineShape {
   triggerBinding?: { event?: unknown; schedule?: unknown };
 }
 
+// ROADMAP P2.1 — the schedule evaluator is single-flight across replicas on a
+// FencedLease (distributed-core/cluster/leases) plus a per-fire Redis claim.
+const scheduleLeaseRedis = createLeaseRedisGetter(sharedRedisUrl());
 const scheduler = createScheduleEvaluator({
   listPipelines: () => {
     const out: Array<{ id: string; status: string; triggerBinding?: { event: string; schedule?: string } }> = [];
@@ -509,15 +513,10 @@ const scheduler = createScheduleEvaluator({
       );
     }
   },
-  // Phase 54.6.1 — multi-replica safe leader election. Without this, every
-  // replica's tick would fire every matching cron pipeline once per minute,
-  // causing N-fold duplicate runs. The DDB-conditional lock here mirrors
-  // outbox-drainer's lease pattern. Owner id includes hostname + pid so
-  // operators can identify which replica is currently the leader from the
-  // DDB row.
-  leaderLock: createDDBSchedulerLeaderLock(
-    `${process.env.HOSTNAME ?? 'localhost'}-${process.pid}`,
-  ),
+  // Only the replica holding the fenced lease evaluates, and each
+  // (pipeline, minute) fire is claimed atomically against that lease, so two
+  // replicas — or a failover mid-minute — never fire a cron pipeline twice.
+  leadership: createFencedSchedulerLeadership({ redis: scheduleLeaseRedis.get }),
 });
 scheduler.start();
 
@@ -558,4 +557,7 @@ sd.register('definitions-invalidate', async () => {
 sd.register('definitions-cache', () => { pipelineDefinitionsCache.stop(); });
 // Registered LAST → drained FIRST. Stopping the scheduler timer first ensures
 // no new pipeline triggers fire while downstream resources are being torn down.
-sd.register('scheduler', () => { scheduler.stop(); });
+sd.register('scheduler', async () => {
+  await scheduler.shutdown();
+  await scheduleLeaseRedis.close();
+});

@@ -8,6 +8,7 @@ import { asyncHandler } from '../middleware/error-handler';
 import { requireDocumentEdit } from '../middleware/resource-access';
 import { definitionsRepo } from '../pipeline/definitions-repository';
 import { pipelineDefinitionsCache } from '../pipeline/definitions-cache';
+import { publishInvalidate } from '../pipeline/definitions-invalidator';
 import { getPipelineBridge } from '../pipeline/bridge-types';
 import { getRunPersistenceService } from '../pipeline/runPersistence';
 import { automationOf, buildAutomationDefinition, validateAutomationInput, withNextRun } from '../documents/documentAutomations';
@@ -42,6 +43,8 @@ documentAutomationsRouter.post('/:documentId/automations', requireDocumentEdit()
   // The evaluator reads the definitions cache; refresh so the first fire is
   // not up to a minute late.
   await pipelineDefinitionsCache.refresh().catch((err: unknown) => log.warn({ err: String(err) }, 'automation: cache refresh failed'));
+  // Other replicas refresh on the invalidation, not on a timer (ROADMAP P2.2).
+  void publishInvalidate('automation.create');
   const automation = withNextRun(automationOf(def)!);
   log.info({ userId, documentId, automationId: automation.id, cron: automation.cron }, 'document automation created');
   res.status(201).json({ automation });
@@ -55,6 +58,7 @@ documentAutomationsRouter.delete('/:documentId/automations/:automationId', async
   if (!a || a.documentId !== documentId) { res.status(404).json({ error: 'automation not found' }); return; }
   await definitionsRepo.delete(userId, automationId);
   await pipelineDefinitionsCache.refresh().catch(() => undefined);
+  void publishInvalidate('automation.delete');
   log.info({ userId, documentId, automationId }, 'document automation removed');
   res.status(204).end();
 }));

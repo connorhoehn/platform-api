@@ -17,10 +17,16 @@ look for hub tasks or `mcp__agent-hub__*` tools.
   singletons from `src/repositories/index.ts`.
 - **Pipeline executor runs in-process.** The `HTTPPipelineBridge` from
   `@connorhoehn/pipeline-runtime` bridges to the local executor, not a worker pod.
+- **Schedule evaluator is single-flight** on a distributed-core `FencedLease`
+  plus a per-fire Redis claim (`src/services/scheduler-fenced-leadership.ts`);
+  no Redis means no replica fires schedules (fail closed).
+- **Definitions cache is event-invalidated** (`src/pipeline/definitions-invalidator.ts`):
+  15-minute safety Scan while subscribed, 60 s while the subscription is down.
 - **Outbox table is the durability primitive.** `src/services/outbox-drainer.ts`
   is lease-coordinated (`OUTBOX_LOCK#drainer`) and publishes to the durable MQ
   via `catalog.publish`; metrics at `/internal/metrics` (`outbox_*`).
-- **Redis pub/sub** (`dcore:topic:pipeline.events.*`) feeds websocket-gateway.
+- **Redis pub/sub** (`dcore:topic:pipeline.events.*`) feeds the realtime gateway
+  (realtime-examples `src/pipeline-relay.ts`; formerly websocket-gateway).
 - **Shared SFU circuit breaker**: every outbound LVS call goes through
   `callSfu` in `src/lib/sfu-breaker.ts`, one process-wide state.
 - **Lobby admission asks the OrgIQ BFF** when `LOBBY_AUTHORITY_REQUIRED=true`

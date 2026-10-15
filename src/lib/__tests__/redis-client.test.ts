@@ -203,3 +203,36 @@ test('shutdown still closes the cache when the primary disconnect fails', async 
     if (oldCache === undefined) delete process.env.REDIS_CACHE_URL; else process.env.REDIS_CACHE_URL = oldCache;
   }
 });
+
+// Lane P1: a connect still retrying (no Redis) must not outlive shutdown —
+// the unit suite used to leave one dialling `redis` once a second.
+test('shutdown cancels a connect that is still retrying', async () => {
+  let rejectConnect!: (err: Error) => void;
+  const pending = {
+    ...makeMockClient(false),
+    isOpen: true,
+    connect: jest.fn(() => new Promise((_resolve, reject) => { rejectConnect = reject; })),
+    destroy: jest.fn(() => { pending.isOpen = false; rejectConnect(new Error('destroyed')); }),
+  };
+  mockCreateClient.mockReturnValueOnce(pending);
+  const { getRedisClient, closeRedisClients } = require('../redis-client');
+  const attempt = getRedisClient();
+  await closeRedisClients();
+  expect(pending.destroy).toHaveBeenCalledTimes(1);
+  await expect(attempt).resolves.toBeNull();
+});
+
+// Lane P1: node-redis rejects connect() on the first socket error yet keeps
+// the client reconnecting in the background. The failed client must be closed.
+test('a failed connect closes the client it created', async () => {
+  const failed = {
+    ...makeMockClient(false),
+    isOpen: true,
+    connect: jest.fn().mockRejectedValue(new Error('getaddrinfo ENOTFOUND redis')),
+    destroy: jest.fn(() => { failed.isOpen = false; }),
+  };
+  mockCreateClient.mockReturnValueOnce(failed);
+  const { getRedisClient } = require('../redis-client');
+  await expect(getRedisClient()).resolves.toBeNull();
+  expect(failed.destroy).toHaveBeenCalledTimes(1);
+});

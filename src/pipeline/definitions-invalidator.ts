@@ -9,9 +9,12 @@
 // double-fires depending on which leader-lock holder it is.
 //
 // Fix: every mutation publishes a Redis pub/sub message; every replica
-// subscribes and triggers cache.refresh() on receipt. The 60s timer
-// remains as a safety net for missed messages (Redis flap, subscriber
-// reconnect window).
+// subscribes and triggers cache.refresh() on receipt.
+//
+// ROADMAP P2.2 (lane P1): while the subscription is live the cache drops its
+// 60 s DynamoDB poll to a slow safety poll (`setEventDriven(true)`); a
+// dropped connection restores the 60 s poll until the subscriber is ready
+// again, and the reconnect refreshes once to cover the gap.
 
 import { createClient, type RedisClientType } from 'redis';
 import { getRedisClient } from '../lib/redis-client';
@@ -78,8 +81,14 @@ export async function startInvalidationSubscriber(
       },
     }) as RedisClientType;
     client.on('error', (err: Error) => {
+      cache.setEventDriven(false);
       log.warn({ err: err.message }, 'definitions-invalidate subscriber error');
     });
+    let subscribed = false;
+    // node-redis resubscribes on reconnect; `ready` marks the channel live again.
+    client.on('ready', () => { if (subscribed) cache.setEventDriven(true); });
+    client.on('reconnecting', () => cache.setEventDriven(false));
+    client.on('end', () => cache.setEventDriven(false));
     await client.connect();
     await client.subscribe(CHANNEL, (raw) => {
       let parsed: InvalidateMessage | null = null;
@@ -98,9 +107,12 @@ export async function startInvalidationSubscriber(
         );
       });
     });
+    subscribed = true;
+    cache.setEventDriven(true);
     log.info('definitions-invalidate subscriber started');
     return {
       async stop() {
+        cache.setEventDriven(false);
         if (!client) return;
         try {
           await client.unsubscribe(CHANNEL);
@@ -111,6 +123,9 @@ export async function startInvalidationSubscriber(
       },
     };
   } catch (err) {
+    cache.setEventDriven(false);
+    // A client that never connected must not keep reconnecting in the background.
+    try { if (client && !opts._client) client.destroy(); } catch { /* best-effort */ }
     log.warn(
       { err: err instanceof Error ? err.message : String(err) },
       'definitions-invalidate subscriber failed to start (60s timer will still refresh)',

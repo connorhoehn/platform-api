@@ -144,7 +144,9 @@ describe('definitions-cache — 2-replica push invalidation', () => {
     await new Promise((r) => setImmediate(r));
 
     expect(cacheB.all().map((d) => d.id).sort()).toEqual(['p-1', 'p-2']);
-    expect(loader).toHaveBeenCalledTimes(3); // 2 prime + 1 invalidate-driven refresh
+    // 2 prime + 1 on going live (P2.2: catch up on anything missed before the
+    // subscription) + 1 invalidate-driven refresh.
+    expect(loader).toHaveBeenCalledTimes(4);
   });
 
   it('delete on replica A → replica B sees the deletion', async () => {
@@ -177,12 +179,13 @@ describe('definitions-cache — 2-replica push invalidation', () => {
     const loader = jest.fn(async () => []);
     const cacheB = new PipelineDefinitionsCache({ loader, intervalMs: 60_000 });
     await cacheB.refresh();
-    const refreshSpy = jest.spyOn(cacheB, 'refresh');
 
     const fakeClientB = makeFakeClient();
     await startInvalidationSubscriber(cacheB, {
       _client: fakeClientB as unknown as import('redis').RedisClientType,
     });
+    await new Promise((r) => setImmediate(r)); // the go-live refresh settles
+    const refreshSpy = jest.spyOn(cacheB, 'refresh');
 
     // These are exactly the strings emitted by every production write path:
     //   - pipelineDefinitions.ts: upsert, delete, publish

@@ -33,6 +33,16 @@
 // propagation delay between PUT and the schedule/webhook surfaces seeing
 // it (the route's PUT handler triggers a synchronous best-effort refresh
 // to shrink that window for the common "save then test" UX).
+//
+// Event-invalidated (ROADMAP P2.2, lane P1, 2026-10-14)
+// -----------------------------------------------------
+// Every definition write publishes an invalidation on Redis
+// (`definitions-invalidator.ts`) and every replica refreshes on receipt. While
+// that subscription is live the cache calls `setEventDriven(true)`: the
+// 60 s Scan becomes a slow safety poll (`safetyIntervalMs`, default 15 min)
+// that only covers a message lost in flight. When the subscription drops
+// (`setEventDriven(false)`) the 60 s poll returns, and the transition back to
+// live refreshes once to pick up anything published during the gap.
 
 import { withContext } from '../lib/logger';
 import {
@@ -44,8 +54,10 @@ import { definitionsRepo, type PipelineDefinition } from './definitions-reposito
 const log = withContext({ module: 'pipelineDefinitionsCache' });
 
 export interface PipelineDefinitionsCacheOptions {
-  /** Refresh interval in ms. Defaults to 60_000. */
+  /** Poll interval while no invalidation subscription is live. Defaults to 60_000. */
   intervalMs?: number;
+  /** Safety-poll interval while invalidations are live. Defaults to 900_000 (15 min). */
+  safetyIntervalMs?: number;
   /** Override the loader (tests). Defaults to `definitionsRepo.listAll()`. */
   loader?: () => Promise<PipelineDefinition[]>;
   /** Override clock (tests, currently unused — refresh is timer-driven). */
@@ -92,6 +104,8 @@ export class PipelineDefinitionsCache {
   private webhookIndex: Map<string, WebhookIndexEntry> = new Map();
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly intervalMs: number;
+  private readonly safetyIntervalMs: number;
+  private eventDriven = false;
   private readonly loader: () => Promise<PipelineDefinition[]>;
   /** Promise of the currently-in-flight refresh, if any. Coalesces concurrent calls. */
   private inFlight: Promise<void> | null = null;
@@ -112,6 +126,7 @@ export class PipelineDefinitionsCache {
 
   constructor(opts: PipelineDefinitionsCacheOptions = {}) {
     this.intervalMs = opts.intervalMs ?? 60_000;
+    this.safetyIntervalMs = opts.safetyIntervalMs ?? 15 * 60_000;
     this.loader = opts.loader ?? (() => definitionsRepo.listAll());
   }
 
@@ -125,16 +140,7 @@ export class PipelineDefinitionsCache {
     if (this.timer) return this.refresh();
     // Schedule the recurring refresh first so we don't lose ticks if the
     // initial refresh takes a while.
-    this.timer = setInterval(() => {
-      // Swallow errors — the periodic-refresh path logs and keeps the
-      // last-known-good snapshot. Throwing here would crash the timer.
-      void this.refresh().catch((err) => {
-        log.error({ err }, 'periodic refresh failed');
-      });
-    }, this.intervalMs);
-    if (typeof this.timer === 'object' && this.timer && 'unref' in this.timer) {
-      (this.timer as unknown as { unref: () => void }).unref();
-    }
+    this.armTimer();
     return this.refresh();
   }
 
@@ -143,6 +149,47 @@ export class PipelineDefinitionsCache {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+  }
+
+  /**
+   * Called by the invalidation subscriber: `true` once it is subscribed (and
+   * again after every reconnect), `false` when the connection drops. Switches
+   * the periodic Scan between the slow safety poll and the 60 s fallback.
+   * Becoming live refreshes once, since messages published while the
+   * subscription was down were lost.
+   */
+  setEventDriven(live: boolean): void {
+    if (live === this.eventDriven) return;
+    this.eventDriven = live;
+    if (this.timer) this.armTimer();
+    if (live) {
+      void this.refresh().catch((err) => {
+        log.warn({ err }, 'refresh on invalidation (re)subscribe failed');
+      });
+    }
+  }
+
+  /** The current periodic-Scan interval: the safety poll while event-driven, else the fallback. */
+  pollIntervalMs(): number {
+    return this.eventDriven ? this.safetyIntervalMs : this.intervalMs;
+  }
+
+  isEventDriven(): boolean {
+    return this.eventDriven;
+  }
+
+  private armTimer(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = setInterval(() => {
+      // Swallow errors — the periodic-refresh path logs and keeps the
+      // last-known-good snapshot. Throwing here would crash the timer.
+      void this.refresh().catch((err) => {
+        log.error({ err }, 'periodic refresh failed');
+      });
+    }, this.pollIntervalMs());
+    if (typeof this.timer === 'object' && this.timer && 'unref' in this.timer) {
+      (this.timer as unknown as { unref: () => void }).unref();
     }
   }
 

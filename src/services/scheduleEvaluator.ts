@@ -41,9 +41,17 @@ export interface ScheduleEvaluatorOptions {
    * fires every tick (legacy single-node behavior).
    */
   leaderLock?: SchedulerLeaderLock;
+  /**
+   * ROADMAP P2.1 — continuous fenced leadership plus a per-fire claim
+   * (`scheduler-fenced-leadership.ts`). Takes precedence over `leaderLock`:
+   * only the replica holding the FencedLease evaluates, and each
+   * (pipeline, minute) fires once across every replica and every failover.
+   */
+  leadership?: SchedulerLeadership;
 }
 
 import type { SchedulerLeaderLock } from './scheduler-leader-lock';
+import type { SchedulerLeadership } from './scheduler-fenced-leadership';
 
 interface ParsedField {
   // Either '*' or an explicit Set<number> of valid values.
@@ -173,6 +181,8 @@ export class ScheduleEvaluator {
   /** Tracks `${pipelineId}:${minuteEpoch}` to avoid double-firing in same minute. */
   private readonly fired = new Set<string>();
   private readonly nowFn: () => Date;
+  /** A tick still awaiting Redis when the next interval fires is not overlapped. */
+  private ticking: Promise<boolean> | null = null;
 
   constructor(opts: ScheduleEvaluatorOptions) {
     this.opts = opts;
@@ -205,6 +215,12 @@ export class ScheduleEvaluator {
    * tick() call — preserving the legacy single-node behavior.
    */
   async runProtectedTick(now: Date = this.nowFn()): Promise<boolean> {
+    if (this.opts.leadership) {
+      if (this.ticking) return false;
+      this.ticking = this.leadTick(this.opts.leadership, now)
+        .finally(() => { this.ticking = null; });
+      return this.ticking;
+    }
     if (!this.opts.leaderLock) {
       this.tick(now);
       return true;
@@ -225,11 +241,57 @@ export class ScheduleEvaluator {
     }
   }
 
+  /**
+   * Leader-only evaluation: skip unless this replica holds the fenced lease,
+   * then claim each fire in Redis before triggering it. Returns true when
+   * this replica evaluated (it was the leader).
+   */
+  private async leadTick(leadership: SchedulerLeadership, now: Date): Promise<boolean> {
+    if (!(await leadership.ensureLeader())) return false;
+    const minuteEpoch = Math.floor(now.getTime() / 60_000);
+    for (const id of this.evaluateOnce(now)) {
+      const key = `${id}:${minuteEpoch}`;
+      if (this.fired.has(key)) continue;
+      if (!(await leadership.claimFire(id, minuteEpoch))) continue;
+      this.fired.add(key);
+      this.fire(id, now);
+    }
+    this.pruneFired(minuteEpoch);
+    return true;
+  }
+
+  private fire(id: string, now: Date): void {
+    void this.opts.trigger(id, {
+      triggerType: 'schedule',
+      firedAt: now.toISOString(),
+    }).catch(err => {
+      log.error({ pipelineId: id, err }, '[scheduleEvaluator] trigger failed');
+    });
+  }
+
+  private pruneFired(minuteEpoch: number): void {
+    // Bound the dedupe set: keep only entries from the last ~10 minutes.
+    if (this.fired.size > 1024) {
+      const cutoff = minuteEpoch - 10;
+      for (const k of this.fired) {
+        const m = Number(k.split(':').pop());
+        if (Number.isFinite(m) && m < cutoff) this.fired.delete(k);
+      }
+    }
+  }
+
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  /** Stop the timer and hand back the fenced lease so a peer takes over at once. */
+  async shutdown(): Promise<void> {
+    this.stop();
+    await this.ticking?.catch(() => false);
+    await this.opts.leadership?.stop();
   }
 
   /** Evaluate a single tick at `now`. Public for tests. */
@@ -240,21 +302,9 @@ export class ScheduleEvaluator {
       const key = `${id}:${minuteEpoch}`;
       if (this.fired.has(key)) continue;
       this.fired.add(key);
-      void this.opts.trigger(id, {
-        triggerType: 'schedule',
-        firedAt: now.toISOString(),
-      }).catch(err => {
-        log.error({ pipelineId: id, err }, '[scheduleEvaluator] trigger failed');
-      });
+      this.fire(id, now);
     }
-    // Bound the dedupe set: keep only entries from the last ~10 minutes.
-    if (this.fired.size > 1024) {
-      const cutoff = minuteEpoch - 10;
-      for (const k of this.fired) {
-        const m = Number(k.split(':').pop());
-        if (Number.isFinite(m) && m < cutoff) this.fired.delete(k);
-      }
-    }
+    this.pruneFired(minuteEpoch);
   }
 
   /**

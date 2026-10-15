@@ -31,6 +31,8 @@ module.exports = {
   // bootstrap time so the cluster comes up with fast timers + log
   // suppression by default.
   setupFiles: ['<rootDir>/jest.setup.js'],
+  // Closes the shared Redis clients after each file (see the file header).
+  setupFilesAfterEnv: ['<rootDir>/jest.after-env.js'],
   transform: {
     '^.+\\.tsx?$': [
       'ts-jest',
