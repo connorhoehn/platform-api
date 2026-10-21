@@ -69,12 +69,17 @@ function session(id: string, startedAt = START): VideoSessionRecord {
   return { documentId: LOBBY, sessionId: id, channelArn: ARN, streamKey: '', status: 'active', startedAt, startedBy: 'u-vera', participants: [] };
 }
 
+// The stores expire an ended session a grace period after END, so the clock is
+// pinned just after the call; on the wall clock these fixtures expire.
+let clock: jest.SpyInstance<number, []>;
 beforeEach(() => {
+  clock = jest.spyOn(Date, 'now').mockReturnValue(Date.parse(END) + 60_000);
   jest.clearAllMocks();
   (ddbClient.send as jest.Mock).mockReset().mockResolvedValue({ Items: [] });
   mockSessions = new MemoryVideoSessionStore();
   mockRecordings = new CallRecordingRepository(recordingClient());
 });
+afterEach(() => clock.mockRestore());
 
 it.each(['orgiq:initiative:p-observability', 'assessment:team:TEAM-005', 'assessment:doc:one'])('does not use the latest lobby signaling call for governed %s', async lobby => {
   await mockSessions.createSession({ ...session('actual'), documentId: lobby, orgId: 'org-one',
