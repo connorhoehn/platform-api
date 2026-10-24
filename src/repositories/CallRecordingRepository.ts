@@ -57,7 +57,7 @@ export const CALL_RECORDINGS_TABLE = tableName('video-call-recordings');
  * Aliasing all of them removes the judgement call from the next edit.
  */
 const HYDRATE_ATTRIBUTES = [
-  'recordingId', 'composeStatus', 'composedUrl', 'composedSegment',
+  'recordingId', 'startedBy', 'composeStatus', 'composedUrl', 'composedSegment',
   'segments', 'tracks', 'transcriptStatus', 'summaryStatus', 'transcriptionRequested', 'callBindingStatus', 'callBindingReason', 'recordingGoverned', 'documentContext', 'ttl',
 ] as const;
 const HYDRATE_PROJECTION = HYDRATE_ATTRIBUTES.map((name) => `#${name}`).join(', ');
@@ -343,6 +343,7 @@ export interface CallRecording {
  */
 export interface RecordingListRow {
   callId: string;
+  startedBy?: string;
   callBindingStatus?: CallRecording['callBindingStatus'];
   callBindingReason?: string;
   recordingGoverned?: boolean;
@@ -800,6 +801,7 @@ export class CallRecordingRepository extends BaseRepository {
       startedAtRecordingId: `${rec.startedAt}#${rec.recordingId}`,
       callId: rec.callId,
       recordingId: rec.recordingId,
+      startedBy: rec.startedBy,
       channelArn: rec.channelArn,
       lobbyName: rec.lobbyName,
       callBindingStatus: rec.callBindingStatus,
@@ -1097,6 +1099,7 @@ export class CallRecordingRepository extends BaseRepository {
     );
     const rows = (out.Items ?? []).map((i) => ({
       callId: i.callId as string,
+      startedBy: i.startedBy as string | undefined,
       recordingId: i.recordingId as string,
       ttl: typeof i.ttl === 'number' ? (i.ttl as number) : undefined,
       startedAt: i.startedAt as string,
@@ -1155,7 +1158,7 @@ export class CallRecordingRepository extends BaseRepository {
     const chunks: RecordingListRow[][] = [];
     for (let i = 0; i < rows.length; i += 100) chunks.push(rows.slice(i, i + 100));
 
-    const byId = new Map<string, ComposableRecording & { transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus']; transcriptionRequested?: boolean; callBindingStatus?: CallRecording['callBindingStatus']; callBindingReason?: string; recordingGoverned?: boolean; documentContext?: DocumentCallContext; ttl?: number }>();
+    const byId = new Map<string, ComposableRecording & { startedBy?: string; transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus']; transcriptionRequested?: boolean; callBindingStatus?: CallRecording['callBindingStatus']; callBindingReason?: string; recordingGoverned?: boolean; documentContext?: DocumentCallContext; ttl?: number }>();
     for (const chunk of chunks) {
       try {
         const res = await this.docClient.send(
@@ -1203,6 +1206,9 @@ export class CallRecordingRepository extends BaseRepository {
       if ((newGovernedRecording(primary) || newGovernedRecording(r)) && !nativeRecordedUsers(primary).has(userId)) return [];
       return [{
         ...r,
+        // Also repairs lists backed by index rows written before the owner
+        // was denormalized. Never infer ownership from participation.
+        startedBy: primary.startedBy,
         composeStatus: deriveComposeStatus(primary),
         transcriptStatus: primary.transcriptStatus,
         summaryStatus: primary.summaryStatus,
@@ -1272,6 +1278,7 @@ export class CallRecordingRepository extends BaseRepository {
       });
       return {
         callId: i.callId,
+        startedBy: i.startedBy,
         recordingId: i.recordingId,
         startedAt: i.startedAt,
         endedAt: i.endedAt,

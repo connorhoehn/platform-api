@@ -67,6 +67,7 @@ describe('CallRecordingRepository.putRecording — owner fan-out', () => {
     expect(participantPuts).toHaveLength(1);
     const item = (participantPuts[0] as PutCommand).input.Item!;
     expect(item.userId).toBe('u-hank');
+    expect(item.startedBy).toBe('u-hank');
     expect(item.callId).toBe('c1');
     expect(item.recordingId).toBe('r1');
     expect(item.channelArn).toBe('arn:x');
@@ -884,6 +885,14 @@ describe('CallRecordingRepository.listByUser — the compose/transcript join', (
       };
     });
   }
+
+  test.each(['u-frank', 'u-other', undefined])('hydrates the actual owner for legacy index rows (%s)', async startedBy => {
+    const send = strictDdb({ recordingId: 'active-now-2026-09-21-planning-recording', startedBy });
+    const repo = new CallRecordingRepository({ send } as unknown as DynamoDBDocumentClient);
+    expect((await repo.listByUser('u-frank')).items[0]?.startedBy).toBe(startedBy);
+    const hydration = send.mock.calls.find(([command]) => command.input.RequestItems)?.[0];
+    expect(Object.values(hydration.input.RequestItems['test-video-call-recordings'].ExpressionAttributeNames)).toContain('startedBy');
+  });
 
   test('reports a ready transcript instead of dropping every badge', async () => {
     const send = strictDdb({
