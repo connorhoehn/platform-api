@@ -512,11 +512,48 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorBody' }
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: The saved room layout changed; reload before saving.
         '410':
           description: Room is archived.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /rooms/{slug}/activity:
+    parameters:
+      - $ref: '#/components/parameters/HangoutRoomSlugPath'
+    get:
+      tags: [hangout-rooms]
+      summary: Recent call participation and summaries available to the caller
+      description: |
+        Requires current access to the hangout. Returns at most 20 indexed media
+        sessions per page, newest first, within video-session retention. Main
+        and breakout sessions share the persistent hangout ID. Historical
+        attendance is not live presence. Summary text requires attendance in
+        that exact media session. Calls before activity indexing are not backfilled.
+      operationId: getHangoutRoomActivity
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: Opaque cursor returned by the preceding page.
+      responses:
+        '200':
+          description: Recent media sessions, attendance and permitted summary state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HangoutActivityResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller cannot access this private hangout.
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          description: Hangout is archived.
 
   /rooms/{slug}/archive:
     parameters:
@@ -1633,10 +1670,89 @@ components:
         createdAt: { type: string, format: date-time }
         visibility: { $ref: '#/components/schemas/HangoutRoomVisibility' }
         settings: { $ref: '#/components/schemas/HangoutRoomSettings' }
+        plan: { $ref: '#/components/schemas/HangoutPlan' }
         state: { $ref: '#/components/schemas/HangoutRoomState' }
         lastActiveAt: { type: string, format: date-time }
         archivedAt: { type: string, format: date-time }
         ttl: { type: integer, description: DDB TTL epoch seconds (set on archive). }
+
+    HangoutPlanRoom:
+      type: object
+      required: [id, name, members]
+      properties:
+        id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+        name: { type: string, minLength: 1, maxLength: 80 }
+        members:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, maxLength: 128 }
+      description: Stable room ID and assignments; assignments do not grant access or indicate live attendance.
+
+    HangoutPlanWrite:
+      type: object
+      required: [expectedVersion, mode, allowReturnToMain, rooms]
+      properties:
+        expectedVersion: { type: integer, minimum: 0 }
+        mode: { type: string, enum: [assigned, self-select] }
+        allowReturnToMain: { type: boolean }
+        rooms:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/HangoutPlanRoom' }
+      description: Compare-and-set layout. At most 500 assigned people across all rooms; each person may be assigned once. Stale writes return 409.
+
+    HangoutPlan:
+      type: object
+      required: [version, mode, allowReturnToMain, rooms, updatedAt, updatedBy]
+      properties:
+        version: { type: integer, minimum: 1 }
+        mode: { type: string, enum: [assigned, self-select] }
+        allowReturnToMain: { type: boolean }
+        rooms:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/HangoutPlanRoom' }
+        updatedAt: { type: string, format: date-time }
+        updatedBy: { type: string }
+
+    HangoutActivityResponse:
+      type: object
+      required: [sessions]
+      properties:
+        cursor: { type: string }
+        sessions:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            required: [sessionId, roomId, roomName, startedAt, endedAt, people, summaries, recordingEnabled]
+            properties:
+              sessionId: { type: string }
+              roomId: { type: [string, 'null'], description: Saved or temporary breakout ID; null for the main call. }
+              roomName: { type: string }
+              startedAt: { type: string, format: date-time }
+              endedAt: { type: [string, 'null'], format: date-time }
+              recordingEnabled: { type: [boolean, 'null'] }
+              people:
+                type: array
+                items:
+                  type: object
+                  required: [userId, displayName, joinedAt, leftAt]
+                  properties:
+                    userId: { type: string }
+                    displayName: { type: string }
+                    joinedAt: { type: string, format: date-time }
+                    leftAt: { type: [string, 'null'], format: date-time }
+              summaries:
+                type: array
+                items:
+                  type: object
+                  required: [recordingId, status]
+                  properties:
+                    recordingId: { type: string }
+                    status: { type: string }
+                    text: { type: string, description: Markdown from the completed summary job; absent until ready. }
 
     HangoutRoomMemberRole:
       type: string
@@ -1689,6 +1805,7 @@ components:
       type: object
       description: All fields optional; only supplied fields are updated.
       properties:
+        plan: { $ref: '#/components/schemas/HangoutPlanWrite' }
         name: { type: string, minLength: 1, maxLength: 100 }
         description: { type: string }
         visibility: { $ref: '#/components/schemas/HangoutRoomVisibility' }

@@ -340,3 +340,25 @@ describe('HangoutRoomRepository.getRoomBySlug', () => {
     expect(await repo.getRoomBySlug('org-1', 'nope')).toBeNull();
   });
 });
+
+describe('saved hangout plans and activity', () => {
+  test('fences both the first save and later saves without unused DDB expression names', async () => {
+    const repo = new HangoutRoomRepository(docClient);
+    for (const version of [1, 2]) {
+      await repo.updateRoom('org-1', '01HX', { plan: { version, rooms: [], mode: 'assigned', allowReturnToMain: true, updatedAt: '2026-10-25', updatedBy: 'user-1' } });
+      const input = mockSend.mock.calls.at(-1)![0].input;
+      expect(input.ConditionExpression).toContain(version === 1 ? 'attribute_not_exists(#plan)' : '#plan.#version = :previousVersion');
+      for (const key of Object.keys(input.ExpressionAttributeValues)) expect(input.UpdateExpression + input.ConditionExpression).toContain(key);
+      for (const key of Object.keys(input.ExpressionAttributeNames)) expect(input.UpdateExpression + input.ConditionExpression).toContain(key);
+    }
+  });
+  test('queries one hangout and refuses a cursor from another hangout', async () => {
+    const repo = new HangoutRoomRepository(docClient);
+    await repo.listSessionPointers('org-1', '01HX');
+    expect(mockSend.mock.calls[0][0]).toBeInstanceOf(QueryCommand);
+    expect(mockSend.mock.calls[0][0].input).toMatchObject({ Limit: 20, ScanIndexForward: false, ExpressionAttributeValues: { ':org': 'activity#org-1#01HX' } });
+    const cursor = Buffer.from(JSON.stringify({ orgId: 'activity#org-2#01HX', roomId: 'x' })).toString('base64url');
+    await expect(repo.listSessionPointers('org-1', '01HX', cursor)).rejects.toThrow('Invalid activity cursor');
+    expect(mockSend).toHaveBeenCalledTimes(1);
+  });
+});

@@ -132,6 +132,8 @@ export interface VideoSessionRecord {
   startedBy: string;
   /** Verified tenant captured when the session was created. Optional for legacy rows. */
   orgId?: string;
+  /** Server-resolved persistent hangout and optional breakout; never accepted from the caller. */
+  hangout?: { orgId: string; roomId: string; slug: string; roomName: string; breakoutRoomId?: string; audioOnly: boolean; recordingEnabled: boolean };
   participants: VideoSessionParticipant[];
   /**
    * Exact SFU participantId → authenticated join identity, for THIS session.

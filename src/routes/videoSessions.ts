@@ -30,7 +30,8 @@ import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { requireAuth, optionalAuth } from '../middleware/auth';
 import { VIDEO_API_URL } from '../lib/video-auth';
-import { videoSessionRepo, callReactionRepo, profileRepo, workSourceAccountRepo } from '../repositories';
+import { videoSessionRepo, callReactionRepo, profileRepo, workSourceAccountRepo, hangoutRoomRepo } from '../repositories';
+import { resolveHangoutMedia } from '../lib/hangout-media';
 import { decideRecording } from '../recordings/recordingDecision';
 import { VideoSessionRecord } from '../repositories/VideoSessionRepository';
 import {
@@ -118,6 +119,7 @@ export const requireCallBindingParticipant = markAccess((req: Request, res: Resp
     if (!bearer) throw new ForbiddenError('Signed call identity required');
     const claim = { lobbyName, callId, participantId, clientId, ...(documentSourceId !== undefined ? { documentSourceId: documentSourceId as string } : {}) };
     await lobbyAccess().assertLobbyAccess(req, lobbyName);
+
     const first = await ownActiveMediaLeg(req, claim, String(req.params.sessionId));
     res.locals.callBinding = { ...claim, bearer, first } satisfies CallBindingClaim;
   })().then(() => next(), next);
@@ -332,6 +334,14 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     await lobbyAccess().assertLobbyAccess(req, lobbyName);
     // In-document calls: `kind: 'document-review'` + title / documentIds /
     // media. Null for every other caller, whose rows stay exactly as before.
+    const hangout = await resolveHangoutMedia(lobbyName, (org, slug) => hangoutRoomRepo.getRoomBySlug(org, slug));
+    if (hangout?.breakoutRoomId) {
+      const parent = await videoSessionRepo.findActiveByLobbyName(lobbyName.split('~breakout~')[0]);
+      if (parent?.hangout) {
+        hangout.audioOnly = parent.hangout.audioOnly;
+        hangout.recordingEnabled = parent.hangout.recordingEnabled;
+      }
+    }
     const callFields = parseCreateFields(body, lobbyName, userId);
     const callFieldsOut = (row?: VideoSessionRecord | null) => {
       const src = row?.kind ? row : callFields;
@@ -373,7 +383,9 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
     // post "No speech was found" transcripts. Only an explicit
     // `recordingConfiguration.enabled: true` goes through the usual decision.
     const documentCallNotRecorded = callFields && incomingRecordingConfig?.enabled !== true;
-    const recordingDecision: { enabled: boolean; reason: string } = documentCallNotRecorded
+    const recordingDecision: { enabled: boolean; reason: string } = hangout
+      ? { enabled: hangout.recordingEnabled, reason: hangout.recordingEnabled ? 'room-setting-on' : 'room-setting-off' }
+      : documentCallNotRecorded
       ? { enabled: false, reason: 'document-call-not-recorded' }
       : await decideRecording({
         lobbyName,
@@ -389,7 +401,12 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       if (isRecordingProfile(raw)) return raw;
       throw new AppError(400, `invalid recordingProfile: '${String(raw)}'`);
     })();
-    const recordingConfiguration = incomingRecordingConfig
+    // A recorded hangout needs per-person audio and transcription for its
+    // dialogue summary. The saved room setting is authoritative, including
+    // breakouts; a joining client cannot downgrade this to a broadcast profile.
+    const recordingConfiguration = hangout
+      ? { enabled: recordingDecision.enabled, destination: 'local', recordingProfile: 'hangout', transcribe: true }
+      : incomingRecordingConfig
       ? {
           enabled: recordingDecision.enabled,
           destination: incomingRecordingConfig.destination ?? 'local',
@@ -530,6 +547,7 @@ videoSessionsRouter.post('/sessions', requireAuth, asyncHandler(async (req: Requ
       ...(organizationId ? { orgId: organizationId } : {}),
       participants: [],
       recording: recordingDecision,
+      ...(hangout ? { hangout } : {}),
       ...(callFields
         ? Object.fromEntries(Object.entries(callFields).filter(([, v]) => v !== undefined))
         : {}),

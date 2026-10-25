@@ -43,6 +43,9 @@ export const ACCESS_ALLOWLIST: Record<string, string> = {
     'POST /api/rooms/:slug/join',
     'POST /api/rooms/:slug/leave',
   ]),
+  ...each('in handler: loadActiveRoom(orgId) + assertCanAccess before history reads; summaries additionally require exact room/session, attendance, resolveForUser and recording:read authorization', [
+    'GET /api/rooms/:slug/activity',
+  ]),
   ...each('OPEN: one global host catalog with no owner field; needs an ownership model, not a gate (inventory, media)', [
     'GET /api/media/catalog/bursts/:burstId',
     'GET /api/media/catalog/files/:fileId',

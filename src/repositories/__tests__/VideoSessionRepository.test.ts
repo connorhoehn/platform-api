@@ -162,3 +162,16 @@ describe('VideoSessionRepository.getSessionsByDocument', () => {
     expect(result.map((s) => s.sessionId)).toEqual(['b', 'c', 'a']);
   });
 });
+
+test('a main call or temporary breakout and its hangout activity pointer are committed atomically', async () => {
+  const repo = new VideoSessionRepository(docClient);
+  const record: VideoSessionRecord = { ...SESSION, documentId: 'social:room:review~breakout~temporary',
+    hangout: { orgId: 'social', roomId: 'room-1', slug: 'review', roomName: 'Temporary room', breakoutRoomId: 'temporary', audioOnly: true, recordingEnabled: false } };
+  await repo.createSession(record);
+  expect(mockSend).toHaveBeenCalledTimes(1);
+  const writes = mockSend.mock.calls[0][0].input.TransactItems;
+  expect(writes).toHaveLength(2);
+  expect(writes[0].Put.Item).toEqual(record);
+  expect(writes[1].Put.Item).toMatchObject({ orgId: 'activity#social#room-1', documentId: record.documentId, sessionId: record.sessionId });
+  expect(writes[1].Put.Item).not.toHaveProperty('slug'); // Never leaks into the room directory GSI.
+});

@@ -19,6 +19,10 @@ const mockSearchRooms = jest.fn();
 const mockIsMember = jest.fn();
 const mockAddMember = jest.fn();
 const mockRemoveMember = jest.fn(async () => undefined);
+const mockListSessionPointers = jest.fn();
+const mockGetSession = jest.fn();
+const mockListByCall = jest.fn();
+const mockResolveRecordingForUser = jest.fn();
 const mockListMembers = jest.fn(async () => [] as unknown[]);
 
 const mockMirrorRoomMembers = jest.fn();
@@ -42,7 +46,10 @@ jest.mock('../../repositories', () => {
       touchLastActive: mockTouchLastActive,
       listRoomsByOrg: mockListRoomsByOrg,
       searchRooms: mockSearchRooms,
+      listSessionPointers: mockListSessionPointers,
     },
+    videoSessionRepo: { getSession: mockGetSession },
+    callRecordingRepo: { listByCall: mockListByCall, resolveForUser: mockResolveRecordingForUser },
     hangoutRoomMemberRepo: {
       isMember: mockIsMember,
       addMember: mockAddMember,
@@ -192,6 +199,9 @@ beforeEach(() => {
   mockSearchRooms.mockReset().mockResolvedValue([]);
   mockIsMember.mockReset().mockResolvedValue(false);
   mockAddMember.mockReset().mockResolvedValue(undefined);
+  mockListSessionPointers.mockReset().mockResolvedValue({ items: [] });
+  mockGetSession.mockReset().mockResolvedValue(null);
+  mockListByCall.mockReset().mockResolvedValue([]);
   resetCanCreateRoomHook();
   _resetCreateRateLimit();
 });
@@ -709,5 +719,73 @@ describe('room partitions — any tenant in the token, not only org', () => {
     mockGetRoomBySlug.mockResolvedValue(makeRoom({ orgId: 'org-a', slug: 'lounge' }));
     await run(buildApp(), 'POST', '/api/rooms/lounge/join', { user: { sub: 'tester', orgId: 'org-a' }, body: {} });
     expect(calls[0]!.body).toMatchObject({ lobbyName: 'room:lounge' });
+  });
+});
+
+
+describe('saved hangout configuration and activity', () => {
+  const plan = { expectedVersion: 0, mode: 'assigned', allowReturnToMain: true, rooms: [{ id: 'design', name: 'Design', members: ['tester'] }] };
+  it('saves settings and a versioned layout together without resetting omitted settings', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ settings: { audioOnly: true, recordingEnabled: true, softCap: 12 } }));
+    const response = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', { body: { settings: { audioOnly: false }, plan } });
+    expect(response.statusCode).toBe(200);
+    expect(mockUpdateRoom.mock.calls[0][2]).toMatchObject({ settings: { audioOnly: false, recordingEnabled: true, softCap: 12 }, plan: { version: 1, updatedBy: 'tester', rooms: plan.rooms } });
+  });
+  it('rejects a concurrent layout update instead of overwriting it', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom());
+    mockUpdateRoom.mockRejectedValue(Object.assign(new Error('conditional conflict'), { name: 'ConditionalCheckFailedException' }));
+    expect((await run(buildApp(), 'PATCH', '/api/rooms/team-standup', { body: { plan } })).statusCode).toBe(409);
+  });
+  it('does not turn assigning an outsider into membership of a private hangout', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ visibility: 'private' }));
+    const response = await run(buildApp(), 'PATCH', '/api/rooms/team-standup', { body: { plan: { ...plan, rooms: [{ id: 'design', name: 'Design', members: ['outsider'] }] } } });
+    expect(response.statusCode).toBe(400);
+    expect(mockAddMember).not.toHaveBeenCalled(); expect(mockUpdateRoom).not.toHaveBeenCalled();
+  });
+  it.each([null, 'invalid', { audioOnly: 'yes' }])('rejects malformed settings %j', async settings => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom());
+    expect((await run(buildApp(), 'PATCH', '/api/rooms/team-standup', { body: { settings } })).statusCode).toBe(400);
+    expect(mockUpdateRoom).not.toHaveBeenCalled();
+  });
+  it('gates private activity before reading session history', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom({ visibility: 'private', createdBy: 'owner' }));
+    expect((await run(buildApp(), 'GET', '/api/rooms/team-standup/activity')).statusCode).toBe(403);
+    expect(mockListSessionPointers).not.toHaveBeenCalled();
+  });
+  it('returns unique attendees and only this session summary to a participant, with pagination', async () => {
+    mockGetRoomBySlug.mockResolvedValue(makeRoom());
+    mockListSessionPointers.mockResolvedValue({ items: [{ documentId: 'default-org:room:team-standup', sessionId: 'session-1' }], cursor: 'next' });
+    const joinedAt = '2026-10-25T16:00:00Z';
+    mockGetSession.mockResolvedValue({ sessionId: 'session-1', documentId: 'default-org:room:team-standup', startedAt: joinedAt,
+      hangout: { orgId: 'default-org', roomId: '01HX', roomName: 'Main call' }, recording: { enabled: true },
+      participantHistory: { camera: { userId: 'tester', displayName: 'Tester', joinedAt, callBinding: { callId: 'call-1' } }, screen: { userId: 'tester', displayName: 'Tester', joinedAt } } });
+    mockListByCall.mockResolvedValue([
+      { recordingId: 'rec-own', sessionId: 'session-1', lobbyName: 'default-org:room:team-standup', summaryStatus: 'ready', summaryMarkdown: 'Actual dialogue' },
+      { recordingId: 'rec-other', sessionId: 'another-session', lobbyName: 'default-org:room:team-standup', summaryStatus: 'ready', summaryMarkdown: 'Private other call' },
+    ]);
+    mockResolveRecordingForUser.mockResolvedValue({ isParticipant: true, detail: {
+      recordingId: 'rec-own', sessionId: 'session-1', lobbyName: 'default-org:room:team-standup', summaryStatus: 'ready', summaryMarkdown: 'Actual dialogue',
+    } });
+    const response = await run(buildApp(), 'GET', '/api/rooms/team-standup/activity?cursor=previous');
+    expect(response.statusCode).toBe(200);
+    expect(mockListSessionPointers).toHaveBeenCalledWith('default-org', '01HX', 'previous');
+    expect(response.body).toMatchObject({ cursor: 'next', sessions: [{ people: [{ userId: 'tester', leftAt: null }], summaries: [{ recordingId: 'rec-own', text: 'Actual dialogue' }] }] });
+    expect((response.body as any).sessions[0].people).toHaveLength(1);
+    expect((response.body as any).sessions[0].summaries).toHaveLength(1);
+    expect(mockResolveRecordingForUser).toHaveBeenCalledWith('tester', 'rec-own');
+    // Removing the participant fan-out revokes summary access even though the
+    // historical media session still proves that this person attended.
+    mockResolveRecordingForUser.mockResolvedValue({ isParticipant: false, detail: {
+      recordingId: 'rec-own', summaryStatus: 'ready', summaryMarkdown: 'Revoked dialogue',
+    } });
+    const untagged = await run(buildApp(), 'GET', '/api/rooms/team-standup/activity');
+    expect((untagged.body as any).sessions[0].summaries).toEqual([]);
+    mockResolveRecordingForUser.mockResolvedValue(null);
+    const deleted = await run(buildApp(), 'GET', '/api/rooms/team-standup/activity');
+    expect((deleted.body as any).sessions[0].summaries).toEqual([]);
+    mockListByCall.mockClear();
+    const outsider = await run(buildApp(), 'GET', '/api/rooms/team-standup/activity', { userId: 'observer' });
+    expect((outsider.body as any).sessions[0].summaries).toEqual([]);
+    expect(mockListByCall).not.toHaveBeenCalled();
   });
 });

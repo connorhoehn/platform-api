@@ -32,8 +32,11 @@ import { ulid } from 'ulid';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
 import { AppError } from '../middleware/error-handler';
+import type { HangoutPlan } from '../lib/hangout-plan';
 
 export const HANGOUT_ROOMS_TABLE = tableName('hangout-rooms');
+export const hangoutActivityPartition = (orgId: string, roomId: string): string => `activity#${orgId}#${roomId}`;
+export interface HangoutSessionPointer { documentId: string; sessionId: string; startedAt: string }
 
 const ARCHIVE_TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days
 
@@ -63,6 +66,8 @@ export interface HangoutRoom {
   createdAt: string;
   visibility: HangoutRoomVisibility;
   settings: HangoutRoomSettings;
+  /** Persistent template; copied into an individual call only on explicit use. */
+  plan?: HangoutPlan;
   state: HangoutRoomState;
   lastActiveAt: string;
   archivedAt?: string;
@@ -153,6 +158,24 @@ export class RoomArchivedError extends AppError {
 export class HangoutRoomRepository extends BaseRepository {
   constructor(docClient: DynamoDBDocumentClient) {
     super(HANGOUT_ROOMS_TABLE, docClient);
+  }
+
+  /** Paginated activity index in the existing table, isolated from the room GSIs. */
+  async listSessionPointers(orgId: string, roomId: string, cursor?: string): Promise<{ items: HangoutSessionPointer[]; cursor?: string }> {
+    const partition = hangoutActivityPartition(orgId, roomId);
+    let start: Record<string, unknown> | undefined;
+    if (cursor) {
+      try {
+        start = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Record<string, unknown>;
+        if (start.orgId !== partition || typeof start.roomId !== 'string') throw new Error('wrong partition');
+      } catch { throw new AppError(400, 'Invalid activity cursor'); }
+    }
+    const result = await this.docClient.send(new QueryCommand({ TableName: HANGOUT_ROOMS_TABLE,
+      KeyConditionExpression: 'orgId = :org', ExpressionAttributeValues: { ':org': partition },
+      ScanIndexForward: false, Limit: 20, ...(start ? { ExclusiveStartKey: start } : {}),
+    }));
+    return { items: (result.Items ?? []) as HangoutSessionPointer[],
+      ...(result.LastEvaluatedKey ? { cursor: Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64url') } : {}) };
   }
 
   /**
@@ -336,6 +359,7 @@ export class HangoutRoomRepository extends BaseRepository {
       description?: string;
       visibility?: HangoutRoomVisibility;
       settings?: HangoutRoomSettings;
+      plan?: HangoutPlan;
     },
   ): Promise<HangoutRoom> {
     const sets: string[] = [];
@@ -359,6 +383,15 @@ export class HangoutRoomRepository extends BaseRepository {
       sets.push('settings = :s');
       values[':s'] = partial.settings;
     }
+    if (partial.plan !== undefined) {
+      sets.push('#plan = :plan');
+      names['#plan'] = 'plan';
+      values[':plan'] = partial.plan;
+      if (partial.plan.version > 1) {
+        names['#version'] = 'version';
+        values[':previousVersion'] = partial.plan.version - 1;
+      }
+    }
 
     // Always bump lastActiveAt on a write to keep the recency sort honest.
     const now = new Date().toISOString();
@@ -372,7 +405,9 @@ export class HangoutRoomRepository extends BaseRepository {
         UpdateExpression: `SET ${sets.join(', ')}`,
         ...(Object.keys(names).length > 0 ? { ExpressionAttributeNames: names } : {}),
         ExpressionAttributeValues: values,
-        ConditionExpression: 'attribute_exists(roomId)',
+        ConditionExpression: partial.plan
+          ? `attribute_exists(roomId) AND ${partial.plan.version === 1 ? 'attribute_not_exists(#plan)' : '#plan.#version = :previousVersion'}`
+          : 'attribute_exists(roomId)',
         ReturnValues: 'ALL_NEW',
       }),
     );

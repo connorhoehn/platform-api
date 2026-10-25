@@ -7,6 +7,7 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 
 const mockCreateSession = jest.fn();
+const mockHangoutBySlug = jest.fn().mockResolvedValue(null);
 const mockAddParticipant = jest.fn();
 const mockAddOrReplaceParticipant = jest.fn();
 const mockEndSession = jest.fn();
@@ -54,6 +55,7 @@ jest.mock('../../lib/video-auth', () => ({
 }));
 
 jest.mock('../../repositories', () => ({
+  hangoutRoomRepo: { getRoomBySlug: (...args: unknown[]) => mockHangoutBySlug(...args) },
   videoSessionRepo: {
     createSession: (...args: unknown[]) => mockCreateSession(...args),
     addParticipant: (...args: unknown[]) => mockAddParticipant(...args),
@@ -194,6 +196,7 @@ function makeTimeoutError(): Error {
 
 beforeEach(() => {
   mockCreateSession.mockReset().mockResolvedValue(undefined);
+  mockHangoutBySlug.mockReset().mockResolvedValue(null);
   mockAddParticipant.mockReset().mockResolvedValue(undefined);
   mockAddOrReplaceParticipant.mockReset().mockResolvedValue({ displaced: [], remaining: 1 });
   mockRemoveParticipant.mockReset();
@@ -2075,6 +2078,7 @@ describe('POST /api/video/sessions — a private room lobby admits members only'
   const tok = (sub: string) => ({ sub, orgId: 'org-a', tenants: ['org-a', 'social'], authKind: 'orgiq-hs256' });
   beforeEach(() => {
     const { makeLobbyAccess } = jest.requireActual('../../lib/lobbyAccess') as typeof import('../../lib/lobbyAccess');
+    mockHangoutBySlug.mockImplementation(async (orgId, slug) => ({ orgId, slug, roomId: 'r-' + slug, state: 'active', settings: { audioOnly: true, recordingEnabled: false, softCap: 25 } }));
     mockRealLobbyAccess = makeLobbyAccess({
       roomBySlug: async (orgId, slug) => (orgId === 'social' && slug === 'den'
         ? { roomId: 'r-den', orgId: 'social', visibility: 'private', createdBy: 'u-owner' }
@@ -2098,6 +2102,17 @@ describe('POST /api/video/sessions — a private room lobby admits members only'
     expect(mockCreateSession).not.toHaveBeenCalled();
   });
 
+  it('recorded hangouts select transcription even when the client asks for a broadcast profile', async () => {
+    mockHangoutBySlug.mockImplementation(async (orgId, slug) => ({ orgId, slug, roomId: 'r-' + slug, state: 'active', settings: { audioOnly: false, recordingEnabled: true, softCap: 25 } }));
+    mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:lounge'));
+    const response = await run(buildApp(), 'POST', '/api/video/sessions', {
+      body: { lobbyName: 'social:room:lounge', findOrCreate: true, recordingConfiguration: { enabled: false, recordingProfile: 'broadcast' } },
+      headers: { authorization: 'Bearer user-jwt' }, user: tok('u-member'),
+    });
+    expect(response.statusCode).toBe(201);
+    expect(JSON.parse(mockFetch.mock.calls.at(-1)[1].body).recordingConfiguration).toMatchObject({ enabled: true, recordingProfile: 'hangout', transcribe: true });
+  });
+
   it('a member opens the call; a public room opens for any listed tenant', async () => {
     mockFetch.mockResolvedValue(lvsSessionCreated('arn:channel:den'));
     const member = await run(buildApp(), 'POST', '/api/video/sessions', {
@@ -2106,6 +2121,7 @@ describe('POST /api/video/sessions — a private room lobby admits members only'
       user: tok('u-member'),
     });
     expect(member.statusCode).toBe(201);
+    expect(mockCreateSession.mock.calls.at(-1)[0]).toMatchObject({ recording: { enabled: false, reason: 'room-setting-off' }, hangout: { roomId: 'r-den', audioOnly: true } });
     const open = await run(buildApp(), 'POST', '/api/video/sessions', {
       body: { lobbyName: 'social:room:lounge', findOrCreate: true },
       headers: { authorization: 'Bearer user-jwt' },

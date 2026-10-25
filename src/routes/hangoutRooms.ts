@@ -27,6 +27,8 @@ import { mayUsePartition, requestedPartition } from '../lib/partition';
 import { Router, Request, Response } from 'express';
 import {
   hangoutRoomRepo,
+  videoSessionRepo,
+  callRecordingRepo,
   hangoutRoomMemberRepo,
   RoomSlugConflictError,
   RoomNotFoundError,
@@ -42,6 +44,9 @@ import {
   AppError, ForbiddenError } from '../middleware/error-handler';
 import { canCreateRoom } from '../middleware/canCreateRoom';
 import log from '../lib/logger';
+import { readHangoutPlan } from '../lib/hangout-plan';
+import { authorize, principalOf } from '../lib/authorize';
+import { tenantOf } from '../lib/tenant';
 import { mirrorRoomMembers, mirrorRoomMemberRemoval, syncRoomOnce } from '../gateway/chatMembership';
 
 /**
@@ -197,7 +202,10 @@ export function slugify(name: string): string {
  * Applies sensible defaults so callers can omit fields.
  */
 function normalizeSettings(input: unknown): HangoutRoomSettings {
+  if (input !== undefined && (!input || typeof input !== 'object' || Array.isArray(input))) throw new ValidationError('settings must be an object');
   const raw = (input ?? {}) as Partial<HangoutRoomSettings>;
+  for (const key of ['audioOnly', 'recordingEnabled'] as const) if (raw[key] !== undefined && typeof raw[key] !== 'boolean') throw new ValidationError(`${key} must be a boolean`);
+  if (raw.softCap !== undefined && (!Number.isSafeInteger(raw.softCap) || raw.softCap < 1 || raw.softCap > 1000)) throw new ValidationError('softCap must be an integer between 1 and 1000');
   return {
     audioOnly: raw.audioOnly === true,
     recordingEnabled: raw.recordingEnabled === true,
@@ -361,6 +369,53 @@ hangoutRoomsRouter.get(
  * rooms; 410 on archived; 404 if missing.
  */
 hangoutRoomsRouter.get(
+  '/:slug/activity',
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const orgId = resolveOrgId(req), userId = getUserId(req);
+    const room = await loadActiveRoom(orgId, req.params.slug);
+    await assertCanAccess(room, userId, orgId);
+    const page = await hangoutRoomRepo.listSessionPointers(orgId, room.roomId, typeof req.query.cursor === 'string' ? req.query.cursor : undefined);
+    const sessions: Array<Record<string, unknown>> = [];
+    // Bounded page (20); each session is read by its exact key, never a table scan.
+    for (const pointer of page.items) {
+      const session = await videoSessionRepo.getSession(pointer.documentId, pointer.sessionId);
+      if (!session || session.hangout?.roomId !== room.roomId || session.hangout.orgId !== orgId
+        || (session.ttl && session.ttl <= Math.floor(Date.now() / 1000))) continue;
+      const attendance = Object.values(session.participantHistory ?? {});
+      const people = [...new Set(attendance.map(p => p.userId))].map(id => ({ userId: id,
+        displayName: attendance.find(p => p.userId === id)?.displayName || id,
+        joinedAt: attendance.filter(p => p.userId === id).map(p => p.joinedAt).sort()[0],
+        // An open media leg is not proof of live presence. The call supplies that separately.
+        leftAt: attendance.filter(p => p.userId === id).every(p => !!p.leftAt)
+          ? attendance.filter(p => p.userId === id).map(p => p.leftAt!).sort().at(-1) : null,
+      }));
+      const summaries: Array<{ recordingId: string; status: string; text?: string }> = [];
+      if (attendance.some(p => p.userId === userId)) {
+        const callIds = [...new Set(attendance.flatMap(p => p.callBinding ? [p.callBinding.callId] : []))];
+        for (const callId of callIds) for (const recording of await callRecordingRepo.listByCall(callId)) {
+          if (recording.lobbyName !== session.documentId || recording.sessionId !== session.sessionId) continue;
+          // Attendance is historical. The current recording fan-out is the
+          // authority, so an untagged participant cannot recover removed access
+          // through the hangout's activity view.
+          const resolved = await callRecordingRepo.resolveForUser(userId, recording.recordingId);
+          if (!resolved || !(await authorize({ principal: principalOf(req.user, tenantOf(req.user?.orgId)),
+            action: 'recording:read', resource: { type: 'recording', id: recording.recordingId,
+              attrs: { isParticipant: resolved.isParticipant } } })).allow) continue;
+          const detail = resolved.detail;
+          if (detail.lobbyName !== session.documentId || detail.sessionId !== session.sessionId) continue;
+          summaries.push({ recordingId: detail.recordingId, status: detail.summaryStatus ?? 'unavailable',
+            ...(detail.summaryStatus === 'ready' && detail.summaryMarkdown ? { text: detail.summaryMarkdown } : {}) });
+        }
+      }
+      sessions.push({ sessionId: session.sessionId, roomId: session.hangout.breakoutRoomId ?? null, roomName: session.hangout.roomName,
+        startedAt: session.startedAt, endedAt: session.endedAt ?? null, people, summaries,
+        recordingEnabled: session.recording?.enabled ?? null });
+    }
+    res.json({ sessions, ...(page.cursor ? { cursor: page.cursor } : {}) });
+  }),
+);
+
+hangoutRoomsRouter.get(
   '/:slug',
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const orgId = resolveOrgId(req);
@@ -507,6 +562,15 @@ hangoutRoomsRouter.patch(
     };
 
     const partial: Parameters<typeof hangoutRoomRepo.updateRoom>[2] = {};
+    const planInput = (req.body as Record<string, unknown> | undefined)?.plan;
+    if (planInput !== undefined) {
+      partial.plan = readHangoutPlan(planInput, userId);
+      if (partial.plan.version !== (room.plan?.version ?? 0) + 1) throw new AppError(409, 'This layout changed. Reload it before saving.');
+      // Assignment never grants access to a private hangout.
+      if (room.visibility === 'private') for (const member of partial.plan.rooms.flatMap(r => r.members)) {
+        if (member !== room.createdBy && !await hangoutRoomMemberRepo.isMember(room.roomId, member)) throw new ValidationError('Assigned people must already have access to this private hangout');
+      }
+    }
     if (body.name !== undefined) {
       // Present but wrong type is a caller bug, not a no-op — reject it
       // rather than silently dropping the field (matches the CREATE path's
@@ -526,9 +590,17 @@ hangoutRoomsRouter.patch(
     if (body.visibility !== undefined) {
       partial.visibility = body.visibility === 'private' ? 'private' : 'org';
     }
-    if (body.settings !== undefined) partial.settings = normalizeSettings(body.settings);
+    if (body.settings !== undefined) {
+      normalizeSettings(body.settings); // Validate before spreading: null and strings are not patches.
+      partial.settings = normalizeSettings({ ...room.settings, ...body.settings });
+    }
 
-    const updated = await hangoutRoomRepo.updateRoom(orgId, room.roomId, partial);
+    let updated: HangoutRoom;
+    try { updated = await hangoutRoomRepo.updateRoom(orgId, room.roomId, partial); }
+    catch (error) {
+      if (partial.plan && error instanceof Error && error.name === 'ConditionalCheckFailedException') throw new AppError(409, 'This layout changed. Reload it before saving.');
+      throw error;
+    }
     res.status(200).json({ room: updated });
   }),
 );

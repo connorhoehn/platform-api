@@ -9,7 +9,8 @@
 //   `ensureVideoSessionsTTL()` in src/lib/dynamo-setup.ts enables it on
 //   the table at startup (idempotent).
 
-import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { HANGOUT_ROOMS_TABLE, hangoutActivityPartition } from './HangoutRoomRepository';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
 import {
@@ -70,7 +71,20 @@ export class VideoSessionRepository extends BaseRepository implements VideoSessi
   }
 
   async createSession(record: VideoSessionRecord): Promise<VideoSessionRecord> {
-    await this.putItem(record as unknown as Record<string, unknown>);
+    if (record.hangout) {
+      // Session + discoverability are atomic. No Scan of all media sessions,
+      // and temporary breakouts remain discoverable after the live meeting ends.
+      await this.docClient.send(new TransactWriteCommand({ TransactItems: [
+        { Put: { TableName: VIDEO_SESSIONS_TABLE, Item: record } },
+        { Put: { TableName: HANGOUT_ROOMS_TABLE, Item: {
+          orgId: hangoutActivityPartition(record.hangout.orgId, record.hangout.roomId),
+          roomId: `${record.startedAt}#${record.sessionId}`, documentId: record.documentId,
+          sessionId: record.sessionId, startedAt: record.startedAt,
+          // The referenced session remains the attendance authority; this is only an index.
+          ttl: computeEndedSessionTtl(new Date(Date.parse(record.startedAt) + 86_400_000).toISOString()),
+        } } },
+      ] }));
+    } else await this.putItem(record as unknown as Record<string, unknown>);
     return record;
   }
 
