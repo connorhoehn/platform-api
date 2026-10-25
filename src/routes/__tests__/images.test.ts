@@ -424,15 +424,19 @@ describe('POST /api/images/from-url — SSRF defense', () => {
     expect(res.status).toBe(400);
   });
 
-  it('refuses to fetch from IPv4-mapped IPv6 (::ffff:10.0.0.1)', async () => {
-    const res = await rawRequest(
-      server,
-      'POST',
-      '/api/images/from-url',
-      Buffer.from(JSON.stringify({ url: 'http://[::ffff:10.0.0.1]/img' })),
-      { 'Content-Type': 'application/json' },
-    );
-    expect(res.status).toBe(400);
+  it.each(['::ffff:10.0.0.1', '::ffff:a00:1', '::ffff:127.0.0.1', '::ffff:169.254.169.254'])('refuses IPv4-mapped IPv6 %s before any fetch', async hostname => {
+    const fetchSpy = jest.spyOn(global, 'fetch').mockRejectedValue(new Error('private URL must not reach fetch'));
+    try {
+      const res = await rawRequest(
+        server,
+        'POST',
+        '/api/images/from-url',
+        Buffer.from(JSON.stringify({ url: `http://[${hostname}]/img` })),
+        { 'Content-Type': 'application/json' },
+      );
+      expect(res.status).toBe(400);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally { fetchSpy.mockRestore(); }
   });
 
   it('rejects a 302 redirect that lands on a private address', async () => {

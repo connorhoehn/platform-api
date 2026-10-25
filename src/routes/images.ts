@@ -244,6 +244,13 @@ function isPrivateOrLocalHost(hostname: string): boolean {
   // IPv4-mapped IPv6 — re-check embedded IPv4 against same private ranges.
   const v4Mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
   if (v4Mapped) return isPrivateOrLocalHost(v4Mapped[1]!);
+  // WHATWG URL canonicalizes ::ffff:10.0.0.1 to ::ffff:a00:1 before
+  // hostname reaches this guard. Decode that form before checking IPv4.
+  const v4MappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
+  if (v4MappedHex) {
+    const high = parseInt(v4MappedHex[1]!, 16), low = parseInt(v4MappedHex[2]!, 16);
+    return isPrivateOrLocalHost([high >>> 8, high & 255, low >>> 8, low & 255].join('.'));
+  }
   // .local / .internal mDNS + intra-cluster
   if (lower.endsWith('.local') || lower.endsWith('.internal')) return true;
   return false;
