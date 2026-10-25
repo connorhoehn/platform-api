@@ -86,10 +86,10 @@ describe('EventBus auto-compaction wiring (Stream 4)', () => {
         await (bus as any).publish('test:compaction:tick', { i });
       }
 
-      // Wait until at least one compact:completed event lands. Poll on a
-      // short interval so we don't oversleep when the timer fires early.
+      // An empty completion may arrive while the publishes are still flushing.
+      // Wait for the same meaningful completion that the assertion uses.
       const deadline = Date.now() + 15_000;
-      while (completions.length === 0 && errors.length === 0 && Date.now() < deadline) {
+      while (!completions.some(r => r.entriesBefore >= NUM_EVENTS) && errors.length === 0 && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 50));
       }
 

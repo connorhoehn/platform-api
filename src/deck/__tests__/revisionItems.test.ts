@@ -226,6 +226,9 @@ describe('revisions as items (NFR #188)', () => {
     expect(tables.items.size).toBe(1);
 
     // A save that lands between the read and the removal wins; the next pass finishes.
+    // Give the stale snapshot an explicit earlier timestamp. Two fast appends
+    // can otherwise land in the same millisecond and not exercise this fence.
+    tables.rows.get('doc-1')!.updatedAt = '2026-09-22T00:00:00.000Z';
     const stale = structuredClone(tables.rows.get('doc-1')) as PresentationDocumentRow;
     await store.appendRevision(input('racer'));
     expect(await migrateRevisionRow(tables.client, stale, { apply: true, table: REVS })).toMatchObject({ action: 'raced', copied: 3 });

@@ -37,12 +37,13 @@ module.exports = {
     '^.+\\.tsx?$': [
       'ts-jest',
       {
-        // Keep type-checks fast: rely on `tsc --noEmit` for full typing.
-        // ts-jest's per-file isolatedModules option moved into tsconfig in
-        // v30, but we can't modify tsconfig.json (owned by app build), so
-        // we disable diagnostics instead — same effect for test runs.
+        // Transpile each test independently; build/typecheck retain full typing.
+        // Disabling diagnostics alone still creates a full TypeScript program
+        // in every recycled worker, so use a test-only isolatedModules config.
+        // Keep this Jest runner's existing CommonJS/dynamic-import mock behavior;
+        // production continues to compile with the unchanged Node16 config.
         diagnostics: false,
-        tsconfig: path.resolve(__dirname, 'tsconfig.json'),
+        tsconfig: path.resolve(__dirname, 'tsconfig.test.json'),
       },
     ],
   },
