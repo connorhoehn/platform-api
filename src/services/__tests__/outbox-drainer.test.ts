@@ -48,7 +48,7 @@ jest.mock('../../lib/logger', () => ({
   },
 }));
 
-import { startOutboxDrainer } from '../outbox-drainer';
+import { isTransientPublishError, startOutboxDrainer } from '../outbox-drainer';
 
 interface DDBCmd {
   constructor: { name: string };
@@ -246,6 +246,45 @@ describe('outbox-drainer — retry & failure paths', () => {
     expect(rowUpdate!.input.ConditionExpression).toContain('attribute_exists(outboxId)');
     expect(rowUpdate!.input.UpdateExpression).toContain('failedAt');
     expect(rowUpdate!.input.UpdateExpression).toContain('#ttl');
+  });
+});
+
+describe('outbox-drainer — transient broker failures', () => {
+  it.each([
+    ['a broker 503', Object.assign(new Error('Queue POST request failed (503)'), { status: 503, code: 'HttpError' })],
+    ['backpressure', Object.assign(new Error('Queue POST request failed (429)'), { status: 429, code: 'QUEUE_DEPTH_EXCEEDED' })],
+    ['a refused connection', Object.assign(new Error('Queue request TransportError'), { status: 0, code: 'TransportError' })],
+    ['a socket error cause', Object.assign(new Error('fetch failed'), { cause: Object.assign(new Error('connect'), { code: 'ECONNREFUSED' }) })],
+  ])('keeps the row UNPROCESSED and its retry budget on %s', async (_label, error) => {
+    const row = {
+      outboxId: 'o-transient',
+      status: 'UNPROCESSED',
+      eventType: 'social.post.created',
+      queueName: 'post-events',
+      payload: JSON.stringify({ postId: 'p-1' }),
+      createdAt: new Date().toISOString(),
+      retryCount: 2,
+    };
+    mockSend.mockImplementation(async (cmd: DDBCmd) => {
+      if (isShardQuery(cmd, 'P0')) return { Items: [row] };
+      return {};
+    });
+    mockPublishDurable.mockRejectedValue(error);
+
+    const drainer = startOutboxDrainer({ pollIntervalMs: 10_000_000, maxRetries: 3 });
+    await flush();
+    drainer.stop();
+    await flush();
+
+    const rowUpdates = findAllCalls(UpdateCommand).filter(
+      (u) => (u.input.Key as { outboxId?: string })?.outboxId === 'o-transient',
+    );
+    expect(rowUpdates).toEqual([]);
+  });
+
+  it('still counts a definite rejection toward FAILED', () => {
+    expect(isTransientPublishError(Object.assign(new Error('400'), { status: 400, code: 'InvalidParameterValue' }))).toBe(false);
+    expect(isTransientPublishError(new Error('FIFO publish requires a groupId'))).toBe(false);
   });
 });
 

@@ -105,6 +105,28 @@ function createDrainerLock(): LeasedKVLock {
   });
 }
 
+/**
+ * A publish that failed because the broker was unreachable, slow or shedding
+ * load says nothing about the row: the event is still valid and must wait for
+ * the broker, not spend its retry budget. Only a definite rejection (a 4xx
+ * other than 408/429, a validation or setup error) counts toward FAILED.
+ * Treating a short broker outage as three strikes marked accepted events
+ * FAILED within six seconds and they were never published.
+ */
+export function isTransientPublishError(err: unknown): boolean {
+  const e = err as { status?: unknown; code?: unknown; name?: unknown; cause?: unknown } | null;
+  if (!e || typeof e !== 'object') return false;
+  if (typeof e.status === 'number') {
+    if (e.status === 0 || e.status === 408 || e.status === 429 || e.status >= 500) return true;
+    return false;
+  }
+  const transientCodes = new Set(['Aborted', 'Timeout', 'TransportError', 'ECONNREFUSED', 'ECONNRESET',
+    'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']);
+  if (typeof e.code === 'string' && transientCodes.has(e.code)) return true;
+  if (e.name === 'AbortError' || e.name === 'TimeoutError') return true;
+  return e.cause !== undefined && e.cause !== err ? isTransientPublishError(e.cause) : false;
+}
+
 export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => void } {
   const pollIntervalMs = config?.pollIntervalMs ?? 2000;
   const batchSize = config?.batchSize ?? 25;
@@ -453,6 +475,10 @@ export function startOutboxDrainer(config?: OutboxDrainerConfig): { stop: () => 
         'outbox-drainer publish failed',
       );
       recordOutboxPublishFailure(row.eventType);
+
+      // Leave the row UNPROCESSED with its retry budget intact; the next tick
+      // retries it once the broker answers again.
+      if (isTransientPublishError(err)) return;
 
       if (!lock.isLeader()) {
         log.warn(
