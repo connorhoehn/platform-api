@@ -6,6 +6,7 @@ import { getRedisClient } from '../lib/redis-client';
 import { tableName } from '../lib/ddb-table-name';
 import { buildFreshnessReadiness } from '../lib/buildFreshness';
 import { readModelHealth } from '../lib/modelHealth';
+import { runtimeReadiness } from '../lib/runtime-profile';
 
 const PROFILES_TABLE = tableName('social-profiles');
 const SERVICE_VERSION = process.env.SERVICE_VERSION ?? '0.1.0';
@@ -69,7 +70,9 @@ router.get(
   makeHealthHandler({
     service: 'platform-api',
     version: SERVICE_VERSION,
-    checks: [ddbCheck, redisCheck, buildCheck, modelCheck],
+    // feature:* checks fail only for features the runtime profile makes
+    // mandatory; optional features that failed report degraded.
+    checks: [ddbCheck, redisCheck, buildCheck, modelCheck, ...runtimeReadiness.healthChecks()],
   }),
 );
 

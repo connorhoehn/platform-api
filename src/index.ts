@@ -26,6 +26,7 @@ import { assertRequiredInProd } from 'distributed-core';
 import { createShutdownManager, drainHttpServer } from '@connorhoehn/service-runtime';
 import { RetryManager } from 'distributed-core/transport';
 import { catalog, connectCatalog, disconnectCatalog, publishDurable } from './lib/event-catalog';
+import { runtimeProfile, runtimeReadiness, validateProfile } from './lib/runtime-profile';
 import { ensureOutboxTTL, ensureVideoSessionsTTL, ensurePipelineRunsTTL, ensurePipelineAuditTTL, ensurePipelineDlqTTL } from './lib/dynamo-setup';
 import { resolveVideoSessionStoreMode } from './repositories/videoSessionStoreFactory';
 import { startOutboxDrainer } from './services/outbox-drainer';
@@ -43,6 +44,22 @@ import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
 import { definitionsRepo } from './pipeline/definitions-repository';
 
 const port = process.env.PORT ?? '3001';
+
+// Runtime profile: validate static capability declarations before opening
+// connections, timers or consumers. A durable profile that cannot honour its
+// guarantees refuses to start rather than silently degrading.
+{
+  const report = validateProfile(runtimeProfile);
+  if (!report.ok) {
+    log.fatal({ profile: runtimeProfile.profile, problems: report.problems }, 'runtime profile requirements failed');
+    process.exit(2);
+  }
+  log.info({
+    profile: runtimeProfile.profile,
+    datastore: runtimeProfile.datastore ?? 'undeclared',
+    mandatory: [...runtimeProfile.mandatory],
+  }, 'runtime profile');
+}
 
 // Cognito env-var gate. In prod (or COGNITO_REQUIRED=true) exit(1) when the
 // required vars are missing; in dev COGNITO_REQUIRED=false explicitly allows
@@ -129,8 +146,9 @@ const server = app.listen(Number(port), () => {
 
 // ---------------------------------------------------------------------------
 // Event catalog — connects to Redis + message-queue so domain events can be
-// published to the catalog. Non-fatal: if connection fails the catalog client
-// degrades gracefully (events simply won't publish).
+// published to the catalog. The process keeps serving if the connection
+// fails; readiness reports the failure (503 when the runtime profile makes
+// the catalog mandatory, degraded otherwise) until a reconnect succeeds.
 // The outbox drainer starts unconditionally — it drains from DynamoDB which is
 // independent of the catalog connection.
 // ---------------------------------------------------------------------------
@@ -141,8 +159,14 @@ let drainer: { stop: () => void } | null = null;
 let drainerStopped = false;
 void whenBuildFresh(log).then(() => {
   if (drainerStopped) return;
-  drainer = startOutboxDrainer();
-  log.info('outbox-drainer started');
+  try {
+    drainer = startOutboxDrainer();
+    runtimeReadiness.ready('outbox');
+    log.info('outbox-drainer started');
+  } catch (err: unknown) {
+    runtimeReadiness.fail('outbox', err);
+    log.error({ errMessage: err instanceof Error ? err.message : String(err) }, 'outbox-drainer failed to start');
+  }
 });
 
 // DDB TTL provisioning. In prod (or DDB_TTL_REQUIRED=true) we refuse to boot
@@ -232,86 +256,113 @@ let callReactionConsumer: { stop: () => Promise<void> } | null = null;
 let workGraphConsumer: { stop: () => Promise<void> } | null = null;
 let workGraphOutboxDrainer: { stop: () => void } | null = null;
 
+let catalogConsumersStarted = false;
+// Runs once, after the first successful catalog connection, whichever path
+// (initial retries or background reconnect) achieved it.
+async function startCatalogConsumers(): Promise<void> {
+  if (catalogConsumersStarted) return;
+  catalogConsumersStarted = true;
+  runtimeReadiness.ready('event-catalog');
+  const consumerFailures: string[] = [];
+  if (process.env.ACTIVE_NOW_WORK_GRAPH_ENABLED === 'true') {
+    try {
+      // Do not consume before the projection table and all lookup indexes
+      // exist. A failed source dependency leaves the feature fail-closed.
+      await ensureWorkGraphTable(ddbClient);
+      workGraphConsumer = startWorkGraphConsumer({
+        transport: catalog.getDurableTransport(),
+        repository: workGraphRepository,
+        accountResolver: new WorkSourceAccountRepository(docClient),
+        // The document source has two declared writers. Admitting a second
+        // service says who may SPEAK, not what they may say: the platform
+        // may describe a presentation its own deck store wrote, and a CRDT
+        // page stays the gateway's to describe.
+        ownership: {
+          ownsDocument: async (serviceId, documentId) => {
+            if (serviceId !== 'platform-api') return false;
+            const { getPresentationDocumentStore } = await import('./deck/presentationDocuments.js');
+            const row = await getPresentationDocumentStore().get(documentId).catch(() => null);
+            return !!row;
+          },
+        },
+      });
+      workGraphOutboxDrainer = startWorkGraphOutboxDrainer();
+      runtimeReadiness.ready('work-graph');
+      log.info('work-graph consumer and outbox drainer started');
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      runtimeReadiness.fail('work-graph', err);
+      log.error({ errMessage: e?.message }, 'work-graph runtime failed to start; feature is unavailable');
+    }
+  }
+  // Phase 57b — start the activity.recorded consumer after the catalog
+  // has connected. If the subscribe throws (e.g. event not declared), the
+  // process continues and readiness reports durable-consumers as failed.
+  try {
+    activityConsumer = startActivityConsumer();
+    log.info('activity-consumer started');
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    consumerFailures.push(`activity-consumer: ${e?.message ?? String(err)}`);
+    log.warn({ errMessage: e?.message }, 'activity-consumer failed to start');
+  }
+  // The meeting-notes summary is a step of the call-transcription pipeline
+  // (src/recordings/recordingPipelines.ts); there is no summary consumer.
+  // Wave A — summary-projector: single durable consumer of
+  // `transcription:summary.ready`. Projects Action Items onto the
+  // call-bound document and fires summary-bound pipelines.
+  try {
+    summaryProjector = startSummaryProjector();
+    log.info('summary-projector started');
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    consumerFailures.push(`summary-projector: ${e?.message ?? String(err)}`);
+    log.warn({ errMessage: e?.message }, 'summary-projector failed to start');
+  }
+  // In-call emoji reactions — durable drain of `call:reaction.recorded`
+  // into the call-reactions table (playback + transcript injection).
+  try {
+    callReactionConsumer = startCallReactionConsumer();
+    log.info('call-reaction-consumer started');
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    consumerFailures.push(`call-reaction-consumer: ${e?.message ?? String(err)}`);
+    log.warn({ errMessage: e?.message }, 'call-reaction-consumer failed to start');
+  }
+  if (consumerFailures.length) runtimeReadiness.set('durable-consumers', 'failed', consumerFailures.join('; '));
+  else runtimeReadiness.ready('durable-consumers');
+}
+
+runtimeReadiness.probe('event-catalog', async () => {
+  const health = await catalog.getDurableTransport().healthCheck();
+  return { ok: health.status === 'connected', details: `message-queue ${health.status}` };
+});
+
 (async () => {
   try {
     await catalogRetry.execute(() => connectCatalog());
     log.info('event-catalog connected');
-    if (process.env.ACTIVE_NOW_WORK_GRAPH_ENABLED === 'true') {
-      try {
-        // Do not consume before the projection table and all lookup indexes
-        // exist. A failed source dependency leaves the feature fail-closed.
-        await ensureWorkGraphTable(ddbClient);
-        workGraphConsumer = startWorkGraphConsumer({
-          transport: catalog.getDurableTransport(),
-          repository: workGraphRepository,
-          accountResolver: new WorkSourceAccountRepository(docClient),
-          // The document source has two declared writers. Admitting a second
-          // service says who may SPEAK, not what they may say: the platform
-          // may describe a presentation its own deck store wrote, and a CRDT
-          // page stays the gateway's to describe.
-          ownership: {
-            ownsDocument: async (serviceId, documentId) => {
-              if (serviceId !== 'platform-api') return false;
-              const { getPresentationDocumentStore } = await import('./deck/presentationDocuments.js');
-              const row = await getPresentationDocumentStore().get(documentId).catch(() => null);
-              return !!row;
-            },
-          },
-        });
-        workGraphOutboxDrainer = startWorkGraphOutboxDrainer();
-        log.info('work-graph consumer and outbox drainer started');
-      } catch (err: unknown) {
-        const e = err as { message?: string };
-        log.error({ errMessage: e?.message }, 'work-graph runtime failed to start; feature is unavailable');
-      }
-    }
-    // Phase 57b — start the activity.recorded consumer after the catalog
-    // has connected. Non-fatal — if the subscribe throws (e.g. event not
-    // declared, durable transport down), we log and continue without it.
-    try {
-      activityConsumer = startActivityConsumer();
-      log.info('activity-consumer started');
-    } catch (err: unknown) {
-      const e = err as { message?: string };
-      log.warn({ errMessage: e?.message }, 'activity-consumer failed to start (non-fatal)');
-    }
-    // The meeting-notes summary is a step of the call-transcription pipeline
-    // (src/recordings/recordingPipelines.ts); there is no summary consumer.
-    // Wave A — summary-projector: single durable consumer of
-    // `transcription:summary.ready`. Projects Action Items onto the
-    // call-bound document and fires summary-bound pipelines.
-    try {
-      summaryProjector = startSummaryProjector();
-      log.info('summary-projector started');
-    } catch (err: unknown) {
-      const e = err as { message?: string };
-      log.warn({ errMessage: e?.message }, 'summary-projector failed to start (non-fatal)');
-    }
-    // In-call emoji reactions — durable drain of `call:reaction.recorded`
-    // into the call-reactions table (playback + transcript injection).
-    // Non-fatal like the other consumers.
-    try {
-      callReactionConsumer = startCallReactionConsumer();
-      log.info('call-reaction-consumer started');
-    } catch (err: unknown) {
-      const e = err as { message?: string };
-      log.warn({ errMessage: e?.message }, 'call-reaction-consumer failed to start (non-fatal)');
-    }
   } catch (err: unknown) {
     const e = err as { message?: string };
+    runtimeReadiness.set('event-catalog', 'failed', `connect failed after retries: ${e?.message ?? String(err)}; reconnecting`);
     log.warn(
       { errMessage: e?.message },
       'event-catalog connect failed after retries — scheduling background reconnect',
     );
     backgroundCatalogReconnect();
+    return;
   }
+  await startCatalogConsumers();
 })();
 
 function backgroundCatalogReconnect(): void {
   const attempt = (delay: number): void => {
     setTimeout(() => {
       connectCatalog()
-        .then(() => log.info('event-catalog connected (background retry)'))
+        .then(() => {
+          log.info('event-catalog connected (background retry)');
+          return startCatalogConsumers();
+        })
         .catch(() => {
           const nextDelay = Math.min(delay * 2, 60_000);
           log.warn({ nextDelayMs: nextDelay }, 'event-catalog background reconnect failed, retrying');
@@ -374,8 +425,14 @@ const pipelineWiring = wirePipelineBridge({
 pipelineShutdown = pipelineWiring.shutdown;
 // Install the bridge into the platform-api singleton once the wiring resolves.
 void pipelineWiring.ready.then((bridge) => {
-  if (bridge) setPipelineBridge(bridge);
-});
+  if (bridge) {
+    setPipelineBridge(bridge);
+    runtimeReadiness.ready('pipelines');
+  } else {
+    // wirePipelineBridge resolves null when bootstrap failed or nothing was wired.
+    runtimeReadiness.set('pipelines', 'failed', `pipeline bridge unavailable (mode ${pipelineWiring.mode})`);
+  }
+}, (err: unknown) => runtimeReadiness.fail('pipelines', err));
 
 // ---------------------------------------------------------------------------
 // Pipeline definitions cache — Scan-backed, refreshed every 60s.
@@ -519,6 +576,7 @@ const scheduler = createScheduleEvaluator({
   leadership: createFencedSchedulerLeadership({ redis: scheduleLeaseRedis.get }),
 });
 scheduler.start();
+runtimeReadiness.ready('scheduler');
 
 // Graceful shutdown — registered via service-runtime/lifecycle's ShutdownManager.
 //
@@ -561,3 +619,6 @@ sd.register('scheduler', async () => {
   await scheduler.shutdown();
   await scheduleLeaseRedis.close();
 });
+// Registered after everything else → runs first: readiness drops before any
+// consumer, drainer or listener stops, so no new traffic is routed here.
+sd.register('readiness', () => { runtimeReadiness.beginDrain(); });

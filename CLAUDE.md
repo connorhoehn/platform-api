@@ -27,6 +27,14 @@ look for hub tasks or `mcp__agent-hub__*` tools.
   via `catalog.publish`; metrics at `/internal/metrics` (`outbox_*`).
 - **Redis pub/sub** (`dcore:topic:pipeline.events.*`) feeds the realtime gateway
   (realtime-examples `src/pipeline-relay.ts`; formerly websocket-gateway).
+- **Runtime profile gates readiness** (`src/lib/runtime-profile.ts`).
+  `PLATFORM_RUNTIME_PROFILE=durable` validates provider declarations before
+  startup (exit 2 with reasons: `MESSAGE_QUEUE_URL`, `REDIS_ENDPOINT`,
+  `PLATFORM_DATASTORE` when `DYNAMODB_ENDPOINT` is set, persisted pipeline runs)
+  and makes outbox, catalog, durable consumers, pipelines, scheduler and
+  work-graph mandatory `feature:*` checks on `/health`. The default
+  `local-ephemeral` profile only reports failures as degraded. `managed-nosql-store`
+  declares no transaction capability until it passes the contract suite.
 - **Shared SFU circuit breaker**: every outbound LVS call goes through
   `callSfu` in `src/lib/sfu-breaker.ts`, one process-wide state.
 - **Lobby admission asks the OrgIQ BFF** when `LOBBY_AUTHORITY_REQUIRED=true`
