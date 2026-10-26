@@ -2,6 +2,7 @@ import type { EventEnvelope } from '@connorhoehn/event-catalog';
 import {
   isWithinWorkGraphEventLimit,
   validateAuthenticatedWorkEvent,
+  workGraphLifecycleDeclarations,
   workGraphProducersFor,
   type AuthenticatedWorkEvent,
   type WorkSourceKind,
@@ -57,8 +58,30 @@ interface DurableTransport {
   subscribe(
     queueName: string,
     handler: (envelope: EventEnvelope<unknown>) => Promise<void>,
-    options?: { pollingInterval?: number; batchSize?: number; visibilityTimeout?: number },
-  ): () => void;
+    options?: {
+      pollingInterval?: number;
+      batchSize?: number;
+      visibilityTimeout?: number;
+      queueOptions?: { retention?: number; fifo?: boolean; dlqAfterAttempts?: number };
+    },
+  ): (() => void) & { done?: Promise<void> };
+}
+
+/**
+ * The policy every lifecycle declaration gives the shared queue. The consumer
+ * must ensure the queue with exactly this policy: subscribing without it let
+ * whichever side ran first create the queue, and a consumer-created queue (4-day
+ * default retention, no DLQ) then refused the producers' declared policy as a
+ * configuration conflict, so nothing was ever published.
+ */
+export function workGraphProjectionQueuePolicy(): { retention?: number; dlqAfterAttempts?: number } {
+  const policies = workGraphLifecycleDeclarations
+    .filter((declaration) => declaration.queue === WORK_GRAPH_PROJECTION_QUEUE)
+    .map((declaration) => JSON.stringify({ retention: declaration.retention, dlqAfterAttempts: declaration.dlqAfterAttempts }));
+  if (!policies.length || new Set(policies).size !== 1) {
+    throw new Error(`work-graph lifecycle declarations disagree on the ${WORK_GRAPH_PROJECTION_QUEUE} policy`);
+  }
+  return JSON.parse(policies[0]);
 }
 
 interface ProjectionRepository {
@@ -268,13 +291,19 @@ export function startWorkGraphConsumer(options: {
         options.ownership,
       );
     },
-    { pollingInterval: options.pollingInterval ?? 1_000, batchSize: 10, visibilityTimeout: 30 },
+    {
+      pollingInterval: options.pollingInterval ?? 1_000,
+      batchSize: 10,
+      visibilityTimeout: 30,
+      queueOptions: workGraphProjectionQueuePolicy(),
+    },
   );
 
   log.info({ queue: WORK_GRAPH_PROJECTION_QUEUE }, 'work-graph durable consumer started');
   return {
     async stop() {
       cancel();
+      await cancel.done;
     },
   };
 }

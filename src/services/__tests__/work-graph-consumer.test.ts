@@ -64,7 +64,12 @@ describe('work-graph durable consumer', () => {
     expect(h.transport.subscribe).toHaveBeenCalledWith(
       WORK_GRAPH_PROJECTION_QUEUE,
       expect.any(Function),
-      { pollingInterval: 1_000, batchSize: 10, visibilityTimeout: 30 },
+      {
+        pollingInterval: 1_000, batchSize: 10, visibilityTimeout: 30,
+        // The producers' declared policy, so neither side can create the shared
+        // queue with a policy the other refuses as a conflict.
+        queueOptions: { retention: 30 * 24 * 60 * 60, dlqAfterAttempts: 5 },
+      },
     );
     await h.run(envelope());
     expect(h.accountResolver.resolve).toHaveBeenCalledWith(
