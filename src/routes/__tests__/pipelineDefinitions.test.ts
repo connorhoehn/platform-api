@@ -26,6 +26,15 @@ jest.mock('../../pipeline/definitions-cache', () => ({
   },
 }));
 
+// These background effects are outside this CRUD fixture. Leaving the real
+// audit client running lets SDK imports occur after Jest tears the file down.
+jest.mock('../../pipeline/audit-repository', () => ({
+  auditRepo: { record: jest.fn().mockResolvedValue(undefined) },
+}));
+jest.mock('../../pipeline/definitions-invalidator', () => ({
+  publishInvalidate: jest.fn().mockResolvedValue(undefined),
+}));
+
 jest.mock('../../lib/logger', () => ({
   withContext: () => ({
     info: jest.fn(),

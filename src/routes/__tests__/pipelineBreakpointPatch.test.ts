@@ -22,6 +22,12 @@ jest.mock('../../pipeline/runAccess', () => {
 
 import express, { type NextFunction, type Request, type Response } from 'express';
 
+// Route behavior is isolated from the background audit database writer.
+// Real SDK requests can outlive this file's Jest environment.
+jest.mock('../../pipeline/audit-repository', () => ({
+  auditRepo: { record: jest.fn().mockResolvedValue(undefined) },
+}));
+
 jest.mock('../../lib/redis-client', () => ({
   getRedisClient: async () => null,
 }));

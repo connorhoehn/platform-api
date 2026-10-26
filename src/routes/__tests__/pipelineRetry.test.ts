@@ -52,6 +52,12 @@ jest.mock('../../lib/ddb-client', () => ({
   getDynamoClient: jest.fn().mockReturnValue({}),
 }));
 
+// Route behavior is isolated from the background audit database writer.
+// Real SDK requests can outlive this file's Jest environment.
+jest.mock('../../pipeline/audit-repository', () => ({
+  auditRepo: { record: jest.fn().mockResolvedValue(undefined) },
+}));
+
 jest.mock('../../lib/redis-client', () => ({
   getRedisClient: async () => null,
 }));
