@@ -8,7 +8,11 @@ import type { AuthorizedWorkGraph, ViewerWorkEdge, ViewerWorkNode } from './poli
  * updates use the delta stream rather than invalidating its authorization.
  *
  * Shape: `wa2.<base>.<set>`.
- *  - `base` hashes the grant/membership revision and every source's health.
+ *  - `base` hashes the grant/membership revision and every source that is
+ *    not `available`. A healthy source and an absent one read the same: an
+ *    empty day lists no sources, and its first activity adds one, which is an
+ *    addition the set below accounts for, not a permission change. A source
+ *    whose authorization is unavailable still moves the base (fails closed).
  *  - `set` is the SUM (mod 2^256) of one SHA-256 digest per disclosed node and
  *    edge — (kind, id, disclosure, capabilities). Any permission change, any
  *    removal and any addition still changes it, exactly as the old single hash
@@ -38,7 +42,8 @@ function baseDigest(
 ): string {
   return createHash('sha256').update(JSON.stringify({
     policyRevision,
-    sources: sources.map(({ source, health }) => [source, health])
+    sources: sources.filter(({ health }) => health !== 'available')
+      .map(({ source, health }) => [source, health])
       .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
   })).digest('hex').slice(0, 32);
 }

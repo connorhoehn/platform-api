@@ -34,6 +34,13 @@ describe('effective work graph authorization revision', () => {
     expect(revision(next)).not.toBe(revision());
   });
 
+  it('reads an absent source like an available one, but not like an unavailable one', () => {
+    const empty = { nodes: [], edges: [], sources: [] };
+    expect(revision({ ...empty, sources: graph.sources })).toBe(revision(empty));
+    expect(revision({ ...empty, sources: [{ ...graph.sources[0], health: 'authorization-unavailable' as const }] }))
+      .not.toBe(revision(empty));
+  });
+
   it('still includes grant and membership revisions', () => {
     expect(workGraphAuthorizationRevision('revoked-membership', graph)).not.toBe(revision());
   });
@@ -50,6 +57,13 @@ describe('advancing a stream past created entities (NFR #22)', () => {
 
   it('a difference made only of created entities is explained by their digests', () => {
     expect(revisionExplainedByAdditions(revision(), revision(withAdded), [authorizationEntityDigest('node', added)])).toBe(true);
+  });
+
+  it("a day's first activity, from a source the empty day did not list, is an addition", () => {
+    const empty = revision({ nodes: [], edges: [], sources: [] });
+    expect(revisionExplainedByAdditions(empty, revision(), [authorizationEntityDigest('node', node)])).toBe(true);
+    // Activity the viewer cannot see moves nothing at all.
+    expect(revisionExplainedByAdditions(empty, revision({ ...graph, nodes: [] }), [])).toBe(true);
   });
 
   it('an unchanged revision needs no explanation', () => {
