@@ -1,8 +1,8 @@
 // social-api/src/pipeline/config/__tests__/pipelineModule.test.ts
 //
 // Tests for buildPipelineModuleConfig: required field assembly, optional
-// field inclusion (walFilePath, eventBus* fields), and the onBeforeAction
-// hook passthrough.
+// field inclusion (walFilePath, eventBus* fields), and the action
+// idempotency store.
 
 import { describe, it, expect, jest } from '@jest/globals';
 import { buildPipelineModuleConfig } from '../pipelineModule';
@@ -58,9 +58,9 @@ describe('buildPipelineModuleConfig — required fields', () => {
     expect(config.metrics).toBe(mockMetricsRegistry);
   });
 
-  it('attaches onBeforeAction hook', () => {
+  it('attaches the action idempotency store', () => {
     const config = buildPipelineModuleConfig(BASE_ARGS);
-    expect(typeof config.onBeforeAction).toBe('function');
+    expect(typeof config.actionDedupStore?.putIfAbsent).toBe('function');
   });
 });
 

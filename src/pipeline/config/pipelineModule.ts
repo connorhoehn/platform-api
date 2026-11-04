@@ -22,18 +22,8 @@ import type {
   BusEvent,
   EventBusCompactionOptions,
 } from 'distributed-core';
-import type { LLMClient } from 'distributed-core/applications/pipeline';
+import type { DedupStore, LLMClient } from 'distributed-core/applications/pipeline';
 import { InMemoryDedupStore } from 'distributed-core/messaging-queue';
-
-/**
- * Inlined replacement for distributed-core's previously-exported
- * `OnBeforeActionHook` type — the type was dropped from the public
- * surface in v0.15-v0.17 narrowing. The shape matches what
- * PipelineModuleConstructorConfig.onBeforeAction still expects
- * structurally; if upstream changes the signature, this declaration
- * needs to follow.
- */
-type OnBeforeActionHook = (ctx: { idempotencyKey: string }) => Promise<'proceed' | 'skip'>;
 
 // PipelineModule's config interface lives in the applications/pipeline
 // barrel; the gateway reaches it through the top-level `distributed-core`
@@ -84,8 +74,13 @@ export interface PipelineModuleConstructorConfig {
    * be set independently. (distributed-core v0.7.2+.)
    */
   eventBusMetrics?: MetricsRegistry;
-  /** T2 idempotency hook — see distributed-core `PipelineModuleConfig.onBeforeAction`. */
-  onBeforeAction?: OnBeforeActionHook;
+  /**
+   * Idempotency store for `action` steps with an `idempotencyMode`
+   * (distributed-core 0.50 `PipelineModuleConfig.actionDedupStore`), forwarded
+   * to fresh, resumed and re-run executors. Replaces the `onBeforeAction`
+   * hook, which nothing upstream ever read.
+   */
+  actionDedupStore?: DedupStore;
   /**
    * Wave A (2026-08-25): base URL for action-API calls. When set, action
    * nodes (post-comment / update-document / create-section-item / notify)
@@ -150,29 +145,21 @@ export interface BuildPipelineModuleConfigArgs {
  * process get distinct identities (matches the same convention used for the
  * cluster topic in `config/cluster.ts`).
  */
-// 24-hour dedup window — long enough to cover all retry backoffs for any run.
-// Per-step keys live in the window even across process restarts once Redis is
-// wired; the in-memory store resets on restart, which is acceptable for now
-// (worst case: a retry fires a second side-effect after a crash-restart).
-const ACTION_DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-// Module-level singleton so the same store survives across multiple bootstrap
-// calls in the same process (test helpers can reconstruct the whole bootstrap
-// multiple times). In production there is exactly one bootstrap per process.
+// Module-level singleton so one store serves every executor in the process —
+// a run resumed (or re-run from a step) on a fresh executor sees the action
+// keys its earlier executor reserved, the same as a live re-run does. Keys are
+// run-scoped (`{runId}:{nodeId}[:{attempt}]`), so sharing never dedups across
+// runs. It is in memory, so it resets on restart: the executor's store is
+// synchronous, and platform-api has no synchronous durable store to offer.
 let actionDedupStore: InMemoryDedupStore | null = null;
 
-function getActionDedupStore(): InMemoryDedupStore {
+/** The process-wide action idempotency store (exported for tests). */
+export function getActionDedupStore(): InMemoryDedupStore {
   if (!actionDedupStore) {
     actionDedupStore = new InMemoryDedupStore();
   }
   return actionDedupStore;
 }
-
-export const onBeforeActionHook: OnBeforeActionHook = async (ctx) => {
-  const store = getActionDedupStore();
-  const result = store.putIfAbsent(ctx.idempotencyKey, ctx.idempotencyKey, ACTION_DEDUP_WINDOW_MS);
-  return result.reserved ? 'proceed' : 'skip';
-};
 
 export function buildPipelineModuleConfig(
   args: BuildPipelineModuleConfigArgs,
@@ -185,7 +172,7 @@ export function buildPipelineModuleConfig(
     configuration: {},
     llmClient:     args.llmClient,
     metrics:       args.metricsRegistry,
-    onBeforeAction: onBeforeActionHook,
+    actionDedupStore: getActionDedupStore(),
   };
   if (args.walFilePath) {
     config.walFilePath = args.walFilePath;
