@@ -28,7 +28,7 @@ import type { EventBus } from 'distributed-core';
 import { retryWithBackoff } from 'distributed-core';
 import type { PipelineEventMap, RunRejection } from 'distributed-core/applications/pipeline';
 import {
-  PipelineRunRepository,
+  type RunRecordRepository,
   type PersistedCheckpoint,
   type PipelineRunItem,
   type RunItemStatus,
@@ -104,7 +104,7 @@ export interface RunPersistenceOptions {
   /** EventBus instance to subscribe to. */
   eventBus: EventBus<PipelineEventMap>;
   /** Repository for persisting run state. */
-  repository: PipelineRunRepository;
+  repository: RunRecordRepository;
   /** TTL in seconds for completed runs (default: 90 days). */
   ttlSeconds?: number;
   /** Maximum size of step output to persist (default: 100KB). */
@@ -238,7 +238,7 @@ function creditsFromSummary(summary: Record<string, unknown> | undefined): Recor
 
 export class RunPersistenceService {
   private readonly eventBus: EventBus<PipelineEventMap>;
-  private readonly repository: PipelineRunRepository;
+  private readonly repository: RunRecordRepository;
   private readonly ttlSeconds: number;
   private readonly maxStepOutputBytes: number;
   private readonly runCache = new Map<string, RunState>();

@@ -19,7 +19,7 @@
 //     pipeline:run:cancelled is published. The interrupted state is purely a
 //     marker so the UI can render appropriately.
 
-import type { PipelineRunRepository, PipelineRunItem } from '../repositories/PipelineRunRepository';
+import type { RunRecordRepository, PipelineRunItem } from '../repositories/PipelineRunRepository';
 import { withContext } from '../lib/logger';
 import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import { getRunRollupSubscriber, type RunRollupSubscriber } from './run-rollup-subscriber';
@@ -36,7 +36,7 @@ export interface ScanOrphanedRunsOptions {
    * instead of `interrupted`, so the resume scan never re-runs it.
    */
   terminalEvidence?: TerminalEvidenceCheck;
-  repository: PipelineRunRepository;
+  repository: RunRecordRepository;
   /** Only transition runs whose `startedAt` is within this window. Default: 4h. */
   resumeWindowMs?: number;
   /** Override `now` for tests. */

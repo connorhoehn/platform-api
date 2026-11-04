@@ -15,7 +15,7 @@
 //   PIPELINE_STUCK_CHECK_INTERVAL_MS  — how often the scan runs (default 60s)
 //   PIPELINE_STUCK_THRESHOLD_MS       — silence window before a run is stuck (default 5 min)
 
-import type { PipelineRunRepository } from '../repositories/PipelineRunRepository';
+import type { RunRecordRepository } from '../repositories/PipelineRunRepository';
 import type { RunPersistenceService } from './runPersistence';
 import { withContext } from '../lib/logger';
 import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
@@ -25,7 +25,7 @@ const log = withContext({ service: 'StuckRunDetector' });
 
 export interface StuckRunDetectorOptions {
   runPersistence: RunPersistenceService;
-  repository: PipelineRunRepository;
+  repository: RunRecordRepository;
   checkIntervalMs?: number;
   stuckThresholdMs?: number;
   /** Override `Date.now()` for tests. */

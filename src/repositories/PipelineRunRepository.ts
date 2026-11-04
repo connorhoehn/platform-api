@@ -364,7 +364,27 @@ export function isSupersededBy(row: Pick<PipelineRunItem, 'completedAt'>, item: 
   return typeof row.completedAt === 'string' && row.completedAt > item.lastEventAt;
 }
 
-export class PipelineRunRepository extends BaseRepository {
+/**
+ * The run-table operations the pipeline lifecycle needs — run persistence
+ * (`put`, `putOwned`), the orphan sweep and boot resume (`listByStatus`,
+ * `claimForResume`), the stuck-run detector and resume-from-step (`get`).
+ * `PipelineRunRepository` is the DynamoDB implementation; consumers are typed
+ * against this so another store (or a test double) can stand in, and so
+ * pipeline-runtime's `/durable` pieces can be adapted onto it in one place.
+ */
+export interface RunRecordRepository {
+  /** Upsert a run row (a later terminal write wins over an older progress write). */
+  put(item: PipelineRunItem): Promise<void>;
+  /** `put`, only by the node that owns the run; see the implementation for the outcomes. */
+  putOwned(item: PipelineRunItem, ownerNodeId: string): Promise<boolean | 'superseded'>;
+  get(pipelineId: string, runId: string): Promise<PipelineRunItem | null>;
+  /** Rows in `status`, most recently started first (at most 200). */
+  listByStatus(status: string, opts?: { limit?: number }): Promise<PipelineRunItem[]>;
+  /** Conditional `interrupted` → `running` claim for resume; `null` when another process won. */
+  claimForResume(pipelineId: string, runId: string, nodeId: string, at?: string): Promise<PipelineRunItem | null>;
+}
+
+export class PipelineRunRepository extends BaseRepository implements RunRecordRepository {
   constructor(docClient: DynamoDBDocumentClient) {
     super(tableName('pipeline-runs'), docClient);
   }

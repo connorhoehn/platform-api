@@ -28,7 +28,7 @@
 import type { PipelineModule, PipelineResumeState } from 'distributed-core/applications/pipeline';
 import type { PipelineDefinition } from 'distributed-core/applications/pipeline';
 import type {
-  PipelineRunRepository,
+  RunRecordRepository,
   PipelineRunItem,
 } from '../repositories/PipelineRunRepository';
 import type { RunPersistenceService } from './runPersistence';
@@ -39,7 +39,7 @@ import { finalizedRow, type TerminalEvidenceCheck } from './runTerminalEvidence'
 const log = withContext({ service: 'resumeInterruptedRuns' });
 
 export interface ResumeInterruptedRunsOptions {
-  repository: PipelineRunRepository;
+  repository: RunRecordRepository;
   module: PipelineModule;
   runPersistence: RunPersistenceService | null;
   /** Fallback definition source when the row has no definitionSnapshot. */
