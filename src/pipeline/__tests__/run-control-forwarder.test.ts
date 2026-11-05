@@ -9,6 +9,7 @@ import { RunControlForwarder, RUN_CONTROLS_TOPIC, type ClusterPubSubLike } from 
 import { RunRollupSubscriber } from '../run-rollup-subscriber';
 import { RollupVersionConflict } from '../../repositories/PipelineRunRollupRepository';
 import type { PipelineRunRollup, RollupRunControl } from '../run-rollup';
+import { MemoryClaimStore, type ClaimStore } from '../../deck/deckReviseRequests';
 
 jest.mock('../../lib/logger', () => ({
   withContext: () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }),
@@ -72,6 +73,8 @@ class StubRuns {
   breakpoints: Array<{ runId: string; stepId: string; action: string }> = [];
   resumed: Array<{ runId: string; fromNodeId: string; options?: unknown }> = [];
   failResume = false;
+  /** When set, a re-run does not return until the test resolves it (a long re-run, or one parked at an approval). */
+  gate: Promise<void> | null = null;
   hold(runId: string, status = 'running'): void { this.runs.set(runId, { status }); }
   getRun(runId: string) { return this.runs.get(runId) ?? null; }
   cancelRun(runId: string): void {
@@ -88,13 +91,14 @@ class StubRuns {
     if (this.failResume) throw new Error('InvalidRunStateError: not resumable');
     this.resumed.push({ runId, fromNodeId, options });
     this.runs.set(runId, { status: 'running' });
+    if (this.gate) await this.gate;
     return { runId };
   }
 }
 
 const t = (s: number) => `2026-09-23T17:00:${String(s).padStart(2, '0')}.000Z`;
 
-function replica(nodeId: string, table: SharedTable, pubsub: SharedPubSub) {
+function replica(nodeId: string, table: SharedTable, pubsub: SharedPubSub, claims?: ClaimStore) {
   const bus = new StubBus();
   const rollup = new RunRollupSubscriber({
     eventBus: bus as unknown as EventBus<PipelineEventMap>,
@@ -103,7 +107,7 @@ function replica(nodeId: string, table: SharedTable, pubsub: SharedPubSub) {
   });
   rollup.start();
   const runs = new StubRuns();
-  const forwarder = new RunControlForwarder({ nodeId, pubsub, runs, eventBus: bus as unknown as EventBus<PipelineEventMap>, rollup, repo: table });
+  const forwarder = new RunControlForwarder({ nodeId, pubsub, runs, eventBus: bus as unknown as EventBus<PipelineEventMap>, rollup, repo: table, claims });
   forwarder.start();
   const settle = async () => { await rollup.idle(); await forwarder.idle(); await rollup.idle(); };
   return { bus, rollup, runs, forwarder, settle };
@@ -263,6 +267,71 @@ describe('RunControlForwarder — two replicas on one bus', () => {
     await B.forwarder.release('deck-revise', 'r1', 's3');
     await B.settle();
     expect(((await table.get('deck-revise'))?.controls ?? []).map((c) => c.controlId)).toEqual(['s2']);
+  });
+
+  it('a re-run slower than the route\'s wait: the holder acks `accepted` before it finishes and holds the claim, so the sender cannot run it too', async () => {
+    const table = new SharedTable();
+    const pubsub = new SharedPubSub();
+    const claims = new MemoryClaimStore();
+    const A = replica('node-a', table, pubsub, claims);
+    const B = replica('node-b', table, pubsub, claims);
+    await A.bus.emit('pipeline:run:started', { runId: 'r1', pipelineId: 'deck-revise', startedAt: t(1) }, 'e1');
+    await A.settle();
+    A.runs.hold('r1', 'failed');
+    let finish!: () => void;
+    A.runs.gate = new Promise<void>((r) => { finish = r; });
+
+    const resume = { kind: 'resume-from-step' as const, controlId: 's1', pipelineId: 'deck-revise', runId: 'r1', userId: 'alice', at: t(11), fromNodeId: 'write' };
+    const outcome = await B.forwarder.forward(resume, { awaitAppliedMs: 300 });
+    expect(outcome.applied).toBeNull();
+    expect(outcome.accepted).toMatchObject({ type: 'accepted', controlId: 's1', runId: 'r1', nodeId: 'node-a' });
+    // Still running on A: nothing acknowledged as applied yet, and the claim is A's.
+    const types = () => pubsub.published.map((m) => (m as { type: string }).type);
+    expect(types()).toEqual(['control', 'accepted']);
+    expect(await B.forwarder.claimRerun('r1', 's1')).toEqual({ won: false, holder: 'pending' });
+
+    finish();
+    await A.settle(); await B.settle();
+    expect(types()).toEqual(['control', 'accepted', 'applied']);
+    expect(A.runs.resumed).toHaveLength(1);
+    expect(B.runs.resumed).toHaveLength(0);
+    expect(await claims.get('rerun:r1:s1')).toBe('node-a');
+  });
+
+  it('the sender claimed the re-run first (its wait timed out): the holder skips it and acks applied:false, duplicate', async () => {
+    const table = new SharedTable();
+    const pubsub = new SharedPubSub();
+    const claims = new MemoryClaimStore();
+    const A = replica('node-a', table, pubsub, claims);
+    const B = replica('node-b', table, pubsub, claims);
+    await A.bus.emit('pipeline:run:started', { runId: 'r1', pipelineId: 'deck-revise', startedAt: t(1) }, 'e1');
+    await A.settle();
+    A.runs.hold('r1', 'failed');
+    expect((await B.forwarder.claimRerun('r1', 's1')).won).toBe(true);
+
+    const outcome = await B.forwarder.forward({ kind: 'resume-from-step', controlId: 's1', pipelineId: 'deck-revise', runId: 'r1', userId: 'alice', at: t(11), fromNodeId: 'write' }, { awaitAppliedMs: 300 });
+    await A.settle(); await B.settle();
+    expect(A.runs.resumed).toHaveLength(0);
+    expect(outcome.applied).toMatchObject({ ok: true, applied: false, duplicate: true, nodeId: 'node-a' });
+    expect(A.forwarder.stats.claimLost).toBe(1);
+  });
+
+  it('a refused re-run frees its claim so a retry with the same controlId can run', async () => {
+    const table = new SharedTable();
+    const pubsub = new SharedPubSub();
+    const claims = new MemoryClaimStore();
+    const A = replica('node-a', table, pubsub, claims);
+    const B = replica('node-b', table, pubsub, claims);
+    await A.bus.emit('pipeline:run:started', { runId: 'r1', pipelineId: 'deck-revise', startedAt: t(1) }, 'e1');
+    await A.settle();
+    A.runs.hold('r1', 'failed');
+    A.runs.failResume = true;
+    const resume = { kind: 'resume-from-step' as const, controlId: 's1', pipelineId: 'deck-revise', runId: 'r1', userId: 'alice', at: t(11), fromNodeId: 'write' };
+    const refused = await B.forwarder.forward(resume, { awaitAppliedMs: 300 });
+    await A.settle(); await B.settle();
+    expect(refused.applied).toMatchObject({ ok: false });
+    expect(refused.accepted).toBeNull();
+    expect(await claims.get('rerun:r1:s1')).toBeNull();
   });
 
   it('a run that already ended takes no control, a failed publish still leaves the row as the record, and a malformed message is dropped', async () => {

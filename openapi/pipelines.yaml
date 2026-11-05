@@ -723,7 +723,13 @@ paths:
                   description: Optional breakpoint list for the resumed dispatch loop.
       responses:
         '202':
-          description: Resume accepted
+          description: |
+            Resume accepted. When another replica holds the run the body is the
+            forwarded-control shape instead (`controlId`, `forwarded: true`,
+            `applied`, `appliedBy`, and `acceptedBy` when that replica accepted
+            the re-run and is still running it — `applied` is then false). A
+            forwarded re-run executes on exactly one replica: the route rewinds
+            it locally only after taking its one-time claim.
           content:
             application/json:
               schema:

@@ -87,6 +87,7 @@ import { startRunRowCacheInvalidation } from '../work-graph/sources/runRowCache'
 import { startCommentAgentResolver } from '../documents/commentAgentResolver';
 import { startApprovalForwarder } from './approval-forwarder';
 import { startRunControlForwarder } from './run-control-forwarder';
+import { DynamoClaimStore } from '../deck/deckReviseRequests';
 import { auditRepo } from './audit-repository';
 import { setupFailureDetectorBridge } from './config/failureDetectorBridge';
 import {
@@ -1495,7 +1496,13 @@ export async function bootstrapPipeline(opts: BootstrapOptions = {}): Promise<Pi
   const approvalForwarder = startApprovalForwarder({ nodeId, pubsub, runs: module, eventBus, rollup: runRollupSubscriber });
   // NFR #120: cancel, breakpoint resolve and resume-from-step reach the replica
   // that holds the run the same way (topic `pipeline.controls`, `controls` on the row).
-  const runControlForwarder = startRunControlForwarder({ nodeId, pubsub, runs: module, eventBus, rollup: runRollupSubscriber });
+  // A resume-from-step is also claimed once cluster-wide before it runs
+  // (`rerun:<runId>:<controlId>` in idempotency-claims), so a slow holder and
+  // a timed-out forwarding route never both execute it.
+  const runControlForwarder = startRunControlForwarder({
+    nodeId, pubsub, runs: module, eventBus, rollup: runRollupSubscriber,
+    claims: new DynamoClaimStore(undefined, undefined, ddbTableName('idempotency-claims')),
+  });
 
   // ── Judge aggregator subscriber ───────────────────────────────────────
   //

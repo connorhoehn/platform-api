@@ -24,6 +24,17 @@ messages remain the detailed record.
 - **Action idempotency is real now.** The `onBeforeAction` hook was never read
   upstream; every executor now shares one process-wide `actionDedupStore`
   (still in memory, so a restart forgets it).
+- **A forwarded resume-from-step runs once.** The replica holding the run now
+  publishes `accepted` on `pipeline.controls` before the re-run starts (it used
+  to ack only at the terminal snapshot, so a re-run over the route's 5 s wait,
+  or one parked at an approval or breakpoint, was also rewound on the receiving
+  replica and action steps fired twice). The route answers 202
+  `{applied:false, acceptedBy}` on `accepted`. Both sides take a one-time claim
+  `rerun:<runId>:<controlId>` in `idempotency-claims` (TTL 7 days, past any
+  plausible re-run) before executing: the route falls back locally only when it
+  wins, else 202; claims table down → 503. Still open: two *different*
+  controlIds for one run while its owner is dead both fall back (needs a
+  run-level claim).
 
 ## 2026-10-14 — upstream refinement (lane P1)
 

@@ -33,10 +33,19 @@
 //
 // Idempotency: (runId, controlId). The row refuses a duplicate controlId; the
 // applier remembers the ids it applied.
+//
+// A resume-from-step re-runs steps, so it is also claimed once cluster-wide
+// (`rerun:${runId}:${controlId}` in the shared claims table) by whichever
+// replica executes it: the holder claims before it runs and publishes an
+// `accepted` message at once (the re-run itself can take minutes or park at
+// an approval), and the route that forwarded it takes the same claim before
+// it falls back to rewinding the run locally. Losing the claim means another
+// replica runs it. Two different controlIds for one run are not covered here.
 
 import type { EventBus } from 'distributed-core';
 import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import { withContext } from '../lib/logger';
+import type { ClaimStore } from '../deck/deckReviseRequests';
 import { pipelineRunRollupRepo, type PipelineRunRollupRepository } from '../repositories/PipelineRunRollupRepository';
 import { controlsFor, isTerminalRollupStatus, normalizeRunStatus, type RollupRunControl, type RollupRunStatus } from './run-rollup';
 import type { RunRollupSubscriber } from './run-rollup-subscriber';
@@ -49,6 +58,14 @@ export const RUN_CONTROLS_TOPIC = 'pipeline.controls';
 const MAX_SEEN_CONTROLS = 5000;
 /** How long a forwarding route waits for the holder's acknowledgement by default. */
 export const DEFAULT_AWAIT_APPLIED_MS = 1500;
+/**
+ * How long a re-run claim lives. Never released: it outlives the re-run, so
+ * it must exceed the longest plausible one, approval and breakpoint parking
+ * included. Seven days, the same as the review-apply and comment-agent claims.
+ */
+export const RERUN_CLAIM_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+export function rerunClaimKey(runId: string, controlId: string): string { return `rerun:${runId}:${controlId}`; }
 
 export type RunControlKind = RollupRunControl['kind'];
 
@@ -71,9 +88,20 @@ export interface RunControlAppliedMessage {
   nodeId: string;
   ok: boolean;
   error?: string;
-  /** The holder had already applied this controlId (a retry). */
+  /** The holder had already applied this controlId (a retry), or another replica claimed it. */
   duplicate?: boolean;
+  /** false: this replica did not run it (another replica holds the re-run claim). */
+  applied?: boolean;
   at: string;
+}
+
+/** A resume-from-step the holder took and is now running (sent before the re-run finishes). */
+export interface RunControlAcceptedMessage {
+  v: 1;
+  type: 'accepted';
+  controlId: string;
+  runId: string;
+  nodeId: string;
 }
 
 /** The cluster pubsub, as far as this module needs it (`Cluster.pubsub`). */
@@ -102,6 +130,8 @@ export interface RunControlForwarderOptions {
   repo?: Pick<PipelineRunRollupRepository, 'get'>;
   /** Resolves a run's pipeline when the subscriber cannot. */
   lookupPipelineId?: (runId: string) => Promise<string | null>;
+  /** The shared one-time claims for re-runs; null/absent: no claim (single replica, tests). */
+  claims?: ClaimStore | null;
 }
 
 export interface ForwardOutcome {
@@ -110,6 +140,8 @@ export interface ForwardOutcome {
   applied: RunControlAppliedMessage | null;
   /** Milliseconds from publish to acknowledgement (when one arrived). */
   appliedInMs: number | null;
+  /** A resume-from-step the holder accepted and is still running, or null. */
+  accepted: RunControlAcceptedMessage | null;
   /** Whether the row holds the control (false: the wire alone carried it). */
   recorded: boolean;
 }
@@ -127,13 +159,14 @@ export class RunControlForwarder {
   private readonly repo: Pick<PipelineRunRollupRepository, 'get'>;
   private readonly lookup: (runId: string) => Promise<string | null>;
   private readonly seen = new Set<string>();
-  private readonly waiters = new Map<string, (ack: RunControlAppliedMessage) => void>();
+  private readonly claims: ClaimStore | null;
+  private readonly waiters = new Map<string, (ack: RunControlAppliedMessage | RunControlAcceptedMessage) => void>();
   private pubsubSubscriptionId: string | null = null;
   private busSubscriptionIds: string[] = [];
   private inFlight: Promise<void>[] = [];
   private active = false;
   /** Counters a test or a health line can read. */
-  readonly stats = { forwarded: 0, received: 0, applied: 0, acked: 0, duplicates: 0, notHere: 0, pickedUp: 0, released: 0, errors: 0 };
+  readonly stats = { forwarded: 0, received: 0, applied: 0, acked: 0, accepted: 0, claimLost: 0, duplicates: 0, notHere: 0, pickedUp: 0, released: 0, errors: 0 };
 
   constructor(options: RunControlForwarderOptions) {
     this.nodeId = options.nodeId;
@@ -143,6 +176,23 @@ export class RunControlForwarder {
     this.rollup = options.rollup;
     this.repo = options.repo ?? pipelineRunRollupRepo;
     this.lookup = options.lookupPipelineId ?? (async (runId) => this.rollup?.resolvePipelineId(runId) ?? null);
+    this.claims = options.claims ?? null;
+  }
+
+  /**
+   * Take the one-time claim to execute this re-run. True when this replica
+   * may run it (also when no claim store is configured); `holder` names the
+   * replica that holds it otherwise. Throws when the claims table cannot be
+   * reached.
+   */
+  async claimRerun(runId: string, controlId: string): Promise<{ won: boolean; holder: string | null }> {
+    if (!this.claims) return { won: true, holder: this.nodeId };
+    const key = rerunClaimKey(runId, controlId);
+    // 'pending' until the holder's re-run returns (then its nodeId): the
+    // store's release() only drops a pending claim, and only the replica that
+    // created one ever releases it.
+    if (await this.claims.create(key, 'pending', RERUN_CLAIM_TTL_SECONDS)) return { won: true, holder: this.nodeId };
+    return { won: false, holder: await this.claims.get(key).catch(() => null) };
   }
 
   /** Idempotent. */
@@ -237,10 +287,12 @@ export class RunControlForwarder {
       log.warn({ runId: control.runId, controlId: control.controlId, kind: control.kind, err: String(err) }, 'control recorded on the row but not published; the holder applies it when the run is next resumed');
     }
     this.stats.forwarded += 1;
-    const applied = await ack;
+    const reply = await ack;
+    const applied = reply?.type === 'applied' ? reply : null;
+    const accepted = reply?.type === 'accepted' ? reply : null;
     const appliedInMs = applied ? Date.now() - publishedAt : null;
-    log.info({ runId: control.runId, controlId: control.controlId, kind: control.kind, recorded, applied: applied?.ok ?? null, appliedBy: applied?.nodeId ?? null, appliedInMs }, 'run control forwarded');
-    return { message, applied, appliedInMs, recorded };
+    log.info({ runId: control.runId, controlId: control.controlId, kind: control.kind, recorded, applied: applied?.ok ?? null, appliedBy: applied?.nodeId ?? null, acceptedBy: accepted?.nodeId ?? null, appliedInMs }, 'run control forwarded');
+    return { message, applied, appliedInMs, accepted, recorded };
   }
 
   /** Release a control this replica recorded but nobody will apply (resume-from-step with no holder). */
@@ -254,7 +306,8 @@ export class RunControlForwarder {
     }
   }
 
-  private awaitApplied(controlId: string, ms: number): Promise<RunControlAppliedMessage | null> {
+  /** Resolves on the holder's first reply for this control: `applied`, or (resume-from-step) `accepted`. */
+  private awaitApplied(controlId: string, ms: number): Promise<RunControlAppliedMessage | RunControlAcceptedMessage | null> {
     if (ms <= 0) return Promise.resolve(null);
     return new Promise((resolve) => {
       const timer = setTimeout(() => { this.waiters.delete(controlId); resolve(null); }, ms);
@@ -264,6 +317,12 @@ export class RunControlForwarder {
   }
 
   private async onMessage(payload: unknown): Promise<void> {
+    const accepted = asAccepted(payload);
+    if (accepted) {
+      this.stats.accepted += 1;
+      this.waiters.get(accepted.controlId)?.(accepted);
+      return;
+    }
     const ack = asApplied(payload);
     if (ack) {
       this.stats.acked += 1;
@@ -280,7 +339,8 @@ export class RunControlForwarder {
   /** Apply one control to the local executor, once per controlId; acknowledge and release it. */
   private async apply(control: RollupRunControl, pipelineId: string | null): Promise<boolean> {
     let error: string | undefined;
-    const duplicate = this.seen.has(control.controlId);
+    let duplicate = this.seen.has(control.controlId);
+    let claimLost = false;
     if (duplicate) {
       // A retry with the same Idempotency-Key is the same control: acknowledge
       // it as applied (the route answers the same 202) and clear its re-record.
@@ -293,11 +353,44 @@ export class RunControlForwarder {
       } else if (control.kind === 'breakpoint') {
         this.runs.resolveBreakpoint(control.runId, control.stepId, control.action);
       } else {
-        if (typeof this.runs.resumeFromStep !== 'function') throw new Error('resumeFromStep unavailable on this replica');
-        await this.runs.resumeFromStep(control.runId, control.fromNodeId, {
-          ...(control.breakpoints !== undefined ? { breakpoints: control.breakpoints } : {}),
-          ...(control.allowCompleted ? { allowCompleted: true } : {}),
+        const resumeFromStep = this.runs.resumeFromStep;
+        if (typeof resumeFromStep !== 'function') throw new Error('resumeFromStep unavailable on this replica');
+        // Claim before running: the forwarding route may have timed out and
+        // claimed it to run locally. A claims table that cannot be reached
+        // does not stop the holder (the route, unable to claim, does not run).
+        const claim = await this.claimRerun(control.runId, control.controlId).catch((err: unknown) => {
+          log.warn({ runId: control.runId, controlId: control.controlId, err: String(err) }, 're-run claim unavailable; the holder runs it unclaimed');
+          return { won: true, holder: null };
         });
+        if (!claim.won) {
+          claimLost = true;
+          duplicate = true;
+          this.stats.claimLost += 1;
+          log.info({ runId: control.runId, controlId: control.controlId, holder: claim.holder }, 'another replica claimed this re-run; not running it here');
+        } else {
+          const run = Promise.resolve().then(() => resumeFromStep.call(this.runs, control.runId, control.fromNodeId, {
+            ...(control.breakpoints !== undefined ? { breakpoints: control.breakpoints } : {}),
+            ...(control.allowCompleted ? { allowCompleted: true } : {}),
+          }));
+          try {
+            // Acknowledge on accept: the re-run returns only at its terminal
+            // snapshot. A refusal (state validation) rejects before the next
+            // macrotask, so it still reaches the route as `applied: ok=false`.
+            const settledEarly = await Promise.race([run.then(() => true, () => true), new Promise<false>((r) => setImmediate(() => r(false)))]);
+            if (!settledEarly) {
+              const accepted: RunControlAcceptedMessage = { v: 1, type: 'accepted', controlId: control.controlId, runId: control.runId, nodeId: this.nodeId };
+              try { await this.pubsub.publish(RUN_CONTROLS_TOPIC, accepted); } catch (err) {
+                log.warn({ runId: control.runId, controlId: control.controlId, err: String(err) }, 'run control acceptance not published');
+              }
+            }
+            await run;
+          } catch (err) {
+            // A refused re-run did not run: free the claim so a retry can.
+            await this.claims?.release(rerunClaimKey(control.runId, control.controlId)).catch(() => undefined);
+            throw err;
+          }
+          await this.claims?.commit(rerunClaimKey(control.runId, control.controlId), this.nodeId, RERUN_CLAIM_TTL_SECONDS).catch(() => undefined);
+        }
       }
     } catch (err) {
       this.stats.errors += 1;
@@ -309,7 +402,7 @@ export class RunControlForwarder {
       this.stats.applied += 1;
       log.info({ runId: control.runId, controlId: control.controlId, kind: control.kind }, 'forwarded run control applied');
     }
-    const ack: RunControlAppliedMessage = { v: 1, type: 'applied', controlId: control.controlId, runId: control.runId, kind: control.kind, nodeId: this.nodeId, ok: !error, ...(error ? { error } : {}), ...(duplicate ? { duplicate: true } : {}), at: new Date().toISOString() };
+    const ack: RunControlAppliedMessage = { v: 1, type: 'applied', controlId: control.controlId, runId: control.runId, kind: control.kind, nodeId: this.nodeId, ok: !error, ...(error ? { error } : {}), ...(duplicate ? { duplicate: true } : {}), ...(claimLost ? { applied: false } : {}), at: new Date().toISOString() };
     try { await this.pubsub.publish(RUN_CONTROLS_TOPIC, ack); } catch (err) {
       log.warn({ runId: control.runId, controlId: control.controlId, err: String(err) }, 'run control acknowledgement not published');
     }
@@ -368,6 +461,12 @@ function asApplied(payload: unknown): RunControlAppliedMessage | null {
   for (const key of ['controlId', 'runId', 'kind', 'nodeId', 'at']) if (typeof payload[key] !== 'string' || !payload[key]) return null;
   if (typeof payload.ok !== 'boolean') return null;
   return payload as unknown as RunControlAppliedMessage;
+}
+
+function asAccepted(payload: unknown): RunControlAcceptedMessage | null {
+  if (!isRecord(payload) || payload.v !== 1 || payload.type !== 'accepted') return null;
+  for (const key of ['controlId', 'runId', 'nodeId']) if (typeof payload[key] !== 'string' || !payload[key]) return null;
+  return payload as unknown as RunControlAcceptedMessage;
 }
 
 function asControl(payload: unknown): RunControlMessage | null {

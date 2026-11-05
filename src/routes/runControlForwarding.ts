@@ -99,31 +99,49 @@ export async function forwardRunControl(params: ForwardRunControlParams): Promis
     res.status(503).json({ error: 'run-control-forwarding-unavailable', kind, controlId, message: 'the control reached neither the rollup row nor the cluster pubsub; retry with the same Idempotency-Key' });
     return true;
   }
-  const applied = outcome.applied?.ok === true;
-  const appliedBy = outcome.applied?.nodeId ?? null;
+  const applied = outcome.applied?.ok === true && outcome.applied.applied !== false;
+  const appliedBy = applied ? outcome.applied?.nodeId ?? null : null;
+  // resume-from-step: the holder took it and is running it (or another replica
+  // claimed it). Either way it runs once, elsewhere: never fall back here.
+  const acceptedBy = outcome.accepted?.nodeId ?? (outcome.applied?.applied === false ? outcome.applied.nodeId : null);
   if (outcome.applied && !outcome.applied.ok) {
     // The holder had the run and refused: its reason is the answer.
-    reqLog.warn({ runId, kind, controlId, appliedBy, err: outcome.applied.error }, 'run control refused by the replica that holds the run');
-    res.status(409).json({ error: 'run-control-refused', kind, controlId, status, ownerNodeId: appliedBy, message: outcome.applied.error ?? 'the replica that holds the run refused the control' });
+    reqLog.warn({ runId, kind, controlId, appliedBy: outcome.applied.nodeId, err: outcome.applied.error }, 'run control refused by the replica that holds the run');
+    res.status(409).json({ error: 'run-control-refused', kind, controlId, status, ownerNodeId: outcome.applied.nodeId, message: outcome.applied.error ?? 'the replica that holds the run refused the control' });
     return true;
   }
-  if (!applied && kind === 'resume-from-step') {
+  if (!applied && !acceptedBy && kind === 'resume-from-step') {
     // Nobody has the failed run's executor (its replica is gone): only a new
     // run can take it from here. The row does not keep a control no one can apply.
     await forwarder.release(pipelineId, runId, controlId);
     if (params.fallBackLocally) {
-      reqLog.info({ runId, kind, controlId, ownerNodeId: item.ownerNodeId ?? null }, 'no replica holds the run; rewinding it here from its stored checkpoint');
-      return false;
+      // The holder may only be slow to answer: run here only with the claim.
+      let claim: { won: boolean; holder: string | null };
+      try {
+        claim = await forwarder.claimRerun(runId, controlId);
+      } catch (err) {
+        reqLog.error({ runId, kind, controlId, err: err instanceof Error ? err.message : String(err) }, 're-run claim unavailable; not rewinding locally');
+        res.status(503).json({ error: 'run-control-forwarding-unavailable', kind, controlId, message: 'the re-run claim could not be taken; retry with the same Idempotency-Key' });
+        return true;
+      }
+      if (claim.won) {
+        reqLog.info({ runId, kind, controlId, ownerNodeId: item.ownerNodeId ?? null }, 'no replica holds the run; rewinding it here from its stored checkpoint');
+        return false;
+      }
+      reqLog.info({ runId, kind, controlId, claimedBy: claim.holder }, 'another replica claimed this re-run; not rewinding locally');
+      res.status(202).json({ controlId, kind, runId, pipelineId, status, ownerNodeId: item.ownerNodeId ?? null, forwarded: true, recorded: outcome.recorded, applied: false, appliedBy: null, appliedInMs: null, acceptedBy: claim.holder === 'pending' ? null : claim.holder, duplicate: true });
+      return true;
     }
     res.status(409).json({ error: 'run-not-resumable', kind, controlId, status, ownerNodeId: item.ownerNodeId ?? null, message: `no replica holds run ${runId} any more; trigger a new run` });
     return true;
   }
   params.onForwarded?.({ controlId, pipelineId, item, applied, appliedBy, appliedInMs: outcome.appliedInMs });
-  reqLog.info({ runId, kind, controlId, userId, applied, appliedBy, appliedInMs: outcome.appliedInMs, ownerNodeId: item.ownerNodeId ?? null, action: `${kind}.forwarded` }, applied ? 'run control forwarded and applied by the replica that holds the run' : 'run control recorded; the replica that resumes the run applies it');
+  reqLog.info({ runId, kind, controlId, userId, applied, appliedBy, acceptedBy, appliedInMs: outcome.appliedInMs, ownerNodeId: item.ownerNodeId ?? null, action: `${kind}.forwarded` }, applied ? 'run control forwarded and applied by the replica that holds the run' : acceptedBy ? 'run control accepted by the replica that holds the run' : 'run control recorded; the replica that resumes the run applies it');
   res.status(202).json({
     controlId, kind, runId, pipelineId, status,
     ownerNodeId: item.ownerNodeId ?? null, forwarded: true, recorded: outcome.recorded,
     applied, appliedBy, appliedInMs: outcome.appliedInMs,
+    ...(acceptedBy ? { acceptedBy } : {}),
   });
   return true;
 }
