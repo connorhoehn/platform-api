@@ -24,9 +24,22 @@
 //      pre-crash steps keep their original timestamps), then
 //      PipelineModule.resumeRun() continues the run. Completion flows
 //      through the normal event → persistence path.
+//
+// Steps 3–4 run on pipeline-runtime's `recoverInterruptedRuns` (`/durable`):
+// the vetted rows go in through `RunRecordRecoveryStore` (runRecordStore.ts),
+// whose `claim` is the conditional write above, and `launch` seeds and
+// resumes. The resume state is `resumeStateFromRecord` over the mapped row.
+// Steps 1–2 stay here because they are async (terminal evidence, the
+// definitions repo) and leave rows untouched rather than interrupting them.
+// A run whose launch throws keeps its claimed row (`onUnrecoverable: 'skip'`
+// and a no-op `interrupt`): the cluster sweep re-interrupts it, as before.
 
-import type { PipelineModule, PipelineResumeState } from 'distributed-core/applications/pipeline';
-import type { PipelineDefinition } from 'distributed-core/applications/pipeline';
+import type { PipelineModule, PipelineDefinition } from 'distributed-core/applications/pipeline';
+import {
+  recoverInterruptedRuns,
+  resumeStateFromRecord,
+  type DurableRunRecord,
+} from '@connorhoehn/pipeline-runtime/durable';
 import type {
   RunRecordRepository,
   PipelineRunItem,
@@ -35,6 +48,12 @@ import type { RunPersistenceService } from './runPersistence';
 import { withContext } from '../lib/logger';
 
 import { finalizedRow, type TerminalEvidenceCheck } from './runTerminalEvidence';
+import {
+  RunRecordRecoveryStore,
+  claimedRowOf,
+  rowOf,
+  toDurableRunRecord,
+} from './runRecordStore';
 
 const log = withContext({ service: 'resumeInterruptedRuns' });
 
@@ -108,6 +127,8 @@ export async function resumeInterruptedRuns(
   const nowMs = now();
   const cutoffMs = nowMs - resumeWindowMs;
 
+  // Vet each row: in the window, not already finished, a checkpoint, a definition.
+  const eligible: DurableRunRecord[] = [];
   for (const item of interrupted) {
     const markedAtMs = Date.parse(item.interruptedAt ?? item.startedAt);
     if (!Number.isFinite(markedAtMs) || markedAtMs < cutoffMs) {
@@ -154,73 +175,56 @@ export async function resumeInterruptedRuns(
       continue;
     }
 
-    try {
-      // Double-resume guard: conditional claim. Loser skips.
-      const claimed = await repository.claimForResume(
-        item.pipelineId,
-        item.runId,
-        nodeId,
-        new Date(nowMs).toISOString(),
-      );
-      if (!claimed) {
-        result.claimLost++;
-        log.info({ runId: item.runId }, 'resume-scan: claim lost — another process owns this resume');
-        continue;
-      }
+    eligible.push(toDurableRunRecord(item, definition));
+  }
+  if (eligible.length === 0) {
+    if (result.scanned > 0) log.info({ ...result, resumeWindowMs }, 'resume-scan complete');
+    return result;
+  }
 
+  // Claim (double-resume guard: the loser skips) and resume each vetted run.
+  const store = new RunRecordRecoveryStore(repository, eligible, () => nowMs);
+  const recovered = await recoverInterruptedRuns({
+    store,
+    owner: nodeId,
+    now: () => nowMs,
+    statuses: ['interrupted'],
+    onUnrecoverable: 'skip',
+    launch: async (record) => {
+      const item = rowOf(record);
+      const claimed = claimedRowOf(record);
       // Seed the persistence cache from the post-claim row so the resumed
       // executor's events merge onto the existing history (original
       // pre-crash step timestamps preserved).
       runPersistence?.seedResumedRun(claimed);
-
-      const cp = item.checkpoint;
-
-      // Re-attach display outputs onto the slimmed step records where the
-      // stepsSummary still has them (checkpoint steps are persisted without
-      // outputs; execution truth travels in cp.context.steps).
-      const steps: Record<string, unknown> = {};
-      for (const [stepId, raw] of Object.entries(cp.steps ?? {})) {
-        const summary = item.stepsSummary?.[stepId];
-        const rec = { ...(raw as Record<string, unknown>) };
-        if (rec.output === undefined && summary?.output !== undefined) {
-          rec.output = summary.output;
-        }
-        steps[stepId] = rec;
-      }
-
-      const resumeState = {
-        runId: item.runId,
-        context: cp.context,
-        currentStepIds: cp.currentStepIds,
-        steps,
-        joinStates: cp.joinStates,
-        firedJoins: cp.firedJoins,
-        completedStepCount: cp.completedStepCount,
-        sequenceNumber: cp.sequenceNumber,
-        startedAt: item.startedAt,
-        triggeredBy: {
-          ...(item.triggeredBy && item.triggeredBy !== 'system' ? { userId: item.triggeredBy } : {}),
-          triggerType: item.triggerType ?? 'manual',
-          payload: {},
-        },
-        replayAttempts: claimed.resumeCount,
-      } as unknown as PipelineResumeState;
-
-      await module.resumeRun({ definition, resumeState });
-      result.resumed++;
+      await module.resumeRun({ definition: record.definition, resumeState: resumeStateFromRecord(record) });
       log.info(
         {
           runId: item.runId,
           pipelineId: item.pipelineId,
-          fromSequence: cp.sequenceNumber,
-          frontier: cp.currentStepIds,
+          fromSequence: item.checkpoint?.sequenceNumber,
+          frontier: item.checkpoint?.currentStepIds,
           resumeCount: claimed.resumeCount,
         },
         'resume-scan: run RESUMED from checkpoint',
       );
-    } catch (err) {
+    },
+    // The claimed row stays as it is (the cluster sweep re-interrupts it); count and log.
+    interrupt: async (record, reason) => {
       result.failed++;
-      log.error({ runId: item.runId, err: String(err) }, 'resume-scan: resume attempt failed');
+      log.error({ runId: record.id, err: reason }, 'resume-scan: resume attempt failed');
+    },
+  });
+
+  result.resumed = recovered.resumed.length;
+  for (const runId of recovered.claimLost) {
+    const claimError = store.claimErrors.get(runId);
+    if (claimError !== undefined) {
+      result.failed++;
+      log.error({ runId, err: claimError }, 'resume-scan: resume attempt failed');
+    } else {
+      result.claimLost++;
+      log.info({ runId }, 'resume-scan: claim lost — another process owns this resume');
     }
   }
 
