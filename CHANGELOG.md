@@ -3,6 +3,28 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-04 — shared pipeline stack
+
+- **Pins.** `distributed-core` 0.48.0 → v0.50.1
+  (`eea5c874766dea15b8b1f58b969af991b289a42c`), `@connorhoehn/pipeline-runtime`
+  1.2.1 → v1.4.0 (`f8d4c07c4ba77f1474684385c66a006f00c8593f`). event-catalog,
+  realtime-modules, service-runtime and message-queue still depend on 0.48.0;
+  an `overrides` entry resolves them to the root pin so the process loads one
+  distributed-core.
+- **Boot resume runs on pipeline-runtime's `recoverInterruptedRuns`**
+  (`/durable`), through `RunRecordRecoveryStore` (`src/pipeline/runRecordStore.ts`)
+  over a new `RunRecordRepository` interface that `PipelineRunRepository`
+  implements. Same outcomes as before (window, terminal evidence, conditional
+  claim, seeded persistence, `module.resumeRun`).
+- **`POST …/runs/:runId/resume?fromNodeId` works after a restart.** With no
+  executor holding the run, the row's definition snapshot and checkpoint go to
+  distributed-core's `resumeFromStep` fallback. A forwarded resume nobody
+  acknowledges is rewound on the receiving replica instead of answering 409
+  `run-not-resumable` (still the answer when the row has no checkpoint).
+- **Action idempotency is real now.** The `onBeforeAction` hook was never read
+  upstream; every executor now shares one process-wide `actionDedupStore`
+  (still in memory, so a restart forgets it).
+
 ## 2026-10-14 — upstream refinement (lane P1)
 
 - **Pins (lane P1).** `@connorhoehn/realtime-modules` 0.92.0 → v0.117.0
