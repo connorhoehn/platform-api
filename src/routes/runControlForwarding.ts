@@ -44,6 +44,13 @@ export interface ForwardRunControlParams {
   awaitAppliedMs?: number;
   /** The control is for a run that already ended (resume-from-step). */
   allowTerminal?: boolean;
+  /**
+   * resume-from-step only: when no replica acknowledges it (the replica that
+   * ran the run is gone, or this process restarted), release it and return
+   * false so the caller rewinds the run here from its stored checkpoint,
+   * instead of answering 409 run-not-resumable.
+   */
+  fallBackLocally?: boolean;
 }
 
 /**
@@ -104,6 +111,10 @@ export async function forwardRunControl(params: ForwardRunControlParams): Promis
     // Nobody has the failed run's executor (its replica is gone): only a new
     // run can take it from here. The row does not keep a control no one can apply.
     await forwarder.release(pipelineId, runId, controlId);
+    if (params.fallBackLocally) {
+      reqLog.info({ runId, kind, controlId, ownerNodeId: item.ownerNodeId ?? null }, 'no replica holds the run; rewinding it here from its stored checkpoint');
+      return false;
+    }
     res.status(409).json({ error: 'run-not-resumable', kind, controlId, status, ownerNodeId: item.ownerNodeId ?? null, message: `no replica holds run ${runId} any more; trigger a new run` });
     return true;
   }

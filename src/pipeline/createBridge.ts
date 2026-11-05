@@ -44,7 +44,7 @@ import { wrap, InMemoryQueueInspector } from 'distributed-core/messaging-queue';
 // hub#2226 — see bridge-types.ts for why these aren't imported from
 // distributed-core (the v0.14.2 pin predates the type re-exports).
 import { normalizeRunStatus } from '@connorhoehn/pipeline-runtime';
-import type { ContextPatch, PatchResult } from './bridge-types';
+import type { ContextPatch, PatchResult, ResumeFromStepOptions } from './bridge-types';
 import type {
   BusEvent,
   PipelineBridge,
@@ -374,29 +374,15 @@ export function createBridge(
     // `InvalidRunStateError`; we surface the same error here so the route can
     // map it to a 4xx. Returns the terminal `PipelineRun` snapshot.
     //
-    // Structural call against the module — `PipelineModule.resumeFromStep`
-    // shipped in distributed-core hub#2222 (post-v0.14.2). We cast through
-    // `unknown` so this code compiles against the v0.14.2 type surface that's
-    // currently pinned; at runtime the method is present on the actual
-    // module instance once the pin is bumped to the post-2222 release.
+    // dc 0.50: when no executor holds the run, `options.definition` +
+    // `options.resumeState` (the stored row's graph and checkpoint) are
+    // rewound and continued on a fresh executor under the same runId.
     async resumeFromStep(
       runId: string,
       fromNodeId: string,
-      options?: { breakpoints?: string[]; allowCompleted?: boolean },
+      options?: ResumeFromStepOptions,
     ): Promise<unknown> {
-      const m = module as unknown as {
-        resumeFromStep?: (
-          runId: string,
-          fromNodeId: string,
-          options?: { breakpoints?: string[]; allowCompleted?: boolean },
-        ) => Promise<unknown>;
-      };
-      if (typeof m.resumeFromStep !== 'function') {
-        throw new Error(
-          'PipelineModule.resumeFromStep is unavailable. Bump distributed-core to a version that includes hub#2222.',
-        );
-      }
-      return m.resumeFromStep(runId, fromNodeId, options);
+      return module.resumeFromStep(runId, fromNodeId, options);
     },
 
     // hub#2226: edit-and-continue. Both methods structural-cast against the

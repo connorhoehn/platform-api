@@ -18,6 +18,12 @@
 //   - 400 when `fromNodeId` is unknown to the original DAG
 //   - 503 when the bridge is not wired (no executor on this node)
 //
+// After a restart (or once the executor is evicted) no executor holds the
+// run. The row's definition snapshot and checkpoint then go along as
+// distributed-core 0.50's resumeFromStep fallback, which rewinds them and
+// continues the run on a fresh executor under the same runId. A row with no
+// checkpoint has nothing to rewind and is answered as before.
+//
 // On success: emits a `pipeline.run.resumed-from-step` audit row and returns
 // `{ runId, replayAttempts }`. The executor's emitted
 // `pipeline:run:resumed-from-step` event drives the live frontend update.
@@ -38,6 +44,9 @@ import { DefinitionsRepository } from '../pipeline/definitions-repository';
 import { auditRepo, type AuditEvent } from '../pipeline/audit-repository';
 import { getDynamoClient } from '../lib/ddb-client';
 import { requireRunAccess } from '../pipeline/runAccess';
+import { rerunStateForRow } from '../pipeline/runRecordStore';
+import type { ResumeFromStepOptions } from '../pipeline/bridge-types';
+import type { PipelineDefinition, RunStatus } from 'distributed-core/applications/pipeline';
 
 const log = withContext({ route: 'pipelineResume' });
 const tracer = trace.getTracer('platform-api');
@@ -168,6 +177,22 @@ pipelineResumeRouter.post(
     //    walks the steps summary for a row whose status is `failed`.
     const originalFailedStepId = pickOriginalFailedStepId(originalRun);
 
+    // 5. The checkpoint fallback, for when no executor holds the run: the
+    //    exact graph the run executed (its snapshot; the current definition
+    //    when the row predates snapshots) and its rewindable state.
+    const runDefinition = (originalRun.definitionSnapshot ?? definition) as PipelineDefinition;
+    if (originalRun.definitionSnapshot && !runDefinition.nodes?.some((n) => n.id === fromNodeId)) {
+      throw new ValidationError(`Node ${fromNodeId} is not in the graph run ${runId} executed`);
+    }
+    const fallback: ResumeFromStepOptions | null = originalRun.checkpoint
+      ? {
+          definition: runDefinition,
+          resumeState: rerunStateForRow(originalRun, runDefinition),
+          runStatus: normalizeRunStatus(originalRun.status) as RunStatus,
+          allowStatuses: allowedStatuses as RunStatus[],
+        }
+      : null;
+
     const bridge = getPipelineBridge();
     if (!bridge?.resumeFromStep) {
       reqLog.warn({ action: 'resume.stub' }, 'pipeline bridge not wired; cannot resume');
@@ -178,13 +203,16 @@ pipelineResumeRouter.post(
       return;
     }
 
-    // NFR #120: only the executor that ran the failed run can rewind it. When
-    // that is another replica the control is forwarded there and answered 202
-    // once it acknowledges; when no replica has it any more, 409 run-not-resumable.
+    // NFR #120: the executor that ran the failed run rewinds it when it is
+    // still held. When that is another replica the control is forwarded there
+    // and answered 202 once it acknowledges; when no replica has it any more,
+    // the run is rewound here from its checkpoint (409 run-not-resumable when
+    // the row has none).
     const controls = runControlForwarder();
     if (controls) {
       const handled = await forwardRunControl({
         req, res, reqLog, forwarder: controls, runId, userId, pipelineId, allowTerminal: true, awaitAppliedMs: 5000,
+        fallBackLocally: fallback !== null,
         control: ({ controlId, at }) => ({
           kind: 'resume-from-step', controlId, runId, userId, at, fromNodeId,
           ...(body.breakpoints !== undefined ? { breakpoints: body.breakpoints } : {}),
@@ -217,10 +245,12 @@ pipelineResumeRouter.post(
     });
 
     try {
-      const resumed = await bridge.resumeFromStep(runId, fromNodeId, {
+      const options: ResumeFromStepOptions = {
         ...(body.breakpoints !== undefined ? { breakpoints: body.breakpoints } : {}),
         ...(allowCompleted ? { allowCompleted: true } : {}),
-      });
+        ...(fallback ?? {}),
+      };
+      const resumed = await bridge.resumeFromStep(runId, fromNodeId, options);
       // The executor returns the terminal PipelineRun snapshot including
       // the post-increment `replayAttempts`. Surface it; default to 0 when
       // the runtime didn't expose the field (e.g. older mock).

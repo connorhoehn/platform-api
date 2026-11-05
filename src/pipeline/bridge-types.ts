@@ -11,6 +11,29 @@
 // own bridge inline at boot time.
 
 import type { PipelineBridge } from '@connorhoehn/pipeline-runtime';
+import type {
+  PipelineDefinition,
+  PipelineResumeState,
+  RunStatus,
+} from 'distributed-core/applications/pipeline';
+
+/**
+ * Options for the in-process bridge's `resumeFromStep`: pipeline-runtime's
+ * `PipelineBridge` options plus distributed-core 0.50's checkpoint fallback.
+ * With no executor holding the run (it was evicted, or the process
+ * restarted), `definition` + `resumeState` are rewound and continued on a
+ * fresh executor; `runStatus` is the stored status the gate checks, and
+ * `allowStatuses` the statuses the route accepts. The root `PipelineBridge`
+ * type does not carry these yet, so routes build this type and pass it.
+ */
+export interface ResumeFromStepOptions {
+  breakpoints?: string[];
+  allowCompleted?: boolean;
+  allowStatuses?: RunStatus[];
+  definition?: PipelineDefinition;
+  resumeState?: PipelineResumeState;
+  runStatus?: RunStatus;
+}
 
 export type {
   PipelineBridge,

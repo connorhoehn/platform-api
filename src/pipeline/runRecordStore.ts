@@ -6,8 +6,9 @@
 //
 //   - `toDurableRunRecord` maps a row (plus the definition it runs) onto the
 //     shared record shape, so `resumeStateFromRecord` builds its resume state.
-//   - `resumeStateForRow` is that resume state for a row: the boot resume and
-//     POST …/resume?fromNodeId (after a restart) both continue from it.
+//   - `resumeStateForRow` is that resume state for a row (the boot resume
+//     continues from it); `rerunStateForRow` is the one POST
+//     …/resume?fromNodeId hands distributed-core to rewind after a restart.
 //   - `RunRecordRecoveryStore` is a RunStore over a set of rows already vetted
 //     for boot resume, whose `claim` is the run table's conditional
 //     `claimForResume`. It is only what `recoverInterruptedRuns` needs: rows
@@ -32,6 +33,15 @@ import {
 import type { PipelineRunItem, RunRecordRepository } from '../repositories/PipelineRunRepository';
 import { normalizeRunStatus } from './run-rollup';
 
+/**
+ * Where a checkpoint step's output comes from (they are stored without one).
+ * `summary`: the display output in `stepsSummary` (what the boot resume has
+ * always attached). `context`: the execution output in `context.steps`, then
+ * the summary — a re-run rebuilds the run's context from step outputs alone,
+ * so it needs what the executor actually produced, not a display copy.
+ */
+export type StepOutputSource = 'summary' | 'context';
+
 /** What `toDurableRunRecord` keeps in `record.meta`. */
 export interface RunRowMeta {
   /** The row the record was mapped from. */
@@ -50,13 +60,18 @@ export function rowOf(record: DurableRunRecord): PipelineRunItem {
  * the display output is re-attached from `stepsSummary` where it is still
  * there, as the resume has always done.
  */
-function checkpointOf(item: PipelineRunItem): DurableCheckpoint | null {
+function checkpointOf(item: PipelineRunItem, outputs: StepOutputSource = 'summary'): DurableCheckpoint | null {
   const cp = item.checkpoint;
   if (!cp) return null;
+  const ctxSteps = cp.context?.['steps'];
+  const fromContext = outputs === 'context' && ctxSteps && typeof ctxSteps === 'object'
+    ? (ctxSteps as Record<string, unknown>)
+    : {};
   const steps: Record<string, CheckpointStep> = {};
   for (const [stepId, raw] of Object.entries(cp.steps ?? {})) {
     const rec = { ...(raw as Record<string, unknown>) };
     const summary = item.stepsSummary?.[stepId];
+    if (rec['output'] === undefined && fromContext[stepId] !== undefined) rec['output'] = fromContext[stepId];
     if (rec['output'] === undefined && summary?.output !== undefined) rec['output'] = summary.output;
     steps[stepId] = rec as unknown as CheckpointStep;
   }
@@ -90,7 +105,7 @@ function durableStatusOf(item: PipelineRunItem): DurableRunStatus {
 export function toDurableRunRecord(
   item: PipelineRunItem,
   definition: PipelineDefinition,
-  opts: { replays?: number; owner?: string } = {},
+  opts: { replays?: number; owner?: string; outputs?: StepOutputSource } = {},
 ): DurableRunRecord {
   const userId = item.triggeredBy && item.triggeredBy !== 'system' ? item.triggeredBy : undefined;
   return {
@@ -106,7 +121,7 @@ export function toDurableRunRecord(
     revision: 0,
     definition,
     steps: {},
-    checkpoint: checkpointOf(item),
+    checkpoint: checkpointOf(item, opts.outputs),
     triggeredBy: { ...(userId ? { userId } : {}), triggerType: item.triggerType ?? 'manual' },
     ...(opts.owner ?? item.resumeClaimedBy ?? item.ownerNodeId
       ? { owner: opts.owner ?? item.resumeClaimedBy ?? item.ownerNodeId }
@@ -126,6 +141,17 @@ export function resumeStateForRow(
   opts: { replays?: number } = {},
 ): PipelineResumeState {
   return resumeStateFromRecord(toDurableRunRecord(item, definition, opts));
+}
+
+/**
+ * The resume state POST …/resume?fromNodeId hands `PipelineModule.resumeFromStep`
+ * when no executor holds the run (dc 0.50 rewinds it with
+ * `rewindResumeState`). Step outputs come from the checkpoint's
+ * `context.steps`, because the rewind rebuilds context from them. The row
+ * keeps no re-run count, so `replayAttempts` starts again from 0.
+ */
+export function rerunStateForRow(item: PipelineRunItem, definition: PipelineDefinition): PipelineResumeState {
+  return resumeStateFromRecord(toDurableRunRecord(item, definition, { replays: 0, outputs: 'context' }));
 }
 
 /**

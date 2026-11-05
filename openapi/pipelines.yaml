@@ -687,6 +687,13 @@ paths:
         original row. Default: only `failed` runs are resumable; pass
         `allowCompleted: true` in the body to resume a succeeded run for
         diagnostic re-execution.
+
+        Works after a restart: when no executor holds the run any more, the
+        run row's definition snapshot and checkpoint are rewound from
+        `fromNodeId` and continued on a fresh executor under the same
+        runId. `replayAttempts` then counts from the stored row, which keeps
+        no earlier re-run count (it starts again at 1). A row with no
+        checkpoint cannot be rewound this way.
       operationId: resumePipelineRunFromStep
       parameters:
         - in: query
@@ -734,7 +741,7 @@ paths:
                     description: Post-increment count of `resumeFromStep` invocations.
                   at: { type: string, format: date-time }
         '400':
-          description: Missing `fromNodeId`, unknown node, or non-resumable status
+          description: Missing `fromNodeId`, unknown node (in the current definition or in the graph the run executed), or non-resumable status
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }

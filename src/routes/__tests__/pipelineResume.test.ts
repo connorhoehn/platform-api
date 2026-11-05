@@ -412,3 +412,96 @@ describe('POST /pipelines/:pipelineId/runs/:runId/resume', () => {
     expect(body.replayAttempts).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// After a restart: no executor holds the run, the stored row is the source
+// ---------------------------------------------------------------------------
+
+describe('POST …/resume after a restart — the stored checkpoint goes along', () => {
+  const snapshot = {
+    id: 'p1',
+    nodes: [{ id: 'trigger', type: 'trigger' }, { id: 'node-A', type: 'action' }, { id: 'node-B', type: 'action' }],
+    edges: [{ id: 'e0', source: 'trigger', target: 'node-A' }, { id: 'e1', source: 'node-A', target: 'node-B' }],
+  };
+  const storedRun = {
+    ...failedRun,
+    definitionSnapshot: snapshot,
+    checkpoint: {
+      sequenceNumber: 4,
+      at: '2026-01-01T00:01:00.000Z',
+      context: { steps: { trigger: {}, 'node-A': { executed: 'A' } }, executed: 'A' },
+      currentStepIds: ['node-B'],
+      steps: {
+        trigger: { nodeId: 'trigger', status: 'completed', completedAt: '2026-01-01T00:00:01.000Z' },
+        'node-A': { nodeId: 'node-A', status: 'completed', completedAt: '2026-01-01T00:00:02.000Z' },
+        'node-B': { nodeId: 'node-B', status: 'failed', error: 'synthetic failure' },
+      },
+      completedStepCount: 2,
+    },
+    stepsSummary: {
+      'node-A': { status: 'completed', output: { display: 'A (truncated copy)' } },
+      'node-B': { status: 'failed' },
+    },
+  };
+
+  test('a failed run: the snapshot, the rewindable state, the stored status and the allowed statuses', async () => {
+    mockRunRepoGet.mockResolvedValueOnce(storedRun);
+    mockDefRepoGet.mockResolvedValueOnce(baseDef);
+    (getPipelineBridge as jest.Mock).mockReturnValue(mockBridge);
+    mockBridge.resumeFromStep.mockResolvedValueOnce({ id: 'r1', status: 'completed', replayAttempts: 1 });
+
+    const res = await dispatch(app, 'POST', '/pipelines/p1/runs/r1/resume?fromNodeId=node-B');
+
+    expect(res.statusCode).toBe(202);
+    expect((res.body as { replayAttempts: number }).replayAttempts).toBe(1);
+    const [runId, fromNodeId, options] = mockBridge.resumeFromStep.mock.calls[0]!;
+    expect([runId, fromNodeId]).toEqual(['r1', 'node-B']);
+    expect(options).toMatchObject({ definition: snapshot, runStatus: 'failed', allowStatuses: ['failed'] });
+    expect(options.resumeState).toMatchObject({
+      runId: 'r1',
+      sequenceNumber: 4,
+      replayAttempts: 0,
+      triggeredBy: { userId: 'user-1', triggerType: 'manual', payload: {} },
+    });
+    // The rewind rebuilds context from step outputs: the executor's output, not the display copy.
+    expect(options.resumeState.steps['node-A'].output).toEqual({ executed: 'A' });
+  });
+
+  test('a completed run with allowCompleted: stored status normalized, completed allowed', async () => {
+    mockRunRepoGet.mockResolvedValueOnce({ ...storedRun, status: 'succeeded' });
+    mockDefRepoGet.mockResolvedValueOnce(baseDef);
+    (getPipelineBridge as jest.Mock).mockReturnValue(mockBridge);
+    mockBridge.resumeFromStep.mockResolvedValueOnce({ id: 'r1', status: 'completed', replayAttempts: 1 });
+
+    const res = await dispatch(app, 'POST', '/pipelines/p1/runs/r1/resume?fromNodeId=node-A', { body: { allowCompleted: true } });
+
+    expect(res.statusCode).toBe(202);
+    expect(mockBridge.resumeFromStep.mock.calls[0]![2]).toMatchObject({
+      allowCompleted: true, runStatus: 'completed', allowStatuses: ['failed', 'completed'], definition: snapshot,
+    });
+  });
+
+  test('400 when the node is in the current definition but not in the graph the run executed', async () => {
+    mockRunRepoGet.mockResolvedValueOnce(storedRun);
+    mockDefRepoGet.mockResolvedValueOnce(baseDef); // has node-C; the snapshot does not
+    (getPipelineBridge as jest.Mock).mockReturnValue(mockBridge);
+
+    const res = await dispatch(app, 'POST', '/pipelines/p1/runs/r1/resume?fromNodeId=node-C');
+
+    expect(res.statusCode).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/not in the graph run r1 executed/);
+    expect(mockBridge.resumeFromStep).not.toHaveBeenCalled();
+  });
+
+  test('a row without a snapshot rewinds over the current definition', async () => {
+    mockRunRepoGet.mockResolvedValueOnce({ ...storedRun, definitionSnapshot: undefined });
+    mockDefRepoGet.mockResolvedValueOnce(baseDef);
+    (getPipelineBridge as jest.Mock).mockReturnValue(mockBridge);
+    mockBridge.resumeFromStep.mockResolvedValueOnce({ id: 'r1', status: 'completed', replayAttempts: 1 });
+
+    const res = await dispatch(app, 'POST', '/pipelines/p1/runs/r1/resume?fromNodeId=node-B');
+
+    expect(res.statusCode).toBe(202);
+    expect(mockBridge.resumeFromStep.mock.calls[0]![2]).toMatchObject({ definition: baseDef });
+  });
+});
