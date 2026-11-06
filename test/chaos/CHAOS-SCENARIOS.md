@@ -1,7 +1,4 @@
-# Raft Chaos Testing Scenarios (Task #962)
-
-**Status:** Scenario specifications complete, implementation pending  
-**Priority:** High — required for Phase 4 staging validation
+# Raft Chaos Testing Scenarios
 
 ## Overview
 
@@ -386,7 +383,7 @@ kill $PROBE_PID  # Triggers verification
 
 ---
 
-## No-Go Criteria (From Planning Doc)
+## No-Go Criteria
 
 Chaos tests MUST validate these before production deployment:
 
@@ -410,10 +407,3 @@ If any criterion fails, **DO NOT promote to production.**
 - [ ] Measure p95 latency with probe client (must be <250ms)
 - [ ] Monitor WAL growth over 24 hours (must be <50MB/day)
 - [ ] Review Raft metrics (elections, rejections, lag) — all green
-
----
-
-## References
-
-- `.planning/PHASE-4-MULTI-NODE-RAFT.md` — Failure modes (section 5), no-go criteria (section 7)
-- `.planning/RAFT-OBSERVABILITY.md` — Metrics to monitor during chaos tests

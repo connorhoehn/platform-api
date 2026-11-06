@@ -1,7 +1,4 @@
-# Raft Read Path Integration Tests (Task #961)
-
-**Status:** Test specifications complete, implementation pending  
-**Priority:** High — required before production Raft deployment
+# Raft Read Path Integration Tests
 
 ## Overview
 
@@ -368,7 +365,7 @@ describe('Raft performance baseline', () => {
 
     console.log(`p95 write latency: ${p95LatencyMs}ms`);
 
-    // No-go criterion from .planning/PHASE-4-MULTI-NODE-RAFT.md section 7
+    // No-go criterion: p95 read latency must stay under 250ms
     expect(p95LatencyMs).toBeLessThan(250);
   });
 });
@@ -387,17 +384,3 @@ npm test -- test/integration/raft/linearizability.test.ts
 # Run with coverage
 npm test -- --coverage test/integration/raft
 ```
-
-## Blockers
-
-1. **RaftClusterHarness implementation** — requires multi-node test harness (not yet written)
-2. **SystemClock mocking** for clock-drift test (may require distributed-core changes)
-3. **Metrics/observability** in tests — verify no quorum RPCs during lease reads
-
-## Next Steps (Operator)
-
-1. Implement `RaftClusterHarness` helper in `test/integration/raft/helpers/`
-2. Write tests 1, 2, 4, 5 (skip clock-drift test until mocking available)
-3. Run against local 3-node cluster (in-memory transport)
-4. Validate p95 latency < 250ms (no-go criterion)
-5. If tests pass, proceed to chaos testing (task #962)

@@ -30,13 +30,3 @@ Dialogue summaries require attendance, matching lobby/session identities and
 current recording access through `resolveForUser` and `recording:read`. Removing
 a recording participant or deleting its recording also removes summary access
 through this view. No summary is synthesized when processing is unavailable.
-
-Owner tests cover validation, conditional writes, private access, metadata,
-recording defaults, bounded activity and summary revocation. AgentCore's live
-two-person walk verifies saved layouts, audio-only entry, temporary breakouts,
-return to main and recorded attendance. Its cross-package release evidence is
-in `aws-agentcore/docs/design/product-readiness/`.
-
-The current plan validator is mirrored in the AgentCore BFF. Chassis work C8
-will move the pure contract to realtime-modules and adopt it in both APIs while
-keeping authorization and storage responsibilities here.

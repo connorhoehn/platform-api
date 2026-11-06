@@ -195,12 +195,12 @@ sizeBytes, width, height}`. Callers can treat both paths identically.
 
 ## Local-dev (Tilt + DDB-local)
 
-DDB-local is wired in `agent-hub/services/docker-compose.yml`. Bring it
-up via `start-shared-services.sh`. Create both v1 tables at boot with
+Run DynamoDB Local on `http://localhost:8000` (the `dev` script points
+`LOCALSTACK_ENDPOINT` there). Create both v1 tables at boot with
 the commands above (they default to `--endpoint-url http://localhost:8000`).
 
-Both tables persist across container restarts via the `agent-hub-ddb-data`
-volume.
+Mount a volume on the DynamoDB Local data directory if the tables should
+survive container restarts.
 
 For the CLI to work in the platform-api container, the image must
 include the Claude Code binary and a mounted `~/.claude` directory.

@@ -130,9 +130,9 @@ aws dynamodb update-time-to-live \
 
 ## Local-dev (Tilt + DDB-local)
 
-DDB-local is wired in `agent-hub/services/docker-compose.yml`. Bring it
-up via `start-shared-services.sh`. Create the v2 tables at boot with the
+Run DynamoDB Local on `http://localhost:8000` (the `dev` script points
+`LOCALSTACK_ENDPOINT` there). Create the v2 tables at boot with the
 commands above (they default to `--endpoint-url http://localhost:8000`).
 
-Both tables persist across container restarts via the `agent-hub-ddb-data`
-volume.
+Mount a volume on the DynamoDB Local data directory if the tables should
+survive container restarts.

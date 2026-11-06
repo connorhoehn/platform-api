@@ -6,9 +6,6 @@ The route verifies authentication and recording participation before subscribing
 
 The portal uses these wake-ups to recheck its existing authorized metadata reader without clearing the card. Hidden tabs pause, actor/scope changes abort, requests have deadlines and observation remains finite. Its five-second polling remains a fallback when the native bus, event endpoint or network is unavailable. The exact call association is discovered through the existing participant index before monitoring begins.
 
-Verification (October 11, 2026 Eastern): 12 focused checks pass, including an actual distributed-core EventBus publication waking an authenticated HTTP request. Its pub/sub transport and recording/host authorities are isolated fixtures. The existing recording-route suite also passed (43 cases); source typecheck, build and OpenAPI coverage pass. This is not a new live SFU call or primary-service activation. The user explicitly requested preservation of the current memory-backed application session.
-
-
 ## Live native acceptance
 
 `scripts/meeting-live-acceptance.cjs` connects real browser RTP capture, native
@@ -39,30 +36,3 @@ private transcript/summary bodies and logs must not be published accidentally.
 The harness deletes only its uniquely prefixed DynamoDB tables and closes its
 browser and HTTP servers. Its caller owns shutting down the dedicated SFU,
 bridge, port forwards, and containers after preserving the recording/evidence.
-
-Gateway acceptance and host directory authorization are explicit fixtures.
-Production Raft/RunPersistence bootstrap, the application's rendered post-call
-card, and application search are separate acceptance boundaries. This harness
-does not activate or reset the primary application.
-
-## October 12 reliability audit
-
-Status requests now detect disconnects during the initial authority read, and
-release their event subscription even if the subsequent authority/database read
-stalls. Final responses still reauthorize the caller. Regression tests reproduce
-both leaks before the fix, including a late rejected read after cancellation.
-
-The live acceptance runner now separates HTTP and cleanup lifecycle helpers,
-handles background promise failures immediately, cancels HTTP/inference work on
-SIGINT/SIGTERM or its deadline, and attempts every cleanup independently with
-bounded waits. Redis shutdown closes existing connections without dialing new
-ones. Each run requires an empty output directory, writes private artifacts with
-owner-only permissions, and publishes a passed proof only after cleanup succeeds.
-The proof asserts and reports observed inference requests. Failure-path tests use
-only owned HTTP fixtures and verify cancellation, failed ownership checks,
-preservation of prior evidence, and cleanup after rejected or stalled closers.
-
-Validation: 68 recording/status/Redis Jest checks, six Node lifecycle/failure
-checks, and the platform build pass. These changes were not activated in the
-preserved primary session. The prior live media run remains the end-to-end
-capture/transcription/summary evidence; this audit did not repeat paid inference.
