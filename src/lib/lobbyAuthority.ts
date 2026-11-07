@@ -22,9 +22,9 @@
 // plumbing; the callback needs no client change and is fresher (no grant can
 // outlive a revocation by its TTL). See docs/lobby-authority.md.
 //
-// Rollout (two independently deployable halves): the BFF route ships first
-// and is inert; then platform-api turns LOBBY_AUTHORITY_REQUIRED on with
-// LOBBY_AUTHORITY_URL. Off (the default) keeps today's behaviour exactly.
+// On by default: a deployment must set LOBBY_AUTHORITY_URL, or every OrgIQ
+// call lobby is refused (fail closed). LOBBY_AUTHORITY_REQUIRED=false turns
+// it off explicitly, for local development without the BFF.
 
 import { withContext } from './logger';
 
@@ -32,8 +32,13 @@ const log = withContext({ component: 'lobby-authority' });
 
 export const LOBBY_AUTHORITY_TIMEOUT_MS = 3_000;
 
+/**
+ * ON unless explicitly `false` (security review, 6 November 2026: off by
+ * default let any Cognito user from any org into OrgIQ and Assessment calls).
+ * Turning it off is a deliberate local-development choice.
+ */
 export function lobbyAuthorityRequired(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (env.LOBBY_AUTHORITY_REQUIRED ?? '').trim().toLowerCase() === 'true';
+  return (env.LOBBY_AUTHORITY_REQUIRED ?? '').trim().toLowerCase() !== 'false';
 }
 
 export function lobbyAuthorityUrl(env: NodeJS.ProcessEnv = process.env): string {

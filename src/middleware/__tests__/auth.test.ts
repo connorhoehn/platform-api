@@ -111,7 +111,7 @@ describe('requireAuth', () => {
   it('sets req.user on valid token', async () => {
     mockDecode.mockReturnValue({ header: { kid: 'kid-1' } });
     mockGetSigningKey.mockResolvedValue({ getPublicKey: () => 'pk' });
-    mockVerify.mockReturnValue({ sub: 'user-42', email: 'user@example.com' });
+    mockVerify.mockReturnValue({ sub: 'user-42', email: 'user@example.com', token_use: 'id', aud: 'test-client' });
 
     const req = mockReq('Bearer valid-token');
     const next = jest.fn() as unknown as NextFunction;
@@ -154,7 +154,7 @@ describe('optionalAuth', () => {
   it('sets req.user on valid token', async () => {
     mockDecode.mockReturnValue({ header: { kid: 'kid-1' } });
     mockGetSigningKey.mockResolvedValue({ getPublicKey: () => 'pk' });
-    mockVerify.mockReturnValue({ sub: 'user-42', email: 'a@b.com' });
+    mockVerify.mockReturnValue({ sub: 'user-42', email: 'a@b.com', token_use: 'id', aud: 'test-client' });
 
     const req = mockReq('Bearer ok-token');
     const next = jest.fn() as unknown as NextFunction;
@@ -203,5 +203,88 @@ describe('requirePrincipal (no silent dev-user)', () => {
     expect(res.statusCode).toBe(401);
     process.env.SKIP_AUTH = prevSkip;
     process.env.NODE_ENV = prevEnv;
+  });
+});
+
+// Security review §7 (platform-api, Medium): Cognito tokens were checked only
+// for issuer and RS256. Now the app client and the token kind are pinned.
+describe('Cognito token binding (client id + token_use)', () => {
+  const prevClient = process.env.COGNITO_CLIENT_ID;
+  afterEach(() => { process.env.COGNITO_CLIENT_ID = prevClient; });
+  function verifiedAs(claims: Record<string, unknown>): void {
+    mockDecode.mockReturnValue({ header: { kid: 'kid-1' } });
+    mockGetSigningKey.mockResolvedValue({ getPublicKey: () => 'pk' });
+    mockVerify.mockReturnValue({ sub: 'user-42', email: 'a@b.com', ...claims });
+  }
+  async function attempt(): Promise<{ res: TestRes; req: Request; next: jest.Mock }> {
+    const req = mockReq('Bearer t');
+    const res = mockRes();
+    const next = jest.fn();
+    await requireAuth(req, res as unknown as Response, next as unknown as NextFunction);
+    return { res, req, next };
+  }
+
+  it('accepts an ID token for an allowed client', async () => {
+    process.env.COGNITO_CLIENT_ID = 'client-a, client-b';
+    verifiedAs({ token_use: 'id', aud: 'client-b' });
+    const { next, req } = await attempt();
+    expect(next).toHaveBeenCalled();
+    expect(req.user?.sub).toBe('user-42');
+  });
+
+  it('refuses an ID token minted for another app client', async () => {
+    process.env.COGNITO_CLIENT_ID = 'client-a';
+    verifiedAs({ token_use: 'id', aud: 'client-z' });
+    const { res, next } = await attempt();
+    expect(res.statusCode).toBe(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('refuses an access token (no email / org claims; not what this API takes)', async () => {
+    process.env.COGNITO_CLIENT_ID = 'client-a';
+    verifiedAs({ token_use: 'access', client_id: 'client-a' });
+    const { res } = await attempt();
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('refuses a token with no token_use', async () => {
+    process.env.COGNITO_CLIENT_ID = 'client-a';
+    verifiedAs({ aud: 'client-a' });
+    expect((await attempt()).res.statusCode).toBe(401);
+  });
+
+  it('refuses every Cognito token when no client id is configured (fail closed)', async () => {
+    delete process.env.COGNITO_CLIENT_ID;
+    verifiedAs({ token_use: 'id', aud: 'client-a' });
+    expect((await attempt()).res.statusCode).toBe(401);
+  });
+
+  it('optionalAuth applies the same binding', async () => {
+    process.env.COGNITO_CLIENT_ID = 'client-a';
+    verifiedAs({ token_use: 'id', aud: 'client-z' });
+    const req = mockReq('Bearer t');
+    const next = jest.fn() as unknown as NextFunction;
+    await optionalAuth(req, mockRes() as unknown as Response, next);
+    expect(req.user).toBeUndefined();
+  });
+});
+
+describe('SKIP_AUTH needs the explicit insecure dev flag', () => {
+  const prevFlag = process.env.INSECURE_DEV_MODE;
+  afterEach(() => { process.env.INSECURE_DEV_MODE = prevFlag; delete process.env.SKIP_AUTH; });
+
+  it('SKIP_AUTH=true without INSECURE_DEV_MODE is not a bypass', async () => {
+    delete process.env.INSECURE_DEV_MODE;
+    process.env.SKIP_AUTH = 'true';
+    const req = mockReq();
+    const res = mockRes();
+    const next = jest.fn() as unknown as NextFunction;
+    await requireAuth(req, res as unknown as Response, next);
+    expect(res.statusCode).toBe(401);
+    expect(req.user).toBeUndefined();
+
+    const req2 = mockReq();
+    await optionalAuth(req2, mockRes() as unknown as Response, jest.fn() as unknown as NextFunction);
+    expect(req2.user).toBeUndefined();
   });
 });

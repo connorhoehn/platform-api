@@ -4,6 +4,7 @@ import jwksClient from 'jwks-rsa';
 import { readOrgClaim } from '../lib/org-claim';
 import { withContext } from '../lib/logger';
 import { isOrgiqCandidate, verifyOrgiqToken } from '../lib/orgiqRealtimeToken';
+import { skipAuthEnabled } from '../lib/insecureDevMode';
 
 // The SKIP_AUTH dev fallback: a request with no usable bearer runs as
 // `dev-user` with no organization. That identity owns nothing and projects
@@ -27,8 +28,9 @@ export function devUserFallback(req: Request): { sub: string; email: string } {
 
 /**
  * Refuses a request that reached a handler with no principal. `requireAuth`
- * always sets one (a verified Cognito user, or — only with SKIP_AUTH=true
- * outside production — the logged `dev-user` fallback), so this fires only
+ * always sets one (a verified Cognito user, or — only with SKIP_AUTH=true and
+ * INSECURE_DEV_MODE=true outside production — the logged `dev-user`
+ * fallback), so this fires only
  * when a route is mounted outside it. Handlers behind it read `req.user.sub`
  * directly instead of defaulting to `'dev-user'` silently.
  */
@@ -55,6 +57,51 @@ async function getPublicKey(kid: string): Promise<string> {
   return key.getPublicKey();
 }
 
+/**
+ * The Cognito app clients whose ID tokens this API accepts
+ * (COGNITO_CLIENT_ID, comma-separated). Read per call so tests and a config
+ * reload see the current value.
+ */
+export function allowedCognitoClients(env: NodeJS.ProcessEnv = process.env): string[] {
+  return (env.COGNITO_CLIENT_ID ?? '').split(',').map((c) => c.trim()).filter(Boolean);
+}
+
+let warnedNoClient = false;
+
+/**
+ * Signature, issuer and algorithm, then the binding the pool alone does not
+ * give: the token is an ID token (`token_use: 'id'`) minted for one of OUR app
+ * clients (`aud`). Before this any token the pool signed was accepted —
+ * another app client's, or an access token. ID tokens only: this API reads
+ * `email` and `custom:orgId`, which access tokens do not carry. No client
+ * configured refuses every Cognito token (fail closed). Throws on refusal.
+ */
+async function verifyCognitoToken(token: string): Promise<jwt.JwtPayload> {
+  const decoded = jwt.decode(token, { complete: true });
+  if (!decoded || typeof decoded === 'string' || !decoded.header.kid) {
+    throw new Error('undecodable token');
+  }
+  const clients = allowedCognitoClients();
+  if (clients.length === 0) {
+    if (!warnedNoClient) {
+      warnedNoClient = true;
+      authLog.error('COGNITO_CLIENT_ID is unset — every Cognito token is refused');
+    }
+    throw new Error('no Cognito app client configured');
+  }
+  const publicKey = await getPublicKey(decoded.header.kid);
+  const verified = jwt.verify(token, publicKey, {
+    algorithms: ['RS256'],
+    issuer,
+    audience: clients as [string, ...string[]],
+  }) as jwt.JwtPayload;
+  if (verified.token_use !== 'id') throw new Error('not an ID token');
+  const aud = Array.isArray(verified.aud) ? verified.aud : [verified.aud];
+  if (!aud.some((a) => typeof a === 'string' && clients.includes(a))) {
+    throw new Error('token minted for another app client');
+  }
+  return verified;
+}
 
 function bearerOf(req: Request): string | null {
   const h = req.headers.authorization;
@@ -105,7 +152,7 @@ export async function requireAuth(
   // request broke per-user fan-outs (every Bob/Alice/Carol call ended
   // up keyed under 'dev-user' instead of their real identity, so
   // listByUser returned zero matches for new recordings).
-  if (process.env.SKIP_AUTH === 'true' && process.env.NODE_ENV !== 'production') {
+  if (skipAuthEnabled()) {
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {
       const token = authHeader.slice(7);
@@ -132,16 +179,7 @@ export async function requireAuth(
   }
   const token = authHeader.slice(7);
   try {
-    const decoded = jwt.decode(token, { complete: true });
-    if (!decoded || typeof decoded === 'string' || !decoded.header.kid) {
-      res.status(401).json({ error: 'Invalid token' });
-      return;
-    }
-    const publicKey = await getPublicKey(decoded.header.kid);
-    const verified = jwt.verify(token, publicKey, {
-      algorithms: ['RS256'],
-      issuer,
-    }) as jwt.JwtPayload;
+    const verified = await verifyCognitoToken(token);
     req.user = { sub: verified.sub!, email: verified.email as string | undefined, orgId: readOrgClaim(verified) };
     next();
   } catch (err) {
@@ -172,7 +210,7 @@ export async function optionalAuth(
     next();
     return;
   }
-  if (process.env.SKIP_AUTH === 'true' && process.env.NODE_ENV !== 'production') {
+  if (skipAuthEnabled()) {
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {
       const token = authHeader.slice(7);
@@ -199,15 +237,8 @@ export async function optionalAuth(
   }
   const token = authHeader.slice(7);
   try {
-    const decoded = jwt.decode(token, { complete: true });
-    if (decoded && typeof decoded !== 'string' && decoded.header.kid) {
-      const publicKey = await getPublicKey(decoded.header.kid);
-      const verified = jwt.verify(token, publicKey, {
-        algorithms: ['RS256'],
-        issuer,
-      }) as jwt.JwtPayload;
-      req.user = { sub: verified.sub!, email: verified.email as string | undefined, orgId: readOrgClaim(verified) };
-    }
+    const verified = await verifyCognitoToken(token);
+    req.user = { sub: verified.sub!, email: verified.email as string | undefined, orgId: readOrgClaim(verified) };
   } catch {
     // Token invalid — proceed without user
   }

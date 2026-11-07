@@ -31,6 +31,7 @@
  */
 
 import log from './logger';
+import { lvsAdminToken } from './lvsAdminToken';
 
 const FILTER = 'IVS Recording State Change';
 
@@ -50,7 +51,13 @@ export async function bootstrapLvsWebhook(): Promise<void> {
     );
     return;
   }
-  const adminToken = process.env.VIDEO_ADMIN_TOKEN ?? process.env.LVS_ADMIN_TOKEN ?? 'admin';
+  // Fail closed: without a configured admin token there is nothing to
+  // register with — never fall back to a guessable literal.
+  const adminToken = lvsAdminToken(['VIDEO_ADMIN_TOKEN', 'LVS_ADMIN_TOKEN']);
+  if (!adminToken) {
+    log.error('[lvs-webhook-bootstrap] skipping — VIDEO_ADMIN_TOKEN / LVS_ADMIN_TOKEN not set');
+    return;
+  }
   const headers = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${adminToken}`,

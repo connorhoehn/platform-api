@@ -41,6 +41,7 @@ import { startSystemRun } from './recordingPipelines';
 import { chatChannelForLobby } from './lobbyChannel';
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import log from '../lib/logger';
+import { lvsAdminAuthHeader } from '../lib/lvsAdminToken';
 
 export const LIVE_CAPTIONS_PIPELINE_ID = 'live-captions';
 
@@ -63,7 +64,8 @@ export function liveCaptionsMaxMs(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_MS;
 }
 
-const lvsAuth = () => ({ Authorization: `Bearer ${process.env.VIDEO_ADMIN_TOKEN ?? process.env.LVS_ADMIN_TOKEN ?? 'admin'}` });
+// No configured token → no header (LVS refuses), never a literal 'admin'.
+const lvsAuth = (): Record<string, string> => lvsAdminAuthHeader(['VIDEO_ADMIN_TOKEN', 'LVS_ADMIN_TOKEN']);
 const tapsUrl = (channelArn: string) => `${VIDEO_API_URL}/api/channels/${encodeURIComponent(channelArn)}/taps`;
 
 // ---------------------------------------------------------------------------

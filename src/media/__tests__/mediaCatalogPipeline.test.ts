@@ -41,7 +41,7 @@ const probe = (n: number, sec: number, over: Partial<MediaProbe> = {}): MediaPro
 
 /** Run the pipeline the way the executor would: each step's output merges into the context. */
 async function runAll(files: MediaProbe[], classifyData?: Record<string, unknown>) {
-  let ctx: Record<string, unknown> = { batch: { batchId: 'b1', root: '/Volumes/nvme', files } };
+  let ctx: Record<string, unknown> = { batch: { batchId: 'b1', root: '/Volumes/nvme', files }, orgId: 'org-a' };
   for (const [kind, data] of [[KINDS.ingest], [KINDS.burstGroup], [KINDS.classify, classifyData], [KINDS.upsert]] as Array<[string, Record<string, unknown> | undefined]>) {
     const out = await run(kind, ctx, data);
     if (out.status !== 'completed') throw new Error(`${kind}: ${(out as { error?: string }).error}`);
@@ -58,6 +58,14 @@ describe('the definition', () => {
     expect(lintSystemPipeline(def)).toEqual([]);
     const classify = (def.nodes as Array<{ id: string; data: { optional?: boolean } }>).find((n) => n.id === 'classify');
     expect(classify?.data.optional).toBe(true);
+  });
+});
+
+describe('media:upsert', () => {
+  it('refuses to write rows that belong to no organisation', async () => {
+    const out = await run(KINDS.upsert, { ingested: [], bursts: [], root: '/v' });
+    expect(out.status).toBe('failed');
+    expect((out as { error?: string }).error).toMatch(/orgId/);
   });
 });
 
@@ -87,14 +95,16 @@ describe('the whole run', () => {
     expect(ctx.burstCount).toBe(1);
     const rows = upserted[0] as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(3);
-    const byId = new Map(rows.map((r) => [r.fileId, r]));
+    const byId = new Map(rows.map((r) => [r.contentId, r]));
     expect(byId.get(ID(1))?.burstSize).toBe(2);
     expect(byId.get(ID(2))?.burstId).toBe(byId.get(ID(1))?.burstId);
     expect(byId.get(ID(3))?.burstSize).toBe(1);
     expect(rows.every((r) => r.scene === null)).toBe(true);
-    expect(rows.every((r) => r.runId === 'run-7' && r.bucket === 'all')).toBe(true);
+    expect(rows.every((r) => r.runId === 'run-7' && r.bucket === 'org-a' && r.orgId === 'org-a')).toBe(true);
+    // Stored under the org: the same photo in another org is another row.
+    expect(rows.every((r) => r.fileId === `org-a#${r.contentId}`)).toBe(true);
     // The middle frame of a 2-frame burst is the first; exactly one representative per burst.
-    expect(rows.filter((r) => r.isRepresentative).map((r) => r.fileId).sort()).toEqual([ID(1), ID(3)]);
+    expect(rows.filter((r) => r.isRepresentative).map((r) => r.contentId).sort()).toEqual([ID(1), ID(3)]);
   });
 
   it('with a vision client: one call per burst, the verdict applied to every frame of it', async () => {

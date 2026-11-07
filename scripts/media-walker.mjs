@@ -147,11 +147,19 @@ async function probeFile(root, path, stat) {
 }
 
 async function post(api, token, batch) {
-  const res = await fetch(`${api}/api/media/catalog/batches`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
-    body: JSON.stringify(batch),
-  });
+  let res;
+  // The API caps batches per user per minute: wait out a 429 rather than fail the walk.
+  for (;;) {
+    res = await fetch(`${api}/api/media/catalog/batches`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(batch),
+    });
+    if (res.status !== 429) break;
+    const waitSec = Math.max(1, Number(res.headers.get('retry-after')) || 5);
+    console.warn(`rate limited; waiting ${waitSec}s`);
+    await new Promise((r) => setTimeout(r, waitSec * 1000));
+  }
   if (!res.ok) throw new Error(`POST batch ${batch.batchId}: ${res.status} ${(await res.text()).slice(0, 300)}`);
   return res.json();
 }

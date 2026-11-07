@@ -8,15 +8,16 @@
 // the host; this service is in a pod) and why burst detection runs before
 // classification (one vision call per moment, not per frame).
 //
-// Trigger payload — one batch, lands in context as `ctx.batch`:
-//   { batchId, root, files: MediaProbe[] }
+// Trigger payload — one batch, lands in context as `ctx.batch`, and the
+// poster's organisation as `ctx.orgId` (every row written is that org's):
+//   { batch: { batchId, root, files: MediaProbe[] }, orgId }
 // A probe is everything the walker can know without a model: hash, size,
 // mime, dimensions, EXIF time and camera, a difference hash, and a ≤512px
 // JPEG thumbnail as base64 for image files.
 
 import type { StepHandler, StepOutcome, PipelineNode } from 'distributed-core/applications/pipeline';
 import { mediaCatalogRepo } from '../repositories';
-import { CATALOG_BUCKET, type MediaCatalogRow } from '../repositories/MediaCatalogRepository';
+import { catalogKey, type MediaCatalogRow } from '../repositories/MediaCatalogRepository';
 import { getImageBlobStore, getVisionClient } from '../pipeline/image/visionServices';
 import { buildPresetSchema } from '../pipeline/image/visionSchemaPresets';
 import { getPipelineBridge } from '../pipeline/bridge-types';
@@ -236,7 +237,10 @@ function upsertHandler(): DescribedStepHandler {
       const bursts = (ctx.bursts as Burst[] | undefined) ?? [];
       const scenes = (ctx.scenes as Record<string, SceneVerdict> | undefined) ?? {};
       const root = typeof ctx.root === 'string' ? ctx.root : '';
+      // The org the batch was posted in (startMediaCatalogRun): every row is that org's.
+      const orgId = typeof ctx.orgId === 'string' ? ctx.orgId : '';
       if (!Array.isArray(files)) return fail('ingested files are required');
+      if (!orgId) return fail('orgId is required: catalog rows belong to an organisation');
       const burstOf = new Map<string, Burst>();
       for (const b of bursts) for (const id of b.fileIds) burstOf.set(id, b);
       const catalogedAt = new Date().toISOString();
@@ -244,8 +248,10 @@ function upsertHandler(): DescribedStepHandler {
         const b = burstOf.get(f.fileId) ?? { burstId: `burst-${f.fileId.slice(0, 16)}`, fileIds: [f.fileId], representativeFileId: f.fileId };
         const s = scenes[f.fileId] ?? null;
         return {
-          fileId: f.fileId,
-          bucket: CATALOG_BUCKET,
+          fileId: catalogKey(orgId, f.fileId),
+          contentId: f.fileId,
+          orgId,
+          bucket: orgId,
           root,
           path: f.path,
           relPath: f.relPath,
@@ -310,13 +316,14 @@ export function buildMediaCatalogDefinition(): Record<string, unknown> {
 }
 
 /** Start one run per posted batch. Mirrors `startSystemRun` in recordingPipelines. */
-export async function startMediaCatalogRun(batch: MediaBatch, userId: string): Promise<string> {
+export async function startMediaCatalogRun(batch: MediaBatch, userId: string, orgId: string): Promise<string> {
+  if (!orgId) throw new Error('a media catalog run needs an organisation');
   const bridge = getPipelineBridge();
   if (!bridge?.trigger) throw new Error('pipeline engine is not available');
   const out = await Promise.resolve(bridge.trigger({
     pipelineId: MEDIA_CATALOG_PIPELINE_ID,
     definition: buildMediaCatalogDefinition() as never,
-    triggerPayload: { batch },
+    triggerPayload: { batch, orgId },
     triggeredBy: { userId },
   } as never));
   const runId = (out as { runId: string }).runId;

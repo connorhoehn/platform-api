@@ -42,6 +42,7 @@ import { createPipelineConfigRegistration } from './control-plane/pipeline-confi
 import { createFileUploadEndpointRegistration } from './control-plane/file-upload-subscriber';
 import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
 import { definitionsRepo } from './pipeline/definitions-repository';
+import { assertSkipAuthAllowed } from './lib/insecureDevMode';
 
 const port = process.env.PORT ?? '3001';
 
@@ -61,6 +62,16 @@ const port = process.env.PORT ?? '3001';
   }, 'runtime profile');
 }
 
+// SKIP_AUTH is a local-development shortcut and needs INSECURE_DEV_MODE=true
+// beside it (lib/insecureDevMode.ts). Set without it, or in production, the
+// process refuses to start rather than serve every request unverified.
+try {
+  assertSkipAuthAllowed();
+} catch (err) {
+  log.fatal({ reason: (err as Error).message }, 'refusing to start');
+  process.exit(2);
+}
+
 // Cognito env-var gate. In prod (or COGNITO_REQUIRED=true) exit(1) when the
 // required vars are missing; in dev COGNITO_REQUIRED=false explicitly allows
 // boot to continue (e.g. when running with SKIP_AUTH=true). Matches the
@@ -72,6 +83,8 @@ void assertRequiredInProd(
       const missing: string[] = [];
       if (!process.env.COGNITO_REGION) missing.push('COGNITO_REGION');
       if (!process.env.COGNITO_USER_POOL_ID) missing.push('COGNITO_USER_POOL_ID');
+      // Tokens are bound to these app clients (middleware/auth.ts); unset refuses every Cognito token.
+      if (!process.env.COGNITO_CLIENT_ID) missing.push('COGNITO_CLIENT_ID');
       if (missing.length > 0) {
         throw new Error(`Cognito env vars missing: ${missing.join(', ')}`);
       }

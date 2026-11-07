@@ -101,6 +101,29 @@ describe('lobbyAccess', () => {
     });
   });
 
+  // Security review §7 "fix first" 7 / §8 package 9: with the per-resource
+  // check off, a Cognito user from any org fell through to the open ad-hoc
+  // rule for `orgiq:initiative:<id>`. The partition check is now mandatory
+  // for every tenant-prefixed lobby, whatever its kind.
+  describe('every tenant-prefixed lobby needs the partition (non-OrgIQ callers)', () => {
+    it('a token from another org is refused for orgiq:initiative:x and assessment:team:x', async () => {
+      const a = access();
+      expect(await a.canUseLobby(req('u-vera', 'org-1'), 'orgiq:initiative:x')).toBe(false);
+      expect(await a.canUseLobby(req('u-vera', 'org-1'), 'assessment:team:x')).toBe(false);
+      await expect(a.assertLobbyAccess(req('u-vera', 'org-1'), 'orgiq:initiative:x')).rejects.toMatchObject({ status: 404 });
+    });
+    it('a caller with no org is refused for any tenant-prefixed lobby', async () => {
+      const a = access();
+      const orgless = { user: { sub: 'u-vera' }, headers: {} } as unknown as Request;
+      expect(await a.canUseLobby(orgless, 'orgiq:initiative:x')).toBe(false);
+    });
+    it('its own org\'s lobby is still allowed; unprefixed lobbies keep their rules', async () => {
+      const a = access();
+      expect(await a.canUseLobby(req('u-vera', 'org-1'), 'org-1:initiative:x')).toBe(true);
+      expect(await a.canUseLobby(req('u-vera', 'org-1'), 'global-hangout')).toBe(true);
+    });
+  });
+
   describe('the tenants claim partitions lobbies (any listed tenant, not only org)', () => {
     const tok = (sub: string, over: Record<string, unknown> = {}) =>
       ({ user: { sub, orgId: 'org-a', authKind: 'orgiq-hs256', ...over }, headers: {} }) as unknown as Request;
@@ -161,11 +184,13 @@ describe('lobbyAccess', () => {
       expect(await a().canUseLobby(tok('u-stranger'), 'org-b:room:den')).toBe(false);
       expect(roomBySlug).not.toHaveBeenCalledWith('org-b', 'den');
     });
-    it('a Cognito caller: its own tenant\'s private room is members-only; another tenant\'s room is 404; unknown stays ad-hoc', async () => {
+    it('a Cognito caller: its own tenant\'s private room is members-only; another tenant\'s room is 404; unknown is ad-hoc in its own tenant only', async () => {
       await expect(a().assertLobbyAccess(req('u-stranger', 'social'), 'social:room:den')).rejects.toMatchObject({ status: 403 });
       expect(await a().canUseLobby(req('u-member', 'social'), 'social:room:den')).toBe(true);
       await expect(a().assertLobbyAccess(req('u-member', 'org-1'), 'social:room:den')).rejects.toMatchObject({ status: 404 });
-      expect(await a().canUseLobby(req('u-stranger', 'org-1'), 'social:room:nowhere')).toBe(true);
+      // Another tenant's unknown room is no longer an open ad-hoc lobby.
+      expect(await a().canUseLobby(req('u-stranger', 'org-1'), 'social:room:nowhere')).toBe(false);
+      expect(await a().canUseLobby(req('u-stranger', 'social'), 'social:room:nowhere')).toBe(true);
     });
     it('room:<slug>: a non-member gets 403; an unknown room stays 404', async () => {
       await expect(a().assertLobbyAccess(req('eve'), 'room:den')).rejects.toMatchObject({ status: 403 });

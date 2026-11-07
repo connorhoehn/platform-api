@@ -150,11 +150,13 @@ export function summaryOps(summaryMarkdown: string): Array<Record<string, unknow
 }
 
 const SETTLED_COMPOSE: ReadonlySet<string> = new Set(['ok', 'degraded', 'failed', 'skipped']);
-const lvsAuth = () => ({ Authorization: `Bearer ${process.env.LVS_ADMIN_TOKEN ?? process.env.VIDEO_ADMIN_TOKEN ?? 'admin'}` });
+// No configured token → no header (LVS refuses), never a literal 'admin'.
+const lvsAuth = (): Record<string, string> => lvsAdminAuthHeader(['LVS_ADMIN_TOKEN', 'VIDEO_ADMIN_TOKEN']);
 
 // The lobby → conversation rule lives in ./lobbyChannel (it now covers
 // document calls too); re-exported so existing importers keep their path.
 import { chatChannelForLobby } from './lobbyChannel';
+import { lvsAdminAuthHeader } from '../lib/lvsAdminToken';
 export { chatChannelForLobby };
 
 /**

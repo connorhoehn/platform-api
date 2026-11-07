@@ -42,6 +42,7 @@ import {
   ForbiddenError,
 } from '../middleware/error-handler';
 import log from '../lib/logger';
+import { lvsAdminAuthHeader } from '../lib/lvsAdminToken';
 import { startLiveCaptions, stopLiveCaptions } from '../recordings/liveCaptions';
 import { callSfu, mapSfuError } from '../lib/sfu-breaker';
 import {
@@ -205,10 +206,9 @@ export async function reapLvsParticipant(args: {
   sessionId: string;
 }): Promise<LvsReapOutcome> {
   const url = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(args.channelArn)}/participants/${encodeURIComponent(args.participantId)}`;
-  const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
   const init: RequestInit = {
     method: 'DELETE',
-    headers: { Authorization: `Bearer ${adminToken}` },
+    headers: lvsAdminAuthHeader(['VIDEO_ADMIN_TOKEN']),
   };
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -1205,10 +1205,9 @@ videoSessionsRouter.get('/sessions/:sessionId/recording', requireAuth, asyncHand
 async function isChannelPublishing(channelArn: string): Promise<boolean | null> {
   if (!channelArn) return null;
   const url = `${VIDEO_API_URL}/api/channels/${encodeURIComponent(channelArn)}/stream`;
-  const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
   try {
     const upstream = await fetch(url, {
-      headers: { Authorization: `Bearer ${adminToken}` },
+      headers: lvsAdminAuthHeader(['VIDEO_ADMIN_TOKEN']),
       signal: AbortSignal.timeout(2500),
     });
     if (!upstream.ok) return null;

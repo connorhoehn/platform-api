@@ -49,7 +49,10 @@ npm run lint:openapi   # check routes against the OpenAPI descriptions
 ```
 
 `npm run dev` sets its own local values, including `SKIP_AUTH=true` so requests
-need no Cognito token. Do not use that setting outside development.
+need no Cognito token. `SKIP_AUTH` takes effect only beside `INSECURE_DEV_MODE=true`
+and never with `NODE_ENV=production`; set without it, the service refuses to start.
+The image sets `NODE_ENV=production`, so a local container stack must set
+`NODE_ENV=development` too.
 
 Common environment variables:
 
@@ -58,6 +61,13 @@ Common environment variables:
 - `LOCALSTACK_ENDPOINT` or `DYNAMODB_ENDPOINT` - DynamoDB endpoint for local runs.
 - `DDB_TABLE_PREFIX` - prefix added to table names, for sharing one DynamoDB instance.
 - `AWS_REGION`, `COGNITO_REGION`, `COGNITO_USER_POOL_ID` - region and user pool used to verify tokens.
+- `COGNITO_CLIENT_ID` - the app client(s), comma-separated, whose ID tokens are accepted.
+  Unset refuses every Cognito token.
+- `CORS_ALLOWED_ORIGINS` - comma-separated origins allowed to call with credentials.
+  Unset allows none (loopback dev servers only in insecure dev mode).
+- `ADMIN_TOKEN` / `VIDEO_ADMIN_TOKEN` - the admin bearer; admin routes answer 503 without it.
+  `VIDEO_ADMIN_TOKEN` (or `LVS_ADMIN_TOKEN`) is also the bearer for the video service;
+  nothing falls back to a default.
 - `MESSAGE_QUEUE_URL` - message queue used for durable event delivery.
 - `VIDEO_API_URL` - the video streaming service that backs call sessions.
 - `PLATFORM_RUNTIME_PROFILE` - `local-ephemeral` (default) or `durable`; the durable

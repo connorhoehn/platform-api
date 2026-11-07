@@ -51,6 +51,7 @@ import log from '../lib/logger';
 import { askLobbyAuthority } from '../lib/lobbyAuthority';
 import { hasControlChar } from '../lib/controlChars';
 import type { RecordingListRow } from '../repositories/CallRecordingRepository';
+import { lvsAdminAuthHeader } from '../lib/lvsAdminToken';
 
 export const recordingsRouter = Router();
 installRecordingStatusRoute(recordingsRouter, { authorize: requireOwnRecording });
@@ -231,7 +232,7 @@ async function settleComposeForList<
       try {
         const res = await callSfu(
           `${VIDEO_API_URL}/api/channels/${encodeURIComponent(arn)}/recordings`,
-          { method: 'GET', headers: { Authorization: `Bearer ${process.env.VIDEO_ADMIN_TOKEN || 'admin'}` } },
+          { method: 'GET', headers: lvsAdminAuthHeader(['VIDEO_ADMIN_TOKEN']) },
         );
         if (!res.ok) return;
         const body = (await res.json()) as
@@ -400,7 +401,7 @@ async function resolveMedia(detail: CallRecording): Promise<{
   try {
     const listRes = await callSfu(
       `${VIDEO_API_URL}/api/channels/${encodeURIComponent(detail.channelArn)}/recordings`,
-      { method: 'GET', headers: { Authorization: `Bearer ${process.env.VIDEO_ADMIN_TOKEN || 'admin'}` } },
+      { method: 'GET', headers: lvsAdminAuthHeader(['VIDEO_ADMIN_TOKEN']) },
     );
     if (listRes.ok) {
       const body = (await listRes.json()) as
@@ -670,13 +671,13 @@ recordingsRouter.post(
     // role=admin wildcard that satisfies `allowJwt` here. Same pattern
     // as reapLvsParticipant (videoSessions.ts).
     const arn = detail.channelArn;
-    const adminToken = process.env.VIDEO_ADMIN_TOKEN || 'admin';
     let token: string;
     let expiresAt: string;
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        // No configured token → no header (LVS refuses), never a literal 'admin'.
+        ...lvsAdminAuthHeader(['VIDEO_ADMIN_TOKEN']),
       };
       // Routed through the shared SFU CircuitBreaker (hub#1001) — an open
       // circuit fast-fails before fetch, and any 5xx from LVS counts as a
@@ -1047,7 +1048,7 @@ recordingsRouter.get(
     try {
       const upstream = await callSfu(lvsUrl, {
         method: 'GET',
-        headers: { 'Authorization': `Bearer ${process.env.LVS_ADMIN_TOKEN ?? 'admin'}` },
+        headers: lvsAdminAuthHeader(['LVS_ADMIN_TOKEN']),
       });
       if (!upstream.ok) {
         if (upstream.status === 404) {

@@ -1086,6 +1086,10 @@ describe('GET /api/video/sessions/document/:documentId', () => {
 // --- LVS participant reap on /end (hub#1281) ----------------------------
 
 describe('reapLvsParticipant — LVS reclamation on /end', () => {
+  // No 'admin' default any more: the reap carries the configured token.
+  const prevAdmin = process.env.VIDEO_ADMIN_TOKEN;
+  beforeEach(() => { process.env.VIDEO_ADMIN_TOKEN = 'lvs-admin-test'; });
+  afterEach(() => { if (prevAdmin === undefined) delete process.env.VIDEO_ADMIN_TOKEN; else process.env.VIDEO_ADMIN_TOKEN = prevAdmin; });
   const args = {
     channelArn: 'arn:lvs:channel/abc',
     streamKey: 'sk-test',

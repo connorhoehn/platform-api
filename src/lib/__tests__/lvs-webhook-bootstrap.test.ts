@@ -23,6 +23,8 @@ describe('bootstrapLvsWebhook dedup', () => {
       ...origEnv,
       VIDEO_API_URL: 'http://lvs.test:3901',
       LVS_WEBHOOK_BOOTSTRAP_URL: RECEIVER,
+      // No default token any more: without one the bootstrap does nothing.
+      VIDEO_ADMIN_TOKEN: 'lvs-admin-test',
     };
     fetchMock = jest.fn();
     (global as { fetch: unknown }).fetch = fetchMock;

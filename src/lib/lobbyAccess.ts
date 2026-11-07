@@ -50,9 +50,11 @@
 //                     `<tenant>:room:<slug>` by the room rule above; anything
 //                     else under the prefix is open to the tenant. No unprefixed
 //                     lobby (dm:, room:, a document id).
-//   any other caller naming a `<tenant>:dm:<ids>` lobby
-//                   → a listed id AND the caller may use `<tenant>` (its own
-//                     org); a tenant DM is never an open ad-hoc lobby.
+//   any other caller naming any `<tenant>:<rest>` lobby
+//                   → the caller may use `<tenant>` (its own org), always;
+//                     then `<tenant>:dm:<ids>` for a listed id only, a
+//                     `<tenant>:room:<slug>` by the room rule, anything else
+//                     ad-hoc within that tenant.
 //
 // Per-resource authority (LOBBY_AUTHORITY_REQUIRED, 2026-10-06). The prefix
 // rule above cannot know whether the caller may use THAT initiative, team,
@@ -61,8 +63,9 @@
 // (lib/lobbyAuthority.ts; the caller's own bearer, POST LOBBY_AUTHORITY_URL).
 // Any failure refuses. While on, a lobby under one of the BFF's own tenant
 // prefixes (LOBBY_AUTHORITY_TENANTS, default orgiq/assessment/social/
-// pipelines) is refused to every non-OrgIQ caller. Off (default) = the prefix
-// rule alone, as before.
+// pipelines) is refused to every non-OrgIQ caller. On by default since the
+// 6 November 2026 security review; LOBBY_AUTHORITY_REQUIRED=false = the prefix
+// rule alone.
 //
 // A refusal is 404: confirming that a DM has a call is itself a disclosure.
 // The one exception is a private room's non-member, who gets the 403 the
@@ -74,6 +77,7 @@ import { RoomAccessDeniedError } from '../repositories/HangoutRoomRepository';
 import { dmLobbyParticipants } from './authorize';
 import { mayUsePartition } from './partition';
 import { askLobbyAuthority, lobbyAuthorityRequired, lobbyAuthorityTenants } from './lobbyAuthority';
+import { skipAuthEnabled } from './insecureDevMode';
 
 export interface LobbyAccessDeps {
   roomBySlug(orgId: string, slug: string): Promise<{ roomId: string; orgId: string; visibility?: string; createdBy?: string } | null>;
@@ -149,7 +153,7 @@ export function orgiqLobbyGuard(
 }
 
 function lookupOrg(req: Request): string {
-  return req.user?.orgId ?? (process.env.SKIP_AUTH === 'true' ? 'default-org' : '');
+  return req.user?.orgId ?? (skipAuthEnabled() ? 'default-org' : '');
 }
 
 export function makeLobbyAccess(deps: LobbyAccessDeps) {
@@ -222,18 +226,20 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
     // to the open ad-hoc rule below and skip the BFF entirely.
     if (tenanted && deps.governedTenant?.(tenanted.tenant)) return false;
 
+    // EVERY tenant-prefixed lobby needs the partition. Before, only the DM and
+    // room shapes checked it, so `orgiq:initiative:<id>` from a Cognito user
+    // of any org fell through to the open ad-hoc rule below whenever the
+    // per-resource check was off (security review, 6 November 2026).
+    if (tenanted && !mayUsePartition(req.user, tenanted.tenant)) return false;
+
     const tenantDm = tenanted ? dmIds(tenanted.rest) : null;
     if (tenanted && tenantDm) {
-      if (!mayUsePartition(req.user, tenanted.tenant)) return false;
       return tenantDm.includes(userId) || (tenantDm.length > 0 && isGuest(lobbyName, userId));
     }
     if (tenanted && tenantRoom) {
       const v = await roomVerdict(req, tenanted.tenant, tenantRoom, userId);
-      if (v !== 'none') {
-        if (!mayUsePartition(req.user, tenanted.tenant)) return false;
-        return v === 'private' ? new RoomAccessDeniedError(tenantRoom) : true;
-      }
-      // No such room: today's rule (an ad-hoc lobby) below.
+      if (v !== 'none') return v === 'private' ? new RoomAccessDeniedError(tenantRoom) : true;
+      // No such room: an ad-hoc lobby in the caller's own partition, below.
     }
     const dm = dmLobbyParticipants(lobbyName);
     if (dm) return dm.includes(userId) || isGuest(lobbyName, userId);
@@ -291,8 +297,8 @@ export function lobbyAccess(): ReturnType<typeof makeLobbyAccess> {
       const live = await repos.videoSessionRepo.findActiveByLobbyName(lobbyName);
       return !!live?.guests?.includes(userId);
     },
-    // Read live, so the flag needs no restart-order games in tests; off →
-    // admitted here and the prefix rule alone decides (today's behaviour).
+    // Read live, so the flag needs no restart-order games in tests; turned
+    // off explicitly → admitted here and the prefix rule alone decides.
     orgiqLobbyAuthority: async (req, lobbyName) => {
       if (!lobbyAuthorityRequired()) return true;
       const h = req.headers.authorization;

@@ -57,6 +57,8 @@ function fakeLvs(initial: Array<{ tapId: string; url: string }> = []) {
   return { fetch: fetchMock, taps, calls };
 }
 
+// The LVS admin bearer has no 'admin' default; these calls carry a configured one.
+process.env.VIDEO_ADMIN_TOKEN = process.env.VIDEO_ADMIN_TOKEN || 'lvs-admin-test';
 beforeEach(() => { __resetLiveCaptionsForTests(); getSessionMock.mockReset(); findByChannelArnMock.mockReset().mockResolvedValue([]); postChatMessageMock.mockClear(); getRunMock.mockReset(); });
 
 describe('the definition', () => {

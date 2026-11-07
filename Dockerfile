@@ -90,6 +90,11 @@ COPY platform-api/src/ ./src/
 RUN node dist/lib/buildFreshness.js src /app/.build-src-fingerprint
 RUN chown -R platformapi:nodejs /app
 USER platformapi
+# Production unless the deployment says otherwise. Several dev shortcuts
+# (SKIP_AUTH among them) used to key off NODE_ENV !== 'production', and the
+# image never set it. Local stacks set NODE_ENV=development explicitly, plus
+# INSECURE_DEV_MODE=true if they want SKIP_AUTH (src/lib/insecureDevMode.ts).
+ENV NODE_ENV=production
 EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:3001/health || exit 1

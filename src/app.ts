@@ -2,6 +2,7 @@ import express from 'express';
 import { requestContextMiddleware } from '@connorhoehn/service-runtime';
 import { requireDocumentPolicy } from './middleware/document-policy';
 import { requireAuth } from './middleware/auth';
+import { corsMiddleware } from './middleware/cors';
 import { serviceOnBehalfOf } from './middleware/serviceOnBehalfOf';
 import { requestLogger } from './middleware/request-logger';
 import { httpMetrics } from './middleware/http-metrics';
@@ -46,19 +47,9 @@ export function createApp(): express.Application {
   // context are available to all downstream middleware and route handlers.
   app.use(requestContextMiddleware());
 
-  // CORS — allow frontend dev server. Echoes the request Origin so the
-  // response is compatible with `credentials: include` fetches (browsers
-  // reject the wildcard `*` when credentials are sent).
-  app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin) res.header('Access-Control-Allow-Origin', origin);
-    res.header('Vary', 'Origin');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,Idempotency-Key');
-    if (req.method === 'OPTIONS') { res.sendStatus(204); return; }
-    next();
-  });
+  // CORS — only origins in CORS_ALLOWED_ORIGINS (loopback dev servers in
+  // insecure dev mode). See middleware/cors.ts.
+  app.use(corsMiddleware());
 
   // Global JSON parser — skipped for /hooks/lvs/* and /hooks/pipeline/* so
   // those webhook receivers can read the raw bytes for HMAC verification.
@@ -75,10 +66,11 @@ export function createApp(): express.Application {
   // an EMPTY rawBody — so signed webhooks could never verify (HMAC over zero
   // bytes) and unsigned ones forwarded `body: {}` into the pipeline. Silent
   // payload loss; live pod logged `bodySize: 0` for a 15-byte POST.
-  // The media walker's batches: forty thumbnails is a few MB, forty times the
+  // The media walker's batches: forty thumbnails is a few MB, many times the
   // global limit. Scoped to the one path that carries them; body-parser marks
-  // the request parsed, so the global parser below leaves it alone.
-  app.use('/api/media', express.json({ limit: '40mb' }));
+  // the request parsed, so the global parser below leaves it alone. 12mb fits
+  // the route's 8 MB thumbnail cap as base64 (MAX_BATCH_THUMBNAIL_BYTES).
+  app.use('/api/media', express.json({ limit: '12mb' }));
   // A DeckSpec is bigger than the 100kb the global parser allows — 40 slides of
   // bullets, notes and citations. These two paths take one up to 2mb so the
   // deck routes' own cap (MAX_SPEC_BYTES) is what answers 413, rather than

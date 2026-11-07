@@ -1,22 +1,39 @@
 // platform-api/src/repositories/MediaCatalogRepository.ts
 //
-// The catalog: one row per file the walker has seen, keyed by CONTENT hash so
-// a file moved or renamed on the drive is the same row, and a second catalog
-// of the same drive (HoehnPhotosOrganizer's) can be reconciled by the same
-// key. Two indexes answer the two reads the page makes: newest first, and
-// everything in one burst.
+// The catalog: one row per file the walker has seen, PER ORGANISATION, keyed by
+// CONTENT hash within it so a file moved or renamed on the drive is the same
+// row, and a second catalog of the same drive (HoehnPhotosOrganizer's) can be
+// reconciled by the same key. Two indexes answer the two reads the page makes:
+// newest first, and everything in one burst.
+//
+// Org scoping (security review, 6 November 2026: the catalog was one shared
+// stream any authenticated user of any org could read). The table's hash key
+// attribute is still `fileId`, but it now holds `<orgId>#<contentHash>`, so
+// two orgs cataloguing the same photo get two rows; `contentId` keeps the bare
+// hash and is what the API calls `fileId`. The time index's partition
+// (`bucket`) is the org, and burst reads filter on `orgId`. Rows written
+// before this (bucket `all`, no `orgId`) belong to no org and are never
+// returned; re-walk to rebuild them.
 
 import { BatchWriteCommand, DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
 
 export const MEDIA_CATALOG_TABLE = tableName('media-catalog');
-/** Every row shares one partition on the time index: the catalog is browsed as one stream. */
-export const CATALOG_BUCKET = 'all';
+
+/** The stored hash key: the org, then the content hash. */
+export function catalogKey(orgId: string, contentId: string): string {
+  return `${orgId}#${contentId}`;
+}
 
 export interface MediaCatalogRow {
+  /** Stored: `catalogKey(orgId, contentId)`. Returned by the API: the content hash. */
   fileId: string;
-  bucket: typeof CATALOG_BUCKET;
+  /** The content hash (sha256 hex). */
+  contentId: string;
+  orgId: string;
+  /** The time index's partition: the org. */
+  bucket: string;
   root: string;
   path: string;
   relPath: string;
@@ -57,6 +74,11 @@ function decodeCursor(cursor: string | null | undefined): Record<string, unknown
   catch { return undefined; }
 }
 
+/** The API's view: `fileId` is the content hash, not the stored org-prefixed key. */
+function toPublicRow(row: MediaCatalogRow): MediaCatalogRow {
+  return { ...row, fileId: row.contentId ?? row.fileId };
+}
+
 export class MediaCatalogRepository extends BaseRepository {
   constructor(docClient: DynamoDBDocumentClient) {
     super(MEDIA_CATALOG_TABLE, docClient);
@@ -81,35 +103,43 @@ export class MediaCatalogRepository extends BaseRepository {
     return written;
   }
 
-  async getFile(fileId: string): Promise<MediaCatalogRow | null> {
-    return this.getItem<MediaCatalogRow>({ fileId });
+  /** One file of `orgId`'s catalog by content hash; null when that org has no such row. */
+  async getFile(orgId: string, contentId: string): Promise<MediaCatalogRow | null> {
+    if (!orgId) return null;
+    const row = await this.getItem<MediaCatalogRow>({ fileId: catalogKey(orgId, contentId) });
+    return row && row.orgId === orgId ? toPublicRow(row) : null;
   }
 
-  /** Newest first by shot time. */
-  async listRecent(opts: { limit?: number; cursor?: string | null } = {}): Promise<CatalogPage> {
+  /** `orgId`'s catalog, newest first by shot time. */
+  async listRecent(orgId: string, opts: { limit?: number; cursor?: string | null } = {}): Promise<CatalogPage> {
+    if (!orgId) return { items: [], cursor: null };
     const out = await this.docClient.send(new QueryCommand({
       TableName: this.tableName,
       IndexName: 'time-index',
       KeyConditionExpression: '#b = :b',
       ExpressionAttributeNames: { '#b': 'bucket' },
-      ExpressionAttributeValues: { ':b': CATALOG_BUCKET },
+      ExpressionAttributeValues: { ':b': orgId },
       ScanIndexForward: false,
       Limit: Math.min(Math.max(opts.limit ?? 60, 1), 500),
       ...(decodeCursor(opts.cursor) ? { ExclusiveStartKey: decodeCursor(opts.cursor) } : {}),
     }));
-    return { items: (out.Items ?? []) as MediaCatalogRow[], cursor: encodeCursor(out.LastEvaluatedKey as Record<string, unknown> | undefined) };
+    const items = ((out.Items ?? []) as MediaCatalogRow[]).filter((r) => r.orgId === orgId).map(toPublicRow);
+    return { items, cursor: encodeCursor(out.LastEvaluatedKey as Record<string, unknown> | undefined) };
   }
 
-  /** Every frame of one burst, in shot order. */
-  async listBurst(burstId: string): Promise<MediaCatalogRow[]> {
+  /** Every frame of one burst in `orgId`'s catalog, in shot order. */
+  async listBurst(orgId: string, burstId: string): Promise<MediaCatalogRow[]> {
+    if (!orgId) return [];
     const out = await this.docClient.send(new QueryCommand({
       TableName: this.tableName,
       IndexName: 'burst-index',
       KeyConditionExpression: '#g = :g',
-      ExpressionAttributeNames: { '#g': 'burstId' },
-      ExpressionAttributeValues: { ':g': burstId },
+      // Burst ids derive from content, so two orgs can share one.
+      FilterExpression: '#o = :o',
+      ExpressionAttributeNames: { '#g': 'burstId', '#o': 'orgId' },
+      ExpressionAttributeValues: { ':g': burstId, ':o': orgId },
       ScanIndexForward: true,
     }));
-    return (out.Items ?? []) as MediaCatalogRow[];
+    return ((out.Items ?? []) as MediaCatalogRow[]).filter((r) => r.orgId === orgId).map(toPublicRow);
   }
 }

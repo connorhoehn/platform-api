@@ -5,19 +5,28 @@
 // secret instead: callers must send `Authorization: Bearer <ADMIN_TOKEN>`
 // where ADMIN_TOKEN matches the env var.
 //
-// When `ADMIN_TOKEN` is unset, in dev mode (`SKIP_AUTH=true`) we let the
-// request through; in any other case we 503 so we fail closed if the
-// secret was accidentally not provisioned.
+// Fails closed: no ADMIN_TOKEN configured is a 503 in every mode (SKIP_AUTH
+// used to wave admin calls through), a missing or wrong bearer is a 401, and
+// the comparison is constant-time over fixed-length digests so neither the
+// token's content nor its length leaks through timing.
 //
 // VIDEO_ADMIN_TOKEN is honoured as a fallback so a single shared admin
 // secret can gate both this surface and the LVS pod-to-pod calls.
 
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import log from '../lib/logger';
 
 function getConfiguredToken(): string | undefined {
   const t = process.env.ADMIN_TOKEN || process.env.VIDEO_ADMIN_TOKEN;
   return t && t.length > 0 ? t : undefined;
+}
+
+/** Constant-time equality for two strings of any length. */
+export function tokensMatch(provided: string, expected: string): boolean {
+  const a = createHash('sha256').update(provided, 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
 }
 
 export function requireAdmin(
@@ -27,12 +36,6 @@ export function requireAdmin(
 ): void {
   const configured = getConfiguredToken();
   if (!configured) {
-    if (process.env.SKIP_AUTH === 'true') {
-      // Dev convenience — no token configured, allow through so Tilt
-      // demos can hit admin endpoints without provisioning a secret.
-      next();
-      return;
-    }
     log.warn(
       { path: req.path },
       '[requireAdmin] no ADMIN_TOKEN configured — refusing admin call',
@@ -47,8 +50,8 @@ export function requireAdmin(
     return;
   }
   const provided = header.slice(7).trim();
-  if (provided !== configured) {
-    res.status(403).json({ error: 'admin forbidden' });
+  if (!provided || !tokensMatch(provided, configured)) {
+    res.status(401).json({ error: 'admin authorization required' });
     return;
   }
   next();

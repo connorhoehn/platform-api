@@ -61,17 +61,18 @@ calls depend on.
 
 1. **Deploy the BFF first.** It adds `POST /api/realtime/lobby-access`. The
    route is inert until someone calls it.
-2. **Then turn on platform-api.** Set `LOBBY_AUTHORITY_URL` to a URL that
-   platform-api's tasks can reach, plus `LOBBY_AUTHORITY_REQUIRED=true`.
+2. **Then point platform-api at it.** Set `LOBBY_AUTHORITY_URL` to a URL that
+   platform-api's tasks can reach. The check is on by default (since the
+   6 November 2026 security review), so without a URL every OrgIQ call lobby
+   is refused.
 
 Reversing that order refuses every OrgIQ call lobby, because the BFF answers
-404 until step 1 lands. To roll back, unset `LOBBY_AUTHORITY_REQUIRED`; no BFF
-change is needed. While the flag is off, which is the default, behaviour is
-exactly as before.
+404 until step 1 lands. `LOBBY_AUTHORITY_REQUIRED=false` turns the check off,
+for local development without the BFF only.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `LOBBY_AUTHORITY_REQUIRED` | off | `true` turns on steps 2–4 |
+| `LOBBY_AUTHORITY_REQUIRED` | on | anything but `false` keeps steps 2–4 on |
 | `LOBBY_AUTHORITY_URL` | — | The BFF route, e.g. `http://host.docker.internal:3001/api/realtime/lobby-access` |
 | `LOBBY_AUTHORITY_TENANTS` | `orgiq,assessment,social,pipelines` | Prefixes that only an OrgIQ token, with BFF admission, can reach |
 

@@ -92,7 +92,7 @@ describe('LOBBY_AUTHORITY_REQUIRED on', () => {
   });
 });
 
-describe('LOBBY_AUTHORITY_REQUIRED off (default) keeps today\'s prefix rule', () => {
+describe('LOBBY_AUTHORITY_REQUIRED=false keeps the prefix rule alone', () => {
   it('admits any well-formed lobby in the token\'s tenants, never asking the BFF', async () => {
     const { a, calls } = access(false, []);
     expect(await a.canUseLobby(orgiq('u-vera'), 'orgiq:initiative:p-soc2')).toBe(true);
@@ -130,10 +130,13 @@ describe('askLobbyAuthority fails closed', () => {
 });
 
 describe('configuration', () => {
-  it('the flag is on only for "true"; tenants default to the BFF\'s four', () => {
-    expect(lobbyAuthorityRequired({} as NodeJS.ProcessEnv)).toBe(false);
+  it('the flag is on unless explicitly "false"; tenants default to the BFF\'s four', () => {
+    expect(lobbyAuthorityRequired({} as NodeJS.ProcessEnv)).toBe(true);
+    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: '' } as NodeJS.ProcessEnv)).toBe(true);
     expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: 'TRUE' } as NodeJS.ProcessEnv)).toBe(true);
-    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: '1' } as NodeJS.ProcessEnv)).toBe(false);
+    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: '1' } as NodeJS.ProcessEnv)).toBe(true);
+    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: 'false' } as NodeJS.ProcessEnv)).toBe(false);
+    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: ' FALSE ' } as NodeJS.ProcessEnv)).toBe(false);
     expect(lobbyAuthorityTenants({} as NodeJS.ProcessEnv)).toEqual(['orgiq', 'assessment', 'social', 'pipelines']);
     expect(lobbyAuthorityTenants({ LOBBY_AUTHORITY_TENANTS: 'orgiq, social' } as NodeJS.ProcessEnv)).toEqual(['orgiq', 'social']);
   });
