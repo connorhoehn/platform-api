@@ -377,6 +377,29 @@ describe('ClaudeCodeLLMClient.stream() — exit code', () => {
 // ---------------------------------------------------------------------------
 
 describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
+  // The child gets the allowlisted env (pipeline/cliChildEnv.ts), not the pod's.
+  it('spawns claude with the allowlisted environment, never the pod secrets', async () => {
+    mockSpawn.mockReturnValue(makeMockChild([
+      resultLine({ input_tokens: 2, output_tokens: 1 }),
+    ]) as unknown as ReturnType<typeof mockSpawn>);
+    const planted = ['REALTIME_JWT_SECRET', 'ADMIN_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'ANTHROPIC_API_KEY'];
+    for (const k of planted) process.env[k] = 'must-not-reach-the-child';
+    try {
+      const client = new ClaudeCodeLLMClient();
+      for await (const _ of client.stream('model', '', 'hi')) { /* drain */ }
+    } finally {
+      for (const k of planted) delete process.env[k];
+    }
+    const opts = (mockSpawn.mock.calls.at(-1) as unknown as [string, string[], { env?: NodeJS.ProcessEnv }])[2];
+    expect(opts.env).toBeDefined();
+    for (const k of planted) expect(opts.env![k]).toBeUndefined();
+    const { CLI_CHILD_ENV_ALLOWLIST } = await import('../cliChildEnv.js');
+    for (const k of Object.keys(opts.env!)) {
+      expect([...CLI_CHILD_ENV_ALLOWLIST, 'MAX_THINKING_TOKENS']).toContain(k);
+    }
+    expect(opts.env!.MAX_THINKING_TOKENS).toBe('0');
+  });
+
   it('includes --append-system-prompt when systemPrompt is non-empty', async () => {
     mockSpawn.mockReturnValue(makeMockChild([
       resultLine({ input_tokens: 2, output_tokens: 1 }),

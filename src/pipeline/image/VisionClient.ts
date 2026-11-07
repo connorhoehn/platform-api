@@ -40,6 +40,7 @@
 
 import { spawn } from 'node:child_process';
 import type { ChildProcessByStdio } from 'node:child_process';
+import { buildCliChildEnv } from '../cliChildEnv';
 import type { Readable } from 'node:stream';
 import { withAbort } from 'distributed-core/common';
 import { randomUUID } from 'node:crypto';
@@ -286,7 +287,8 @@ export class VisionClient {
     const child: ChildProcessByStdio<null, Readable, Readable> = this.spawnImpl(
       this.claudeBin,
       args,
-      { stdio: ['ignore', 'pipe', 'pipe'], cwd: callDir },
+      // Allowlisted, never the pod's environment (pipeline/cliChildEnv.ts).
+      { stdio: ['ignore', 'pipe', 'pipe'], cwd: callDir, env: buildCliChildEnv() },
     ) as ChildProcessByStdio<null, Readable, Readable>;
 
     const abortReg = input.abortSignal

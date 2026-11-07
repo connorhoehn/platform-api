@@ -1,5 +1,5 @@
 import { createServer, type Server, type RequestListener } from 'node:http';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexCompletion, codexSummaryArgs, codexBridgeUrl, CodexLLMClient } from '../CodexLLMClient';
@@ -67,6 +67,17 @@ describe('Codex subprocess lifecycle', () => {
     const controller = new AbortController(); const pending = collect(controller.signal);
     setTimeout(() => controller.abort(), 100);
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  });
+  it('runs codex with the allowlisted environment, not the pod secrets', async () => {
+    const envFile = join(directory, 'env.json');
+    await cli(`require('fs').writeFileSync(${JSON.stringify(envFile)}, JSON.stringify(Object.keys(process.env))); process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write(${JSON.stringify(message + '\n')}); process.stdout.write(${JSON.stringify(done + '\n')}); });`);
+    for (const k of ['REALTIME_JWT_SECRET', 'ADMIN_TOKEN', 'AWS_SECRET_ACCESS_KEY']) process.env[k] = 'must-not-reach-the-child';
+    await collect();
+    const keys = JSON.parse(await readFile(envFile, 'utf8')) as string[];
+    const { CLI_CHILD_ENV_ALLOWLIST } = await import('../cliChildEnv.js');
+    // macOS adds __CF_USER_TEXT_ENCODING to every process it starts.
+    for (const k of keys.filter((key) => key !== '__CF_USER_TEXT_ENCODING')) expect(CLI_CHILD_ENV_ALLOWLIST as readonly string[]).toContain(k);
+    expect(keys).not.toContain('REALTIME_JWT_SECRET');
   });
   it('reports timeout and missing executable without hanging', async () => {
     await cli('setInterval(()=>{},1000);'); process.env.CODEX_SUMMARY_TIMEOUT_MS = '100';

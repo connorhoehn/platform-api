@@ -143,6 +143,24 @@ describe('buildVisionSystemPrompt', () => {
 // ─── CLI happy paths ───────────────────────────────────────────────────
 
 describe('VisionClient.analyze — caption mode', () => {
+  it('spawns claude with the allowlisted environment, never the pod secrets', async () => {
+    const calls: Array<{ env?: NodeJS.ProcessEnv }> = [];
+    const spawnImpl = ((_bin: string, _args: string[], opts: { env?: NodeJS.ProcessEnv }) => {
+      calls.push(opts);
+      return makeFakeChild({ stdoutLines: [deltaLine('ok'), resultLine(1, 1)] });
+    }) as unknown as typeof import('node:child_process').spawn;
+    process.env.REALTIME_JWT_SECRET = 'must-not-reach-the-child';
+    try {
+      await new VisionClient({ spawnImpl }).analyze(baseInput());
+    } finally {
+      delete process.env.REALTIME_JWT_SECRET;
+    }
+    const { CLI_CHILD_ENV_ALLOWLIST } = await import('../../cliChildEnv.js');
+    expect(calls[0]?.env).toBeDefined();
+    expect(calls[0]!.env!.REALTIME_JWT_SECRET).toBeUndefined();
+    for (const k of Object.keys(calls[0]!.env!)) expect(CLI_CHILD_ENV_ALLOWLIST as readonly string[]).toContain(k);
+  });
+
   it('returns the full text as caption when no schema is set', async () => {
     const stdoutLines = [
       deltaLine('A red apple'),

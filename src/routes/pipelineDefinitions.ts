@@ -55,7 +55,7 @@ import { getPipelineBridge } from '../pipeline/bridge-types';
 import { idempotency } from '../middleware/idempotency';
 import { generateDraftDefinition, InvalidInstructionError, PlannerUnavailableError } from '../pipeline/generate-definition';
 import type { LoopPlan } from '../chat/agentLoopPlanner';
-import { toolRequestingSteps, describeToolRequestingSteps } from '../pipeline/agent/userDefinitionPolicy';
+import { unapprovedToolSteps, describeToolRequestingSteps } from '../pipeline/agent/userDefinitionPolicy';
 
 const log = withContext({ route: 'pipelineDefinitions' });
 
@@ -424,17 +424,6 @@ pipelineDefinitionsRouter.put(
       return;
     }
 
-    // A definition a person writes carries no agent tools (userDefinitionPolicy.ts).
-    const toolSteps = toolRequestingSteps(def);
-    if (toolSteps.length > 0) {
-      res.status(400).json({
-        error: 'agent_tools_not_allowed',
-        detail: describeToolRequestingSteps(toolSteps),
-        steps: toolSteps,
-      });
-      return;
-    }
-
     // Read the existing def once — reused for (a) the audit BEFORE snapshot,
     // (b) the optimistic-lock check, and (c) authoritative version bumping.
     // (best-effort — read failure becomes a missing `before`, not a failure).
@@ -444,6 +433,19 @@ pipelineDefinitionsRouter.put(
     } catch {
       existing = null;
     }
+    // A definition a person writes carries no NEW agent tools
+    // (userDefinitionPolicy.ts): a tool step is kept only when the stored
+    // definition already has it, unchanged, on the devbox runtime.
+    const toolSteps = unapprovedToolSteps(def, existing);
+    if (toolSteps.length > 0) {
+      res.status(400).json({
+        error: 'agent_tools_not_allowed',
+        detail: describeToolRequestingSteps(toolSteps),
+        steps: toolSteps,
+      });
+      return;
+    }
+
     const beforeSnap = definitionSnapshot(existing);
 
     const existingVersion =

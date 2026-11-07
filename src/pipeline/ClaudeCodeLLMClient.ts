@@ -17,6 +17,7 @@
 // SIGTERM, then SIGKILL after a short grace.
 
 import { spawn } from 'node:child_process';
+import { buildCliChildEnv } from './cliChildEnv';
 import type { Readable } from 'node:stream';
 import type { ChildProcessByStdio } from 'node:child_process';
 import { withAbort } from 'distributed-core/common';
@@ -115,9 +116,11 @@ export class ClaudeCodeLLMClient implements LLMClient {
           // PIPELINE_LLM_DISABLE_THINKING=false to restore thinking.
           // Deliberately NOT applied to the agent client — agentic tool
           // loops are where reasoning earns its cost.
+          //
+          // Allowlisted, never the pod's environment (pipeline/cliChildEnv.ts).
           env: process.env['PIPELINE_LLM_DISABLE_THINKING'] === 'false'
-            ? process.env
-            : { ...process.env, MAX_THINKING_TOKENS: '0' },
+            ? buildCliChildEnv()
+            : { ...buildCliChildEnv(), MAX_THINKING_TOKENS: '0' },
         });
 
         const abortReg = signal

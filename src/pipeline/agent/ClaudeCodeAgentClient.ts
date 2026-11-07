@@ -54,6 +54,7 @@ import type { Readable } from 'node:stream';
 import type { ChildProcessByStdio } from 'node:child_process';
 import { withAbort } from 'distributed-core/common';
 import { describeClaudeCliFailure } from '../claudeCliErrors';
+import { buildCliChildEnv, CLI_CHILD_ENV_ALLOWLIST } from '../cliChildEnv';
 import type {
   AgentClient,
   AgentEvent,
@@ -186,53 +187,11 @@ export function buildAgentArgs(prompt: string, opts: AgentRunOptions = {}): stri
 }
 
 /**
- * The only environment variables the `claude` child receives.
- *
- * It used to inherit the pod's whole environment: the realtime JWT secret,
- * the admin token, AWS credentials. Anything the agent could run could read
- * them. Now it gets what the CLI needs to start (PATH, HOME for the mounted
- * session in ~/.claude, locale) and the model settings, and nothing else.
+ * The `claude` child's environment: the shared allowlist (pipeline/cliChildEnv.ts).
+ * Re-exported under the agent names its tests and callers already use.
  */
-export const AGENT_ENV_ALLOWLIST = [
-  'PATH',
-  'HOME',
-  'LANG',
-  'LC_ALL',
-  'TZ',
-  'TMPDIR',
-  'CLAUDE_CONFIG_DIR',
-  'CLAUDE_CODE_USE_BEDROCK',
-  'ANTHROPIC_MODEL',
-  'ANTHROPIC_SMALL_FAST_MODEL',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'DISABLE_TELEMETRY',
-  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
-  // Bedrock mode only: the CLI cannot pick a Bedrock endpoint without a
-  // region. These are the only AWS_* names that ever pass; credentials never do.
-  'AWS_REGION',
-  'AWS_DEFAULT_REGION',
-] as const;
-
-const BEDROCK_ONLY_ENV = new Set<string>(['AWS_REGION', 'AWS_DEFAULT_REGION']);
-
-/** Belt and braces: never pass a name that looks like a credential, even if allowlisted. */
-const NEVER_PASS = /SECRET|TOKEN|PASSWORD|CREDENTIAL|ACCESS_KEY/i;
-
-/** Pure: the child's environment from `source`. Exported for tests. */
-export function buildAgentEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const bedrock = source['CLAUDE_CODE_USE_BEDROCK'] === '1'
-    || source['CLAUDE_CODE_USE_BEDROCK']?.toLowerCase() === 'true';
-  const env: NodeJS.ProcessEnv = {};
-  for (const key of AGENT_ENV_ALLOWLIST) {
-    if (NEVER_PASS.test(key)) continue;
-    if (BEDROCK_ONLY_ENV.has(key) && !bedrock) continue;
-    const value = source[key];
-    if (typeof value === 'string') env[key] = value;
-  }
-  return env;
-}
+export const AGENT_ENV_ALLOWLIST = CLI_CHILD_ENV_ALLOWLIST;
+export const buildAgentEnv = buildCliChildEnv;
 
 /** How much raw stdout is kept for a process that never emitted an event. */
 export const MAX_STDOUT_TAIL_CHARS = 4_000;

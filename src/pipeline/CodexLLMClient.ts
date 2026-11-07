@@ -2,6 +2,7 @@
 // no token is extracted or sent to another provider. Requires Codex CLI 0.162.1+
 // controls verified by the meeting pipeline acceptance on October 10, 2026.
 import { spawn } from 'node:child_process';
+import { buildCliChildEnv } from './cliChildEnv';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -119,6 +120,8 @@ export class CodexLLMClient implements LLMClient {
       try {
         const child = spawn(process.env.CODEX_CLI_PATH || 'codex', codexSummaryArgs(directory, model), {
           cwd: directory, stdio: ['pipe', 'pipe', 'pipe'],
+          // Allowlisted, never the pod's environment (pipeline/cliChildEnv.ts).
+          env: buildCliChildEnv(),
         });
         let stopped: Error | undefined;
         let forceKill: NodeJS.Timeout | undefined;

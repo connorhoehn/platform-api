@@ -3,6 +3,42 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-07 — 0.1.1, security fixes (review packages 1 and 9)
+
+Fails closed where it used to fail open. **Deployments must set new env before
+taking this version**, or they lose Cognito sign-in, CORS, call lobbies and LVS
+admin calls.
+
+| Env | Needed by | Unset now means |
+|-----|-----------|-----------------|
+| `COGNITO_CLIENT_ID` | every deployment taking Cognito tokens (comma list of app client ids) | every Cognito token is refused (401); boot fails where `COGNITO_REQUIRED` applies |
+| `CORS_ALLOWED_ORIGINS` | any browser origin calling with credentials (comma list of exact origins) | no CORS grant for any origin |
+| `LOBBY_AUTHORITY_URL` | OrgIQ / Assessment calls (the BFF's `/api/realtime/lobby-access`) | every OrgIQ-token call lobby is refused; `LOBBY_AUTHORITY_REQUIRED` is now **on** unless set to `false` |
+| `VIDEO_ADMIN_TOKEN` (or `LVS_ADMIN_TOKEN`) | LVS admin calls, the recording webhook bootstrap, playback tokens, captions | no Authorization header (LVS refuses); the bootstrap skips; there is no `'admin'` default |
+| `INSECURE_DEV_MODE=true` | local development only, beside `SKIP_AUTH=true` | `SKIP_AUTH=true` without it refuses to start; never honoured with `NODE_ENV=production` |
+
+- **Image sets `NODE_ENV=production`.** A local container stack that wants
+  `SKIP_AUTH` must set `NODE_ENV=development` and `INSECURE_DEV_MODE=true`.
+- **Agent steps.** A pipeline definition a person writes (run trigger body, `PUT
+  /pipelines/defs/:id`) may not add or change agent steps that request tools
+  (400 `agent_tools_not_allowed`). A re-save keeps a tool step the stored
+  definition already has, unchanged, on `runtime: 'devbox'`. Tool-using steps run
+  only on devbox. The `claude` and `codex` children (agent, LLM, vision, Codex
+  summary) get an allowlisted environment (`src/pipeline/cliChildEnv.ts`): no
+  keys, tokens or secrets; in Bedrock mode the AWS credential-provider pointers
+  pass so the CLI can use the pod's role. `ANTHROPIC_API_KEY` is not passed:
+  local CLI auth is the mounted `~/.claude` session.
+- **Lobbies.** Every tenant-prefixed lobby needs the caller's partition, not only
+  `dm:` and `room:` shapes.
+- **Cognito.** Only ID tokens (`token_use: 'id'`) whose `aud` is in
+  `COGNITO_CLIENT_ID`; access tokens are refused.
+- **Admin.** `requireAdmin` compares in constant time, answers 401 for a missing
+  or wrong token (was 403 for wrong), and `SKIP_AUTH` no longer bypasses it.
+- **Media catalog.** Rows are per organisation (stored key `<orgId>#<hash>`;
+  the API's `fileId` stays the hash). Rows written before (bucket `all`) are no
+  longer returned; re-walk to rebuild. Batches: 20 per user per minute, 8 MB of
+  thumbnails per batch, 12mb body. The walker waits out a 429.
+
 ## 2026-11-04 — shared pipeline stack
 
 - **Pins.** `distributed-core` 0.48.0 → v0.50.1

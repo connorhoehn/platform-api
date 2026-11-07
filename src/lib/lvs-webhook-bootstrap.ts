@@ -18,8 +18,10 @@
  *   LVS_WEBHOOK_BOOTSTRAP_URL  — Where LVS should POST events. Skip if unset.
  *   LVS_WEBHOOK_SECRET         — HMAC secret (passed through to LVS for
  *                                 outbound signing).
+ *   VIDEO_ADMIN_TOKEN /
  *   LVS_ADMIN_TOKEN            — Auth for /api/event-subscriptions (LVS
- *                                 admin route). Defaults to 'admin' (Tilt).
+ *                                 admin route), first one set wins. No
+ *                                 default: unset skips the bootstrap.
  *   LVS_WEBHOOK_REBOOTSTRAP_MS — If >0, re-run the bootstrap on this
  *                                 interval. Default 30000 (30s). LVS
  *                                 keeps subscriptions in memory only —

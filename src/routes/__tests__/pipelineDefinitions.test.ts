@@ -257,6 +257,63 @@ describe('PUT /api/pipelines/defs/:pipelineId', () => {
     expect(mockPut).not.toHaveBeenCalled();
   });
 
+  // A generated pipeline (POST /generate) stores devbox agent steps WITH tools.
+  // Re-saving it from the editor must not 400; only new or changed tool steps do.
+  describe('re-saving a stored definition that already has devbox tool steps', () => {
+    const toolNode = (over: Record<string, unknown> = {}) => ({
+      id: 'loop-1', type: 'agent',
+      data: { type: 'agent', prompt: 'do the step', runtime: 'devbox', allowedTools: ['Read', 'Bash'], ...over },
+    });
+    const stored = { id: 'p-1', version: 3, nodes: [toolNode()], edges: [] };
+
+    it('accepts the unchanged tool step (prompt and layout edits are fine)', async () => {
+      mockGet.mockResolvedValue(stored);
+      const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', {
+        body: { id: 'p-1', nodes: [{ ...toolNode({ prompt: 'reworded' }), position: { x: 5, y: 5 } }], edges: [] },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(mockPut).toHaveBeenCalled();
+    });
+
+    it('refuses a changed tool list on a stored node', async () => {
+      mockGet.mockResolvedValue(stored);
+      const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', {
+        body: { id: 'p-1', nodes: [toolNode({ allowedTools: ['Read', 'Bash', 'Write'] })], edges: [] },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('refuses moving a stored tool step off the devbox runtime', async () => {
+      mockGet.mockResolvedValue(stored);
+      const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', {
+        body: { id: 'p-1', nodes: [toolNode({ runtime: 'local' })], edges: [] },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('refuses a new tool step beside the stored ones', async () => {
+      mockGet.mockResolvedValue(stored);
+      const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', {
+        body: { id: 'p-1', nodes: [toolNode(), toolNode({ id: undefined })].map((n, i) => (i === 1 ? { ...n, id: 'loop-new' } : n)), edges: [] },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toMatchObject({ steps: [{ nodeId: 'loop-new' }] });
+    });
+
+    it('refuses a tool step whose stored twin was not on devbox', async () => {
+      mockGet.mockResolvedValue({ ...stored, nodes: [toolNode({ runtime: 'local' })] });
+      const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', { body: { id: 'p-1', nodes: [toolNode()], edges: [] } });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('refuses when no definition is stored', async () => {
+      mockGet.mockResolvedValue(null);
+      const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', { body: { id: 'p-1', nodes: [toolNode()], edges: [] } });
+      expect(res.statusCode).toBe(400);
+    });
+  });
+
   it('accepts an agent step with no tools', async () => {
     const def = {
       id: 'p-1',

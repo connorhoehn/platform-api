@@ -13,7 +13,10 @@ const POD_ENV: NodeJS.ProcessEnv = {
   HOME: '/root',
   LANG: 'C.UTF-8',
   ANTHROPIC_MODEL: 'sonnet',
+  ANTHROPIC_BASE_URL: 'http://127.0.0.1:4000',
   CLAUDE_CODE_USE_BEDROCK: '0',
+  HTTPS_PROXY: 'http://proxy:3128',
+  NO_PROXY: 'localhost',
   REALTIME_JWT_SECRET: 'shh',
   ADMIN_TOKEN: 'admin-token',
   LVS_ADMIN_TOKEN: 'lvs',
@@ -22,10 +25,30 @@ const POD_ENV: NodeJS.ProcessEnv = {
   AWS_SECRET_ACCESS_KEY: 'secret',
   AWS_SESSION_TOKEN: 'session',
   AWS_REGION: 'us-east-1',
+  AWS_DEFAULT_REGION: 'us-east-1',
+  AWS_PROFILE: 'pod',
+  AWS_SDK_LOAD_CONFIG: '1',
   AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: '/v2/credentials/x',
+  AWS_CONTAINER_CREDENTIALS_FULL_URI: 'http://169.254.170.23/v1/credentials',
+  AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: '/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token',
+  AWS_WEB_IDENTITY_TOKEN_FILE: '/var/run/secrets/eks.amazonaws.com/serviceaccount/token',
+  AWS_ROLE_ARN: 'arn:aws:iam::123456789012:role/platform-api',
+  AWS_ROLE_SESSION_NAME: 'platform-api',
+  AWS_EC2_METADATA_DISABLED: 'false',
   DATABASE_URL: 'postgres://u:p@h/db',
   ANTHROPIC_API_KEY: 'sk-ant',
+  SOME_PASSWORD: 'pw',
 };
+
+/** The credential provider's pointers: where to get the task role, never the keys. */
+const PROVIDER_VARS = [
+  'AWS_REGION', 'AWS_DEFAULT_REGION', 'AWS_PROFILE', 'AWS_SDK_LOAD_CONFIG',
+  'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', 'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+  'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE', 'AWS_WEB_IDENTITY_TOKEN_FILE',
+  'AWS_ROLE_ARN', 'AWS_ROLE_SESSION_NAME', 'AWS_EC2_METADATA_DISABLED',
+];
+const NEVER = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'ANTHROPIC_API_KEY',
+  'REALTIME_JWT_SECRET', 'ADMIN_TOKEN', 'LVS_ADMIN_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'SOME_PASSWORD', 'DATABASE_URL'];
 
 describe('buildAgentEnv', () => {
   it('passes only allowlisted keys', () => {
@@ -38,24 +61,24 @@ describe('buildAgentEnv', () => {
       HOME: '/root',
       LANG: 'C.UTF-8',
       ANTHROPIC_MODEL: 'sonnet',
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:4000',
       CLAUDE_CODE_USE_BEDROCK: '0',
+      HTTPS_PROXY: 'http://proxy:3128',
+      NO_PROXY: 'localhost',
     });
   });
 
-  it('never passes anything named *SECRET*, *TOKEN* or AWS_* credentials', () => {
+  it('Bedrock mode gets the task-role provider variables and never a key, token or secret', () => {
     const env = buildAgentEnv({ ...POD_ENV, CLAUDE_CODE_USE_BEDROCK: '1' });
+    for (const key of PROVIDER_VARS) expect(env[key]).toBe(POD_ENV[key]);
+    for (const key of NEVER) expect(env[key]).toBeUndefined();
     for (const key of Object.keys(env)) {
-      expect(key).not.toMatch(/SECRET|TOKEN/);
-      if (key.startsWith('AWS_')) expect(['AWS_REGION', 'AWS_DEFAULT_REGION']).toContain(key);
+      if (/SECRET|TOKEN|PASSWORD/.test(key)) expect(key).toMatch(/_TOKEN_FILE$/);
     }
-    // Bedrock mode needs the region and nothing else from AWS_*.
-    expect(env.AWS_REGION).toBe('us-east-1');
-    expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
-    expect(env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI).toBeUndefined();
   });
 
-  it('drops the region outside Bedrock mode', () => {
-    expect(buildAgentEnv(POD_ENV).AWS_REGION).toBeUndefined();
+  it('outside Bedrock mode no AWS_* variable passes', () => {
+    expect(Object.keys(buildAgentEnv(POD_ENV)).filter((k) => k.startsWith('AWS_'))).toEqual([]);
   });
 });
 
