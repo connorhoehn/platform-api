@@ -70,6 +70,17 @@ Common environment variables:
   nothing falls back to a default.
 - `MESSAGE_QUEUE_URL` - message queue used for durable event delivery.
 - `VIDEO_API_URL` - the video streaming service that backs call sessions.
+- `VIDEO_SERVICE_TOKEN` - required for calls. The bearer for the video service's
+  `/api/sessions` routes; it must equal the video service's `LVS_SERVICE_TOKEN`.
+  Unset refuses every session create, join, refresh and end with a 503 before any
+  request is sent.
+- `VIDEO_OPS_TOKEN` (or `LVS_OPS_TOKEN`) - the bearer for webhook registration
+  (`/api/event-subscriptions`); falls back to `VIDEO_ADMIN_TOKEN` when the video
+  service has no `OPS_TOKEN`.
+- Video service side: it needs `LVS_SERVICE_TOKEN`, `ADMIN_TOKEN` (also the dashboard
+  subscribe) and `LVS_WEBHOOK_ALLOWED_HOSTS` (the host of `LVS_WEBHOOK_BOOTSTRAP_URL`
+  when it is private or loopback). Recording media URLs this API returns carry a
+  short-lived `?token=` playback token minted per channel with the admin token.
 - `PLATFORM_RUNTIME_PROFILE` - `local-ephemeral` (default) or `durable`; the durable
   profile refuses to start when required providers are missing.
 

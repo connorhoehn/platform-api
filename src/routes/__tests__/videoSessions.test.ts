@@ -195,6 +195,7 @@ function makeTimeoutError(): Error {
 }
 
 beforeEach(() => {
+  process.env.VIDEO_SERVICE_TOKEN = 'svc-test';
   mockCreateSession.mockReset().mockResolvedValue(undefined);
   mockHangoutBySlug.mockReset().mockResolvedValue(null);
   mockAddParticipant.mockReset().mockResolvedValue(undefined);
@@ -294,7 +295,7 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
       creatorId: 'alice',
       recordingConfiguration: { enabled: true, destination: 'local' },
     });
-    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer user-jwt');
+    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer svc-test');
   });
 
   it('findOrCreate hit: reuses DDB row when channelArn matches', async () => {
@@ -733,12 +734,16 @@ describe('POST /api/video/sessions (thin proxy → LVS)', () => {
     expect(res.statusCode).toBe(201);
   });
 
-  it('401 when Authorization header missing', async () => {
-    mockFetch.mockResolvedValue(lvsSessionCreated());
+  it('fails closed with 503 and makes no HTTP request when VIDEO_SERVICE_TOKEN is unset', async () => {
+    delete process.env.VIDEO_SERVICE_TOKEN;
+    mockFetch.mockClear();
     const res = await run(buildApp(), 'POST', '/api/video/sessions', {
+      headers: { authorization: 'Bearer user-jwt' },
       body: { documentId: 'doc-1' },
     });
-    expect(res.statusCode).toBe(401);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.stringify(res.body)).toContain('VIDEO_SERVICE_TOKEN');
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });
 
@@ -1231,6 +1236,7 @@ describe('POST /api/video/sessions/:sessionId/end — LVS authoritative path', (
       participants: [{ participantId: 'p-1' }, { participantId: 'p-2' }],
     });
     mockRemoveParticipant.mockResolvedValueOnce({ remaining: 1 });
+    delete process.env.VIDEO_SERVICE_TOKEN; // no service token: the record settles locally, LVS is not called
     mockFetch.mockResolvedValueOnce(apiOk({}));  // reap only (no LVS /end forward)
 
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/end', {
@@ -1478,6 +1484,7 @@ describe('POST /api/video/sessions/:sessionId/end — join/leave symmetry', () =
         { userId: 'alice', participantId: 'alice-t2', clientId: 'tab-2' },
       ],
     });
+    delete process.env.VIDEO_SERVICE_TOKEN;
     mockRemoveParticipant.mockResolvedValueOnce({ remaining: 1 });
     mockFetch.mockResolvedValue(apiOk({}));
 
@@ -1618,14 +1625,18 @@ describe('POST /api/video/sessions/:sessionId/refresh-token', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  it('401 when Authorization header missing (cannot forward to LVS)', async () => {
+  it('503 before any HTTP request when VIDEO_SERVICE_TOKEN is unset (refresh-token)', async () => {
+    delete process.env.VIDEO_SERVICE_TOKEN;
+    mockFetch.mockClear();
     mockGetSession.mockResolvedValue({
       sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
     });
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      headers: { authorization: 'Bearer user-jwt' },
       body: { documentId: 'doc-1', participantId: 'p-1' },
     });
-    expect(res.statusCode).toBe(401);
+    expect(res.statusCode).toBe(503);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('200 on happy path — forwards user auth + body to LVS, returns LVS response verbatim', async () => {
@@ -1948,11 +1959,6 @@ describe('NFR #175 — lobby access and participant binding', () => {
   it('a lobby member reads the session (200)', async () => {
     const res = await run(buildApp(), 'GET', '/api/video/sessions/vs-9?lobbyName=dm:alice:bob', { userId: 'bob', headers: auth });
     expect(res.statusCode).toBe(200);
-  });
-
-  it('join without a bearer is 401 even for a member', async () => {
-    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-9/join', { userId: 'bob', body: { lobbyName: 'dm:alice:bob' } });
-    expect(res.statusCode).toBe(401);
   });
 
   it('/end naming someone else\'s participant is 403 — and the session owner may clear it', async () => {

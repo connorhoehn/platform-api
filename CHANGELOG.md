@@ -3,6 +3,12 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-07 — 0.1.2, follows live-video-streaming's auth hardening
+
+- Recording media URLs (composed MP4, tracks, thumbnail, share playback) now end in `?token=<LVS playback token for that channel>`; treat those URLs as secrets.
+- **New required env `VIDEO_SERVICE_TOKEN`** (= LVS `LVS_SERVICE_TOKEN`): session create/join/refresh/end refuse with 503 when unset; the caller's bearer is no longer forwarded to LVS.
+- The webhook bootstrap sends `VIDEO_OPS_TOKEN`/`LVS_OPS_TOKEN` (admin token fallback) and logs a hint when LVS refuses the target (add its host to LVS `LVS_WEBHOOK_ALLOWED_HOSTS`).
+
 ## 2026-11-07 — 0.1.1, security fixes (review packages 1 and 9)
 
 Fails closed where it used to fail open. **Deployments must set new env before

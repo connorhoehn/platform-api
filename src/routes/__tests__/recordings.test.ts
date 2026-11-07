@@ -316,6 +316,55 @@ describe('GET /api/recordings/:recordingId', () => {
   });
 });
 
+describe('LVS media URLs carry a playback token for the recording channel', () => {
+  const ARN = 'arn:aws:ivs:us-east-1:1:channel/abc';
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  // Shaped like LVS's token: a JWT whose channelArn claim is the arn it was minted for.
+  const jwt = (arn: string) => `${b64({ alg: 'RS256' })}.${b64({ channelArn: arn, aud: 'playback' })}.sig`;
+  const row = {
+    recordingId: 'r-1', callId: 'c-1', channelArn: ARN, lobbyName: 'doc-1',
+    startedAt: '2026-05-30T00:00:00Z', endedAt: '2026-05-30T00:30:00Z',
+    composeStatus: 'ok', composedSegment: { key: 'x/r-1/composed.mp4' },
+    thumbnailUrl: `/api/channels/${encodeURIComponent(ARN)}/recordings/r-1/thumbnail.jpg`,
+    tracks: [{ key: 'x/r-1/peer_leg-001.mp4', userId: 'u-1' }],
+  };
+  const claimOf = (url: string) => {
+    const tok = new URL(url).searchParams.get('token')!;
+    return JSON.parse(Buffer.from(tok.split('.')[1], 'base64url').toString()).channelArn;
+  };
+
+  it('GET detail: composedUrl, track urls and thumbnail all carry a token minted for that arn', async () => {
+    givenRecording(row);
+    mockCallSfu.mockResolvedValue(lvsOk({ token: jwt(ARN), expiresAt: '2026-05-30T01:00:00Z' }));
+    const res = await run('GET', '/api/recordings/r-1');
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { composedUrl: string; playlistUrl: string; thumbnailUrl: string; tracks: Array<{ url: string }> };
+    for (const u of [body.composedUrl, body.playlistUrl, body.thumbnailUrl, body.tracks[0].url]) {
+      expect(u).toContain('https://public.video.test/api/channels/');
+      expect(claimOf(u)).toBe(ARN);
+    }
+    expect(mockCallSfu).toHaveBeenCalledTimes(1);
+    expect(mockCallSfu.mock.calls[0][0]).toBe(`https://video.test/api/channels/${encodeURIComponent(ARN)}/playback-tokens`);
+  });
+
+  it('GET detail: when LVS refuses the mint the URLs go out untokened', async () => {
+    givenRecording(row);
+    mockCallSfu.mockResolvedValue(lvsFail(403));
+    const res = await run('GET', '/api/recordings/r-1');
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { composedUrl: string }).composedUrl).not.toContain('token=');
+  });
+
+  it('POST playback-token: composedUrl and playlistUrl carry the minted token for that arn', async () => {
+    givenRecording(row);
+    mockCallSfu.mockResolvedValue(lvsOk({ token: jwt(ARN), expiresAt: '2026-05-30T01:00:00Z' }));
+    const res = await run('POST', '/api/recordings/r-1/playback-token');
+    const body = res.body as { composedUrl: string; playlistUrl: string; token: string };
+    expect(claimOf(body.composedUrl)).toBe(ARN);
+    expect(new URL(body.playlistUrl).searchParams.get('token')).toBe(body.token);
+  });
+});
+
 describe('POST /api/recordings/:recordingId/playback-token', () => {
   const matchDetail = {
     recordingId: 'r-1',
@@ -349,8 +398,9 @@ describe('POST /api/recordings/:recordingId/playback-token', () => {
     expect(body.expiresAt).toBe('2026-05-30T01:00:00Z');
     expect(body.playlistUrl).toContain('https://public.video.test/api/channels/');
     // Direct-MP4 playback (composed-url flow): playlistUrl points at the LVS
-    // segments route with no token query param — the token rides separately
-    // in body.token for private-channel callers.
+    // segments route and, since LVS 3a36786, carries ?token=<playback token>
+    // (a <video src> cannot send headers); body.token is the same value.
+    expect(body.playlistUrl).toContain('?token=tok');
     expect(body.playlistUrl).toContain('/recordings/r-1/segments/');
     expect((res.body as { composedUrl: string }).composedUrl).toBe(body.playlistUrl);
 

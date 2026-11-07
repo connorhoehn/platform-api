@@ -184,6 +184,7 @@ function makeTimeoutError(): Error {
 }
 
 beforeEach(() => {
+  process.env.VIDEO_SERVICE_TOKEN = 'svc-test';
   mockCreateSession.mockReset().mockResolvedValue(undefined);
   mockAddParticipant.mockReset().mockResolvedValue(undefined);
   mockAddOrReplaceParticipant.mockReset().mockResolvedValue({ displaced: [], remaining: 1 });

@@ -69,4 +69,33 @@ describe('bootstrapLvsWebhook dedup', () => {
     const [, postCall] = fetchMock.mock.calls;
     expect(postCall[1].method).toBe('POST');
   });
+
+  it('sends the ops token (not the admin token) when one is configured', async () => {
+    process.env.VIDEO_OPS_TOKEN = 'lvs-ops-test';
+    fetchMock.mockResolvedValueOnce(jsonRes([])).mockResolvedValueOnce(jsonRes({ id: 'sub-9' }, 201));
+    await bootstrapLvsWebhook();
+    for (const [, init] of fetchMock.mock.calls) {
+      expect((init as RequestInit).headers).toMatchObject({ Authorization: 'Bearer lvs-ops-test' });
+    }
+  });
+
+  it('logs the allowlist hint when LVS refuses the target host, without the token', async () => {
+    const logger = jest.requireMock('../logger').default;
+    logger.error.mockClear();
+    fetchMock
+      .mockResolvedValueOnce(jsonRes([]))
+      .mockResolvedValueOnce(jsonRes({ error: 'webhook target resolves to a loopback address' }, 400));
+    await bootstrapLvsWebhook();
+    const msgs = logger.error.mock.calls.map((c: unknown[]) => String(c[1]));
+    expect(msgs.join('\n')).toContain('LVS_WEBHOOK_ALLOWED_HOSTS');
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('lvs-admin-test');
+  });
+
+  it('logs a credential-or-allowlist hint on 403', async () => {
+    const logger = jest.requireMock('../logger').default;
+    logger.error.mockClear();
+    fetchMock.mockResolvedValueOnce(jsonRes([])).mockResolvedValueOnce(jsonRes({ error: 'forbidden' }, 403));
+    await bootstrapLvsWebhook();
+    expect(String(logger.error.mock.calls[0][1])).toContain('LVS_WEBHOOK_ALLOWED_HOSTS');
+  });
 });

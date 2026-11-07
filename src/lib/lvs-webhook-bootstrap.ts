@@ -18,10 +18,16 @@
  *   LVS_WEBHOOK_BOOTSTRAP_URL  — Where LVS should POST events. Skip if unset.
  *   LVS_WEBHOOK_SECRET         — HMAC secret (passed through to LVS for
  *                                 outbound signing).
- *   VIDEO_ADMIN_TOKEN /
- *   LVS_ADMIN_TOKEN            — Auth for /api/event-subscriptions (LVS
- *                                 admin route), first one set wins. No
- *                                 default: unset skips the bootstrap.
+ *   VIDEO_OPS_TOKEN /
+ *   LVS_OPS_TOKEN              — Auth for /api/event-subscriptions. LVS puts
+ *                                 it behind opsAuth (OPS_TOKEN, or ADMIN_TOKEN
+ *                                 when LVS has no OPS_TOKEN), so when neither
+ *                                 ops var is set here the admin token
+ *                                 (VIDEO_ADMIN_TOKEN / LVS_ADMIN_TOKEN) is sent.
+ *                                 No default: all unset skips the bootstrap.
+ *   (LVS side)                 — LVS_WEBHOOK_ALLOWED_HOSTS must list the host
+ *                                 of LVS_WEBHOOK_BOOTSTRAP_URL when that host is
+ *                                 private/loopback (e.g. a compose service name).
  *   LVS_WEBHOOK_REBOOTSTRAP_MS — If >0, re-run the bootstrap on this
  *                                 interval. Default 30000 (30s). LVS
  *                                 keeps subscriptions in memory only —
@@ -35,12 +41,25 @@
 import log from './logger';
 import { lvsAdminToken } from './lvsAdminToken';
 
+/** The ops credential LVS's opsAuth expects; the admin token only when no ops token is configured. */
+function opsToken(): string | undefined {
+  for (const name of ['VIDEO_OPS_TOKEN', 'LVS_OPS_TOKEN']) {
+    const v = process.env[name]?.trim();
+    if (v) return v;
+  }
+  return lvsAdminToken(['VIDEO_ADMIN_TOKEN', 'LVS_ADMIN_TOKEN']);
+}
+
 const FILTER = 'IVS Recording State Change';
 
 interface ExistingSubscription {
   id?: string;
   url?: string;
   filter?: string;
+}
+
+function hostOf(u: string): string {
+  try { return new URL(u).host; } catch { return '(invalid url)'; }
 }
 
 export async function bootstrapLvsWebhook(): Promise<void> {
@@ -55,9 +74,9 @@ export async function bootstrapLvsWebhook(): Promise<void> {
   }
   // Fail closed: without a configured admin token there is nothing to
   // register with — never fall back to a guessable literal.
-  const adminToken = lvsAdminToken(['VIDEO_ADMIN_TOKEN', 'LVS_ADMIN_TOKEN']);
+  const adminToken = opsToken();
   if (!adminToken) {
-    log.error('[lvs-webhook-bootstrap] skipping — VIDEO_ADMIN_TOKEN / LVS_ADMIN_TOKEN not set');
+    log.error('[lvs-webhook-bootstrap] skipping — VIDEO_OPS_TOKEN / LVS_OPS_TOKEN (or VIDEO_ADMIN_TOKEN / LVS_ADMIN_TOKEN) not set');
     return;
   }
   const headers = {
@@ -116,6 +135,20 @@ export async function bootstrapLvsWebhook(): Promise<void> {
     });
     if (!postRes.ok) {
       const text = await postRes.text().catch(() => '');
+      if (postRes.status === 400 && /webhook|loopback|private|link-local|reserved|resolve/i.test(text)) {
+        log.error(
+          { status: postRes.status, receiverHost: hostOf(receiverUrl), reason: text.slice(0, 200) },
+          '[lvs-webhook-bootstrap] LVS refused the webhook target — add its host to LVS_WEBHOOK_ALLOWED_HOSTS on the video service',
+        );
+        return;
+      }
+      if (postRes.status === 401 || postRes.status === 403) {
+        log.error(
+          { status: postRes.status, receiverHost: hostOf(receiverUrl), reason: text.slice(0, 200) },
+          '[lvs-webhook-bootstrap] LVS refused the credential or the target — check VIDEO_OPS_TOKEN matches LVS OPS_TOKEN, and that the target host is in LVS_WEBHOOK_ALLOWED_HOSTS',
+        );
+        return;
+      }
       log.error(
         { status: postRes.status, body: text.slice(0, 200) },
         '[lvs-webhook-bootstrap] subscription POST failed',

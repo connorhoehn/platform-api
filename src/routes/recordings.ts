@@ -52,6 +52,7 @@ import { askLobbyAuthority } from '../lib/lobbyAuthority';
 import { hasControlChar } from '../lib/controlChars';
 import type { RecordingListRow } from '../repositories/CallRecordingRepository';
 import { lvsAdminAuthHeader } from '../lib/lvsAdminToken';
+import { mintLvsPlaybackToken, withPlaybackToken } from '../lib/lvsPlaybackToken';
 
 export const recordingsRouter = Router();
 installRecordingStatusRoute(recordingsRouter, { authorize: requireOwnRecording });
@@ -499,7 +500,11 @@ recordingsRouter.get(
     const media = await resolveMedia(detail);
     await recheckRecordingDocument(req, detail);
     res.setHeader('Cache-Control', 'private, no-store');
-    res.json({ ...publicRecordingView(detail), ...mediaView(detail, media) });
+    // LVS media GETs need a channel credential; a <video src>/<img src> can
+    // only carry it as ?token=, so mint one scoped to this recording's arn.
+    const minted = media.playbackFilename || detail.tracks?.length || detail.thumbnailUrl
+      ? await mintLvsPlaybackToken(detail.channelArn) : null;
+    res.json({ ...publicRecordingView(detail, minted?.token), ...mediaView(detail, media, minted?.token) });
   }),
 );
 
@@ -517,9 +522,10 @@ recordingsRouter.get(
 function mediaView(
   detail: CallRecording,
   media: { composeStatus: ComposeStatus; mediaState: string; playbackFilename: string | null },
+  playbackToken?: string | null,
 ): Record<string, unknown> {
   const url = media.playbackFilename
-    ? `${VIDEO_PUBLIC_URL}/api/channels/${encodeURIComponent(detail.channelArn)}/recordings/${encodeURIComponent(detail.recordingId)}/segments/${encodeURIComponent(media.playbackFilename)}`
+    ? withPlaybackToken(`${VIDEO_PUBLIC_URL}/api/channels/${encodeURIComponent(detail.channelArn)}/recordings/${encodeURIComponent(detail.recordingId)}/segments/${encodeURIComponent(media.playbackFilename)}`, playbackToken)
     : null;
   return {
     composeStatus: media.composeStatus,
@@ -577,7 +583,7 @@ export function recordingArtifactContext(lobbyName: unknown, documentContext?: {
     ? { tenant: 'assessment', documentSourceId: documentContext.sourceId } : null;
 }
 
-function publicRecordingView(detail: CallRecording): Record<string, unknown> {
+function publicRecordingView(detail: CallRecording, playbackToken?: string | null): Record<string, unknown> {
   const people = reconcileParticipants({
     participants: detail.participants,
     tracks: detail.tracks,
@@ -594,11 +600,12 @@ function publicRecordingView(detail: CallRecording): Record<string, unknown> {
     // The row's ttl is when DynamoDB drops it — which is when the recording
     // expires, and what the card's "Set to expire" line says.
     expiresAt: detail.ttl ? new Date(detail.ttl * 1000).toISOString() : null,
-    thumbnailUrl: detail.thumbnailUrl && detail.thumbnailUrl.startsWith('/') ? `${VIDEO_PUBLIC_URL}${detail.thumbnailUrl}` : detail.thumbnailUrl,
+    thumbnailUrl: detail.thumbnailUrl && detail.thumbnailUrl.startsWith('/') ? withPlaybackToken(`${VIDEO_PUBLIC_URL}${detail.thumbnailUrl}`, playbackToken) : detail.thumbnailUrl,
     tracks: publicizeTracks(detail.tracks, {
       channelArn: detail.channelArn,
       recordingId: detail.recordingId,
       publicBaseUrl: VIDEO_PUBLIC_URL,
+      playbackToken,
     }),
     // `tracks[]` was scrubbed; `composedSegment` was not, and it carries the
     // same recorder-pod absolute path in `.url`. Measured on a live row: a
@@ -750,7 +757,7 @@ recordingsRouter.post(
     // `composedUrl` because RecordingPlayer reads that name.
     await recheckRecordingDocument(req, detail);
     res.json({
-      ...mediaView(detail, media),
+      ...mediaView(detail, media, token),
       token: token || null,
       expiresAt: expiresAt || null,
     });
@@ -838,8 +845,9 @@ recordingsRouter.get(
     // every share link minted since then pointed at nothing. Same resolution
     // as the authed route, so the two cannot drift apart again.
     const media = await resolveMedia(detail);
+    const minted = media.playbackFilename ? await mintLvsPlaybackToken(detail.channelArn) : null;
     res.json({
-      ...mediaView(detail, media),
+      ...mediaView(detail, media, minted?.token),
       expiresAt: link.expiresAt,
     });
   }),

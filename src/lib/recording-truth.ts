@@ -1,3 +1,4 @@
+import { withPlaybackToken } from './lvsPlaybackToken';
 // lib/recording-truth.ts
 //
 // Three pure derivations that decide what a recording row is ALLOWED to
@@ -371,7 +372,7 @@ function parseIso(v: string | null | undefined): number | null {
  */
 export function publicizeTracks<T extends TruthTrack>(
   tracks: T[] | null | undefined,
-  opts: { channelArn: string; recordingId: string; publicBaseUrl: string },
+  opts: { channelArn: string; recordingId: string; publicBaseUrl: string; playbackToken?: string | null },
 ): Array<Omit<T, 'file'>> {
   if (!Array.isArray(tracks)) return [];
   const base = (opts.publicBaseUrl || '').replace(/\/+$/, '');
@@ -379,7 +380,7 @@ export function publicizeTracks<T extends TruthTrack>(
     const { file: _file, ...rest } = t as TruthTrack & { file?: unknown };
     const filename = trackFilename(t);
     const url = filename
-      ? `${base}/api/channels/${encodeURIComponent(opts.channelArn)}/recordings/${encodeURIComponent(opts.recordingId)}/segments/${encodeURIComponent(filename)}`
+      ? withPlaybackToken(`${base}/api/channels/${encodeURIComponent(opts.channelArn)}/recordings/${encodeURIComponent(opts.recordingId)}/segments/${encodeURIComponent(filename)}`, opts.playbackToken)
       : undefined;
     const out = { ...rest } as Record<string, unknown>;
     if (url) out.url = url;
