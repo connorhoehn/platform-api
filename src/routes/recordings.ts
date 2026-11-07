@@ -20,7 +20,7 @@
 
 import { Router, Request, Response } from 'express';
 import { installRecordingStatusRoute } from './recordingStatus';
-import { startRecordingTranscription, CALL_TRANSCRIPTION_PIPELINE_ID } from '../recordings/recordingPipelines';
+import { startRecordingTranscription, CALL_TRANSCRIPTION_PIPELINE_ID, renderRecordingCard } from '../recordings/recordingPipelines';
 import { randomUUID, randomBytes } from 'crypto';
 import { PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { requireAuth } from '../middleware/auth';
@@ -52,7 +52,7 @@ import { askLobbyAuthority } from '../lib/lobbyAuthority';
 import { hasControlChar } from '../lib/controlChars';
 import type { RecordingListRow } from '../repositories/CallRecordingRepository';
 import { lvsAdminAuthHeader } from '../lib/lvsAdminToken';
-import { mintLvsPlaybackToken, withPlaybackToken } from '../lib/lvsPlaybackToken';
+import { mintLvsPlaybackToken, mintRecordingTokens, RECORDING_TOKEN_TTL_SECONDS, withPlaybackToken } from '../lib/lvsPlaybackToken';
 
 export const recordingsRouter = Router();
 installRecordingStatusRoute(recordingsRouter, { authorize: requireOwnRecording });
@@ -105,7 +105,7 @@ recordingsRouter.get(
         const { items, cursor: next } = await callRecordingRepo.listByUser(userId, { limit, cursor });
         const visible = await documentReadableList(req, items.filter(row => row.lobbyName === lobbyName));
         const settled = await settleComposeForList(visible);
-        res.json({ items: withListView(await documentReadableList(req, settled)), cursor: next ?? null });
+        res.json({ items: await withListTokens(withListView(await documentReadableList(req, settled))), cursor: next ?? null });
         return;
       }
       const tenant = tenantOf(req.user?.orgId);
@@ -152,15 +152,29 @@ recordingsRouter.get(
         },
       });
       const { items, cursor: next } = await callRecordingRepo.listByLobbyName(lobbyName, limit, cursor);
-      res.json({ items: withListView(await settleComposeForList(items)), cursor: next ?? null });
+      res.json({ items: await withListTokens(withListView(await settleComposeForList(items))), cursor: next ?? null });
       return;
     }
 
     const { items, cursor: next } = await callRecordingRepo.listByUser(userId, { limit, cursor });
     const settled = await settleComposeForList(await documentReadableList(req, items));
-    res.json({ items: withListView(await documentReadableList(req, settled)), cursor: next ?? null });
+    res.json({ items: await withListTokens(withListView(await documentReadableList(req, settled))), cursor: next ?? null });
   }),
 );
+
+/**
+ * List rows carry the thumbnail as an LVS path a browser cannot fetch without
+ * a credential. Mint one token per channel on this read and put it on the
+ * row's `thumbnailUrl`; nothing is stored.
+ */
+async function withListTokens<T extends { channelArn?: string; thumbnailUrl?: string }>(rows: T[]): Promise<T[]> {
+  const withThumb = rows.filter((r) => r.channelArn && r.thumbnailUrl && r.thumbnailUrl.startsWith('/'));
+  if (withThumb.length === 0) return rows;
+  const tokens = await mintRecordingTokens(withThumb.map((r) => r.channelArn!));
+  return rows.map((r) => (r.channelArn && r.thumbnailUrl && r.thumbnailUrl.startsWith('/')
+    ? { ...r, thumbnailUrl: withPlaybackToken(`${VIDEO_PUBLIC_URL}${r.thumbnailUrl}`, tokens.get(r.channelArn)) }
+    : r));
+}
 
 /** What a list row says beyond the stored fields: the stage and the expiry, as the detail does. */
 function withListView<T extends { ttl?: number; lobbyName?: string; documentContext?: CallRecording['documentContext']; composeStatus?: ComposeStatus; transcriptStatus?: CallRecording['transcriptStatus']; summaryStatus?: CallRecording['summaryStatus'] }>(rows: T[]): Array<T & { stage: ReturnType<typeof recordingStage>; expiresAt: string | null }> {
@@ -503,7 +517,7 @@ recordingsRouter.get(
     // LVS media GETs need a channel credential; a <video src>/<img src> can
     // only carry it as ?token=, so mint one scoped to this recording's arn.
     const minted = media.playbackFilename || detail.tracks?.length || detail.thumbnailUrl
-      ? await mintLvsPlaybackToken(detail.channelArn) : null;
+      ? await mintLvsPlaybackToken(detail.channelArn, RECORDING_TOKEN_TTL_SECONDS) : null;
     res.json({ ...publicRecordingView(detail, minted?.token), ...mediaView(detail, media, minted?.token) });
   }),
 );
@@ -668,7 +682,7 @@ recordingsRouter.post(
 
     // Mint an LVS playback token. We hit LVS as the authoritative
     // signer; LVS validates the channel's `authorized` flag and
-    // returns a JWT with 1-hour TTL.
+    // returns a JWT with a 24-hour TTL (LVS's cap).
     //
     // Auth: post-Wave-7 thin-proxy migration LVS no longer returns a
     // streamKey on POST /api/sessions, so the DDB row's streamKey is
@@ -695,7 +709,7 @@ recordingsRouter.post(
         {
           method: 'POST',
           headers,
-          body: JSON.stringify({ ttlSeconds: 3600 }),
+          body: JSON.stringify({ ttlSeconds: RECORDING_TOKEN_TTL_SECONDS }),
         },
       );
       if (!lvsRes.ok) {
@@ -811,6 +825,22 @@ recordingsRouter.post(
   }),
 );
 
+// GET /api/recordings/:recordingId/card — the recording chat card's thumbnail,
+// tokenised on read. The stored message carries the bare URL; the client asks
+// here for a fresh one when it renders the card.
+recordingsRouter.get(
+  '/recordings/:recordingId/card',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    const detail = await requireOwnRecording(req, req.params.recordingId);
+    await recheckRecordingDocument(req, detail);
+    res.setHeader('Cache-Control', 'private, no-store');
+    const minted = detail.thumbnailUrl ? await mintLvsPlaybackToken(detail.channelArn, RECORDING_TOKEN_TTL_SECONDS) : null;
+    const stored = detail.thumbnailUrl && detail.thumbnailUrl.startsWith('/') ? `${VIDEO_PUBLIC_URL}${detail.thumbnailUrl}` : detail.thumbnailUrl;
+    res.json(renderRecordingCard({ kind: 'recording', recordingId: detail.recordingId, ...(stored ? { thumbnailUrl: stored } : {}) }, minted?.token));
+  }),
+);
+
 // GET /api/recordings/share/:shareToken/playback — unauthed access via
 // a valid share-token. Returns the same playlistUrl shape as the
 // authed playback-token endpoint.
@@ -845,7 +875,7 @@ recordingsRouter.get(
     // every share link minted since then pointed at nothing. Same resolution
     // as the authed route, so the two cannot drift apart again.
     const media = await resolveMedia(detail);
-    const minted = media.playbackFilename ? await mintLvsPlaybackToken(detail.channelArn) : null;
+    const minted = media.playbackFilename ? await mintLvsPlaybackToken(detail.channelArn, RECORDING_TOKEN_TTL_SECONDS) : null;
     res.json({
       ...mediaView(detail, media, minted?.token),
       expiresAt: link.expiresAt,

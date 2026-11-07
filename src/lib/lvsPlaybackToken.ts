@@ -10,6 +10,9 @@ import { callSfu } from './sfu-breaker';
 import { lvsAdminAuthHeader } from './lvsAdminToken';
 import log from './logger';
 
+/** LVS caps playback tokens at 24 h. Recording links get copied into documents, so they get the cap. */
+export const RECORDING_TOKEN_TTL_SECONDS = 24 * 60 * 60;
+
 export interface LvsPlaybackToken { token: string; expiresAt: string }
 
 /** Mint a playback token for one channel arn; null (and a warning without the token) when LVS cannot. */
@@ -36,4 +39,18 @@ export async function mintLvsPlaybackToken(channelArn: string, ttlSeconds = 3600
 export function withPlaybackToken<T extends string | null | undefined>(url: T, token?: string | null): T {
   if (!url || !token) return url;
   return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` as T;
+}
+
+/** At most this many distinct channels get a token per list page; the rest go out untokened. */
+export const MAX_LIST_TOKEN_CHANNELS = 20;
+
+/** One recording-lifetime token per distinct arn (bounded, in parallel); arns LVS refuses are absent. */
+export async function mintRecordingTokens(arns: Iterable<string>): Promise<Map<string, string>> {
+  const unique = Array.from(new Set(Array.from(arns).filter(Boolean))).slice(0, MAX_LIST_TOKEN_CHANNELS);
+  const out = new Map<string, string>();
+  await Promise.all(unique.map(async (arn) => {
+    const minted = await mintLvsPlaybackToken(arn, RECORDING_TOKEN_TTL_SECONDS);
+    if (minted) out.set(arn, minted.token);
+  }));
+  return out;
 }

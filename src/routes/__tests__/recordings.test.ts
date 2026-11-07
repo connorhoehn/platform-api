@@ -355,6 +355,69 @@ describe('LVS media URLs carry a playback token for the recording channel', () =
     expect((res.body as { composedUrl: string }).composedUrl).not.toContain('token=');
   });
 
+  // A stand-in for LVS: honours ttlSeconds, so exp is real and each mint differs.
+  let mintSeq = 0;
+  const lvsMinting = () => mockCallSfu.mockImplementation(async (url: string, init: { body?: string }) => {
+    const arn = decodeURIComponent(String(url).split('/api/channels/')[1].split('/playback-tokens')[0]);
+    const ttl = JSON.parse(init.body ?? '{}').ttlSeconds as number;
+    const t = `${b64({ alg: 'RS256' })}.${b64({ channelArn: arn, n: ++mintSeq, exp: 1_000_000 + ttl, iat: 1_000_000 })}.sig`;
+    return lvsOk({ token: t, expiresAt: '' });
+  });
+  const claims = (url: string) => JSON.parse(Buffer.from(new URL(url).searchParams.get('token')!.split('.')[1], 'base64url').toString());
+
+  it('GET detail: the token has a 24 hour expiry, differs per read, and is never written to the row', async () => {
+    givenRecording(row);
+    lvsMinting();
+    const a = (await run('GET', '/api/recordings/r-1')).body as { composedUrl: string };
+    const b = (await run('GET', '/api/recordings/r-1')).body as { composedUrl: string };
+    const ca = claims(a.composedUrl);
+    expect(ca.exp - ca.iat).toBe(24 * 3600);
+    expect(ca.channelArn).toBe(ARN);
+    expect(new URL(a.composedUrl).searchParams.get('token')).not.toBe(new URL(b.composedUrl).searchParams.get('token'));
+    expect(JSON.stringify(row)).not.toContain('token=');
+    expect(mockUpdateComposeState).not.toHaveBeenCalled();
+  });
+
+  it('GET share playback: minted with the 24 hour ttl', async () => {
+    givenRecording(row);
+    lvsMinting();
+    mockDocClientSend.mockResolvedValue({ Item: { recordingId: 'r-1', callId: 'c-1', channelArn: ARN, expiresAt: '2999-01-01T00:00:00Z' } });
+    mockGetRecording.mockResolvedValue(row);
+    const res = await run('GET', '/api/recordings/share/tok-1/playback');
+    const c = claims((res.body as { composedUrl: string }).composedUrl);
+    expect(c.exp - c.iat).toBe(24 * 3600);
+  });
+
+  it('GET list: rows with a thumbnail carry a token for their own channel arn', async () => {
+    const ARN2 = 'arn:aws:ivs:us-east-1:1:channel/def';
+    const thumb = (arn: string) => `/api/channels/${encodeURIComponent(arn)}/recordings/r/thumbnail.jpg`;
+    mockListByUser.mockResolvedValue({ items: [
+      { ...row, recordingId: 'r-1', thumbnailUrl: thumb(ARN) },
+      { ...row, recordingId: 'r-2', channelArn: ARN2, thumbnailUrl: thumb(ARN2) },
+      { ...row, recordingId: 'r-3', thumbnailUrl: undefined },
+    ] });
+    lvsMinting();
+    const res = await run('GET', '/api/recordings');
+    const items = (res.body as { items: Array<{ thumbnailUrl?: string }> }).items;
+    expect(claims(items[0].thumbnailUrl!).channelArn).toBe(ARN);
+    expect(claims(items[1].thumbnailUrl!).channelArn).toBe(ARN2);
+    expect(items[0].thumbnailUrl).toContain('https://public.video.test/api/channels/');
+    expect(items[2].thumbnailUrl).toBeUndefined();
+  });
+
+  it('chat card: stored metadata has no token; the card rendered on read does, for the right arn', async () => {
+    const { recordingCardMetadata } = jest.requireActual('../../recordings/recordingPipelines');
+    const stored = recordingCardMetadata({ recordingId: 'r-1', callId: 'c-1', composeStatus: 'ok', detail: { thumbnailUrl: row.thumbnailUrl } }, 'run-1');
+    expect(JSON.stringify(stored)).not.toContain('token');
+    givenRecording(row);
+    lvsMinting();
+    const res = await run('GET', '/api/recordings/r-1/card');
+    const card = res.body as { thumbnailUrl: string };
+    expect(claims(card.thumbnailUrl).channelArn).toBe(ARN);
+    expect(claims(card.thumbnailUrl).exp - claims(card.thumbnailUrl).iat).toBe(24 * 3600);
+    expect(JSON.stringify(stored)).not.toContain('token');
+  });
+
   it('POST playback-token: composedUrl and playlistUrl carry the minted token for that arn', async () => {
     givenRecording(row);
     mockCallSfu.mockResolvedValue(lvsOk({ token: jwt(ARN), expiresAt: '2026-05-30T01:00:00Z' }));

@@ -157,6 +157,7 @@ const lvsAuth = (): Record<string, string> => lvsAdminAuthHeader(['LVS_ADMIN_TOK
 // document calls too); re-exported so existing importers keep their path.
 import { chatChannelForLobby } from './lobbyChannel';
 import { lvsAdminAuthHeader } from '../lib/lvsAdminToken';
+import { withPlaybackToken } from '../lib/lvsPlaybackToken';
 export { chatChannelForLobby };
 
 /**
@@ -551,6 +552,12 @@ export function recordingCardMetadata(ctx: Record<string, unknown>, runId: strin
     ? `Recording could not be processed (compose ${String(ctx.composeStatus)})`
     : `Recording${durationMs > 0 ? ` — ${formatDurationMs(durationMs)}` : ''}`;
   return { message, metadata };
+}
+
+/** The card as a client renders it: the stored metadata plus a token on the thumbnail. Never written back. */
+export function renderRecordingCard(metadata: Record<string, unknown>, playbackToken?: string | null): Record<string, unknown> {
+  const thumb = typeof metadata.thumbnailUrl === 'string' ? metadata.thumbnailUrl : undefined;
+  return thumb ? { ...metadata, thumbnailUrl: withPlaybackToken(thumb, playbackToken) } : { ...metadata };
 }
 
 function announceHandler(): DescribedStepHandler {

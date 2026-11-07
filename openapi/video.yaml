@@ -322,6 +322,25 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /recordings/{recordingId}/card:
+    parameters:
+      - $ref: '#/components/parameters/RecordingIdPath'
+    get:
+      tags: [recordings]
+      summary: Recording chat card thumbnail with a fresh playback token
+      description: |
+        The stored chat card carries the bare thumbnail URL. This returns the
+        card fields with a 24 hour playback token added, minted on every read
+        and never stored.
+      operationId: getRecordingCard
+      responses:
+        '200':
+          description: Card metadata with a tokenised thumbnailUrl
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /recordings/{recordingId}/share:
     parameters:
       - $ref: '#/components/parameters/RecordingIdPath'

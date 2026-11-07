@@ -141,6 +141,11 @@ startEventLoopMetrics();
 
 const server = app.listen(Number(port), () => {
   log.info({ port }, 'platform-api listening');
+  // Catalog rows from before org scoping: stamp the walker's org, or log how many stay hidden.
+  void import('./media/backfillOrg.js').then(async ({ backfillMediaOrg }) => {
+    const { mediaCatalogRepo } = await import('./repositories/index.js');
+    await backfillMediaOrg(mediaCatalogRepo, log);
+  }).catch((e: any) => log.warn({ err: e?.message ?? e }, 'media orgId backfill failed'));
   // Register the LVS recording webhook subscription on boot so
   // recording.completed events flow into /hooks/lvs/recording → DDB.
   // Idempotent + non-fatal — failures log and the recording pipeline

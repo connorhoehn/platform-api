@@ -157,6 +157,7 @@ export const ACCESS_ALLOWLIST: Record<string, string> = {
     'POST /api/recordings/:recordingId/share',
     'GET /api/recordings/:recordingId/transcript',
     'GET /api/recordings/:recordingId/summary',
+    'GET /api/recordings/:recordingId/card',
     'DELETE /api/recordings/:recordingId',
   ]),
   ...each('public: an unexpired share token is the grant (link holders)', [

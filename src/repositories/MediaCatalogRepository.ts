@@ -15,7 +15,7 @@
 // before this (bucket `all`, no `orgId`) belong to no org and are never
 // returned; re-walk to rebuild them.
 
-import { BatchWriteCommand, DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { BatchWriteCommand, DynamoDBDocumentClient, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { BaseRepository } from './BaseRepository';
 import { tableName } from '../lib/ddb-table-name';
 
@@ -141,5 +141,23 @@ export class MediaCatalogRepository extends BaseRepository {
       ScanIndexForward: true,
     }));
     return ((out.Items ?? []) as MediaCatalogRow[]).filter((r) => r.orgId === orgId).map(toPublicRow);
+  }
+
+  /** One bounded page of rows that carry no `orgId` (written before org scoping), for the startup backfill. */
+  async listUnscoped(limit: number, cursor?: Record<string, unknown>): Promise<{ items: MediaCatalogRow[]; cursor: Record<string, unknown> | undefined }> {
+    const out = await this.docClient.send(new ScanCommand({
+      TableName: this.tableName,
+      FilterExpression: 'attribute_not_exists(orgId)',
+      Limit: limit,
+      ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+    }));
+    return { items: (out.Items ?? []) as MediaCatalogRow[], cursor: out.LastEvaluatedKey as Record<string, unknown> | undefined };
+  }
+
+  /** Re-key an org-less row into `orgId`'s catalog: write the scoped row, then drop the old one. */
+  async adoptRow(row: MediaCatalogRow, orgId: string): Promise<void> {
+    const contentId = row.contentId ?? row.fileId;
+    await this.putItem({ ...row, fileId: catalogKey(orgId, contentId), contentId, orgId, bucket: orgId });
+    await this.deleteItem({ fileId: row.fileId });
   }
 }

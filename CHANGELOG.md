@@ -3,6 +3,10 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-07 — 0.1.4, media org backfill and 24 hour recording tokens
+
+- At startup, catalog rows with no `orgId` are stamped with the walker's org when exactly one is configured (`MEDIA_WALKER_ORG_ID`; `default-org` under the insecure dev switch), in batches of 100; otherwise the count of hidden rows is logged once. Recording playback tokens are now minted for 24 hours (LVS's cap) on every read of the detail, list, share and new `GET /api/recordings/:id/card` routes, list rows and the chat card get a tokenised `thumbnailUrl` on read, and no token is ever stored.
+
 ## 2026-11-07 — 0.1.3, response security headers (fix package 20)
 
 - Every response now carries nosniff, `Referrer-Policy: strict-origin-when-cross-origin`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, a minimal Permissions-Policy and CORP `same-site`; `X-Powered-By` is removed. HSTS is sent over TLS (`req.secure`, or `x-forwarded-proto: https` with `TRUST_PROXY=1`). No new dependency.
