@@ -282,6 +282,27 @@ describe('POST /pipelines/:pipelineId/runs (trigger)', () => {
     }
   });
 
+  test('refuses an inline definition whose agent step requests Bash, and starts nothing', async () => {
+    const trigger = jest.fn(async () => ({ runId: 'bridge-run-tools' }));
+    setPipelineBridge({ trigger, getRun: async () => null, getHistory: async () => [], resolveApproval: async () => {} } as PipelineBridge);
+    const app = buildApp();
+    const res = await run(app, 'POST', '/pipelines/p1/runs', {
+      body: {
+        definition: {
+          id: 'p1',
+          nodes: [
+            { id: 'trigger', type: 'trigger', data: { type: 'trigger' } },
+            { id: 'shell', type: 'action', data: { type: 'agent', prompt: 'env', runtime: 'devbox', allowedTools: ['Bash(env:*)'] } },
+          ],
+          edges: [],
+        },
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.stringify(res.body)).toMatch(/tools/i);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+
   test('forwards to bridge.trigger when wired', async () => {
     const trigger = jest.fn(async () => ({ runId: 'bridge-run-1' }));
     const bridge: PipelineBridge = {

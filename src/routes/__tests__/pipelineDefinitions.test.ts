@@ -240,6 +240,33 @@ describe('PUT /api/pipelines/defs/:pipelineId', () => {
     }));
   });
 
+  // A user-written agent step may not ask for tools (security review §8,
+  // package 1): the tool list reached `claude --tools` in this container.
+  it('rejects an agent step requesting Bash as 400 and stores nothing', async () => {
+    const def = {
+      id: 'p-1',
+      nodes: [
+        { id: 'trigger', type: 'trigger', data: { type: 'trigger' } },
+        { id: 'a1', type: 'agent', data: { type: 'agent', prompt: 'run it', allowedTools: ['Bash'] } },
+      ],
+      edges: [],
+    };
+    const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', { body: def });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toMatchObject({ error: 'agent_tools_not_allowed', steps: [{ nodeId: 'a1', tools: ['Bash'] }] });
+    expect(mockPut).not.toHaveBeenCalled();
+  });
+
+  it('accepts an agent step with no tools', async () => {
+    const def = {
+      id: 'p-1',
+      nodes: [{ id: 'a1', type: 'agent', data: { type: 'agent', prompt: 'summarise', allowedTools: [] } }],
+      edges: [],
+    };
+    const res = await run(buildApp(), 'PUT', '/api/pipelines/defs/p-1', { body: def });
+    expect(res.statusCode).toBe(200);
+  });
+
   it('preserves existing webhook secret', async () => {
     const def = {
       id: 'p-1',

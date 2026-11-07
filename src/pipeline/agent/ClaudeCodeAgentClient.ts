@@ -185,6 +185,55 @@ export function buildAgentArgs(prompt: string, opts: AgentRunOptions = {}): stri
   return args;
 }
 
+/**
+ * The only environment variables the `claude` child receives.
+ *
+ * It used to inherit the pod's whole environment: the realtime JWT secret,
+ * the admin token, AWS credentials. Anything the agent could run could read
+ * them. Now it gets what the CLI needs to start (PATH, HOME for the mounted
+ * session in ~/.claude, locale) and the model settings, and nothing else.
+ */
+export const AGENT_ENV_ALLOWLIST = [
+  'PATH',
+  'HOME',
+  'LANG',
+  'LC_ALL',
+  'TZ',
+  'TMPDIR',
+  'CLAUDE_CONFIG_DIR',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'DISABLE_TELEMETRY',
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  // Bedrock mode only: the CLI cannot pick a Bedrock endpoint without a
+  // region. These are the only AWS_* names that ever pass; credentials never do.
+  'AWS_REGION',
+  'AWS_DEFAULT_REGION',
+] as const;
+
+const BEDROCK_ONLY_ENV = new Set<string>(['AWS_REGION', 'AWS_DEFAULT_REGION']);
+
+/** Belt and braces: never pass a name that looks like a credential, even if allowlisted. */
+const NEVER_PASS = /SECRET|TOKEN|PASSWORD|CREDENTIAL|ACCESS_KEY/i;
+
+/** Pure: the child's environment from `source`. Exported for tests. */
+export function buildAgentEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const bedrock = source['CLAUDE_CODE_USE_BEDROCK'] === '1'
+    || source['CLAUDE_CODE_USE_BEDROCK']?.toLowerCase() === 'true';
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of AGENT_ENV_ALLOWLIST) {
+    if (NEVER_PASS.test(key)) continue;
+    if (BEDROCK_ONLY_ENV.has(key) && !bedrock) continue;
+    const value = source[key];
+    if (typeof value === 'string') env[key] = value;
+  }
+  return env;
+}
+
 /** How much raw stdout is kept for a process that never emitted an event. */
 export const MAX_STDOUT_TAIL_CHARS = 4_000;
 
@@ -249,6 +298,8 @@ export class ClaudeCodeAgentClient implements AgentClient {
           stdio: ['ignore', 'pipe', 'pipe'],
           // New process group so a Bash tool's grandchildren die with us.
           detached: true,
+          // Allowlisted, never inherited (see AGENT_ENV_ALLOWLIST).
+          env: buildAgentEnv(),
           ...(opts.cwd ? { cwd: opts.cwd } : {}),
         });
 

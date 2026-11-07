@@ -39,6 +39,7 @@ import { pipelineRunReviewRouter } from './pipelineRunReview';
 import { workSourceAccountRepo } from '../repositories';
 import { assertRunAccess, canSeeRun, isTrustedServiceCall, requireRunAccess } from '../pipeline/runAccess';
 import { markAccess } from '../middleware/resource-access';
+import { toolRequestingSteps, describeToolRequestingSteps } from '../pipeline/agent/userDefinitionPolicy';
 
 export { classifyPipelineError, type ErrorCategory };
 export {
@@ -298,6 +299,13 @@ export async function triggerPipelineRun(input: {
   const { pipelineId, userId, organizationId, body, reqLog } = input;
   if (input.runId !== undefined && !CALLER_RUN_ID.test(input.runId)) {
     throw new ValidationError('runId must be 8–128 of [A-Za-z0-9_-]');
+  }
+  // An inline definition is the caller's own JSON: it carries no agent tools
+  // (userDefinitionPolicy.ts). Stored and system definitions are not checked
+  // here; AgentStepHandler keeps any tool use on the devbox runtime.
+  if (body.definition) {
+    const toolSteps = toolRequestingSteps(body.definition);
+    if (toolSteps.length > 0) throw new ValidationError(describeToolRequestingSteps(toolSteps));
   }
   // The trigger payload becomes the run's context, and step handlers act
   // AS `context.requestedBy` (the deck steps write revisions with it and

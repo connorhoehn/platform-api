@@ -255,6 +255,24 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
       // Which runtime runs it. Absent means 'local', so nothing written
       // before the devbox runtime existed changes behaviour.
       const runtime: 'local' | 'devbox' = data.runtime === 'devbox' ? 'devbox' : 'local';
+
+      // DEFAULT-DENY. Absent/empty allowlist means no tools at all, and
+      // the output says so via `toolless` rather than looking like a
+      // run that simply chose not to use one.
+      const allowedTools = Array.isArray(data.allowedTools) ? data.allowedTools : [];
+      const toolless = isToolless(allowedTools);
+
+      // TOOLS RUN IN THE MICROVM, NEVER IN THIS POD. A local agent step is
+      // `claude -p` inside platform-api, next to its secrets and credentials;
+      // a Bash tool there was a shell in the service (security review,
+      // 6 November 2026). So a step that asks for tools runs on the devbox
+      // runtime or not at all.
+      if (runtime === 'local' && !toolless) {
+        return {
+          status: 'failed',
+          error: 'agent step requests tools, and tool-using agent steps run only on the devbox runtime (set runtime: \'devbox\')',
+        };
+      }
       const client = runtime === 'devbox' ? opts.devboxAgentClient : opts.agentClient;
       if (!client) {
         return { status: 'failed', error: 'devbox runtime unavailable: no devbox agent client is configured' };
@@ -307,12 +325,6 @@ export function createAgentStepHandler(opts: AgentStepHandlerOpts): StepHandler 
       const timeoutMs = Number.isFinite(data.timeoutMs) && (data.timeoutMs as number) > 0
         ? (data.timeoutMs as number)
         : DEFAULT_TIMEOUT_MS;
-
-      // DEFAULT-DENY. Absent/empty allowlist means no tools at all, and
-      // the output says so via `toolless` rather than looking like a
-      // run that simply chose not to use one.
-      const allowedTools = Array.isArray(data.allowedTools) ? data.allowedTools : [];
-      const toolless = isToolless(allowedTools);
 
       let toolCalls: AgentToolCall[] = [];
       let text = '';

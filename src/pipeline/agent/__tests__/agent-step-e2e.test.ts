@@ -26,7 +26,8 @@ import type { PipelineEventMap } from 'distributed-core/applications/pipeline';
 import type { PipelineNode, StepHandlerHelpers } from 'distributed-core/applications/pipeline';
 
 import { createAgentStepHandler } from '../AgentStepHandler';
-import { ClaudeCodeAgentClient, buildAgentArgs } from '../ClaudeCodeAgentClient';
+import { ClaudeCodeAgentClient, buildAgentArgs, AGENT_ENV_ALLOWLIST } from '../ClaudeCodeAgentClient';
+import type { AgentClient } from '../types';
 import type { AgentStepOutput } from '../types';
 import { RunPersistenceService } from '../../runPersistence';
 import type { PipelineRunRepository, PipelineRunItem } from '../../../repositories/PipelineRunRepository';
@@ -56,12 +57,15 @@ function useStub(opts: {
   fixture?: string;
   argvFile?: string;
   pidFile?: string;
+  envFile?: string;
 }): void {
   const lit = (v: string | undefined): string => (v === undefined ? 'null' : JSON.stringify(v));
   const src = `#!/usr/bin/env node
 const fs = require('fs');
 const argvOut = ${lit(opts.argvFile)};
 if (argvOut) fs.writeFileSync(argvOut, JSON.stringify(process.argv.slice(2)));
+const envOut = ${lit(opts.envFile)};
+if (envOut) fs.writeFileSync(envOut, JSON.stringify(Object.keys(process.env)));
 const pidOut = ${lit(opts.pidFile)};
 if (pidOut) fs.writeFileSync(pidOut, String(process.pid));
 
@@ -113,6 +117,21 @@ function makeHelpers(emitted: Emitted[], signal?: AbortSignal): StepHandlerHelpe
   };
 }
 
+/**
+ * Tool-using agent steps run only on the devbox runtime (AgentStepHandler).
+ * The tool-trace tests below still exercise the REAL CLI client and parser,
+ * so they hand it to the handler as the devbox client and mark the node
+ * `runtime: 'devbox'`; the local slot is a client that must never be called.
+ */
+const localNeverCalled: AgentClient = {
+  provider: 'claude-code',
+  run: () => { throw new Error('the local runtime must not run a tool-using step'); },
+} as unknown as AgentClient;
+
+function toolTraceHandler(): ReturnType<typeof createAgentStepHandler> {
+  return createAgentStepHandler({ agentClient: localNeverCalled, devboxAgentClient: new ClaudeCodeAgentClient() });
+}
+
 function agentNode(data: Record<string, unknown>): PipelineNode {
   return {
     id: 'agent-1',
@@ -130,12 +149,13 @@ describe('agent step — tool use trace', () => {
     const argvFile = join(workDir, 'argv-1.json');
     useStub({ fixture: FIXTURE, argvFile });
 
-    const handler = createAgentStepHandler({ agentClient: new ClaudeCodeAgentClient() });
+    const handler = toolTraceHandler();
     const emitted: Emitted[] = [];
     const outcome = await handler.execute(
       agentNode({
         prompt: 'Read {{ context.target }} and report the secret word.',
         allowedTools: ['Read'],
+        runtime: 'devbox',
       }),
       { target: '/tmp/agentprobe/secret.txt' },
       makeHelpers(emitted),
@@ -201,10 +221,10 @@ describe('agent step — trace persistence round-trip', () => {
   it('persists toolCalls through pipeline:step:completed and returns them from the run read path', async () => {
     useStub({ fixture: FIXTURE });
 
-    const handler = createAgentStepHandler({ agentClient: new ClaudeCodeAgentClient() });
+    const handler = toolTraceHandler();
     const emitted: Emitted[] = [];
     const outcome = await handler.execute(
-      agentNode({ prompt: 'read the file', allowedTools: ['Read'] }),
+      agentNode({ prompt: 'read the file', allowedTools: ['Read'], runtime: 'devbox' }),
       {},
       makeHelpers(emitted),
     );
@@ -304,14 +324,31 @@ describe('agent step — safety', () => {
       ].join('\n'),
       'utf8',
     );
-    useStub({ fixture: tooLessFixture, argvFile });
+    const envFile = join(workDir, 'env-toolless.json');
+    useStub({ fixture: tooLessFixture, argvFile, envFile });
 
+    const planted = ['REALTIME_JWT_SECRET', 'ADMIN_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'];
+    for (const key of planted) process.env[key] = 'must-not-reach-the-child';
     const handler = createAgentStepHandler({ agentClient: new ClaudeCodeAgentClient() });
-    const outcome = await handler.execute(
-      agentNode({ prompt: 'do a thing' }), // NO allowedTools
-      {},
-      makeHelpers([]),
-    );
+    let outcome: Awaited<ReturnType<typeof handler.execute>>;
+    try {
+      outcome = await handler.execute(
+        agentNode({ prompt: 'do a thing' }), // NO allowedTools
+        {},
+        makeHelpers([]),
+      );
+    } finally {
+      for (const key of planted) delete process.env[key];
+    }
+
+    // The child's environment is the allowlist, not the pod's.
+    const childEnv = JSON.parse(readFileSync(envFile, 'utf8')) as string[];
+    for (const key of planted) expect(childEnv).not.toContain(key);
+    // macOS adds __CF_USER_TEXT_ENCODING to every process it starts.
+    const osAdded = new Set(['__CF_USER_TEXT_ENCODING']);
+    for (const key of childEnv.filter((k) => !osAdded.has(k))) {
+      expect(AGENT_ENV_ALLOWLIST as readonly string[]).toContain(key);
+    }
 
     const out = outcome.output as AgentStepOutput;
     expect(out.toolless).toBe(true);
@@ -354,7 +391,7 @@ describe('agent step — safety', () => {
     const handler = createAgentStepHandler({ agentClient: new ClaudeCodeAgentClient() });
     const started = Date.now();
     const outcome = await handler.execute(
-      agentNode({ prompt: 'stall', allowedTools: ['Read'], timeoutMs: 1500 }),
+      agentNode({ prompt: 'stall', timeoutMs: 1500 }),
       {},
       makeHelpers([]),
     );
@@ -401,7 +438,7 @@ describe('agent step — safety', () => {
 
     const handler = createAgentStepHandler({ agentClient: new ClaudeCodeAgentClient() });
     const outcome = await handler.execute(
-      agentNode({ prompt: 'loop', allowedTools: ['Read'], maxTurns: 3 }),
+      agentNode({ prompt: 'loop', maxTurns: 3 }),
       {},
       makeHelpers([]),
     );
