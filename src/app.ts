@@ -3,6 +3,7 @@ import { requestContextMiddleware } from '@connorhoehn/service-runtime';
 import { requireDocumentPolicy } from './middleware/document-policy';
 import { requireAuth } from './middleware/auth';
 import { corsMiddleware } from './middleware/cors';
+import { securityHeaders } from './middleware/security-headers';
 import { serviceOnBehalfOf } from './middleware/serviceOnBehalfOf';
 import { requestLogger } from './middleware/request-logger';
 import { httpMetrics } from './middleware/http-metrics';
@@ -42,10 +43,14 @@ export function shouldParseJsonBody(url: string, contentType: string): boolean {
 
 export function createApp(): express.Application {
   const app = express();
+  app.disable('x-powered-by');
 
   // Request context — must be FIRST so X-Correlation-ID and AsyncLocalStorage
   // context are available to all downstream middleware and route handlers.
   app.use(requestContextMiddleware());
+
+  // Security headers on every response, including 404s and errors.
+  app.use(securityHeaders());
 
   // CORS — only origins in CORS_ALLOWED_ORIGINS (loopback dev servers in
   // insecure dev mode). See middleware/cors.ts.

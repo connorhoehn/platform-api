@@ -3,6 +3,10 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-07 — 0.1.3, response security headers (fix package 20)
+
+- Every response now carries nosniff, `Referrer-Policy: strict-origin-when-cross-origin`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, a minimal Permissions-Policy and CORP `same-site`; `X-Powered-By` is removed. HSTS is sent over TLS (`req.secure`, or `x-forwarded-proto: https` with `TRUST_PROXY=1`). No new dependency.
+
 ## 2026-11-07 — 0.1.2, follows live-video-streaming's auth hardening
 
 - Recording media URLs (composed MP4, tracks, thumbnail, share playback) now end in `?token=<LVS playback token for that channel>`; treat those URLs as secrets.
