@@ -1,3 +1,4 @@
+import { skipAuthEnabled } from '../lib/insecureDevMode';
 import { Router } from 'express';
 import { randomUUID } from 'crypto';
 import { getCorrelationId } from '@connorhoehn/service-runtime';
@@ -1396,7 +1397,7 @@ function requireApprovalAccess() {
       const listed = userApprovers.some((a) => a.value === userId || a.userId === userId);
       if (listed) { next(); return; }
       await assertRunAccess(req, undefined, runId, userApprovers.length > 0 ? 'read' : 'owner');
-      if (userApprovers.length > 0 && process.env.SKIP_AUTH !== 'true') {
+      if (userApprovers.length > 0 && !skipAuthEnabled()) {
         res.status(403).json({ error: 'not authorized to resolve this approval step' });
         return;
       }
@@ -1502,7 +1503,7 @@ pipelineApprovalsRouter.post(
       }
       // Authorization, from the run's own definition snapshot (the same rule
       // the local path applies from the executor's queue).
-      if (process.env.SKIP_AUTH !== 'true') {
+      if (!skipAuthEnabled()) {
         const node = approvalNodeOf(item.definitionSnapshot, body.stepId);
         const userApprovers = (node?.approvers ?? []).filter((a) => a.type === 'user');
         if (userApprovers.length > 0 && !userApprovers.some((a) => a.value === userId || a.userId === userId)) {
@@ -1554,7 +1555,7 @@ pipelineApprovalsRouter.post(
     // In dev (SKIP_AUTH=true) the approver UUID baked into the pipeline
     // definition is rarely the operator's own dev userId, so the check
     // below would 403 every legitimate dev approval. Bypass it.
-    if (bridge.getPendingApprovals && process.env.SKIP_AUTH !== 'true') {
+    if (bridge.getPendingApprovals && !skipAuthEnabled()) {
       let rows: PendingApprovalRow[] = [];
       try {
         rows = await Promise.resolve(bridge.getPendingApprovals());

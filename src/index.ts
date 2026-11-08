@@ -42,7 +42,8 @@ import { createPipelineConfigRegistration } from './control-plane/pipeline-confi
 import { createFileUploadEndpointRegistration } from './control-plane/file-upload-subscriber';
 import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
 import { definitionsRepo } from './pipeline/definitions-repository';
-import { assertSkipAuthAllowed } from './lib/insecureDevMode';
+import { announceInsecureDevMode } from '@connorhoehn/service-runtime';
+import { assertSkipAuthAllowed, requiredGateEnv } from './lib/insecureDevMode';
 
 const port = process.env.PORT ?? '3001';
 
@@ -67,6 +68,7 @@ const port = process.env.PORT ?? '3001';
 // process refuses to start rather than serve every request unverified.
 try {
   assertSkipAuthAllowed();
+  announceInsecureDevMode();
 } catch (err) {
   log.fatal({ reason: (err as Error).message }, 'refusing to start');
   process.exit(2);
@@ -92,6 +94,7 @@ void assertRequiredInProd(
   },
   {
     requiredEnvVar: 'COGNITO_REQUIRED',
+    env: requiredGateEnv('COGNITO_REQUIRED'),
     logger: log,
   },
 );
@@ -101,7 +104,7 @@ void assertRequiredInProd(
 if (process.env.ACTIVE_NOW_WORK_GRAPH_ENABLED === 'true') {
   void assertRequiredInProd(
     { name: 'ddb-work-graph', ping: () => ensureWorkGraphTable(ddbClient) },
-    { requiredEnvVar: 'WORK_GRAPH_DDB_REQUIRED', logger: log },
+    { requiredEnvVar: 'WORK_GRAPH_DDB_REQUIRED', env: requiredGateEnv('WORK_GRAPH_DDB_REQUIRED'), logger: log },
   );
 }
 
@@ -118,12 +121,9 @@ void assertRequiredInProd(
       const missing: string[] = [];
       if (!process.env.LVS_WEBHOOK_SECRET) missing.push('LVS_WEBHOOK_SECRET');
       if (!process.env.VIDEO_ADMIN_TOKEN) missing.push('VIDEO_ADMIN_TOKEN');
-      // Skip the SKIP_AUTH=true escape hatch in prod — it makes every
-      // request authenticate as decoded-but-unverified-JWT, breaking
-      // every authorization invariant downstream.
-      if (process.env.SKIP_AUTH === 'true') {
-        throw new Error('SKIP_AUTH=true is not allowed in production');
-      }
+      // SKIP_AUTH=true makes every request authenticate as a decoded-but-unverified
+      // JWT; the shared gate refuses it in production and without INSECURE_DEV_MODE.
+      assertSkipAuthAllowed();
       if (missing.length > 0) {
         throw new Error(`video/recording env vars missing: ${missing.join(', ')}`);
       }
@@ -131,6 +131,7 @@ void assertRequiredInProd(
   },
   {
     requiredEnvVar: 'VIDEO_SECRETS_REQUIRED',
+    env: requiredGateEnv('VIDEO_SECRETS_REQUIRED'),
     logger: log,
   },
 );
@@ -198,6 +199,7 @@ void assertRequiredInProd(
   },
   {
     requiredEnvVar: 'DDB_TTL_REQUIRED',
+    env: requiredGateEnv('DDB_TTL_REQUIRED'),
     logger: log,
   },
 );
@@ -216,6 +218,7 @@ if (videoStoreMode === 'ddb') {
     },
     {
       requiredEnvVar: 'DDB_TTL_REQUIRED',
+      env: requiredGateEnv('DDB_TTL_REQUIRED'),
       logger: log,
     },
   );
@@ -232,6 +235,7 @@ void assertRequiredInProd(
   },
   {
     requiredEnvVar: 'DDB_TTL_REQUIRED',
+    env: requiredGateEnv('DDB_TTL_REQUIRED'),
     logger: log,
   },
 );
@@ -245,6 +249,7 @@ void assertRequiredInProd(
   },
   {
     requiredEnvVar: 'DDB_TTL_REQUIRED',
+    env: requiredGateEnv('DDB_TTL_REQUIRED'),
     logger: log,
   },
 );
@@ -255,6 +260,7 @@ void assertRequiredInProd(
   },
   {
     requiredEnvVar: 'DDB_TTL_REQUIRED',
+    env: requiredGateEnv('DDB_TTL_REQUIRED'),
     logger: log,
   },
 );

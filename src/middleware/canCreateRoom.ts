@@ -7,8 +7,9 @@
  * default-allow. We expose a single function the host process can
  * override via `setCanCreateRoomHook(fn)` at bootstrap.
  *
- * Default: open (returns true) — matches dev (SKIP_AUTH=true) and any
- * production deployment that hasn't wired a stricter policy yet.
+ * Default rule (installed at module load, so every process has it): the
+ * caller must have a user id and an org id, and the anonymous `dev-user`
+ * identity counts only under INSECURE_DEV_MODE.
  *
  * Failure mode: if the hook throws (e.g. transient downstream lookup
  * error), we fail CLOSED (return false). This is the safer default for
@@ -16,12 +17,20 @@
  * silent denials.
  */
 
+import { insecureDevMode } from '../lib/insecureDevMode';
+
 export type CanCreateRoomHook = (
   userId: string,
   orgId: string,
 ) => boolean | Promise<boolean>;
 
-let hook: CanCreateRoomHook = () => true; // default open
+export const defaultCanCreateRoomRule: CanCreateRoomHook = (userId, orgId) => {
+  if (!userId || !orgId) return false;
+  if (userId === 'dev-user') return insecureDevMode();
+  return true;
+};
+
+let hook: CanCreateRoomHook = defaultCanCreateRoomRule;
 
 /**
  * Replace the active permission hook. Call this once at process bootstrap
@@ -33,11 +42,11 @@ export function setCanCreateRoomHook(fn: CanCreateRoomHook): void {
 }
 
 /**
- * Reset to the default open policy. Test-only convenience so suites can
+ * Reset to the default rule. Test-only convenience so suites can
  * isolate from each other without leaking hook state.
  */
 export function resetCanCreateRoomHook(): void {
-  hook = () => true;
+  hook = defaultCanCreateRoomRule;
 }
 
 /**

@@ -15,6 +15,7 @@
 //     room is declared as the run's own artifact (`artifacts[]`, the same
 //     declaration the deck step makes) instead of a fabricated attendance.
 
+import { skipAuthEnabled } from '../lib/insecureDevMode';
 import type { PipelineNode, StepHandlerHelpers, StepOutcome } from 'distributed-core/applications/pipeline';
 import type { DescribedStepHandler } from '../pipeline/customStepHandlers';
 import { hangoutRoomRepo, hangoutRoomMemberRepo, profileRepo, teamRepo } from '../repositories';
@@ -67,7 +68,7 @@ export function resolveOrganization(context: Record<string, unknown>): { organiz
   if (declared) return { organizationId: declared };
   const configured = str(process.env.WORK_GRAPH_ORG) ?? str(process.env.DEFAULT_ORG_ID);
   if (configured) return { organizationId: configured, notice: `The run named no organization, so the room was made in ${configured}.` };
-  if (process.env.SKIP_AUTH === 'true') {
+  if (skipAuthEnabled()) {
     return { organizationId: DEV_ORG_ID, notice: `The run named no organization, so the room was made in ${DEV_ORG_ID}.` };
   }
   return {};

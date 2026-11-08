@@ -18,6 +18,7 @@
  * (see routes/lvsWebhooks.ts). This file is purely read + token-mint.
  */
 
+import { skipAuthEnabled } from '../lib/insecureDevMode';
 import { Router, Request, Response } from 'express';
 import { installRecordingStatusRoute } from './recordingStatus';
 import { startRecordingTranscription, CALL_TRANSCRIPTION_PIPELINE_ID, renderRecordingCard } from '../recordings/recordingPipelines';
@@ -131,7 +132,7 @@ recordingsRouter.get(
         // fallback there would fold every org-less token into one tenant,
         // which lib/org-claim.ts warns about at length.
         const lookupOrgId = req.user?.orgId
-          ?? (process.env.SKIP_AUTH === 'true' ? 'default-org' : '');
+          ?? (skipAuthEnabled() ? 'default-org' : '');
         const room = await hangoutRoomRepo.getRoomBySlug(lookupOrgId, slug).catch(() => null);
         if (room) {
           visibility = (room as { visibility?: string }).visibility;

@@ -1,3 +1,4 @@
+import { insecureDevMode } from '../lib/insecureDevMode';
 import type { Request, Response, NextFunction } from 'express';
 import type { DocumentGrantClaims, DocumentGrantOperation } from '@connorhoehn/realtime-modules/server';
 import {
@@ -74,10 +75,10 @@ export function createDocumentPolicy(options: {
 }
 
 /** Installed before every /documents/:documentId route, including formerly
- * anonymous workflow reads. Local fixture auth is available only outside prod. */
+ * anonymous workflow reads. Local fixture auth is available only under INSECURE_DEV_MODE. */
 export async function requireDocumentPolicy(req: Request, res: Response, next: NextFunction): Promise<void> {
   const configured = Boolean(process.env.DOCUMENT_GRANT_ISSUER || process.env.DOCUMENT_GRANT_PUBLIC_KEY || process.env.DOCUMENT_GRANT_KEY_ID);
-  if (!configured && process.env.NODE_ENV !== 'production' && process.env.DOCUMENT_AUTH_MODE !== 'grants') {
+  if (!configured && insecureDevMode() && process.env.DOCUMENT_AUTH_MODE !== 'grants') {
     next();
     return;
   }

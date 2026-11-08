@@ -37,6 +37,7 @@
  *     hatch model closes that gap.
  */
 
+import { skipAuthEnabled } from '../lib/insecureDevMode';
 import { Router, Request, Response } from 'express';
 import { createHmac, timingSafeEqual } from 'crypto';
 import {
@@ -131,7 +132,7 @@ function currentSecret(): string {
 }
 
 function isDevSkipAuth(): boolean {
-  return process.env.SKIP_AUTH === 'true';
+  return skipAuthEnabled();
 }
 
 interface HmacVerifyResult {

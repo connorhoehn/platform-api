@@ -23,6 +23,7 @@
  * the persistent-metadata layer on top.
  */
 
+import { skipAuthEnabled } from '../lib/insecureDevMode';
 import { mayUsePartition, requestedPartition } from '../lib/partition';
 import { Router, Request, Response } from 'express';
 import {
@@ -160,7 +161,7 @@ function resolveOrgId(req: Request): string {
     return named;
   }
   if (user?.orgId) return user.orgId;
-  if (process.env.SKIP_AUTH === 'true') return DEFAULT_ORG_ID;
+  if (skipAuthEnabled()) return DEFAULT_ORG_ID;
   throw new ValidationError('orgId is required (missing from auth context)');
 }
 

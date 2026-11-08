@@ -24,6 +24,7 @@
 //
 // Code parity with platform-api/src/routes/judgments.ts.
 
+import { insecureDevMode } from '../lib/insecureDevMode';
 import { Router, raw, json as jsonBody } from 'express';
 import { randomUUID } from 'crypto';
 import sharp from 'sharp';
@@ -213,7 +214,7 @@ imagesRouter.post(
 // to bypass — used in tests + dev. Production should keep it false.
 // ---------------------------------------------------------------------------
 
-const ALLOW_INTERNAL_IMAGE_FETCH = process.env['ALLOW_INTERNAL_IMAGE_FETCH'] === 'true';
+const ALLOW_INTERNAL_IMAGE_FETCH = process.env['ALLOW_INTERNAL_IMAGE_FETCH'] === 'true' && insecureDevMode();
 const URL_FETCH_TIMEOUT_MS = 5000;
 
 /**

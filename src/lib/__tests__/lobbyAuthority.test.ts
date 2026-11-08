@@ -135,8 +135,8 @@ describe('configuration', () => {
     expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: '' } as NodeJS.ProcessEnv)).toBe(true);
     expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: 'TRUE' } as NodeJS.ProcessEnv)).toBe(true);
     expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: '1' } as NodeJS.ProcessEnv)).toBe(true);
-    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: 'false' } as NodeJS.ProcessEnv)).toBe(false);
-    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: ' FALSE ' } as NodeJS.ProcessEnv)).toBe(false);
+    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: 'false', INSECURE_DEV_MODE: 'true' } as NodeJS.ProcessEnv)).toBe(false);
+    expect(lobbyAuthorityRequired({ LOBBY_AUTHORITY_REQUIRED: ' FALSE ', INSECURE_DEV_MODE: 'true' } as NodeJS.ProcessEnv)).toBe(false);
     expect(lobbyAuthorityTenants({} as NodeJS.ProcessEnv)).toEqual(['orgiq', 'assessment', 'social', 'pipelines']);
     expect(lobbyAuthorityTenants({ LOBBY_AUTHORITY_TENANTS: 'orgiq, social' } as NodeJS.ProcessEnv)).toEqual(['orgiq', 'social']);
   });

@@ -1,3 +1,4 @@
+import { skipAuthEnabled } from '../lib/insecureDevMode';
 import { Request, Response, NextFunction } from 'express';
 import { roomRepo } from '../repositories';
 import log from '../lib/logger';
@@ -20,7 +21,7 @@ export async function requireRoomMembership(
   next: NextFunction,
 ): Promise<void> {
   // In local dev (SKIP_AUTH=true), skip membership check so any dev identity can post
-  if (process.env.SKIP_AUTH === 'true') {
+  if (skipAuthEnabled()) {
     next();
     return;
   }

@@ -28,6 +28,8 @@
 
 import { withContext } from './logger';
 
+import { insecureDevMode } from './insecureDevMode';
+
 const log = withContext({ component: 'lobby-authority' });
 
 export const LOBBY_AUTHORITY_TIMEOUT_MS = 3_000;
@@ -37,8 +39,17 @@ export const LOBBY_AUTHORITY_TIMEOUT_MS = 3_000;
  * default let any Cognito user from any org into OrgIQ and Assessment calls).
  * Turning it off is a deliberate local-development choice.
  */
+let warnedOffIgnored = false;
+
 export function lobbyAuthorityRequired(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (env.LOBBY_AUTHORITY_REQUIRED ?? '').trim().toLowerCase() !== 'false';
+  const off = (env.LOBBY_AUTHORITY_REQUIRED ?? '').trim().toLowerCase() === 'false';
+  if (!off) return true;
+  if (insecureDevMode(env)) return false;
+  if (!warnedOffIgnored) {
+    warnedOffIgnored = true;
+    log.error('LOBBY_AUTHORITY_REQUIRED=false ignored: it counts only with INSECURE_DEV_MODE=true; authority stays required');
+  }
+  return true;
 }
 
 export function lobbyAuthorityUrl(env: NodeJS.ProcessEnv = process.env): string {

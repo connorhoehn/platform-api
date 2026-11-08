@@ -1,6 +1,8 @@
 // platform-api/src/lib/insecureDevMode.ts
 //
-// ONE explicit switch for the insecure local-development shortcuts.
+// ONE explicit switch for the insecure local-development shortcuts. The
+// switch itself lives in @connorhoehn/service-runtime (shared by every repo);
+// this file keeps platform-api's existing names on top of it.
 //
 // SKIP_AUTH used to be honoured whenever NODE_ENV was not 'production' — and
 // the image never set NODE_ENV, so a deployment that inherited SKIP_AUTH=true
@@ -9,12 +11,10 @@
 // in production, and the process refuses to start when SKIP_AUTH is set
 // without it (assertSkipAuthAllowed, called from index.ts).
 
-export const INSECURE_DEV_FLAG = 'INSECURE_DEV_MODE';
+import { insecureDevMode, assertDevShortcutAllowed } from '@connorhoehn/service-runtime';
 
-/** The explicit dev flag is on, and this is not production. */
-export function insecureDevMode(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (env[INSECURE_DEV_FLAG] ?? '').trim().toLowerCase() === 'true' && env.NODE_ENV !== 'production';
-}
+export { insecureDevMode };
+export const INSECURE_DEV_FLAG = 'INSECURE_DEV_MODE';
 
 /** Is the SKIP_AUTH dev fallback in effect? */
 export function skipAuthEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -23,11 +23,14 @@ export function skipAuthEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 
 /** Boot gate: SKIP_AUTH=true without the dev flag (or in production) is a misconfiguration. */
 export function assertSkipAuthAllowed(env: NodeJS.ProcessEnv = process.env): void {
-  if (env.SKIP_AUTH !== 'true') return;
-  if (env.NODE_ENV === 'production') {
-    throw new Error('SKIP_AUTH=true is not allowed in production');
-  }
-  if (!insecureDevMode(env)) {
-    throw new Error(`SKIP_AUTH=true requires ${INSECURE_DEV_FLAG}=true (local development only)`);
-  }
+  assertDevShortcutAllowed('SKIP_AUTH', env);
+}
+
+/**
+ * Env snapshot for `assertRequiredInProd`: the gate is armed (`<name>=true`)
+ * unless the insecure dev switch is on, in which case the operator's own
+ * value (or its absence) stands.
+ */
+export function requiredGateEnv(name: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return insecureDevMode(env) ? env : { ...env, [name]: 'true' };
 }

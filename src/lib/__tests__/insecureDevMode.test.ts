@@ -17,3 +17,67 @@ describe('insecure dev mode', () => {
     expect(() => assertSkipAuthAllowed(env({}))).not.toThrow();
   });
 });
+
+describe('shortcuts are ignored without INSECURE_DEV_MODE', () => {
+  const saved = { ...process.env };
+  afterEach(() => { process.env = { ...saved }; });
+  const shortcutOn = () => { process.env.SKIP_AUTH = 'true'; delete process.env.INSECURE_DEV_MODE; };
+
+  it.each([
+    ['teams', async () => require('../../routes/teams')],
+    ['lvsWebhooks', async () => require('../../routes/lvsWebhooks')],
+  ])('%s module loads and skipAuthEnabled() is false', async (_n, load) => {
+    shortcutOn();
+    await load();
+    expect(skipAuthEnabled()).toBe(false);
+  });
+
+  it('meetingStepHandler.resolveOrganization does not fall back to the dev org', async () => {
+    shortcutOn();
+    delete process.env.WORK_GRAPH_ORG; delete process.env.DEFAULT_ORG_ID;
+    const { resolveOrganization } = require('../../loop/meetingStepHandler');
+    expect(resolveOrganization({}).organizationId).toBeUndefined();
+    process.env.INSECURE_DEV_MODE = 'true';
+    expect(resolveOrganization({}).organizationId).toBeDefined();
+  });
+
+  it('requireRoomMembership does not skip the membership check', async () => {
+    shortcutOn();
+    const { requireRoomMembership } = require('../../middleware/require-membership');
+    const next = jest.fn();
+    const res: any = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    await requireRoomMembership({ params: { roomId: 'r' }, user: undefined } as any, res, next).catch(() => undefined);
+    expect(next).not.toHaveBeenCalledWith();
+  });
+
+  it('document policy stays closed, lobby authority stays required, images stay SSRF-guarded', async () => {
+    shortcutOn();
+    delete process.env.DOCUMENT_GRANT_ISSUER; delete process.env.DOCUMENT_GRANT_PUBLIC_KEY; delete process.env.DOCUMENT_GRANT_KEY_ID;
+    const { requireDocumentPolicy } = require('../../middleware/document-policy');
+    const next = jest.fn();
+    const res: any = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    await requireDocumentPolicy({} as any, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(503);
+
+    const { lobbyAuthorityRequired } = require('../lobbyAuthority');
+    expect(lobbyAuthorityRequired(env({ LOBBY_AUTHORITY_REQUIRED: 'false' }))).toBe(true);
+    expect(lobbyAuthorityRequired(env({ LOBBY_AUTHORITY_REQUIRED: 'false', INSECURE_DEV_MODE: 'true' }))).toBe(false);
+  });
+
+  it('requiredGateEnv arms every gate unless the dev switch is on', async () => {
+    const { requiredGateEnv } = require('../insecureDevMode');
+    expect(requiredGateEnv('X_REQUIRED', env({ X_REQUIRED: 'false' })).X_REQUIRED).toBe('true');
+    expect(requiredGateEnv('X_REQUIRED', env({ X_REQUIRED: 'false', INSECURE_DEV_MODE: 'true' })).X_REQUIRED).toBe('false');
+  });
+
+  it('default canCreateRoom rule refuses dev-user and empty ids without the flag', async () => {
+    const { defaultCanCreateRoomRule } = require('../../middleware/canCreateRoom');
+    delete process.env.INSECURE_DEV_MODE;
+    expect(defaultCanCreateRoomRule('dev-user', 'o')).toBe(false);
+    expect(defaultCanCreateRoomRule('u', '')).toBe(false);
+    expect(defaultCanCreateRoomRule('u', 'o')).toBe(true);
+    process.env.INSECURE_DEV_MODE = 'true';
+    expect(defaultCanCreateRoomRule('dev-user', 'o')).toBe(true);
+  });
+});

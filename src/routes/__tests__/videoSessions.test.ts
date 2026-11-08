@@ -2096,6 +2096,7 @@ describe('POST /api/video/sessions — a private room lobby admits members only'
       isRoomMember: async (roomId, userId) => roomId === 'r-den' && userId === 'u-member',
       isChannelMember: async () => false,
       documentExists: async () => false,
+      orgiqLobbyAuthority: async () => true,
       assertCanReadDocument: async () => undefined,
     }) as never;
   });

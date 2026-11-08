@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { DescribeTableCommand } from '@aws-sdk/client-dynamodb';
 import { makeHealthHandler, type HealthCheck } from '@connorhoehn/service-runtime';
+import { insecureDevMode } from '../lib/insecureDevMode';
 import { ddbClient } from '../lib/aws-clients';
 import { getRedisClient } from '../lib/redis-client';
 import { tableName } from '../lib/ddb-table-name';
@@ -59,6 +60,7 @@ export function livezHandler(_req: Request, res: Response): void {
     status: 'alive',
     service: 'platform-api',
     version: SERVICE_VERSION,
+    insecureDevMode: insecureDevMode(),
     uptimeSeconds: Math.round(process.uptime()),
   });
 }

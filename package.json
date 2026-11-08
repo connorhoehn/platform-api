@@ -1,6 +1,6 @@
 {
   "name": "@connorhoehn/platform-api",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "engines": {
     "node": ">=20"
   },
@@ -27,7 +27,7 @@
     "@connorhoehn/event-catalog": "github:connorhoehnslalom/event-catalog#b758fb7dcd7b915119d5914cc670578c057af223",
     "@connorhoehn/pipeline-runtime": "github:connorhoehn/pipeline-runtime#f8d4c07c4ba77f1474684385c66a006f00c8593f",
     "@connorhoehn/realtime-modules": "github:connorhoehn/realtime-modules#c002e5e86f61bad8c6534826561f55d6471f0a8d",
-    "@connorhoehn/service-runtime": "github:connorhoehn/service-runtime#c01db0e6dfe0e6b91081ae92ee5cc3c1e77d2ad6",
+    "@connorhoehn/service-runtime": "github:connorhoehn/service-runtime#6fb67add20ae9177395edecf4a691be1dbd33ce9",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/auto-instrumentations-node": "^0.77.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.219.0",

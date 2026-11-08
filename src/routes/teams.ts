@@ -23,6 +23,7 @@
  * path `/api/rooms/:slug/members` uses.
  */
 
+import { skipAuthEnabled } from '../lib/insecureDevMode';
 import { mayUsePartition, requestedPartition } from '../lib/partition';
 import { Router, Request, Response } from 'express';
 import {
@@ -75,7 +76,7 @@ function resolveOrgId(req: Request): string {
     throw teamId ? new TeamNotFoundError(teamId) : new TeamAccessDeniedError(named);
   }
   if (user?.orgId) return user.orgId;
-  if (process.env.SKIP_AUTH === 'true') return DEFAULT_ORG_ID;
+  if (skipAuthEnabled()) return DEFAULT_ORG_ID;
   throw new ValidationError('orgId is required (missing from auth context)');
 }
 

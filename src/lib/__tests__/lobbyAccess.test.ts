@@ -10,6 +10,7 @@ function access(over: Partial<Parameters<typeof makeLobbyAccess>[0]> = {}) {
     isRoomMember: async (roomId, userId) => roomId === 'r-1' && userId === 'member',
     isChannelMember: async (channel, userId) => channel === 'chat:dmg:abc' && userId === 'member',
     documentExists: async (id) => id === 'doc-1',
+    orgiqLobbyAuthority: async () => true,
     assertCanReadDocument: async (r, id) => { if (!(id === 'doc-1' && r.user?.sub === 'reader')) throw new Error('404'); },
     ...over,
   });

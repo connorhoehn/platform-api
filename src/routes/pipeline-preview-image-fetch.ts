@@ -9,13 +9,14 @@
 // export its SSRF helpers; if/when a generic SSRF utility lands in
 // `src/lib/`, both call sites should switch over.
 
+import { insecureDevMode } from '../lib/insecureDevMode';
 import { ValidationError } from '../middleware/error-handler';
 
 const URL_FETCH_TIMEOUT_MS = 5000;
 const MAX_REDIRECTS = 5;
 const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
-const ALLOW_INTERNAL = process.env['ALLOW_INTERNAL_IMAGE_FETCH'] === 'true';
+const ALLOW_INTERNAL = process.env['ALLOW_INTERNAL_IMAGE_FETCH'] === 'true' && insecureDevMode();
 
 export function isPrivateOrLocalHost(hostname: string): boolean {
   let lower = hostname.toLowerCase();

@@ -183,7 +183,7 @@ export function makeLobbyAccess(deps: LobbyAccessDeps) {
   /** One BFF question per (request, lobby): assert + list filter ask once. */
   const authorityCache = new WeakMap<Request, Map<string, Promise<boolean>>>();
   function orgiqAuthority(req: Request, lobbyName: string): Promise<boolean> {
-    if (!deps.orgiqLobbyAuthority) return Promise.resolve(true);
+    if (!deps.orgiqLobbyAuthority) return Promise.resolve(false); // an absent hook means deny
     let perReq = authorityCache.get(req);
     if (!perReq) { perReq = new Map(); authorityCache.set(req, perReq); }
     let verdict = perReq.get(lobbyName);

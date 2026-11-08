@@ -3,6 +3,11 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-07 — 0.1.5, one dev flag for every open default
+
+- `INSECURE_DEV_MODE=true` (never in production) is now the only thing that opens a security default, through `@connorhoehn/service-runtime` 0.7.3's `insecureDevMode`. All raw `SKIP_AUTH` reads go through `skipAuthEnabled()`; `SKIP_AUTH=true` without the flag still refuses to boot.
+- Also behind the flag now: the open document-policy branch (no grant config), `LOBBY_AUTHORITY_REQUIRED=false` (otherwise logged and ignored), `ALLOW_INTERNAL_IMAGE_FETCH`, and the `dev-user` identity in the default room-creation rule. A lobby access built with no authority hook now denies. Every `assertRequiredInProd` gate is armed regardless of `*_REQUIRED=false` unless the flag is on. `/livez` reports `insecureDevMode`, and start-up prints one loud line when it is on. `npm run dev` already sets the flag.
+
 ## 2026-11-07 — 0.1.4, media org backfill and 24 hour recording tokens
 
 - At startup, catalog rows with no `orgId` are stamped with the walker's org when exactly one is configured (`MEDIA_WALKER_ORG_ID`; `default-org` under the insecure dev switch), in batches of 100; otherwise the count of hidden rows is logged once. Recording playback tokens are now minted for 24 hours (LVS's cap) on every read of the detail, list, share and new `GET /api/recordings/:id/card` routes, list rows and the chat card get a tokenised `thumbnailUrl` on read, and no token is ever stored.
