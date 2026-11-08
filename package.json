@@ -1,6 +1,6 @@
 {
   "name": "@connorhoehn/platform-api",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "engines": {
     "node": ">=20"
   },
@@ -24,9 +24,9 @@
     "@aws-sdk/client-s3": "^3.1044.0",
     "@aws-sdk/client-sqs": "^3.1011.0",
     "@aws-sdk/lib-dynamodb": "^3.1010.0",
-    "@connorhoehn/event-catalog": "github:connorhoehn/event-catalog#b758fb7dcd7b915119d5914cc670578c057af223",
-    "@connorhoehn/pipeline-runtime": "github:connorhoehn/pipeline-runtime#f8d4c07c4ba77f1474684385c66a006f00c8593f",
-    "@connorhoehn/realtime-modules": "github:connorhoehn/realtime-modules#c002e5e86f61bad8c6534826561f55d6471f0a8d",
+    "@connorhoehn/event-catalog": "github:connorhoehn/event-catalog#a045aca3c2960361ba7a1a47659219a382e00724",
+    "@connorhoehn/pipeline-runtime": "github:connorhoehn/pipeline-runtime#fa4b0d38e22d43c566958fadcfbe8039d8650d7c",
+    "@connorhoehn/realtime-modules": "github:connorhoehn/realtime-modules#b5a8632bca64322df64b55c57dad821f8a404ad0",
     "@connorhoehn/service-runtime": "github:connorhoehn/service-runtime#6fb67add20ae9177395edecf4a691be1dbd33ce9",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/auto-instrumentations-node": "^0.77.0",

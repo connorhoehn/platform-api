@@ -3,6 +3,12 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-08 — 0.1.7, pipeline-runtime 1.5.3, realtime-modules 0.146.5, event-catalog 0.10.7
+
+- **`@connorhoehn/pipeline-runtime` 1.4.0 → 1.5.3** (`fa4b0d38`). Carries "authorise approvals before persisting; require an explicit approver": `DurableRunner.approve()` runs `authorizeApproval` before any write, refuses a missing approver (400 `approver`) unless `allowDefaultApprover`, and resume replays only decisions marked `verified: true`. platform-api does not run a `DurableRunner` (approvals go through `/api/pipelines/:runId/approvals`, which checks the step's approvers before `PipelineModule.resolveApproval`) and its run records keep step approvals empty, so behaviour here is unchanged. Also 1.5.0's resume fallbacks and distributed-core 0.51.2.
+- **`@connorhoehn/realtime-modules` 0.139.0 → 0.146.5** (`b5a8632b`). Carries the 0.146.x fail-closed defaults (documents need an `authz` hook or `insecureAllowAll`, rooms and documents ask the router's `checkChannel`, calls reach members only and take caller identity from the auth context, DM membership enforced by default, socket rate/payload/channel caps, token expiry), the attachment-token fix and request-bound `GatewayProxyClient` envelopes. platform-api imports only `/server` document-grant types and helpers, `/work-graph` and `/hangout-rooms`, which are unchanged in shape; no code change was needed.
+- **`@connorhoehn/event-catalog` 0.10.0 → 0.10.7** (`a045aca3`). Carries bearer-authenticated registry reads (`EVENT_CATALOG_AUTH_TOKEN` is now sent on `getSchemaFingerprint` too), the validating publisher's `strict` default (platform-api passes `mode: 'warn'` explicitly, so unchanged), and the renamed transitive `@connorhoehn/message-queue` 0.7.0 (`f89c7c31`), which replaces `@connorhoehnslalom/message-queue` 0.5.0: the old scope is gone from the lockfile. 0.10.7 rather than 0.10.6 because 0.10.6 (`8e9fe76c`) shipped a stale `dist/` that still required the old scope. MQ requests already use audience-bound headers (`src/lib/event-catalog.ts`); no code change.
+
 ## 2026-11-07 — 0.1.6, distributed-core 0.51.2
 
 - Pin moves to distributed-core 0.51.2 (`5ff83f5c`): rebuilt dist, Raft election-safety fix, transport-level signature gating, and `lz4` is an optional peer only, so CI's git-dependency preparation no longer compiles it on Node 22. Webhook signature tests updated to the `t=<unix>,sha256=` header.
