@@ -18,6 +18,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The checkout credential is scoped to this repo and would override the
+          # dependency token in the rewritten github: URLs (npm ci "Repository not found").
+          persist-credentials: false
       # The github: dependencies (distributed-core, service-runtime, ...) are private
       # repositories. The workflow token only reads this repository, so a personal
       # access token with read access to the dependency repositories is required:
