@@ -1,6 +1,6 @@
 {
   "name": "@connorhoehn/platform-api",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "engines": {
     "node": ">=20"
   },
@@ -34,7 +34,7 @@
     "@opentelemetry/sdk-node": "^0.219.0",
     "@types/uuid": "^10.0.0",
     "csv-parse": "^6.2.1",
-    "distributed-core": "github:connorhoehn/distributed-core#eea5c874766dea15b8b1f58b969af991b289a42c",
+    "distributed-core": "github:connorhoehn/distributed-core#5ff83f5c77a9dd4da0d55437b128a847e1c77a79",
     "express": "^4.18.2",
     "googleapis": "^171.4.0",
     "jsonwebtoken": "^9.0.3",

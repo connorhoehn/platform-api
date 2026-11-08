@@ -3,6 +3,10 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-07 — 0.1.6, distributed-core 0.51.2
+
+- Pin moves to distributed-core 0.51.2 (`5ff83f5c`): rebuilt dist, Raft election-safety fix, transport-level signature gating, and `lz4` is an optional peer only, so CI's git-dependency preparation no longer compiles it on Node 22. Webhook signature tests updated to the `t=<unix>,sha256=` header.
+
 ## 2026-11-07 — 0.1.5, one dev flag for every open default
 
 - `INSECURE_DEV_MODE=true` (never in production) is now the only thing that opens a security default, through `@connorhoehn/service-runtime` 0.7.3's `insecureDevMode`. All raw `SKIP_AUTH` reads go through `skipAuthEnabled()`; `SKIP_AUTH=true` without the flag still refuses to boot.

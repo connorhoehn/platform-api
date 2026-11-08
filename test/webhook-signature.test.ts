@@ -28,9 +28,9 @@ describe('generateWebhookSecret', () => {
 // ─── computeSignature ─────────────────────────────────────────────────────
 
 describe('computeSignature', () => {
-    test('returns a string starting with sha256=', () => {
+    test('returns a t=<unix>,sha256=<hex> header', () => {
         const sig = computeSignature('my-secret', Buffer.from('body'));
-        expect(sig).toMatch(/^sha256=[0-9a-f]{64}$/);
+        expect(sig).toMatch(/^t=\d+,sha256=[0-9a-f]{64}$/);
     });
 
     test('is deterministic for the same secret+body', () => {
@@ -56,9 +56,13 @@ describe('computeSignature', () => {
     test('matches manual HMAC-SHA256 computation', () => {
         const secret = 'known-secret';
         const body = Buffer.from('test payload');
+        const sig = computeSignature(secret, body);
+        const t = /^t=(\d+),/.exec(sig)![1];
+        // 0.51: the HMAC covers "<t>.<body>" and the header carries t=.
         const expected =
-            'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
-        expect(computeSignature(secret, body)).toBe(expected);
+            `t=${t},sha256=` +
+            crypto.createHmac('sha256', secret).update(`${t}.`).update(body).digest('hex');
+        expect(sig).toBe(expected);
     });
 });
 
