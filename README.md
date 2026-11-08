@@ -48,6 +48,8 @@ npm run lint:fix       # lint and apply automatic fixes
 npm run lint:openapi   # check routes against the OpenAPI descriptions
 ```
 
+CI: `.github/workflows/ci.yml` runs typecheck and tests on push; it has not run yet (no GitHub access from the machine that wrote it).
+
 `npm run dev` sets its own local values, including `SKIP_AUTH=true` so requests
 need no Cognito token. `SKIP_AUTH` takes effect only beside `INSECURE_DEV_MODE=true`
 and never with `NODE_ENV=production`; set without it, the service refuses to start.
