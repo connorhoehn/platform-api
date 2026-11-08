@@ -103,11 +103,11 @@ This service depends on:
 - `connorhoehn/realtime-modules` - realtime gateway, call and document building blocks.
 - `connorhoehn/service-runtime` - signed service-to-service requests, logging and health helpers.
 - `connorhoehn/pipeline-runtime` - pipeline contracts, the run bridge and approval state machine.
-- `connorhoehnslalom/event-catalog` - the event registry and durable event delivery.
+- `connorhoehn/event-catalog` - the event registry and durable event delivery.
 
 It is used by:
 
-- `connorhoehnslalom/aws-agentcore` - runs this service in its local development stack.
+- `connorhoehn/aws-agentcore` - runs this service in its local development stack.
 - `connorhoehn/realtime-examples` - example applications built on the realtime platform.
 
 ## Documentation

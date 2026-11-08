@@ -24,7 +24,7 @@
     "@aws-sdk/client-s3": "^3.1044.0",
     "@aws-sdk/client-sqs": "^3.1011.0",
     "@aws-sdk/lib-dynamodb": "^3.1010.0",
-    "@connorhoehn/event-catalog": "github:connorhoehnslalom/event-catalog#b758fb7dcd7b915119d5914cc670578c057af223",
+    "@connorhoehn/event-catalog": "github:connorhoehn/event-catalog#b758fb7dcd7b915119d5914cc670578c057af223",
     "@connorhoehn/pipeline-runtime": "github:connorhoehn/pipeline-runtime#f8d4c07c4ba77f1474684385c66a006f00c8593f",
     "@connorhoehn/realtime-modules": "github:connorhoehn/realtime-modules#c002e5e86f61bad8c6534826561f55d6471f0a8d",
     "@connorhoehn/service-runtime": "github:connorhoehn/service-runtime#6fb67add20ae9177395edecf4a691be1dbd33ce9",

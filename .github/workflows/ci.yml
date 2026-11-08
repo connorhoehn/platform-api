@@ -28,7 +28,7 @@ jobs:
           GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
         run: |
           if [ -z "$GH_PACKAGES_TOKEN" ]; then
-            echo "::error::GH_PACKAGES_TOKEN secret is not set. npm ci cannot fetch the private github: dependencies without it. Create a PAT with read access to the connorhoehn and connorhoehnslalom dependency repositories and add it as a repository secret named GH_PACKAGES_TOKEN."
+            echo "::error::GH_PACKAGES_TOKEN secret is not set. npm ci cannot fetch the private github: dependencies without it. Create a PAT with read access to the connorhoehn dependency repositories and add it as a repository secret named GH_PACKAGES_TOKEN."
             exit 1
           fi
       - name: "Let npm fetch github: dependencies"
