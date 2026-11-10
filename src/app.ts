@@ -9,6 +9,7 @@ import { requestLogger } from './middleware/request-logger';
 import { httpMetrics } from './middleware/http-metrics';
 import { errorHandler } from './middleware/error-handler';
 import { pipelineReadRateLimit } from './middleware/rateLimit';
+import { requireLoopbackOrServiceAuth } from './middleware/internalOpsAccess';
 import healthRouter, { livezHandler } from './routes/health';
 import apiRouter from './routes/index';
 import { pipelineWebhooksRouter } from './routes/pipelineWebhooks';
@@ -100,15 +101,17 @@ export function createApp(): express.Application {
   app.get('/livez', livezHandler);
 
   // Prometheus scrape endpoint — distributed-core MetricsRegistry shadow.
-  // Public (no auth) so a Prometheus server can scrape it; matches the
-  // gateway's `GET /internal/metrics` mount. See observability/metrics.ts.
-  app.get('/internal/metrics', (_req, res) => {
+  // Loopback or a service-auth envelope only (middleware/internalOpsAccess.ts):
+  // it used to be public, and its sibling below resets counters. A scraper
+  // runs as a sidecar or signs its request. See observability/metrics.ts.
+  const internalOps = requireLoopbackOrServiceAuth();
+  app.get('/internal/metrics', internalOps, (_req, res) => {
     res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
     res.status(200).send(renderPrometheusText());
   });
 
   // realtime-examples NFR #197: pipeline bus publish latency, by phase.
-  app.get('/internal/bus-publish-timing', (req, res) => {
+  app.get('/internal/bus-publish-timing', internalOps, (req, res) => {
     res.status(200).json(busPublishTimingSummary(req.query.reset === '1'));
   });
 

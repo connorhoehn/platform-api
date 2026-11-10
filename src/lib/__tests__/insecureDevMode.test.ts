@@ -13,8 +13,27 @@ describe('insecure dev mode', () => {
   it('boot refuses SKIP_AUTH=true without the flag, and in production', () => {
     expect(() => assertSkipAuthAllowed(env({ SKIP_AUTH: 'true' }))).toThrow(/INSECURE_DEV_MODE/);
     expect(() => assertSkipAuthAllowed(env({ SKIP_AUTH: 'true', INSECURE_DEV_MODE: 'true', NODE_ENV: 'production' }))).toThrow();
-    expect(() => assertSkipAuthAllowed(env({ SKIP_AUTH: 'true', INSECURE_DEV_MODE: 'true' }))).not.toThrow();
+    expect(() => assertSkipAuthAllowed(env({ SKIP_AUTH: 'true', INSECURE_DEV_MODE: 'true', BIND_HOST: '127.0.0.1' }))).not.toThrow();
     expect(() => assertSkipAuthAllowed(env({}))).not.toThrow();
+  });
+
+  it('SKIP_AUTH needs a loopback bind unless the container network-bind flag is set', () => {
+    const dev = { SKIP_AUTH: 'true', INSECURE_DEV_MODE: 'true' };
+    // No BIND_HOST = every interface: refused.
+    expect(() => assertSkipAuthAllowed(env(dev))).toThrow(/loopback bind/);
+    expect(() => assertSkipAuthAllowed(env({ ...dev, BIND_HOST: '0.0.0.0' }))).toThrow(/0\.0\.0\.0/);
+    expect(() => assertSkipAuthAllowed(env({ ...dev, BIND_HOST: '192.168.1.20' }))).toThrow(/loopback bind/);
+    expect(() => assertSkipAuthAllowed(env({ ...dev, BIND_HOST: '::' }))).toThrow(/loopback bind/);
+    // HOST is a hostname, not a bind decision: ignored.
+    expect(() => assertSkipAuthAllowed(env({ ...dev, HOST: '127.0.0.1' }))).toThrow(/loopback bind/);
+    for (const host of ['127.0.0.1', 'localhost', '::1', '[::1]', '127.0.0.2']) {
+      expect(() => assertSkipAuthAllowed(env({ ...dev, BIND_HOST: host }))).not.toThrow();
+    }
+    expect(() => assertSkipAuthAllowed(env({ ...dev, INSECURE_DEV_MODE_ALLOW_NETWORK_BIND: 'true' }))).not.toThrow();
+    // The network-bind flag never opens production.
+    expect(() => assertSkipAuthAllowed(env({ ...dev, NODE_ENV: 'production', INSECURE_DEV_MODE_ALLOW_NETWORK_BIND: 'true' }))).toThrow();
+    // A non-loopback bind is fine when SKIP_AUTH is off.
+    expect(() => assertSkipAuthAllowed(env({ INSECURE_DEV_MODE: 'true', BIND_HOST: '0.0.0.0' }))).not.toThrow();
   });
 });
 

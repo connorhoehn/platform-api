@@ -483,6 +483,29 @@ describe('ClaudeCodeLLMClient.stream() — spawn args', () => {
     expect(args).toContain('--include-partial-messages');
   });
 
+  it('disables every tool and MCP server, and never bypasses permissions', async () => {
+    mockSpawn.mockReturnValue(makeMockChild([
+      resultLine({ input_tokens: 2, output_tokens: 1 }),
+    ]) as unknown as ReturnType<typeof mockSpawn>);
+
+    const client = new ClaudeCodeLLMClient();
+    for await (const _ of client.stream('model', 'sys', 'hi')) { /* drain */ }
+
+    const args = (mockSpawn.mock.calls.at(-1) as unknown as [string, string[]])[1];
+    const toolsAt = args.indexOf('--tools');
+    expect(toolsAt).toBeGreaterThan(-1);
+    expect(args[toolsAt + 1]).toBe('');
+    expect(args.filter((a) => a === '--tools')).toHaveLength(1);
+    expect(args).toContain('--strict-mcp-config');
+    expect(args).not.toContain('--mcp-config');
+    expect(args).not.toContain('--allowedTools');
+    for (const flag of ['--dangerously-skip-permissions', '--allow-dangerously-skip-permissions', '--permission-mode']) {
+      expect(args).not.toContain(flag);
+    }
+    // The prompt is still the last argument, after the empty tool list.
+    expect(args[args.length - 1]).toBe('hi');
+  });
+
   it('appends the user prompt as the last argument', async () => {
     mockSpawn.mockReturnValue(makeMockChild([
       resultLine({ input_tokens: 2, output_tokens: 1 }),

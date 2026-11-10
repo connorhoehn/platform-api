@@ -21,9 +21,41 @@ export function skipAuthEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.SKIP_AUTH === 'true' && insecureDevMode(env);
 }
 
-/** Boot gate: SKIP_AUTH=true without the dev flag (or in production) is a misconfiguration. */
+/**
+ * The address the HTTP server listens on: BIND_HOST; undefined = every
+ * interface. HOST is deliberately not read: shells and platforms set it to a
+ * hostname, which is not a bind decision. Same rule as the realtime gateway.
+ */
+export function resolveBindHost(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = (env.BIND_HOST ?? '').trim();
+  return raw === '' ? undefined : raw;
+}
+
+export function isLoopbackHost(host: string | undefined | null): boolean {
+  if (!host) return false;
+  const h = host.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  if (h === 'localhost' || h === '::1') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Boot gate: SKIP_AUTH=true without the dev flag (or in production) is a
+ * misconfiguration. With the flag it also needs a loopback bind
+ * (BIND_HOST=127.0.0.1): a dev server on the network would accept unsigned
+ * tokens from anyone who can reach it. A container dev stack cannot listen on
+ * loopback (the host and sibling containers reach the container's address), so
+ * it may set a second, equally explicit INSECURE_DEV_MODE_ALLOW_NETWORK_BIND=true.
+ */
 export function assertSkipAuthAllowed(env: NodeJS.ProcessEnv = process.env): void {
   assertDevShortcutAllowed('SKIP_AUTH', env);
+  if (!skipAuthEnabled(env)) return;
+  const host = resolveBindHost(env);
+  if (!isLoopbackHost(host) && env.INSECURE_DEV_MODE_ALLOW_NETWORK_BIND !== 'true') {
+    throw new Error(
+      `SKIP_AUTH=true requires a loopback bind (BIND_HOST=127.0.0.1); the server would listen on ${host ?? 'every interface'}. ` +
+        'A container dev stack may set INSECURE_DEV_MODE_ALLOW_NETWORK_BIND=true instead.',
+    );
+  }
 }
 
 /**

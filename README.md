@@ -54,11 +54,17 @@ CI: `.github/workflows/ci.yml` runs typecheck and tests on push; it has not run 
 need no Cognito token. `SKIP_AUTH` takes effect only beside `INSECURE_DEV_MODE=true`
 and never with `NODE_ENV=production`; set without it, the service refuses to start.
 The image sets `NODE_ENV=production`, so a local container stack must set
-`NODE_ENV=development` too.
+`NODE_ENV=development` too. `SKIP_AUTH` also needs a loopback bind,
+`BIND_HOST=127.0.0.1` (which `npm run dev` sets); a container dev stack, which
+cannot listen on loopback, sets `INSECURE_DEV_MODE_ALLOW_NETWORK_BIND=true` instead.
 
 Common environment variables:
 
 - `PORT` - HTTP port (default `3001`).
+- `BIND_HOST` - address to listen on (default: every interface).
+- `SERVICE_AUTH_SECRET`, `SERVICE_AUTH_ALLOWED_SERVICES` - verify service-auth envelopes.
+  `/internal/metrics` and `/internal/bus-publish-timing` answer only a loopback
+  caller or a request signed for audience `platform-api`.
 - `REDIS_ENDPOINT` - Redis host used for event pub/sub and coordination.
 - `LOCALSTACK_ENDPOINT` or `DYNAMODB_ENDPOINT` - DynamoDB endpoint for local runs.
 - `DDB_TABLE_PREFIX` - prefix added to table names, for sharing one DynamoDB instance.

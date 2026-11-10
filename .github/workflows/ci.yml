@@ -47,6 +47,21 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The token is needed only to fetch the github: dependencies. Remove the
+      # rewritten URLs (they embed it) right after the install, whatever its
+      # outcome, so the typecheck, the tests and any later dependency script
+      # cannot read the token from the global git config.
+      - name: "Remove the dependency token from git config"
+        if: always()
+        run: |
+          sections=$(git config --global --name-only --get-regexp '^url\..*\.insteadof$' | sed 's/\.insteadof$//' | sort -u || true)
+          while IFS= read -r section; do
+            if [ -n "$section" ]; then git config --global --remove-section "$section"; fi
+          done <<< "$sections"
+          if git config --global --get-regexp '^url\.' >/dev/null; then
+            echo "::error::url rewrites are still in the global git config"
+            exit 1
+          fi
       - name: Typecheck
         run: npm run typecheck
       - name: Test

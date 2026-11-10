@@ -206,4 +206,24 @@ describe('lobbyAccess', () => {
       expect(isRoomMember).toHaveBeenCalledTimes(1);
     });
   });
+
+  // An access built with no OrgIQ authority hook denies every OrgIQ caller
+  // (lobbyAccess.ts: "an absent hook means deny"); it must never fall back to
+  // the prefix rule alone. A hook that throws, or answers anything but true,
+  // is a refusal too.
+  describe('the OrgIQ lobby authority hook', () => {
+    const orgiq = (sub: string) => ({ user: { sub, orgId: 'orgiq', authKind: 'orgiq-hs256' }, headers: {} }) as unknown as Request;
+    it('absent: every OrgIQ lobby is refused, even one the prefix rule allows', async () => {
+      const a = access({ orgiqLobbyAuthority: undefined });
+      expect(await a.canUseLobby(orgiq('u-vera'), 'orgiq:dm:u-nora:u-vera')).toBe(false);
+      expect(await a.canUseLobby(orgiq('u-vera'), 'orgiq:initiative:p-auth-migration')).toBe(false);
+      await expect(a.assertLobbyAccess(orgiq('u-vera'), 'orgiq:initiative:p-auth-migration')).rejects.toMatchObject({ status: 404 });
+    });
+    it('a hook that throws or answers a non-true value denies', async () => {
+      const throwing = access({ orgiqLobbyAuthority: async () => { throw new Error('bff down'); } });
+      expect(await throwing.canUseLobby(orgiq('u-vera'), 'orgiq:initiative:x')).toBe(false);
+      const truthy = access({ orgiqLobbyAuthority: async () => 'yes' as unknown as boolean });
+      expect(await truthy.canUseLobby(orgiq('u-vera'), 'orgiq:initiative:x')).toBe(false);
+    });
+  });
 });

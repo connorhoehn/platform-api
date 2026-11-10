@@ -91,12 +91,20 @@ export class ClaudeCodeLLMClient implements LLMClient {
         // The Tilt mount at /root/.claude/.credentials.json IS where
         // the OAuth tokens live, so leaving --bare off lets claude CLI
         // pick them up. --no-session-persistence keeps each run clean.
+        //
+        // A completion step gets no tools and no MCP servers: the same
+        // default-deny flags the agent client uses for a step with no
+        // allowlist (agent/ClaudeCodeAgentClient.ts). Without them print
+        // mode makes every built-in tool and the pod's configured MCP
+        // servers available, and permits their use with no one to ask.
         const args = [
           '-p',
           '--output-format', 'stream-json',
           '--include-partial-messages',
           '--no-session-persistence',
           '--verbose',
+          '--strict-mcp-config',
+          '--tools', '',
         ];
         if (systemPrompt?.trim()) {
           args.push('--append-system-prompt', systemPrompt);

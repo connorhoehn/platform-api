@@ -43,7 +43,7 @@ import { createFileUploadEndpointRegistration } from './control-plane/file-uploa
 import { ControlPlaneSubscriberRegistry } from './control-plane/registry';
 import { definitionsRepo } from './pipeline/definitions-repository';
 import { announceInsecureDevMode } from '@connorhoehn/service-runtime';
-import { assertSkipAuthAllowed, requiredGateEnv } from './lib/insecureDevMode';
+import { assertSkipAuthAllowed, requiredGateEnv, resolveBindHost } from './lib/insecureDevMode';
 
 const port = process.env.PORT ?? '3001';
 
@@ -140,8 +140,11 @@ const app = createApp();
 // realtime-examples NFR #202: event-loop delay + utilization on /internal/metrics.
 startEventLoopMetrics();
 
-const server = app.listen(Number(port), () => {
-  log.info({ port }, 'platform-api listening');
+// BIND_HOST unset = every interface (the container default). SKIP_AUTH needs a
+// loopback BIND_HOST (assertSkipAuthAllowed above).
+const bindHost = resolveBindHost();
+const onListening = () => {
+  log.info({ port, bindHost: bindHost ?? '(all interfaces)' }, 'platform-api listening');
   // Catalog rows from before org scoping: stamp the walker's org, or log how many stay hidden.
   void import('./media/backfillOrg.js').then(async ({ backfillMediaOrg }) => {
     const { mediaCatalogRepo } = await import('./repositories/index.js');
@@ -161,7 +164,10 @@ const server = app.listen(Number(port), () => {
     // (and the most-likely cause in prod if LVS pods rotate independently).
     startLvsWebhookReconciler();
   }).catch((e: any) => log.warn({ err: e?.message ?? e }, 'lvs-webhook-bootstrap failed'));
-});
+};
+const server = bindHost
+  ? app.listen(Number(port), bindHost, onListening)
+  : app.listen(Number(port), onListening);
 
 // ---------------------------------------------------------------------------
 // Event catalog — connects to Redis + message-queue so domain events can be

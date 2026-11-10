@@ -3,6 +3,14 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## 2026-11-09 — 0.1.8, security follow-ups
+
+- **`POST /api/v2/pipelines/:id/runs` refuses tool-requesting steps** in a body definition, like the v1 inline trigger and the save path (`toolRequestingSteps`): 400 `{ action: 'trigger', error: 'agent steps in a pipeline you write may not request tools: …' }`, before the trigger runs. A stored definition (body without `definition`) still runs as saved.
+- **`SKIP_AUTH` needs a loopback bind.** The server now listens on `BIND_HOST` (unset = every interface, as before), and `SKIP_AUTH=true` refuses to start unless `BIND_HOST` is loopback or `INSECURE_DEV_MODE_ALLOW_NETWORK_BIND=true` is set (same rule and names as the realtime gateway). `npm run dev` sets `BIND_HOST=127.0.0.1`. **A container dev stack running with `SKIP_AUTH=true` must add `INSECURE_DEV_MODE_ALLOW_NETWORK_BIND=true`**, or it refuses to boot.
+- **`/internal/metrics` and `/internal/bus-publish-timing`** (whose `?reset=1` clears counters) answer only a loopback socket or a request-bound service-auth envelope (`X-Service-Auth`, audience `platform-api`, services from `SERVICE_AUTH_ALLOWED_SERVICES`, default `orchestrator,orgiq-middleware`); anything else gets 401. A remote Prometheus scrape must run as a sidecar or sign its request.
+- **LLM steps run the CLI with no tools and no MCP servers** (`--strict-mcp-config --tools ""`), the agent client's default-deny flags for a step with no allowlist.
+- Tests: the lobby access with no OrgIQ authority hook denies; the route, bind and metrics rules above. Test fixtures no longer carry a developer's home path. CI removes the token-bearing git URL rewrites right after `npm ci` (`if: always()`), so typecheck, tests and dependency scripts cannot read `GH_PACKAGES_TOKEN`.
+
 ## 2026-11-08 — 0.1.7, pipeline-runtime 1.5.3, realtime-modules 0.146.5, event-catalog 0.10.7
 
 - **`@connorhoehn/pipeline-runtime` 1.4.0 → 1.5.3** (`fa4b0d38`). Carries "authorise approvals before persisting; require an explicit approver": `DurableRunner.approve()` runs `authorizeApproval` before any write, refuses a missing approver (400 `approver`) unless `allowDefaultApprover`, and resume replays only decisions marked `verified: true`. platform-api does not run a `DurableRunner` (approvals go through `/api/pipelines/:runId/approvals`, which checks the step's approvers before `PipelineModule.resolveApproval`) and its run records keep step approvals empty, so behaviour here is unchanged. Also 1.5.0's resume fallbacks and distributed-core 0.51.2.

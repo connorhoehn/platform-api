@@ -10,8 +10,10 @@
 //   options bag — auth, persistence lookup, the bridge into the runtime.
 //
 //   Constraints:
-//     - Only `express` is imported. No platform-api middleware, no Cognito,
-//       no DDB clients, no distributed-core internals.
+//     - Only `express` is imported, plus the dependency-free definition
+//       policy (`../agent/userDefinitionPolicy`), which moves with this file.
+//       No platform-api middleware, no Cognito, no DDB clients, no
+//       distributed-core internals.
 //     - All cross-process knowledge (who the user is, where definitions
 //       live, how to call the runtime) flows through `deps`.
 //     - When this file is ported into distributed-core, the host wires
@@ -37,6 +39,10 @@ import type {
   PipelineTriggerRequest,
   PipelineTriggerResponse,
 } from './contracts';
+import {
+  describeToolRequestingSteps,
+  toolRequestingSteps,
+} from '../agent/userDefinitionPolicy';
 
 // ---------------------------------------------------------------------------
 // Host-injected dependencies.
@@ -166,6 +172,18 @@ export function createPipelineRouter(deps: PipelineRouterDeps): Router {
           `definition.id (${body.definition.id}) does not match :pipelineId (${pipelineId})`,
         );
         return;
+      }
+
+      // A definition in the body is the caller's own JSON, so it carries no
+      // agent tools: the same refusal as the v1 inline trigger and the save
+      // path (userDefinitionPolicy.ts). Stored definitions were checked when
+      // they were saved and are not re-checked here.
+      if (body.definition) {
+        const toolSteps = toolRequestingSteps(body.definition);
+        if (toolSteps.length > 0) {
+          badRequest(res, 'trigger', describeToolRequestingSteps(toolSteps));
+          return;
+        }
       }
 
       // Server-side definition resolution (canonical store wins when the

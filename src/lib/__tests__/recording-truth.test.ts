@@ -279,8 +279,8 @@ describe('publicizeTracks', () => {
         {
           legId: 'leg-001',
           key: 'arn_local_ivs_channel_fe74b6a1/2026-08-26T02-35-09-652Z-546cf1e9/peer_leg-001.mp4',
-          file: '/Users/connorhoehn/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
-          url: 'file:///Users/connorhoehn/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
+          file: '/Users/dev/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
+          url: 'file:///Users/dev/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
           size: 796,
         },
       ],
@@ -313,7 +313,7 @@ describe('publicizeTracks', () => {
 
   test('an unrecoverable key drops the url rather than leaking the raw path', () => {
     const [track] = publicizeTracks(
-      [{ legId: 'leg-003', url: 'file:///Users/connorhoehn/secret-dir' }],
+      [{ legId: 'leg-003', url: 'file:///Users/dev/secret-dir' }],
       opts,
     );
     expect(track.url).toBeUndefined();

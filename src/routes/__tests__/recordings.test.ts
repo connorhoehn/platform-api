@@ -876,9 +876,9 @@ describe('GET /api/recordings/:recordingId — what leaves the process', () => {
       {
         legId: 'leg-001',
         participantId: 'a937dfa9-aeb8-5366-a90b-6d5599ba1239',
-        file: '/Users/connorhoehn/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
+        file: '/Users/dev/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
         key: 'arn_local_ivs_channel_fe74b6a1/2026-08-26T02-35-09-652Z-546cf1e9/peer_leg-001.mp4',
-        url: 'file:///Users/connorhoehn/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
+        url: 'file:///Users/dev/Projects/realtime-examples/.tilt-lvs-recordings/x/peer_leg-001.mp4',
         size: 796,
         kind: 'av',
       },
@@ -890,7 +890,7 @@ describe('GET /api/recordings/:recordingId — what leaves the process', () => {
     // leak is still on the wire.
     composedSegment: {
       key: 'arn_local_ivs_channel_fe74b6a1/2026-08-26T02-35-09-652Z-546cf1e9/composed.mp4',
-      url: 'file:///Users/connorhoehn/Projects/realtime-examples/.tilt-lvs-recordings/x/composed.mp4',
+      url: 'file:///Users/dev/Projects/realtime-examples/.tilt-lvs-recordings/x/composed.mp4',
       size: 41_000,
     },
   };
