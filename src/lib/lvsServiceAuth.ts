@@ -2,7 +2,9 @@
 //
 // The credential platform-api presents on LVS's session-lifecycle routes
 // (`POST /api/sessions`, `/:arn/join`, `/:arn/end`, `/:arn/refresh-token`) —
-// the ones LVS gates with `cognito-auth.js`.
+// the ones LVS gates with `cognito-auth.js` — and on the participant
+// publish-control routes (`POST /api/channels/:arn/participants/:id/
+// grant-publish | revoke-publish`), which LVS also admits on its service token.
 //
 // Before: platform-api forwarded the CALLER's bearer, so LVS verified a user
 // token (and a Cognito token could mint a publisher token under any body userId).

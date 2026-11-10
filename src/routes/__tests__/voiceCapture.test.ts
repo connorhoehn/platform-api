@@ -19,6 +19,7 @@ jest.mock('../../lib/logger', () => ({
 
 import { voiceCaptureRouter, __resetVoiceCaptureBindings } from '../voiceCapture';
 import { errorHandler } from '../../middleware/error-handler';
+import log from '../../lib/logger';
 
 const CAPTURE_ID = 'abcdef0123456789abcdef0123456789';
 const UTTERANCE_ID = '0123456789abcdef0123456789abcdef';
@@ -72,6 +73,8 @@ beforeEach(() => {
   __resetVoiceCaptureBindings();
   currentUser = 'user-alice';
   process.env.LIVE_CAPTIONS_URL = 'http://sidecar.test:3915';
+  delete process.env.LIVE_CAPTIONS_SHARED_SECRET;
+  (log.warn as jest.Mock).mockClear();
   sidecarFetch = jest.fn().mockResolvedValue({
     ok: true,
     status: 200,
@@ -157,6 +160,29 @@ describe('POST /api/voice-capture/pcm', () => {
     const res = await postPcm(Buffer.alloc(320));
     expect(res.status).toBe(503);
     expect(String(res.body.error)).toMatch(/unavailable/);
+  });
+
+  it('sends LIVE_CAPTIONS_SHARED_SECRET as X-Live-Captions-Secret', async () => {
+    process.env.LIVE_CAPTIONS_SHARED_SECRET = 'cap-secret';
+    expect((await postPcm(Buffer.alloc(320))).status).toBe(202);
+    expect(sidecarFetch.mock.calls[0]![1].headers['X-Live-Captions-Secret']).toBe('cap-secret');
+  });
+
+  it('sends no secret header when LIVE_CAPTIONS_SHARED_SECRET is unset (sidecar in insecure dev mode)', async () => {
+    delete process.env.LIVE_CAPTIONS_SHARED_SECRET;
+    expect((await postPcm(Buffer.alloc(320))).status).toBe(202);
+    expect(Object.keys(sidecarFetch.mock.calls[0]![1].headers)).not.toContain('X-Live-Captions-Secret');
+  });
+
+  it('answers 502 on a sidecar 401 and logs the misconfiguration without the secret', async () => {
+    process.env.LIVE_CAPTIONS_SHARED_SECRET = 'wrong-secret';
+    sidecarFetch.mockResolvedValueOnce({ ok: false, status: 401, text: async () => 'unauthorized' });
+    const res = await postPcm(Buffer.alloc(320));
+    expect(res.status).toBe(502);
+    const warnings = JSON.stringify((log.warn as jest.Mock).mock.calls);
+    expect(warnings).toContain('voice.capture.sidecar_unauthorized');
+    expect(warnings).toContain('LIVE_CAPTIONS_SHARED_SECRET');
+    expect(warnings).not.toContain('wrong-secret');
   });
 
   it('reports 502 when the sidecar rejects the chunk', async () => {

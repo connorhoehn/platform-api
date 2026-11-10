@@ -3,6 +3,12 @@
 Dated entries for changes other repos or operators need to know about. Commit
 messages remain the detailed record.
 
+## Unreleased — follows live-video-streaming's captions secret and publish control
+
+- **New env `LIVE_CAPTIONS_SHARED_SECRET`** (= the live-captions sidecar's `LIVE_CAPTIONS_SHARED_SECRET`): sent as `X-Live-Captions-Secret` on voice-capture POSTs to the sidecar, which now answers 401 without it. Unset sends no header and logs one warning; only a sidecar in `INSECURE_DEV_MODE` with no secret accepts that. A sidecar 401 is logged as `voice.capture.sidecar_unauthorized` and answered 502. Call-caption taps need no change here: the video service adds the header itself when its `LIVE_CAPTIONS_SHARED_SECRET` and `LIVE_CAPTIONS_ORIGIN` are set and `LIVE_CAPTIONS_SINK_URL`'s origin matches.
+- **`POST /api/video/sessions/:id/refresh-token` no longer forwards `role`.** The token's role is the one recorded at join, or set by the host since; a `role` in the body is ignored. A video-service 409 (role change refused) is answered 409 `{ error, role }`, a 403 `publish_revoked` is passed on as 403 `{ error, reason: 'publish_revoked' }`, and a 401/403 refusing platform-api's own service token is 502 instead of a 401/403 to the browser.
+- **New `POST /api/video/sessions/:id/participants/:participantId/grant-publish` and `.../revoke-publish`**, body `{ lobbyName | documentId, reason? }`: the call's host promotes a participant to publisher or demotes one to subscriber through the video service's publish control (service token). Host only (403), active call only (409), participant from the session's join list (404). Answers `{ sessionId, participantId, userId, role, changed, publishPermission }`. The participant's client then calls refresh-token to get the new role; the video service tells it with a `participant.publish-granted` / `-revoked` stage frame.
+
 ## 2026-11-09 — 0.1.8, security follow-ups
 
 - **`POST /api/v2/pipelines/:id/runs` refuses tool-requesting steps** in a body definition, like the v1 inline trigger and the save path (`toolRequestingSteps`): 400 `{ action: 'trigger', error: 'agent steps in a pipeline you write may not request tools: …' }`, before the trigger runs. A stored definition (body without `definition`) still runs as saved.

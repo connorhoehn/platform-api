@@ -1639,7 +1639,7 @@ describe('POST /api/video/sessions/:sessionId/refresh-token', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  it('200 on happy path — forwards user auth + body to LVS, returns LVS response verbatim', async () => {
+  it('200 on happy path — forwards the participant to LVS, returns LVS response verbatim', async () => {
     mockGetSession.mockResolvedValue({
       sessionId: 'vs-1', channelArn: 'arn:lvs:1', streamKey: 'sk', status: 'active',
     });
@@ -1648,20 +1648,76 @@ describe('POST /api/video/sessions/:sessionId/refresh-token', () => {
       participantId: 'p-1', role: 'publisher',
     }));
     const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
-      body: { documentId: 'doc-1', participantId: 'p-1', role: 'publisher' },
+      body: { documentId: 'doc-1', participantId: 'p-1' },
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(200);
-    expect((res.body as { token: string }).token).toBe('new.jwt.here');
+    expect((res.body as { token: string; role: string }).token).toBe('new.jwt.here');
+    expect((res.body as { role: string }).role).toBe('publisher');
     expect(mockFetch).toHaveBeenCalledTimes(1);
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toContain('/api/sessions/');
     expect(url).toContain('/refresh-token');
     expect(url).toContain(encodeURIComponent('arn:lvs:1'));
     expect((init as RequestInit).method).toBe('POST');
-    expect(JSON.parse((init as RequestInit).body as string)).toMatchObject({
-      participantId: 'p-1', role: 'publisher',
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({ participantId: 'p-1' });
+  });
+
+  it('never forwards a client-chosen role: LVS mints the role recorded at join or by a publish grant', async () => {
+    mockGetSession.mockResolvedValue({
+      sessionId: 'vs-1', channelArn: 'arn:lvs:1', status: 'active',
+      participants: [{ participantId: 'p-1', userId: 'tester' }],
     });
+    mockFetch.mockResolvedValueOnce(apiOk({
+      token: 'sub.jwt', expiresAt: '2026-06-02T13:00:00Z', participantId: 'p-1', role: 'subscriber',
+    }));
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1', role: 'publisher' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { role: string }).role).toBe('subscriber');
+    const sent = JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string);
+    expect(sent).toEqual({ participantId: 'p-1' });
+  });
+
+  it('maps an LVS 409 (role differs from the recorded one) to a 409 that names the recorded role', async () => {
+    mockGetSession.mockResolvedValue({ sessionId: 'vs-1', channelArn: 'arn:lvs:1', status: 'active' });
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 409,
+      json: async () => ({ error: "participant's role is subscriber; refresh cannot change it", role: 'subscriber' }),
+      text: async () => '',
+    } as unknown as globalThis.Response);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ role: 'subscriber' });
+    expect(String((res.body as { error: string }).error)).toMatch(/host/i);
+  });
+
+  it('maps an LVS 403 publish_revoked to a 403 with the same reason', async () => {
+    mockGetSession.mockResolvedValue({ sessionId: 'vs-1', channelArn: 'arn:lvs:1', status: 'active' });
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 403,
+      json: async () => ({ error: 'publishing revoked', participantId: 'p-1', reason: 'publish_revoked' }),
+      text: async () => '',
+    } as unknown as globalThis.Response);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatchObject({ reason: 'publish_revoked' });
+  });
+
+  it('an LVS 401/403 refusing platform-api\'s own credential is a 502, not the caller\'s 401/403', async () => {
+    mockGetSession.mockResolvedValue({ sessionId: 'vs-1', channelArn: 'arn:lvs:1', status: 'active' });
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 401, json: async () => ({ error: 'invalid service token' }), text: async () => '',
+    } as unknown as globalThis.Response);
+    const res = await run(buildApp(), 'POST', '/api/video/sessions/vs-1/refresh-token', {
+      body: { documentId: 'doc-1', participantId: 'p-1' },
+    });
+    expect(res.statusCode).toBe(502);
   });
 
   it('propagates LVS 404 (participant not registered) verbatim to the FE', async () => {
@@ -1706,6 +1762,134 @@ describe('POST /api/video/sessions/:sessionId/refresh-token', () => {
       headers: { authorization: 'Bearer user-jwt' },
     });
     expect(res.statusCode).toBe(502);
+  });
+});
+
+// The host promotes a participant who joined as a subscriber (or demotes a
+// publisher) through LVS grant-publish / revoke-publish; the participant's
+// next refresh-token then mints the new role.
+describe('POST /api/video/sessions/:sessionId/participants/:participantId/grant-publish | revoke-publish', () => {
+  const session = {
+    documentId: 'room:standup', sessionId: 'vs-7', channelArn: 'arn:lvs:7', status: 'active', startedBy: 'host-1',
+    participants: [
+      { userId: 'host-1', participantId: 'host-1-a1' },
+      { userId: 'guest-2', participantId: 'guest-2-b2' },
+    ],
+  };
+  const grantUrl = '/api/video/sessions/vs-7/participants/guest-2-b2/grant-publish';
+  const revokeUrl = '/api/video/sessions/vs-7/participants/guest-2-b2/revoke-publish';
+  const lvsAnswer = (state: 'granted' | 'revoked', changed = true) => apiOk({
+    participantId: 'guest-2-b2', channelArn: 'arn:lvs:7', changed, publishRevoked: state === 'revoked',
+    publishPermission: { state, reason: null, by: 'service', at: '2026-11-10T10:00:00.000Z' },
+    participant: null,
+  });
+
+  beforeEach(() => {
+    mockCanUseLobby.mockReset().mockResolvedValue(true);
+    mockGetSession.mockResolvedValue(session);
+  });
+
+  it('grant: the host calls LVS grant-publish with the service token and the participantId LVS minted at join', async () => {
+    mockFetch.mockResolvedValueOnce(lvsAnswer('granted'));
+    const res = await run(buildApp(), 'POST', grantUrl, {
+      userId: 'host-1', headers: { authorization: 'Bearer user-jwt' },
+      body: { lobbyName: 'room:standup', reason: 'invited on stage' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      sessionId: 'vs-7', participantId: 'guest-2-b2', userId: 'guest-2', role: 'publisher', changed: true,
+      publishPermission: { state: 'granted', reason: null, by: 'service', at: '2026-11-10T10:00:00.000Z' },
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe(`https://video.test/api/channels/${encodeURIComponent('arn:lvs:7')}/participants/guest-2-b2/grant-publish`);
+    expect((init as RequestInit).method).toBe('POST');
+    expect(((init as RequestInit).headers as Record<string, string>).Authorization).toBe('Bearer svc-test');
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({ reason: 'invited on stage' });
+  });
+
+  it('revoke: the host demotes through LVS revoke-publish; the answer says subscriber', async () => {
+    mockFetch.mockResolvedValueOnce(lvsAnswer('revoked'));
+    const res = await run(buildApp(), 'POST', revokeUrl, { userId: 'host-1', body: { lobbyName: 'room:standup' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ participantId: 'guest-2-b2', role: 'subscriber', changed: true });
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(String(url)).toMatch(/\/participants\/guest-2-b2\/revoke-publish$/);
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({});
+  });
+
+  it('the document-review host (hostUserId) may act even when someone else started the session', async () => {
+    mockGetSession.mockResolvedValue({ ...session, startedBy: 'guest-2', hostUserId: 'host-1' });
+    mockFetch.mockResolvedValueOnce(lvsAnswer('granted'));
+    const host = await run(buildApp(), 'POST', grantUrl, { userId: 'host-1', body: { lobbyName: 'room:standup' } });
+    expect(host.statusCode).toBe(200);
+    const starter = await run(buildApp(), 'POST', grantUrl, { userId: 'guest-2', body: { lobbyName: 'room:standup' } });
+    expect(starter.statusCode).toBe(403);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('a participant who is not the host is 403 and nothing reaches LVS — no self-promotion', async () => {
+    for (const url of [grantUrl, revokeUrl]) {
+      const res = await run(buildApp(), 'POST', url, { userId: 'guest-2', body: { lobbyName: 'room:standup' } });
+      expect(res.statusCode).toBe(403);
+    }
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('a caller without lobby access is 404 and nothing reaches LVS', async () => {
+    mockCanUseLobby.mockResolvedValue(false);
+    const res = await run(buildApp(), 'POST', grantUrl, { userId: 'host-1', body: { lobbyName: 'room:standup' } });
+    expect(res.statusCode).toBe(404);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('400 without lobbyName, and for a reason that is not a string of at most 256 characters', async () => {
+    const bodies: unknown[] = [{}, { lobbyName: 'room:standup', reason: 5 }, { lobbyName: 'room:standup', reason: 'x'.repeat(257) }];
+    for (const body of bodies) {
+      const res = await run(buildApp(), 'POST', grantUrl, { userId: 'host-1', body });
+      expect(res.statusCode).toBe(400);
+    }
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('404 when the session is unknown or the participant is not in it', async () => {
+    mockGetSession.mockResolvedValueOnce(null);
+    const noSession = await run(buildApp(), 'POST', grantUrl, { userId: 'host-1', body: { lobbyName: 'room:standup' } });
+    expect(noSession.statusCode).toBe(404);
+    const stranger = await run(buildApp(), 'POST', '/api/video/sessions/vs-7/participants/nobody-x/grant-publish', {
+      userId: 'host-1', body: { lobbyName: 'room:standup' },
+    });
+    expect(stranger.statusCode).toBe(404);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('409 once the call has ended', async () => {
+    mockGetSession.mockResolvedValue({ ...session, status: 'ended' });
+    const res = await run(buildApp(), 'POST', grantUrl, { userId: 'host-1', body: { lobbyName: 'room:standup' } });
+    expect(res.statusCode).toBe(409);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('503 before any request when VIDEO_SERVICE_TOKEN is unset', async () => {
+    delete process.env.VIDEO_SERVICE_TOKEN;
+    const res = await run(buildApp(), 'POST', grantUrl, { userId: 'host-1', body: { lobbyName: 'room:standup' } });
+    expect(res.statusCode).toBe(503);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('maps LVS answers: 404 → 404, 503 → 503, 401/403 (our credential) → 502, network → 502', async () => {
+    const lvs = (status: number) => ({
+      ok: false, status, json: async () => ({ error: 'x' }), text: async () => 'x',
+    } as unknown as globalThis.Response);
+    const cases: Array<[unknown, number]> = [[lvs(404), 404], [lvs(503), 503], [lvs(401), 502], [lvs(403), 502]];
+    for (const [answer, expected] of cases) {
+      mockFetch.mockResolvedValueOnce(answer);
+      const res = await run(buildApp(), 'POST', grantUrl, { userId: 'host-1', body: { lobbyName: 'room:standup' } });
+      expect([expected, res.statusCode]).toEqual([expected, expected]);
+    }
+    mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+    const down = await run(buildApp(), 'POST', grantUrl, { userId: 'host-1', body: { lobbyName: 'room:standup' } });
+    expect(down.statusCode).toBe(502);
   });
 });
 

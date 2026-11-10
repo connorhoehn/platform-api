@@ -1174,14 +1174,54 @@ paths:
       description: |
         Thin proxy to LVS `POST /api/sessions/{arn}/refresh-token` —
         rotates the caller's stage token without leaving the session.
+        The token's role is the one LVS recorded at join, or set since by
+        the host's grant-publish / revoke-publish. A `role` in the body is
+        ignored and not forwarded: a participant cannot refresh itself into
+        a publisher token.
       operationId: refreshVideoSessionToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [participantId]
+              properties:
+                participantId: { type: string, description: The caller's own participant id from join }
+                lobbyName: { type: string }
+                documentId: { type: string, description: Alias of lobbyName }
       responses:
         '200':
           description: OK — fresh stage token payload
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, expiresAt, participantId, role]
+                properties:
+                  token: { type: string }
+                  expiresAt: { type: string, format: date-time }
+                  participantId: { type: string }
+                  role: { type: string, enum: [publisher, subscriber] }
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            Not the caller's participant, or publishing was revoked
+            (`{ error, reason: 'publish_revoked' }`).
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            LVS refused a role change on refresh; `{ error, role }` names the
+            recorded role. Only the host's grant-publish changes it.
+        '410':
+          description: Session ended
+        '502':
+          description: Video service unreachable, or it refused platform-api's service token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
         '503':
           description: SFU circuit breaker open
           content:
@@ -1189,6 +1229,101 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorBody' }
         '504':
           description: Upstream LVS timeout
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /video/sessions/{sessionId}/participants/{participantId}/grant-publish:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdPath'
+      - $ref: '#/components/parameters/ParticipantIdPath'
+    post:
+      tags: [video-sessions]
+      summary: Promote a participant to publisher (host only)
+      description: |
+        Thin proxy to LVS `POST /api/channels/{arn}/participants/{participantId}/grant-publish`
+        with platform-api's service token. Only the call's host (the
+        document-review host, else whoever started the session) may call it,
+        on an active call, for a participant in the session's join list.
+        LVS records the participant as a publisher, so its next
+        refresh-token mints a publisher token; LVS also sends
+        `participant.publish-granted` to the participant's stage socket.
+        Also reverses an earlier revoke-publish.
+      operationId: grantVideoSessionPublish
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishControlRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishControlResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: The caller is not the call's host
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The call has ended
+        '502':
+          description: Video service unreachable, or it refused platform-api's service token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: VIDEO_SERVICE_TOKEN unset, SFU circuit breaker open, or LVS publish control unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+
+  /video/sessions/{sessionId}/participants/{participantId}/revoke-publish:
+    parameters:
+      - $ref: '#/components/parameters/SessionIdPath'
+      - $ref: '#/components/parameters/ParticipantIdPath'
+    post:
+      tags: [video-sessions]
+      summary: Demote a participant to subscriber (host only)
+      description: |
+        Thin proxy to LVS `POST /api/channels/{arn}/participants/{participantId}/revoke-publish`.
+        Same rules as grant-publish. LVS closes the participant's publisher
+        transports (camera and screen) at once, refuses further WHIP with
+        `403 { reason: 'publish_revoked' }`, keeps its viewer transports and
+        stage socket up, and its next refresh-token mints a subscriber token.
+      operationId: revokeVideoSessionPublish
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishControlRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishControlResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: The caller is not the call's host
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The call has ended
+        '502':
+          description: Video service unreachable, or it refused platform-api's service token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorBody' }
+        '503':
+          description: VIDEO_SERVICE_TOKEN unset, SFU circuit breaker open, or LVS publish control unavailable
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorBody' }
@@ -1330,6 +1465,12 @@ components:
       required: true
       schema: { type: string, format: uuid }
       description: VideoSession identifier (UUID minted at create time).
+    ParticipantIdPath:
+      in: path
+      name: participantId
+      required: true
+      schema: { type: string }
+      description: The participant id the video service minted at join (the session's join list stores it).
     LobbyNameQuery:
       in: query
       name: lobbyName
@@ -1385,6 +1526,33 @@ components:
           type: integer
           description: Epoch-seconds row TTL (90 days).
 
+    PublishControlRequest:
+      type: object
+      properties:
+        lobbyName: { type: string }
+        documentId: { type: string, description: Alias of lobbyName }
+        reason: { type: string, maxLength: 256, description: Shown in the video service's publish-control event }
+      description: lobbyName or documentId is required.
+    PublishControlResponse:
+      type: object
+      required: [sessionId, participantId, userId, role, changed, publishPermission]
+      properties:
+        sessionId: { type: string }
+        participantId: { type: string }
+        userId: { type: string }
+        role:
+          type: string
+          enum: [publisher, subscriber]
+          description: The role the participant's next refresh-token mints.
+        changed: { type: boolean, description: False when the permission was already in this state }
+        publishPermission:
+          type: object
+          nullable: true
+          properties:
+            state: { type: string, enum: [granted, revoked] }
+            reason: { type: string, nullable: true }
+            by: { type: string }
+            at: { type: string, format: date-time }
     ErrorBody:
       type: object
       required: [error]

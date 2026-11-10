@@ -149,6 +149,10 @@ export const ACCESS_ALLOWLIST: Record<string, string> = {
     'GET /api/video/sessions/:sessionId',
     'PATCH /api/video/sessions/:sessionId',
   ]),
+  ...each('in handler: call-lobby access (lib/lobbyAccess.ts) + caller is the call host (hostOf) + participantId in the join list', [
+    'POST /api/video/sessions/:sessionId/participants/:participantId/grant-publish',
+    'POST /api/video/sessions/:sessionId/participants/:participantId/revoke-publish',
+  ]),
   ...each('in handler: requireOwnRecording (recording:read, participant); DELETE also startedBy', [
     'POST /api/recordings/:recordingId/transcribe',
     'PATCH /api/recordings/:recordingId/expiry',

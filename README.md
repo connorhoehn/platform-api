@@ -82,6 +82,15 @@ Common environment variables:
   `/api/sessions` routes; it must equal the video service's `LVS_SERVICE_TOKEN`.
   Unset refuses every session create, join, refresh and end with a 503 before any
   request is sent.
+- `LIVE_CAPTIONS_URL` - the live-captions sidecar platform-api posts voice-capture
+  audio to (default `http://host.docker.internal:3915`). `LIVE_CAPTIONS_SINK_URL`
+  is the sidecar URL handed to the video service for call-caption taps (default
+  `http://localhost:3915/pcm`); its origin must equal the video service's
+  `LIVE_CAPTIONS_ORIGIN`, or the video service will not send the secret on the tap.
+- `LIVE_CAPTIONS_SHARED_SECRET` - sent as `X-Live-Captions-Secret` on every POST to
+  the sidecar; must equal the sidecar's `LIVE_CAPTIONS_SHARED_SECRET`. Unset sends
+  no header (one warning is logged on first use), which only a sidecar running with
+  `INSECURE_DEV_MODE=true` and no secret accepts; otherwise voice capture gets 502.
 - `VIDEO_OPS_TOKEN` (or `LVS_OPS_TOKEN`) - the bearer for webhook registration
   (`/api/event-subscriptions`); falls back to `VIDEO_ADMIN_TOKEN` when the video
   service has no `OPS_TOKEN`.

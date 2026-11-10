@@ -185,6 +185,46 @@ function assertOwnParticipant(
 }
 
 /**
+ * Answer a non-2xx (and non-5xx: callSfu throws those) from LVS on the routes
+ * that touch a participant's publish permission — refresh-token, and
+ * grant-publish / revoke-publish:
+ *
+ *   409  the refresh asked for a role other than the recorded one. Promotion
+ *        is the host's grant, so say that, with LVS's recorded `role`.
+ *   403 `publish_revoked`  publishing was revoked for this participant;
+ *        passed on with the same `reason` so a client can tell it apart.
+ *   401 / other 403  LVS refused platform-api's own service credential —
+ *        a deployment fault, not the caller's, so 502 (a 401/403 here would
+ *        read as "your sign-in is bad").
+ *   anything else  the LVS status, as before.
+ */
+async function sendLvsPublishRefusal(
+  upstream: globalThis.Response,
+  res: Response,
+  ctx: { sessionId: string; participantId: string; op: string },
+): Promise<void> {
+  const body = (await upstream.json().catch(() => ({}))) as { error?: unknown; role?: unknown; reason?: unknown };
+  const role = body.role === 'publisher' || body.role === 'subscriber' ? body.role : undefined;
+  if (upstream.status === 409) {
+    log.warn({ ...ctx, role }, '[videoSessions] LVS refused a role change on refresh');
+    res.status(409).json({
+      error: `Your role in this call is ${role ?? 'fixed'}; only the host can change it`,
+      ...(role ? { role } : {}),
+    });
+    return;
+  }
+  if (upstream.status === 403 && body.reason === 'publish_revoked') {
+    res.status(403).json({ error: 'Publishing was revoked for this participant', reason: 'publish_revoked' });
+    return;
+  }
+  log.error({ ...ctx, status: upstream.status, body }, `[videoSessions] LVS ${ctx.op} upstream failed`);
+  if (upstream.status === 401 || upstream.status === 403) {
+    throw new AppError(502, 'Video service refused platform-api\'s credentials (VIDEO_SERVICE_TOKEN must equal LVS_SERVICE_TOKEN)');
+  }
+  throw new AppError(upstream.status, `LVS ${ctx.op} upstream ${upstream.status}`);
+}
+
+/**
  * Reap one LVS participant on /end (hub#1281). LVS's
  * `DELETE /api/channels/:arn/participants/:participantId` is idempotent
  * (404 on second call) and reaps the `${pid}:screen` sibling server-side.
@@ -1006,18 +1046,20 @@ videoSessionsRouter.post('/sessions/:sessionId/end', optionalAuth, asyncHandler(
 // (hub#1249 third quarter — long-lived calls survive the 1h stage-token expiry
 // without forcing a full WHIP/WHEP re-handshake).
 //
-// Body: { participantId, lobbyName | documentId, role? }
+// Body: { participantId, lobbyName | documentId }
 // Returns: { token, expiresAt, participantId, role }
 //
-// Forwards the caller's Cognito Bearer to LVS. LVS validates participant
-// registration via its sessionStore (LOBBY_TAKEN / not-registered → 4xx).
+// The role is LVS's: the one recorded at join, or set since by a host's
+// grant-publish / revoke-publish (routes below). A `role` in the body is
+// ignored and never forwarded — the browser cannot refresh itself into a
+// publisher token. LVS validates participant registration via its
+// sessionStore (not-registered → 404).
 videoSessionsRouter.post('/sessions/:sessionId/refresh-token', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {
   try {
     const { sessionId } = req.params;
     const body = (req.body ?? {}) as Record<string, unknown>;
     const lobbyName = resolveLobbyName(body);
     const participantId = typeof body.participantId === 'string' ? body.participantId : undefined;
-    const role = typeof body.role === 'string' ? body.role : undefined;
 
     if (!lobbyName) {
       throw new ValidationError('lobbyName (or documentId) is required in request body');
@@ -1052,7 +1094,7 @@ videoSessionsRouter.post('/sessions/:sessionId/refresh-token', requireAuth, asyn
             Authorization: authHeader,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ participantId, ...(role ? { role } : {}) }),
+          body: JSON.stringify({ participantId }),
         },
       );
     } catch (sfuErr) {
@@ -1067,9 +1109,8 @@ videoSessionsRouter.post('/sessions/:sessionId/refresh-token', requireAuth, asyn
         res.status(upstream.status).json(errBody);
         return;
       }
-      const errorBody = await upstream.text().catch(() => 'Unknown error');
-      log.error({ status: upstream.status, body: errorBody, sessionId }, '[videoSessions] refresh-token upstream failed');
-      throw new AppError(upstream.status, `LVS refresh-token upstream ${upstream.status}`);
+      await sendLvsPublishRefusal(upstream, res, { sessionId, participantId, op: 'refresh-token' });
+      return;
     }
 
     const tokenData = await upstream.json() as {
@@ -1089,6 +1130,102 @@ videoSessionsRouter.post('/sessions/:sessionId/refresh-token', requireAuth, asyn
     throw new AppError(500, 'Failed to refresh participant token');
   }
 }));
+
+// POST /api/video/sessions/:sessionId/participants/:participantId/grant-publish
+// POST /api/video/sessions/:sessionId/participants/:participantId/revoke-publish
+//
+// Promote a participant who joined as a subscriber to publisher (grant), or
+// demote one to subscriber (revoke). Body { lobbyName | documentId, reason? }.
+// Answers { sessionId, participantId, userId, role, changed, publishPermission }.
+//
+// The host only (`hostOf`: the document-review host, else whoever started
+// the session), in a call that is still active, for a participant in this
+// session's join list. `participantId` is the one LVS minted at join (the
+// mirror stores it); LVS adds the participant's user id and memberId itself,
+// so a re-joined tab of the same person is covered too.
+//
+// Thin proxy → LVS POST /api/channels/:arn/participants/:participantId/
+// grant-publish | revoke-publish, with platform-api's service token. LVS
+// rewrites the role it recorded at join, so the participant's next
+// refresh-token mints the new role; a revoke also closes its publisher
+// transports at once and refuses further WHIP. LVS tells the participant's
+// own stage socket (`participant.publish-granted` / `-revoked`), which is the
+// client's cue to refresh and start or stop publishing.
+const MAX_PUBLISH_REASON_LENGTH = 256; // LVS's limit
+function publishControlHandler(action: 'grant-publish' | 'revoke-publish') {
+  const role = action === 'grant-publish' ? 'publisher' : 'subscriber';
+  return asyncHandler(async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { sessionId, participantId } = req.params;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const lobbyName = resolveLobbyName(body);
+      if (!lobbyName) {
+        throw new ValidationError('lobbyName (or documentId) is required in request body');
+      }
+      const reason = body.reason;
+      if (reason !== undefined && reason !== null
+        && (typeof reason !== 'string' || reason.length > MAX_PUBLISH_REASON_LENGTH || hasControlChar(reason))) {
+        throw new ValidationError(`reason must be a string of at most ${MAX_PUBLISH_REASON_LENGTH} characters`);
+      }
+      await lobbyAccess().assertLobbyAccess(req, lobbyName);
+
+      const session = await videoSessionRepo.getSession(lobbyName, sessionId);
+      if (!session) throw new NotFoundError('Session not found');
+      if (session.status !== 'active') throw new AppError(409, 'This call has ended');
+      const userId = req.user!.sub;
+      if (hostOf(session) !== userId) {
+        throw new ForbiddenError('Only the host can change who may publish');
+      }
+      const target = (session.participants ?? []).find((p) => p.participantId === participantId);
+      if (!target) throw new NotFoundError('Participant not found in this call');
+
+      const authHeader = lvsSessionAuthHeader();
+      let upstream: globalThis.Response;
+      try {
+        upstream = await callSfu(
+          `${VIDEO_API_URL}/api/channels/${encodeURIComponent(session.channelArn)}/participants/${encodeURIComponent(participantId)}/${action}`,
+          {
+            method: 'POST',
+            headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+            body: JSON.stringify(typeof reason === 'string' && reason.trim() ? { reason: reason.trim() } : {}),
+          },
+        );
+      } catch (sfuErr) {
+        throw mapSfuError(sfuErr);
+      }
+      if (!upstream.ok) {
+        if (upstream.status === 404) {
+          // LVS no longer knows the channel or the participant (left, reaped).
+          await upstream.json().catch(() => undefined);
+          throw new NotFoundError('Participant not found in this call');
+        }
+        await sendLvsPublishRefusal(upstream, res, { sessionId, participantId, op: action });
+        return;
+      }
+      const result = (await upstream.json().catch(() => ({}))) as {
+        changed?: boolean; publishPermission?: { state: string; reason: string | null; by: string; at: string } | null;
+      };
+      log.info(
+        { sessionId, participantId, target: target.userId, by: userId, role, changed: result.changed },
+        `[videoSessions] ${action}`,
+      );
+      res.status(200).json({
+        sessionId,
+        participantId,
+        userId: target.userId,
+        role,
+        changed: result.changed === true,
+        publishPermission: result.publishPermission ?? null,
+      });
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      log.error({ err }, `[videoSessions] POST /sessions/:id/participants/:pid/${action} error`);
+      throw new AppError(500, 'Failed to change publish permission');
+    }
+  });
+}
+videoSessionsRouter.post('/sessions/:sessionId/participants/:participantId/grant-publish', requireAuth, publishControlHandler('grant-publish'));
+videoSessionsRouter.post('/sessions/:sessionId/participants/:participantId/revoke-publish', requireAuth, publishControlHandler('revoke-publish'));
 
 // GET /api/video/sessions/document/:documentId — list all sessions for a lobby
 videoSessionsRouter.get('/sessions/document/:documentId', requireAuth, asyncHandler(async (req: Request, res: Response): Promise<void> => {

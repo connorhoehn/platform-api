@@ -15,7 +15,9 @@
 //
 // What this route adds over POSTing the sidecar directly:
 //
-//   * Auth. The sidecar has none, and must never be reachable from a browser.
+//   * Auth. The sidecar only knows a shared service secret (sent here as
+//     X-Live-Captions-Secret, lib/liveCaptionsAuth.ts) and must never be
+//     reachable from a browser.
 //   * Ownership binding. A captureId is a fan-out address: anyone who knows one
 //     can read its transcripts off the WS channel. First writer wins, and a
 //     second user POSTing to the same id is rejected — otherwise one user could
@@ -32,6 +34,7 @@
 import express, { Router, type Request, type Response } from 'express';
 import { asyncHandler, ValidationError, ForbiddenError } from '../middleware/error-handler';
 import log from '../lib/logger';
+import { liveCaptionsAuthHeaders } from '../lib/liveCaptionsAuth';
 
 export const voiceCaptureRouter = Router();
 
@@ -144,6 +147,7 @@ voiceCaptureRouter.post(
           'X-Channel-Arn': `capture:${captureId}`,
           'X-Participant-Id': utteranceId,
           'X-Sample-Rate': '16000',
+          ...liveCaptionsAuthHeaders(),
         },
         body: new Uint8Array(body),
       });
@@ -163,6 +167,15 @@ voiceCaptureRouter.post(
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
+      if (upstream.status === 401) {
+        // Our credential, not the user's: a missing or different secret.
+        log.warn(
+          { event: 'voice.capture.sidecar_unauthorized', target },
+          'live-captions refused platform-api: LIVE_CAPTIONS_SHARED_SECRET must equal the sidecar\'s LIVE_CAPTIONS_SHARED_SECRET',
+        );
+        res.status(502).json({ error: 'transcription service rejected chunk' });
+        return;
+      }
       log.warn(
         { event: 'voice.capture.sidecar_error', status: upstream.status, text: text.slice(0, 200) },
         'live-captions rejected chunk',
